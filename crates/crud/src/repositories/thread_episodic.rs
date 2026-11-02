@@ -1637,6 +1637,96 @@ pub async fn update_capsule_metadata_json<C: ConnectionTrait>(
         })
 }
 
+/// Bounded preliminary source snapshot. No connection or stream escapes this call.
+/// Each page is independent; callers must still revalidate selected sources.
+pub async fn search_source_batch<C: ConnectionTrait>(
+    db: &C,
+    workspace_id: &str,
+    ids: &[String],
+) -> Result<
+    Vec<(
+        thread_episodic_items::Model,
+        pioneer_entity::turn_item::Model,
+        Option<String>,
+    )>,
+> {
+    anyhow::ensure!(ids.len() <= 128, "search source batch exceeds row bound");
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let items = thread_episodic_items::Entity::find()
+        .filter(thread_episodic_items::Column::WorkspaceId.eq(workspace_id))
+        .filter(thread_episodic_items::Column::Id.is_in(ids.iter().cloned()))
+        .all(db)
+        .await?;
+    let excluded = thread_episodic_exclusions::Entity::find()
+        .filter(thread_episodic_exclusions::Column::WorkspaceId.eq(workspace_id))
+        .filter(thread_episodic_exclusions::Column::IndexItemId.is_in(ids.iter().cloned()))
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|row| (row.thread_id, row.index_item_id))
+        .collect::<HashSet<_>>();
+    let threads = thread::Entity::find()
+        .filter(thread::Column::WorkspaceId.eq(workspace_id))
+        .filter(thread::Column::Id.is_in(items.iter().map(|item| item.thread_id.clone())))
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|row| (row.id, row.name))
+        .collect::<std::collections::HashMap<_, _>>();
+    // Select only ownership/deletion guards, never complete turns or their history.
+    let turns = turn::Entity::find()
+        .select_only()
+        .column(turn::Column::Id)
+        .column(turn::Column::ThreadId)
+        .filter(turn::Column::Id.is_in(items.iter().map(|item| item.turn_id.clone())))
+        .filter(turn::Column::MessageDeletedAt.is_null())
+        .into_tuple::<(String, String)>()
+        .all(db)
+        .await?
+        .into_iter()
+        .collect::<std::collections::HashMap<_, _>>();
+    let items = items
+        .into_iter()
+        .filter(|item| {
+            threads.contains_key(&item.thread_id)
+                && turns.get(&item.turn_id) == Some(&item.thread_id)
+                && !excluded.contains(&(item.thread_id.clone(), item.id.clone()))
+        })
+        .collect::<Vec<_>>();
+    if items.is_empty() {
+        return Ok(Vec::new());
+    }
+    use pioneer_entity::turn_item;
+    let mut sources = Condition::any();
+    for item in &items {
+        sources = sources.add(
+            Condition::all()
+                .add(turn_item::Column::TurnId.eq(item.turn_id.clone()))
+                .add(turn_item::Column::ItemId.eq(item.item_id.clone())),
+        );
+    }
+    let canonical = turn_item::Entity::find()
+        .filter(sources)
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|row| ((row.turn_id.clone(), row.item_id.clone()), row))
+        .collect::<std::collections::HashMap<_, _>>();
+    // Different indexed versions can refer to the same canonical source.
+    Ok(items
+        .into_iter()
+        .filter_map(|item| {
+            let source = canonical
+                .get(&(item.turn_id.clone(), item.item_id.clone()))?
+                .clone();
+            let title = threads.get(&item.thread_id)?.clone();
+            Some((item, source, title))
+        })
+        .collect())
+}
+
 pub async fn find_item_by_id<C: ConnectionTrait>(
     db: &C,
     index_item_id: &str,

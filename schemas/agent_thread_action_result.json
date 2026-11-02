@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AgentThreadActionResult",
+  "description": "References fixed at the thread action commit, preserved on replay.",
+  "type": "object",
+  "properties": {
+    "executionId": {
+      "description": "Execution committed for turnId in threadId by foreground admission.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "taskId": {
+      "description": "Task atomically created by the shared detached launch mechanism.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "threadId": {
+      "description": "Created conversation or the target conversation of send/start.",
+      "type": "string"
+    },
+    "turnId": {
+      "description": "Saved message or admitted turn in threadId. For a detached launch this\nis the parent admission, never the executing child turn.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "workspaceId": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "workspaceId",
+    "threadId"
+  ]
+}

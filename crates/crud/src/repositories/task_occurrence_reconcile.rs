@@ -304,10 +304,10 @@ pub(crate) async fn next_generation<C: ConnectionTrait>(db: &C) -> Result<i64> {
         .filter(sequence::Column::Generation.eq(row.generation))
         .exec(db)
         .await?;
-    anyhow::ensure!(
-        updated.rows_affected == 1,
-        "task occurrence sequence changed"
-    );
+    if updated.rows_affected != 1 {
+        // Escape the owning transaction; its caller retries from a fresh snapshot.
+        return Err(super::portable_payload::PreflightRace.into());
+    }
     Ok(generation)
 }
 

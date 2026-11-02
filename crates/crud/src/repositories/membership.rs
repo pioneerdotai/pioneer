@@ -94,6 +94,62 @@ pub struct NewThreadMembership {
     pub now: DateTimeWithTimeZone,
 }
 
+/// Maximum input IDs and returned rows for one authorization-facts query.
+/// Membership queries use at most 130 binds: 128 IDs, scope and row limit.
+pub const AUTHORIZATION_FACTS_BATCH_LIMIT: usize = 128;
+
+pub async fn load_workspace_membership_principal_ids<C: ConnectionTrait>(
+    db: &C,
+    workspace_id: &str,
+    principal_ids: &[PrincipalId],
+) -> Result<Vec<String>> {
+    if principal_ids.len() > AUTHORIZATION_FACTS_BATCH_LIMIT {
+        bail!("workspace authorization facts batch exceeds limit");
+    }
+    if principal_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    workspace_membership::Entity::find()
+        .select_only()
+        .column(workspace_membership::Column::PrincipalId)
+        .filter(workspace_membership::Column::WorkspaceId.eq(workspace_id))
+        .filter(
+            workspace_membership::Column::PrincipalId
+                .is_in(principal_ids.iter().map(ToString::to_string)),
+        )
+        .limit(AUTHORIZATION_FACTS_BATCH_LIMIT as u64)
+        .into_tuple::<String>()
+        .all(db)
+        .await
+        .context("failed to load bounded workspace authorization memberships")
+}
+
+pub async fn load_thread_membership_principal_ids<C: ConnectionTrait>(
+    db: &C,
+    thread_id: &str,
+    principal_ids: &[PrincipalId],
+) -> Result<Vec<String>> {
+    if principal_ids.len() > AUTHORIZATION_FACTS_BATCH_LIMIT {
+        bail!("thread authorization facts batch exceeds limit");
+    }
+    if principal_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    thread_membership::Entity::find()
+        .select_only()
+        .column(thread_membership::Column::PrincipalId)
+        .filter(thread_membership::Column::ThreadId.eq(thread_id))
+        .filter(
+            thread_membership::Column::PrincipalId
+                .is_in(principal_ids.iter().map(ToString::to_string)),
+        )
+        .limit(AUTHORIZATION_FACTS_BATCH_LIMIT as u64)
+        .into_tuple::<String>()
+        .all(db)
+        .await
+        .context("failed to load bounded thread authorization memberships")
+}
+
 pub async fn find_workspace_membership<C: ConnectionTrait>(
     db: &C,
     principal_id: &PrincipalId,

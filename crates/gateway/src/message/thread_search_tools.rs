@@ -194,27 +194,38 @@ impl MessageProcessor {
                     };
                     incomplete |=
                         !page.unavailable_segment_ids.is_empty() || !page.warnings.is_empty();
+                    let sources = service
+                        .resolve_thread_search_sources(&authority.workspace_id, &page.hits)
+                        .await?;
+                    // Request-local, bounded to this retrieval portion. Never reused by
+                    // the final disclosure check or by another request.
+                    let mut readable = BTreeMap::new();
                     for hit in page.hits {
-                        if !self
-                            .thread_source_readable(authority, &hit.thread_id)
-                            .await?
+                        let Some((item, title)) = sources.get(&hit.index_item_id) else {
+                            continue;
+                        };
+                        if hit.workspace_id != authority.workspace_id
+                            || item.thread_id != hit.thread_id
+                            || item.turn_id != hit.turn_id
+                            || item.item_id != hit.item_id
+                            || hit.metadata.get("pioneer.thread_episodic.source_text_hash")
+                                != Some(&item.source_text_hash)
                         {
                             continue;
                         }
-                        let Some(item) = service
-                            .resolve_thread_search_source(&authority.workspace_id, &hit)
-                            .await?
-                        else {
-                            continue;
+                        let allowed = match readable.get(&item.thread_id) {
+                            Some(allowed) => *allowed,
+                            None => {
+                                let allowed = self
+                                    .thread_source_readable(authority, &item.thread_id)
+                                    .await?;
+                                readable.insert(item.thread_id.clone(), allowed);
+                                allowed
+                            }
                         };
-                        let Some(thread) = self
-                            .crud_store
-                            .get_thread_by_id(&item.thread_id)
-                            .await?
-                            .filter(|t| t.workspace_id == authority.workspace_id)
-                        else {
+                        if !allowed {
                             continue;
-                        };
+                        }
                         let key = (
                             item.thread_id.clone(),
                             item.turn_id.clone(),
@@ -229,7 +240,7 @@ impl MessageProcessor {
                             .unwrap_or_default();
                         let found = FoundSource {
                             thread_id: item.thread_id.clone(),
-                            title: thread.name,
+                            title: title.clone(),
                             fragment: json!({"text":hit.text,"score":score,"source":{
                                 "workspaceId":item.workspace_id,"threadId":item.thread_id,
                                 "turnId":item.turn_id,"itemId":item.item_id,"indexItemId":item.id,

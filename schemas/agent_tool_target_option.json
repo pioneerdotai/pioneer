@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "AgentToolTargetOption",
-  "description": "Opaque action target projected by the server. The model never receives a\nthread, route, workspace, capsule or Gateway identifier and therefore\ncannot turn guessed infrastructure IDs into an existence oracle.",
+  "description": "Opaque action target projected by the server. Returned navigation IDs do\nnot replace this option or grant authority to write or launch.",
   "type": "object",
   "properties": {
     "id": {

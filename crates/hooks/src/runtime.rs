@@ -69,6 +69,7 @@ pub enum HookRuntimeError {
         phase: HookPhase,
         subscription_ids: Vec<HookSubscriptionId>,
     },
+    RecoveryStorageUnavailable,
     DurablePersistenceUnavailable {
         phase: HookPhase,
         operation: &'static str,
@@ -91,7 +92,9 @@ impl HookRuntimeError {
             Self::HookFailed { error, .. } | Self::HookFailedClosed { error, .. } => {
                 error.retryable
             }
-            Self::HookTimedOut { .. } | Self::DurablePersistenceUnavailable { .. } => true,
+            Self::HookTimedOut { .. }
+            | Self::RecoveryStorageUnavailable
+            | Self::DurablePersistenceUnavailable { .. } => true,
             Self::DurableExecutionIncomplete { retryable, .. } => *retryable,
             Self::Registry(_)
             | Self::MissingHandler { .. }
@@ -187,6 +190,9 @@ impl fmt::Display for HookRuntimeError {
                 }
                 Ok(())
             }
+            Self::RecoveryStorageUnavailable => {
+                formatter.write_str("hook recovery storage is unavailable")
+            }
             Self::DurablePersistenceUnavailable { phase, operation } => write!(
                 formatter,
                 "durable hook persistence failed during `{operation}` for phase `{phase}`"
@@ -217,6 +223,7 @@ impl std::error::Error for HookRuntimeError {
             | Self::MissingDependency { .. }
             | Self::DependencyCycle { .. }
             | Self::DurablePersistenceUnavailable { .. }
+            | Self::RecoveryStorageUnavailable
             | Self::DurableExecutionIncomplete { .. } => None,
         }
     }
@@ -895,7 +902,17 @@ impl HookRuntime {
                 phases: None,
             })
             .await
-            .unwrap_or_default();
+            .map_err(|error| {
+                let diagnostic = error.diagnostic();
+                tracing::error!(
+                    operation = "list_recoverable_runs",
+                    cause_class = diagnostic.cause_class.as_str(),
+                    sqlite_primary_code = diagnostic.sqlite_primary_code,
+                    sqlite_extended_code = diagnostic.sqlite_extended_code,
+                    "failed to discover recoverable hook runs"
+                );
+                HookRuntimeError::RecoveryStorageUnavailable
+            })?;
         let mut summary = HookRecoverySummary {
             scanned_count: records.len(),
             ..HookRecoverySummary::default()
@@ -7393,6 +7410,28 @@ mod tests {
                 .with_retry_policy(retry_policy),
             )
             .expect("subscription registers");
+    }
+
+    #[tokio::test]
+    async fn recovery_discovery_storage_error_is_retryable_and_never_empty_success() {
+        let runtime = HookRuntime::with_run_store(
+            Arc::new(HookRegistry::new()),
+            Arc::new(HookSubscriptionRegistry::new()),
+            Arc::new(RecordingHookRunStore {
+                fail_all: true,
+                ..Default::default()
+            }),
+        );
+        let error = runtime
+            .recover_background_runs_once(HookRecoveryOptions::default())
+            .await
+            .expect_err("storage failure must reach the recovery owner");
+        assert!(error.retryable());
+        assert!(matches!(
+            error,
+            HookRuntimeError::RecoveryStorageUnavailable
+        ));
+        assert_eq!(error.to_string(), "hook recovery storage is unavailable");
     }
 
     #[tokio::test]

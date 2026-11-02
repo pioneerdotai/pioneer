@@ -161,6 +161,14 @@ struct TaskTimelineChangedTarget {
     run_id: Option<String>,
 }
 
+// Advisory only: one finite due-set pass, shared by scoped processor clones.
+// Ownership remains entirely in durable claim/revision fences.
+#[derive(Clone, Default)]
+pub(super) struct ChildDiscoveryPass<K> {
+    after: Option<K>,
+    upper: Option<K>,
+}
+
 impl MessageProcessor {
     pub(super) async fn reconcile_terminal_task_child_turns_with_retry(
         &self,
@@ -176,104 +184,107 @@ impl MessageProcessor {
     }
 
     pub(super) async fn reconcile_terminal_task_child_turns(&self, limit: u64) -> Result<usize> {
-        let turns = self
-            .crud_store
-            .list_unreconciled_terminal_task_child_turns(limit)
-            .await?;
-        let mut reconciled = 0usize;
+        let store = self.crud_store.with_maintenance_access();
+        let clock = || chrono::Utc::now().timestamp();
         let mut errors = TaskChildReconciliationFailures::default();
-        for turn in turns {
-            let result = match turn.status {
-                TurnStatus::Completed => {
-                    self.task_agent_executor
-                        .reconcile_child_turn_completed(
-                            turn.thread_id.as_str(),
-                            turn.turn_id.as_str(),
-                            TaskChildReconciliationOrigin::DurableBackground,
-                        )
-                        .await
+        let ready = match store.child_work_queues_ready().await {
+            Ok(ready) => ready,
+            Err(error) => {
+                errors.push("", "", error);
+                false
+            }
+        };
+        if !ready {
+            if let Err(error) = store.discover_legacy_child_work(limit).await {
+                errors.push("", "", error);
+            }
+        }
+        let mut scope_pass = self.task_child_scope_cursor.lock().await.clone();
+        let scope_candidate = async {
+            if scope_pass.upper.is_none() {
+                scope_pass.upper = store.child_scope_due_upper(clock()).await?;
+                scope_pass.after = None;
+            }
+            if let Some(upper) = &scope_pass.upper {
+                store
+                    .discover_child_scope_in_pass(clock(), scope_pass.after.as_ref(), upper)
+                    .await
+            } else {
+                Ok(None)
+            }
+        }
+        .await;
+        match scope_candidate {
+            Ok(Some(candidate)) => {
+                // Publish raw discovery progress before any potentially failing
+                // claim/page. New suffix growth cannot extend the captured pass.
+                scope_pass.after = candidate.next_attempt_at.map(|due| {
+                    (
+                        due,
+                        candidate.scope_kind.clone(),
+                        candidate.scope_key.clone(),
+                    )
+                });
+                if scope_pass.after == scope_pass.upper {
+                    scope_pass = Default::default();
                 }
-                TurnStatus::Failed => {
-                    let error = turn.error.as_deref().unwrap_or("child turn failed");
-                    self.task_agent_executor
-                        .reconcile_child_turn_failed(
-                            turn.thread_id.as_str(),
-                            turn.turn_id.as_str(),
-                            error,
-                            TaskChildReconciliationOrigin::DurableBackground,
-                        )
-                        .await
+                *self.task_child_scope_cursor.lock().await = scope_pass;
+                if let Err(error) = store
+                    .expand_child_scope_candidate_with_clock(&candidate, &clock, false)
+                    .await
+                {
+                    errors.push("", "", error);
                 }
-                TurnStatus::Interrupted => {
-                    let reason = turn
-                        .error
-                        .as_deref()
-                        .unwrap_or("child turn was interrupted");
-                    self.task_agent_executor
-                        .reconcile_child_turn_cancelled(
-                            turn.thread_id.as_str(),
-                            turn.turn_id.as_str(),
-                            reason,
-                            TaskChildReconciliationOrigin::DurableBackground,
-                        )
-                        .await
-                }
-                TurnStatus::Blocked => {
-                    let reason = turn.error.as_deref().unwrap_or("child turn was blocked");
-                    self.task_agent_executor
-                        .reconcile_child_turn_blocked(
-                            turn.thread_id.as_str(),
-                            turn.turn_id.as_str(),
-                            reason,
-                            TaskChildReconciliationOrigin::DurableBackground,
-                        )
-                        .await
-                }
-                TurnStatus::InProgress => continue,
-            };
-            match result {
-                Ok(true) => {
-                    if turn.status != TurnStatus::Blocked {
-                        match self
-                            .crud_store
-                            .with_maintenance_access()
-                            .cleanup_terminal_task_child_capsule(&turn.thread_id, &turn.turn_id)
-                            .await
-                        {
-                            Ok(Some(true)) => {
-                                reconciled = reconciled.saturating_add(1);
-                                continue;
-                            }
-                            Ok(Some(false)) => continue,
-                            Ok(None) => {} // Active aggregate: existing cleanup below.
-                            Err(error) => {
-                                errors.push(&turn.thread_id, &turn.turn_id, error);
-                                continue;
-                            }
-                        }
-                        if let Err(error) = self
-                            .crud_store
-                            .delete_turn_llm_context_for_turn(turn.turn_id.as_str())
-                            .await
-                        {
-                            warn!(
-                                thread_id = turn.thread_id.as_str(),
-                                turn_id = turn.turn_id.as_str(),
-                                error = %format!("{error:#}"),
-                                "failed to delete child Turn LLM context after durable task reconciliation"
-                            );
-                        }
-                        self.delete_turn_runtime_snapshot_for_closed_turn(
-                            turn.thread_id.as_str(),
-                            turn.turn_id.as_str(),
-                            "durably reconciled",
-                        )
-                        .await;
+            }
+            Ok(None) => *self.task_child_scope_cursor.lock().await = Default::default(),
+            Err(error) => errors.push("", "", error),
+        }
+        let mut point_pass = self.task_child_point_cursor.lock().await.clone();
+        if point_pass.upper.is_none() {
+            point_pass.upper = store.child_point_due_upper(clock()).await?;
+            point_pass.after = None;
+        }
+        let candidates = if let Some(upper) = &point_pass.upper {
+            store
+                .discover_child_points_in_pass(clock(), limit, point_pass.after.as_ref(), upper)
+                .await?
+        } else {
+            Vec::new()
+        };
+        point_pass.after = candidates
+            .last()
+            .and_then(|row| row.next_attempt_at.map(|due| (due, row.turn_id.clone())));
+        if candidates.len() < limit.min(32) as usize || point_pass.after == point_pass.upper {
+            point_pass = Default::default();
+        }
+        // Save the complete raw page before processing, including poison rows.
+        *self.task_child_point_cursor.lock().await = point_pass;
+        let mut reconciled = 0usize;
+        for candidate in candidates {
+            let claim = match store.claim_child_point_with_clock(&candidate, &clock).await {
+                Ok(Some(claim)) => claim,
+                Ok(None) => continue,
+                Err(error) => {
+                    errors.push(&candidate.thread_id, &candidate.turn_id, error);
+                    if let Err(error) = store.defer_child_point_snapshot(&candidate, &clock).await {
+                        errors.push(&candidate.thread_id, &candidate.turn_id, error);
                     }
-                    reconciled = reconciled.saturating_add(1);
+                    continue;
                 }
-                Ok(false) => {}
-                Err(error) => errors.push(&turn.thread_id, &turn.turn_id, error),
+            };
+            // Claim exactly one candidate and process it before claiming another.
+            // Every record/executor/ACK error is isolated to this exact snapshot.
+            match self
+                .reconcile_claimed_task_child_point(&store, &claim, &clock)
+                .await
+            {
+                Ok(changed) => reconciled = reconciled.saturating_add(changed),
+                Err(error) => {
+                    errors.push(&claim.thread_id, &claim.turn_id, error);
+                    if let Err(error) = store.defer_child_point_snapshot(&claim, &clock).await {
+                        errors.push(&claim.thread_id, &claim.turn_id, error);
+                    }
+                }
             }
         }
         if errors.pending_projection > 0
@@ -283,6 +294,101 @@ impl MessageProcessor {
             return Err(anyhow::Error::new(errors));
         }
         Ok(reconciled)
+    }
+
+    async fn reconcile_claimed_task_child_point<F: Fn() -> i64 + Sync>(
+        &self,
+        store: &CrudStore,
+        claim: &pioneer_entity::task_child_reconcile_pending::Model,
+        clock: &F,
+    ) -> Result<usize> {
+        let Some(turn) = store.child_point_record(claim).await? else {
+            store.finish_child_point(claim, None, true).await?;
+            return Ok(0);
+        };
+        if turn.status != TurnStatus::Blocked
+            && store
+                .terminal_task_child_cleanup_ready(&turn.thread_id, &turn.turn_id)
+                .await?
+                == Some(false)
+        {
+            store.finish_child_point(claim, None, false).await?;
+            return Ok(0);
+        }
+        let result = match turn.status {
+            TurnStatus::Completed => {
+                self.task_agent_executor
+                    .reconcile_child_turn_completed(
+                        turn.thread_id.as_str(),
+                        turn.turn_id.as_str(),
+                        TaskChildReconciliationOrigin::DurableBackground,
+                    )
+                    .await
+            }
+            TurnStatus::Failed => {
+                let error = turn.error.as_deref().unwrap_or("child turn failed");
+                self.task_agent_executor
+                    .reconcile_child_turn_failed(
+                        turn.thread_id.as_str(),
+                        turn.turn_id.as_str(),
+                        error,
+                        TaskChildReconciliationOrigin::DurableBackground,
+                    )
+                    .await
+            }
+            TurnStatus::Interrupted => {
+                let reason = turn
+                    .error
+                    .as_deref()
+                    .unwrap_or("child turn was interrupted");
+                self.task_agent_executor
+                    .reconcile_child_turn_cancelled(
+                        turn.thread_id.as_str(),
+                        turn.turn_id.as_str(),
+                        reason,
+                        TaskChildReconciliationOrigin::DurableBackground,
+                    )
+                    .await
+            }
+            TurnStatus::Blocked => {
+                let reason = turn.error.as_deref().unwrap_or("child turn was blocked");
+                self.task_agent_executor
+                    .reconcile_child_turn_blocked(
+                        turn.thread_id.as_str(),
+                        turn.turn_id.as_str(),
+                        reason,
+                        TaskChildReconciliationOrigin::DurableBackground,
+                    )
+                    .await
+            }
+            TurnStatus::InProgress => {
+                store
+                    .finish_child_point(claim, Some(clock().saturating_add(2)), false)
+                    .await?;
+                return Ok(0);
+            }
+        };
+        match result? {
+            true if turn.status != TurnStatus::Blocked => {
+                if store.cleanup_claimed_child_capsule(claim).await? {
+                    Ok(1)
+                } else {
+                    store
+                        .finish_child_point(claim, Some(clock().saturating_add(2)), false)
+                        .await?;
+                    Ok(0)
+                }
+            }
+            true => Ok(usize::from(
+                store.finish_child_point(claim, None, true).await?,
+            )),
+            false => {
+                store
+                    .finish_child_point(claim, Some(clock().saturating_add(2)), false)
+                    .await?;
+                Ok(0)
+            }
+        }
     }
 
     pub(super) async fn reconcile_terminal_task_run_occurrence_turns(
@@ -310,15 +416,20 @@ impl MessageProcessor {
     ) -> Result<TaskRunOccurrenceReconcileSummary> {
         // Exactly one advisory discovery per pass. Every selected candidate
         // consumes budget, including lost claims and failed preparations.
-        let candidates = self
+        let discovery = self
             .crud_store
-            .discover_task_run_occurrence_reconcile(clock(), limit)
+            .discover_task_run_occurrence_reconcile_with_audit(clock(), limit)
             .await?;
         let mut summary = TaskRunOccurrenceReconcileSummary {
-            selected: candidates.len(),
+            selected: discovery.candidates.len(),
             ..Default::default()
         };
-        for candidate in candidates {
+        let audit_failed = discovery.audit_error.is_some();
+        if let Some(error) = discovery.audit_error {
+            summary.queue_state_errors += 1;
+            summary.record_error(error);
+        }
+        for candidate in discovery.candidates {
             let claim = match self
                 .crud_store
                 .claim_task_run_occurrence_reconcile(&candidate, clock)
@@ -397,6 +508,9 @@ impl MessageProcessor {
                 .has_pending_task_run_occurrence_reconcile()
                 .await,
         );
+        if audit_failed {
+            summary.pending = None;
+        }
         Ok(summary)
     }
 

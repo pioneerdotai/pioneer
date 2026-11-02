@@ -175,8 +175,10 @@ impl ArtifactRepository {
         id: String,
         now: DateTimeWithTimeZone,
         metadata_json: String,
+        released_copies: bool,
+        io_locator: Option<&super::html_preview_io_work::HtmlPreviewIoLocator>,
     ) -> ArtifactCrudResult<ArtifactRecord> {
-        artifact::ActiveModel {
+        let model = artifact::ActiveModel {
             id: Set(id),
             workspace_id: Set(request.workspace_id.clone()),
             primary_thread_id: Set(request.primary_thread_id.clone()),
@@ -184,12 +186,16 @@ impl ArtifactRepository {
             display_name: Set(request.display_name.clone()),
             kind: Set(kind_to_db(request.kind)),
             mime_type: Set(request.mime_type.clone()),
-            status: Set(status_to_db(ArtifactStatus::Ready)),
+            status: Set(status_to_db(if released_copies {
+                ArtifactStatus::Deleted
+            } else {
+                ArtifactStatus::Ready
+            })),
             created_by_kind: Set(created_by_kind_to_db(request.created_by_kind)),
             created_by_actor_id: Set(request.created_by_actor_id.clone()),
             created_at: Set(now),
             updated_at: Set(now),
-            deleted_at: Set(None),
+            deleted_at: Set(if released_copies { Some(now) } else { None }),
             metadata_json: Set(metadata_json),
         }
         .insert(db)
@@ -197,8 +203,22 @@ impl ArtifactRepository {
         .map_err(|source| ArtifactCrudError::Database {
             message: "failed to insert artifact".to_owned(),
             source,
-        })
-        .map(artifact_record_from_model)
+        })?;
+        if released_copies {
+            super::html_preview_io_work::request_prepared(
+                db,
+                super::html_preview_io_work::HtmlPreviewIoFamily::Copies,
+                io_locator.expect("prepared released-copy locator"),
+                0,
+                &model.workspace_id,
+            )
+            .await
+            .map_err(|error| ArtifactCrudError::Database {
+                message: "failed to enqueue released copies".into(),
+                source: super::html_preview_io_work::into_database_error(error),
+            })?;
+        }
+        Ok(artifact_record_from_model(model))
     }
 
     #[allow(clippy::too_many_arguments)]

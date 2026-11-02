@@ -1,5 +1,6 @@
 use pioneer_crud::AppendedTaskEvent;
-use tokio::sync::broadcast;
+use std::sync::Arc;
+use tokio::sync::{Notify, broadcast};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskEventWake {
@@ -86,6 +87,7 @@ pub enum TaskEventWakeDelivery {
 #[derive(Clone)]
 pub struct TaskEventBus {
     sender: broadcast::Sender<TaskEventWake>,
+    scheduler_notify: Arc<Notify>,
 }
 
 impl Default for TaskEventBus {
@@ -97,7 +99,14 @@ impl Default for TaskEventBus {
 impl TaskEventBus {
     pub fn new() -> Self {
         let (sender, _) = broadcast::channel(1024);
-        Self { sender }
+        Self {
+            sender,
+            scheduler_notify: Arc::new(Notify::new()),
+        }
+    }
+
+    pub(crate) fn scheduler_notify(&self) -> Arc<Notify> {
+        self.scheduler_notify.clone()
     }
 
     pub fn subscribe(&self, filter: TaskEventFilter) -> TaskEventSubscription {
@@ -112,6 +121,8 @@ impl TaskEventBus {
             return;
         }
         let _ = self.sender.send(TaskEventWake::from_committed_event(event));
+        // A permit survives publication between processing and registering a wait.
+        self.scheduler_notify.notify_one();
     }
 
     pub async fn publish_many(&self, events: Vec<AppendedTaskEvent>) {
@@ -127,6 +138,24 @@ pub struct TaskEventSubscription {
 }
 
 impl TaskEventSubscription {
+    pub(crate) fn try_recv(&mut self) -> Option<TaskEventWakeDelivery> {
+        loop {
+            match self.receiver.try_recv() {
+                Ok(wake) if self.filter.matches(&wake) => {
+                    return Some(TaskEventWakeDelivery::Wake(wake));
+                }
+                Ok(_) => {}
+                Err(broadcast::error::TryRecvError::Empty) => return None,
+                Err(broadcast::error::TryRecvError::Lagged(count)) => {
+                    return Some(TaskEventWakeDelivery::Lagged(count));
+                }
+                Err(broadcast::error::TryRecvError::Closed) => {
+                    return Some(TaskEventWakeDelivery::Closed);
+                }
+            }
+        }
+    }
+
     pub async fn recv(&mut self) -> TaskEventWakeDelivery {
         loop {
             match self.receiver.recv().await {

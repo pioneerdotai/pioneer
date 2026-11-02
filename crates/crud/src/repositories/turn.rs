@@ -794,7 +794,10 @@ pub(crate) async fn apply_prepared_turn_upsert<C: ConnectionTrait>(
     prepared: PreparedTurnUpsert,
 ) -> Result<()> {
     let turn_id = prepared.row.id.as_ref().to_owned();
-    let current = find_turn_by_id(db, turn_id.as_str()).await?;
+    let current = turn::Entity::find_by_id(turn_id.as_str())
+        .lock_exclusive()
+        .one(db)
+        .await?;
     if current != prepared.expected_existing {
         anyhow::bail!("turn `{turn_id}` changed during projection preparation");
     }
@@ -808,6 +811,12 @@ pub(crate) async fn apply_prepared_turn_upsert<C: ConnectionTrait>(
         .await
         .context("failed to upsert turn")?;
 
+    let new = turn::Entity::find_by_id(&turn_id)
+        .lock_exclusive()
+        .one(db)
+        .await?;
+    super::task_child_producers::turn_change(db, current.as_ref(), new.as_ref()).await?;
+    super::task_occurrence_producers::turn_change(db, current.as_ref(), new.as_ref()).await?;
     Ok(())
 }
 
@@ -1216,6 +1225,10 @@ pub async fn update_turn_status<C: ConnectionTrait>(
     error: Option<&str>,
     updated_at: DateTimeWithTimeZone,
 ) -> Result<bool> {
+    let old = turn::Entity::find_by_id(turn_id)
+        .lock_exclusive()
+        .one(db)
+        .await?;
     let update_result = turn::Entity::update_many()
         .filter(turn::Column::ThreadId.eq(thread_id.to_owned()))
         .filter(turn::Column::Id.eq(turn_id.to_owned()))
@@ -1229,6 +1242,14 @@ pub async fn update_turn_status<C: ConnectionTrait>(
         .await
         .context("failed to update turn status")?;
 
+    if update_result.rows_affected > 0 {
+        let new = turn::Entity::find_by_id(turn_id)
+            .lock_exclusive()
+            .one(db)
+            .await?;
+        super::task_child_producers::turn_change(db, old.as_ref(), new.as_ref()).await?;
+        super::task_occurrence_producers::turn_change(db, old.as_ref(), new.as_ref()).await?;
+    }
     Ok(update_result.rows_affected > 0)
 }
 

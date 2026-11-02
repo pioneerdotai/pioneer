@@ -40,7 +40,7 @@ A next page advances matching results over the searched accessible corpus. It is
 
 ## Browse And Follow A Child
 
-Call `threads_list` with `{"limit":50}` and follow nextCursor through eof, including empty nonterminal pages. The list starts with the newest creation dates, breaking ties by descending ID. Retain limit and the issued cursor; unrelated activity does not restart the walk. Start a fresh first page to see new threads before the current position. Finish any metadata fragments for the same card/version before decoding it. Select a thread and read its history. A childReference in that history can be opened directly using its threadId. Save the parent cursor before switching. To browse descendants separately:
+Call `threads_list` with `{"limit":50}` and follow nextCursor through eof, including empty nonterminal pages. The list contains standalone conversations, including archived ones, and excludes internal execution children. It starts with the newest creation dates, breaking ties by descending ID. Retain limit and the issued cursor; unrelated activity does not restart the walk. Start a fresh first page to see new threads before the current position. Finish any metadata fragments for the same card/version before decoding it. Select a thread and read its history. A childReference in that history can be opened directly using its threadId. Save the parent cursor before switching. To browse descendants separately:
 
 ```json
 {"threadId":"SELECTED_PARENT_THREAD","recursive":true,"limit":50}
@@ -62,7 +62,7 @@ Use the response's actual full-result reference as `threads_tools_result_read` i
 {"optionId":"SELECTED_THREAD_CREATION_OPTION_ID"}
 ```
 
-4. Inspect status/outcome and retain the refreshed returned `targetOptions`. Creation alone runs no model. Do not claim a title was assigned or return an invented threadId.
+4. Inspect status/outcome and retain `threadResult.workspaceId/threadId` to open the created conversation directly. Keep the refreshed returned `targetOptions` for subsequent writes/launches; threadId cannot replace an option. Creation alone runs no model. Do not claim a title was assigned.
 
 ## Add A Message Without Starting A Model
 
@@ -72,7 +72,7 @@ Choose an existing destination from `threads_start_options.targetOptions`, or re
 {"targetOptionId":"SELECTED_MESSAGE_TARGET_ID","input":[{"type":"text","text":"The requested source is now available for review."}]}
 ```
 
-Confirm the action result. Do not start a turn unless requested. A source threadId from search is not a message route.
+Confirm the action result. Retain `threadResult.threadId/turnId` and open the saved message directly with `threads_history_read` and `anchor:{turnId}`. Do not start a turn unless requested. A source threadId from search is not a message route.
 
 ## Create And Run With Inherited Settings
 
@@ -83,6 +83,8 @@ Create using the sequence above. From that confirmed creation result select the 
 ```
 
 No launch catalog is needed solely for inheritance. `targetOptionId` is still required. The input itself carries the task text; do not add Task fields such as goal or instructions. Accepted/queued start confirms admission/queuing, not a completed answer. The server follows the target thread’s execution rules. Collaborative conversations use an internal detached Task with normal result delivery; an executable TaskRun child continues in that same child without another Task or child thread. This creates no attached review candidate. Do not call task_create yourself or add Task goal/instructions fields to the Threads payload.
+
+Retain start's `threadResult`. For Collaborative, `threadId/turnId` open the parent admission and `taskId` identifies the committed Task. Read that parent history with `anchor:{turnId}` and follow the saved child reference when it appears; the parent turn is not an execution turn in the child. For foreground, `threadId/turnId/executionId` refer to the actual turn and execution in the same conversation. Replay preserves the issued references after a lost response; do not create another operation to rediscover them.
 
 ## Explicit Identity, Executor, Model, And Reasoning
 

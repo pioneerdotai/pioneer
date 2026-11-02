@@ -25,7 +25,7 @@ use pioneer_provider::{ChatMessage, ModelInputItem, ProviderRegistry, Role};
 use pioneer_tools::{ExecutionWindowAdmissionDecision, decide_execution_window_admission};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{Notify, RwLock};
 use tracing::warn;
 
 use super::timeout::{
@@ -504,6 +504,8 @@ pub struct RecoveryCoordinator {
     execution_leases: Arc<crate::authorization::ExecutionLeaseRegistry>,
     turn_execution_owner_id: Arc<str>,
     listener_starter: Arc<RwLock<Option<RecoveryListenerStarter>>>,
+    due_wake: Arc<Notify>,
+    active_scan: Arc<tokio::sync::Mutex<(Option<String>, Option<String>)>>,
 }
 
 #[derive(Debug, Clone)]
@@ -723,6 +725,16 @@ fn execution_window_no_progress_reason(limit: u32, observed: u32) -> String {
     )
 }
 
+fn finish_recovery_phases(
+    events: Vec<RecoveryCoordinatorEvent>,
+    errors: Vec<String>,
+) -> Result<Vec<RecoveryCoordinatorEvent>> {
+    if events.is_empty() && !errors.is_empty() {
+        bail!("recovery coordinator phases failed: {}", errors.join("; "));
+    }
+    Ok(events)
+}
+
 impl RecoveryCoordinator {
     pub fn new(
         crud_store: Arc<CrudStore>,
@@ -734,6 +746,7 @@ impl RecoveryCoordinator {
         let authorization_invalidation_hub = Arc::new(
             crate::authorization::AuthorizationInvalidationHub::durable(crud_store.clone()),
         );
+        let due_wake = crud_store.recovery_job_notification();
         Self {
             crud_store,
             agent_manager,
@@ -747,6 +760,8 @@ impl RecoveryCoordinator {
             )
             .into(),
             listener_starter: Arc::new(RwLock::new(None)),
+            due_wake,
+            active_scan: Default::default(),
         }
     }
 
@@ -1661,7 +1676,27 @@ impl RecoveryCoordinator {
             }))
     }
 
+    /// Compatibility entry point for explicit reconstruction callers. Live
+    /// workers select the independent audit and due phases below.
     pub async fn run_ready_jobs(
+        &self,
+        now_unix: i64,
+        limit: u64,
+    ) -> Result<Vec<RecoveryCoordinatorEvent>> {
+        let mut events = Vec::new();
+        let mut errors = Vec::new();
+        match self.run_supervision_audits(now_unix, limit).await {
+            Ok(mut found) => events.append(&mut found),
+            Err(error) => errors.push(format!("supervision: {error:#}")),
+        }
+        match self.run_due_jobs(now_unix, limit).await {
+            Ok(mut found) => events.append(&mut found),
+            Err(error) => errors.push(format!("due: {error:#}")),
+        }
+        finish_recovery_phases(events, errors)
+    }
+
+    pub async fn run_supervision_audits(
         &self,
         now_unix: i64,
         limit: u64,
@@ -1716,6 +1751,23 @@ impl RecoveryCoordinator {
             }
         }
 
+        finish_recovery_phases(events, phase_errors)
+    }
+
+    pub(crate) fn due_wake(&self) -> Arc<Notify> {
+        self.due_wake.clone()
+    }
+
+    /// Due work never invokes discovery/backfill or active supervision. A
+    /// retained wake is advisory; the existing short point retry is retained
+    /// for foreign producers, due/retry deadlines and expired claims.
+    pub async fn run_due_jobs(
+        &self,
+        now_unix: i64,
+        limit: u64,
+    ) -> Result<Vec<RecoveryCoordinatorEvent>> {
+        let mut events = Vec::new();
+        let mut phase_errors = Vec::new();
         match self
             .crud_store
             .claim_due_recovery_jobs(now_unix, RECOVERY_JOB_CLAIM_LEASE_SECS, limit)
@@ -1744,14 +1796,7 @@ impl RecoveryCoordinator {
             }
         }
 
-        if events.is_empty() && !phase_errors.is_empty() {
-            bail!(
-                "recovery coordinator phases failed: {}",
-                phase_errors.join("; ")
-            );
-        }
-
-        Ok(events)
+        finish_recovery_phases(events, phase_errors)
     }
 
     /// Reconcile executions whose durable process-owner lease proves that the
@@ -2097,116 +2142,197 @@ impl RecoveryCoordinator {
         now_unix: i64,
         limit: u64,
     ) -> Result<Vec<RecoveryCoordinatorEvent>> {
-        let jobs = self.crud_store.list_active_recovery_jobs(limit).await?;
-        let mut events = Vec::new();
-
-        for job in jobs {
-            let policy = self.policy_for_recovery_job(&job).await?;
-            let Some(max_wall_clock_secs) = i64::try_from(policy.max_wall_clock_secs).ok() else {
-                continue;
-            };
-            let wall_clock_elapsed = now_unix.saturating_sub(job.scheduled_at_unix);
-            let active_elapsed = job
-                .active_attempt_started_at_unix
-                .map(|started_at| now_unix.saturating_sub(started_at))
-                .unwrap_or_else(|| now_unix.saturating_sub(job.updated_at_unix));
-            let attempt_wall_clock_secs = i64::try_from(
-                policy
-                    .max_wall_clock_secs
-                    .min(RECOVERY_ATTEMPT_MAX_WALL_CLOCK_SECS),
-            )
-            .unwrap_or(i64::MAX);
-            let progress_frontier = self
-                .crud_store
-                .get_turn_liveness(job.turn_id.as_str())
-                .await?;
-            let progress_since_attempt = progress_frontier.as_ref().is_some_and(|liveness| {
-                is_causal_recovery_progress(liveness.last_activity_kind.as_str())
-                    && now_unix.saturating_sub(liveness.last_activity_at_unix)
-                        <= RECOVERY_PROGRESS_STALE_SECS
-                    && liveness.last_activity_at_unix
-                        > job
-                            .active_attempt_started_at_unix
-                            .unwrap_or(job.updated_at_unix)
-            });
-            // Wall-clock expiry is only a no-progress episode guard.  A
-            // provider stream that is durably emitting causal progress must
-            // not be failed merely because recovery mode crossed the old
-            // hidden 180-second ceiling.
-            let job_budget_exceeded =
-                wall_clock_elapsed > max_wall_clock_secs && !progress_since_attempt;
-            let attempt_budget_exceeded =
-                active_elapsed > attempt_wall_clock_secs && !progress_since_attempt;
-            if !job_budget_exceeded && !attempt_budget_exceeded {
-                continue;
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let jobs = {
+            // Serialize only discovery cursor updates, never domain work.
+            let mut scan = self.active_scan.lock().await;
+            if scan.1.is_none() {
+                scan.1 = self.crud_store.active_recovery_job_upper_id().await?;
             }
-
-            let message = Some(if job_budget_exceeded {
-                format!(
-                    "recovery job exceeded {max_wall_clock_secs}s wall-clock budget after {wall_clock_elapsed}s (active attempt ran for {active_elapsed}s)"
-                )
+            let Some(upper) = scan.1.as_deref() else {
+                return Ok(Vec::new());
+            };
+            let jobs = self
+                .crud_store
+                .list_active_recovery_job_page(scan.0.as_deref(), upper, limit)
+                .await?;
+            if let Some(last) = jobs.last() {
+                if scan.1.as_ref() == Some(&last.id) {
+                    *scan = (None, None);
+                } else {
+                    scan.0 = Some(last.id.clone());
+                }
             } else {
-                format!(
-                    "recovery attempt exceeded {attempt_wall_clock_secs}s wall-clock budget after {active_elapsed}s"
-                )
-            });
-
-            if let Some(active_attempt_id) = job.active_attempt_id.clone() {
-                events.extend(
-                    self.record_active_recovery_failure(
-                        job,
-                        active_attempt_id.as_str(),
-                        message,
-                        None,
-                        None,
-                        now_unix,
-                        None,
-                    )
-                    .await?,
-                );
-            } else {
-                let attempt_number = attempt_number_for_job(&job);
-                let diagnostic = terminal_diagnostic(
-                    &job,
-                    if job_budget_exceeded {
-                        pioneer_protocol::RecoveryStopReason::WallClockExhausted
-                    } else {
-                        pioneer_protocol::RecoveryStopReason::TerminalFailure
-                    },
-                );
-                let public_message = diagnostic.public_message();
-                if self
-                    .crud_store
-                    .mark_malformed_active_recovery_job_terminal_with_diagnostic(
-                        job.id.as_str(),
-                        RecoveryJobStatus::Failed,
-                        message.clone(),
-                        Some(diagnostic),
-                        now_unix,
-                    )
-                    .await?
-                {
-                    self.cancel_other_open_jobs_after_terminal_recovery(
-                        job.turn_id.as_str(),
-                        job.id.as_str(),
-                        now_unix,
-                    )
-                    .await?;
-                    events.push(RecoveryCoordinatorEvent::RecoveryExhausted(
-                        RecoveryTerminalOutcome {
-                            job_id: job.id,
-                            turn_id: job.turn_id,
-                            item_id: job.item_id,
-                            item_type: job.item_type,
-                            attempt_number,
-                            status: RecoveryJobStatus::Failed,
-                            error_message: public_message,
-                        },
-                    ));
+                *scan = (None, None);
+            }
+            jobs
+        };
+        let mut events = Vec::new();
+        let mut errors = Vec::new();
+        for job in jobs {
+            match self.expire_active_recovery_job(job, now_unix).await {
+                Ok(mut found) => events.append(&mut found),
+                Err(error) => {
+                    warn!(error = %format!("{error:#}"), "active recovery row deferred");
+                    errors.push(format!("active recovery: {error:#}"));
                 }
             }
         }
+        finish_recovery_phases(events, errors)
+    }
 
+    async fn expire_active_recovery_job(
+        &self,
+        job: RecoveryJobRecord,
+        now_unix: i64,
+    ) -> Result<Vec<RecoveryCoordinatorEvent>> {
+        let mut events = Vec::new();
+
+        let policy = self.policy_for_recovery_job(&job).await?;
+        let Some(max_wall_clock_secs) = i64::try_from(policy.max_wall_clock_secs).ok() else {
+            return Ok(Vec::new());
+        };
+        let wall_clock_elapsed = now_unix.saturating_sub(job.scheduled_at_unix);
+        let active_elapsed = job
+            .active_attempt_started_at_unix
+            .map(|started_at| now_unix.saturating_sub(started_at))
+            .unwrap_or_else(|| now_unix.saturating_sub(job.updated_at_unix));
+        let attempt_wall_clock_secs = i64::try_from(
+            policy
+                .max_wall_clock_secs
+                .min(RECOVERY_ATTEMPT_MAX_WALL_CLOCK_SECS),
+        )
+        .unwrap_or(i64::MAX);
+        let progress_frontier = self
+            .crud_store
+            .get_turn_liveness(job.turn_id.as_str())
+            .await?;
+        let progress_since_attempt = progress_frontier.as_ref().is_some_and(|liveness| {
+            is_causal_recovery_progress(liveness.last_activity_kind.as_str())
+                && now_unix.saturating_sub(liveness.last_activity_at_unix)
+                    <= RECOVERY_PROGRESS_STALE_SECS
+                && liveness.last_activity_at_unix
+                    > job
+                        .active_attempt_started_at_unix
+                        .unwrap_or(job.updated_at_unix)
+        });
+        // Wall-clock expiry is only a no-progress episode guard.  A
+        // provider stream that is durably emitting causal progress must
+        // not be failed merely because recovery mode crossed the old
+        // hidden 180-second ceiling.
+        let job_budget_exceeded =
+            wall_clock_elapsed > max_wall_clock_secs && !progress_since_attempt;
+        let attempt_budget_exceeded =
+            active_elapsed > attempt_wall_clock_secs && !progress_since_attempt;
+        if !job_budget_exceeded && !attempt_budget_exceeded {
+            return Ok(Vec::new());
+        }
+
+        let message = Some(if job_budget_exceeded {
+            format!(
+                "recovery job exceeded {max_wall_clock_secs}s wall-clock budget after {wall_clock_elapsed}s (active attempt ran for {active_elapsed}s)"
+            )
+        } else {
+            format!(
+                "recovery attempt exceeded {attempt_wall_clock_secs}s wall-clock budget after {active_elapsed}s"
+            )
+        });
+
+        let attempt_number = attempt_number_for_job(&job);
+        let consumed = job.run_count.saturating_add(1);
+        let exhausted = job.active_attempt_id.is_some()
+            && (job_budget_exceeded
+                || (policy.no_progress_limit >= 0 && consumed >= policy.no_progress_limit)
+                || (policy.max_attempts >= 0 && consumed >= policy.max_attempts));
+        let status = if job.active_attempt_id.is_none() {
+            RecoveryJobStatus::Failed
+        } else if exhausted {
+            RecoveryJobStatus::Exhausted
+        } else {
+            RecoveryJobStatus::Pending
+        };
+        let next_run = (status == RecoveryJobStatus::Pending).then(|| {
+            backoff_deadline(
+                now_unix,
+                policy.base_backoff_secs,
+                job.run_count,
+                &job.id,
+                None,
+            )
+        });
+        let diagnostic = if next_run.is_some() {
+            None
+        } else if job.active_attempt_id.is_some() {
+            let mut value = job.diagnostic.clone().unwrap_or_default();
+            value.stop_reason = Some(budget_stop_reason(
+                job_budget_exceeded,
+                policy.max_attempts >= 0 && consumed >= policy.max_attempts,
+            ));
+            Some(value)
+        } else {
+            Some(terminal_diagnostic(
+                &job,
+                if job_budget_exceeded {
+                    pioneer_protocol::RecoveryStopReason::WallClockExhausted
+                } else {
+                    pioneer_protocol::RecoveryStopReason::TerminalFailure
+                },
+            ))
+        };
+        let public_message = diagnostic.as_ref().map(|value| value.public_message());
+        let last_error = if job.active_attempt_id.is_some() && next_run.is_none() {
+            public_message.as_ref().map(|public| match &message {
+                Some(detail) => format!("{public}: {detail}"),
+                None => public.clone(),
+            })
+        } else {
+            message.clone()
+        };
+        if self
+            .crud_store
+            .apply_recovery_watchdog_failure(
+                &job,
+                status,
+                next_run,
+                last_error,
+                diagnostic,
+                now_unix,
+                progress_frontier.as_ref(),
+            )
+            .await?
+        {
+            if let Some(next_run_at_unix) = next_run {
+                events.push(RecoveryCoordinatorEvent::RetryScheduled {
+                    job_id: job.id,
+                    turn_id: job.turn_id,
+                    item_id: job.item_id,
+                    item_type: job.item_type,
+                    attempt_number: attempt_number.saturating_add(1),
+                    next_run_at_unix,
+                    reason: message,
+                });
+            } else {
+                self.cancel_other_open_jobs_after_terminal_recovery(
+                    &job.turn_id,
+                    &job.id,
+                    now_unix,
+                )
+                .await?;
+                events.push(RecoveryCoordinatorEvent::RecoveryExhausted(
+                    RecoveryTerminalOutcome {
+                        job_id: job.id,
+                        turn_id: job.turn_id,
+                        item_id: job.item_id,
+                        item_type: job.item_type,
+                        attempt_number,
+                        status,
+                        error_message: public_message.unwrap_or_default(),
+                    },
+                ));
+            }
+        }
         Ok(events)
     }
 
@@ -10784,6 +10910,405 @@ mod tests {
         assert_eq!(
             reloaded.active_attempt_id.as_deref(),
             Some(active_attempt_id.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn due_drain_does_not_expire_active_episode_but_audit_does() {
+        let (store, coordinator) = setup_coordinator().await;
+        let job = coordinator
+            .enqueue_provider_failure_job(
+                &ProviderFailureCandidate {
+                    turn_id: "turn_split_audit".into(),
+                    item_id: "reasoning".into(),
+                    item_type: TurnItemType::Reasoning,
+                    failure: provider_failure(ProviderFailureClass::NetworkTransient, "failure"),
+                },
+                1_700_000_000,
+            )
+            .await
+            .unwrap()
+            .into_job();
+        claim_and_activate(store.as_ref(), &job.id).await;
+        assert!(
+            coordinator
+                .run_due_jobs(1_700_000_901, 64)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .get_recovery_job(&job.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            RecoveryJobStatus::Active
+        );
+        assert!(matches!(
+            coordinator
+                .run_supervision_audits(1_700_000_901, 64)
+                .await
+                .unwrap()
+                .as_slice(),
+            [RecoveryCoordinatorEvent::RecoveryExhausted(_)]
+        ));
+    }
+
+    #[tokio::test]
+    async fn watchdog_commit_rejects_progress_after_preparation_and_retains_episode() {
+        let (store, coordinator) = setup_coordinator().await;
+        let turn_id = "turn_watchdog_progress_race";
+        materialize_turn_with_tool_item(
+            store.as_ref(),
+            "ws_watchdog_race",
+            "thr_watchdog_race",
+            turn_id,
+            "tool",
+            None,
+        )
+        .await;
+        let now = chrono::Utc::now().timestamp();
+        let job = coordinator
+            .enqueue_provider_failure_job(
+                &ProviderFailureCandidate {
+                    turn_id: turn_id.into(),
+                    item_id: "reasoning".into(),
+                    item_type: TurnItemType::Reasoning,
+                    failure: provider_failure(ProviderFailureClass::NetworkTransient, "failure"),
+                },
+                now - 1_000,
+            )
+            .await
+            .unwrap()
+            .into_job();
+        let claimed = store
+            .claim_due_recovery_jobs(now - 999, 45, 1)
+            .await
+            .unwrap();
+        assert!(matches!(
+            store
+                .mark_claimed_recovery_job_active(
+                    &job.id,
+                    claimed[0].claim_token.as_deref().unwrap(),
+                    "watchdog_attempt",
+                    now - 999
+                )
+                .await
+                .unwrap(),
+            ClaimedRecoveryActivation::Activated
+        ));
+        let prepared = store.get_recovery_job(&job.id).await.unwrap().unwrap();
+        let observed = store.get_turn_liveness(turn_id).await.unwrap();
+        assert!(
+            store
+                .observe_turn_runtime_activity(turn_id, "item/confirmed_external_activity", now + 1)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .apply_recovery_watchdog_failure(
+                    &prepared,
+                    RecoveryJobStatus::Exhausted,
+                    None,
+                    Some("stale watchdog".into()),
+                    None,
+                    now,
+                    observed.as_ref()
+                )
+                .await
+                .unwrap()
+        );
+        let retained = store.get_recovery_job(&job.id).await.unwrap().unwrap();
+        assert_eq!(retained.status, RecoveryJobStatus::Active);
+        assert_eq!(retained.claim_token, prepared.claim_token);
+        assert_eq!(retained.run_count, prepared.run_count);
+        assert!(
+            coordinator
+                .run_supervision_audits(now, 64)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn watchdog_preserves_strict_budget_and_backwards_clock_retry() {
+        let (store, coordinator) = setup_coordinator().await;
+        let start = 1_700_000_000;
+        let job = coordinator
+            .enqueue_provider_failure_job(
+                &ProviderFailureCandidate {
+                    turn_id: "turn_watchdog_clock".into(),
+                    item_id: "reasoning".into(),
+                    item_type: TurnItemType::Reasoning,
+                    failure: provider_failure(ProviderFailureClass::NetworkTransient, "failure"),
+                },
+                start,
+            )
+            .await
+            .unwrap()
+            .into_job();
+        claim_and_activate(store.as_ref(), &job.id).await;
+        for now in [start - 3600, start + 900] {
+            assert!(
+                coordinator
+                    .run_supervision_audits(now, 64)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(
+                store
+                    .get_recovery_job(&job.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                RecoveryJobStatus::Active
+            );
+        }
+        assert!(
+            !coordinator
+                .run_supervision_audits(start + 901, 64)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn active_scan_advances_through_healthy_and_legacy_raw_poison_values() {
+        let (store, coordinator) = setup_coordinator().await;
+        let now = chrono::Utc::now().timestamp();
+        let mut jobs = Vec::new();
+        for index in 0..5 {
+            let job = coordinator
+                .enqueue_provider_failure_job(
+                    &ProviderFailureCandidate {
+                        turn_id: format!("turn_scan_{index}"),
+                        item_id: "reasoning".into(),
+                        item_type: TurnItemType::Reasoning,
+                        failure: provider_failure(
+                            ProviderFailureClass::NetworkTransient,
+                            "failure",
+                        ),
+                    },
+                    now - 1000,
+                )
+                .await
+                .unwrap()
+                .into_job();
+            let claimed = store
+                .claim_due_recovery_jobs(now - 999, 45, 1)
+                .await
+                .unwrap();
+            assert!(matches!(
+                store
+                    .mark_claimed_recovery_job_active(
+                        &job.id,
+                        claimed[0].claim_token.as_deref().unwrap(),
+                        &format!("attempt_{index}"),
+                        now - 999
+                    )
+                    .await
+                    .unwrap(),
+                ClaimedRecoveryActivation::Activated
+            ));
+            jobs.push(job);
+        }
+        jobs.sort_by(|a, b| a.id.cmp(&b.id));
+        materialize_turn_with_tool_item(
+            store.as_ref(),
+            "ws_scan",
+            "thr_scan",
+            &jobs[0].turn_id,
+            "tool",
+            None,
+        )
+        .await;
+        assert!(
+            store
+                .observe_turn_runtime_activity(&jobs[0].turn_id, "Runtime/activity", now + 1)
+                .await
+                .unwrap()
+        );
+        // Legacy corruption fixture through the application's scoped Entity DB
+        // path. The fallback {} policy must still permit later rows to progress.
+        let row = pioneer_entity::recovery_job::Entity::find_by_id(jobs[1].id.clone())
+            .one(&store.database_connection())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut row: pioneer_entity::recovery_job::ActiveModel = row.into();
+        row.policy_snapshot = Set("invalid legacy JSON".into());
+        row.update(&store.database_connection()).await.unwrap();
+        for (index, unknown_action) in [(2, true), (3, false)] {
+            let row = pioneer_entity::recovery_job::Entity::find_by_id(jobs[index].id.clone())
+                .one(&store.database_connection())
+                .await
+                .unwrap()
+                .unwrap();
+            let mut row: pioneer_entity::recovery_job::ActiveModel = row.into();
+            if unknown_action {
+                row.action = Set("unknown_legacy_action".into());
+            } else {
+                row.error_class = Set(Some("unknown_legacy_class".into()));
+            }
+            row.update(&store.database_connection()).await.unwrap();
+        }
+
+        assert!(
+            coordinator
+                .expire_active_recovery_jobs(now, 1)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        for _ in 0..4 {
+            assert!(
+                !coordinator
+                    .expire_active_recovery_jobs(now, 1)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        assert_eq!(
+            store
+                .get_recovery_job(&jobs[0].id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            RecoveryJobStatus::Active
+        );
+        for job in &jobs[1..] {
+            assert_eq!(
+                store
+                    .get_recovery_job(&job.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                RecoveryJobStatus::Exhausted
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn supervision_storage_error_does_not_hide_independent_due_terminal_job() {
+        let (store, coordinator) = setup_coordinator().await;
+        let active = coordinator
+            .enqueue_provider_failure_job(
+                &ProviderFailureCandidate {
+                    turn_id: "turn_audit_error".into(),
+                    item_id: "reasoning".into(),
+                    item_type: TurnItemType::Reasoning,
+                    failure: provider_failure(ProviderFailureClass::NetworkTransient, "transient"),
+                },
+                1_700_000_000,
+            )
+            .await
+            .unwrap()
+            .into_job();
+        claim_and_activate(store.as_ref(), &active.id).await;
+        let terminal = coordinator
+            .enqueue_provider_failure_job(
+                &ProviderFailureCandidate {
+                    turn_id: "turn_independent_due".into(),
+                    item_id: "reasoning".into(),
+                    item_type: TurnItemType::Reasoning,
+                    failure: provider_failure(
+                        ProviderFailureClass::UnsupportedParameter,
+                        "permanent",
+                    ),
+                },
+                1_700_000_000,
+            )
+            .await
+            .unwrap()
+            .into_job();
+        // Deliberate storage-failure fixture, not an alternate application path.
+        store
+            .database_connection()
+            .execute_unprepared("DROP TABLE turn_liveness")
+            .await
+            .unwrap();
+        let events = coordinator.run_ready_jobs(1_700_000_011, 64).await.unwrap();
+        assert!(events.iter().any(|event| matches!(event,
+            RecoveryCoordinatorEvent::RecoveryExhausted(value) if value.job_id == terminal.id)));
+        assert_eq!(
+            store
+                .get_recovery_job(&active.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            RecoveryJobStatus::Active
+        );
+    }
+
+    #[tokio::test]
+    async fn changed_policy_rejects_prepared_watchdog_and_next_audit_uses_new_budget() {
+        let (store, coordinator) = setup_coordinator().await;
+        let start = 1_700_000_000;
+        let job = coordinator
+            .enqueue_provider_failure_job(
+                &ProviderFailureCandidate {
+                    turn_id: "turn_policy_race".into(),
+                    item_id: "reasoning".into(),
+                    item_type: TurnItemType::Reasoning,
+                    failure: provider_failure(ProviderFailureClass::NetworkTransient, "failure"),
+                },
+                start,
+            )
+            .await
+            .unwrap()
+            .into_job();
+        claim_and_activate(store.as_ref(), &job.id).await;
+        let prepared = store.get_recovery_job(&job.id).await.unwrap().unwrap();
+        let row = pioneer_entity::recovery_job::Entity::find_by_id(job.id.clone())
+            .one(&store.database_connection())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut policy = prepared.policy_snapshot.clone();
+        policy["max_wall_clock_secs"] = serde_json::json!(3600);
+        let mut row: pioneer_entity::recovery_job::ActiveModel = row.into();
+        row.policy_snapshot = Set(policy.to_string());
+        row.update(&store.database_connection()).await.unwrap();
+        assert!(
+            !store
+                .apply_recovery_watchdog_failure(
+                    &prepared,
+                    RecoveryJobStatus::Exhausted,
+                    None,
+                    Some("old budget".into()),
+                    None,
+                    start + 901,
+                    None
+                )
+                .await
+                .unwrap()
+        );
+        assert!(
+            coordinator
+                .expire_active_recovery_jobs(start + 901, 64)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .get_recovery_job(&job.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            RecoveryJobStatus::Active
         );
     }
 

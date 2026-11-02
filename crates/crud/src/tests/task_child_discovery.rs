@@ -353,3 +353,617 @@ async fn discovery_globally_orders_and_limits_active_and_ready_terminal_children
         ["a_active", "d_active", "e_terminal", "f_terminal"]
     );
 }
+
+async fn claimed_child(
+    store: &CrudStore,
+    thread: &str,
+    turn: &str,
+) -> pioneer_entity::task_child_reconcile_pending::Model {
+    let tx = store.connection.begin().await.unwrap();
+    crate::repositories::task_child_work::enqueue_point(&tx, thread, turn, AT)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    let row = pioneer_entity::task_child_reconcile_pending::Entity::find_by_id(turn)
+        .one(&store.connection)
+        .await
+        .unwrap()
+        .unwrap();
+    store
+        .claim_child_point_with_clock(&row, &|| AT)
+        .await
+        .unwrap()
+        .unwrap()
+}
+async fn publish_capsule(store: &CrudStore, id: &str) {
+    store
+        .insert_turn_llm_context(NewTurnLlmContextEntry {
+            turn_id: id.into(),
+            item_id: None,
+            attempt_id: None,
+            sequence: 0,
+            source: "late_capsule_fixture".into(),
+            tool_name: None,
+            payload: "{}".into(),
+            output_policy_snapshot: "{}".into(),
+            created_at: unix_to_datetime(AT),
+            expires_at: None,
+        })
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn queued_cleanup_revalidates_late_lineage_receipt_and_capsule_without_self_enqueue() {
+    use crate::repositories::turn_event_projection_stream_state as receipt;
+    use pioneer_entity::{
+        task_child_reconcile_pending as point, task_child_reconcile_scope as scope,
+    };
+    let (store, task) = fixture().await;
+    terminal_child(
+        &store,
+        &task,
+        77,
+        "gated_child",
+        TaskRunStatus::Succeeded,
+        AT,
+    )
+    .await;
+    let child_thread = "th_gated_child";
+    let run_id = format!("r{:020}", 77);
+    let claim = claimed_child(&store, child_thread, "gated_child").await;
+    // An old/repair writer may miss a queue hook. Domain proof must still
+    // reject a changed child kind while the old claim remains present.
+    use pioneer_entity::turn as turn_rows;
+    turn_rows::Entity::update_many()
+        .filter(turn_rows::Column::Id.eq("gated_child"))
+        .col_expr(turn_rows::Column::TurnKind, Expr::value("task_run"))
+        .exec(&store.connection)
+        .await
+        .unwrap();
+    assert!(!store.cleanup_claimed_child_capsule(&claim).await.unwrap());
+    turn_rows::Entity::update_many()
+        .filter(turn_rows::Column::Id.eq("gated_child"))
+        .col_expr(turn_rows::Column::TurnKind, Expr::value("conversation"))
+        .exec(&store.connection)
+        .await
+        .unwrap();
+    let mut lineage = TaskThreadLineage {
+        child_thread_id: child_thread.into(),
+        parent_thread_id: "thr_task".into(),
+        root_thread_id: "thr_task".into(),
+        depth: 1,
+        origin_kind: None,
+        created_by_thread_id: Some("thr_task".into()),
+        created_by_turn_id: Some(run_id.clone()),
+        created_at: AT,
+    };
+    let tx = store.connection.begin().await.unwrap();
+    thread_lineage::upsert_lineage(&tx, &lineage).await.unwrap();
+    tx.commit().await.unwrap();
+    assert!(
+        !store.cleanup_claimed_child_capsule(&claim).await.unwrap(),
+        "queue ownership is not positive lineage proof"
+    );
+    assert!(
+        !store
+            .list_turn_llm_context("gated_child")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    lineage.origin_kind = Some("task_run".into());
+    let tx = store.connection.begin().await.unwrap();
+    thread_lineage::upsert_lineage(&tx, &lineage).await.unwrap();
+    receipt::quarantine(
+        &tx,
+        "thr_task",
+        &run_id,
+        "repair-event",
+        "repair required".into(),
+        unix_to_datetime(AT + 1),
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    assert!(
+        !store.cleanup_claimed_child_capsule(&claim).await.unwrap(),
+        "late quarantine invalidates healthy receipt authority even while claim remains valid"
+    );
+    let tx = store.connection.begin().await.unwrap();
+    receipt::restore(&tx, &run_id, "repair-event", unix_to_datetime(AT + 2))
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    let scopes_before = scope::Entity::find()
+        .order_by_asc(scope::Column::ScopeKind)
+        .order_by_asc(scope::Column::ScopeKey)
+        .all(&store.connection)
+        .await
+        .unwrap();
+    assert!(store.cleanup_claimed_child_capsule(&claim).await.unwrap());
+    assert!(
+        store
+            .list_turn_llm_context("gated_child")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        point::Entity::find_by_id("gated_child")
+            .one(&store.connection)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        scopes_before,
+        scope::Entity::find()
+            .order_by_asc(scope::Column::ScopeKind)
+            .order_by_asc(scope::Column::ScopeKey)
+            .all(&store.connection)
+            .await
+            .unwrap(),
+        "successful capsule cleanup must not enqueue its own scope"
+    );
+    let empty_capsule_claim = claimed_child(&store, child_thread, "gated_child").await;
+    assert!(
+        store
+            .child_point_record(&empty_capsule_claim)
+            .await
+            .unwrap()
+            .is_none(),
+        "broad scope rediscovery without a capsule must be a no-op"
+    );
+    store
+        .finish_child_point(&empty_capsule_claim, None, true)
+        .await
+        .unwrap();
+    publish_capsule(&store, "gated_child").await;
+    assert!(
+        point::Entity::find_by_id("gated_child")
+            .one(&store.connection)
+            .await
+            .unwrap()
+            .is_some(),
+        "late eligible capsule birth must publish a fresh obligation"
+    );
+    let next = claimed_child(&store, child_thread, "gated_child").await;
+    assert_ne!(next.revision, claim.revision);
+    assert!(store.cleanup_claimed_child_capsule(&next).await.unwrap());
+}
+
+// Complete cutover before parking, then discard setup-only fanout so no
+// historical seed or unrelated fixture obligation can accidentally revive it.
+async fn park_after_cutover(
+    store: &CrudStore,
+    claim: &pioneer_entity::task_child_reconcile_pending::Model,
+) {
+    use pioneer_entity::{
+        task_child_reconcile_pending as point, task_child_reconcile_scope as scope,
+    };
+    while store.expand_child_scope(AT, true).await.unwrap() {}
+    assert!(store.child_work_queues_ready().await.unwrap());
+    scope::Entity::delete_many()
+        .filter(scope::Column::ScopeKind.ne("historical-seed"))
+        .exec(&store.connection)
+        .await
+        .unwrap();
+    // Seed preserves the active claim; park through the same fenced operation
+    // used by the real consumer when domain proof is missing.
+    assert_eq!(
+        store
+            .terminal_task_child_cleanup_ready(&claim.thread_id, &claim.turn_id)
+            .await
+            .unwrap(),
+        Some(false)
+    );
+    assert!(store.finish_child_point(claim, None, false).await.unwrap());
+    let parked = point::Entity::find_by_id(&claim.turn_id)
+        .one(&store.connection)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(parked.next_attempt_at.is_none());
+    assert!(parked.claim_token.is_none());
+}
+
+async fn drain_dependency_scopes(store: &CrudStore) {
+    // Bounded guard turns a broken EOF implementation into a clear assertion.
+    for _ in 0..64 {
+        if !store
+            .expand_child_scope(chrono::Utc::now().timestamp() + 100, false)
+            .await
+            .unwrap()
+        {
+            return;
+        }
+    }
+    panic!("dependency scope chain did not drain");
+}
+
+async fn assert_parked(store: &CrudStore, id: &str) {
+    let row = pioneer_entity::task_child_reconcile_pending::Entity::find_by_id(id)
+        .one(&store.connection)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        row.next_attempt_at.is_none(),
+        "unrelated dependency must not wake child"
+    );
+    assert!(row.claim_token.is_none());
+}
+
+async fn consume_woken_capsule(store: &CrudStore, id: &str) {
+    use pioneer_entity::task_child_reconcile_pending as point;
+    let row = point::Entity::find_by_id(id)
+        .one(&store.connection)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        row.next_attempt_at.is_some(),
+        "reverse scope must revive parked point"
+    );
+    let claim = store
+        .claim_child_point_with_clock(&row, &|| chrono::Utc::now().timestamp() + 100)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(store.child_point_record(&claim).await.unwrap().is_some());
+    assert!(store.cleanup_claimed_child_capsule(&claim).await.unwrap());
+    assert!(store.list_turn_llm_context(id).await.unwrap().is_empty());
+    assert!(
+        point::Entity::find_by_id(id)
+            .one(&store.connection)
+            .await
+            .unwrap()
+            .is_none(),
+        "cleanup ACK must commit with deletion"
+    );
+}
+
+#[tokio::test]
+async fn immediate_cleanup_requires_distinct_accepted_source_and_absent_occurrence() {
+    use pioneer_protocol::{TaskOccurrenceContract, TaskOccurrenceStatus};
+    let (store, task) = fixture().await;
+    let parent_thread = sample_thread("ws_task", "thr_task", AT);
+    let creator = sample_turn("turn_task");
+    store
+        .materialize_turn_start(
+            &parent_thread,
+            SandboxMode::FullAccess,
+            &creator,
+            &[],
+            PersistedActorRef::System,
+        )
+        .await
+        .unwrap();
+    let trigger = super::sample_task_trigger(AT);
+    crate::repositories::task_trigger::upsert_trigger(&store.connection, &trigger)
+        .await
+        .unwrap();
+    let mut run = run(&store, &task, 78, TaskRunStatus::Succeeded).await;
+    run.trigger_id = Some(trigger.id.clone());
+    task_run::upsert_run(&store.connection, &run).await.unwrap();
+    store
+        .upsert_task_occurrence_contract(
+            &TaskOccurrenceContract {
+                occurrence_id: run.id.clone(),
+                task_id: task.id.clone(),
+                run_id: run.id.clone(),
+                trigger_id: Some(trigger.id),
+                occurrence_key: format!("immediate:{}", run.id),
+                execution_generation: 79,
+                agent_execution_id: None,
+                work_graph_root_execution_id: None,
+                root_resource_scope_id: None,
+                status: TaskOccurrenceStatus::Running,
+                queue_position: None,
+                retry_attempt: 0,
+                action_idempotency_key: format!("immediate-action:{}", run.id),
+                route_id: None,
+                result_return_route_id: None,
+                delivery_plan: None,
+                terminal_reason: None,
+            },
+            AT,
+        )
+        .await
+        .unwrap();
+    let link = child(
+        &store,
+        &run,
+        "immediate_child",
+        TurnStatus::Completed,
+        TaskRunTurnStatus::CandidateCreated,
+        AT,
+    )
+    .await;
+    let tx = store.connection.begin().await.unwrap();
+    thread_lineage::upsert_lineage(
+        &tx,
+        &TaskThreadLineage {
+            child_thread_id: link.thread_id.clone(),
+            parent_thread_id: parent_thread.id.clone(),
+            root_thread_id: parent_thread.id.clone(),
+            depth: 1,
+            origin_kind: Some("task_run".into()),
+            created_by_thread_id: Some(parent_thread.id.clone()),
+            created_by_turn_id: Some(creator.id.clone()),
+            created_at: AT,
+        },
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    publish_capsule(&store, &link.turn_id).await;
+    let claim = claimed_child(&store, &link.thread_id, &link.turn_id).await;
+    assert!(
+        !store.cleanup_claimed_child_capsule(&claim).await.unwrap(),
+        "an immediate launch requires its accepted snapshot"
+    );
+    store
+        .insert_task_run_conversation_snapshot_if_absent(crate::NewTaskRunConversationSnapshot {
+            run_id: run.id.clone(),
+            task_id: task.id,
+            workspace_id: "ws_task".into(),
+            conversation_thread_id: parent_thread.id.clone(),
+            source_turn_id: Some("different_accepted_source".into()),
+            history_json: "[]".into(),
+            created_at: unix_to_datetime(AT),
+        })
+        .await
+        .unwrap();
+    assert!(
+        !store.cleanup_claimed_child_capsule(&claim).await.unwrap(),
+        "creator presence cannot substitute for distinct accepted source"
+    );
+    park_after_cutover(&store, &claim).await;
+    let unrelated = sample_turn("unrelated_accepted_source");
+    store
+        .materialize_turn_start(
+            &parent_thread,
+            SandboxMode::FullAccess,
+            &unrelated,
+            &[],
+            PersistedActorRef::System,
+        )
+        .await
+        .unwrap();
+    drain_dependency_scopes(&store).await;
+    assert_parked(&store, &link.turn_id).await;
+    let accepted_source = sample_turn("different_accepted_source");
+    store
+        .materialize_turn_start(
+            &parent_thread,
+            SandboxMode::FullAccess,
+            &accepted_source,
+            &[],
+            PersistedActorRef::System,
+        )
+        .await
+        .unwrap();
+    drain_dependency_scopes(&store).await;
+    consume_woken_capsule(&store, &link.turn_id).await;
+    publish_capsule(&store, &link.turn_id).await;
+    let next = claimed_child(&store, &link.thread_id, &link.turn_id).await;
+    let occurrence = Turn {
+        id: run.id,
+        turn_kind: TurnKind::TaskRun,
+        origin: TurnOrigin::ScheduledTask,
+        ..sample_turn("unused")
+    };
+    store
+        .materialize_turn_start(
+            &parent_thread,
+            SandboxMode::FullAccess,
+            &occurrence,
+            &[],
+            PersistedActorRef::System,
+        )
+        .await
+        .unwrap();
+    assert!(
+        !store.cleanup_claimed_child_capsule(&next).await.unwrap(),
+        "an occurrence appearing after preparation invalidates the immediate absence proof"
+    );
+    assert!(
+        !store
+            .list_turn_llm_context(&link.turn_id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn queue_cutover_requires_seed_completion_and_recognized_producer_generation() {
+    use pioneer_entity::task_child_reconcile_pending as point;
+    let (store, task) = fixture().await;
+    terminal_child(
+        &store,
+        &task,
+        79,
+        "foreign_writer_child",
+        TaskRunStatus::Succeeded,
+        AT,
+    )
+    .await;
+    assert!(
+        !store.child_work_queues_ready().await.unwrap(),
+        "schema installation alone cannot retire compatibility"
+    );
+    while store.expand_child_scope(AT, true).await.unwrap() {}
+    assert!(store.child_work_queues_ready().await.unwrap());
+    // A foreign repair writer installs an unknown producer generation after
+    // startup; readiness must not be a stale process-local true cache.
+    store.connection.execute_unprepared("CREATE TRIGGER task_occurrence_reconcile_unknown AFTER UPDATE ON task BEGIN SELECT 1; END").await.unwrap();
+    assert!(!store.child_work_queues_ready().await.unwrap());
+    point::Entity::delete_many()
+        .exec(&store.connection)
+        .await
+        .unwrap();
+    store.discover_legacy_child_work(32).await.unwrap();
+    assert!(
+        point::Entity::find_by_id("foreign_writer_child")
+            .one(&store.connection)
+            .await
+            .unwrap()
+            .is_some(),
+        "compatibility must preserve late work from unrecognized writers"
+    );
+    let claim = claimed_child(&store, "th_foreign_writer_child", "foreign_writer_child").await;
+    store.discover_legacy_child_work(32).await.unwrap();
+    assert_eq!(
+        point::Entity::find_by_id("foreign_writer_child")
+            .one(&store.connection)
+            .await
+            .unwrap()
+            .unwrap(),
+        claim,
+        "repeated discovery cannot invalidate an existing live claim"
+    );
+    store.finish_child_point(&claim, None, false).await.unwrap();
+    store.discover_legacy_child_work(32).await.unwrap();
+    assert!(
+        point::Entity::find_by_id("foreign_writer_child")
+            .one(&store.connection)
+            .await
+            .unwrap()
+            .unwrap()
+            .next_attempt_at
+            .is_some(),
+        "a newly proven legacy dependency can revive a parked obligation"
+    );
+}
+
+#[tokio::test]
+async fn taskrun_parent_terminal_receipt_arriving_after_child_close_releases_capsule() {
+    let (store, task) = fixture().await;
+    let run = run(&store, &task, 80, TaskRunStatus::Succeeded).await;
+    let link = child(
+        &store,
+        &run,
+        "receipt_late_child",
+        TurnStatus::Completed,
+        TaskRunTurnStatus::CandidateCreated,
+        AT,
+    )
+    .await;
+    let parent_thread = sample_thread("ws_task", "thr_task", AT);
+    let mut parent = Turn {
+        turn_kind: TurnKind::TaskRun,
+        origin: TurnOrigin::ScheduledTask,
+        ..sample_turn(&run.id)
+    };
+    store
+        .materialize_turn_start(
+            &parent_thread,
+            SandboxMode::FullAccess,
+            &parent,
+            &[],
+            PersistedActorRef::System,
+        )
+        .await
+        .unwrap();
+    let tx = store.connection.begin().await.unwrap();
+    thread_lineage::upsert_lineage(
+        &tx,
+        &TaskThreadLineage {
+            child_thread_id: link.thread_id.clone(),
+            parent_thread_id: parent_thread.id.clone(),
+            root_thread_id: parent_thread.id.clone(),
+            depth: 1,
+            origin_kind: Some("task_run".into()),
+            created_by_thread_id: Some(parent_thread.id.clone()),
+            created_by_turn_id: Some(parent.id.clone()),
+            created_at: AT,
+        },
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    publish_capsule(&store, &link.turn_id).await;
+    let claim = claimed_child(&store, &link.thread_id, &link.turn_id).await;
+    assert!(!store.cleanup_claimed_child_capsule(&claim).await.unwrap());
+    assert!(
+        !store
+            .list_turn_llm_context(&link.turn_id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    parent.status = TurnStatus::Completed;
+    store
+        .materialize_turn_completed(
+            TurnCompletedNotification {
+                workspace_id: "ws_task".into(),
+                thread_id: parent_thread.id,
+                turn: parent,
+            },
+            AT + 1,
+        )
+        .await
+        .unwrap();
+    assert!(
+        store.cleanup_claimed_child_capsule(&claim).await.unwrap(),
+        "the actual canonical terminal receipt, not queue ownership, releases the capsule"
+    );
+}
+
+#[tokio::test]
+async fn parked_taskrun_child_wakes_after_parent_thread_workspace_repair() {
+    let (store, task) = fixture().await;
+    terminal_child(
+        &store,
+        &task,
+        81,
+        "parent_workspace_child",
+        TaskRunStatus::Succeeded,
+        AT,
+    )
+    .await;
+    // Keep the Task creator elsewhere: creator-thread fanout cannot rescue
+    // this TaskRun parent-thread test if the parent-thread arm is lost.
+    let mut independent_creator = task.clone();
+    independent_creator.created_by_thread_id = Some("other_creator_thread".into());
+    independent_creator.created_by_turn_id = Some("other_creator_turn".into());
+    task::upsert_prepared_task(
+        &store.connection,
+        task::prepare_task_projection(&independent_creator).unwrap(),
+    )
+    .await
+    .unwrap();
+    let wrong = sample_thread("wrong_workspace", "thr_task", AT);
+    store
+        .upsert_thread_model(&wrong, PersistedActorRef::System)
+        .await
+        .unwrap();
+    let claim = claimed_child(
+        &store,
+        "th_parent_workspace_child",
+        "parent_workspace_child",
+    )
+    .await;
+    assert!(!store.cleanup_claimed_child_capsule(&claim).await.unwrap());
+    park_after_cutover(&store, &claim).await;
+    let unrelated = sample_thread("ws_task", "unrelated_parent_thread", AT);
+    store
+        .upsert_thread_model(&unrelated, PersistedActorRef::System)
+        .await
+        .unwrap();
+    drain_dependency_scopes(&store).await;
+    assert_parked(&store, &claim.turn_id).await;
+    let repaired = sample_thread("ws_task", "thr_task", AT);
+    store
+        .upsert_thread_model(&repaired, PersistedActorRef::System)
+        .await
+        .unwrap();
+    drain_dependency_scopes(&store).await;
+    consume_woken_capsule(&store, &claim.turn_id).await;
+}
+
+#[path = "task_child_owner_repair.rs"]
+mod owner_repair;

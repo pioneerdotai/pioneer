@@ -138,6 +138,9 @@ pub struct ClientTransitionDto {
     pub sequence: pioneer_client::core::ClientTransitionSequence,
     pub outcome: ClientTransitionOutcome,
     pub effects: Vec<ClientEffectPlan>,
+    /// Command receipt from Begin's own immutable publication, independent of delivery.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub composer_begin_plan: Option<pioneer_client::composer::store::ComposerOperationPlan>,
 }
 
 pub fn validate_schema_version(schema_version: u32) -> Result<(), String> {
@@ -179,7 +182,41 @@ pub fn transition_dto(transition: ClientTransition) -> ClientTransitionDto {
         sequence: transition.sequence(),
         outcome: transition.outcome(),
         effects: transition.effects().to_vec(),
+        composer_begin_plan: None,
     }
+}
+
+pub fn intent_transition_dto(
+    intent: &ClientIntent,
+    transition: ClientTransition,
+) -> ClientTransitionDto {
+    let mut result = transition_dto(transition.clone());
+    if let ClientIntent::Composer {
+        intent: pioneer_client::composer::store::ComposerIntent::BeginOperation { thread_id, .. },
+    } = intent
+    {
+        result.composer_begin_plan =
+            transition
+                .changes()
+                .publications()
+                .iter()
+                .find_map(|publication| {
+                    if publication.scope()
+                        != &(ClientScope::Composer {
+                            thread_id: thread_id.clone(),
+                        })
+                    {
+                        return None;
+                    }
+                    publication
+                        .snapshot()
+                        .payload::<pioneer_client::composer::store::ComposerPublication>()?
+                        .operation()?
+                        .plan
+                        .clone()
+                });
+    }
+    result
 }
 
 pub fn change_dto(event: ClientSubscriptionEvent) -> ClientChangeDto {
@@ -249,5 +286,67 @@ pub fn publication_dto(
         scope: snapshot.scope().clone(),
         revisions: snapshot.revisions(),
         payload,
+    }
+}
+
+#[cfg(test)]
+mod begin_receipt_tests {
+    use super::*;
+    use pioneer_client::composer::store::{ComposerIntent, ComposerOperationKind};
+
+    #[test]
+    fn begin_receipt_uses_its_immutable_transition_even_after_replacement() {
+        let core = pioneer_client::core::ClientCore::shared();
+        core.composer_intent(ComposerIntent::Open {
+            thread_id: "receipt".into(),
+            defaults: Default::default(),
+        });
+        let draft_id = core.composer_snapshot("receipt").unwrap().draft_id();
+        let edit = |text: &str| ComposerIntent::EditText {
+            thread_id: "receipt".into(),
+            draft_id,
+            text: text.into(),
+        };
+        core.composer_intent(edit("captured payload"));
+        let begin = ClientIntent::Composer {
+            intent: ComposerIntent::BeginOperation {
+                thread_id: "receipt".into(),
+                draft_id,
+                operation: ComposerOperationKind::Send,
+            },
+        };
+        let accepted = core.dispatch(begin.clone());
+        let captured = core
+            .composer_snapshot("receipt")
+            .unwrap()
+            .operation()
+            .unwrap()
+            .plan
+            .clone()
+            .unwrap();
+        assert_eq!(accepted.outcome(), ClientTransitionOutcome::Changed);
+        assert_eq!(captured.draft.text, "captured payload");
+        let duplicate = intent_transition_dto(&begin, core.dispatch(begin.clone()));
+        assert_eq!(duplicate.outcome, ClientTransitionOutcome::Noop);
+        assert!(duplicate.composer_begin_plan.is_none());
+        let edit = ClientIntent::Composer {
+            intent: edit("new payload"),
+        };
+        let edited = intent_transition_dto(&edit, core.dispatch(edit.clone()));
+        assert!(edited.composer_begin_plan.is_none());
+        let replacement = intent_transition_dto(&begin, core.dispatch(begin.clone()))
+            .composer_begin_plan
+            .unwrap();
+        assert_ne!(captured.identity, replacement.identity);
+        assert_eq!(replacement.draft.text, "new payload");
+        core.shutdown();
+        // Receipt serialization has no current snapshot read: teardown and a
+        // newer operation cannot replace the accepted command's ownership.
+        let receipt = intent_transition_dto(&begin, accepted);
+        assert_eq!(receipt.composer_begin_plan.as_ref(), Some(&captured));
+        assert_eq!(
+            serde_json::to_value(receipt).unwrap()["composer_begin_plan"],
+            serde_json::to_value(&captured).unwrap()
+        );
     }
 }
