@@ -5,7 +5,8 @@ use pioneer_entity::{task_run, task_run_occurrence_reconcile_pending as pending,
 use pioneer_sqlite::SqliteDatabase;
 use sea_orm::sea_query::{Expr, ExprTrait, JoinType, Order, Query, SelectStatement, SimpleExpr};
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, EntityTrait, FromQueryResult, QueryFilter, TransactionTrait,
+    ColumnTrait, ConnectionTrait, EntityTrait, FromQueryResult, QueryFilter, QuerySelect,
+    TransactionTrait,
 };
 
 pub const OCCURRENCE_RECONCILE_BUDGET: u64 = 64;
@@ -147,10 +148,14 @@ pub(crate) fn mismatch_status_predicate(run: SimpleExpr, turn: SimpleExpr) -> Si
         .or(run.eq("cancelled").and(turn.ne("interrupted")))
 }
 
-#[cfg(test)]
 pub(crate) async fn is_mismatch<C: ConnectionTrait>(db: &C, run_id: &str) -> Result<bool> {
-    Ok(db
-        .query_one_raw(db.get_database_backend().build(&mismatch_query(run_id)))
+    Ok(task_run::Entity::find()
+        .select_only()
+        .column(task_run::Column::Id)
+        .filter(task_run::Column::Id.eq(run_id.to_owned()))
+        .filter(Expr::exists(mismatch_query(run_id)))
+        .into_tuple::<String>()
+        .one(db)
         .await?
         .is_some())
 }

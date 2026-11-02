@@ -113,6 +113,7 @@ pub async fn insert_if_absent<C: ConnectionTrait>(
     .await
     .context("failed to insert immutable task run conversation snapshot")?;
 
+    super::task_child_producers::run(db, &run_id).await?;
     find_by_run(db, run_id.as_str())
         .await?
         .context("task run conversation snapshot is missing after insert")

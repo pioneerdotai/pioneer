@@ -608,6 +608,8 @@ pub struct MessageProcessor {
     gateway_listen_addr: Arc<std::sync::RwLock<Option<std::net::SocketAddr>>>,
     summary_config: Arc<summary::SummaryConfig>,
     compaction_settings: Arc<StdRwLock<pioneer_compaction::CompactionSettings>>,
+    task_child_point_cursor: Arc<Mutex<tasks::ChildDiscoveryPass<(i64, String)>>>,
+    task_child_scope_cursor: Arc<Mutex<tasks::ChildDiscoveryPass<(i64, String, String)>>>,
     completed_history_checks: Arc<Mutex<HashMap<(String, String), compaction_background::OwnedHistoryCheck>>>,
     compaction_lifecycle_not_before: Arc<StdRwLock<Option<tokio::time::Instant>>>,
     #[cfg(test)]
@@ -1268,6 +1270,8 @@ impl MessageProcessor {
                 pioneer_protocol::GatewayBaseUrl::parse_presentation("http://127.0.0.1:17878")
                     .expect("static Gateway base URL is valid"),
             ),
+            task_child_point_cursor: Arc::new(Mutex::new(Default::default())),
+            task_child_scope_cursor: Arc::new(Mutex::new(Default::default())),
             completed_history_checks: Arc::new(Mutex::new(HashMap::new())),
             compaction_lifecycle_not_before: Arc::new(StdRwLock::new(None)),
             #[cfg(test)]
@@ -2876,14 +2880,25 @@ impl MessageProcessor {
 
         let task_runtime_stage =
             trace.stage(pioneer_observability::GatewayOperationStage::ResilienceTaskRuntimeStart);
-        if let Err(error) = self.task_runtime.start().await {
-            drop(task_runtime_stage);
-            error!(error = %format!("{error:#}"), "failed to start task runtime");
-            trace.finish_failure();
-            return Err(error).context("failed to start task runtime");
-        } else {
-            task_runtime_stage.succeed();
-        }
+        let partial_startup = match self.task_runtime.start().await {
+            Ok(()) => {
+                task_runtime_stage.succeed();
+                None
+            }
+            Err(error) => {
+                drop(task_runtime_stage);
+                error!(error = %format!("{error:#}"), "failed to start task runtime");
+                if error
+                    .downcast_ref::<pioneer_tasks::PartialTaskStartup>()
+                    .is_some()
+                {
+                    Some(error)
+                } else {
+                    trace.finish_failure();
+                    return Err(error).context("failed to start task runtime");
+                }
+            }
+        };
 
         let task_events_stage = trace
             .stage(pioneer_observability::GatewayOperationStage::ResilienceTaskEventListenerStart);
@@ -2895,7 +2910,13 @@ impl MessageProcessor {
         self.start_hook_recovery_worker().await;
         hook_recovery_stage.succeed();
 
-        trace.finish_success();
+        if partial_startup.is_some() {
+            // Keep explicit failure diagnostics/trace, but do not trap Gateway
+            // initialization in a retry loop on classified row-local poison.
+            trace.finish_failure();
+        } else {
+            trace.finish_success();
+        }
         Ok(())
     }
 
@@ -5028,6 +5049,8 @@ impl MessageProcessor {
                 pioneer_protocol::GatewayBaseUrl::parse_presentation("http://127.0.0.1:17878")
                     .expect("static Gateway base URL is valid"),
             ),
+            task_child_point_cursor: Arc::new(Mutex::new(Default::default())),
+            task_child_scope_cursor: Arc::new(Mutex::new(Default::default())),
             completed_history_checks: Arc::new(Mutex::new(HashMap::new())),
             compaction_lifecycle_not_before: Arc::new(StdRwLock::new(None)),
             #[cfg(test)]
