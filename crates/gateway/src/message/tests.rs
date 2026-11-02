@@ -25,6 +25,9 @@ mod workspace_scope;
 #[path = "tests/authorization_reads.rs"]
 mod authorization_reads;
 
+#[path = "tests/fanout_facts.rs"]
+mod fanout_facts;
+
 #[cfg(unix)]
 #[path = "tests/title_recovery.rs"]
 mod title_recovery;
@@ -33132,6 +33135,13 @@ async fn cli_predispatch_read_failure_cancel_and_shutdown_release_session_lease_
 
 #[test]
 fn cancelling_cli_transfer_while_waiting_for_coordinator_releases_session() {
+    // Nextest runs this case in its own process. Preserve the internal failure
+    // behind a redacted persistence response, including async runtime workers.
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .with_ansi(false)
+        .with_writer(std::io::stderr)
+        .try_init();
     run_standard_stack_message_test(
         "cancel CLI transfer waiting for compaction coordinator",
         cancelling_cli_history_transfer_stops_before_provider_start_and_releases_session_impl(
@@ -46000,13 +46010,14 @@ async fn setup_execution_window_terminal_turn(
     thread_id: &str,
     turn_id: &str,
 ) -> (MessageProcessor, Arc<CrudStore>, String) {
-    setup_execution_window_terminal_turn_with_input(thread_id, turn_id, &[]).await
+    setup_execution_window_terminal_turn_with_input_and_mode(thread_id, turn_id, &[], None).await
 }
 
-async fn setup_execution_window_terminal_turn_with_input(
+async fn setup_execution_window_terminal_turn_with_input_and_mode(
     thread_id: &str,
     turn_id: &str,
     input: &[UserInput],
+    mode: Option<ThreadMode>,
 ) -> (MessageProcessor, Arc<CrudStore>, String) {
     let session_manager = Arc::new(SessionManager::new());
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -46062,7 +46073,7 @@ async fn setup_execution_window_terminal_turn_with_input(
                 model: None,
                 model_provider: None,
                 sandbox_policy: None,
-                mode: None,
+                mode,
                 agent_launch: None,
                 reply_to_turn_id: None,
                 mentioned_principal_ids: Vec::new(),
@@ -66344,6 +66355,7 @@ async fn codex_retry_notice_is_durable_semantic_work_in_an_internal_execution_th
                     limit: Some(12),
                 },
             })
+            .unwrap()
             .unwrap();
         let mut fresh_task = newer_task.clone();
         fresh_task.status = TaskStatus::Running;
@@ -66362,7 +66374,14 @@ async fn codex_retry_notice_is_durable_semantic_work_in_an_internal_execution_th
             },
             sent: std::cell::Cell::new(false),
         };
-        core.execute_thread_semantic_request(&transport, request);
+        let mut next = Some(request);
+        for _ in 0..128 {
+            let Some(request) = next else {
+                break;
+            };
+            next = core.execute_thread_semantic_request(&transport, request);
+        }
+        assert!(next.is_none(), "authorized page reconciliation must finish");
         assert!(transport.sent.get());
         let state = core.thread_semantic_snapshot(&harness.thread_id);
         let timeline = &state.thread(&harness.thread_id).unwrap().top_level;

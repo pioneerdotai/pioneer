@@ -8650,3 +8650,117 @@ mod webhook;
 
 #[path = "tests/agent_spec_snapshots.rs"]
 mod agent_spec_snapshots;
+
+#[path = "tests_scheduler_live.rs"]
+mod scheduler_live;
+
+#[tokio::test]
+async fn compatibility_audit_error_repairs_healthy_work_before_returning_and_sets_storage_backoff()
+{
+    use sea_orm::ConnectionTrait;
+    let runtime = runtime().await;
+    runtime
+        .register_executor(Arc::new(CompletingSystemExecutor))
+        .await;
+    let mut runs = Vec::new();
+    for _ in 0..2 {
+        let response = runtime
+            .service()
+            .create_task(
+                TaskCreateContext::default(),
+                create_params(TaskTriggerSpec::ScheduledAt {
+                    scheduled_at: 1,
+                    timezone: Some("UTC".into()),
+                    catch_up_policy: None,
+                }),
+            )
+            .await
+            .unwrap();
+        runtime.process_due_once(1).await.unwrap();
+        let task = runtime
+            .service()
+            .get_task(pioneer_protocol::TaskGetParams {
+                task_id: response.task.id,
+            })
+            .await
+            .unwrap();
+        runs.push(task.runs[0].id.clone());
+    }
+    runs.sort();
+    let store = runtime.service().store();
+    let db = store.database_connection();
+    pioneer_sqlite::apply_sqlite_pragmas(&db).await.unwrap();
+    // Model historical drift independently of the public terminal fence.
+    // Then exercise the real typed producer with a permitted nonterminal
+    // transition, retaining a durable healthy ticket for the audit to drain.
+    for id in &runs {
+        db.execute_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "UPDATE task_occurrence_contract SET status='running' WHERE run_id=?",
+            [id.clone().into()],
+        ))
+        .await
+        .unwrap();
+        let mut occurrence = store
+            .get_task_occurrence_contract_by_run(id)
+            .await
+            .unwrap()
+            .unwrap();
+        occurrence.status = TaskOccurrenceStatus::Recovering;
+        store
+            .upsert_task_occurrence_contract(&occurrence, chrono::Utc::now().timestamp())
+            .await
+            .unwrap();
+    }
+    db.execute_unprepared("CREATE TRIGGER task_occurrence_reconcile_foreign AFTER UPDATE ON task_occurrence_contract BEGIN SELECT 1; END").await.unwrap();
+    // Retain the healthy real typed ticket; remove only the missed obligation.
+    db.execute_raw(Statement::from_sql_and_values(
+        DatabaseBackend::Sqlite,
+        "DELETE FROM task_occurrence_reconcile_pending WHERE run_id=?",
+        [runs[0].clone().into()],
+    ))
+    .await
+    .unwrap();
+    db.execute_unprepared("DELETE FROM task_occurrence_reconcile_scope")
+        .await
+        .unwrap();
+    db.execute_unprepared("UPDATE task_occurrence_reconcile_seed SET status_index=5")
+        .await
+        .unwrap();
+    // SQL parameters cannot occur in trigger bodies. Reject every new insert;
+    // existing healthy pending work can still be claimed and ACKed.
+    db.execute_unprepared("CREATE TRIGGER reject_compatibility_contract BEFORE INSERT ON task_occurrence_reconcile_pending BEGIN SELECT RAISE(ABORT,'compatibility insert rejected'); END").await.unwrap();
+    assert!(
+        runtime.start().await.is_err(),
+        "partial audit failure must reach caller"
+    );
+    assert_eq!(
+        store
+            .get_task_occurrence_contract_by_run(&runs[1])
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        TaskOccurrenceStatus::Delivered
+    );
+    assert_eq!(
+        store
+            .get_task_occurrence_contract_by_run(&runs[0])
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        TaskOccurrenceStatus::Recovering
+    );
+    // A retry inside the storage backoff skips the still-failing audit.
+    assert!(runtime.start().await.is_ok());
+    assert_eq!(
+        store
+            .get_task_occurrence_contract_by_run(&runs[0])
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        TaskOccurrenceStatus::Recovering
+    );
+}

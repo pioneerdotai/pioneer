@@ -1297,3 +1297,1546 @@ async fn concurrent_reader_sees_new_input_and_adoption_only_after_the_same_commi
         assert_eq!(bindings.len(), usize::from(commit));
     }
 }
+
+#[tokio::test]
+async fn retirement_page_keeps_individual_metadata_budget_and_empty_reader_only_eof() {
+    let f = fixture().await;
+    for index in 0..17 {
+        // Oversized metadata must never enter preparation even inside page16.
+        let oversized = index == 8;
+        f.store.connection.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "INSERT INTO artifact(id,workspace_id,display_name,kind,mime_type,status,created_by_kind,created_by_actor_id,current_version_id,metadata_json) VALUES(?1,'ws','preview','screenshot','image/png','ready','tool','html_preview',?2,?3)",
+            [format!("page-{index:02}").into(), if oversized {Some("advisory-version".to_owned())} else {None}.into(), if oversized {"x".repeat(1048577)} else {"{}".to_owned()}.into()],
+        )).await.unwrap();
+    }
+    let mut progress = HtmlPreviewRetentionProgress::default();
+    f.routes.reset();
+    for _ in 0..17 {
+        assert!(progress.artifact_quantum(&f.store).await.unwrap());
+    }
+    // Two compact discovery pages; no metadata fetch or writer reservation.
+    assert_eq!(f.routes.counts(), (2, 0));
+    f.routes.reset();
+    assert!(!progress.artifact_quantum(&f.store).await.unwrap());
+    assert_eq!(f.routes.counts(), (1, 0));
+}
+
+// Closed test gate: these exercise the real read-only/serialized-writer fixture.
+fn io_queue_key(id: &str) -> String {
+    super::super::html_preview_io_work::HtmlPreviewIoLocator::new(id).key
+}
+#[tokio::test]
+async fn io_enqueue_rollback_and_idle_poll_never_claim_writer() {
+    use super::super::html_preview_io_work::{HtmlPreviewIoFamily, request};
+    use pioneer_entity::html_preview_io_work as work;
+    let f = fixture().await;
+    let tx = f.store.connection.begin().await.unwrap();
+    request(&tx, HtmlPreviewIoFamily::Copies, "rollback-copies", 0, "ws")
+        .await
+        .unwrap();
+    tx.rollback().await.unwrap();
+    assert!(
+        work::Entity::find_by_id(("copies".to_owned(), io_queue_key("rollback-copies"), 0_i64))
+            .one(&f.store.connection)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    f.sql("UPDATE html_preview_io_work SET state='done',due_at=NULL,seed_version=1")
+        .await;
+    f.routes.reset();
+    assert!(
+        f.store
+            .claim_html_preview_io_work(0, 60_000)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(f.routes.counts(), (1, 0));
+}
+
+#[tokio::test]
+async fn io_takeover_and_reinsert_reject_stale_worker() {
+    use super::super::html_preview_io_work::{HtmlPreviewIoFamily, ack, request};
+    use pioneer_entity::html_preview_io_work as work;
+    let f = fixture().await;
+    f.sql("UPDATE html_preview_io_work SET state='done',due_at=NULL,seed_version=1")
+        .await;
+    let tx = f.store.connection.begin().await.unwrap();
+    request(&tx, HtmlPreviewIoFamily::Copies, "missing", 0, "ws")
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    let old = f
+        .store
+        .claim_html_preview_io_work(0, 10)
+        .await
+        .unwrap()
+        .unwrap();
+    let owner = f
+        .store
+        .claim_html_preview_io_work(10, 10)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(owner.row.claim_token, old.row.claim_token);
+    let tx = f.store.connection.begin().await.unwrap();
+    assert!(!ack(&tx, &old).await.unwrap());
+    assert!(ack(&tx, &owner).await.unwrap());
+    tx.commit().await.unwrap();
+    let tx = f.store.connection.begin().await.unwrap();
+    request(&tx, HtmlPreviewIoFamily::Copies, "missing", 0, "ws")
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    let next = f
+        .store
+        .claim_html_preview_io_work(20, 10)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(owner.row.incarnation, next.row.incarnation);
+    let tx = f.store.connection.begin().await.unwrap();
+    assert!(!ack(&tx, &owner).await.unwrap());
+    tx.rollback().await.unwrap();
+    assert!(
+        work::Entity::find_by_id(("copies".to_owned(), io_queue_key("missing"), 0_i64))
+            .one(&f.store.connection)
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn io_producer_during_claim_preserves_pass_and_ack_keeps_new_request() {
+    use super::super::html_preview_io_work::{HtmlPreviewIoFamily, ack, request};
+    use pioneer_entity::html_preview_io_work as work;
+    let f = fixture().await;
+    f.sql("UPDATE html_preview_io_work SET state='done',due_at=NULL,seed_version=1")
+        .await;
+    let tx = f.store.connection.begin().await.unwrap();
+    request(&tx, HtmlPreviewIoFamily::Copies, "late", 0, "ws")
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    let old = f
+        .store
+        .claim_html_preview_io_work(0, 10)
+        .await
+        .unwrap()
+        .unwrap();
+    let tx = f.store.connection.begin().await.unwrap();
+    request(&tx, HtmlPreviewIoFamily::Copies, "late", 0, "ws")
+        .await
+        .unwrap();
+    let active = work::Entity::find_by_id(("copies".to_owned(), io_queue_key("late"), 0_i64))
+        .one(&tx)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(active.claim_token, old.row.claim_token);
+    assert_eq!(active.due_at, old.row.due_at);
+    assert_eq!(active.pass_revision, old.row.pass_revision);
+    assert_ne!(active.requested_revision, old.row.requested_revision);
+    assert!(ack(&tx, &old).await.unwrap());
+    tx.commit().await.unwrap();
+    let next = f
+        .store
+        .claim_html_preview_io_work(chrono::Utc::now().timestamp_millis(), 10)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(next.row.pass_revision, active.requested_revision);
+}
+
+#[tokio::test]
+async fn io_seed_completion_is_durable_across_restart() {
+    let f = fixture().await;
+    for _ in 0..256 {
+        if !f
+            .store
+            .html_preview_io_seed_startup_quantum()
+            .await
+            .unwrap()
+        {
+            break;
+        }
+    }
+    assert!(f.store.html_preview_io_seed_complete().await.unwrap());
+    let restarted = f.store.clone();
+    f.routes.reset();
+    assert!(
+        !restarted
+            .html_preview_io_seed_startup_quantum()
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        f.routes.counts().1,
+        0,
+        "completed seeds do not reopen at startup"
+    );
+}
+
+#[tokio::test]
+async fn io_zero_row_copy_cas_keeps_claim_durable() {
+    use super::super::html_preview_io_work::{HtmlPreviewIoFamily, request};
+    use pioneer_entity::html_preview_io_work as work;
+    let f = fixture().await;
+    f.sql("UPDATE html_preview_io_work SET state='done',due_at=NULL,seed_version=1")
+        .await;
+    let tx = f.store.connection.begin().await.unwrap();
+    request(&tx, HtmlPreviewIoFamily::Copies, "missing-source", 0, "ws")
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    let claim = f
+        .store
+        .claim_html_preview_io_work(0, 60_000)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        !f.store
+            .finish_html_preview_copy_cleanup_claimed(&claim, "stale", "prepared")
+            .await
+            .unwrap()
+    );
+    let row =
+        work::Entity::find_by_id(("copies".to_owned(), io_queue_key("missing-source"), 0_i64))
+            .one(&f.store.connection)
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(row.state, "running");
+    assert_eq!(row.claim_token, claim.row.claim_token);
+}
+
+async fn io_copy_source(f: &Fixture, id: &str, metadata: &str) {
+    f.store.connection.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+        "INSERT INTO artifact(id,workspace_id,display_name,kind,mime_type,status,created_by_kind,created_by_actor_id,created_at,updated_at,metadata_json) VALUES(?1,'ws','preview','image','image/png','deleted','tool','html_preview',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,?2)",
+        [id.into(),metadata.into()])).await.unwrap();
+}
+
+#[tokio::test]
+async fn io_seed_continuous_resync_keeps_frontier_and_late_producer() {
+    use super::super::html_preview_io_work::{HtmlPreviewIoFamily, request};
+    use pioneer_entity::html_preview_io_work as work;
+    let f = fixture().await;
+    let metadata = r#"{"htmlTool":{"retention":"released","releasedCopies":["x"]}}"#;
+    for id in ["a", "b", "c"] {
+        io_copy_source(&f, id, metadata).await;
+    }
+    f.sql("UPDATE html_preview_io_work SET state='done',due_at=NULL,seed_version=1 WHERE family='seed_witness'").await;
+    assert!(
+        f.store
+            .html_preview_io_seed_startup_quantum()
+            .await
+            .unwrap()
+    );
+    let first = work::Entity::find_by_id(("seed_copies".to_owned(), String::new(), 0_i64))
+        .one(&f.store.connection)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.cursor_id.as_deref(), Some("a"));
+    io_copy_source(&f, "0-behind", metadata).await;
+    let tx = f.store.connection.begin().await.unwrap();
+    request(&tx, HtmlPreviewIoFamily::Copies, "0-behind", 0, "ws")
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    for expected in ["b", "c"] {
+        let tx = f.store.connection.begin().await.unwrap();
+        request(&tx, HtmlPreviewIoFamily::SeedCopies, "", 0, "")
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        assert!(
+            f.store
+                .html_preview_io_seed_startup_quantum()
+                .await
+                .unwrap()
+        );
+        let row = work::Entity::find_by_id(("seed_copies".to_owned(), String::new(), 0_i64))
+            .one(&f.store.connection)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.cursor_id.as_deref(),
+            Some(expected),
+            "new requests cannot restart an active pass"
+        );
+        assert_eq!(row.upper_id, first.upper_id);
+        assert_eq!(row.pass_revision, first.pass_revision);
+    }
+    assert!(
+        work::Entity::find_by_id(("copies".to_owned(), io_queue_key("0-behind"), 0_i64))
+            .one(&f.store.connection)
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn io_seed_only_enqueues_real_copies() {
+    use pioneer_entity::html_preview_io_work as work;
+    let f = fixture().await;
+    io_copy_source(
+        &f,
+        "empty",
+        r#"{"htmlTool":{"retention":"released","releasedCopies":[]}}"#,
+    )
+    .await;
+    io_copy_source(
+        &f,
+        "real",
+        r#"{"htmlTool":{"retention":"released","releasedCopies":["x"]}}"#,
+    )
+    .await;
+    for _ in 0..16 {
+        if !f
+            .store
+            .html_preview_io_seed_startup_quantum()
+            .await
+            .unwrap()
+        {
+            break;
+        }
+    }
+    assert!(
+        work::Entity::find_by_id(("copies".to_owned(), io_queue_key("empty"), 0_i64))
+            .one(&f.store.connection)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let claim = f
+        .store
+        .claim_html_preview_io_work(chrono::Utc::now().timestamp_millis(), 60_000)
+        .await
+        .unwrap()
+        .unwrap();
+    let crate::HtmlPreviewIoSource::Ready((_workspace, metadata)) =
+        f.store.load_html_preview_io_copies(&claim).await.unwrap()
+    else {
+        panic!("real copies")
+    };
+    assert!(!metadata.is_empty());
+}
+
+#[tokio::test]
+async fn io_poison_quarantine_does_not_block_later_work_and_unknown_outcome_is_durable() {
+    use super::super::html_preview_io_work::{HtmlPreviewIoFamily, request};
+    use pioneer_entity::html_preview_io_work as work;
+    let f = fixture().await;
+    f.sql("UPDATE html_preview_io_work SET state='done',due_at=NULL,seed_version=1")
+        .await;
+    let tx = f.store.connection.begin().await.unwrap();
+    request(&tx, HtmlPreviewIoFamily::Witness, "a-poison", 0, "ws")
+        .await
+        .unwrap();
+    request(&tx, HtmlPreviewIoFamily::Witness, "b-later", 0, "ws")
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    work::Entity::update_many()
+        .col_expr(work::Column::DueAt, Expr::val(-1_i64))
+        .filter(work::Column::ObjectId.eq(io_queue_key("a-poison")))
+        .exec(&f.store.connection)
+        .await
+        .unwrap();
+    let claim = f
+        .store
+        .claim_html_preview_io_work(0, 10)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        f.store
+            .defer_html_preview_io_work(&claim, crate::HtmlPreviewIoOutcome::Quarantine, 0)
+            .await
+            .unwrap()
+    );
+    let later = f
+        .store
+        .claim_html_preview_io_work(0, 10)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(later.source_id(), "b-later");
+    // Discard the successful claim response as a transport could: durable row
+    // must remain recoverable; no empty/finished marker may be inferred.
+    drop(later);
+    let takeover = f
+        .store
+        .claim_html_preview_io_work(10, 10)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(takeover.source_id(), "b-later");
+    let poison = work::Entity::find_by_id(("witness".to_owned(), io_queue_key("a-poison"), 0_i64))
+        .one(&f.store.connection)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(poison.state, "quarantine");
+    assert!(poison.due_at.is_none());
+}
+
+#[tokio::test]
+async fn io_witness_zero_cas_corrupt_expired_and_unavailable_are_distinct() {
+    use super::super::html_preview_io_work::{HtmlPreviewIoFamily, request};
+    use pioneer_entity::html_preview_io_work as work;
+    for mode in [
+        "corrupt",
+        "empty-unit",
+        "invalid-digest",
+        "expired",
+        "unavailable",
+        "missing-header",
+        "body-restored",
+    ] {
+        let f = fixture().await;
+        f.sql("UPDATE html_preview_io_work SET state='done',due_at=NULL,seed_version=1")
+            .await;
+        if mode != "missing-header" {
+            manifest(&f, "w", "parent", &[], &[], 0, None).await;
+        }
+        let mut reference = reference(
+            SourceRef {
+                scope: "context:parent-turn".into(),
+                id: "missing-source".into(),
+                version: "revision:1".into(),
+            },
+            "parent",
+            None,
+        );
+        let semantic_invalid = matches!(mode, "empty-unit" | "invalid-digest");
+        let healthy_reference = reference.clone();
+        if mode == "empty-unit" {
+            reference.unit_id.clear();
+        } else if mode == "invalid-digest" {
+            reference.wire_sha256 = "invalid".into();
+        }
+        if semantic_invalid {
+            // A real canonical source makes the old serde-only loader return
+            // Ready: absence/provenance guards must not mask this regression.
+            f.sql("INSERT INTO turn_llm_context(id,turn_id,sequence,source,tool_name,payload,output_policy_snapshot,created_at) VALUES('missing-source','parent-turn',999,'tool_result_v2','html_preview','{}','{}',CURRENT_TIMESTAMP)").await;
+            f.sql("UPDATE compaction_source_revision SET revision=1,present=1 WHERE source_id='missing-source'").await;
+        }
+        let reference_json = if mode == "corrupt" {
+            "invalid".into()
+        } else {
+            serde_json::to_string(&reference).unwrap()
+        };
+        frozen_result::Entity::insert(frozen_result::ActiveModel {
+            manifest_id: Set("w".into()),
+            ordinal: Set(0),
+            reference_json: Set(reference_json),
+            turn_id: Set("parent-turn".into()),
+            source_id: Set("missing-source".into()),
+            source_version: Set("revision:1".into()),
+            archive_wire_sha256: Set(None),
+        })
+        .exec_without_returning(&f.store.connection)
+        .await
+        .unwrap();
+        if mode == "expired" {
+            f.sql("UPDATE compaction_frozen_history SET expired=1 WHERE id='w'")
+                .await;
+        }
+        if mode == "body-restored" {
+            f.sql("INSERT INTO compaction_source_revision(source_id,turn_id,revision,present,capture_order) VALUES('missing-source','parent-turn',1,1,9999)").await;
+        }
+        let tx = f.store.connection.begin().await.unwrap();
+        request(&tx, HtmlPreviewIoFamily::Witness, "w", 0, "ws")
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        let claim = f
+            .store
+            .claim_html_preview_io_work(0, 60_000)
+            .await
+            .unwrap()
+            .unwrap();
+        let outcome = f.store.load_html_preview_io_witness(&claim).await.unwrap();
+        match mode {
+            "corrupt" | "empty-unit" | "invalid-digest" => {
+                assert!(matches!(outcome, crate::HtmlPreviewIoSource::Quarantine))
+            }
+            "expired" => assert!(matches!(outcome, crate::HtmlPreviewIoSource::Obsolete)),
+            _ => assert!(matches!(outcome, crate::HtmlPreviewIoSource::Retry)),
+        }
+        if semantic_invalid {
+            assert!(
+                f.store
+                    .defer_html_preview_io_work(&claim, crate::HtmlPreviewIoOutcome::Quarantine, 0)
+                    .await
+                    .unwrap()
+            );
+            let poison = work::Entity::find_by_id(("witness".to_owned(), io_queue_key("w"), 0_i64))
+                .one(&f.store.connection)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(poison.state, "quarantine");
+            assert!(poison.due_at.is_none());
+            let retained = frozen_result::Entity::find_by_id(("w".to_owned(), 0_i64))
+                .one(&f.store.connection)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                serde_json::from_str::<FrozenMessageRef>(&retained.reference_json).unwrap(),
+                reference
+            );
+            assert!(retained.archive_wire_sha256.is_none());
+            frozen_result::Entity::insert(frozen_result::ActiveModel {
+                manifest_id: Set("w".into()),
+                ordinal: Set(1),
+                reference_json: Set(serde_json::to_string(&healthy_reference).unwrap()),
+                turn_id: Set("parent-turn".into()),
+                source_id: Set("missing-source".into()),
+                source_version: Set("revision:1".into()),
+                archive_wire_sha256: Set(None),
+            })
+            .exec_without_returning(&f.store.connection)
+            .await
+            .unwrap();
+            let tx = f.store.connection.begin().await.unwrap();
+            request(&tx, HtmlPreviewIoFamily::Witness, "w", 1, "ws")
+                .await
+                .unwrap();
+            tx.commit().await.unwrap();
+            let healthy = f
+                .store
+                .claim_html_preview_io_work(0, 60_000)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(healthy.row.ordinal, 1);
+            assert!(matches!(
+                f.store
+                    .load_html_preview_io_witness(&healthy)
+                    .await
+                    .unwrap(),
+                crate::HtmlPreviewIoSource::Ready(_)
+            ));
+            continue;
+        }
+        if mode == "body-restored" {
+            // Pending work remains addressably timed, and restores without
+            // changing its source identity/revision or requiring a resync.
+            assert!(
+                f.store
+                    .defer_html_preview_io_work(&claim, crate::HtmlPreviewIoOutcome::Retry, 0)
+                    .await
+                    .unwrap()
+            );
+            let pending =
+                work::Entity::find_by_id(("witness".to_owned(), io_queue_key("w"), 0_i64))
+                    .one(&f.store.connection)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(pending.state, "timed");
+            assert_eq!(pending.due_at, Some(60_000));
+            assert!(
+                f.store
+                    .claim_html_preview_io_work(59_999, 60_000)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            let claim = f
+                .store
+                .claim_html_preview_io_work(60_000, 60_000)
+                .await
+                .unwrap()
+                .unwrap();
+            f.sql("INSERT INTO turn_llm_context(id,turn_id,sequence,source,tool_name,payload,output_policy_snapshot,created_at) VALUES('missing-source','parent-turn',999,'tool_result_v2','html_preview','{}','{}',CURRENT_TIMESTAMP)").await;
+            // Historical restoration preserves its original revision identity.
+            f.sql("UPDATE compaction_source_revision SET revision=1,present=1 WHERE source_id='missing-source'").await;
+            let crate::HtmlPreviewIoSource::Ready(witness) =
+                f.store.load_html_preview_io_witness(&claim).await.unwrap()
+            else {
+                panic!("restored body must become ready");
+            };
+            let hash = "a".repeat(64);
+            f.store
+                .record_html_preview_archive_witness(&witness, &hash)
+                .await
+                .unwrap();
+            let tx = f.store.connection.begin().await.unwrap();
+            request(&tx, HtmlPreviewIoFamily::Witness, "w", 0, "ws")
+                .await
+                .unwrap();
+            tx.commit().await.unwrap();
+            let repeated = f
+                .store
+                .claim_html_preview_io_work(0, 60_000)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                f.store
+                    .record_html_preview_archive_witness_claimed(&repeated, &witness, &hash)
+                    .await
+                    .unwrap(),
+                "zero-row publication requires verified reread before ACK"
+            );
+            assert!(
+                work::Entity::find_by_id(("witness".to_owned(), io_queue_key("w"), 0_i64))
+                    .one(&f.store.connection)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            continue;
+        }
+        let witness = HtmlPreviewArchiveWitness {
+            manifest: "w".into(),
+            ordinal: 0,
+            workspace: "ws".into(),
+            owner_thread: "parent".into(),
+            reference,
+            payload: "{}".into(),
+        };
+        assert!(
+            !f.store
+                .record_html_preview_archive_witness_claimed(&claim, &witness, &"a".repeat(64))
+                .await
+                .unwrap(),
+            "refused source cannot ACK"
+        );
+        assert!(
+            f.store
+                .record_html_preview_archive_witness(&witness, &"a".repeat(64))
+                .await
+                .is_err(),
+            "legacy callback cannot report zero-row CAS success"
+        );
+        assert!(
+            work::Entity::find_by_id(("witness".to_owned(), io_queue_key("w"), 0_i64))
+                .one(&f.store.connection)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        if matches!(mode, "unavailable" | "missing-header") {
+            assert!(
+                f.store
+                    .defer_html_preview_io_work(&claim, crate::HtmlPreviewIoOutcome::Retry, 0)
+                    .await
+                    .unwrap()
+            );
+            let pending =
+                work::Entity::find_by_id(("witness".to_owned(), io_queue_key("w"), 0_i64))
+                    .one(&f.store.connection)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(pending.state, "timed");
+            assert_eq!(pending.due_at, Some(60_000));
+        }
+    }
+}
+
+#[tokio::test]
+async fn io_repair_updates_workspace_and_reopens_quarantine_without_losing_active_claim() {
+    use super::super::html_preview_io_work::{HtmlPreviewIoFamily, ack, request};
+    use pioneer_entity::html_preview_io_work as work;
+    let f = fixture().await;
+    f.sql("UPDATE html_preview_io_work SET state='done',due_at=NULL,seed_version=1")
+        .await;
+    let tx = f.store.connection.begin().await.unwrap();
+    request(&tx, HtmlPreviewIoFamily::Copies, "repair", 0, "old")
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    let old = f
+        .store
+        .claim_html_preview_io_work(0, 10)
+        .await
+        .unwrap()
+        .unwrap();
+    let tx = f.store.connection.begin().await.unwrap();
+    request(&tx, HtmlPreviewIoFamily::Copies, "repair", 0, "ws")
+        .await
+        .unwrap();
+    assert!(ack(&tx, &old).await.unwrap());
+    tx.commit().await.unwrap();
+    let current = work::Entity::find_by_id(("copies".to_owned(), io_queue_key("repair"), 0_i64))
+        .one(&f.store.connection)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.workspace_id, "ws");
+    assert_eq!(current.state, "ready");
+}
+
+#[tokio::test]
+async fn io_copy_cleanup_refuses_sql_nocase_match_after_cooperative_resync() {
+    use super::super::html_preview_io_work::{HtmlPreviewIoFamily, HtmlPreviewIoLocator, request};
+    use pioneer_entity::html_preview_io_work as work;
+    for claimed in [true, false] {
+        let f = fixture().await;
+        // Vary only the empty artifact table from the normal Migrator fixture.
+        // SQLite cannot ALTER COLUMN collation. Reuse its actual migrated DDL
+        // and restore its actual indexes/triggers; no handwritten Entity/schema.
+        assert!(
+            artifact::Entity::find()
+                .one(&f.store.connection)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let ddl = f
+            .store
+            .connection
+            .query_one_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT sql FROM sqlite_schema WHERE type='table' AND name='artifact'",
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get::<String>("", "sql")
+            .unwrap();
+        let nocase_ddl = ddl.replacen(
+            "\"metadata_json\" text",
+            "\"metadata_json\" text COLLATE NOCASE",
+            1,
+        );
+        assert_ne!(
+            ddl, nocase_ddl,
+            "fixture must actually install NOCASE on the metadata column"
+        );
+        let dependents = f.store.connection.query_all_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT sql FROM sqlite_schema WHERE tbl_name='artifact' AND type IN ('index','trigger') AND sql IS NOT NULL ORDER BY type,name",
+        )).await.unwrap().into_iter().map(|row| row.try_get::<String>("", "sql").unwrap()).collect::<Vec<_>>();
+        let tx = f.store.connection.begin().await.unwrap();
+        tx.execute_unprepared("DROP TABLE artifact").await.unwrap();
+        tx.execute_unprepared(&nocase_ddl).await.unwrap();
+        for ddl in dependents {
+            tx.execute_unprepared(&ddl).await.unwrap();
+        }
+        tx.commit().await.unwrap();
+        f.sql("UPDATE html_preview_io_work SET state='done',due_at=NULL,seed_version=1")
+            .await;
+
+        let previous = r#"{"htmlTool":{"retention":"released","releasedCopies":["A.html"]}}"#;
+        let repaired = r#"{"htmlTool":{"retention":"released","releasedCopies":["a.html"]}}"#;
+        let cleaned = r#"{"htmlTool":{"retention":"released","releasedCopies":[]}}"#;
+        io_copy_source(&f, "nocase", previous).await;
+        let tx = f.store.connection.begin().await.unwrap();
+        request(&tx, HtmlPreviewIoFamily::Copies, "nocase", 0, "ws")
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        let old = f
+            .store
+            .claim_html_preview_io_work(now, 300_000)
+            .await
+            .unwrap()
+            .unwrap();
+        let crate::HtmlPreviewIoSource::Ready((workspace, prepared_from)) =
+            f.store.load_html_preview_io_copies(&old).await.unwrap()
+        else {
+            panic!("old source must be ready")
+        };
+        assert_eq!(workspace, "ws");
+        assert_eq!(prepared_from, previous);
+        // Cleanup preparation has finished from A.html before a cooperative
+        // repair publishes a.html and its durable scoped resync atomically.
+        let prepared_cleanup = cleaned.to_owned();
+        let scope = HtmlPreviewIoLocator::new("ws");
+        let tx = f.store.connection.begin().await.unwrap();
+        assert_eq!(
+            artifact::Entity::update_many()
+                .col_expr(artifact::Column::MetadataJson, Expr::val(repaired))
+                .filter(artifact::Column::Id.eq("nocase"))
+                .exec(&tx)
+                .await
+                .unwrap()
+                .rows_affected,
+            1
+        );
+        f.store
+            .request_html_preview_io_resync(&tx, &scope, &[HtmlPreviewIoFamily::Copies])
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        f.store.notify_html_preview_io_work();
+
+        // This is the actual old SQL source fence, with column collation (no
+        // explicit COLLATE override). A binary-only fixture cannot pass here.
+        let sql_equal = artifact::Entity::find_by_id("nocase")
+            .filter(artifact::Column::CurrentVersionId.is_null())
+            .filter(artifact::Column::MetadataJson.eq(&prepared_from))
+            .one(&f.store.connection)
+            .await
+            .unwrap()
+            .expect("ordinary SQL '=' must falsely equate A.html and a.html");
+        assert_eq!(sql_equal.metadata_json, repaired);
+        assert_ne!(sql_equal.metadata_json, prepared_from);
+        let scope_key = ("seed_copies".to_owned(), scope.key.clone(), 0_i64);
+        assert!(
+            work::Entity::find_by_id(scope_key.clone())
+                .one(&f.store.connection)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        // Process this scoped pass before the stale callback: its newer point
+        // request must survive as well as the repaired source metadata.
+        for _ in 0..2 {
+            let seed = f
+                .store
+                .claim_html_preview_io_work(chrono::Utc::now().timestamp_millis(), 300_000)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(seed.row.family, "seed_copies");
+            assert!(f.store.html_preview_io_seed_quantum(&seed).await.unwrap());
+        }
+        let key = ("copies".to_owned(), io_queue_key("nocase"), 0_i64);
+        let renewed = work::Entity::find_by_id(key.clone())
+            .one(&f.store.connection)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(renewed.requested_revision, old.row.requested_revision);
+        assert_eq!(renewed.claim_token, old.row.claim_token);
+        assert_eq!(renewed.pass_revision, old.row.pass_revision);
+        if claimed {
+            assert!(
+                !f.store
+                    .finish_html_preview_copy_cleanup_claimed(
+                        &old,
+                        &prepared_from,
+                        &prepared_cleanup
+                    )
+                    .await
+                    .unwrap()
+            );
+        } else {
+            assert!(
+                f.store
+                    .finish_html_preview_copy_cleanup("nocase", &prepared_from, &prepared_cleanup)
+                    .await
+                    .is_err()
+            );
+        }
+        let preserved = work::Entity::find_by_id(key.clone())
+            .one(&f.store.connection)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            preserved, renewed,
+            "refusal must neither ACK nor change the durable obligation"
+        );
+        assert_eq!(
+            artifact::Entity::find_by_id("nocase")
+                .one(&f.store.connection)
+                .await
+                .unwrap()
+                .unwrap()
+                .metadata_json,
+            repaired
+        );
+
+        assert!(
+            !f.store
+                .defer_html_preview_io_work(&old, crate::HtmlPreviewIoOutcome::Retry, now)
+                .await
+                .unwrap()
+        );
+        let next = f
+            .store
+            .claim_html_preview_io_work(chrono::Utc::now().timestamp_millis() + 60_000, 300_000)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(next.row.family, "copies");
+        let crate::HtmlPreviewIoSource::Ready((workspace, previous)) =
+            f.store.load_html_preview_io_copies(&next).await.unwrap()
+        else {
+            panic!("repaired copies must remain discoverable")
+        };
+        assert_eq!(workspace, "ws");
+        assert_eq!(previous, repaired);
+        assert!(
+            f.store
+                .finish_html_preview_copy_cleanup_claimed(&next, &previous, cleaned)
+                .await
+                .unwrap()
+        );
+        assert!(
+            work::Entity::find_by_id(key)
+                .one(&f.store.connection)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            artifact::Entity::find_by_id("nocase")
+                .one(&f.store.connection)
+                .await
+                .unwrap()
+                .unwrap()
+                .metadata_json,
+            cleaned
+        );
+    }
+}
+
+#[tokio::test]
+async fn io_legacy_copy_callback_commits_source_and_ack_atomically() {
+    use super::super::html_preview_io_work::{HtmlPreviewIoFamily, request};
+    use pioneer_entity::html_preview_io_work as work;
+    let f = fixture().await;
+    let previous = r#"{"htmlTool":{"retention":"released","releasedCopies":["x"]}}"#;
+    io_copy_source(&f, "callback", previous).await;
+    let tx = f.store.connection.begin().await.unwrap();
+    request(&tx, HtmlPreviewIoFamily::Copies, "callback", 0, "ws")
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    assert!(
+        f.store
+            .finish_html_preview_copy_cleanup("callback", "stale", "{}")
+            .await
+            .is_err()
+    );
+    assert!(
+        work::Entity::find_by_id(("copies".to_owned(), io_queue_key("callback"), 0_i64))
+            .one(&f.store.connection)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    f.store
+        .finish_html_preview_copy_cleanup("callback", previous, "{}")
+        .await
+        .unwrap();
+    assert!(
+        work::Entity::find_by_id(("copies".to_owned(), io_queue_key("callback"), 0_i64))
+            .one(&f.store.connection)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        artifact::Entity::find_by_id("callback")
+            .one(&f.store.connection)
+            .await
+            .unwrap()
+            .unwrap()
+            .metadata_json,
+        "{}"
+    );
+}
+
+#[tokio::test]
+async fn io_released_import_producer_rolls_back_domain_and_obligation_together() {
+    use super::super::artifact::{IngestArtifactMetadataRecord, NewArtifactBlobRecord};
+    use sea_orm::PaginatorTrait;
+    let f = fixture().await;
+    f.sql("UPDATE html_preview_io_work SET state='done',due_at=NULL,seed_version=1")
+        .await;
+    let blob = NewArtifactBlobRecord {
+        workspace_id: "ws".into(),
+        sha256: "a".repeat(64),
+        size_bytes: 1,
+        mime_type: Some("image/png".into()),
+        storage_backend: "local".into(),
+        storage_key: "restore".into(),
+        metadata: Default::default(),
+    };
+    let request = IngestArtifactMetadataRecord {
+        workspace_id: "ws".into(),
+        primary_thread_id: None,
+        display_name: "released".into(),
+        kind: pioneer_protocol::ArtifactKind::Image,
+        mime_type: Some("image/png".into()),
+        created_by_kind: pioneer_protocol::ArtifactCreatedByKind::Tool,
+        created_by_actor_id: Some("html_preview".into()),
+        metadata: std::collections::BTreeMap::from([(
+            "htmlTool".into(),
+            json!({"retention":"released","releasedCopies":["x"]}),
+        )]),
+    };
+    let before = (
+        artifact::Entity::find()
+            .count(&f.store.connection)
+            .await
+            .unwrap(),
+        artifact_blob::Entity::find()
+            .count(&f.store.connection)
+            .await
+            .unwrap(),
+        artifact_version::Entity::find()
+            .count(&f.store.connection)
+            .await
+            .unwrap(),
+    );
+    f.sql("CREATE TRIGGER io_fail_enqueue BEFORE INSERT ON html_preview_io_work WHEN NEW.family='copies' BEGIN SELECT RAISE(ABORT,'injected enqueue failure'); END").await;
+    assert!(
+        f.store
+            .ingest_artifact_metadata_with_identity(
+                blob.clone(),
+                request.clone(),
+                None,
+                Default::default(),
+                None,
+                None,
+                None
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        before,
+        (
+            artifact::Entity::find()
+                .count(&f.store.connection)
+                .await
+                .unwrap(),
+            artifact_blob::Entity::find()
+                .count(&f.store.connection)
+                .await
+                .unwrap(),
+            artifact_version::Entity::find()
+                .count(&f.store.connection)
+                .await
+                .unwrap()
+        )
+    );
+    f.sql("DROP TRIGGER io_fail_enqueue").await;
+    let imported = f
+        .store
+        .ingest_artifact_metadata_with_identity(
+            blob,
+            request,
+            None,
+            Default::default(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(imported.artifact.current_version_id.is_none());
+    let claim = f
+        .store
+        .claim_html_preview_io_work(chrono::Utc::now().timestamp_millis(), 60_000)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(claim.source_id(), imported.artifact.id);
+    assert!(matches!(
+        f.store.load_html_preview_io_copies(&claim).await.unwrap(),
+        crate::HtmlPreviewIoSource::Ready(_)
+    ));
+}
+
+#[tokio::test]
+async fn io_startup_does_not_spin_while_runtime_owns_seed_claims() {
+    let f = fixture().await;
+    let now = chrono::Utc::now().timestamp_millis();
+    let first = f
+        .store
+        .claim_html_preview_io_work(now, 300_000)
+        .await
+        .unwrap()
+        .unwrap();
+    let second = f
+        .store
+        .claim_html_preview_io_work(now, 300_000)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(first.row.family.starts_with("seed_") && second.row.family.starts_with("seed_"));
+    f.routes.reset();
+    assert!(
+        !f.store
+            .html_preview_io_seed_startup_quantum()
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        f.routes.counts().1,
+        0,
+        "occupied durable seeds do not cause startup claim writes"
+    );
+}
+
+#[tokio::test]
+async fn io_long_source_locator_seed_and_claim_are_lossless_and_collision_checked() {
+    use super::super::html_preview_io_work::{
+        HtmlPreviewIoFamily, HtmlPreviewIoLocator, request, request_prepared,
+    };
+    let f = fixture().await;
+    let id = "legacy-source-".repeat(1024);
+    let metadata = r#"{"htmlTool":{"retention":"released","releasedCopies":["x"]}}"#;
+    io_copy_source(&f, &id, metadata).await;
+    for _ in 0..16 {
+        if !f
+            .store
+            .html_preview_io_seed_startup_quantum()
+            .await
+            .unwrap()
+        {
+            break;
+        }
+    }
+    let claim = f
+        .store
+        .claim_html_preview_io_work(chrono::Utc::now().timestamp_millis(), 60_000)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(claim.row.object_id.len(), 64);
+    assert_eq!(claim.source_id(), id);
+    assert!(matches!(
+        f.store.load_html_preview_io_copies(&claim).await.unwrap(),
+        crate::HtmlPreviewIoSource::Ready(_)
+    ));
+    let tx = f.store.connection.begin().await.unwrap();
+    request(&tx, HtmlPreviewIoFamily::Copies, &id, 0, "ws")
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    assert!(
+        f.store
+            .finish_html_preview_copy_cleanup_claimed(&claim, metadata, "{}")
+            .await
+            .unwrap()
+    );
+    let next = f
+        .store
+        .claim_html_preview_io_work(chrono::Utc::now().timestamp_millis(), 60_000)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        next.source_id(),
+        id,
+        "new request must preserve full point locator"
+    );
+    let tx = f.store.connection.begin().await.unwrap();
+    let collision = HtmlPreviewIoLocator {
+        source_id: "different source".into(),
+        key: claim.row.object_id,
+    };
+    assert!(
+        request_prepared(&tx, HtmlPreviewIoFamily::Copies, &collision, 0, "ws")
+            .await
+            .is_err()
+    );
+    tx.rollback().await.unwrap();
+}
+
+#[tokio::test]
+async fn io_witness_seed_ignores_verified_and_expired_history() {
+    use pioneer_entity::html_preview_io_work as work;
+    let f = fixture().await;
+    for (id, expired, hash) in [
+        ("pending", false, None),
+        ("verified", false, Some("a".repeat(64))),
+        ("expired", true, None),
+    ] {
+        manifest(&f, id, "parent", &[], &[], 0, None).await;
+        frozen_result::Entity::insert(frozen_result::ActiveModel {
+            manifest_id: Set(id.into()),
+            ordinal: Set(0),
+            reference_json: Set("{}".into()),
+            turn_id: Set("parent-turn".into()),
+            source_id: Set("missing-source".into()),
+            source_version: Set("revision:1".into()),
+            archive_wire_sha256: Set(hash),
+        })
+        .exec_without_returning(&f.store.connection)
+        .await
+        .unwrap();
+        if expired {
+            history::Entity::update_many()
+                .col_expr(history::Column::Expired, Expr::val(1))
+                .filter(history::Column::Id.eq(id))
+                .exec(&f.store.connection)
+                .await
+                .unwrap();
+        }
+    }
+    for _ in 0..16 {
+        if !f
+            .store
+            .html_preview_io_seed_startup_quantum()
+            .await
+            .unwrap()
+        {
+            break;
+        }
+    }
+    for (id, expected) in [("pending", true), ("verified", false), ("expired", false)] {
+        assert_eq!(
+            work::Entity::find_by_id(("witness".to_owned(), io_queue_key(id), 0_i64))
+                .one(&f.store.connection)
+                .await
+                .unwrap()
+                .is_some(),
+            expected
+        );
+    }
+}
+
+#[tokio::test]
+async fn io_malformed_point_locator_quarantines_and_next_ticket_progresses() {
+    use super::super::html_preview_io_work::{HtmlPreviewIoFamily, request};
+    use pioneer_entity::html_preview_io_work as work;
+    let f = fixture().await;
+    f.sql("UPDATE html_preview_io_work SET state='done',due_at=NULL,seed_version=1")
+        .await;
+    io_copy_source(
+        &f,
+        "good",
+        r#"{"htmlTool":{"retention":"released","releasedCopies":["x"]}}"#,
+    )
+    .await;
+    let tx = f.store.connection.begin().await.unwrap();
+    request(&tx, HtmlPreviewIoFamily::Copies, "bad", 0, "ws")
+        .await
+        .unwrap();
+    request(&tx, HtmlPreviewIoFamily::Copies, "good", 0, "ws")
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    work::Entity::update_many()
+        .filter(work::Column::ObjectId.eq(io_queue_key("bad")))
+        .col_expr(work::Column::CursorId, Expr::val(None::<String>))
+        .col_expr(work::Column::DueAt, Expr::val(-1_i64))
+        .exec(&f.store.connection)
+        .await
+        .unwrap();
+    let bad = f
+        .store
+        .claim_html_preview_io_work(0, 60_000)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        f.store.load_html_preview_io_copies(&bad).await.unwrap(),
+        crate::HtmlPreviewIoSource::Quarantine
+    ));
+    assert!(
+        f.store
+            .defer_html_preview_io_work(&bad, crate::HtmlPreviewIoOutcome::Quarantine, 0)
+            .await
+            .unwrap()
+    );
+    let good = f
+        .store
+        .claim_html_preview_io_work(0, 60_000)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(good.source_id(), "good");
+    assert!(matches!(
+        f.store.load_html_preview_io_copies(&good).await.unwrap(),
+        crate::HtmlPreviewIoSource::Ready(_)
+    ));
+}
+
+#[tokio::test]
+async fn io_generic_claim_admits_point_work_during_continuous_resync() {
+    use super::super::html_preview_io_work::{
+        HtmlPreviewIoFamily, HtmlPreviewIoLocator, request_at, request_prepared,
+    };
+    let f = fixture().await;
+    f.sql("UPDATE html_preview_io_work SET state='done',due_at=NULL,seed_version=1")
+        .await;
+    let metadata = r#"{"htmlTool":{"retention":"released","releasedCopies":["x"]}}"#;
+    for id in ["a", "b", "c"] {
+        io_copy_source(&f, id, metadata).await;
+    }
+    let workspace = HtmlPreviewIoLocator::new("ws");
+    let point = HtmlPreviewIoLocator::new("point");
+    let tx = f.store.connection.begin().await.unwrap();
+    request_at(&tx, HtmlPreviewIoFamily::SeedCopies, &workspace, 0, "ws", 0)
+        .await
+        .unwrap();
+    request_at(&tx, HtmlPreviewIoFamily::Witness, &point, 0, "ws", 0)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    let mut point_seen = false;
+    let mut seed_quanta = 0;
+    for _ in 0..32 {
+        let now = chrono::Utc::now().timestamp_millis();
+        let claim = f
+            .store
+            .claim_html_preview_io_work(now, 60_000)
+            .await
+            .unwrap()
+            .unwrap();
+        match claim.row.family.as_str() {
+            "seed_copies" => {
+                assert!(f.store.html_preview_io_seed_quantum(&claim).await.unwrap());
+                seed_quanta += 1;
+            }
+            "witness" => {
+                point_seen = true;
+                assert!(
+                    f.store
+                        .defer_html_preview_io_work(&claim, crate::HtmlPreviewIoOutcome::Done, now)
+                        .await
+                        .unwrap()
+                );
+            }
+            "copies" => {
+                assert!(
+                    f.store
+                        .finish_html_preview_copy_cleanup_claimed(&claim, metadata, "{}")
+                        .await
+                        .unwrap()
+                );
+            }
+            family => panic!("unexpected family {family}"),
+        }
+        let tx = f.store.connection.begin().await.unwrap();
+        request_prepared(&tx, HtmlPreviewIoFamily::SeedCopies, &workspace, 0, "ws")
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        if point_seen && seed_quanta >= 3 {
+            break;
+        }
+    }
+    assert!(point_seen, "resync must not starve point witnesses");
+    assert!(
+        seed_quanta >= 3,
+        "point admission must preserve seed progress"
+    );
+}
+
+#[tokio::test]
+async fn io_index_enqueue_failure_rolls_back_result_and_progress() {
+    use pioneer_entity::html_preview_io_work as work;
+    let f = fixture().await;
+    let mut message = reference(
+        SourceRef {
+            scope: "context:parent-turn".into(),
+            id: "context".into(),
+            version: "revision:1".into(),
+        },
+        "parent",
+        None,
+    );
+    message.tool_name = Some("html_preview".into());
+    manifest(&f, "index-obligation", "parent", &[message], &[], 0, None).await;
+    let before = f.marker("index-obligation").await;
+    f.sql("CREATE TRIGGER reject_io_enqueue BEFORE INSERT ON html_preview_io_work WHEN NEW.family='witness' BEGIN SELECT RAISE(ABORT,'fixture enqueue failure'); END").await;
+    let mut after = String::new();
+    let mut imports = None;
+    assert!(
+        index_quantum(&f.store, &mut after, &mut imports)
+            .await
+            .is_err()
+    );
+    assert_eq!(f.marker("index-obligation").await, before);
+    assert!(
+        frozen_result::Entity::find_by_id(("index-obligation".to_owned(), 0_i64))
+            .one(&f.store.connection)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        work::Entity::find_by_id((
+            "witness".to_owned(),
+            io_queue_key("index-obligation"),
+            0_i64
+        ))
+        .one(&f.store.connection)
+        .await
+        .unwrap()
+        .is_none()
+    );
+    f.sql("DROP TRIGGER reject_io_enqueue").await;
+    after.clear();
+    assert!(
+        index_quantum(&f.store, &mut after, &mut imports)
+            .await
+            .unwrap()
+    );
+    assert!(
+        frozen_result::Entity::find_by_id(("index-obligation".to_owned(), 0_i64))
+            .one(&f.store.connection)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        work::Entity::find_by_id((
+            "witness".to_owned(),
+            io_queue_key("index-obligation"),
+            0_i64
+        ))
+        .one(&f.store.connection)
+        .await
+        .unwrap()
+        .is_some()
+    );
+}
+
+#[tokio::test]
+async fn io_lost_source_ack_response_recovers_newer_request_after_restart() {
+    use super::super::html_preview_io_work::{HtmlPreviewIoFamily, request};
+    let f = fixture().await;
+    f.sql("UPDATE html_preview_io_work SET state='done',due_at=NULL,seed_version=1")
+        .await;
+    let metadata = r#"{"htmlTool":{"retention":"released","releasedCopies":["x"]}}"#;
+    io_copy_source(&f, "lost-ack", metadata).await;
+    let tx = f.store.connection.begin().await.unwrap();
+    request(&tx, HtmlPreviewIoFamily::Copies, "lost-ack", 0, "ws")
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    let old = f
+        .store
+        .claim_html_preview_io_work(0, 60_000)
+        .await
+        .unwrap()
+        .unwrap();
+    // Source preparation precedes a producer's newer requested revision.
+    let tx = f.store.connection.begin().await.unwrap();
+    request(&tx, HtmlPreviewIoFamily::Copies, "lost-ack", 0, "ws")
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    // Deliberately lose the response of the actual source+ACK API, rather than
+    // pretending that a failed driver response establishes rollback or empty.
+    drop(
+        f.store
+            .finish_html_preview_copy_cleanup_claimed(&old, metadata, "{}")
+            .await,
+    );
+    let restarted = CrudStore::new(f.store.database_connection()).with_maintenance_access();
+    assert_eq!(
+        artifact::Entity::find_by_id("lost-ack")
+            .one(&restarted.connection)
+            .await
+            .unwrap()
+            .unwrap()
+            .metadata_json,
+        "{}"
+    );
+    let now = chrono::Utc::now().timestamp_millis();
+    let newer = restarted
+        .claim_html_preview_io_work(now, 60_000)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(newer.row.pass_revision, old.row.pass_revision);
+    assert!(matches!(
+        restarted.load_html_preview_io_copies(&newer).await.unwrap(),
+        crate::HtmlPreviewIoSource::Obsolete
+    ));
+    assert!(
+        restarted
+            .defer_html_preview_io_work(&newer, crate::HtmlPreviewIoOutcome::Done, now)
+            .await
+            .unwrap()
+    );
+    assert!(
+        restarted
+            .claim_html_preview_io_work(now, 60_000)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn io_seed_revision_and_frontier_capture_the_same_committed_request() {
+    use super::super::html_preview_io_work::{HtmlPreviewIoFamily, request};
+    use pioneer_entity::html_preview_io_work as work;
+    let f = fixture().await;
+    f.sql("UPDATE html_preview_io_work SET state='done',due_at=NULL,seed_version=1 WHERE family='seed_witness'").await;
+    let metadata = r#"{"htmlTool":{"retention":"released","releasedCopies":["x"]}}"#;
+    io_copy_source(&f, "a", metadata).await;
+    let claim = f
+        .store
+        .claim_html_preview_io_work(0, 60_000)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(claim.row.family, "seed_copies");
+    // A repair arrives after claim but before the pass has a frontier.
+    io_copy_source(&f, "b", metadata).await;
+    let tx = f.store.connection.begin().await.unwrap();
+    request(&tx, HtmlPreviewIoFamily::SeedCopies, "", 0, "")
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    assert!(f.store.html_preview_io_seed_quantum(&claim).await.unwrap());
+    let row = work::Entity::find_by_id(("seed_copies".to_owned(), String::new(), 0_i64))
+        .one(&f.store.connection)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(row.requested_revision, claim.row.requested_revision);
+    assert_eq!(row.pass_revision, row.requested_revision);
+    assert_eq!(row.upper_id.as_deref(), Some("b"));
+    assert_eq!(row.cursor_id.as_deref(), Some("a"));
+}
+
+#[tokio::test]
+async fn io_business_retry_preserves_cas_class_through_artifact_error_boundary() {
+    use super::super::artifact::ArtifactCrudError;
+    use super::super::html_preview_io_work::{CasRace, into_database_error};
+    for conflict in [true, false] {
+        let f = fixture().await;
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let store = &f.store;
+        let result: Result<()> = store
+            .run_serialized_write(|| {
+                let attempt = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async move {
+                    let tx = store.connection.begin().await?;
+                    if attempt == 0 {
+                        tx.rollback().await?;
+                        let error: anyhow::Error = if conflict {
+                            CasRace.into()
+                        } else {
+                            anyhow::anyhow!("unknown outcome")
+                        };
+                        return Err(ArtifactCrudError::Database {
+                            message: "enqueue failed".into(),
+                            source: into_database_error(error),
+                        }
+                        .into());
+                    }
+                    tx.commit().await?;
+                    Ok(())
+                }
+            })
+            .await;
+        assert_eq!(result.is_ok(), conflict);
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            if conflict { 2 } else { 1 }
+        );
+        let tx = f.store.connection.begin().await.unwrap();
+        tx.rollback().await.unwrap();
+    }
+}

@@ -172,6 +172,21 @@ impl CrudStore {
                 task_occurrence_contract::Entity::insert(prepared_occurrence.clone())
                     .exec(&transaction)
                     .await?;
+                let occurrence_row =
+                    task_actor_contract::find_task_occurrence_row_by_run(&transaction, &run.id)
+                        .await?
+                        .context("webhook occurrence disappeared after insert")?;
+                crate::repositories::task_occurrence_producers::contract_change(
+                    &transaction,
+                    None,
+                    Some(&occurrence_row),
+                )
+                .await?;
+                crate::repositories::task_child_producers::occurrence_identity(
+                    &transaction,
+                    &run.id,
+                )
+                .await?;
                 Ok(Some(appended))
             }
             .await;

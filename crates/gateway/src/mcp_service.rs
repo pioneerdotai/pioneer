@@ -3605,7 +3605,7 @@ impl McpService {
         let _activity = tokio::select! { biased;
             _ = cancel.cancelled() => return Err(TurnMcpInvocationError::new(
                 TurnMcpInvocationErrorCode::Cancelled, "HTML image delivery was cancelled")),
-            guard = processor.artifact_service.html_preview_activity() => guard,
+            guard = processor.artifact_service.html_preview_activity_signaled() => guard,
         };
         let context = pioneer_agent::TurnToolContext {
             workspace_id: validated.invocation.workspace_id.clone(),
@@ -4637,7 +4637,7 @@ mod tests {
         let artifacts =
             ArtifactService::new(store, Arc::new(LocalArtifactBlobStore::new(root.path())));
         // Match the production caller's retention protection across every read.
-        let _activity = artifacts.html_preview_activity().await;
+        let _activity = artifacts.html_preview_activity_signaled().await;
         let frames = [
             ("light", 360u32),
             ("light", 768),
@@ -5141,7 +5141,7 @@ mod tests {
             );
             self.calls.fetch_add(1, Ordering::SeqCst);
             if let Some((artifacts, retained)) = &self.replay {
-                let _activity = artifacts.html_preview_activity().await;
+                let _activity = artifacts.html_preview_activity_signaled().await;
                 let mut value = retained.clone();
                 let content = html_preview_mcp_content(
                     artifacts,

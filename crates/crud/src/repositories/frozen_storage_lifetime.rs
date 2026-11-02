@@ -57,6 +57,7 @@ pub struct FrozenStorageLifetimeProgress {
     proof_pending: VecDeque<String>,
     proof: Option<checkpoint_proofs::GraphPreparation>,
     expiry_after: String,
+    expiry_pending: VecDeque<history::Model>,
     expiry: Option<ExpiryPreparation>,
     sweep: Option<SweepPreparation>,
     sweep_pending: VecDeque<SweepPreparation>,
@@ -2089,16 +2090,21 @@ impl FrozenStorageLifetimeProgress {
             }
             return Ok(true);
         }
-        // The existing (expired, ready, id) index selects one lightweight
-        // header directly. No payload lives in this Entity; the writer still
-        // revalidates the complete header and root/hold observations.
-        let header = history::Entity::find()
-            .filter(history::Column::Expired.eq(0))
-            .filter(history::Column::Ready.eq(1))
-            .filter(history::Column::Id.gt(&self.expiry_after))
-            .order_by_asc(history::Column::Id)
-            .one(&store.connection)
-            .await?;
+        // Only lightweight headers live in this Entity; payloads remain in
+        // separate tables. Prefetch is advisory: ExpiryPreparation and expire
+        // preserve individual root/hold checks and exact writer revalidation.
+        if self.expiry_pending.is_empty() {
+            self.expiry_pending = history::Entity::find()
+                .filter(history::Column::Expired.eq(0))
+                .filter(history::Column::Ready.eq(1))
+                .filter(history::Column::Id.gt(&self.expiry_after))
+                .order_by_asc(history::Column::Id)
+                .limit(16)
+                .all(&store.connection)
+                .await?
+                .into();
+        }
+        let header = self.expiry_pending.pop_front();
         if let Some(header) = header {
             self.expiry_after = header.id.clone();
             ensure!(counter_health(&header), "corrupt expiry counters");

@@ -349,6 +349,7 @@ pub async fn insert_user_thread_with_creator<C: ConnectionTrait>(
     .await
     .context("failed to insert user thread")?;
 
+    super::task_child_producers::thread(db, &thread_model.id).await?;
     Ok(())
 }
 
@@ -386,6 +387,13 @@ async fn upsert_thread_with_actor_columns_prepared<C: ConnectionTrait>(
     created_at: DateTimeWithTimeZone,
     updated_at: DateTimeWithTimeZone,
 ) -> Result<()> {
+    let old_workspace = thread::Entity::find_by_id(&thread_model.id)
+        .select_only()
+        .column(thread::Column::WorkspaceId)
+        .lock_exclusive()
+        .into_tuple::<String>()
+        .one(db)
+        .await?;
     thread::Entity::insert(thread::ActiveModel {
         workspace_unread_started_at: sea_orm::NotSet,
         id: Set(thread_model.id.clone()),
@@ -451,6 +459,9 @@ async fn upsert_thread_with_actor_columns_prepared<C: ConnectionTrait>(
     .await
     .context("failed to upsert thread")?;
 
+    if old_workspace.as_ref() != Some(&thread_model.workspace_id) {
+        super::task_child_producers::thread(db, &thread_model.id).await?;
+    }
     Ok(())
 }
 

@@ -4424,25 +4424,37 @@ async fn fixture(
     target_fits: bool,
     observer_fails: bool,
 ) -> Fixture {
-    fixture_with_canonical_payload(
-        serde_json::to_string(&pioneer_crud::CanonicalTurnEventPayload::ItemCompleted(
-            pioneer_protocol::ItemCompletedNotification {
-                workspace_id: "ws".into(),
-                thread_id: "thread".into(),
-                turn_id: "turn".into(),
-                item: pioneer_protocol::TurnItem::AgentMessage {
-                    id: "fixture-agent-message".into(),
-                    text: text.into(),
-                    phase: Default::default(),
-                    markdown: None,
-                    markdown_version: None,
+    fixture_with_database_observer(text, replies, target_fits, observer_fails, None).await
+}
+async fn fixture_with_database_observer(
+    text: &str,
+    replies: Vec<Reply>,
+    target_fits: bool,
+    observer_fails: bool,
+    database_observer: Option<Arc<HistoryReadObserver>>,
+) -> Fixture {
+    fixture_with_canonical_payloads_and_observer(
+        vec![
+            serde_json::to_string(&pioneer_crud::CanonicalTurnEventPayload::ItemCompleted(
+                pioneer_protocol::ItemCompletedNotification {
+                    workspace_id: "ws".into(),
+                    thread_id: "thread".into(),
+                    turn_id: "turn".into(),
+                    item: pioneer_protocol::TurnItem::AgentMessage {
+                        id: "fixture-agent-message".into(),
+                        text: text.into(),
+                        phase: Default::default(),
+                        markdown: None,
+                        markdown_version: None,
+                    },
                 },
-            },
-        ))
-        .unwrap(),
+            ))
+            .unwrap(),
+        ],
         replies,
         target_fits,
         observer_fails,
+        database_observer,
     )
     .await
 }
