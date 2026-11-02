@@ -1337,7 +1337,7 @@ async fn portable_unavailable_history_pages_yield_and_revisit_without_blocking_o
     for i in 0..130 {
         let id = format!("a-{i:03}");
         store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-            "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES(?,'task',?,1,1,'succeeded','agent')", [id.clone().into(), id.clone().into()]
+            "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES(?,'task',?,1,?,'succeeded','agent')", [id.clone().into(), id.clone().into(), (i64::from(i) + 2).into()]
         )).await.unwrap();
         input.run_id = id;
         store
@@ -1361,7 +1361,7 @@ async fn portable_unavailable_history_pages_yield_and_revisit_without_blocking_o
         0
     );
     store.database_connection().execute_unprepared(
-        "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES('zz-legacy','task','zz-legacy',1,1,'succeeded','agent')"
+        "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES('zz-legacy','task','zz-legacy',1,132,'succeeded','agent')"
     ).await.unwrap();
     input.run_id = "zz-legacy".into();
     input.history_json = r#"[{"role":"user","content":"legacy inline"}]"#.into();

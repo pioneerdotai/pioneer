@@ -2000,9 +2000,9 @@ mod tests {
         store.connection.execute_unprepared(
             "INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,created_by_turn_id,executor_kind,status,title,goal) VALUES('task','ws','thread','thread','thread','turn','agent','running','fixture','fixture')"
         ).await.unwrap();
-        for id in ["a-skip", "b-damaged"] {
+        for (number, id) in [(1_i64, "a-skip"), (2, "b-damaged")] {
             store.connection.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-                "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES(?,'task',?,1,1,'succeeded','agent')", [id.into(), id.into()]
+                "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES(?,'task',?,1,?,'succeeded','agent')", [id.into(), id.into(), number.into()]
             )).await.unwrap();
             store.connection.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
                 "INSERT INTO compaction_frozen_history(id,workspace_id,owner_thread,identity_sha256,message_count,next_ordinal,import_count,next_import,imports_sha256,ready) VALUES(?,'ws','thread',?,0,0,0,0,'',1)", [id.into(), "a".repeat(64).into()]
