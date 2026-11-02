@@ -1485,12 +1485,35 @@ pub enum TurnFinalizationCommitOutcome {
     SupersededByTerminalStatus(TurnStatus),
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default)]
 pub struct TurnFinalizationReconciliationSummary {
+    /// Selected intents which failed; successful commits are still returned.
+    pub failures: Vec<std::sync::Arc<anyhow::Error>>,
+    pub pass_complete: bool,
+    pub pass_failed: bool,
     pub scanned: u64,
     pub committed: Vec<CommittedTurnFinalization>,
     pub deferred_by_predecessor: u64,
     pub superseded_by_terminal_status: u64,
+}
+
+// Preserve value comparison for callers of the existing summary API. Error
+// chains have no native PartialEq; compare their contextual display values.
+impl PartialEq for TurnFinalizationReconciliationSummary {
+    fn eq(&self, other: &Self) -> bool {
+        self.scanned == other.scanned
+            && self.committed == other.committed
+            && self.deferred_by_predecessor == other.deferred_by_predecessor
+            && self.superseded_by_terminal_status == other.superseded_by_terminal_status
+            && self.pass_complete == other.pass_complete
+            && self.pass_failed == other.pass_failed
+            && self.failures.len() == other.failures.len()
+            && self
+                .failures
+                .iter()
+                .zip(&other.failures)
+                .all(|(left, right)| format!("{left:#}") == format!("{right:#}"))
+    }
 }
 
 impl TurnFinalizationReconciliationSummary {
@@ -1736,6 +1759,14 @@ pub struct ClaimedTurnEventDeliveryRecord {
     pub attempt_count: i64,
     pub claim_token: String,
     pub event: AppendedTurnEvent,
+}
+
+/// One advisory discovery page and its conditional claims. The clock is the
+/// earliest eligible row observed, including future retry/lease obligations.
+#[derive(Debug, Default)]
+pub struct TurnEventDeliveryClaimBatch {
+    pub deliveries: Vec<ClaimedTurnEventDeliveryRecord>,
+    pub next_eligible_at_unix: Option<i64>,
 }
 
 /// A terminal task-owned child Turn whose TaskRun aggregate has not yet
@@ -2099,6 +2130,9 @@ pub struct TurnItemAttemptDeadlines {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TurnProjectionReplaySummary {
+    /// Earliest eligible clock from this replay's last bounded discovery.
+    /// Advisory only: foreign changes are still discovered on every poll.
+    pub next_eligible_at_unix: Option<i64>,
     pub claimed: usize,
     pub projected: usize,
     pub deferred: usize,
@@ -3124,6 +3158,7 @@ pub struct CrudStore {
     episodic_claim_fault: std::sync::Arc<std::sync::Mutex<Option<(String, &'static str)>>>,
     #[cfg(any(test, feature = "test-support"))]
     episodic_claim_discoveries: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    finalization_cursor: std::sync::Arc<tokio::sync::Mutex<turn_finalization::PreparedPass>>,
     episodic_work: std::sync::Arc<tokio::sync::Notify>,
     frozen_readers: frozen_lifetime::ReaderCounts,
     legacy_task_text_cursors:
@@ -4719,6 +4754,7 @@ impl CrudStore {
     pub fn new(connection: impl Into<SqliteDatabase>) -> Self {
         Self {
             connection: connection.into(),
+            finalization_cursor: Default::default(),
             episodic_work: std::sync::Arc::new(tokio::sync::Notify::new()),
             frozen_readers: Default::default(),
             legacy_task_text_cursors: Default::default(),
@@ -5339,25 +5375,68 @@ impl CrudStore {
             .collect()
     }
 
+    /// Advisory timers; errors remain errors, never evidence of an empty queue.
+    pub async fn next_turn_event_delivery_deadline(&self, consumer: &str) -> Result<Option<i64>> {
+        Ok(
+            turn_event_delivery::next_deadline(&self.connection, consumer)
+                .await?
+                .map(|at| at.timestamp()),
+        )
+    }
+
+    pub async fn next_turn_event_projection_deadline(&self) -> Result<Option<i64>> {
+        Ok(turn_event_projection_state::next_deadline(&self.connection)
+            .await?
+            .map(|at| at.timestamp()))
+    }
+
     pub async fn claim_due_turn_event_deliveries(
         &self,
         consumer: &str,
         now_unix: i64,
         limit: u64,
     ) -> Result<Vec<ClaimedTurnEventDeliveryRecord>> {
+        Ok(self
+            .claim_due_turn_event_deliveries_with_deadline(consumer, now_unix, limit)
+            .await?
+            .deliveries)
+    }
+
+    pub async fn claim_due_turn_event_deliveries_with_deadline(
+        &self,
+        consumer: &str,
+        now_unix: i64,
+        limit: u64,
+    ) -> Result<TurnEventDeliveryClaimBatch> {
+        // One compact reader discovery supplies both due IDs and an eligible
+        // timer. Empty polls need no second query, writer or payload load.
+        let page = turn_event_delivery::discover(&self.connection, consumer, limit).await?;
+        let next_eligible_at_unix = page.first().map(|(_, at)| at.timestamp());
+        let candidates = page
+            .into_iter()
+            .filter(|(_, at)| *at <= unix_to_datetime(now_unix))
+            .map(|(id, _)| id)
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            return Ok(TurnEventDeliveryClaimBatch {
+                deliveries: Vec::new(),
+                next_eligible_at_unix,
+            });
+        }
         let consumer = consumer.to_owned();
         let claimed = self
             .run_serialized_write(|| {
                 let consumer = consumer.clone();
+                let candidates = candidates.clone();
                 async move {
                     let now = unix_to_datetime(now_unix);
                     let claim_expires_at = unix_to_datetime(now_unix.saturating_add(120));
-                    turn_event_delivery::claim_due(
+                    turn_event_delivery::claim_candidates(
                         &self.connection,
                         &consumer,
                         now,
                         claim_expires_at,
-                        limit,
+                        candidates.clone(),
                     )
                     .await
                 }
@@ -5383,7 +5462,10 @@ impl CrudStore {
                 event,
             });
         }
-        Ok(records)
+        Ok(TurnEventDeliveryClaimBatch {
+            deliveries: records,
+            next_eligible_at_unix,
+        })
     }
 
     pub async fn complete_turn_event_delivery(
@@ -14917,14 +14999,7 @@ impl CrudStore {
     }
 
     pub async fn list_prepared_turn_finalization_ids(&self, limit: u64) -> Result<Vec<String>> {
-        self.run_serialized_write(|| async {
-            Ok(turn_finalization::list_prepared(&self.connection, limit)
-                .await?
-                .into_iter()
-                .map(|row| row.turn_id)
-                .collect())
-        })
-        .await
+        turn_finalization::list_prepared_ids(&self.connection, limit).await
     }
 
     /// Returns whether this Turn participates in the atomic execution-success
@@ -14932,15 +15007,7 @@ impl CrudStore {
     /// intent before publishing success; only older workers retain the legacy
     /// terminal event path during expand/migrate/contract rollout.
     pub async fn has_turn_finalization_intent(&self, turn_id: &str) -> Result<bool> {
-        let turn_id = turn_id.to_owned();
-        self.run_serialized_write(|| async {
-            Ok(
-                turn_finalization::find_by_turn_id(&self.connection, turn_id.as_str())
-                    .await?
-                    .is_some(),
-            )
-        })
-        .await
+        turn_finalization::exists(&self.connection, turn_id).await
     }
 
     pub async fn reconcile_prepared_turn_finalizations(
@@ -14948,30 +15015,62 @@ impl CrudStore {
         limit: u64,
         event_timestamp_secs: i64,
     ) -> Result<TurnFinalizationReconciliationSummary> {
-        let turn_ids = self
-            .list_prepared_turn_finalization_ids(limit)
-            .await
-            .context(NativeFinalizationPhase::Scan)?;
+        if limit == 0 {
+            return Ok(TurnFinalizationReconciliationSummary::default());
+        }
+        // Serialize only this domain owner's cursor, never database capacity.
+        // One bounded eligible page per call; failures advance too, then retry
+        // after the pass wraps. Discovery errors leave the cursor unchanged.
+        let mut pass = self.finalization_cursor.lock().await;
+        if pass.upper.is_none() {
+            pass.upper = turn_finalization::prepared_upper(&self.connection)
+                .await
+                .context(NativeFinalizationPhase::Scan)?;
+        }
+        let Some(upper) = pass.upper.as_ref() else {
+            return Ok(TurnFinalizationReconciliationSummary {
+                pass_complete: true,
+                ..Default::default()
+            });
+        };
+        let page = turn_finalization::list_eligible_prepared(
+            &self.connection,
+            pass.after.as_ref(),
+            upper,
+            limit,
+        )
+        .await
+        .context(NativeFinalizationPhase::Scan)?;
+        let complete = (page.len() as u64) < limit;
+        let last = page.last().cloned();
         let mut summary = TurnFinalizationReconciliationSummary::default();
-        for turn_id in turn_ids {
+        for candidate in page {
             summary.scanned = summary.scanned.saturating_add(1);
             match self
-                .commit_prepared_turn_finalization(turn_id.as_str(), event_timestamp_secs)
+                .commit_prepared_turn_finalization(candidate.turn_id.as_str(), event_timestamp_secs)
                 .await
-                .with_context(|| format!("failed to reconcile finalization for turn `{turn_id}`"))?
             {
-                TurnFinalizationCommitOutcome::Committed(committed) => {
+                Ok(TurnFinalizationCommitOutcome::Committed(committed)) => {
                     summary.committed.push(committed);
                 }
-                TurnFinalizationCommitOutcome::DeferredByPredecessor => {
+                Ok(TurnFinalizationCommitOutcome::DeferredByPredecessor) => {
                     summary.deferred_by_predecessor =
                         summary.deferred_by_predecessor.saturating_add(1);
                 }
-                TurnFinalizationCommitOutcome::SupersededByTerminalStatus(_) => {
+                Ok(TurnFinalizationCommitOutcome::SupersededByTerminalStatus(_)) => {
                     summary.superseded_by_terminal_status =
                         summary.superseded_by_terminal_status.saturating_add(1);
                 }
+                Err(error) => summary.failures.push(std::sync::Arc::new(error)),
             }
+        }
+        pass.failed |= !summary.failures.is_empty();
+        summary.pass_complete = complete;
+        summary.pass_failed = pass.failed;
+        if complete {
+            *pass = turn_finalization::PreparedPass::default();
+        } else {
+            pass.after = last;
         }
         Ok(summary)
     }
@@ -14994,7 +15093,6 @@ impl CrudStore {
                     .await
                     .context(NativeFinalizationPhase::Preparation)?
                     .with_context(|| format!("turn `{turn_id}` has no finalization intent"))?;
-            let final_item = turn_finalization::notification_from_model(&prepared_intent)?;
             let prepared_turn = turn::find_turn_by_thread_and_id(
                 &self.connection,
                 prepared_intent.thread_id.as_str(),
@@ -15003,6 +15101,23 @@ impl CrudStore {
             .await
             .context(NativeFinalizationPhase::Preparation)?
             .with_context(|| format!("turn `{turn_id}` disappeared during finalization"))?;
+            // Advisory only: do not decode/render the final answer or prepare
+            // two events for a prefix which cannot yet commit. Terminal Turns
+            // still reach authoritative supersession/idempotent reconciliation.
+            // The writer below repeats the prefix proof: a concurrent append
+            // after this read must not allow finalization to overtake it.
+            if prepared_intent.status == turn_finalization::STATUS_PREPARED
+                && prepared_turn.status == "in_progress"
+                && turn_event_projection_state::has_unprojected_event(
+                    &self.connection,
+                    turn_id.as_str(),
+                )
+                .await
+                .context(NativeFinalizationPhase::Preparation)?
+            {
+                return Ok(TurnFinalizationCommitOutcome::DeferredByPredecessor);
+            }
+            let final_item = turn_finalization::notification_from_model(&prepared_intent)?;
             let prepared_thread =
                 thread::find_thread_by_id(&self.connection, prepared_intent.thread_id.as_str())
                     .await
@@ -32714,13 +32829,23 @@ impl CrudStore {
         // each Turn. Refill after projecting those events so one healthy stream
         // can still use the replay budget without monopolizing the first batch.
         while remaining > 0 {
+            let page = turn_event_projection_state::discover(&self.connection, remaining).await?;
+            summary.next_eligible_at_unix = page.first().map(|(_, at)| at.timestamp());
+            let candidates = page
+                .into_iter()
+                .filter(|(_, at)| *at <= now)
+                .map(|(id, _)| id)
+                .collect::<Vec<_>>();
+            if candidates.is_empty() {
+                break;
+            }
             let claimed = self
                 .run_serialized_write(|| {
-                    turn_event_projection_state::claim_due(
+                    turn_event_projection_state::claim_candidates(
                         &self.connection,
                         now,
                         claim_expires_at,
-                        remaining,
+                        candidates.clone(),
                     )
                 })
                 .await?;
@@ -38295,6 +38420,224 @@ mod tests {
         );
     }
 
+    async fn prepare_progress_finalization(store: &CrudStore, index: usize, at: i64) -> String {
+        let turn_id = format!("turn_progress_{index}");
+        let thread_id = format!("thread_progress_{index}");
+        store
+            .materialize_turn_start(
+                &sample_thread("ws_progress", &thread_id, at),
+                SandboxMode::FullAccess,
+                &sample_turn(&turn_id),
+                &[],
+                PersistedActorRef::System,
+            )
+            .await
+            .unwrap();
+        store
+            .prepare_turn_finalization(
+                &ItemCompletedNotification {
+                    workspace_id: "ws_progress".into(),
+                    thread_id,
+                    turn_id: turn_id.clone(),
+                    item: TurnItem::AgentMessage {
+                        id: format!("final_progress_{index}"),
+                        text: "accepted answer".into(),
+                        phase: AgentMessagePhase::FinalAnswer,
+                        markdown: None,
+                        markdown_version: None,
+                    },
+                },
+                1,
+                None,
+                at + index as i64,
+            )
+            .await
+            .unwrap();
+        turn_id
+    }
+
+    #[tokio::test]
+    async fn finalization_filters_more_than_a_page_of_blocked_prefixes_before_limit() {
+        let at = 1_700_000_000;
+        let store = test_store_with_workspace("ws_progress").await;
+        for index in 0..6 {
+            let id = prepare_progress_finalization(&store, index, at).await;
+            if index < 5 {
+                mark_first_turn_projection_failed(&store, &id, at + 100).await;
+            }
+        }
+        let result = store
+            .reconcile_prepared_turn_finalizations(2, at + 10)
+            .await
+            .unwrap();
+        assert_eq!(result.scanned, 1);
+        assert_eq!(result.committed_count(), 1);
+        assert_eq!(
+            result.committed[0].turn_completed.turn.id,
+            "turn_progress_5"
+        );
+        assert!(result.failures.is_empty());
+        assert_eq!(
+            store
+                .list_prepared_turn_finalization_ids(10)
+                .await
+                .unwrap()
+                .len(),
+            5
+        );
+        // Restoration makes the retained obligations eligible on the next pass.
+        store
+            .replay_due_turn_event_projections(at + 200, 10)
+            .await
+            .unwrap();
+        let next = store
+            .reconcile_prepared_turn_finalizations(2, at + 201)
+            .await
+            .unwrap();
+        assert_eq!(next.committed_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn finalization_pages_past_poison_and_reports_storage_failure_with_success() {
+        let at = 1_700_000_000;
+        let store = test_store_with_workspace("ws_progress").await;
+        for index in 0..6 {
+            let id = prepare_progress_finalization(&store, index, at).await;
+            if index < 4 {
+                pioneer_entity::turn_finalization::Entity::update_many()
+                    .col_expr(
+                        pioneer_entity::turn_finalization::Column::ItemJson,
+                        sea_orm::sea_query::Expr::value("invalid JSON"),
+                    )
+                    .filter(pioneer_entity::turn_finalization::Column::TurnId.eq(id))
+                    .exec(&store.connection)
+                    .await
+                    .unwrap();
+            }
+        }
+        store
+            .connection
+            .execute_unprepared(
+                "CREATE TRIGGER reject_progress_finalization BEFORE INSERT ON turn_event
+             WHEN NEW.turn_id='turn_progress_4'
+             BEGIN SELECT RAISE(ABORT, 'finalization storage failure'); END",
+            )
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            let page = store
+                .reconcile_prepared_turn_finalizations(2, at + 10)
+                .await
+                .unwrap();
+            assert_eq!(page.scanned, 2);
+            assert_eq!(page.failures.len(), 2);
+            assert_eq!(page.committed_count(), 0);
+        }
+        let page = store
+            .reconcile_prepared_turn_finalizations(2, at + 10)
+            .await
+            .unwrap();
+        assert_eq!(page.scanned, 2);
+        assert_eq!(page.committed_count(), 1);
+        assert_eq!(page.committed[0].turn_completed.turn.id, "turn_progress_5");
+        assert_eq!(page.failures.len(), 1);
+        assert!(matches!(
+            page.failures[0].downcast_ref::<super::NativeFinalizationPhase>(),
+            Some(super::NativeFinalizationPhase::WriterApply)
+        ));
+        assert_eq!(
+            store
+                .list_prepared_turn_finalization_ids(10)
+                .await
+                .unwrap()
+                .len(),
+            5
+        );
+        // EOF wraps; retained poison is retried rather than ACKed or forgotten.
+        let eof = store
+            .reconcile_prepared_turn_finalizations(2, at + 11)
+            .await
+            .unwrap();
+        assert_eq!(eof.scanned, 0);
+        let retry = store
+            .reconcile_prepared_turn_finalizations(2, at + 12)
+            .await
+            .unwrap();
+        assert_eq!(retry.failures.len(), 2);
+        store
+            .connection
+            .execute_unprepared("DROP TRIGGER reject_progress_finalization")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn blocked_finalization_defers_payload_preparation_and_preserves_failed_intent() {
+        let at = 1_700_000_000;
+        let turn_id = "turn_defer_decode";
+        let (store, _, _) =
+            test_store_with_started_turn("ws_defer_decode", "thr_defer_decode", turn_id).await;
+        store
+            .prepare_turn_finalization(
+                &ItemCompletedNotification {
+                    workspace_id: "ws_defer_decode".into(),
+                    thread_id: "thr_defer_decode".into(),
+                    turn_id: turn_id.into(),
+                    item: TurnItem::AgentMessage {
+                        id: "final_defer_decode".into(),
+                        text: "accepted answer".into(),
+                        phase: AgentMessagePhase::FinalAnswer,
+                        markdown: None,
+                        markdown_version: None,
+                    },
+                },
+                1,
+                None,
+                at + 1,
+            )
+            .await
+            .unwrap();
+        mark_first_turn_projection_failed(&store, turn_id, at + 20).await;
+        // A corrupt stored payload must be examined only when its causal prefix
+        // is ready. Deferral must not run answer preparation or ACK the intent.
+        pioneer_entity::turn_finalization::Entity::update_many()
+            .col_expr(
+                pioneer_entity::turn_finalization::Column::ItemJson,
+                sea_orm::sea_query::Expr::value("invalid JSON"),
+            )
+            .filter(pioneer_entity::turn_finalization::Column::TurnId.eq(turn_id))
+            .exec(&store.connection)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .commit_prepared_turn_finalization(turn_id, at + 2)
+                .await
+                .unwrap(),
+            TurnFinalizationCommitOutcome::DeferredByPredecessor
+        );
+        store
+            .replay_due_turn_event_projections(at + 30, 10)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .commit_prepared_turn_finalization(turn_id, at + 31)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            store.list_prepared_turn_finalization_ids(1).await.unwrap(),
+            vec![turn_id]
+        );
+        let (_, target) = store
+            .get_turn("thr_defer_decode", turn_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(target.status, TurnStatus::InProgress);
+    }
+
     #[tokio::test]
     async fn prepared_native_finalization_defers_until_its_predecessor_is_projected() {
         let timestamp = 1_700_000_000;
@@ -38330,8 +38673,8 @@ mod tests {
             .reconcile_prepared_turn_finalizations(10, timestamp + 10)
             .await
             .expect("deferred finalization must not fail reconciliation");
-        assert_eq!(deferred.scanned, 1);
-        assert_eq!(deferred.deferred_by_predecessor, 1);
+        assert_eq!(deferred.scanned, 0);
+        assert_eq!(deferred.deferred_by_predecessor, 0);
         assert_eq!(deferred.committed_count(), 0);
         assert!(
             turn::find_turn_item(
@@ -38433,8 +38776,8 @@ mod tests {
             .reconcile_prepared_turn_finalizations(10, timestamp + 3)
             .await
             .expect("one deferred Turn must not fail the bounded batch");
-        assert_eq!(reconciliation.scanned, 2);
-        assert_eq!(reconciliation.deferred_by_predecessor, 1);
+        assert_eq!(reconciliation.scanned, 1);
+        assert_eq!(reconciliation.deferred_by_predecessor, 0);
         assert_eq!(reconciliation.committed_count(), 1);
         assert_eq!(
             reconciliation.committed[0].turn_completed.turn.id,
@@ -51337,6 +51680,11 @@ mod tests {
             );
         }
 
+        assert_eq!(
+            store.next_turn_event_projection_deadline().await.unwrap(),
+            Some(timestamp + 1),
+            "a stale receipt behind the watermark must not affect the next deadline",
+        );
         let first_claim = crate::repositories::turn_event_projection_state::claim_due(
             &store.connection,
             unix_to_datetime(timestamp + 10),
@@ -51347,6 +51695,11 @@ mod tests {
         .expect("first watermark successor should claim");
         assert_eq!(first_claim.len(), 1);
         assert_eq!(first_claim[0].state.sequence, 2);
+        assert_eq!(
+            store.next_turn_event_projection_deadline().await.unwrap(),
+            Some(timestamp + 70),
+            "the past pending successor must not supersede its predecessor's running lease",
+        );
 
         let transaction = store
             .connection

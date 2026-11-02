@@ -402,11 +402,19 @@ async fn shutdown_retains_claim_and_restored_processor_recovers_with_a_new_token
     assert_eq!(after_shutdown[1].status, "pending");
     // Emulate elapsed durable lease time, without sleeping or changing the
     // claim protocol. All access still goes through the fixture's CrudStore DB.
-    let mut expired: turn_event_delivery::ActiveModel = after_shutdown[0].clone().into();
-    expired.claim_expires_at = Set(Some(
-        chrono::Utc::now().fixed_offset() - chrono::Duration::seconds(1),
-    ));
-    expired.update(&store.database_connection()).await.unwrap();
+    // Shutdown can also interrupt LIVE after claim and before ACK. Advance
+    // every retained lease so restored workers do not wait for real lease time.
+    for consumer in [LIVE, EPISODIC] {
+        for row in rows(&store, consumer).await {
+            if row.status == "delivering" {
+                let mut expired: turn_event_delivery::ActiveModel = row.into();
+                expired.claim_expires_at = Set(Some(
+                    chrono::Utc::now().fixed_offset() - chrono::Duration::seconds(1),
+                ));
+                expired.update(&store.database_connection()).await.unwrap();
+            }
+        }
+    }
     let restored = MessageProcessor::with_agent_manager(
         Arc::new(ThreadManager::new("test-model", "openai")),
         Arc::new(AgentManager::new(test_provider(), test_tool_loop_config())),
@@ -518,18 +526,352 @@ async fn future_due_retry_does_not_spin_or_unblock_its_causal_successor() {
     for _ in 0..32 {
         processor.kick_native_turn_event_deliveries();
     }
+    owner.claim_barrier.arm("timer");
     owner.claim_barrier.release();
-    idle(&processor).await;
+    reached(&owner.claim_barrier).await;
     let after = rows(&store, EPISODIC).await;
     assert_eq!(after[0].status, "failed");
     assert_eq!(after[0].attempt_count, 1);
     assert_eq!(after[0].next_run_at, before[0].next_run_at);
     assert_eq!(after[1].status, "pending");
+    // EPISODIC remains parked on its future timer. Its barrier does not
+    // synchronize the independent LIVE owner, and the shared tracker cannot
+    // become idle while that timer is retained.
+    timeout(Duration::from_secs(10), async {
+        while wake(&processor, LIVE).running.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("LIVE owner must finish independently of the EPISODIC timer");
     assert!(
         rows(&store, LIVE)
             .await
             .iter()
             .all(|row| row.status == "delivered")
     );
+    processor.shutdown_resilience_workers().await;
+}
+
+#[tokio::test]
+async fn eligible_retry_timer_drains_without_a_new_commit_or_kick() {
+    let (processor, store, workspace) = fixture().await;
+    commit(&store, &workspace, "timed-retry").await;
+    let deadline = now_timestamp_secs() + 2;
+    Entity::update_many()
+        .col_expr(
+            Column::NextRunAt,
+            sea_orm::sea_query::Expr::value(
+                chrono::DateTime::from_timestamp(deadline, 0)
+                    .unwrap()
+                    .fixed_offset(),
+            ),
+        )
+        .filter(Column::TurnId.eq(TURN))
+        .exec(&store.database_connection())
+        .await
+        .unwrap();
+    processor.kick_native_turn_event_deliveries();
+    idle(&processor).await;
+    for consumer in [LIVE, EPISODIC] {
+        assert!(
+            rows(&store, consumer)
+                .await
+                .iter()
+                .all(|row| row.status == "delivered")
+        );
+    }
+}
+
+#[tokio::test]
+async fn deadline_ignores_past_successors_behind_future_causal_head() {
+    let (_processor, store, workspace) = fixture().await;
+    commit(&store, &workspace, "head").await;
+    commit(&store, &workspace, "blocked-successor").await;
+    let deadline = now_timestamp_secs() + 120;
+    for consumer in [LIVE, EPISODIC] {
+        let head = rows(&store, consumer).await.remove(0);
+        Entity::update_many()
+            .col_expr(
+                Column::NextRunAt,
+                sea_orm::sea_query::Expr::value(
+                    chrono::DateTime::from_timestamp(deadline, 0)
+                        .unwrap()
+                        .fixed_offset(),
+                ),
+            )
+            .filter(Column::Id.eq(head.id.clone()))
+            .exec(&store.database_connection())
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .next_turn_event_delivery_deadline(consumer)
+                .await
+                .unwrap(),
+            Some(deadline)
+        );
+        let waiting = store
+            .claim_due_turn_event_deliveries_with_deadline(consumer, deadline - 1, 64)
+            .await
+            .unwrap();
+        assert!(waiting.deliveries.is_empty());
+        assert_eq!(waiting.next_eligible_at_unix, Some(deadline));
+        let claimed = store
+            .claim_due_turn_event_deliveries_with_deadline(consumer, deadline, 64)
+            .await
+            .unwrap();
+        assert_eq!(claimed.deliveries.len(), 1);
+        let old_token = claimed.deliveries[0].claim_token.clone();
+        assert_eq!(
+            store
+                .next_turn_event_delivery_deadline(consumer)
+                .await
+                .unwrap(),
+            Some(deadline + 120)
+        );
+        let reclaimed = store
+            .claim_due_turn_event_deliveries_with_deadline(consumer, deadline + 120, 64)
+            .await
+            .unwrap();
+        assert_eq!(reclaimed.deliveries.len(), 1);
+        assert_ne!(reclaimed.deliveries[0].claim_token, old_token);
+        assert!(
+            !store
+                .complete_turn_event_delivery(&head.id, &old_token, deadline + 121)
+                .await
+                .unwrap()
+        );
+        Entity::update_many()
+            .col_expr(
+                Column::ClaimExpiresAt,
+                sea_orm::sea_query::Expr::value(
+                    Option::<chrono::DateTime<chrono::FixedOffset>>::None,
+                ),
+            )
+            .filter(Column::Id.eq(head.id))
+            .exec(&store.database_connection())
+            .await
+            .unwrap();
+        let no_lease = store
+            .claim_due_turn_event_deliveries_with_deadline(consumer, deadline + 1000, 64)
+            .await
+            .unwrap();
+        assert!(no_lease.deliveries.is_empty());
+        assert_eq!(
+            no_lease.next_eligible_at_unix, None,
+            "NULL lease cannot fall back to past retry clock or unblock successor"
+        );
+    }
+}
+
+#[tokio::test]
+async fn projection_deadline_tracks_healthy_watermark_successor_and_quarantine() {
+    use pioneer_entity::{
+        turn_event_projection_state as projection, turn_event_projection_stream_state as stream,
+    };
+    let (_processor, store, workspace) = fixture().await;
+    commit(&store, &workspace, "projection-timer").await;
+    let connection = store.database_connection();
+    let head = projection::Entity::find()
+        .filter(projection::Column::TurnId.eq(TURN))
+        .order_by_desc(projection::Column::Sequence)
+        .one(&connection)
+        .await
+        .unwrap()
+        .unwrap();
+    let deadline = now_timestamp_secs() + 120;
+    projection::Entity::update_many()
+        .col_expr(
+            projection::Column::Status,
+            sea_orm::sea_query::Expr::value("failed"),
+        )
+        .col_expr(
+            projection::Column::NextRunAt,
+            sea_orm::sea_query::Expr::value(
+                chrono::DateTime::from_timestamp(deadline, 0)
+                    .unwrap()
+                    .fixed_offset(),
+            ),
+        )
+        .filter(projection::Column::EventId.eq(head.event_id))
+        .exec(&connection)
+        .await
+        .unwrap();
+    // Fixture an unprojected immediate successor; earlier projected receipts
+    // and any old next_run_at values must have no influence on this clock.
+    stream::Entity::update_many()
+        .col_expr(
+            stream::Column::ProjectedThroughSequence,
+            sea_orm::sea_query::Expr::value(head.sequence - 1),
+        )
+        .filter(stream::Column::TurnId.eq(TURN))
+        .exec(&connection)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.next_turn_event_projection_deadline().await.unwrap(),
+        Some(deadline)
+    );
+    let replay = store
+        .replay_due_turn_event_projections(deadline - 1, 64)
+        .await
+        .unwrap();
+    assert_eq!(replay.claimed, 0);
+    assert_eq!(replay.next_eligible_at_unix, Some(deadline));
+    stream::Entity::update_many()
+        .col_expr(
+            stream::Column::Status,
+            sea_orm::sea_query::Expr::value("quarantined"),
+        )
+        .filter(stream::Column::TurnId.eq(TURN))
+        .exec(&connection)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.next_turn_event_projection_deadline().await.unwrap(),
+        None
+    );
+    assert_eq!(
+        store
+            .replay_due_turn_event_projections(deadline - 1, 64)
+            .await
+            .unwrap()
+            .next_eligible_at_unix,
+        None
+    );
+    stream::Entity::update_many()
+        .col_expr(
+            stream::Column::Status,
+            sea_orm::sea_query::Expr::value("healthy"),
+        )
+        .filter(stream::Column::TurnId.eq(TURN))
+        .exec(&connection)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.next_turn_event_projection_deadline().await.unwrap(),
+        Some(deadline)
+    );
+    let replay = store
+        .replay_due_turn_event_projections(deadline - 1, 64)
+        .await
+        .unwrap();
+    assert_eq!(replay.claimed, 0);
+    assert_eq!(replay.next_eligible_at_unix, Some(deadline));
+}
+
+#[tokio::test]
+async fn projection_recovery_deadline_storage_errors_remain_errors() {
+    let (_processor, store, _) = fixture().await;
+    store.database_connection().close().await.unwrap();
+    assert!(
+        store
+            .replay_due_turn_event_projections(now_timestamp_secs(), 64)
+            .await
+            .is_err()
+    );
+    assert!(store.next_turn_event_delivery_deadline(LIVE).await.is_err());
+}
+
+#[tokio::test]
+async fn empty_delivery_owners_and_projection_cycles_do_not_repeat_deadline_queries() {
+    use pioneer_sqlite::{
+        SqliteDatabase, SqliteReadClass, SqliteReadEvent, SqliteReadOutcome, SqliteWriteExecutor,
+    };
+    use sea_orm::ConnectOptions;
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("empty-delivery-owners.sqlite");
+    let mut options = ConnectOptions::new(pioneer_sqlite::sqlite_connection_url(&path));
+    options.max_connections(1).sqlx_logging(false);
+    let writer = Database::connect(options).await.unwrap();
+    let (_, _, _) = setup_workspace_manager_with_connection(writer.clone()).await;
+    writer
+        .execute_unprepared("PRAGMA journal_mode=WAL")
+        .await
+        .unwrap();
+    let mut options = ConnectOptions::new(pioneer_sqlite::sqlite_read_only_connection_url(&path));
+    options
+        .max_connections(2)
+        .map_sqlx_sqlite_opts(|opts| opts.pragma("query_only", "ON"));
+    let reader = Database::connect(options).await.unwrap();
+    let observer = Arc::new(NativeSchedulingObserver::default());
+    let database = SqliteDatabase::from_executor_with_read_observer(
+        reader,
+        SqliteWriteExecutor::with_observer(writer, observer.clone()),
+        observer.clone(),
+    );
+    let processor = Arc::new(MessageProcessor::with_agent_manager(
+        Arc::new(ThreadManager::new("test-model", "openai")),
+        Arc::new(AgentManager::new(test_provider(), test_tool_loop_config())),
+        Arc::new(SessionManager::new()),
+        Arc::new(WorkspaceManager::new(database.clone())),
+        Arc::new(CrudStore::new(database)),
+    ));
+    let read_count = || {
+        observer
+            .reads
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    SqliteReadEvent::OperationFinished {
+                        class: SqliteReadClass::Maintenance,
+                        outcome: SqliteReadOutcome::Ok,
+                        ..
+                    }
+                )
+            })
+            .count()
+    };
+    observer.reads.lock().unwrap().clear();
+    observer.writes.lock().unwrap().clear();
+    // Exercise the actual independent owner futures twice, not a deadline DAO.
+    for expected in [2, 4] {
+        processor.kick_native_turn_event_deliveries();
+        idle(&processor).await;
+        assert_eq!(
+            read_count(),
+            expected,
+            "one discovery per consumer; no empty MIN or extra drain"
+        );
+        assert!(observer.writes.lock().unwrap().is_empty());
+    }
+    observer.reads.lock().unwrap().clear();
+    processor.arm_completed_history_preparation_barrier("__event_delivery_recovery_before_kick__");
+    let worker = tokio::spawn(MessageProcessor::run_projection_delivery_resilience_worker(
+        Arc::downgrade(&processor),
+    ));
+    timeout(
+        Duration::from_secs(10),
+        processor.wait_for_completed_history_preparation_barrier(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        read_count(),
+        2,
+        "projection discovery + unchanged finalization upper read"
+    );
+    processor.release_completed_history_preparation_barrier();
+    processor.arm_completed_history_preparation_barrier("__event_delivery_recovery_before_kick__");
+    timeout(
+        Duration::from_secs(10),
+        processor.wait_for_completed_history_preparation_barrier(),
+    )
+    .await
+    .unwrap();
+    // The next cycle is paused before its kicks. Wait only for the first pair.
+    idle(&processor).await;
+    assert_eq!(
+        read_count(),
+        6,
+        "two projection/finalization passes + two delivery discoveries; no deadline SQL"
+    );
+    assert!(observer.writes.lock().unwrap().is_empty());
+    worker.abort();
+    let _ = worker.await;
     processor.shutdown_resilience_workers().await;
 }

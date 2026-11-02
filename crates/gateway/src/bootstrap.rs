@@ -6,7 +6,7 @@ use pioneer_sqlite::{
 };
 use sea_orm::{ActiveModelTrait, ConnectionTrait, EntityTrait, Set};
 use std::time::Duration;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::workspace::{DEFAULT_WORKSPACE_ID, DEFAULT_WORKSPACE_NAME};
 
@@ -54,6 +54,13 @@ pub async fn bootstrap(connection: impl Into<SqliteDatabase>) -> Result<()> {
         replay_due_turn_event_projections(&connection, recovery_now).await?;
     let turn_finalization_reconciliation =
         reconcile_prepared_turn_finalizations(&connection, recovery_now).await?;
+    if !turn_finalization_reconciliation.failures.is_empty() {
+        warn!(
+            failures = turn_finalization_reconciliation.failures.len(),
+            committed = turn_finalization_reconciliation.committed_count(),
+            "prepared finalization bootstrap had failures; durable intents retained for runtime retry"
+        );
+    }
     let reconciled_recovery_terminalizations =
         reconcile_recovery_terminalization_outbox(&connection).await?;
     let repaired_completed_turn_rows =
