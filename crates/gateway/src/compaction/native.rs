@@ -316,7 +316,7 @@ async fn prepare_native_projection_with_prepared(
         Some(processor) => Some(tokio::select! { biased;
             _ = context.cancellation.cancelled() => anyhow::bail!("native media preparation cancelled"),
             _ = clock.sleep_until(preparation_deadline) => anyhow::bail!("native media preparation deadline exceeded"),
-            guard = processor.artifact_service.html_preview_activity() => guard,
+            guard = processor.artifact_service.html_preview_activity_signaled() => guard,
         }),
         None => None,
     };

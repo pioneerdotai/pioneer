@@ -3173,6 +3173,7 @@ pub struct CrudStore {
     episodic_claim_discoveries: std::sync::Arc<std::sync::atomic::AtomicU64>,
     finalization_cursor: std::sync::Arc<tokio::sync::Mutex<turn_finalization::PreparedPass>>,
     episodic_work: std::sync::Arc<tokio::sync::Notify>,
+    html_preview_io_work: std::sync::Arc<tokio::sync::Notify>,
     frozen_readers: frozen_lifetime::ReaderCounts,
     legacy_task_text_cursors:
         std::sync::Arc<std::sync::Mutex<repositories::portable_payload_legacy_text::Cursors>>,
@@ -4773,6 +4774,7 @@ impl CrudStore {
             connection: connection.into(),
             finalization_cursor: Default::default(),
             episodic_work: std::sync::Arc::new(tokio::sync::Notify::new()),
+            html_preview_io_work: Default::default(),
             frozen_readers: Default::default(),
             legacy_task_text_cursors: Default::default(),
             #[cfg(any(test, feature = "test-support"))]
@@ -9196,9 +9198,20 @@ impl CrudStore {
         let blob_size_bytes = artifact_repository::checked_size_bytes(blob.size_bytes)?;
         let blob_metadata_json = artifact_repository::metadata_to_db(&blob.metadata)?;
         let artifact_metadata_json = artifact_repository::metadata_to_db(&artifact.metadata)?;
+        let released_copies = artifact.created_by_kind
+            == pioneer_protocol::ArtifactCreatedByKind::Tool
+            && artifact.created_by_actor_id.as_deref() == Some("html_preview")
+            && artifact.metadata.get("htmlTool").is_some_and(|tool| {
+                tool["retention"] == "released"
+                    && tool["releasedCopies"]
+                        .as_array()
+                        .is_some_and(|paths| !paths.is_empty())
+            });
         let version_metadata_json = artifact_repository::metadata_to_db(&version_metadata)?;
         let binding_metadata_json = artifact_repository::metadata_to_db(&BTreeMap::new())?;
-        self.run_serialized_write(|| {
+        let io_locator = released_copies
+            .then(|| repositories::html_preview_io_work::HtmlPreviewIoLocator::new(&artifact_id));
+        let result=self.run_serialized_write(|| {
             let identity = identity.clone();
             let commit_guard = commit_guard.clone();
             let blob = blob.clone();
@@ -9206,6 +9219,7 @@ impl CrudStore {
             let mut binding = binding.clone();
             let blob_id = blob_id.clone();
             let artifact_id = artifact_id.clone();
+            let io_locator=io_locator.clone();
             let version_id = version_id.clone();
             let binding_id = binding_id.clone();
             let blob_metadata_json = blob_metadata_json.clone();
@@ -9254,6 +9268,8 @@ impl CrudStore {
                             artifact_id,
                             prepared_at,
                             artifact_metadata_json,
+                            released_copies,
+                            io_locator.as_ref(),
                         )
                         .await?;
                     let version = repository
@@ -9267,9 +9283,9 @@ impl CrudStore {
                             version_metadata_json,
                         )
                         .await?;
-                    let artifact = repository
+                    let artifact = if released_copies {artifact} else {repository
                         .update_current_version(&transaction, artifact, &version.id)
-                        .await?;
+                        .await?};
                     if let Some(binding) = &binding {
                         repository
                             .create_binding_prepared(
@@ -9326,7 +9342,11 @@ impl CrudStore {
                 Ok(record)
             }
         })
-        .await
+        .await?;
+        if released_copies {
+            self.notify_html_preview_io_work();
+        }
+        Ok(result)
     }
 
     pub async fn find_or_create_artifact_blob(
@@ -34552,6 +34572,7 @@ impl CrudStore {
             || repositories::portable_payload::after_database_owners(operation()),
             |error| {
                 is_anyhow_sqlite_lock(error)
+                    || repositories::html_preview_io_work::is_conflict(error)
                     || task_event::is_idempotency_preflight_race(error)
                     || error
                         .downcast_ref::<repositories::portable_payload::PreflightRace>()
@@ -63452,3 +63473,8 @@ impl CrudStore {
             .transpose()
     }
 }
+
+pub use repositories::html_preview_io_work::{
+    HtmlPreviewIoClaim, HtmlPreviewIoErrorClass, HtmlPreviewIoFamily, HtmlPreviewIoLocator,
+    HtmlPreviewIoOutcome, HtmlPreviewIoSource, HtmlPreviewIoState,
+};

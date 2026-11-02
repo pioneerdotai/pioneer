@@ -215,4 +215,5 @@ pub use super::portable_payload_dictionary::Entity as PortablePayloadDictionary;
 
 pub use super::portable_payload::Entity as PortablePayload;
 
+pub use super::html_preview_io_work::Entity as HtmlPreviewIoWork;
 pub use super::portable_payload_block::Entity as PortablePayloadBlock;

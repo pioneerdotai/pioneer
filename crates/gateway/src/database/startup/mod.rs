@@ -1,5 +1,6 @@
 mod authorization_integrity_audit;
 mod execution_authority_integrity;
+mod html_preview_io;
 pub(crate) mod thread_episodic_workspace_capsule_refill;
 mod turn_event_projection_stream_state_backfill;
 mod turn_permission_profile_backfill;
@@ -448,6 +449,16 @@ async fn run_inner(
                 stage.succeed();
             }
         }};
+    }
+    // No new startup gate: failure preserves compatibility discovery and the
+    // maintenance worker resumes durable seed obligations.
+    if let Err(error) = html_preview_io::run(crud_store.as_ref()).await {
+        if is_maintenance_cancelled(&error) {
+            trace.finish_cancelled();
+            return Err(error);
+        }
+        failed = true;
+        tracing::warn!("HTML preview IO seed deferred; compatibility discovery retained");
     }
     run_stage!(
         pioneer_observability::GatewayOperationStage::DatabaseTurnEventProjectionBackfill,

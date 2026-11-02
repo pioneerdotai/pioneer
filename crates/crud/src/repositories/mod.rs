@@ -143,4 +143,5 @@ pub(crate) mod portable_payload_legacy_text;
 
 mod portable_payload_json;
 
+pub mod html_preview_io_work;
 pub(crate) mod recovery_watchdog;
