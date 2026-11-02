@@ -20,3 +20,5 @@ pub mod members;
 pub mod message_deletion;
 
 pub mod message_revisions;
+
+pub(crate) mod history_scheduler;

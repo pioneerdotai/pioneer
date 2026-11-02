@@ -184,7 +184,7 @@ fn keyboard_navigation_reaches_virtualized_history_without_reading_it(cx: &mut T
     assert_eq!(
         popup.top(),
         viewport.top(),
-        "history starts at the popup top"
+        "history starts at the top of the headerless popup"
     );
     assert!(viewport.bottom() <= footer.top());
     assert!(cx.debug_bounds("task-inbox-read-all").is_some());
@@ -205,7 +205,11 @@ fn keyboard_navigation_reaches_virtualized_history_without_reading_it(cx: &mut T
                 .all(|item| item.is_actionable())
         );
     });
-    assert_eq!(cx.debug_bounds("task-inbox-viewport").unwrap(), viewport);
+    assert_eq!(
+        cx.debug_bounds("task-inbox-viewport").unwrap(),
+        viewport,
+        "keyboard navigation scrolls rows inside the fixed viewport"
+    );
     assert_eq!(
         cx.debug_bounds("task-inbox-footer").unwrap(),
         footer,

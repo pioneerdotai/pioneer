@@ -215,4 +215,8 @@ pub use super::portable_payload_dictionary::Entity as PortablePayloadDictionary;
 
 pub use super::portable_payload::Entity as PortablePayload;
 
+pub use super::html_preview_io_work::Entity as HtmlPreviewIoWork;
 pub use super::portable_payload_block::Entity as PortablePayloadBlock;
+
+pub use super::task_child_reconcile_pending::Entity as TaskChildReconcilePending;
+pub use super::task_child_reconcile_scope::Entity as TaskChildReconcileScope;

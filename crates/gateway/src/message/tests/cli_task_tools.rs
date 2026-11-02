@@ -3,6 +3,7 @@ use crate::message::agent_runtime::TurnFailureRecoveryKind;
 use crate::message::turn_handlers::cli_runtime_provider_key;
 use crate::turn_mcp::invoker::{TurnMcpInvocation, TurnMcpInvocationOrigin, TurnMcpInvoker};
 use crate::turn_mcp::result::CanonicalMcpToolResult;
+use futures_util::future::BoxFuture;
 use pioneer_protocol::AgentMessagePhase;
 use std::path::Path;
 
@@ -27,51 +28,57 @@ async fn start_task_cli_fixture_with_task_config(
     start_task_cli_fixture_with_models(kind, task_config, &[]).await
 }
 
-async fn start_task_cli_fixture_with_models(
+fn start_task_cli_fixture_with_models<'a>(
     kind: CLIAgentRuntimeKind,
     task_config: pioneer_tasks::TaskRuntimeConfig,
-    models: &[&str],
-) -> (
-    CliRuntimeSkillPreflightHarness,
-    Arc<MessageProcessor>,
-    String,
-) {
-    let mut harness = setup_cli_runtime_skill_preflight_harness(kind, false).await;
-    harness.processor.task_runtime = Arc::new(pioneer_tasks::TaskRuntime::new_with_config(
-        harness.crud_store.clone(),
-        task_config,
-    ));
-    *harness.cli_session.projected_mcp_store.lock().await = Some(harness.crud_store.clone());
-    let thread_id = format!("cli_tasks_{kind:?}").to_lowercase();
-    let turn_id = format!("cli_tasks_turn_{kind:?}").to_lowercase();
-    seed_cli_runtime_skill_preflight_thread(&harness, &thread_id).await;
-    let processor = Arc::new(harness.processor.clone());
-    for model in models {
+    models: &'a [&'a str],
+) -> BoxFuture<
+    'a,
+    (
+        CliRuntimeSkillPreflightHarness,
+        Arc<MessageProcessor>,
+        String,
+    ),
+> {
+    // Keep fixture setup out of the matrix caller's inline future.
+    Box::pin(async move {
+        let mut harness = setup_cli_runtime_skill_preflight_harness(kind, false).await;
+        harness.processor.task_runtime = Arc::new(pioneer_tasks::TaskRuntime::new_with_config(
+            harness.crud_store.clone(),
+            task_config,
+        ));
+        *harness.cli_session.projected_mcp_store.lock().await = Some(harness.crud_store.clone());
+        let thread_id = format!("cli_tasks_{kind:?}").to_lowercase();
+        let turn_id = format!("cli_tasks_turn_{kind:?}").to_lowercase();
+        seed_cli_runtime_skill_preflight_thread(&harness, &thread_id).await;
+        let processor = Arc::new(harness.processor.clone());
+        for model in models {
+            processor
+                .mark_cli_reasoning_model_ready_for_tests(
+                    &harness.workspace_id,
+                    &harness.runtime_id,
+                    model,
+                )
+                .await
+                .unwrap();
+        }
+        processor.bind_agent_tool_bridges().await;
+        let request = cli_runtime_turn_start_request_with_capabilities(
+            &generate_test_request_id("cli-tasks", &format!("{kind:?}")),
+            &thread_id,
+            &turn_id,
+            &harness.runtime_id,
+            kind,
+            Vec::new(),
+        );
         processor
-            .mark_cli_reasoning_model_ready_for_tests(
-                &harness.workspace_id,
-                &harness.runtime_id,
-                model,
-            )
-            .await
-            .unwrap();
-    }
-    processor.bind_agent_tool_bridges().await;
-    let request = cli_runtime_turn_start_request_with_capabilities(
-        &generate_test_request_id("cli-tasks", &format!("{kind:?}")),
-        &thread_id,
-        &turn_id,
-        &harness.runtime_id,
-        kind,
-        Vec::new(),
-    );
-    processor
-        .process_request_for_connection(harness.connection_id, &request)
-        .await;
-    wait_for_recorded_cli_runtime_turn_start(&harness.cli_session).await;
-    wait_for_task_cli_activation(&processor, &turn_id).await;
+            .process_request_for_connection(harness.connection_id, &request)
+            .await;
+        wait_for_recorded_cli_runtime_turn_start(&harness.cli_session).await;
+        wait_for_task_cli_activation(&processor, &turn_id).await;
 
-    (harness, processor, turn_id)
+        (harness, processor, turn_id)
+    })
 }
 
 #[test]
@@ -263,6 +270,20 @@ async fn wait_for_task_cli_activation(processor: &MessageProcessor, turn_id: &st
     .expect("CLI task fixture activation");
 }
 
+// Keep construction of the large dispatch future out of the fixture poll
+// frame. Boxing at each call site still leaves that temporary in the caller.
+#[inline(never)]
+fn process_cli_fixture_outbox(
+    processor: &Arc<MessageProcessor>,
+) -> MessageFuture<
+    '_,
+    anyhow::Result<crate::message::agent_action_tools::AgentActionOutboxProcessingBatch>,
+> {
+    message_future(
+        crate::message::agent_action_tools::process_due_agent_action_outbox(processor, 64),
+    )
+}
+
 #[test]
 fn threads_first_cli_outbox_dispatch_uses_committed_turn_once() {
     run_standard_stack_message_test("Threads committed CLI first dispatch", async {
@@ -421,10 +442,9 @@ fn threads_first_cli_outbox_dispatch_uses_committed_turn_once() {
             .cli_session
             .set_next_native_turn_id("first-delegated-cli-child")
             .await;
-        let batch =
-            crate::message::agent_action_tools::process_due_agent_action_outbox(&processor, 64)
-                .await
-                .unwrap();
+        // Keep the dispatcher state out of this already large fixture future.
+        // The production runtime's bounded worker stack still applies.
+        let batch = process_cli_fixture_outbox(&processor).await.unwrap();
         assert!(batch.errors.is_empty(), "{:#?}", batch.errors);
         wait_for_task_cli_activation(&processor, child).await;
         let starts = harness.cli_session.turn_starts.lock().await.clone();
@@ -529,9 +549,7 @@ fn threads_first_cli_outbox_dispatch_uses_committed_turn_once() {
         .await
         .unwrap();
         assert!(!replay.is_error, "{replay:?}");
-        crate::message::agent_action_tools::process_due_agent_action_outbox(&processor, 64)
-            .await
-            .unwrap();
+        process_cli_fixture_outbox(&processor).await.unwrap();
         assert_eq!(
             harness.cli_session.turn_starts.lock().await.len(),
             starts_before + 1
@@ -1223,8 +1241,7 @@ fn cli_observation_tracks_the_child_outcome_across_same_run_resume() {
                         )
                         .await
                 );
-                processor
-                    .reconcile_terminal_task_child_turns(64)
+                message_future(processor.reconcile_terminal_task_child_turns(64))
                     .await
                     .unwrap();
                 assert_eq!(
@@ -5198,64 +5215,67 @@ impl ThreadsFacade {
         response["result"]["structuredContent"].clone()
     }
 
-    async fn call_response(
-        &self,
-        rpc: &str,
-        item: &str,
-        name: &str,
+    fn call_response<'a>(
+        &'a self,
+        rpc: &'a str,
+        item: &'a str,
+        name: &'a str,
         arguments: JsonValue,
-    ) -> JsonValue {
-        let fingerprint =
-            crate::cli_runtime::codex_mcp::canonical_value_fingerprint(&arguments).unwrap();
-        let item_id = match self.kind {
-            CLIAgentRuntimeKind::Claude => format!("toolu_{item}"),
-            CLIAgentRuntimeKind::OpenCode => format!("assistant:tool:{item}"),
-            CLIAgentRuntimeKind::Codex => item.to_owned(),
-        };
-        if self.kind == CLIAgentRuntimeKind::Claude {
-            self.claude_items
-                .register(
-                    &crate::cli_runtime::claude_mcp::ClaudeNativeMcpItemBinding {
-                        native_thread_id: self.native_thread.clone(),
-                        native_turn_id: self.native_turn.clone(),
-                        native_item_id: item_id,
-                        canonical_callable_name: name.to_owned(),
-                        arguments_fingerprint: fingerprint,
-                        metadata: pioneer_protocol::ToolMetadata::empty(),
-                    },
-                )
-                .unwrap();
-        } else {
-            self.native_items
-                .register(
-                    crate::cli_runtime::mcp::native_correlation::NativeMcpItemBinding {
-                        native_thread_id: self.native_thread.clone(),
-                        native_turn_id: self.native_turn.clone(),
-                        native_item_id: item_id,
-                        canonical_callable_name: name.to_owned(),
-                        arguments_fingerprint: fingerprint,
-                    },
-                )
-                .unwrap();
-        }
-        let (wire, meta) = match self.kind {
-            CLIAgentRuntimeKind::Codex => (
-                arguments,
-                json!({"callId":item,"threadId":self.native_thread,"x-codex-turn-metadata":{"thread_id":self.native_thread,"turn_id":self.native_turn}}),
-            ),
-            CLIAgentRuntimeKind::Claude => (
-                arguments,
-                json!({"claudecode/toolUseId":format!("toolu_{item}")}),
-            ),
-            CLIAgentRuntimeKind::OpenCode => (
-                json!({"__pioneer_mcp":{"sessionID":self.native_thread,"messageID":"assistant","id":item},"arguments":arguments}),
-                json!({"ai.opencode/sessionID":self.native_thread}),
-            ),
-        };
-        let (response, diagnostics) = crate::public_error::test_support::capture_events_async(
+    ) -> BoxFuture<'a, JsonValue> {
+        // Each matrix case drives the real facade on the normal Gateway stack.
+        Box::pin(async move {
+            let fingerprint =
+                crate::cli_runtime::codex_mcp::canonical_value_fingerprint(&arguments).unwrap();
+            let item_id = match self.kind {
+                CLIAgentRuntimeKind::Claude => format!("toolu_{item}"),
+                CLIAgentRuntimeKind::OpenCode => format!("assistant:tool:{item}"),
+                CLIAgentRuntimeKind::Codex => item.to_owned(),
+            };
+            if self.kind == CLIAgentRuntimeKind::Claude {
+                self.claude_items
+                    .register(
+                        &crate::cli_runtime::claude_mcp::ClaudeNativeMcpItemBinding {
+                            native_thread_id: self.native_thread.clone(),
+                            native_turn_id: self.native_turn.clone(),
+                            native_item_id: item_id,
+                            canonical_callable_name: name.to_owned(),
+                            arguments_fingerprint: fingerprint,
+                            metadata: pioneer_protocol::ToolMetadata::empty(),
+                        },
+                    )
+                    .unwrap();
+            } else {
+                self.native_items
+                    .register(
+                        crate::cli_runtime::mcp::native_correlation::NativeMcpItemBinding {
+                            native_thread_id: self.native_thread.clone(),
+                            native_turn_id: self.native_turn.clone(),
+                            native_item_id: item_id,
+                            canonical_callable_name: name.to_owned(),
+                            arguments_fingerprint: fingerprint,
+                        },
+                    )
+                    .unwrap();
+            }
+            let (wire, meta) = match self.kind {
+                CLIAgentRuntimeKind::Codex => (
+                    arguments,
+                    json!({"callId":item,"threadId":self.native_thread,"x-codex-turn-metadata":{"thread_id":self.native_thread,"turn_id":self.native_turn}}),
+                ),
+                CLIAgentRuntimeKind::Claude => (
+                    arguments,
+                    json!({"claudecode/toolUseId":format!("toolu_{item}")}),
+                ),
+                CLIAgentRuntimeKind::OpenCode => (
+                    json!({"__pioneer_mcp":{"sessionID":self.native_thread,"messageID":"assistant","id":item},"arguments":arguments}),
+                    json!({"ai.opencode/sessionID":self.native_thread}),
+                ),
+            };
+            let (response, diagnostics) = crate::public_error::test_support::capture_events_async(
             self.facade.handle_message(&self.context, json!({"jsonrpc":"2.0","id":rpc,"method":"tools/call","params":{"name":name,"arguments":wire,"_meta":meta}})),
         ).await;
-        response.unwrap_or_else(|| panic!("{name}: no response; diagnostics: {diagnostics:#?}"))
+            response.unwrap_or_else(|| panic!("{name}: no response; diagnostics: {diagnostics:#?}"))
+        })
     }
 }
 
@@ -5536,6 +5556,16 @@ fn cli_threads_actions_use_facade_shared_handlers_routes_and_replay_for_all_prov
                 1,
                 "receipt replay must not append a second completion"
             );
+            assert_eq!(replay["threadResult"], created["threadResult"]);
+            assert_eq!(created["threadResult"]["workspaceId"], harness.workspace_id);
+            let created_thread = processor
+                .crud_store
+                .get_thread_model(created["threadResult"]["threadId"].as_str().unwrap())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(created_thread.workspace_id, harness.workspace_id);
+            assert!(created["threadResult"].get("turnId").is_none());
             let target = created["targetOptions"]
                 .as_array()
                 .unwrap()
@@ -5558,10 +5588,28 @@ fn cli_threads_actions_use_facade_shared_handlers_routes_and_replay_for_all_prov
                 .call("send-reconnected", "send", "thread_message_send", send_args)
                 .await;
             assert_eq!(sent["receiptId"], replay["receiptId"]);
+            assert_eq!(sent["threadResult"], replay["threadResult"]);
+            assert_eq!(sent["threadResult"]["threadId"], created_thread.id);
             let listed = facade
                 .call("read", "read", "threads_list", json!({"limit":100}))
                 .await;
-            let children = listed["threads"]
+            assert!(
+                listed["threads"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|row| row["threadId"] == caller.thread_id),
+                "the admitted CLI caller's standalone conversation remains listed"
+            );
+            let descendants = facade
+                .call(
+                    "read-children",
+                    "read-children",
+                    "threads_children_list",
+                    json!({"threadId":caller.thread_id,"recursive":false,"limit":100}),
+                )
+                .await;
+            let children = descendants["threads"]
                 .as_array()
                 .unwrap()
                 .iter()
@@ -5575,12 +5623,21 @@ fn cli_threads_actions_use_facade_shared_handlers_routes_and_replay_for_all_prov
                 "replayed creation must not add another thread"
             );
             let child = children[0]["threadId"].clone();
+            assert!(
+                !listed["threads"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|row| row["threadId"] == child),
+                "hidden home-capsule children must not be standalone list cards"
+            );
+            assert_eq!(children[0]["threadId"], created["threadResult"]["threadId"]);
             let history = facade
                 .call(
                     "history",
                     "history",
                     "threads_history_read",
-                    json!({"threadId":child,"limit":100}),
+                    json!({"threadId":sent["threadResult"]["threadId"],"anchor":{"turnId":sent["threadResult"]["turnId"]},"limit":100}),
                 )
                 .await;
             assert_eq!(
@@ -5651,6 +5708,22 @@ fn cli_threads_actions_use_facade_shared_handlers_routes_and_replay_for_all_prov
             let payload: JsonValue = serde_json::from_str(&outbox.payload_json).unwrap();
             let params: pioneer_protocol::TurnStartParams =
                 serde_json::from_value(payload["dispatch"]["params"].clone()).unwrap();
+            assert_eq!(
+                started["threadResult"],
+                json!({"workspaceId":harness.workspace_id,"threadId":params.thread_id,"turnId":params.turn_id,"executionId":payload["spawned_execution_id"]})
+            );
+            assert_eq!(replay["threadResult"], started["threadResult"]);
+            let response = pioneer_crud::load_agent_turn_response(
+                &processor.crud_store.database_connection(),
+                &params.turn_id,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                started["threadResult"]["executionId"],
+                response.execution_id
+            );
             assert_eq!(params.model.as_deref(), model["id"].as_str());
             assert_eq!(
                 params.model_provider.as_deref(),
@@ -5665,9 +5738,7 @@ fn cli_threads_actions_use_facade_shared_handlers_routes_and_replay_for_all_prov
                 .cli_session
                 .set_next_native_turn_id("threads-facade-explicit-child")
                 .await;
-            crate::message::agent_action_tools::process_due_agent_action_outbox(&processor, 64)
-                .await
-                .unwrap();
+            process_cli_fixture_outbox(&processor).await.unwrap();
             let calls = wait_for_cli_runtime_turn_starts(&harness.cli_session, 2).await;
             assert_eq!(calls[1].model.as_deref(), model["id"].as_str());
             assert_eq!(calls[1].effort.as_deref(), effort.as_str());
@@ -5799,6 +5870,11 @@ fn cli_threads_permission_matrix_preserves_restricted_names_denies_and_missing_g
         assert_ne!(
             limited["error"]["data"]["kind"], "invalid_request",
             "correlation must reach the restricted binding"
+        );
+        assert!(
+            limited["result"]["structuredContent"]
+                .get("threadResult")
+                .is_none()
         );
         processor
             .register_agent_action_binding(turn.clone(), original_binding)
@@ -5983,8 +6059,7 @@ fn task_resume_preserves_persisted_admission_but_constrains_a_new_legacy_seed() 
                     )
                     .await
             );
-            processor
-                .reconcile_terminal_task_child_turns(64)
+            message_future(processor.reconcile_terminal_task_child_turns(64))
                 .await
                 .unwrap();
             assert_eq!(
@@ -6240,13 +6315,7 @@ fn ordinary_cli_delegated_root_dispatch_uses_cli_attempt_and_replays_without_nat
                     );
                     let dispatch = tokio::spawn({
                         let processor = processor.clone();
-                        async move {
-                            crate::message::agent_action_tools::process_due_agent_action_outbox(
-                                &processor, 64,
-                            )
-                            .await
-                            .unwrap()
-                        }
+                        async move { process_cli_fixture_outbox(&processor).await.unwrap() }
                     });
                     timeout(
                         Duration::from_secs(10),
@@ -6326,9 +6395,7 @@ fn ordinary_cli_delegated_root_dispatch_uses_cli_attempt_and_replays_without_nat
                         Set(Some(pioneer_crud::utc_now() - chrono::Duration::seconds(1)));
                     retry.update(&db).await.unwrap();
                 }
-                crate::message::agent_action_tools::process_due_agent_action_outbox(&processor, 64)
-                    .await
-                    .unwrap();
+                process_cli_fixture_outbox(&processor).await.unwrap();
                 wait_for_recorded_cli_runtime_turn_count(&harness.cli_session, 2).await;
                 wait_for_task_cli_activation(&processor, &params.turn_id).await;
                 assert!(
@@ -6359,9 +6426,7 @@ fn ordinary_cli_delegated_root_dispatch_uses_cli_attempt_and_replays_without_nat
                 pending.delivered_at = Set(None);
                 pending.next_attempt_at = Set(None);
                 pending.update(&db).await.unwrap();
-                crate::message::agent_action_tools::process_due_agent_action_outbox(&processor, 64)
-                    .await
-                    .unwrap();
+                process_cli_fixture_outbox(&processor).await.unwrap();
                 assert_eq!(harness.cli_session.turn_starts.lock().await.len(), 2);
             }
         }
@@ -6443,6 +6508,14 @@ fn cli_threads_collaborative_admission_uses_one_detached_task_and_normal_stop() 
         assert_eq!(payload["execution_mode"], "detached_task");
         assert!(payload.get("dispatch").is_none());
         let task_id = payload["task_id"].as_str().unwrap();
+        assert_eq!(
+            started["threadResult"],
+            json!({"workspaceId":harness.workspace_id,"threadId":payload["thread_id"],"turnId":payload["turn_id"],"taskId":task_id})
+        );
+        assert_eq!(
+            created["threadResult"]["threadId"],
+            started["threadResult"]["threadId"]
+        );
         let task = processor
             .crud_store
             .get_task(task_id)
@@ -6460,6 +6533,8 @@ fn cli_threads_collaborative_admission_uses_one_detached_task_and_normal_stop() 
             .launch;
         let child = wait_for_task_cli_child(&processor, &task.runs[0].id, None).await;
         assert_ne!(child.thread_id, launch.thread_id);
+        assert_ne!(started["threadResult"]["threadId"], child.thread_id);
+        assert_ne!(started["threadResult"]["turnId"], child.turn_id);
         assert_eq!(
             processor
                 .crud_store
@@ -6524,6 +6599,7 @@ fn cli_threads_collaborative_admission_uses_one_detached_task_and_normal_stop() 
             )
             .await;
         assert_eq!(started["receiptId"], replay["receiptId"]);
+        assert_eq!(started["threadResult"], replay["threadResult"]);
         crate::message::agent_action_tools::process_due_agent_action_outbox(&processor, 64)
             .await
             .unwrap();
@@ -6575,6 +6651,24 @@ fn cli_threads_collaborative_admission_uses_one_detached_task_and_normal_stop() 
             serde_json::from_str(&continuation_outbox.payload_json).unwrap();
         assert!(continuation.get("task_id").is_none());
         assert_eq!(continuation["dispatch"]["thread_id"], child.thread_id);
+        assert_eq!(
+            continued["threadResult"],
+            json!({"workspaceId":harness.workspace_id,"threadId":child.thread_id,"turnId":continuation["dispatch"]["turn_id"],"executionId":continuation["spawned_execution_id"]})
+        );
+        let (_, continued_turn) = processor
+            .crud_store
+            .get_turn(
+                continued["threadResult"]["threadId"].as_str().unwrap(),
+                continued["threadResult"]["turnId"].as_str().unwrap(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            continued_turn.work_owner,
+            pioneer_protocol::TurnWorkOwner::Turn
+        );
+        assert_ne!(continued_turn.id, child.turn_id);
         assert!(
             processor
                 .crud_store

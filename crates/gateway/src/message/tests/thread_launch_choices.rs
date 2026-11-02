@@ -591,6 +591,19 @@ async fn inherited_configuration_survives_visible_thread_creation_message_and_st
         .await
         .unwrap()
         .unwrap();
+    assert_eq!(
+        created["threadResult"],
+        json!({"workspaceId":context.workspace_id,"threadId":thread.id})
+    );
+    let created_replay = call(
+        &tools,
+        "thread_create",
+        "create-visible",
+        json!({"optionId": option.id}),
+    )
+    .await;
+    assert_eq!(created_replay["threadResult"], created["threadResult"]);
+    assert_eq!(created_replay["receiptId"], created["receiptId"]);
     assert_eq!(thread.sidebar_visibility, ThreadSidebarVisibility::Visible);
     assert_eq!(
         (
@@ -613,7 +626,14 @@ async fn inherited_configuration_survives_visible_thread_creation_message_and_st
     assert_eq!(empty_list.model_provider, "openai");
     assert_eq!(empty_list.model, "gpt-5.4");
     assert_eq!(empty_list.reasoning_effort.as_deref(), Some("high"));
-    call(&tools, "thread_message_send", "post-only", json!({"targetOptionId": target.id, "input": [{"type":"text","text":"A message, without a model launch"}]})).await;
+    let message_args = json!({"targetOptionId": target.id, "input": [{"type":"text","text":"A message, without a model launch"}]});
+    let sent = call(
+        &tools,
+        "thread_message_send",
+        "post-only",
+        message_args.clone(),
+    )
+    .await;
     let message_thread = processor
         .crud_store
         .get_thread_model(thread_id)
@@ -621,6 +641,29 @@ async fn inherited_configuration_survives_visible_thread_creation_message_and_st
         .unwrap()
         .unwrap();
     assert_eq!(message_thread.turns[0].mode, ThreadMode::Message);
+    assert_eq!(
+        sent["threadResult"],
+        json!({"workspaceId":context.workspace_id,"threadId":thread_id,"turnId":message_thread.turns[0].id})
+    );
+    let sent_replay = call(&tools, "thread_message_send", "post-only", message_args).await;
+    assert_eq!(sent_replay["threadResult"], sent["threadResult"]);
+    let mut read_tools = tools.clone();
+    read_tools
+        .bundles
+        .push(processor.thread_read_tools(context.clone()));
+    let history = call(
+        &read_tools,
+        "threads_history_read",
+        "read-sent-reference",
+        json!({"threadId":sent["threadResult"]["threadId"],"anchor":{"turnId":sent["threadResult"]["turnId"]},"limit":100}),
+    )
+    .await;
+    assert!(history["events"].as_array().unwrap().iter().any(|event| {
+        event["turnId"] == sent["threadResult"]["turnId"]
+            && event
+                .to_string()
+                .contains("A message, without a model launch")
+    }));
     let loaded = processor
         .thread_manager
         .thread_get(thread_id)
@@ -688,6 +731,11 @@ async fn inherited_configuration_survives_visible_thread_creation_message_and_st
     assert_eq!(persisted["execution_mode"], "detached_task");
     assert!(persisted.get("dispatch").is_none());
     let task_id = persisted["task_id"].as_str().unwrap();
+    assert_eq!(
+        first["threadResult"],
+        json!({"workspaceId":context.workspace_id,"threadId":thread_id,"turnId":persisted["turn_id"],"taskId":task_id})
+    );
+    assert_eq!(simultaneous["threadResult"], first["threadResult"]);
     let task = processor
         .crud_store
         .get_task(task_id)
@@ -795,6 +843,8 @@ async fn inherited_configuration_survives_visible_thread_creation_message_and_st
         call(&tools, "threads_turn_start", "start-visible", arguments),
     );
     assert_eq!(replay["receiptId"], concurrent_replay["receiptId"]);
+    assert_eq!(replay["threadResult"], first["threadResult"]);
+    assert_eq!(concurrent_replay["threadResult"], first["threadResult"]);
     assert_eq!(replay["outcome"], "agent_action_already_committed");
     assert_eq!(
         pioneer_crud::load_agent_action_outbox(&db, &outbox.action_id)
@@ -842,6 +892,7 @@ async fn inherited_configuration_survives_visible_thread_creation_message_and_st
     let lineage = wait_for_child_lineage_for_run(processor.crud_store.clone(), &run_id).await;
     assert_eq!(lineage.parent_thread_id, thread_id);
     assert_ne!(lineage.child_thread_id, thread_id);
+    assert_ne!(first["threadResult"]["threadId"], lineage.child_thread_id);
     assert_eq!(
         processor
             .crud_store
@@ -1631,7 +1682,7 @@ async fn inherited_reasoning_replay_uses_committed_choice_when_catalog_changes()
         let target = delegated_launch_target(&processor, &tools, &binding.options).await;
         let request = json!({"targetOptionId":target.id,"input":[{"type":"text","text":"Inherited model, changed effort"}],
             "launch":{"reasoning":{"effort":"low"},"permissionProfile":{"mode":"full_access"}}});
-        call(
+        let first = call(
             &tools,
             "threads_turn_start",
             "inherit-reasoning",
@@ -1647,6 +1698,18 @@ async fn inherited_reasoning_replay_uses_committed_choice_when_catalog_changes()
         let payload: serde_json::Value = serde_json::from_str(&before.payload_json).unwrap();
         let params: TurnStartParams =
             serde_json::from_value(payload["dispatch"]["params"].clone()).unwrap();
+        assert_eq!(
+            first["threadResult"],
+            json!({"workspaceId":context.workspace_id,"threadId":params.thread_id,"turnId":params.turn_id,"executionId":payload["spawned_execution_id"]})
+        );
+        let turn_response = pioneer_crud::load_agent_turn_response(&database, &params.turn_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            first["threadResult"]["executionId"],
+            turn_response.execution_id
+        );
         assert_eq!(params.model.as_deref(), Some("gpt-5.4"));
         assert_eq!(params.reasoning.as_ref().unwrap().effort, "low");
         let child_id = payload["spawned_execution_id"].as_str().unwrap();
@@ -1670,6 +1733,7 @@ async fn inherited_reasoning_replay_uses_committed_choice_when_catalog_changes()
             request.clone(),
         )
         .await;
+        assert_eq!(replay["threadResult"], first["threadResult"]);
         assert_eq!(replay["outcome"], "agent_action_already_committed");
         for change_reasoning in [false, true] {
             let mut changed_request = request.clone();
@@ -5451,6 +5515,16 @@ async fn detached_threads_action_recovers_after_commit_without_recreating_or_dis
     let task_id = payload["task_id"].as_str().unwrap();
     let thread_id = payload["thread_id"].as_str().unwrap();
     let turn_id = payload["turn_id"].as_str().unwrap();
+    let committed_receipt = pioneer_crud::load_agent_action_receipt(&database, action.as_str())
+        .await
+        .unwrap()
+        .unwrap();
+    let committed_response: serde_json::Value =
+        serde_json::from_str(committed_receipt.response_json.as_deref().unwrap()).unwrap();
+    assert_eq!(
+        committed_response["threadResult"],
+        json!({"workspaceId":context.workspace_id,"threadId":thread_id,"turnId":turn_id,"taskId":task_id})
+    );
     assert_eq!(
         processor
             .crud_store
@@ -5527,6 +5601,7 @@ async fn detached_threads_action_recovers_after_commit_without_recreating_or_dis
         .unwrap()
         .unwrap();
     assert_eq!(replay["receiptId"], receipt.id);
+    assert_eq!(replay["threadResult"], committed_response["threadResult"]);
     assert_eq!(
         recovered
             .crud_store

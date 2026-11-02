@@ -75,8 +75,31 @@ impl CrudStore {
         now: i64,
         limit: u64,
     ) -> Result<Vec<TaskRunOccurrenceReconcileCandidate>> {
+        let discovery = self
+            .discover_task_run_occurrence_reconcile_with_audit(now, limit)
+            .await?;
+        if let Some(error) = discovery.audit_error {
+            return Err(error);
+        }
+        Ok(discovery.candidates)
+    }
+
+    pub async fn discover_task_run_occurrence_reconcile_with_audit(
+        &self,
+        now: i64,
+        limit: u64,
+    ) -> Result<OccurrenceReconcileDiscovery<TaskRunOccurrenceReconcileCandidate>> {
         let maintenance = self.with_maintenance_access();
-        queue::discover(&maintenance.connection, now, limit).await
+        let audit_error = maintenance
+            .audit_legacy_occurrence_producers(false)
+            .await
+            .err();
+        // Independent durable tickets remain serviceable after an audit error.
+        let candidates = queue::discover(&maintenance.connection, now, limit).await?;
+        Ok(OccurrenceReconcileDiscovery {
+            candidates,
+            audit_error,
+        })
     }
 
     pub async fn claim_task_run_occurrence_reconcile(
@@ -438,6 +461,12 @@ impl CrudStore {
             )
             .await?;
 
+            // Unknown legacy producers may not retire the queue row when the
+            // projection becomes consistent. ACK this exact claim in the same
+            // transaction; a superseding generation/token remains protected.
+            if let Some(claim) = claim.as_ref() {
+                queue::remove_if_consistent(&transaction, claim).await?;
+            }
             Ok(TaskRunOccurrenceTerminalizationOutcome::Changed)
         }
         .await;

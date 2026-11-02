@@ -66,7 +66,7 @@ const DEFAULT_MAX_TASK_DEPTH: i64 = 3;
 const MAX_ROOT_TASK_DEPTH_LIMIT: i64 = 10;
 const WAIT_RESCAN_INTERVAL: Duration = Duration::from_millis(250);
 const WAIT_LIVENESS_SCAN_INTERVAL: Duration = Duration::from_secs(5);
-const LIVE_RECONCILIATION_INTERVAL: Duration = Duration::from_secs(5);
+pub(crate) const LIVE_RECONCILIATION_INTERVAL: Duration = Duration::from_secs(5);
 const REVIEW_AUTO_ACCEPT_SCAN_INTERVAL: Duration = Duration::from_secs(30);
 const REVIEW_AUTO_ACCEPT_SCAN_LIMIT: u64 = 1024;
 const DELIVERY_RECOVERY_BATCH_LIMIT: u64 = pioneer_crud::DELIVERY_RECOVERY_BUDGET;
@@ -307,7 +307,18 @@ impl TaskRuntime {
 
     pub async fn start(&self) -> TaskRuntimeResult<()> {
         let now = now_timestamp_secs();
-        self.reconciler.reconcile(now).await?;
+        let mut partial_failures = Vec::new();
+        match self.reconciler.reconcile(now).await {
+            Ok(_) => {}
+            Err(error)
+                if error
+                    .downcast_ref::<crate::reconciliation::PartialRecoveryError>()
+                    .is_some() =>
+            {
+                partial_failures.push(error)
+            }
+            Err(error) => return Err(error),
+        }
         self.maintenance_service
             .recover_retry_and_lock_state(now)
             .await?;
@@ -325,7 +336,17 @@ impl TaskRuntime {
         self.maintenance_service
             .auto_accept_expired_review_candidates(now, REVIEW_AUTO_ACCEPT_SCAN_LIMIT)
             .await?;
-        self.scheduler.process_due_once(now).await?;
+        match self.scheduler.process_due_once(now).await {
+            Ok(_) => {}
+            Err(error)
+                if error
+                    .downcast_ref::<crate::scheduler::PartialDiscoveryError>()
+                    .is_some() =>
+            {
+                partial_failures.push(error)
+            }
+            Err(error) => return Err(error),
+        }
         let mut guard = self.scheduler_task.lock().await;
         if guard.is_none() {
             let scheduler = self.scheduler.clone();
@@ -377,6 +398,9 @@ impl TaskRuntime {
                     }
                 }
             }));
+        }
+        if !partial_failures.is_empty() {
+            return Err(crate::PartialTaskStartup(partial_failures).into());
         }
         Ok(())
     }
@@ -2343,6 +2367,9 @@ impl TaskService {
                 response["taskCreation"] = serde_json::json!({
                     "taskId": task_id, "triggerId": trigger_id, "runId": immediate_run.as_ref().map(|run| &run.id),
                 });
+                if detached_start && response.get("threadResult").is_some() {
+                    response["threadResult"]["taskId"] = serde_json::json!(task_id);
+                }
                 let response = serde_json::to_string(&response)?;
                 action.action_response_json = Some(response.clone());
                 action.receipt_response_json = Some(response);

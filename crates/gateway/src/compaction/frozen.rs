@@ -6240,13 +6240,41 @@ pub(crate) async fn prepare_html_preview_archive_witness(
     store: &CrudStore,
     witness: &pioneer_crud::HtmlPreviewArchiveWitness,
 ) -> Result<()> {
+    let hash = prepare_html_preview_archive_witness_hash(store, witness).await?;
+    store
+        .record_html_preview_archive_witness(witness, &hash)
+        .await
+}
+
+#[derive(Debug)]
+pub(crate) struct InvalidHtmlPreviewArchiveWitness;
+impl std::fmt::Display for InvalidHtmlPreviewArchiveWitness {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("invalid immutable HTML preview archive provenance")
+    }
+}
+impl std::error::Error for InvalidHtmlPreviewArchiveWitness {}
+
+// A deterministic observation at the actual digest boundary, compiled only
+// for tests. It does not add production observers or alter database semantics.
+#[cfg(test)]
+tokio::task_local! {
+    pub(super) static HTML_PREVIEW_HASH_CAPACITY_AUDIT: std::sync::Arc<dyn Fn() + Send + Sync>;
+}
+
+/// Prepare outside writer capacity; queue consumers publish with their claim
+/// and the authoritative source CAS in one transaction.
+pub(crate) async fn prepare_html_preview_archive_witness_hash(
+    store: &CrudStore,
+    witness: &pioneer_crud::HtmlPreviewArchiveWitness,
+) -> Result<String> {
     let reference = &witness.reference;
     ensure!(
         reference.tool_name.as_deref() == Some("html_preview")
             && reference.source_aliases.is_empty()
             && reference.ambiguous_input_aliases.is_empty()
             && !reference.protected_input,
-        "unsupported preview archive provenance"
+        InvalidHtmlPreviewArchiveWitness
     );
     // An accepted import keeps its canonical source thread while its context
     // belongs to the receiving manifest. Admit only that persisted owner, not
@@ -6260,7 +6288,8 @@ pub(crate) async fn prepare_html_preview_archive_witness(
         &witness.workspace,
         &allowed,
         &reference_metadata_provenance(&witness.workspace, reference),
-    )?;
+    )
+    .map_err(|_| InvalidHtmlPreviewArchiveWitness)?;
     let original = restore_entry(
         store,
         &witness.workspace,
@@ -6284,6 +6313,8 @@ pub(crate) async fn prepare_html_preview_archive_witness(
         anyhow::bail!("invalid preview archive");
     };
     let message: ChatMessage = serde_json::from_value(value)?;
+    #[cfg(test)]
+    let _ = HTML_PREVIEW_HASH_CAPACITY_AUDIT.try_with(|audit| audit());
     let hash = wire_digest(&message)?;
     let source = reference
         .replay_source
@@ -6293,7 +6324,8 @@ pub(crate) async fn prepare_html_preview_archive_witness(
     // Verify the other direction too: archival transformation must commute
     // with this exact retained-tool rendering. Unsupported legacy/budget forms
     // keep their media instead of leaving a hash that cannot be replayed.
-    let canonical = pioneer_crud::archive_html_preview_result(&witness.payload)?;
+    let canonical = pioneer_crud::archive_html_preview_result(&witness.payload)
+        .map_err(|_| InvalidHtmlPreviewArchiveWitness)?;
     verified_preview_diagnostic(
         store,
         &witness.workspace,
@@ -6303,9 +6335,7 @@ pub(crate) async fn prepare_html_preview_archive_witness(
         &hash,
     )
     .await?;
-    store
-        .record_html_preview_archive_witness(witness, &hash)
-        .await
+    Ok(hash)
 }
 
 async fn verified_preview_diagnostic(
