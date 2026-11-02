@@ -1,6 +1,8 @@
 use super::*;
 use std::time::Instant;
 
+mod pre_serialization;
+
 fn markdown_notification_stream(
     method: &str,
 ) -> Option<pioneer_observability::GatewayMarkdownStreamKind> {
@@ -1277,44 +1279,56 @@ impl MessageProcessor {
         payload: &T,
         subscribers: Vec<crate::thread::ThreadSubscriber>,
     ) {
-        // Keep the original identity as scope across both current membership
-        // lookups. A lookup by connection ID alone can return a new subscriber.
-        let identities = subscribers
-            .into_iter()
-            .map(|subscriber| (subscriber.connection_id, subscriber.identity))
-            .collect::<HashMap<_, _>>();
-        let serialization_subscribers = self
-            .thread_manager
-            .subscribed_connections_for_candidates(thread_id, identities.keys().copied().collect())
-            .await
-            .into_iter()
-            .filter(|subscriber| {
-                identities.get(&subscriber.connection_id) == Some(&subscriber.identity)
-            })
-            .collect();
-        let serialization_connection_ids = self
-            .authorized_thread_notification_recipients(thread_id, serialization_subscribers)
-            .await;
-        if serialization_connection_ids.is_empty() {
-            return;
-        }
-        let Some(serialized) = self.serialize_notification(method, payload) else {
-            return;
-        };
-        let subscribers = self
-            .thread_manager
-            .subscribed_connections_for_candidates(thread_id, serialization_connection_ids)
-            .await
-            .into_iter()
-            .filter(|subscriber| {
-                identities.get(&subscriber.connection_id) == Some(&subscriber.identity)
-            })
-            .collect();
-        let connection_ids = self
-            .authorized_thread_notification_recipients(thread_id, subscribers)
-            .await;
-        self.send_serialized_notification_to_connections(method, &serialized, connection_ids)
-            .await;
+        // Bound the state embedded in task/CLI callers across both authorization
+        // stages and delivery. Poll inline so cancellation retains ownership.
+        Box::pin(async move {
+            // Keep the original identity as scope across both current membership
+            // lookups. A lookup by connection ID alone can return a new subscriber.
+            let identities = subscribers
+                .into_iter()
+                .map(|subscriber| (subscriber.connection_id, subscriber.identity))
+                .collect::<HashMap<_, _>>();
+            let serialization_subscribers = self
+                .thread_manager
+                .subscribed_connections_for_candidates(
+                    thread_id,
+                    identities.keys().copied().collect(),
+                )
+                .await
+                .into_iter()
+                .filter(|subscriber| {
+                    identities.get(&subscriber.connection_id) == Some(&subscriber.identity)
+                })
+                .collect();
+            // Only recipient IDs cross serialization; the stage drops its facts.
+            let serialization_connection_ids = self
+                .pre_serialization_thread_notification_recipients(
+                    thread_id,
+                    serialization_subscribers,
+                )
+                .await;
+            if serialization_connection_ids.is_empty() {
+                return;
+            }
+            let Some(serialized) = self.serialize_notification(method, payload) else {
+                return;
+            };
+            let subscribers = self
+                .thread_manager
+                .subscribed_connections_for_candidates(thread_id, serialization_connection_ids)
+                .await
+                .into_iter()
+                .filter(|subscriber| {
+                    identities.get(&subscriber.connection_id) == Some(&subscriber.identity)
+                })
+                .collect();
+            let connection_ids = self
+                .authorized_thread_notification_recipients(thread_id, subscribers)
+                .await;
+            self.send_serialized_notification_to_connections(method, &serialized, connection_ids)
+                .await;
+        })
+        .await;
     }
 
     pub(crate) async fn send_notification_to_removed_thread_subscribers<T: Serialize>(

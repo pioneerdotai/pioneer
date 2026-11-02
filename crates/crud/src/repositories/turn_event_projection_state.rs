@@ -365,56 +365,73 @@ pub async fn is_projected<C: ConnectionTrait>(
     Ok(projected_by_watermark)
 }
 
+/// Same eligible page as claim discovery; diagnostic callers need only its head.
+/// Workers reuse the page they already fetched instead of issuing this query.
+pub async fn next_deadline<C: ConnectionTrait>(db: &C) -> Result<Option<DateTimeWithTimeZone>> {
+    Ok(discover(db, 1).await?.first().map(|(_, at)| *at))
+}
+
+fn eligible_clock() -> sea_orm::sea_query::SimpleExpr {
+    Expr::case(
+        Expr::col(turn_event_projection_state::Column::Status).eq(PROJECTION_STATUS_PROJECTING),
+        Expr::col(turn_event_projection_state::Column::ClaimExpiresAt),
+    )
+    .finally(Expr::col(turn_event_projection_state::Column::NextRunAt))
+    .into()
+}
+
+/// A bounded ID/clock page, including future causal heads. Ordering by clock
+/// ensures a future row cannot hide due work. Causal/projection guards precede
+/// LIMIT; the conditional claim repeats them after this advisory read.
+pub async fn discover<C: ConnectionTrait>(
+    db: &C,
+    limit: u64,
+) -> Result<Vec<(String, DateTimeWithTimeZone)>> {
+    turn_event_projection_state::Entity::find()
+        .select_only()
+        .column(turn_event_projection_state::Column::EventId)
+        .column_as(eligible_clock(), "eligible_at")
+        .filter(next_for_healthy_stream())
+        .filter(turn_event_projection_state::Column::Status.is_in([
+            PROJECTION_STATUS_PENDING,
+            PROJECTION_STATUS_FAILED,
+            PROJECTION_STATUS_PROJECTING,
+        ]))
+        // In particular a NULL running lease must not fall back to next_run_at.
+        .filter(eligible_clock().is_not_null())
+        .order_by_asc(eligible_clock())
+        .order_by_asc(turn_event_projection_state::Column::TurnId)
+        .order_by_asc(turn_event_projection_state::Column::Sequence)
+        .order_by_asc(turn_event_projection_state::Column::CreatedAt)
+        .limit(limit)
+        .into_tuple::<(String, DateTimeWithTimeZone)>()
+        .all(db)
+        .await
+        .context("failed to discover eligible event work")
+}
+
 pub async fn claim_due<C: ConnectionTrait>(
     db: &C,
     now: DateTimeWithTimeZone,
     claim_expires_at: DateTimeWithTimeZone,
     limit: u64,
 ) -> Result<Vec<ClaimedTurnEventProjection>> {
-    let due_pending_or_failed = Condition::all()
-        .add(
-            turn_event_projection_state::Column::Status
-                .is_in([PROJECTION_STATUS_PENDING, PROJECTION_STATUS_FAILED]),
-        )
-        .add(turn_event_projection_state::Column::NextRunAt.lte(now));
-    let expired_projecting = Condition::all()
-        .add(turn_event_projection_state::Column::Status.eq(PROJECTION_STATUS_PROJECTING))
-        .add(turn_event_projection_state::Column::ClaimExpiresAt.lte(now));
-    // The watermark is the causal authority. Exactly one event per healthy
-    // Turn can be claimable: the immediate successor of its projected prefix.
-    let is_next_for_healthy_stream = sea_orm::sea_query::Expr::cust(
-        "EXISTS (\
-            SELECT 1 FROM turn_event_projection_stream_state AS stream_state \
-            WHERE stream_state.turn_id = turn_event_projection_state.turn_id \
-              AND stream_state.status = 'healthy' \
-              AND turn_event_projection_state.sequence = \
-                  stream_state.projected_through_sequence + 1\
-        )",
-    );
+    let candidates = list_due(db, now, limit).await?;
+    claim_candidates(db, now, claim_expires_at, candidates).await
+}
 
-    let candidates = turn_event_projection_state::Entity::find()
-        .filter(
-            Condition::any()
-                .add(due_pending_or_failed.clone())
-                .add(expired_projecting.clone()),
-        )
-        .filter(is_next_for_healthy_stream.clone())
-        .order_by_asc(turn_event_projection_state::Column::NextRunAt)
-        .order_by_asc(turn_event_projection_state::Column::TurnId)
-        .order_by_asc(turn_event_projection_state::Column::Sequence)
-        .order_by_asc(turn_event_projection_state::Column::CreatedAt)
-        .limit(limit)
-        .all(db)
-        .await
-        .context("failed to load due turn event projections")?;
-
+pub async fn claim_candidates<C: ConnectionTrait>(
+    db: &C,
+    now: DateTimeWithTimeZone,
+    claim_expires_at: DateTimeWithTimeZone,
+    candidates: Vec<String>,
+) -> Result<Vec<ClaimedTurnEventProjection>> {
+    let claimable = due_at(now);
+    let is_next_for_healthy_stream = next_for_healthy_stream();
     let mut claimed = Vec::new();
 
     for candidate in candidates {
         let claim_token = generate_id(CLAIM_TOKEN_LEN);
-        let claimable = Condition::any()
-            .add(due_pending_or_failed.clone())
-            .add(expired_projecting.clone());
         let claimed_now = turn_event_projection_state::Entity::update_many()
             .col_expr(
                 turn_event_projection_state::Column::Status,
@@ -432,17 +449,12 @@ pub async fn claim_due<C: ConnectionTrait>(
                 turn_event_projection_state::Column::UpdatedAt,
                 sea_orm::sea_query::Expr::value(now),
             )
-            .filter(turn_event_projection_state::Column::EventId.eq(candidate.event_id.clone()))
-            .filter(claimable)
+            .filter(turn_event_projection_state::Column::EventId.eq(candidate.clone()))
+            .filter(claimable.clone())
             .filter(is_next_for_healthy_stream.clone())
             .exec(db)
             .await
-            .with_context(|| {
-                format!(
-                    "failed to claim turn event projection `{}`",
-                    candidate.event_id
-                )
-            })?
+            .with_context(|| format!("failed to claim turn event projection `{}`", candidate))?
             .rows_affected
             > 0;
 
@@ -450,12 +462,78 @@ pub async fn claim_due<C: ConnectionTrait>(
             continue;
         }
 
-        if let Some(state) = find_by_event_id(db, candidate.event_id.as_str()).await? {
+        if let Some(state) = find_by_event_id(db, candidate.as_str()).await? {
             claimed.push(ClaimedTurnEventProjection { state, claim_token });
         }
     }
 
     Ok(claimed)
+}
+
+fn due_at(now: DateTimeWithTimeZone) -> Condition {
+    let due_pending_or_failed = Condition::all()
+        .add(
+            turn_event_projection_state::Column::Status
+                .is_in([PROJECTION_STATUS_PENDING, PROJECTION_STATUS_FAILED]),
+        )
+        .add(turn_event_projection_state::Column::NextRunAt.lte(now));
+    let expired_projecting = Condition::all()
+        .add(turn_event_projection_state::Column::Status.eq(PROJECTION_STATUS_PROJECTING))
+        .add(turn_event_projection_state::Column::ClaimExpiresAt.lte(now));
+    Condition::any()
+        .add(due_pending_or_failed)
+        .add(expired_projecting)
+}
+
+fn next_for_healthy_stream() -> sea_orm::sea_query::SimpleExpr {
+    use sea_orm::sea_query::Query;
+    Expr::exists(
+        Query::select()
+            .expr(Expr::val(1_i64))
+            .from(stream_state_entity::Entity)
+            .and_where(
+                Expr::col((
+                    stream_state_entity::Entity,
+                    stream_state_entity::Column::TurnId,
+                ))
+                .eq(Expr::col((
+                    turn_event_projection_state::Entity,
+                    turn_event_projection_state::Column::TurnId,
+                ))),
+            )
+            .and_where(
+                Expr::col((
+                    stream_state_entity::Entity,
+                    stream_state_entity::Column::Status,
+                ))
+                .eq("healthy"),
+            )
+            .and_where(
+                Expr::col((
+                    turn_event_projection_state::Entity,
+                    turn_event_projection_state::Column::Sequence,
+                ))
+                .eq(Expr::col((
+                    stream_state_entity::Entity,
+                    stream_state_entity::Column::ProjectedThroughSequence,
+                ))
+                .add(1_i64)),
+            )
+            .to_owned(),
+    )
+}
+
+pub async fn list_due<C: ConnectionTrait>(
+    db: &C,
+    now: DateTimeWithTimeZone,
+    limit: u64,
+) -> Result<Vec<String>> {
+    Ok(discover(db, limit)
+        .await?
+        .into_iter()
+        .filter(|(_, at)| *at <= now)
+        .map(|(id, _)| id)
+        .collect())
 }
 
 pub async fn is_next_projection_sequence<C: ConnectionTrait>(

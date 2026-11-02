@@ -121,16 +121,18 @@ pub async fn count_jobs_for_turn<C: ConnectionTrait>(db: &C, turn_id: &str) -> R
         .with_context(|| format!("failed to count recovery jobs for turn `{turn_id}`"))
 }
 
-pub async fn claim_due_jobs<C: ConnectionTrait>(
+/// Advisory, payload-free discovery. The writer must revalidate every predicate.
+pub async fn list_due_job_ids<C: ConnectionTrait>(
     db: &C,
     now: DateTimeWithTimeZone,
-    claim_expires_at: DateTimeWithTimeZone,
     limit: u64,
-) -> Result<Vec<recovery_job::Model>> {
-    let pending = recovery_job_status_to_db(RecoveryJobStatus::Pending);
-
-    let candidates = recovery_job::Entity::find()
-        .filter(recovery_job::Column::Status.eq(pending))
+) -> Result<Vec<String>> {
+    recovery_job::Entity::find()
+        .select_only()
+        .column(recovery_job::Column::Id)
+        .filter(
+            recovery_job::Column::Status.eq(recovery_job_status_to_db(RecoveryJobStatus::Pending)),
+        )
         .filter(recovery_job::Column::NextRunAt.lte(now))
         .filter(
             Condition::any()
@@ -138,13 +140,24 @@ pub async fn claim_due_jobs<C: ConnectionTrait>(
                 .add(recovery_job::Column::ClaimExpiresAt.lte(now)),
         )
         .order_by_asc(recovery_job::Column::NextRunAt)
+        .order_by_asc(recovery_job::Column::Id)
         .limit(limit)
+        .into_tuple::<String>()
         .all(db)
         .await
-        .context("failed to load due recovery jobs")?;
+        .context("failed to discover due recovery job identities")
+}
 
+/// Claims only the bounded reader page. No reader observation grants authority:
+/// status, due time and lease are rechecked by each conditional writer UPDATE.
+pub async fn claim_due_job_ids<C: ConnectionTrait>(
+    db: &C,
+    candidates: &[String],
+    now: DateTimeWithTimeZone,
+    claim_expires_at: DateTimeWithTimeZone,
+) -> Result<Vec<recovery_job::Model>> {
+    let pending = recovery_job_status_to_db(RecoveryJobStatus::Pending);
     let mut claimed = Vec::new();
-
     for candidate in candidates {
         let claim_token = generate_id(CLAIM_TOKEN_LEN);
         let claimed_now = recovery_job::Entity::update_many()
@@ -164,8 +177,9 @@ pub async fn claim_due_jobs<C: ConnectionTrait>(
                 recovery_job::Column::UpdatedAt,
                 sea_orm::sea_query::Expr::value(now),
             )
-            .filter(recovery_job::Column::Id.eq(candidate.id.clone()))
+            .filter(recovery_job::Column::Id.eq(candidate.clone()))
             .filter(recovery_job::Column::Status.eq(pending))
+            .filter(recovery_job::Column::NextRunAt.lte(now))
             .filter(
                 Condition::any()
                     .add(recovery_job::Column::ClaimExpiresAt.is_null())
@@ -173,23 +187,24 @@ pub async fn claim_due_jobs<C: ConnectionTrait>(
             )
             .exec(db)
             .await
-            .with_context(|| format!("failed to claim recovery job `{}`", candidate.id))?
+            .context("failed to claim recovery job")?
             .rows_affected
             > 0;
-
         if !claimed_now {
             continue;
         }
-
-        if let Some(job) = recovery_job::Entity::find_by_id(candidate.id.clone())
+        // A foreign transition between UPDATE and reload must never hand us a
+        // different owner's payload/token. Existing consumers retain domain fences.
+        if let Some(job) = recovery_job::Entity::find_by_id(candidate.clone())
+            .filter(recovery_job::Column::Status.eq(pending))
+            .filter(recovery_job::Column::ClaimToken.eq(claim_token))
             .one(db)
             .await
-            .with_context(|| format!("failed to reload claimed recovery job `{}`", candidate.id))?
+            .context("failed to reload claimed recovery job")?
         {
             claimed.push(job);
         }
     }
-
     Ok(claimed)
 }
 

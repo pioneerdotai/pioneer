@@ -1,10 +1,13 @@
 use anyhow::{Context, Result};
-use pioneer_entity::turn_finalization;
+use pioneer_entity::{
+    turn, turn_event, turn_event_projection_stream_state as stream, turn_finalization,
+};
 use pioneer_protocol::{ItemCompletedNotification, TurnItem};
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
+use sea_orm::sea_query::{Expr, ExprTrait, Query};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder,
-    QuerySelect, Set,
+    ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, EntityTrait, FromQueryResult,
+    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set,
 };
 use sha2::{Digest, Sha256};
 
@@ -110,6 +113,15 @@ pub async fn find_by_turn_id<C: ConnectionTrait>(
         .context("failed to query turn finalization")
 }
 
+/// Presence discovery does not materialize the accepted provider answer.
+pub async fn exists<C: ConnectionTrait>(db: &C, turn_id: &str) -> Result<bool> {
+    Ok(turn_finalization::Entity::find_by_id(turn_id.to_owned())
+        .count(db)
+        .await
+        .context("failed to check turn finalization presence")?
+        != 0)
+}
+
 pub async fn list_prepared<C: ConnectionTrait>(
     db: &C,
     limit: u64,
@@ -122,6 +134,133 @@ pub async fn list_prepared<C: ConnectionTrait>(
         .all(db)
         .await
         .context("failed to list prepared turn finalizations")
+}
+
+pub async fn list_prepared_ids<C: ConnectionTrait>(db: &C, limit: u64) -> Result<Vec<String>> {
+    turn_finalization::Entity::find()
+        .select_only()
+        .column(turn_finalization::Column::TurnId)
+        .filter(turn_finalization::Column::Status.eq(STATUS_PREPARED))
+        .order_by_asc(turn_finalization::Column::PreparedAt)
+        .order_by_asc(turn_finalization::Column::TurnId)
+        .limit(limit)
+        .into_tuple::<String>()
+        .all(db)
+        .await
+        .context("failed to list prepared turn finalizations")
+}
+
+/// Owner-local progress only. Durable intent rows remain the source of truth;
+/// restart or an end-of-pass resets this cursor and retries every failed row.
+#[derive(Debug, Clone, FromQueryResult)]
+pub(crate) struct PreparedCursor {
+    pub turn_id: String,
+    pub prepared_at: DateTimeWithTimeZone,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct PreparedPass {
+    pub after: Option<PreparedCursor>,
+    pub upper: Option<PreparedCursor>,
+    pub failed: bool,
+}
+
+pub(crate) async fn prepared_upper<C: ConnectionTrait>(db: &C) -> Result<Option<PreparedCursor>> {
+    turn_finalization::Entity::find()
+        .select_only()
+        .column(turn_finalization::Column::TurnId)
+        .column(turn_finalization::Column::PreparedAt)
+        .filter(turn_finalization::Column::Status.eq(STATUS_PREPARED))
+        .order_by_desc(turn_finalization::Column::PreparedAt)
+        .order_by_desc(turn_finalization::Column::TurnId)
+        .into_model::<PreparedCursor>()
+        .one(db)
+        .await
+        .context("failed to discover prepared finalization pass upper bound")
+}
+
+/// Prefix eligibility is applied before LIMIT. Missing dependencies are kept as
+/// candidates so corrupt data reports an error rather than masquerading as idle.
+pub(crate) async fn list_eligible_prepared<C: ConnectionTrait>(
+    db: &C,
+    after: Option<&PreparedCursor>,
+    upper: &PreparedCursor,
+    limit: u64,
+) -> Result<Vec<PreparedCursor>> {
+    let outer_id = || Expr::col((turn_finalization::Entity, turn_finalization::Column::TurnId));
+    let active = Query::select()
+        .expr(Expr::val(1))
+        .from(turn::Entity)
+        .and_where(Expr::col((turn::Entity, turn::Column::Id)).eq(outer_id()))
+        .and_where(Expr::col((turn::Entity, turn::Column::Status)).eq("in_progress"))
+        .to_owned();
+    let events = Query::select()
+        .expr(Expr::val(1))
+        .from(turn_event::Entity)
+        .and_where(Expr::col((turn_event::Entity, turn_event::Column::TurnId)).eq(outer_id()))
+        .to_owned();
+    let newer = Query::select()
+        .expr(Expr::val(1))
+        .from(turn_event::Entity)
+        .and_where(Expr::col((turn_event::Entity, turn_event::Column::TurnId)).eq(outer_id()))
+        .and_where(
+            Expr::col((turn_event::Entity, turn_event::Column::Sequence)).gt(Expr::col((
+                stream::Entity,
+                stream::Column::ProjectedThroughSequence,
+            ))),
+        )
+        .to_owned();
+    let stream_exists = Query::select()
+        .expr(Expr::val(1))
+        .from(stream::Entity)
+        .and_where(Expr::col((stream::Entity, stream::Column::TurnId)).eq(outer_id()))
+        .to_owned();
+    let ready_stream = Query::select()
+        .expr(Expr::val(1))
+        .from(stream::Entity)
+        .and_where(Expr::col((stream::Entity, stream::Column::TurnId)).eq(outer_id()))
+        .and_where(Expr::exists(newer).not())
+        .to_owned();
+    let mut query = turn_finalization::Entity::find()
+        .select_only()
+        .column(turn_finalization::Column::TurnId)
+        .column(turn_finalization::Column::PreparedAt)
+        .filter(turn_finalization::Column::Status.eq(STATUS_PREPARED))
+        .filter(
+            Condition::any()
+                .add(Expr::exists(active).not())
+                .add(Expr::exists(events).not())
+                .add(Expr::exists(stream_exists).not())
+                .add(Expr::exists(ready_stream)),
+        );
+    query = query.filter(
+        Condition::any()
+            .add(turn_finalization::Column::PreparedAt.lt(upper.prepared_at))
+            .add(
+                Condition::all()
+                    .add(turn_finalization::Column::PreparedAt.eq(upper.prepared_at))
+                    .add(turn_finalization::Column::TurnId.lte(upper.turn_id.clone())),
+            ),
+    );
+    if let Some(after) = after {
+        query = query.filter(
+            Condition::any()
+                .add(turn_finalization::Column::PreparedAt.gt(after.prepared_at))
+                .add(
+                    Condition::all()
+                        .add(turn_finalization::Column::PreparedAt.eq(after.prepared_at))
+                        .add(turn_finalization::Column::TurnId.gt(after.turn_id.clone())),
+                ),
+        );
+    }
+    query
+        .order_by_asc(turn_finalization::Column::PreparedAt)
+        .order_by_asc(turn_finalization::Column::TurnId)
+        .limit(limit)
+        .into_model::<PreparedCursor>()
+        .all(db)
+        .await
+        .context("failed to discover eligible prepared finalizations")
 }
 
 pub async fn delete_prepared_by_turn_id<C: ConnectionTrait>(db: &C, turn_id: &str) -> Result<bool> {

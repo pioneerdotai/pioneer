@@ -34,11 +34,36 @@ const MAX_CANCEL_HANDLERS: usize = 1;
 // Same window as DEFAULT_TASK_RESOURCES.max_concurrent_waits; the service's
 // per-actor/workspace policy remains authoritative (and may be more restrictive).
 const MAX_TASK_WAITERS: usize = 4;
+// Independent resource reads share a small connection budget, separate from
+// control/wait capacity. Saturation uses the existing deferred FIFO.
+const MAX_READ_HANDLERS: usize = 4;
 
 #[derive(Clone, Copy)]
 enum ConnectionRequestClass {
     Cancel,
     TaskWait,
+    Read,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IngressMode {
+    Serial,
+    ReadGroup,
+}
+
+// This is an execution allowlist, not an authorization classification. Each
+// handler targets an explicit resource and has no selection/subscription/write
+// effects. Everything else (including unknown requests and Binary) is a barrier.
+fn independent_read_request(request: &pioneer_protocol::JsonRpcRequest) -> bool {
+    use pioneer_protocol::constants::methods;
+    matches!(
+        request.method.as_str(),
+        methods::THREAD_GET
+            | methods::THREAD_TREE
+            | methods::THREAD_TIMELINE_PAGE
+            | methods::TURN_WORK_PAGE
+            | methods::TURN_WORK_ITEMS_GET
+    )
 }
 
 fn connection_request_class(
@@ -52,19 +77,21 @@ fn connection_request_class(
     }
 }
 
-/// Only exact Cancel and task/wait. Parsing selects ownership, never authority.
+/// Exact Cancel, task/wait and the explicit-resource read allowlist. Parsing
+/// selects ownership, never authority. Serial work never overlaps a read group.
 /// JoinSet aborts on Drop (including an unpolled/unwound pump); normal terminal
 /// paths additionally drain joins before connection-owned resources are freed.
 #[derive(Default)]
 pub(crate) struct ConnectionHandlers {
     cancels: JoinSet<()>,
     waits: JoinSet<()>,
+    reads: JoinSet<()>,
     closed: bool,
 }
 
 impl ConnectionHandlers {
     fn is_empty(&self) -> bool {
-        self.cancels.is_empty() && self.waits.is_empty()
+        self.cancels.is_empty() && self.waits.is_empty() && self.reads.is_empty()
     }
 
     fn reap(&mut self) -> Result<()> {
@@ -74,6 +101,9 @@ impl ConnectionHandlers {
         while let Some(result) = self.waits.try_join_next() {
             result?;
         }
+        while let Some(result) = self.reads.try_join_next() {
+            result?;
+        }
         Ok(())
     }
 
@@ -81,6 +111,7 @@ impl ConnectionHandlers {
         tokio::select! {
             result = self.cancels.join_next(), if !self.cancels.is_empty() => { result.expect("active cancel")?; }
             result = self.waits.join_next(), if !self.waits.is_empty() => { result.expect("active wait")?; }
+            result = self.reads.join_next(), if !self.reads.is_empty() => { result.expect("active read")?; }
         }
         Ok(())
     }
@@ -94,6 +125,7 @@ impl ConnectionHandlers {
         let (tasks, capacity) = match class {
             ConnectionRequestClass::Cancel => (&mut self.cancels, MAX_CANCEL_HANDLERS),
             ConnectionRequestClass::TaskWait => (&mut self.waits, MAX_TASK_WAITERS),
+            ConnectionRequestClass::Read => (&mut self.reads, MAX_READ_HANDLERS),
         };
         anyhow::ensure!(
             tasks.len() < capacity,
@@ -112,8 +144,10 @@ impl ConnectionHandlers {
         self.closed = true;
         self.cancels.abort_all();
         self.waits.abort_all();
+        self.reads.abort_all();
         while self.cancels.join_next().await.is_some() {}
         while self.waits.join_next().await.is_some() {}
+        while self.reads.join_next().await.is_some() {}
     }
 }
 
@@ -445,7 +479,7 @@ pub(crate) async fn run_normal_connection(
     let mut writer_completion = None;
     let mut deferred_ingress = VecDeque::new();
     let mut handlers = ConnectionHandlers::default();
-    let dispatch_control = |context: crate::request_context::ConnectionContext, payload: String| {
+    let dispatch_owned = |context: crate::request_context::ConnectionContext, payload: String| {
         let processor = message_processor.clone();
         let auth = auth_service.clone();
         let sessions = session_manager.clone();
@@ -531,12 +565,13 @@ pub(crate) async fn run_normal_connection(
                     // auth/refresh remains restricted to credential issuance.
                     let request = serde_json::from_str::<pioneer_protocol::JsonRpcRequest>(&payload).ok();
                     if let Some(class) = request.as_ref().and_then(connection_request_class) {
-                        if handlers.admit(class, dispatch_control(connection_context.clone(), payload.to_string())).is_err() {
+                        if handlers.admit(class, dispatch_owned(connection_context.clone(), payload.to_string())).is_err() {
                             send_close_bounded(&outbound_tx, 1013, "connection_control_overloaded").await;
                             break;
                         }
                         continue;
                     }
+                    let independent_read = request.as_ref().is_some_and(independent_read_request);
                     let renewal = request.filter(|request| request.method == pioneer_protocol::constants::methods::AUTH_ACCESS_RENEW);
                     let mut renewal_failed = false;
                     let mut ingress_alive = true;
@@ -559,18 +594,36 @@ pub(crate) async fn run_normal_connection(
                                 )
                                 .await;
                             } else {
-                                ordinary = Some(Arc::clone(&message_processor)
-                                    .start_owned_request(
-                                        connection_context.clone(),
-                                        payload.to_string(),
-                                    ));
+                                let mode = if independent_read {
+                                    if payload.len() > MAX_DEFERRED_BYTES {
+                                        send_close_bounded(&outbound_tx, 1009, "ingress_message_too_large").await;
+                                        ingress_alive = false;
+                                        return;
+                                    }
+                                    // Return the head to the same bounded FIFO;
+                                    // the read pump owns all read admission.
+                                    deferred_ingress.push_front(Message::Text(payload));
+                                    IngressMode::ReadGroup
+                                } else {
+                                    ordinary = Some(Arc::clone(&message_processor)
+                                        .start_owned_request(
+                                            connection_context.clone(),
+                                            payload.to_string(),
+                                        ));
+                                    IngressMode::Serial
+                                };
                                 ingress_alive = process_with_access_renewals(
                                     async {
-                                        if let Err(error) = ordinary.as_mut().expect("ordinary owner").join().await {
-                                            ordinary_failed = true;
-                                            tracing::warn!(error = %error, "ordinary RPC handler failed");
+                                        if mode == IngressMode::Serial {
+                                            if let Err(error) = ordinary.as_mut().expect("ordinary owner").join().await {
+                                                ordinary_failed = true;
+                                                tracing::warn!(error = %error, "ordinary RPC handler failed");
+                                            }
+                                        } else {
+                                            std::future::pending::<()>().await;
                                         }
                                     },
+                                    mode,
                                     &mut ws_reader,
                                     &mut deferred_ingress,
                                     &auth_service,
@@ -579,7 +632,7 @@ pub(crate) async fn run_normal_connection(
                                     &renewal_tx,
                                     &outbound_tx,
                                     &mut handlers,
-                                    &dispatch_control,
+                                    &dispatch_owned,
                                 )
                                 .await;
                             }
@@ -621,6 +674,7 @@ pub(crate) async fn run_normal_connection(
                             ingress_alive = process_with_access_renewals(
                                 message_processor
                                     .process_binary_frame(&processing_context, payload.as_ref()),
+                                IngressMode::Serial,
                                 &mut ws_reader,
                                 &mut deferred_ingress,
                                 &auth_service,
@@ -629,7 +683,7 @@ pub(crate) async fn run_normal_connection(
                                 &renewal_tx,
                                 &outbound_tx,
                                 &mut handlers,
-                                &dispatch_control,
+                                &dispatch_owned,
                             )
                             .await;
                         },
@@ -769,10 +823,14 @@ async fn continue_after_message_processing(
     }
 }
 
-/// Poll ordered work and exact connection-owned control together. A full FIFO
-/// never disables reading: the first frame that cannot fit closes the socket.
+/// Poll serial work or a read group and connection-owned control together. Only
+/// the FIFO's read prefix can join the group: a serial frame closes admission
+/// until the whole group drains. A full FIFO never disables reading: the first
+/// frame that cannot fit closes the socket. No context is captured for deferred
+/// work until execution, after every preceding selection/mutation has completed.
 pub(crate) async fn process_with_access_renewals<F, D, C>(
     processing: F,
+    mode: IngressMode,
     reader: &mut (impl futures_util::Stream<Item = std::result::Result<Message, axum::Error>> + Unpin),
     deferred: &mut VecDeque<Message>,
     auth: &GatewayAuthService,
@@ -798,6 +856,37 @@ where
         .sum();
     tokio::pin!(processing);
     loop {
+        if handlers.reap().is_err() {
+            return false;
+        }
+        if mode == IngressMode::ReadGroup {
+            while handlers.reads.len() < MAX_READ_HANDLERS {
+                let Some(Message::Text(payload)) = deferred.front() else {
+                    break;
+                };
+                if !serde_json::from_str::<pioneer_protocol::JsonRpcRequest>(payload)
+                    .is_ok_and(|request| independent_read_request(&request))
+                {
+                    break;
+                }
+                let Some(Message::Text(payload)) = deferred.pop_front() else {
+                    unreachable!()
+                };
+                deferred_bytes -= payload.len();
+                if handlers
+                    .admit(
+                        ConnectionRequestClass::Read,
+                        dispatch(connection.clone(), payload.to_string()),
+                    )
+                    .is_err()
+                {
+                    return false;
+                }
+            }
+            if handlers.reads.is_empty() {
+                return true;
+            }
+        }
         tokio::select! {
             // A ready ordinary completion cannot be starved by control traffic.
             biased;
@@ -844,6 +933,16 @@ where
                         if let Some(class) = connection_request_class(&request) {
                             if handlers.admit(class, dispatch(connection.clone(), payload.to_string())).is_err() {
                                 send_close_bounded(outbound, 1013, "connection_control_overloaded").await;
+                                return false;
+                            }
+                            continue;
+                        }
+                        if mode == IngressMode::ReadGroup
+                            && deferred.is_empty()
+                            && independent_read_request(&request)
+                            && handlers.reads.len() < MAX_READ_HANDLERS {
+                            if handlers.admit(ConnectionRequestClass::Read,
+                                dispatch(connection.clone(), payload.to_string())).is_err() {
                                 return false;
                             }
                             continue;
@@ -1070,6 +1169,7 @@ mod tests {
         for class in [
             ConnectionRequestClass::Cancel,
             ConnectionRequestClass::TaskWait,
+            ConnectionRequestClass::Read,
         ] {
             let (tx, rx) = tokio::sync::oneshot::channel();
             let notifier = DropNotifier(Some(tx));
@@ -1092,15 +1192,88 @@ mod tests {
                 .is_err()
         );
 
-        let mut owner = ConnectionHandlers::default();
-        owner
-            .admit(ConnectionRequestClass::TaskWait, async {
-                panic!("synthetic handler panic")
-            })
-            .unwrap();
-        assert!(owner.next().await.is_err());
-        assert!(owner.is_empty());
-        owner.shutdown().await;
+        for class in [
+            ConnectionRequestClass::TaskWait,
+            ConnectionRequestClass::Read,
+        ] {
+            let mut owner = ConnectionHandlers::default();
+            owner
+                .admit(class, async { panic!("synthetic handler panic") })
+                .unwrap();
+            assert!(owner.next().await.is_err());
+            assert!(owner.is_empty());
+            owner.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn read_group_drain_observes_terminal_signals_and_joins_children() {
+        for reason in ["revoke", "expiry", "shutdown", "writer"] {
+            let (termination_tx, mut termination_rx) = watch::channel(None);
+            let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+            let (expired_tx, mut expired_rx) = watch::channel(false);
+            let mut writer = tokio::spawn(async move {
+                if reason == "writer" {
+                    anyhow::bail!("synthetic writer failure");
+                }
+                std::future::pending::<Result<()>>().await
+            });
+            let (started, entered) = tokio::sync::oneshot::channel();
+            let (drop_tx, dropped) = tokio::sync::oneshot::channel();
+            let mut owner = ConnectionHandlers::default();
+            owner
+                .admit(ConnectionRequestClass::Read, async move {
+                    let _drop = DropNotifier(Some(drop_tx));
+                    started.send(()).unwrap();
+                    std::future::pending::<()>().await;
+                })
+                .unwrap();
+            entered.await.unwrap();
+            match reason {
+                "revoke" => {
+                    termination_tx
+                        .send(Some(AuthSessionTerminationReason::SessionRevoked))
+                        .unwrap();
+                }
+                "expiry" => {
+                    expired_tx.send(true).unwrap();
+                }
+                "shutdown" => {
+                    shutdown_tx.send(true).unwrap();
+                }
+                "writer" => {}
+                _ => unreachable!(),
+            }
+            let outcome = await_message_processing(
+                async {
+                    owner.next().await.unwrap();
+                },
+                &mut termination_rx,
+                &mut shutdown_rx,
+                &mut expired_rx,
+                &mut writer,
+            )
+            .await;
+            match (reason, outcome) {
+                (
+                    "revoke",
+                    MessageProcessingOutcome::SessionTerminated(Some(
+                        AuthSessionTerminationReason::SessionRevoked,
+                    )),
+                )
+                | ("expiry", MessageProcessingOutcome::AccessExpired)
+                | ("shutdown", MessageProcessingOutcome::ServerShutdown)
+                | ("writer", MessageProcessingOutcome::WriterFinished(Ok(Err(_)))) => {}
+                _ => panic!("wrong read-drain terminal outcome: {reason}"),
+            }
+            owner.shutdown().await;
+            dropped.await.unwrap();
+            assert!(owner.is_empty());
+            if reason != "writer" {
+                writer.abort();
+                let _ = writer.await;
+            }
+        }
     }
 
     #[test]

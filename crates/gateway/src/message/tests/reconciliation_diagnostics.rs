@@ -400,3 +400,41 @@ fn finalization_operation_survives_typed_sqlite_or_pool_cause() {
     assert_eq!(fields(&events[0])["phase"], "finalization_writer_begin");
     assert!(!serde_json::to_string(&events).unwrap().contains("canary"));
 }
+
+#[test]
+fn partial_finalization_failure_retains_storage_diagnostics_and_does_not_recover() {
+    let events = capture(|| {
+        let mut reporter = Reporter::new(OP);
+        reporter.observe::<usize>(
+            &Err(pool_error().context(pioneer_crud::NativeFinalizationPhase::WriterApply)),
+            Instant::now(),
+        );
+        let mut summary = pioneer_crud::TurnFinalizationReconciliationSummary::default();
+        summary.scanned = 1;
+        summary.failures.push(Arc::new(
+            pool_error()
+                .context(pioneer_crud::NativeFinalizationPhase::WriterApply)
+                .context(CANARY),
+        ));
+        reporter.observe_finalizations(&Ok(summary), Instant::now());
+        let mut eof = pioneer_crud::TurnFinalizationReconciliationSummary::default();
+        eof.pass_complete = true;
+        eof.pass_failed = true;
+        reporter.observe_finalizations(&Ok(eof), Instant::now());
+        assert_eq!(reporter.episode.as_ref().unwrap().failures, 2);
+    });
+    assert_eq!(
+        events.len(),
+        1,
+        "same storage failure uses existing rate policy"
+    );
+    // No successful observation closed the episode despite the outer Ok summary.
+    assert!(
+        events[0]
+            .breadcrumbs
+            .iter()
+            .all(|crumb| crumb.message.as_deref()
+                != Some("reconciliation recovered after observed failures"))
+    );
+    assert!(!serde_json::to_string(&events).unwrap().contains("canary"));
+}

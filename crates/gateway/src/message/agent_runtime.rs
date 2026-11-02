@@ -28,6 +28,7 @@ const TITLE_JOB_MAX_JITTER_MS: u64 = 250;
 pub(super) struct NativeTurnEventDeliveryWake {
     pub(super) running: AtomicBool,
     pending: AtomicBool,
+    deadline_wake: tokio::sync::Notify,
     #[cfg(test)]
     pub(super) claim_barrier: super::compaction_background::CompletedHistoryPreparationBarrier,
     #[cfg(test)]
@@ -3118,17 +3119,17 @@ impl MessageProcessor {
         consumer: &'static str,
         now_unix: i64,
         limit: u64,
-    ) -> Result<u64> {
-        let deliveries = self
+    ) -> Result<(u64, Option<i64>)> {
+        let batch = self
             .crud_store
-            .claim_due_turn_event_deliveries(consumer, now_unix, limit)
+            .claim_due_turn_event_deliveries_with_deadline(consumer, now_unix, limit)
             .await?;
-        let processed = deliveries.len() as u64;
+        let processed = batch.deliveries.len() as u64;
         let mut by_turn = std::collections::BTreeMap::<
             String,
             Vec<pioneer_crud::ClaimedTurnEventDeliveryRecord>,
         >::new();
-        for delivery in deliveries {
+        for delivery in batch.deliveries {
             by_turn
                 .entry(delivery.event.turn_id.clone())
                 .or_default()
@@ -3155,7 +3156,7 @@ impl MessageProcessor {
             !storage_failed.load(Ordering::Relaxed),
             "turn-event delivery acknowledgement/deferral storage failed"
         );
-        Ok(processed)
+        Ok((processed, batch.next_eligible_at_unix))
     }
 
     /// Wake both existing consumers after commit, or from periodic recovery.
@@ -3185,6 +3186,7 @@ impl MessageProcessor {
             return;
         }
         wake.pending.store(true, Ordering::SeqCst);
+        wake.deadline_wake.notify_one();
         let Some(guard) = NativeTurnEventDeliveryGuard::acquire(wake.clone()) else {
             return;
         };
@@ -3221,6 +3223,9 @@ impl MessageProcessor {
         let shutdown = &self.native_turn_event_delivery_workers.shutdown;
         loop {
             wake.pending.store(false, Ordering::SeqCst);
+            // Consume the initial kick's permit before discovering timers.
+            // A concurrent kick still publishes pending before its Notify.
+            let _ = wake.deadline_wake.notified().now_or_never();
             let mut exhausted = true;
             for _ in 0..128 {
                 let result = crate::database::attribution::scope_database_workload_result(
@@ -3236,10 +3241,30 @@ impl MessageProcessor {
                 )
                 .await;
                 match result {
-                    Ok(0) => {
+                    Ok((0, next_eligible_at_unix)) => {
                         exhausted = false;
                         #[cfg(test)]
                         wake.claim_barrier.wait_if_armed("empty", shutdown).await;
+                        // Timed retry/lease is itself an unblocker: no new
+                        // domain commit is required. Keep the coalesced owner
+                        // only while a future eligible timer exists. A retained
+                        // Notify permit plus pending covers kick-before-sleep.
+                        if let Some(deadline) =
+                            next_eligible_at_unix.filter(|at| *at > now_timestamp_secs())
+                        {
+                            let delay = Duration::from_secs(
+                                deadline.saturating_sub(now_timestamp_secs()).max(0) as u64,
+                            );
+                            #[cfg(test)]
+                            wake.claim_barrier.wait_if_armed("timer", shutdown).await;
+                            if !wake.pending.load(Ordering::SeqCst) {
+                                tokio::select! {
+                                    _ = wake.deadline_wake.notified() => {}
+                                    _ = tokio::time::sleep(delay) => {}
+                                }
+                            }
+                            wake.pending.store(true, Ordering::SeqCst);
+                        }
                         break;
                     }
                     Ok(_) => tokio::task::yield_now().await,
@@ -3281,6 +3306,18 @@ impl MessageProcessor {
     /// process-wide resilience loop. One bounded claim wave runs at a time;
     /// terminal commits and the periodic worker provide subsequent kicks.
     pub(super) fn kick_native_terminal_effects(&self) {
+        #[cfg(not(test))]
+        self.spawn_native_terminal_effect_kick();
+        #[cfg(test)]
+        self.spawn_native_terminal_effect_kick(None);
+    }
+
+    // Regression fixtures fix only this owner's discovery clock. Production
+    // has no clock override and still reads UTC separately for each wave.
+    pub(super) fn spawn_native_terminal_effect_kick(
+        &self,
+        #[cfg(test)] discovery_clock: Option<Box<dyn Fn() -> i64 + Send>>,
+    ) {
         // Retain a wakeup that arrives while the bounded worker is already
         // running. Without this bit, a terminal commit racing an earlier
         // preparation kick can leave a newly eligible effect asleep until the
@@ -3298,8 +3335,13 @@ impl MessageProcessor {
             loop {
                 this.native_terminal_effect_kick_pending
                     .store(false, Ordering::Release);
+                let discovery_now = now_timestamp_secs();
+                #[cfg(test)]
+                let discovery_now = discovery_clock
+                    .as_ref()
+                    .map_or(discovery_now, |clock| clock());
                 let (dispatched_count, storage_failed) = match this
-                    .process_due_native_terminal_effects(now_timestamp_secs(), 8)
+                    .process_due_native_terminal_effects(discovery_now, 8)
                     .await
                 {
                     Ok(outcome) => (outcome.count, outcome.storage_failed),
@@ -3315,10 +3357,17 @@ impl MessageProcessor {
                     tokio::time::sleep(Duration::from_secs(5)).await;
                 }
 
-                if this
-                    .native_terminal_effect_kick_pending
-                    .load(Ordering::Acquire)
+                // Dispatch count is not the input quantum: rotating status
+                // quotas can return fewer records while due work remains.
+                // Continue on successful progress; each bounded wave releases
+                // DB capacity and yields. An empty wave stops, so future retry,
+                // lease and acceptance-gate clocks cannot create a busy loop.
+                if (!storage_failed && dispatched_count > 0)
+                    || this
+                        .native_terminal_effect_kick_pending
+                        .load(Ordering::Acquire)
                 {
+                    tokio::task::yield_now().await;
                     continue;
                 }
 
@@ -7911,7 +7960,7 @@ impl MessageProcessor {
         now_unix: i64,
         limit: u64,
     ) -> Result<TurnFinalizationReconciliationSummary> {
-        let summary = self
+        let mut summary = self
             .crud_store
             .reconcile_prepared_turn_finalizations(limit, now_unix)
             .await?;
@@ -7924,7 +7973,8 @@ impl MessageProcessor {
                 .await;
             }
             let turn_id = committed.turn_completed.turn.id.as_str();
-            self.thread_manager
+            if let Err(error) = self
+                .thread_manager
                 .commit_terminal_turn(
                     committed.turn_completed.thread_id.as_str(),
                     &committed.turn_completed.turn,
@@ -7932,7 +7982,10 @@ impl MessageProcessor {
                 .await
                 .with_context(|| {
                     format!("failed to synchronize reconciled native Turn `{turn_id}` in memory")
-                })?;
+                })
+            {
+                summary.failures.push(Arc::new(error));
+            }
         }
         Ok(summary)
     }

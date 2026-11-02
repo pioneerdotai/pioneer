@@ -346,6 +346,87 @@ pub struct ResourceSnapshot {
     pub host: Vec<Value>,
     pub children: Vec<ChildSnapshot>,
 }
+// These walks count additional heap storage only. Inline Options/structs and
+// Vec elements are already charged by their enclosing owner.
+fn storage_add(total: usize, count: usize, element_bytes: usize) -> Option<usize> {
+    total.checked_add(count.checked_mul(element_bytes)?)
+}
+impl Value {
+    fn additional_heap_bytes(&self) -> Option<usize> {
+        [
+            self.source.capacity(),
+            self.unit.capacity(),
+            self.scope.capacity(),
+            self.temporality.capacity(),
+        ]
+        .into_iter()
+        .try_fold(0usize, usize::checked_add)
+    }
+}
+fn values_heap_bytes(values: &Vec<Value>) -> Option<usize> {
+    let backing = storage_add(0, values.capacity(), std::mem::size_of::<Value>())?;
+    values.iter().try_fold(backing, |total, value| {
+        total.checked_add(value.additional_heap_bytes()?)
+    })
+}
+impl RawUsage {
+    fn additional_heap_bytes(&self) -> Option<usize> {
+        let strings = [
+            self.main_module_id.as_ref().map_or(0, String::capacity),
+            self.start_identity.capacity(),
+            self.cpu_source.capacity(),
+        ]
+        .into_iter()
+        .try_fold(0usize, usize::checked_add)?;
+        strings.checked_add(values_heap_bytes(&self.values)?)
+    }
+}
+impl ProcessSample {
+    fn additional_heap_bytes(&self) -> Option<usize> {
+        self.raw
+            .as_ref()
+            .map_or(Some(0), RawUsage::additional_heap_bytes)
+    }
+}
+impl ChildSnapshot {
+    fn additional_heap_bytes(&self) -> Option<usize> {
+        let strings = [
+            self.parent_run.capacity(),
+            self.start_identity.as_ref().map_or(0, String::capacity),
+            self.outcome.capacity(),
+            self.final_usage.capacity(),
+        ]
+        .into_iter()
+        .try_fold(0usize, usize::checked_add)?;
+        strings.checked_add(
+            self.sample
+                .as_ref()
+                .map_or(Some(0), ProcessSample::additional_heap_bytes)?,
+        )
+    }
+}
+impl ResourceSnapshot {
+    /// Additional owned heap allocations, excluding this value's inline storage.
+    /// None means overflow and must be rejected as oversized by the journal.
+    /// Capacities describe retained storage, not RSS or allocator overhead.
+    pub(crate) fn additional_heap_bytes(&self) -> Option<usize> {
+        let mut total = self.child_coverage.capacity();
+        total = total.checked_add(
+            self.self_process
+                .as_ref()
+                .map_or(Some(0), ProcessSample::additional_heap_bytes)?,
+        )?;
+        total = total.checked_add(values_heap_bytes(&self.host)?)?;
+        total = storage_add(
+            total,
+            self.children.capacity(),
+            std::mem::size_of::<ChildSnapshot>(),
+        )?;
+        self.children.iter().try_fold(total, |total, child| {
+            total.checked_add(child.additional_heap_bytes()?)
+        })
+    }
+}
 struct RegisteredChild {
     snapshot: ChildSnapshot,
     live: Option<crate::live::WorkGuard>,
@@ -1508,4 +1589,13 @@ pub fn captured_output(
     let output = child.wait_with_output()?;
     owner.exited(output.status.success());
     Ok(output)
+}
+
+#[cfg(test)]
+#[test]
+fn retained_storage_checked_arithmetic_rejects_add_and_multiply_overflow() {
+    assert_eq!(storage_add(3, 4, 5), Some(23));
+    assert_eq!(storage_add(usize::MAX, 1, 1), None);
+    assert_eq!(storage_add(0, usize::MAX, 2), None);
+    assert_eq!(storage_add(7, 0, usize::MAX), Some(7));
 }

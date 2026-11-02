@@ -72,6 +72,56 @@ fn event_requires_live_delivery(event: &TurnEventPayload) -> bool {
     )
 }
 
+/// Same eligible page as claim discovery; diagnostic callers need only its head.
+/// Workers reuse the page they already fetched instead of issuing this query.
+pub async fn next_deadline<C: ConnectionTrait>(
+    db: &C,
+    consumer: &str,
+) -> Result<Option<DateTimeWithTimeZone>> {
+    Ok(discover(db, consumer, 1).await?.first().map(|(_, at)| *at))
+}
+
+fn eligible_clock() -> sea_orm::sea_query::SimpleExpr {
+    Expr::case(
+        Expr::col(turn_event_delivery::Column::Status).eq(DELIVERY_STATUS_DELIVERING),
+        Expr::col(turn_event_delivery::Column::ClaimExpiresAt),
+    )
+    .finally(Expr::col(turn_event_delivery::Column::NextRunAt))
+    .into()
+}
+
+/// A bounded ID/clock page, including future causal heads. Ordering by clock
+/// ensures a future row cannot hide due work. Causal/projection guards precede
+/// LIMIT; the conditional claim repeats them after this advisory read.
+pub async fn discover<C: ConnectionTrait>(
+    db: &C,
+    consumer: &str,
+    limit: u64,
+) -> Result<Vec<(String, DateTimeWithTimeZone)>> {
+    turn_event_delivery::Entity::find()
+        .select_only()
+        .column(turn_event_delivery::Column::Id)
+        .column_as(eligible_clock(), "eligible_at")
+        .filter(no_pending_predecessor())
+        .filter(projection_ready(consumer))
+        .filter(turn_event_delivery::Column::Consumer.eq(consumer.to_owned()))
+        .filter(turn_event_delivery::Column::Status.is_in([
+            DELIVERY_STATUS_PENDING,
+            DELIVERY_STATUS_FAILED,
+            DELIVERY_STATUS_DELIVERING,
+        ]))
+        // In particular a NULL running lease must not fall back to next_run_at.
+        .filter(eligible_clock().is_not_null())
+        .order_by_asc(eligible_clock())
+        .order_by_asc(turn_event_delivery::Column::TurnId)
+        .order_by_asc(turn_event_delivery::Column::Sequence)
+        .limit(limit)
+        .into_tuple::<(String, DateTimeWithTimeZone)>()
+        .all(db)
+        .await
+        .context("failed to discover eligible event work")
+}
+
 pub async fn claim_due<C: ConnectionTrait>(
     db: &C,
     consumer: &str,
@@ -79,22 +129,70 @@ pub async fn claim_due<C: ConnectionTrait>(
     claim_expires_at: DateTimeWithTimeZone,
     limit: u64,
 ) -> Result<Vec<ClaimedTurnEventDelivery>> {
-    let due = Condition::all()
-        .add(turn_event_delivery::Column::Consumer.eq(consumer.to_owned()))
-        .add(
-            turn_event_delivery::Column::Status
-                .is_in([DELIVERY_STATUS_PENDING, DELIVERY_STATUS_FAILED]),
-        )
-        .add(turn_event_delivery::Column::NextRunAt.lte(now));
-    let expired = Condition::all()
-        .add(turn_event_delivery::Column::Consumer.eq(consumer.to_owned()))
-        .add(turn_event_delivery::Column::Status.eq(DELIVERY_STATUS_DELIVERING))
-        .add(turn_event_delivery::Column::ClaimExpiresAt.lte(now));
+    let candidates = list_due(db, consumer, now, limit).await?;
+    claim_candidates(db, consumer, now, claim_expires_at, candidates).await
+}
+
+pub async fn claim_candidates<C: ConnectionTrait>(
+    db: &C,
+    consumer: &str,
+    now: DateTimeWithTimeZone,
+    claim_expires_at: DateTimeWithTimeZone,
+    candidates: Vec<String>,
+) -> Result<Vec<ClaimedTurnEventDelivery>> {
+    let due = due_at(consumer, now);
+    let no_pending_predecessor = no_pending_predecessor();
+    let projection_ready = projection_ready(consumer);
+    let mut claimed = Vec::new();
+    for candidate in candidates {
+        let claim_token = generate_id(DB_ID_LEN);
+        let affected = turn_event_delivery::Entity::update_many()
+            .col_expr(
+                turn_event_delivery::Column::Status,
+                sea_orm::sea_query::Expr::value(DELIVERY_STATUS_DELIVERING.to_owned()),
+            )
+            .col_expr(
+                turn_event_delivery::Column::ClaimToken,
+                sea_orm::sea_query::Expr::value(Some(claim_token.clone())),
+            )
+            .col_expr(
+                turn_event_delivery::Column::ClaimExpiresAt,
+                sea_orm::sea_query::Expr::value(Some(claim_expires_at)),
+            )
+            .col_expr(
+                turn_event_delivery::Column::UpdatedAt,
+                sea_orm::sea_query::Expr::value(now),
+            )
+            .filter(turn_event_delivery::Column::Id.eq(candidate.clone()))
+            .filter(due.clone())
+            // Candidate discovery does not replace the claim's state guard.
+            // Revalidate causal eligibility in the same UPDATE as its lease.
+            .filter(no_pending_predecessor.clone())
+            .filter(projection_ready.clone())
+            .exec(db)
+            .await
+            .context("failed to claim turn event delivery")?
+            .rows_affected;
+        if affected == 0 {
+            continue;
+        }
+        if let Some(row) = turn_event_delivery::Entity::find_by_id(candidate)
+            .one(db)
+            .await
+            .context("failed to reload claimed turn event delivery")?
+        {
+            claimed.push(ClaimedTurnEventDelivery { row, claim_token });
+        }
+    }
+    Ok(claimed)
+}
+
+fn projection_ready(consumer: &str) -> SimpleExpr {
     // Canonical append can commit before its read-model projection. The
     // contiguous watermark is authoritative even after receipt compaction
     // (see turn_event_projection_state::is_projected). Quarantine does not
     // invalidate an already projected prefix.
-    let projection_ready = if consumer == CONSUMER_THREAD_EPISODIC {
+    if consumer == CONSUMER_THREAD_EPISODIC {
         use pioneer_entity::turn_event_projection_stream_state as stream;
         Expr::exists(
             Query::select()
@@ -133,63 +231,36 @@ pub async fn claim_due<C: ConnectionTrait>(
         )
     } else {
         Expr::val(true).into()
-    };
-    let no_pending_predecessor = no_pending_predecessor();
-    let candidates = turn_event_delivery::Entity::find()
-        .filter(Condition::any().add(due.clone()).add(expired.clone()))
-        // Apply causal eligibility before LIMIT so a blocked turn's backlog
-        // cannot consume all slots and starve independent turns.
-        .filter(no_pending_predecessor.clone())
-        .filter(projection_ready.clone())
-        .order_by_asc(turn_event_delivery::Column::TurnId)
-        .order_by_asc(turn_event_delivery::Column::Sequence)
-        .limit(limit)
-        .all(db)
-        .await
-        .context("failed to list due turn event deliveries")?;
-
-    let mut claimed = Vec::new();
-    for candidate in candidates {
-        let claim_token = generate_id(DB_ID_LEN);
-        let affected = turn_event_delivery::Entity::update_many()
-            .col_expr(
-                turn_event_delivery::Column::Status,
-                sea_orm::sea_query::Expr::value(DELIVERY_STATUS_DELIVERING.to_owned()),
-            )
-            .col_expr(
-                turn_event_delivery::Column::ClaimToken,
-                sea_orm::sea_query::Expr::value(Some(claim_token.clone())),
-            )
-            .col_expr(
-                turn_event_delivery::Column::ClaimExpiresAt,
-                sea_orm::sea_query::Expr::value(Some(claim_expires_at)),
-            )
-            .col_expr(
-                turn_event_delivery::Column::UpdatedAt,
-                sea_orm::sea_query::Expr::value(now),
-            )
-            .filter(turn_event_delivery::Column::Id.eq(candidate.id.clone()))
-            .filter(Condition::any().add(due.clone()).add(expired.clone()))
-            // Candidate discovery does not replace the claim's state guard.
-            // Revalidate causal eligibility in the same UPDATE as its lease.
-            .filter(no_pending_predecessor.clone())
-            .filter(projection_ready.clone())
-            .exec(db)
-            .await
-            .context("failed to claim turn event delivery")?
-            .rows_affected;
-        if affected == 0 {
-            continue;
-        }
-        if let Some(row) = turn_event_delivery::Entity::find_by_id(candidate.id)
-            .one(db)
-            .await
-            .context("failed to reload claimed turn event delivery")?
-        {
-            claimed.push(ClaimedTurnEventDelivery { row, claim_token });
-        }
     }
-    Ok(claimed)
+}
+
+pub async fn list_due<C: ConnectionTrait>(
+    db: &C,
+    consumer: &str,
+    now: DateTimeWithTimeZone,
+    limit: u64,
+) -> Result<Vec<String>> {
+    Ok(discover(db, consumer, limit)
+        .await?
+        .into_iter()
+        .filter(|(_, at)| *at <= now)
+        .map(|(id, _)| id)
+        .collect())
+}
+
+fn due_at(consumer: &str, now: DateTimeWithTimeZone) -> Condition {
+    let due = Condition::all()
+        .add(turn_event_delivery::Column::Consumer.eq(consumer.to_owned()))
+        .add(
+            turn_event_delivery::Column::Status
+                .is_in([DELIVERY_STATUS_PENDING, DELIVERY_STATUS_FAILED]),
+        )
+        .add(turn_event_delivery::Column::NextRunAt.lte(now));
+    let expired = Condition::all()
+        .add(turn_event_delivery::Column::Consumer.eq(consumer.to_owned()))
+        .add(turn_event_delivery::Column::Status.eq(DELIVERY_STATUS_DELIVERING))
+        .add(turn_event_delivery::Column::ClaimExpiresAt.lte(now));
+    Condition::any().add(due).add(expired)
 }
 
 fn no_pending_predecessor() -> SimpleExpr {

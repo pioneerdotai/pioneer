@@ -1727,6 +1727,13 @@ fn warn_hook_diagnostic(phase: HookPhase, diagnostic: &HookDiagnostic) {
 
 fn warn_hook_policy_runtime_error(phase: HookPhase, error: &HookRuntimeError) {
     match error {
+        HookRuntimeError::RecoveryStorageUnavailable => {
+            warn!(
+                phase = %phase,
+                error_kind = "recovery_storage_unavailable",
+                "hook recovery storage is unavailable"
+            );
+        }
         HookRuntimeError::Registry(_) => {
             warn!(
                 phase = %phase,
@@ -1890,6 +1897,13 @@ fn warn_hook_policy_runtime_error(phase: HookPhase, error: &HookRuntimeError) {
 
 fn warn_hook_prompt_context_runtime_error(phase: HookPhase, error: &HookRuntimeError) {
     match error {
+        HookRuntimeError::RecoveryStorageUnavailable => {
+            warn!(
+                phase = %phase,
+                error_kind = "recovery_storage_unavailable",
+                "hook recovery storage is unavailable"
+            );
+        }
         HookRuntimeError::Registry(_) => {
             warn!(
                 phase = %phase,
@@ -2053,6 +2067,13 @@ fn warn_hook_prompt_context_runtime_error(phase: HookPhase, error: &HookRuntimeE
 
 fn warn_hook_prompt_section_runtime_error(phase: HookPhase, error: &HookRuntimeError) {
     match error {
+        HookRuntimeError::RecoveryStorageUnavailable => {
+            warn!(
+                phase = %phase,
+                error_kind = "recovery_storage_unavailable",
+                "hook recovery storage is unavailable"
+            );
+        }
         HookRuntimeError::Registry(_) => {
             warn!(
                 phase = %phase,
@@ -2216,6 +2237,13 @@ fn warn_hook_prompt_section_runtime_error(phase: HookPhase, error: &HookRuntimeE
 
 fn warn_hook_runtime_error(phase: HookPhase, error: &HookRuntimeError) {
     match error {
+        HookRuntimeError::RecoveryStorageUnavailable => {
+            warn!(
+                phase = %phase,
+                error_kind = "recovery_storage_unavailable",
+                "hook recovery storage is unavailable"
+            );
+        }
         HookRuntimeError::Registry(_) => {
             warn!(
                 phase = %phase,
