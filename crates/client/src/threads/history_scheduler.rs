@@ -297,6 +297,27 @@ impl ThreadControllerReceiver {
         });
         Some((id, item))
     }
+    /// Caller holds registry: refine a selected queued identity to its prepared
+    /// attempt, before attaching a waiter. No callback runs under either lock.
+    pub(crate) fn refine(
+        &self,
+        id: u64,
+        identity: super::registry::HistoryIdentity,
+        current: bool,
+    ) {
+        let mut p = self
+            .shared
+            .pending
+            .lock()
+            .expect("history pending poisoned");
+        let a = p
+            .active
+            .iter_mut()
+            .find(|a| a.id == id)
+            .expect("history reservation");
+        a.identity = identity;
+        a.retired |= !current;
+    }
     pub(crate) fn attach(&self, id: u64, response: crate::rpc::JsonRpcResponseSender) -> bool {
         let mut p = self
             .shared

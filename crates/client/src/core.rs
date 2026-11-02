@@ -2203,15 +2203,19 @@ impl ClientCore {
                             };
                             let mut flight = flights.remove(index);
                             let apply = std::mem::replace(&mut flight.apply, Box::new(|_, _| None));
-                            let continuation = if current {
-                                flight.work.run(|| {
-                                    apply(&core, result).map(|request| {
-                                        Self::history_continuation(request, flight.queue.clone())
-                                    })
-                                })
+                            // Physical retirement is not logical finalization. Discard
+                            // stale payloads, but run the same reducer's exact-generation
+                            // error path so continuing-session rotation cannot strand work.
+                            let result = if current {
+                                result
                             } else {
-                                None
+                                Err(anyhow::anyhow!("History request authority retired"))
                             };
+                            let continuation = flight.work.run(|| {
+                                apply(&core, result).map(|request| {
+                                    Self::history_continuation(request, flight.queue.clone())
+                                })
+                            });
                             receiver.finish_active(flight.reservation, continuation);
                         }
 
@@ -2245,17 +2249,30 @@ impl ClientCore {
                                 pioneer_observability::work::ExecutorRole::ClientController,
                             );
                             let mut processing = queue.as_ref().map(|q| q.processing());
+                            // Capture network authority before domain preparation, then
+                            // revalidate it before sending or accepting any payload.
+                            let auth = core.current_auth_ticket();
+                            let transport = auth.1.map(|connection| {
+                                core.transport_runtime
+                                    .ws_command_sender()
+                                    .requests_for_connection(connection)
+                            });
                             let prepared = work.run(|| core.prepare_history_request(request));
                             if let Some(processing) = &mut processing {
                                 processing.processed();
                             }
                             if let Some(prepared) = prepared {
-                                let auth = core.current_auth_ticket();
-                                let transport = auth.1.map(|connection| {
-                                    core.transport_runtime
-                                        .ws_command_sender()
-                                        .requests_for_connection(connection)
-                                });
+                                if let Some(identity) = &prepared.identity {
+                                    let registry = core
+                                        .thread_registry
+                                        .lock()
+                                        .expect("thread registry poisoned");
+                                    receiver.refine(
+                                        reservation,
+                                        identity.clone(),
+                                        identity.current(&registry),
+                                    );
+                                }
                                 let deadline =
                                     std::time::Instant::now() + crate::rpc::RPC_REQUEST_TIMEOUT;
                                 let (tx, rx) = std::sync::mpsc::channel();
@@ -2264,7 +2281,12 @@ impl ClientCore {
                                     deadline,
                                     receiver.completion_wake(),
                                 );
-                                if !receiver.attach(reservation, response.clone()) {
+                                if !receiver.attach(reservation, response.clone())
+                                    || core.current_auth_ticket() != auth
+                                    || transport
+                                        .as_ref()
+                                        .is_some_and(|t| t.scope().is_some() && !t.is_current())
+                                {
                                     response.cancel();
                                 }
                                 let payload = prepared.rpc.map(|(method, params)| {
@@ -2393,6 +2415,7 @@ impl ClientCore {
             R::Semantic(request) => {
                 self.prepare_thread_semantic_request(request)
                     .map(|mut prepared| crate::threads::registry::PreparedHistory {
+                        identity: None,
                         rpc: prepared.rpc.take(),
                         apply: Box::new(move |core, result| {
                             core.complete_thread_semantic_request(prepared, result)

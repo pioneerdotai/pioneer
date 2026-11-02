@@ -2371,6 +2371,7 @@ impl crate::core::ClientCore {
             through_turn_id: request.through_turn_id.clone(),
         };
         Some(crate::threads::registry::PreparedHistory {
+            identity: None,
             rpc: Some((
                 pioneer_protocol::constants::methods::THREAD_READ,
                 serde_json::to_value(params).expect("read params"),
@@ -2383,7 +2384,10 @@ impl crate::core::ClientCore {
                     .thread_registry
                     .lock()
                     .expect("thread registry poisoned");
-                if core.is_stopped() || !registry.timeline_operation_matches(&token) {
+                if core.is_stopped()
+                    || !registry.timeline_operation_matches(&token)
+                    || !registry.timeline.accepts_read(&request)
+                {
                     return None;
                 }
                 if !auth_is_current {

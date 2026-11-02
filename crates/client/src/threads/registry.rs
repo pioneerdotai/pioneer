@@ -190,6 +190,7 @@ struct ThreadSubscriptionBaseline {
 }
 
 struct ThreadDomainStore {
+    resume_attempt: u64,
     coordinator: ThreadCoordinator,
     semantic: SemanticTimelineState,
     cli_binding: Option<CLIRuntimeThreadBinding>,
@@ -356,6 +357,7 @@ impl ThreadDomainStore {
 
     fn new(id: &str, workspace: &str) -> Self {
         Self {
+            resume_attempt: 0,
             coordinator: ThreadCoordinator::pending(id, workspace),
             semantic: Default::default(),
             cli_binding: None,
@@ -766,6 +768,7 @@ impl DerefMut for ThreadMutation<'_> {
 }
 impl Drop for ThreadMutation<'_> {
     fn drop(&mut self) {
+        self.core.wake_thread_timeline_requests();
         let drafts = self.registry.publish(&self.id);
         self.core.transition_directory(
             &mut self.registry,
@@ -1490,6 +1493,8 @@ impl ClientCore {
             drafts,
             Vec::new(),
         );
+        drop(registry);
+        self.retire_thread_controller_jobs();
         changed
     }
 }
@@ -1924,6 +1929,8 @@ impl ClientCore {
             drafts,
             Vec::new(),
         );
+        drop(registry);
+        self.retire_thread_controller_jobs();
         patch
     }
 }
@@ -6035,16 +6042,72 @@ mod tests {
         queue_history(&core, "b");
         let (request, b) = requests.recv_timeout(watchdog).unwrap();
         assert_eq!(
-            request["params"]["thread_id"], "b",
+            request["params"]["threadId"], "b",
             "same-thread quantum must wait for A"
         );
         a.send(Ok(empty_history("a"))).unwrap();
         let (request, next_a) = requests.recv_timeout(watchdog).unwrap();
-        assert_eq!(request["params"]["thread_id"], "a");
+        assert_eq!(request["params"]["threadId"], "a");
         assert!(b.is_active());
         core.shutdown();
         wait_history_owner_exit(&waiting);
         assert!(!next_a.is_active());
+    }
+
+    #[test]
+    fn canonical_history_scheduler_enforces_two_active_semantic_reservations() {
+        let core = crate::catalog_test_support::settings_client();
+        let (sender, receiver) = crate::threads::history_scheduler::channel();
+        let mut third = None;
+        for id in ["a", "b", "c"] {
+            core.upsert_thread(thread(id, "ws"));
+            let request = core
+                .begin_thread_semantic_request(SemanticTimelineRequestAction::ThreadTimelinePage {
+                    key: SemanticTimelineRequestKey::ThreadNewest {
+                        thread_id: id.into(),
+                    },
+                    params: pioneer_protocol::ThreadTimelinePageParams {
+                        thread_id: id.into(),
+                        anchor: pioneer_protocol::TimelinePageAnchor::Newest,
+                        limit: Some(100),
+                    },
+                })
+                .unwrap()
+                .unwrap();
+            if id == "c" {
+                third = Some(request);
+            } else {
+                sender
+                    .send(ThreadControllerRequest::Semantic(request))
+                    .unwrap();
+            }
+        }
+        let receive = |item: pioneer_observability::work::WorkItem<ThreadControllerRequest>| {
+            use pioneer_observability::work::{Boundary, ExecutorRole, WorkKind};
+            let queue = item.queue.as_ref().map(|(q, _)| q.clone());
+            let (request, _) = item.received(
+                Boundary::StdThread,
+                WorkKind::ClientCommand,
+                ExecutorRole::ClientController,
+            );
+            if let Some(queue) = queue {
+                queue.processing().processed();
+            }
+            request
+        };
+        let (a, item) = receiver.take_ready_by(|_| false).unwrap();
+        assert!(matches!(receive(item), ThreadControllerRequest::Semantic(r) if r.id == "a"));
+        let (b, item) = receiver.take_ready_by(|_| false).unwrap();
+        assert!(matches!(receive(item), ThreadControllerRequest::Semantic(r) if r.id == "b"));
+        sender
+            .send(ThreadControllerRequest::Semantic(third.unwrap()))
+            .unwrap();
+        assert!(receiver.take_ready_by(|_| false).is_none());
+        receiver.finish_active(b, None);
+        let (c, item) = receiver.take_ready_by(|_| false).unwrap();
+        assert!(matches!(receive(item), ThreadControllerRequest::Semantic(r) if r.id == "c"));
+        receiver.finish_active(c, None);
+        receiver.finish_active(a, None);
     }
 
     #[test]
@@ -6053,21 +6116,20 @@ mod tests {
         let watchdog = std::time::Duration::from_secs(5);
         queue_history(&core, "a");
         let (a_request, a) = requests.recv_timeout(watchdog).unwrap();
-        assert_eq!(a_request["params"]["thread_id"], "a");
+        assert_eq!(a_request["params"]["threadId"], "a");
         queue_history(&core, "b");
         let (b_request, b) = requests
             .recv_timeout(watchdog)
             .expect("B starts without a reply to A");
-        assert_eq!(b_request["params"]["thread_id"], "b");
+        assert_eq!(b_request["params"]["threadId"], "b");
         queue_history(&core, "c");
-        // The owner reaches its sleep boundary with both response handles held.
-        waiting.recv_timeout(watchdog).unwrap();
-        assert!(requests.try_recv().is_err());
+        // Hard bound is proved by canonical scheduler selection separately;
+        // this test observes progress after B while A remains blocked.
         b.send(Ok(empty_history("b"))).unwrap();
         let (c_request, c) = requests
             .recv_timeout(watchdog)
             .expect("B completion releases a slot");
-        assert_eq!(c_request["params"]["thread_id"], "c");
+        assert_eq!(c_request["params"]["threadId"], "c");
         assert!(core.thread_semantic_in_flight("b").is_empty());
         assert!(!core.thread_semantic_in_flight("a").is_empty());
         assert!(a.is_active());
@@ -6089,7 +6151,7 @@ mod tests {
                 response: crate::rpc::JsonRpcResponseSender,
             ) -> Result<(), String> {
                 let request: serde_json::Value = serde_json::from_str(&payload).unwrap();
-                if request["params"]["thread_id"] == "b" {
+                if request["params"]["threadId"] == "b" {
                     response.send(Ok(empty_history("b"))).unwrap();
                     Ok(())
                 } else {
@@ -6116,7 +6178,7 @@ mod tests {
         let (request, _) = requests
             .recv_timeout(std::time::Duration::from_secs(5))
             .unwrap();
-        assert_eq!(request["params"]["thread_id"], "c");
+        assert_eq!(request["params"]["threadId"], "c");
         assert!(core.thread_semantic_in_flight("b").is_empty());
         assert!(a.is_active());
         core.shutdown();
@@ -6235,6 +6297,326 @@ mod tests {
         );
         assert!(requests.try_recv().is_err());
         assert!(a.is_active() && b.is_active());
+        core.shutdown();
+        wait_history_owner_exit(&waiting);
+    }
+
+    fn rotate_history_authority(core: &ClientCore) {
+        let before = core.current_auth_ticket();
+        // Actual continuing-session token-rotation branch: Update increments
+        // identity_request, keeps the store, and wakes history. The socket need
+        // not have disappeared for the captured logical authority to be stale.
+        core.begin_authorization_epoch(Some(("endpoint".into(), 8)));
+        let after = core.current_auth_ticket();
+        assert_ne!(after.0, before.0);
+        assert_eq!(after.1, before.1);
+        assert!(core.current_auth().is_some());
+    }
+
+    #[test]
+    fn continuing_session_rotation_finishes_each_exact_history_obligation() {
+        use crate::timeline::controller::TimelineDemand;
+        let watchdog = std::time::Duration::from_secs(5);
+        for kind in ["semantic", "read", "resume"] {
+            let (core, requests, waiting) = history_owner_fixture();
+            core.prepare_history_rotation_session_for_test();
+            for id in ["a", "b", "c"] {
+                core.upsert_thread(thread(id, "ws"));
+            }
+            let token = core.thread_operation_token("a").unwrap();
+            let read = match kind {
+                "semantic" => {
+                    queue_history(&core, "a");
+                    None
+                }
+                "resume" => {
+                    core.apply_thread_conversation_event(
+                        "ws",
+                        ConversationEvent::TurnStarted {
+                            thread_id: "a".into(),
+                            turn: running_turn("old"),
+                        },
+                        None,
+                    );
+                    core.schedule_thread_resume("a").unwrap();
+                    None
+                }
+                "read" => {
+                    let demand = TimelineDemand {
+                        thread_id: "a".into(),
+                        consumer_id: "reader".into(),
+                        generation: 1,
+                        source_revision: 0,
+                        row_ids: vec![],
+                        threshold: 0,
+                        before: false,
+                        after: false,
+                        work: false,
+                        presented_rows: true,
+                        scroll_generation: 0,
+                        latest_user_turn_id: Some("viewed".into()),
+                        viewed_through_turn_id: Some("viewed".into()),
+                        viewed_row_ids: vec![],
+                        viewed_through_block: None,
+                        read_requires_unread: false,
+                        prefetch_on_visibility: false,
+                        boundary_request_limit: 1,
+                    };
+                    let read = core
+                        .thread_registry
+                        .lock()
+                        .unwrap()
+                        .timeline
+                        .update(demand, vec![], 0)
+                        .reads
+                        .pop()
+                        .unwrap();
+                    core.thread_request_sender
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .unwrap()
+                        .send(ThreadControllerRequest::Read(read.clone()))
+                        .unwrap();
+                    Some(read)
+                }
+                _ => unreachable!(),
+            };
+            let (_, old) = requests.recv_timeout(watchdog).unwrap();
+            let semantic_key = SemanticTimelineRequestKey::ThreadNewest {
+                thread_id: "a".into(),
+            };
+            let semantic_generation = core
+                .thread_registry
+                .lock()
+                .unwrap()
+                .timeline
+                .request_generation(&semantic_key);
+            // A serial job is a deterministic progress marker: it cannot begin
+            // until the held flight's logical finalization and release finish.
+            let generation = core.thread_operation_token("b").unwrap().generation;
+            core.thread_request_sender
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .send(ThreadControllerRequest::Binding {
+                    id: "b".into(),
+                    workspace: "ws".into(),
+                    generation,
+                })
+                .unwrap();
+            rotate_history_authority(&core);
+            let (next, _) = requests
+                .recv_timeout(watchdog)
+                .expect("continuing-session rotation releases the barrier");
+            assert_eq!(next["method"], "cli_runtime/thread_binding/get");
+            assert!(!old.is_active());
+            assert_eq!(
+                core.thread_operation_token("a").unwrap(),
+                token,
+                "rotation preserves the store incarnation"
+            );
+            match kind {
+                "semantic" => assert!(
+                    !core
+                        .thread_registry
+                        .lock()
+                        .unwrap()
+                        .timeline
+                        .accepts(&semantic_key, semantic_generation)
+                ),
+                "read" => {
+                    let registry = core.thread_registry.lock().unwrap();
+                    assert!(!registry.timeline.accepts_read(read.as_ref().unwrap()));
+                    // A due retry may already own a newer generation; the old
+                    // Loading must be gone in either case.
+                }
+                "resume" => {
+                    let state = core.thread_coordinator_snapshot("a").unwrap();
+                    assert!(!state.resume.in_progress);
+                    assert!(state.resume.next_attempt_at.is_some());
+                }
+                _ => unreachable!(),
+            }
+            assert!(old.send(Ok(serde_json::Value::Null)).is_err());
+            core.shutdown();
+            wait_history_owner_exit(&waiting);
+        }
+    }
+
+    #[test]
+    fn terminal_or_moved_resume_retires_snapshot_and_items_without_waiting_for_reply() {
+        let watchdog = std::time::Duration::from_secs(5);
+        for page in [false, true] {
+            for moved in [false, true] {
+                let (core, requests, waiting) = history_owner_fixture();
+                core.apply_thread_conversation_event(
+                    "ws",
+                    ConversationEvent::TurnStarted {
+                        thread_id: "a".into(),
+                        turn: running_turn("old"),
+                    },
+                    None,
+                );
+                core.schedule_thread_resume("a").unwrap();
+                let (_, mut old) = requests.recv_timeout(watchdog).unwrap();
+                if page {
+                    old.send(Ok(serde_json::to_value(
+                        pioneer_protocol::TurnGetResponse {
+                            thread_id: "a".into(),
+                            workspace_id: "ws".into(),
+                            turn: running_turn("old"),
+                        },
+                    )
+                    .unwrap()))
+                        .unwrap();
+                    let (request, items) = requests.recv_timeout(watchdog).unwrap();
+                    assert_eq!(request["method"], "turn/items/page");
+                    old = items;
+                }
+                queue_history(&core, "b");
+                if moved {
+                    core.apply_thread_conversation_event(
+                        "ws",
+                        ConversationEvent::TurnStarted {
+                            thread_id: "a".into(),
+                            turn: running_turn("new"),
+                        },
+                        None,
+                    );
+                } else {
+                    let mut turn = running_turn("old");
+                    turn.status = TurnStatus::Completed;
+                    core.apply_thread_conversation_event(
+                        "ws",
+                        ConversationEvent::TurnCompleted {
+                            thread_id: "a".into(),
+                            turn,
+                        },
+                        None,
+                    );
+                    core.tick_thread_conversations();
+                }
+                let (request, b) = requests
+                    .recv_timeout(watchdog)
+                    .expect("B must bypass retired Resume without reply or timeout");
+                assert_eq!(request["params"]["threadId"], "b");
+                assert!(!old.is_active());
+                if !moved {
+                    core.apply_thread_conversation_event(
+                        "ws",
+                        ConversationEvent::TurnStarted {
+                            thread_id: "a".into(),
+                            turn: running_turn("new"),
+                        },
+                        None,
+                    );
+                    core.schedule_thread_resume("a").unwrap();
+                }
+                b.send(Ok(empty_history("b"))).unwrap();
+                let (request, new) = requests.recv_timeout(watchdog).unwrap();
+                assert_eq!(request["method"], "turn/get");
+                assert_eq!(request["params"]["turn_id"], "new");
+                assert!(old.send(Ok(serde_json::Value::Null)).is_err());
+                assert!(new.is_active());
+                assert!(
+                    core.thread_coordinator_snapshot("a")
+                        .unwrap()
+                        .resume
+                        .in_progress
+                );
+                core.shutdown();
+                wait_history_owner_exit(&waiting);
+            }
+        }
+    }
+
+    #[test]
+    fn buffered_history_success_cannot_apply_to_recreated_loading_request() {
+        struct BufferedReplacement {
+            core: std::sync::Weak<ClientCore>,
+            first: std::sync::atomic::AtomicBool,
+            held: HeldHistory,
+        }
+        impl crate::rpc::JsonRpcRequestTransport for BufferedReplacement {
+            fn send_json_rpc_request(
+                &self,
+                id: String,
+                payload: String,
+                response: crate::rpc::JsonRpcResponseSender,
+            ) -> Result<(), String> {
+                if self.first.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                    // The actual owner is inside this send: completion is buffered
+                    // successfully, but cannot be polled/applied until we return.
+                    response
+                        .send(Ok(serde_json::to_value(presentation_page(&[(
+                            "stale",
+                            "old payload",
+                        )]))
+                        .unwrap()))
+                        .unwrap();
+                    let core = self.core.upgrade().unwrap();
+                    let old = core.thread_operation_token("a").unwrap();
+                    core.remove_thread_store("a");
+                    core.upsert_thread(thread("a", "ws"));
+                    assert_ne!(core.thread_operation_token("a").unwrap(), old);
+                    queue_history(&core, "a");
+                    Ok(())
+                } else {
+                    crate::rpc::JsonRpcRequestTransport::send_json_rpc_request(
+                        &self.held, id, payload, response,
+                    )
+                }
+            }
+        }
+        let (core, _, waiting) = history_owner_fixture();
+        let (tx, requests) = std::sync::mpsc::channel();
+        *core
+            .transport_runtime()
+            .ws_command_sender()
+            .test_requests
+            .lock()
+            .unwrap() = Some(Arc::new(BufferedReplacement {
+            core: Arc::downgrade(&core),
+            first: std::sync::atomic::AtomicBool::new(true),
+            held: HeldHistory(tx),
+        }));
+        queue_history(&core, "a");
+        let (_, new) = requests
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let snapshot = core.thread_semantic_snapshot("a");
+        let top = &snapshot.thread("a").unwrap().top_level;
+        assert!(top.block("stale").is_none());
+        assert!(matches!(
+            top.request_status,
+            crate::timeline::semantic::TimelineRequestStatus::Loading { .. }
+        ));
+        assert!(new.is_active());
+        new.send(Ok(serde_json::to_value(presentation_page(&[(
+            "fresh",
+            "new payload",
+        )]))
+        .unwrap()))
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "new request did not complete"
+            );
+            if core.thread_semantic_in_flight("a").is_empty() {
+                break;
+            }
+            waiting
+                .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                .unwrap();
+        }
+        let snapshot = core.thread_semantic_snapshot("a");
+        let top = &snapshot.thread("a").unwrap().top_level;
+        assert!(top.block("stale").is_none());
+        assert!(top.block("fresh").is_some());
         core.shutdown();
         wait_history_owner_exit(&waiting);
     }
@@ -13803,6 +14185,7 @@ pub(crate) type HistoryApply = Box<
         + Send,
 >;
 pub(crate) struct PreparedHistory {
+    pub(crate) identity: Option<HistoryIdentity>,
     pub(crate) rpc: Option<(&'static str, serde_json::Value)>,
     pub(crate) apply: HistoryApply,
 }
@@ -15551,6 +15934,7 @@ fn retire_moved_resume(store: &mut ThreadDomainStore) {
     }
 }
 struct ThreadResumeContinuation {
+    attempt: u64,
     snapshot: pioneer_protocol::TurnGetResponse,
     after: Option<i64>,
 }
@@ -15576,6 +15960,12 @@ pub(crate) enum HistoryIdentity {
         key: SemanticTimelineRequestKey,
     },
     Read(crate::timeline::controller::TimelineReadRequest),
+    Resume {
+        id: String,
+        generation: u64,
+        turn_id: String,
+        attempt: u64,
+    },
     Store {
         id: String,
         generation: u64,
@@ -15584,7 +15974,7 @@ pub(crate) enum HistoryIdentity {
 impl HistoryIdentity {
     pub(crate) fn thread(&self) -> &str {
         match self {
-            Self::Semantic { id, .. } | Self::Store { id, .. } => id,
+            Self::Semantic { id, .. } | Self::Store { id, .. } | Self::Resume { id, .. } => id,
             Self::Read(r) => &r.thread_id,
         }
     }
@@ -15606,6 +15996,17 @@ impl HistoryIdentity {
                     && registry.timeline.accepts(key, *request_generation)
             }
             Self::Read(r) => registry.timeline.accepts_read(r),
+            Self::Resume {
+                id,
+                generation,
+                turn_id,
+                attempt,
+            } => registry.stores.get(id).is_some_and(|store| {
+                store.generation == *generation
+                    && store.resume_attempt == *attempt
+                    && store.coordinator.resume.in_progress
+                    && store.coordinator.conversation.in_flight_turn_id() == Some(turn_id.as_str())
+            }),
             Self::Store { id, generation } => registry
                 .stores
                 .get(id)
@@ -15929,7 +16330,7 @@ impl ClientCore {
         let id = request.id.clone();
         let id = id.as_str();
         let generation = request.generation;
-        let (turn_id, workspace) = {
+        let (turn_id, workspace, attempt) = {
             let mut registry = self
                 .thread_registry
                 .lock()
@@ -15958,7 +16359,12 @@ impl ClientCore {
                 return None;
             };
             if let Some(continuation) = &request.continuation {
-                if continuation.snapshot.turn.id != turn || !store.coordinator.resume.in_progress {
+                if continuation.attempt != store.resume_attempt
+                    || !store.coordinator.resume.in_progress
+                {
+                    return None;
+                }
+                if continuation.snapshot.turn.id != turn {
                     retire_moved_resume(store);
                     let drafts = registry.publish(id);
                     self.transition_directory(
@@ -15970,9 +16376,17 @@ impl ClientCore {
                     return None;
                 }
             } else {
+                store.resume_attempt = store
+                    .resume_attempt
+                    .checked_add(1)
+                    .expect("resume attempt exhausted");
                 begin_turn_resume_attempt(&mut store.coordinator.resume);
             }
-            (turn, store.coordinator.workspace_id.clone())
+            (
+                turn,
+                store.coordinator.workspace_id.clone(),
+                store.resume_attempt,
+            )
         };
         let rpc = if let Some(continuation) = &request.continuation {
             (
@@ -15991,11 +16405,43 @@ impl ClientCore {
                     .expect("resume params"),
             )
         };
+        let identity = HistoryIdentity::Resume {
+            id: id.to_owned(),
+            generation,
+            turn_id: turn_id.clone(),
+            attempt,
+        };
         Some(PreparedHistory {
+            identity: Some(identity.clone()),
             rpc: Some(rpc),
             apply: Box::new(move |core, response| {
                 let id_owned = request.id.clone();
                 let id = id_owned.as_str();
+                {
+                    let mut registry = core
+                        .thread_registry
+                        .lock()
+                        .expect("thread registry poisoned");
+                    if !identity.current(&registry) {
+                        if let Some(store) = registry.stores.get_mut(id).filter(|s| {
+                            s.generation == generation
+                                && s.resume_attempt == attempt
+                                && s.coordinator.resume.in_progress
+                        }) {
+                            // Only this captured attempt may be retired. A moved
+                            // turn gets the existing recovery scheduling policy.
+                            retire_moved_resume(store);
+                            let drafts = registry.publish(id);
+                            core.transition_directory(
+                                &mut registry,
+                                &ClientMutationAuthority { _private: () },
+                                drafts,
+                                vec![],
+                            );
+                        }
+                        return None;
+                    }
+                }
                 let result = (|| -> anyhow::Result<Option<TurnResumeSnapshotReduction>> {
                     if request.continuation.is_none() {
                         let snapshot =
@@ -16014,6 +16460,7 @@ impl ClientCore {
                             "Resume snapshot capacity exceeded"
                         );
                         request.continuation = Some(ThreadResumeContinuation {
+                            attempt,
                             snapshot,
                             after: None,
                         });
@@ -16039,6 +16486,8 @@ impl ClientCore {
                         anyhow::ensure!(
                             !core.is_stopped()
                                 && store.generation == generation
+                                && store.resume_attempt == attempt
+                                && store.coordinator.resume.in_progress
                                 && page.workspace_id == workspace
                                 && store.coordinator.conversation.in_flight_turn_id()
                                     == Some(turn_id.as_str()),
@@ -16072,10 +16521,11 @@ impl ClientCore {
                         .lock()
                         .expect("thread registry poisoned");
                     if !core.is_stopped()
-                        && let Some(store) = registry
-                            .stores
-                            .get_mut(id)
-                            .filter(|store| store.generation == generation)
+                        && let Some(store) = registry.stores.get_mut(id).filter(|store| {
+                            store.generation == generation
+                                && store.resume_attempt == attempt
+                                && store.coordinator.resume.in_progress
+                        })
                     {
                         if store.coordinator.resume.in_progress
                             && store.coordinator.conversation.in_flight_turn_id()
@@ -16102,7 +16552,11 @@ impl ClientCore {
                 let Some(store) = registry.stores.get_mut(id) else {
                     return None;
                 };
-                if core.is_stopped() || store.generation != generation {
+                if core.is_stopped()
+                    || store.generation != generation
+                    || store.resume_attempt != attempt
+                    || !store.coordinator.resume.in_progress
+                {
                     return None;
                 }
                 if store.coordinator.conversation.in_flight_turn_id() != Some(turn_id.as_str()) {
@@ -17269,6 +17723,7 @@ impl ClientCore {
         let id = id.to_owned();
         let workspace = workspace.to_owned();
         Some(PreparedHistory {
+            identity: None,
             rpc: Some((
                 pioneer_protocol::constants::methods::CLI_RUNTIME_THREAD_BINDING_GET,
                 serde_json::to_value(params).expect("binding params"),

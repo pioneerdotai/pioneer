@@ -3129,4 +3129,16 @@ mod tests {
         assert_eq!(first.join().unwrap(), second.join().unwrap());
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
+    pub(crate) fn prepare_history_rotation_session_for_test(core: &ClientCore) {
+        // Use the same preparation, verification and session commit owners as
+        // existing session tests; only external exchange/connect ports are fake.
+        connect(core, &endpoint("endpoint"), &storage(), 7).unwrap();
+    }
+}
+
+#[cfg(test)]
+impl ClientCore {
+    pub(crate) fn prepare_history_rotation_session_for_test(&self) {
+        tests::prepare_history_rotation_session_for_test(self);
+    }
 }
