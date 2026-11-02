@@ -24326,7 +24326,7 @@ impl CrudStore {
         Ok(threads)
     }
 
-    /// Unfiltered storage candidates for authorized thread observation.
+    /// Ordinary visible conversation candidates for threads_list; ACL is separate.
     /// Does not hydrate turns or change read cursors/subscriptions.
     pub async fn list_thread_read_candidates_page(
         &self,
@@ -24335,6 +24335,14 @@ impl CrudStore {
         limit: u64,
     ) -> Result<Vec<ThreadReadPosition>> {
         thread::list_read_candidates_page(&self.connection, workspace_id, after, limit).await
+    }
+
+    pub async fn is_thread_list_conversation(
+        &self,
+        workspace_id: &str,
+        thread_id: &str,
+    ) -> Result<bool> {
+        thread::is_list_conversation(&self.connection, workspace_id, thread_id).await
     }
 
     pub async fn list_threads_for_workspace(

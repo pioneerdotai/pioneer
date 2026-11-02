@@ -123,6 +123,9 @@ async fn list_filters_private_metadata_and_rechecks_acl_on_cursor_continuation()
     );
     // A broader user ACL does not widen a capsule-restricted execution.
     let capsule_only = authority(MEMBER_A_ID, THREAD_RED_PRIVATE_A_ID, false);
+    let restricted_rows = list_all(&processor, &capsule_only).await;
+    assert_eq!(restricted_rows.as_array().unwrap().len(), 1);
+    assert_eq!(restricted_rows[0]["threadId"], THREAD_RED_PRIVATE_A_ID);
     assert!(
         !processor
             .thread_source_readable(&capsule_only, THREAD_RED_WORKSPACE_ID)
@@ -209,6 +212,16 @@ async fn add_thread(processor: &MessageProcessor, id: &str, parent: Option<&str>
             "INSERT INTO thread_lineage(child_thread_id,parent_thread_id,root_thread_id,depth,created_at,created_by_thread_id,created_by_turn_id) VALUES (?,?,?,1,CURRENT_TIMESTAMP,?,'read-root-turn')",
             [id.into(), parent.into(), THREAD_RED_WORKSPACE_ID.into(), THREAD_RED_WORKSPACE_ID.into()])).await.unwrap();
     }
+}
+
+// List-specific fixtures are ordinary visible conversations. Child traversal
+// fixtures above retain their real hidden/system semantics.
+async fn make_conversation(processor: &MessageProcessor, id: &str) {
+    processor.crud_store.database_connection().execute_raw(Statement::from_sql_and_values(
+        DatabaseBackend::Sqlite,
+        "UPDATE thread SET origin_kind='user',sidebar_visibility='visible',access_class='workspace' WHERE id=?",
+        [id.into()],
+    )).await.unwrap();
 }
 
 #[tokio::test]
@@ -474,10 +487,39 @@ async fn internal_child_requires_authorized_root_and_parent_history_cursor_is_in
         )
         .await
         .unwrap();
+    assert!(
+        !list_all(&processor, &a)
+            .await
+            .to_string()
+            .contains("internal-child")
+    );
+    let children = processor
+        .thread_children_page(
+            &a,
+            ThreadsChildrenListParams {
+                thread_id: THREAD_RED_WORKSPACE_ID.into(),
+                recursive: false,
+                limit: 100,
+                cursor: None,
+            },
+            &processor.thread_read_cursor_codec().unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        children["threads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["threadId"] == "internal-child")
+    );
     assert!(!first.eof);
     let parent_cursor = first.next_cursor.clone().unwrap();
+    let reference = first.events[0]["childReference"]["threadId"]
+        .as_str()
+        .unwrap();
     let child = processor
-        .read_saved_thread_history(WORKSPACE_RED_ID, "internal-child", 1, None, |_| async {
+        .read_saved_thread_history(WORKSPACE_RED_ID, reference, 1, None, |_| async {
             Ok(false)
         })
         .await
@@ -1253,6 +1295,7 @@ async fn metadata_returns_full_titles_and_explicit_preview_truncation_across_pag
     assert_eq!(metadata["previewTruncated"], true);
     for index in 0..205 {
         add_thread(&processor, &format!("list-{index:03}"), None, false).await;
+        make_conversation(&processor, &format!("list-{index:03}")).await;
     }
     let codec = processor.thread_read_cursor_codec().unwrap();
     let mut cursor = None;
@@ -1365,6 +1408,7 @@ async fn list_creation_key_survives_skips_activity_insertions_deletion_and_acces
         ("d-fraction", "2050-01-01 00:00:00.123456788+00:00"),
     ] {
         add_thread(&processor, id, None, false).await;
+        make_conversation(&processor, id).await;
         harness
             .database
             .execute_raw(Statement::from_sql_and_values(
@@ -1380,6 +1424,16 @@ async fn list_creation_key_survives_skips_activity_insertions_deletion_and_acces
     for index in 0..205 {
         let id = format!("denied-{index:03}");
         add_thread(&processor, &id, None, true).await;
+        make_conversation(&processor, &id).await;
+        harness
+            .database
+            .execute_raw(Statement::from_sql_and_values(
+                DatabaseBackend::Sqlite,
+                "UPDATE thread SET access_class='private' WHERE id=?",
+                [id.clone().into()],
+            ))
+            .await
+            .unwrap();
         harness
             .database
             .execute_raw(Statement::from_sql_and_values(
@@ -1429,6 +1483,7 @@ async fn list_creation_key_survives_skips_activity_insertions_deletion_and_acces
         .await
         .unwrap();
     add_thread(&processor, "0-latest", None, false).await;
+    make_conversation(&processor, "0-latest").await;
     harness
         .database
         .execute_unprepared(
@@ -1593,6 +1648,7 @@ async fn list_rejects_legacy_tampered_and_cross_scope_cursors_with_public_errors
 async fn list_fragment_pins_only_its_source_and_reports_change_disappearance_or_denial() {
     let (harness, processor) = fixture().await;
     add_thread(&processor, "pending-card", None, false).await;
+    make_conversation(&processor, "pending-card").await;
     let title = "🌍\"\n".repeat(450_000);
     harness.database.execute_raw(Statement::from_sql_and_values(
         DatabaseBackend::Sqlite,
@@ -1619,6 +1675,7 @@ async fn list_fragment_pins_only_its_source_and_reports_change_disappearance_or_
         cursor: Some(first["nextCursor"].as_str().unwrap().to_owned()),
     };
     add_thread(&processor, "new-before-pending", None, false).await;
+    make_conversation(&processor, "new-before-pending").await;
     harness.database.execute_unprepared("UPDATE thread SET created_at='2051-01-01 00:00:00+00:00' WHERE id='new-before-pending'; UPDATE thread SET name='unrelated change',preview='activity',updated_at='2060-01-01 00:00:00+00:00' WHERE id='T00000000000000000002'").await.unwrap();
     let second = processor
         .thread_list_page(&a, continuation.clone(), &codec)
@@ -1633,6 +1690,28 @@ async fn list_fragment_pins_only_its_source_and_reports_change_disappearance_or_
         second["threads"][0]["fragment"]["version"],
         fragment["version"]
     );
+    for change in [
+        "sidebar_visibility='hidden'",
+        "origin_kind='task_run'",
+        "access_class='internal'",
+    ] {
+        harness
+            .database
+            .execute_unprepared(&format!(
+                "UPDATE thread SET {change} WHERE id='pending-card'"
+            ))
+            .await
+            .unwrap();
+        let error = processor
+            .thread_list_page(&a, continuation.clone(), &codec)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            public_read_error(&safe_read_error(&error)).1,
+            "read_source_unavailable"
+        );
+        make_conversation(&processor, "pending-card").await;
+    }
     harness
         .database
         .execute_unprepared("UPDATE thread SET name='changed source' WHERE id='pending-card'")
@@ -1676,4 +1755,119 @@ async fn list_fragment_pins_only_its_source_and_reports_change_disappearance_or_
         public_read_error(&safe_read_error(&error)).1,
         "read_source_unavailable"
     );
+}
+
+#[tokio::test]
+async fn list_conversation_boundary_excludes_internal_quanta_but_keeps_visible_agent_roots() {
+    let (harness, processor) = fixture().await;
+    for (id, origin) in [
+        ("root-collaborative", "collaborative"),
+        ("root-dm", "direct_message"),
+        ("root-legacy", "user"),
+    ] {
+        add_thread(&processor, id, Some(THREAD_RED_WORKSPACE_ID), false).await;
+        make_conversation(&processor, id).await;
+        harness.database.execute_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "UPDATE thread SET origin_kind=?,created_by_actor_kind='agent_execution',created_by_actor_id='E00000000000000000001',created_at='2050-01-01 00:00:00+00:00' WHERE id=?",
+            [origin.into(), id.into()],
+        )).await.unwrap();
+    }
+    // More than a processing quantum, interleaved between new and old roots.
+    // Includes readable hidden children, nested descendants and inconsistent
+    // combinations to exercise each independent part of the list predicate.
+    for index in 0..205 {
+        let id = format!("internal-{index:03}");
+        let parent = if index == 0 {
+            THREAD_RED_WORKSPACE_ID
+        } else {
+            "internal-000"
+        };
+        add_thread(&processor, &id, Some(parent), false).await;
+        let (origin, visibility, access) = match index % 5 {
+            0 => ("task_run", "visible", "workspace"),
+            1 => ("user", "hidden", "workspace"),
+            2 => ("user", "visible", "internal"),
+            3 => ("system", "visible", "workspace"),
+            _ => ("task_run", "hidden", "internal"),
+        };
+        harness.database.execute_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "UPDATE thread SET origin_kind=?,sidebar_visibility=?,access_class=?,created_at='2040-01-01 00:00:00+00:00' WHERE id=?",
+            [origin.into(), visibility.into(), access.into(), id.into()],
+        )).await.unwrap();
+    }
+    let a = authority(MEMBER_A_ID, THREAD_RED_WORKSPACE_ID, true);
+    let rows = list_all(&processor, &a).await;
+    let ids = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["threadId"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(&ids[..3], &["root-legacy", "root-dm", "root-collaborative"]);
+    assert!(ids.contains(&THREAD_RED_PRIVATE_A_ID));
+    assert!(ids.contains(&THREAD_RED_WORKSPACE_ID));
+    assert!(!ids.contains(&THREAD_RED_PRIVATE_B_ID));
+    assert!(!ids.iter().any(|id| id.starts_with("internal-")));
+    assert_eq!(ids.len(), 5);
+    for row in rows.as_array().unwrap().iter().take(3) {
+        assert_eq!(row["archived"], true);
+    }
+}
+
+#[tokio::test]
+async fn list_rejects_previous_candidate_scope_even_for_pending_readable_child_fragments() {
+    let (_harness, processor) = fixture().await;
+    add_thread(&processor, "old-hidden-card", None, false).await;
+    let a = authority(MEMBER_A_ID, THREAD_RED_PRIVATE_A_ID, true);
+    let codec = processor.thread_read_cursor_codec().unwrap();
+    let metadata = processor
+        .thread_read_metadata(&a, "old-hidden-card")
+        .await
+        .unwrap();
+    let digest = hex::encode(Sha256::digest(
+        serde_json::to_string(&metadata).unwrap().as_bytes(),
+    ));
+    let old_scope = json!([
+        a.scope("list-created-desc-v1", "", false, 1),
+        a.current_turn_id
+    ])
+    .to_string();
+    for fragment in [
+        None,
+        Some(MetadataFragment {
+            thread_id: "old-hidden-card".into(),
+            digest,
+            offset: 1,
+        }),
+    ] {
+        let cursor = codec
+            .encode(
+                &ListCursor {
+                    after: Some(pioneer_crud::ThreadReadPosition {
+                        created_at: "2050-01-01 00:00:00+00:00".into(),
+                        id: "old-hidden-card".into(),
+                    }),
+                    fragment,
+                },
+                &old_scope,
+            )
+            .unwrap();
+        let error = processor
+            .thread_list_page(
+                &a,
+                ThreadsListParams {
+                    limit: 1,
+                    cursor: Some(cursor),
+                },
+                &codec,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            public_read_error(&safe_read_error(&error)).1,
+            "read_cursor_incompatible"
+        );
+    }
 }

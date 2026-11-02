@@ -648,7 +648,36 @@ pub struct ThreadReadPosition {
     pub id: String,
 }
 
-/// Raw observation candidates, including hidden and archived (Closed) threads.
+// Same ordinary-conversation boundary as user management: visibility and
+// origin/access semantics, independent of creator, lineage, archive state or ACL.
+fn list_conversation_condition() -> sea_orm::Condition {
+    sea_orm::Condition::all()
+        .add(thread::Column::SidebarVisibility.eq("visible"))
+        .add(thread::Column::AccessClass.is_in(["private", "workspace"]))
+        .add(thread::Column::OriginKind.is_not_in(["task_run", "taskRun", "system"]))
+}
+
+/// Revalidate list membership independently of read authorization, including
+/// when resuming metadata fragments and before disclosing a completed page.
+pub async fn is_list_conversation<C: ConnectionTrait>(
+    db: &C,
+    workspace_id: &str,
+    thread_id: &str,
+) -> Result<bool> {
+    Ok(thread::Entity::find_by_id(thread_id.to_owned())
+        .select_only()
+        .column(thread::Column::Id)
+        .column(thread::Column::CreatedAt)
+        .filter(thread::Column::WorkspaceId.eq(workspace_id.to_owned()))
+        .filter(list_conversation_condition())
+        .into_model::<ThreadReadPosition>()
+        .one(db)
+        .await
+        .context("failed to revalidate thread list membership")?
+        .is_some())
+}
+
+/// Ordinary visible conversation candidates, including archived conversations.
 /// Authorization belongs to the caller. Advance by the last *candidate* key,
 /// including rows the caller cannot disclose; a filtered empty page is not EOF.
 pub async fn list_read_candidates_page<C: ConnectionTrait>(
@@ -665,7 +694,8 @@ pub async fn list_read_candidates_page<C: ConnectionTrait>(
         .select_only()
         .column(thread::Column::Id)
         .column(thread::Column::CreatedAt)
-        .filter(thread::Column::WorkspaceId.eq(workspace_id.to_owned()));
+        .filter(thread::Column::WorkspaceId.eq(workspace_id.to_owned()))
+        .filter(list_conversation_condition());
     if let Some(after) = after {
         query = query
             // Give the workspace/creation index an explicit range as well as

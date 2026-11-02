@@ -35,7 +35,7 @@ pub(crate) fn thread_read_tool_specs() -> Vec<ConfiguredToolSpec> {
     let definitions = [
         (
             "threads_list",
-            "List accessible saved conversations in the current workspace, including hidden internal children and archived conversations. Bounded pages ordered by created_at DESC, id DESC (newest creation first, not latest activity). Follow nextCursor until eof; an empty nonterminal page is possible. Continuation retains the last candidate's full creation date and ID; unrelated activity does not invalidate it. New threads before that position appear on a fresh first page. Access is rechecked on every page. Oversized metadata uses UTF-8 JSON fragments: concatenate text by byte offsets before decoding; changes to the continued card invalidate its fragments. Invalid or incompatible cursors require restarting the list. No search. Read a selected conversation with threads_history_read.",
+            "List accessible saved conversations in the current workspace, containing only standalone user conversations, including archived conversations. Internal execution children are available through history childReference and threads_children_list. Bounded pages ordered by created_at DESC, id DESC (newest creation first, not latest activity). Follow nextCursor until eof; an empty nonterminal page is possible. Continuation retains the last candidate's full creation date and ID; unrelated activity does not invalidate it. New threads before that position appear on a fresh first page. Access is rechecked on every page. Oversized metadata uses UTF-8 JSON fragments: concatenate text by byte offsets before decoding; changes to the continued card invalidate its fragments. Invalid or incompatible cursors require restarting the list. No search. Read a selected conversation with threads_history_read.",
             json!({"limit":limit,"cursor":cursor}),
             vec!["limit"],
         ),
@@ -72,7 +72,7 @@ pub(super) struct ThreadReadAuthority {
 impl ThreadReadAuthority {
     fn list_scope(&self, limit: u32) -> String {
         json!([
-            self.scope("list-created-desc-v1", "", false, limit),
+            self.scope("list-conversations-created-desc-v2", "", false, limit),
             self.current_turn_id
         ])
         .to_string()
@@ -371,8 +371,8 @@ impl MessageProcessor {
         params: ThreadsListParams,
         codec: &ThreadReadCursorCodec,
     ) -> Result<Value> {
-        // Changing only the list operation's authenticated scope rejects legacy
-        // ID-ascending/revision cursors without changing history or children.
+        // List-only scope rejects earlier candidate sets, including pending child
+        // fragments, without changing history, search or children cursors.
         let scope = authority.list_scope(params.limit);
         let state: Option<ListCursor> = params
             .cursor
@@ -411,7 +411,12 @@ impl MessageProcessor {
         let mut threads = Vec::new();
         let mut done = !continuing_fragment && rows.len() < CANDIDATE_QUANTUM as usize;
         for (index, row) in rows.iter().enumerate() {
-            if self.thread_source_readable(authority, &row.id).await? {
+            if self
+                .crud_store
+                .is_thread_list_conversation(&authority.workspace_id, &row.id)
+                .await?
+                && self.thread_source_readable(authority, &row.id).await?
+            {
                 let metadata = self.thread_read_metadata(authority, &row.id).await?;
                 let (metadata, fragment) = metadata_page_record(
                     metadata,
@@ -865,6 +870,15 @@ impl ThreadReadHandler {
                     self.processor.thread_source_readable(&current, id).await?,
                     "source unavailable or access denied"
                 );
+                if name == "threads_list" {
+                    ensure!(
+                        self.processor
+                            .crud_store
+                            .is_thread_list_conversation(&current.workspace_id, id)
+                            .await?,
+                        "source unavailable or access denied"
+                    );
+                }
                 for field in ["parentThreadId", "rootThreadId"] {
                     if let Some(reference) = row.get(field).and_then(Value::as_str) {
                         if !self

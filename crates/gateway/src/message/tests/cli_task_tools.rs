@@ -5593,7 +5593,23 @@ fn cli_threads_actions_use_facade_shared_handlers_routes_and_replay_for_all_prov
             let listed = facade
                 .call("read", "read", "threads_list", json!({"limit":100}))
                 .await;
-            let children = listed["threads"]
+            assert!(
+                listed["threads"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|row| row["threadId"] == caller.thread_id),
+                "the admitted CLI caller's standalone conversation remains listed"
+            );
+            let descendants = facade
+                .call(
+                    "read-children",
+                    "read-children",
+                    "threads_children_list",
+                    json!({"threadId":caller.thread_id,"recursive":false,"limit":100}),
+                )
+                .await;
+            let children = descendants["threads"]
                 .as_array()
                 .unwrap()
                 .iter()
@@ -5605,6 +5621,15 @@ fn cli_threads_actions_use_facade_shared_handlers_routes_and_replay_for_all_prov
                 children.len(),
                 1,
                 "replayed creation must not add another thread"
+            );
+            let child = children[0]["threadId"].clone();
+            assert!(
+                !listed["threads"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|row| row["threadId"] == child),
+                "hidden home-capsule children must not be standalone list cards"
             );
             assert_eq!(children[0]["threadId"], created["threadResult"]["threadId"]);
             let history = facade
