@@ -62574,20 +62574,31 @@ async fn assert_turn_cancel_with_optional_busy_native_actor(
                     )
                     .await
                     .unwrap();
-                assert!(matches!(
-                    crud_store_for_assert
-                        .resume_blocked_turn_recovery(
-                            thread_id,
-                            turn_id,
-                            Some(&job.id),
-                            now,
-                            processor.turn_execution_owner_id.as_ref(),
-                            now + 100
-                        )
+                // Resume through the lifecycle owner so both the durable Turn
+                // and its in-memory projection are InProgress before the actor
+                // waits for the durable control-registration ACK.
+                let resumed = processor
+                    .resume_blocked_turn_control(
+                        &workspace_id,
+                        thread_id,
+                        turn_id,
+                        Some(&job.id),
+                        now,
+                    )
+                    .await
+                    .unwrap()
+                    .expect("blocked cancellation fixture should resume");
+                assert_eq!(resumed.id, job.id);
+                assert_eq!(
+                    processor
+                        .thread_manager
+                        .turn_get(thread_id, turn_id)
                         .await
-                        .unwrap(),
-                    pioneer_crud::BlockedTurnRecoveryResumeOutcome::Resumed(_)
-                ));
+                        .unwrap()
+                        .1
+                        .status,
+                    TurnStatus::InProgress
+                );
                 resumed_job_id = Some(job.id);
                 assert_eq!(
                     crud_store_for_assert
