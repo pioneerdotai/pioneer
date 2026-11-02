@@ -62289,6 +62289,19 @@ async fn assert_turn_cancel_with_optional_busy_native_actor(
                 .await
                 .unwrap()
         );
+        if resume_direct {
+            ensure_test_superuser_execution_turn(&processor, &workspace_id, thread_id, turn_id)
+                .await;
+            assert!(
+                crud_store_for_assert
+                    .set_turn_execution_security_snapshot(
+                        turn_id,
+                        &test_full_access_execution_security_snapshot(),
+                    )
+                    .await
+                    .unwrap()
+            );
+        }
         for cycle in 0..if resume_direct { 2 } else { 1 } {
             processor
                 .agent_manager
@@ -62301,81 +62314,28 @@ async fn assert_turn_cancel_with_optional_busy_native_actor(
                 .await
                 .unwrap();
             if let Some(job_id) = resumed_job_id.as_deref() {
-                // A replacement actor resumes a claimed recovery attempt; it must
-                // not republish initial-start events with the old delivery identity.
+                // Let the recovery owner checkpoint the interrupted window and
+                // commit its continuation before starting the replacement actor.
+                // Replaying window 1 directly bypasses that durable lifecycle.
                 let now = now_timestamp_secs();
-                let claimed = crud_store_for_assert
+                let mut claimed = crud_store_for_assert
                     .claim_due_recovery_jobs(now, 45, 1)
                     .await
                     .unwrap();
                 assert_eq!(claimed.len(), 1);
                 assert_eq!(claimed[0].id, job_id);
-                let attempt_id = "cancellation-after-blocked-resume";
-                assert!(matches!(
-                    crud_store_for_assert
-                        .mark_claimed_recovery_job_active(
-                            job_id,
-                            claimed[0].claim_token.as_deref().unwrap(),
-                            attempt_id,
-                            now,
-                        )
-                        .await
-                        .unwrap(),
-                    pioneer_crud::ClaimedRecoveryActivation::Activated
-                ));
-                processor
-                    .agent_manager
-                    .start_restored_recovery_turn(
-                        thread_id,
-                        &workspace_id,
-                        pioneer_agent::RestoredRecoveryTurnRequest {
-                            turn_id: turn_id.into(),
-                            execution_window_index: 1,
-                            mode: ThreadMode::Agent,
-                            hook_runtime_context: Default::default(),
-                            model: "test-model".into(),
-                            provider_name: "delayed".into(),
-                            reasoning: None,
-                            workspace_skill_policies: HashMap::new(),
-                            skill_catalog: pioneer_skills::SkillCatalogSnapshot {
-                                version: 1,
-                                generated_at_unix: 0,
-                                skills: Vec::new(),
-                            },
-                            agent_skill_overlay: Vec::new(),
-                            input: vec![UserInput::Text {
-                                text: "hello".into(),
-                                text_elements: Vec::new(),
-                            }],
-                            capabilities: Vec::new(),
-                            resolved_artifacts: Vec::new(),
-                            runtime_environment: HashMap::new(),
-                            history: Vec::new(),
-                            permission_profile: default_test_permission_profile(),
-                            execution_security_snapshot: Some(
-                                test_full_access_execution_security_snapshot(),
-                            ),
-                        },
-                        pioneer_agent::RecoveryAttemptRequest {
-                            recovery_job_id: job_id.into(),
-                            recovery_attempt_id: attempt_id.into(),
-                            turn_id: turn_id.into(),
-                            item_id: "reasoning_resume".into(),
-                            item_type: pioneer_protocol::TurnItemType::Reasoning,
-                            force_non_stream: false,
-                            disable_tool_calling: false,
-                            disable_image_input: false,
-                            refresh_provider_auth: false,
-                            compact_history: false,
-                            context_recovery_deadline_ms: None,
-                            continue_generation: false,
-                            model_override: None,
-                            retained_provider_history: Vec::new(),
-                            execution_checkpoint_context: None,
-                        },
-                    )
+                let events = processor
+                    .recovery_coordinator
+                    .run_claimed_recovery_job_for_test(claimed.remove(0), now)
                     .await
                     .unwrap();
+                assert!(events.iter().any(|event| matches!(
+                    event,
+                    crate::resilience::RecoveryCoordinatorEvent::RetryAttemptStarted {
+                        job_id: started_job_id,
+                        ..
+                    } if started_job_id == job_id
+                )));
             } else {
                 processor
                     .agent_manager
