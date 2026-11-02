@@ -95,6 +95,15 @@ jobs:
           echo 'CARGO_PROFILE_DEV_DEBUG=0' >> "$GITHUB_ENV"
           echo 'CARGO_PROFILE_TEST_DEBUG=0' >> "$GITHUB_ENV"
 
+      - name: free-linux-build-disk
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The Rust cache can fill the hosted runner before any build starts.
+          # These preinstalled SDKs are unused by this Linux Rust job.
+          sudo rm -rf -- /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h "$GITHUB_WORKSPACE" "$RUNNER_TEMP"
+
       - name: rust-cache
         uses: Swatinem/rust-cache@v2
         with:
