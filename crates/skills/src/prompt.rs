@@ -1,5 +1,5 @@
 use crate::compact_skill_label;
-use crate::resolver::{ResolvedSkill, SkillResolvedReason};
+use crate::resolver::ResolvedSkill;
 use crate::runtime::{
     AgentSkillOverlayError, AgentSkillRuntimeEntry, validate_agent_skill_runtime_entries,
 };
@@ -7,9 +7,15 @@ use crate::runtime::{
 pub const AGENT_SKILL_PROMPT_BUDGET: usize = 8_000;
 pub const MAX_ACTIVE_AGENT_SKILLS: usize = 16;
 
+const READ_SKILL_HINT: &str =
+    "\nUse `read_skill` with the exact `skill:<skill_id>` reference, not the readable label.";
+
 const SKILLS_HEADER: &str = "[Skills]\nThe following skills are available for this turn:\n";
-const SKILLS_FOOTER: &str = "\nWhen a skill is relevant, call `read_skill` with its exact `skill:<skill_id>` reference before executing specialized actions. Never reconstruct the reference from the readable label. `read_skill` returns `skill_asset_root`; resolve relative file paths from the skill body under that directory and prefer absolute paths built from `skill_asset_root`. Skill runtime tools remain subject to the current turn permissions and sandbox. Then follow its instructions";
-const COMBINED_SKILLS_FOOTER: &str = "\nWhen a skill is relevant, call `read_skill` with its exact `skill:<skill_id>` reference before executing specialized actions. Never reconstruct the reference from the readable label. `read_skill` returns the exact instructions for every skill; package skills additionally return `skill_asset_root` for resolving relative file paths. Skill runtime tools remain subject to the current turn permissions and sandbox. Then follow its instructions";
+// Cards describe read_skill entries; governing read/permission/asset rules live
+// in the prompt compiler's Tool Usage and Safety sections, not this inventory.
+const SKILLS_FOOTER: &str =
+    "\nThese read_skill entries provide immutable instructions and package skill_asset_root.";
+const COMBINED_SKILLS_FOOTER: &str = "\nThese read_skill entries provide immutable instructions; skill_asset_root is present only for package skills.";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkillPromptBuild {
@@ -39,11 +45,13 @@ fn compact_skill_block(card: SkillPromptCard<'_>) -> String {
             );
             let machine_ref = format!("skill:{}", skill.skill_id);
             format!(
-                "- {} ({})\n  Exact skill reference for read_skill: `{}`\n  Skill asset root: `{}`\n  Use when: {}\n",
+                "- {} ({})\n  Exact skill reference for read_skill: `{}`\n  Skill asset root: `{}`\n  Package fingerprint: `{}`; version: `{:?}`\n  Use when: {}\n",
                 skill.definition.identity.display_name,
                 label,
                 machine_ref,
                 skill.definition.identity.skill_dir,
+                skill.definition.identity.fingerprint,
+                skill.definition.identity.version_hint,
                 skill.definition.instructions.description,
             )
         }
@@ -57,17 +65,6 @@ fn compact_skill_block(card: SkillPromptCard<'_>) -> String {
             skill.runtime_description,
         ),
     }
-}
-
-fn full_skill_block(skill: &ResolvedSkill) -> String {
-    let machine_ref = format!("skill:{}", skill.skill_id);
-    format!(
-        "\nSkill asset root for ${}: `{}`\nResolve relative paths mentioned by this skill under Skill asset root. Prefer absolute paths built from Skill asset root for commands and file operations.\n[Skill Body: ${}]\n{}\n",
-        machine_ref,
-        skill.definition.identity.skill_dir,
-        machine_ref,
-        skill.definition.instructions.body
-    )
 }
 
 fn internal_skill_reference_block(skills: &[&ResolvedSkill]) -> String {
@@ -94,7 +91,15 @@ fn internal_skill_reference_block(skills: &[&ResolvedSkill]) -> String {
             skill.definition.identity.owner.as_deref(),
             skill.definition.identity.slug.as_str(),
         );
-        block.push_str(format!("- {label}: `skill:{}`\n", skill.skill_id).as_str());
+        block.push_str(
+            format!(
+                "- {label}: `skill:{}`\n  Package fingerprint: `{}`; version: `{:?}`\n",
+                skill.skill_id,
+                skill.definition.identity.fingerprint,
+                skill.definition.identity.version_hint,
+            )
+            .as_str(),
+        );
     }
     block
 }
@@ -104,7 +109,7 @@ pub fn build_skill_prompt(active: &[ResolvedSkill], budget: SkillPromptBudget) -
         .iter()
         .filter(|skill| skill.definition.policy_hints.catalog_hidden)
         .collect::<Vec<_>>();
-    let catalog_skills = active
+    let mut catalog_skills = active
         .iter()
         .filter(|skill| !skill.definition.policy_hints.catalog_hidden)
         .collect::<Vec<_>>();
@@ -118,13 +123,18 @@ pub fn build_skill_prompt(active: &[ResolvedSkill], budget: SkillPromptBudget) -
     }
 
     let max_chars = budget.max_chars.max(1);
-    let compact_mode_threshold = budget.compact_mode_threshold;
+    let card_limit = max_chars.saturating_sub(if budget.include_read_skill_hint {
+        READ_SKILL_HINT.len()
+    } else {
+        0
+    });
+    catalog_skills.sort_by(|left, right| left.skill_id.cmp(&right.skill_id));
     let mut text = String::new();
     let mut omitted_slugs = std::collections::BTreeSet::new();
 
     if !hidden_skills.is_empty() {
         let block = internal_skill_reference_block(hidden_skills.as_slice());
-        if block.len() <= max_chars {
+        if block.len() <= card_limit {
             text.push_str(block.as_str());
         } else {
             omitted_slugs.extend(hidden_skills.iter().map(|skill| skill.slug.clone()));
@@ -136,7 +146,7 @@ pub fn build_skill_prompt(active: &[ResolvedSkill], budget: SkillPromptBudget) -
         if !text.is_empty() {
             text.push('\n');
         }
-        if text.len() + SKILLS_HEADER.len() <= max_chars {
+        if text.len() + SKILLS_HEADER.len() <= card_limit {
             text.push_str(SKILLS_HEADER);
             catalog_header_added = true;
         } else {
@@ -150,36 +160,11 @@ pub fn build_skill_prompt(active: &[ResolvedSkill], budget: SkillPromptBudget) -
         .filter(|_| catalog_header_added)
     {
         let block = compact_skill_block(SkillPromptCard::Package(skill));
-        if text.len() + block.len() > max_chars {
+        if text.len() + block.len() > card_limit {
             omitted_slugs.insert(skill.slug.clone());
             continue;
         }
         text.push_str(block.as_str());
-    }
-
-    let can_expand_full = catalog_header_added && catalog_skills.len() <= compact_mode_threshold;
-
-    if can_expand_full {
-        let mut full_body_candidates = catalog_skills
-            .iter()
-            .copied()
-            .filter(|skill| matches!(skill.reason, SkillResolvedReason::PathMatch))
-            .collect::<Vec<_>>();
-
-        full_body_candidates.sort_by(|left, right| left.slug.as_str().cmp(right.slug.as_str()));
-
-        for skill in full_body_candidates {
-            let block = full_skill_block(skill);
-            if text.len() + block.len() > max_chars {
-                omitted_slugs.insert(skill.slug.clone());
-                continue;
-            }
-            text.push_str(block.as_str());
-        }
-    } else {
-        for skill in catalog_skills.iter().copied() {
-            omitted_slugs.insert(skill.slug.clone());
-        }
     }
 
     if catalog_header_added && text.len() < max_chars {
@@ -191,23 +176,12 @@ pub fn build_skill_prompt(active: &[ResolvedSkill], budget: SkillPromptBudget) -
     let truncated = !omitted_slugs.is_empty();
 
     if truncated {
+        if budget.include_read_skill_hint && text.len() + READ_SKILL_HINT.len() <= max_chars {
+            text.push_str(READ_SKILL_HINT);
+        }
         let note = "\nSkills list truncated due to prompt budget.";
         if text.len() + note.len() <= max_chars {
             text.push_str(note);
-        }
-
-        if budget.include_read_skill_hint {
-            let hint = "\nUse `read_skill` with the exact `skill:<skill_id>` reference, not the readable label.";
-            if text.len() + hint.len() <= max_chars {
-                text.push_str(hint);
-            } else if hint.len() < max_chars {
-                let mut keep = max_chars.saturating_sub(hint.len());
-                while keep > 0 && !text.is_char_boundary(keep) {
-                    keep = keep.saturating_sub(1);
-                }
-                text.truncate(keep);
-                text.push_str(hint);
-            }
         }
     }
 
@@ -425,7 +399,7 @@ mod tests {
     }
 
     #[test]
-    fn compact_mode_omits_full_body_and_inserts_hint() {
+    fn compact_cards_do_not_count_unrequested_bodies_as_omitted() {
         let active = vec![resolved("one", "desc"), resolved("two", "desc")];
 
         let built = build_skill_prompt(
@@ -437,8 +411,13 @@ mod tests {
             },
         );
 
-        assert!(built.truncated);
-        assert!(built.text.contains("Use `read_skill`"));
+        assert!(!built.truncated);
+        assert!(built.omitted_slugs.is_empty());
+        assert!(
+            built
+                .text
+                .contains("read_skill entries provide immutable instructions")
+        );
         assert!(!built.text.contains("[Skill Body:"));
     }
 
@@ -463,54 +442,72 @@ mod tests {
         assert!(
             built
                 .text
-                .contains("call `read_skill` with its exact `skill:<skill_id>` reference")
+                .contains("read_skill entries provide immutable instructions")
         );
-        assert!(
-            built
-                .text
-                .contains("`read_skill` returns `skill_asset_root`")
-        );
+        assert!(built.text.contains("package skill_asset_root"));
         assert!(built.text.contains("Skill asset root: `/tmp/weather`"));
         assert!(!built.text.contains("/tmp/weather/SKILL.md"));
-        assert!(built.text.contains(
-            "Skill runtime tools remain subject to the current turn permissions and sandbox"
-        ));
+        assert!(!built.text.contains("permissions and sandbox"));
+        assert!(!built.text.contains("before executing specialized actions"));
         assert!(!built.text.contains("[Skill Body:"));
         assert!(!built.text.contains("\nbody\n"));
     }
 
     #[test]
-    fn path_match_can_expand_full_body() {
+    fn path_match_delivers_card_and_exact_reference_without_body() {
         let active = vec![resolved_with_reason(
             "weather",
             "Get weather forecasts.",
             SkillResolvedReason::PathMatch,
         )];
-
         let built = build_skill_prompt(
-            active.as_slice(),
+            &active,
             SkillPromptBudget {
                 max_chars: 2_000,
                 compact_mode_threshold: 6,
                 include_read_skill_hint: true,
             },
         );
+        assert!(
+            built
+                .text
+                .contains(&format!("`skill:{}`", active[0].skill_id))
+        );
+        assert!(built.text.contains("Skill asset root: `/tmp/weather`"));
+        assert!(built.text.contains("Get weather forecasts."));
+        assert!(!built.text.contains("[Skill Body:"));
+        assert!(!built.text.contains("\nbody\n"));
+        assert!(built.omitted_slugs.is_empty());
+        assert!(!built.truncated);
+    }
 
-        assert!(
-            built
-                .text
-                .contains(&format!("[Skill Body: $skill:{}]", active[0].skill_id))
-        );
-        assert!(built.text.contains(&format!(
-            "Skill asset root for $skill:{}: `/tmp/weather`",
-            active[0].skill_id
-        )));
-        assert!(
-            built
-                .text
-                .contains("Resolve relative paths mentioned by this skill under Skill asset root")
-        );
-        assert!(built.text.contains("\nbody\n"));
+    #[test]
+    fn large_skill_slice_is_bounded_order_independent_and_omissions_match_cards() {
+        let mut active = (0..2_000)
+            .map(|index| resolved(&format!("skill-{index:04}"), "Specialized operation."))
+            .collect::<Vec<_>>();
+        let budget = SkillPromptBudget {
+            max_chars: 2_000,
+            compact_mode_threshold: 6,
+            include_read_skill_hint: true,
+        };
+        let first = build_skill_prompt(&active, budget);
+        active.reverse();
+        assert_eq!(first, build_skill_prompt(&active, budget));
+        assert!(first.text.len() <= budget.max_chars);
+        assert!(first.truncated);
+        let shown = active
+            .iter()
+            .filter(|skill| first.text.contains(&format!("`skill:{}`", skill.skill_id)))
+            .count();
+        assert!(shown > 0);
+        assert_eq!(shown + first.omitted_slugs.len(), active.len());
+        for skill in &active {
+            assert_eq!(
+                first.omitted_slugs.contains(&skill.slug),
+                !first.text.contains(&format!("`skill:{}`", skill.skill_id))
+            );
+        }
     }
 
     #[test]
@@ -655,7 +652,7 @@ mod tests {
         assert!(
             built
                 .text
-                .contains("package skills additionally return `skill_asset_root`")
+                .contains("skill_asset_root is present only for package skills")
         );
         assert!(
             !built

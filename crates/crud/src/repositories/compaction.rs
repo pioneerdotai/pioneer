@@ -10,7 +10,13 @@ pub(crate) use super::compaction_task_output as task_output;
 
 /// Context rows retained by cleanup and admitted to newly built model history.
 /// Exact source lookup for existing frozen histories remains independent of this rule.
-pub const MODEL_HISTORY_CONTEXT_SOURCES: [&str; 2] = ["assistant_round", "tool_result_v2"];
+pub const MODEL_HISTORY_CONTEXT_SOURCES: [&str; 5] = [
+    "assistant_round",
+    "tool_result_v2",
+    "turn_input_projection_v1",
+    "runtime_context_v1",
+    "system_snapshot_v1",
+];
 
 pub fn model_history_context_source(source: &str) -> bool {
     MODEL_HISTORY_CONTEXT_SOURCES.contains(&source)
@@ -1319,7 +1325,7 @@ pub(crate) async fn compaction_model_context_sources_current<C: ConnectionTrait>
             JOIN thread context_thread ON context_thread.id=context_turn.thread_id
             WHERE revision.present=1 AND context_thread.workspace_id=?2
               AND context_turn.thread_id=?3
-              AND context_source.source IN (?4,?5)
+              AND context_source.source IN (?4,?5,?6,?7,?8)
               AND 'context:'||revision.turn_id=json_extract(wanted.value,'$.scope')
               AND revision.source_id=json_extract(wanted.value,'$.id')
               AND 'revision:'||revision.revision=json_extract(wanted.value,'$.version')
@@ -1330,6 +1336,9 @@ pub(crate) async fn compaction_model_context_sources_current<C: ConnectionTrait>
             thread.into(),
             MODEL_HISTORY_CONTEXT_SOURCES[0].into(),
             MODEL_HISTORY_CONTEXT_SOURCES[1].into(),
+            MODEL_HISTORY_CONTEXT_SOURCES[2].into(),
+            MODEL_HISTORY_CONTEXT_SOURCES[3].into(),
+            MODEL_HISTORY_CONTEXT_SOURCES[4].into(),
         ],
     ))
     .one(db)
@@ -3817,7 +3826,13 @@ pub(crate) async fn compaction_context_reference_for_item<C: ConnectionTrait>(
     source: &str,
 ) -> Result<Option<SourceRef>> {
     ensure!(
-        ["assistant_round", "tool_result_v2"].contains(&source),
+        [
+            "assistant_round",
+            "tool_result_v2",
+            "turn_input_projection_v1",
+            "runtime_context_v1",
+        ]
+        .contains(&source),
         "unsupported canonical runtime locator"
     );
     let row = turn_llm_context::Entity::find()

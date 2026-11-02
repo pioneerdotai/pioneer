@@ -1080,7 +1080,8 @@ impl CrudStore {
                     .column(context::Column::Id)
                     .filter(context::Column::TurnId.eq(&claim.turn_id))
                     .filter(
-                        context::Column::Source.is_not_in(["assistant_round", "tool_result_v2"]),
+                        context::Column::Source
+                            .is_not_in(super::compaction::MODEL_HISTORY_CONTEXT_SOURCES),
                     )
                     .into_tuple::<String>()
                     .one(&self.connection)

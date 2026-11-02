@@ -2,7 +2,8 @@
 //! agent loop is the oracle for cold/accepted restoration's next wire prefix.
 use super::*;
 use pioneer_provider::providers::{
-    AuthStyle, ChatCompletionsApiCompatibleProvider, ResponsesApiCompatibleProvider,
+    AuthStyle, ChatCompletionsApiCompatibleProvider, OpenRouterProvider,
+    ResponsesApiCompatibleProvider,
 };
 use pioneer_tools::{
     ConfiguredToolSpec, ExecutionClass, FunctionToolOutput, PayloadKind, ToolEventTrace,
@@ -132,14 +133,27 @@ async fn transport(
     mpsc::UnboundedReceiver<serde_json::Value>,
     tokio::task::JoinHandle<()>,
 ) {
+    transport_with_final(responses, "done").await
+}
+
+async fn transport_with_final(
+    responses: bool,
+    final_text: &str,
+) -> (
+    String,
+    mpsc::UnboundedReceiver<serde_json::Value>,
+    tokio::task::JoinHandle<()>,
+) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let root = format!("http://{}/v1", listener.local_addr().unwrap());
     let (tx, rx) = mpsc::unbounded_channel();
     let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let final_text = final_text.to_owned();
     let router = axum::Router::new().route(if responses {"/v1/responses"} else {"/v1/chat/completions"}, axum::routing::post(
         move |axum::Json(body): axum::Json<serde_json::Value>| {
             let first = count.fetch_add(1, Ordering::SeqCst) == 0;
             tx.send(body).unwrap();
+            let final_text = final_text.clone();
             async move {
                 let calls = NAMES.iter().enumerate().map(|(i, name)| if responses {
                     json!({"type":"function_call","id":format!("fc_{i}"),"call_id":format!("cache_call_{i}"),
@@ -155,7 +169,7 @@ async fn transport(
                         output.extend(calls); output
                     } else {
                         vec![json!({"type":"message","id":"final","role":"assistant","status":"completed","phase":"final_answer",
-                            "content":[{"type":"output_text","text":"done","annotations":[]}]})]
+                            "content":[{"type":"output_text","text":final_text,"annotations":[]}]})]
                     };
                     json!({"id":"response","status":"completed","model":MODEL,"output":output})
                 } else if first {
@@ -163,7 +177,7 @@ async fn transport(
                         "message":{"role":"assistant","content":null,"tool_calls":calls}}]})
                 } else {
                     json!({"id":"response","model":MODEL,"choices":[{"index":0,"finish_reason":"stop",
-                        "message":{"role":"assistant","content":"done"}}]})
+                        "message":{"role":"assistant","content":final_text}}]})
                 };
                 axum::Json(reply)
             }
@@ -647,4 +661,301 @@ async fn actual_loop_sent_prefix_survives_cold_and_accepted_restore_on_both_wire
         }
         server.abort();
     }
+}
+
+#[test]
+fn sequential_detached_executions_keep_the_sent_input_prefix_on_both_wires() {
+    run_standard_stack_message_test("detached prepared input continuity", async {
+        for responses in [true, false] {
+            crate::compaction::load_test_catalog();
+            let answer = r#"<task_result>{"summary":"detached answer retained"}</task_result>"#;
+            let (root, mut wire, server) = transport_with_final(responses, answer).await;
+            let inner: Arc<dyn Provider> = if responses {
+                Arc::new(
+                    ResponsesApiCompatibleProvider::new(
+                        "openai",
+                        &root,
+                        "fixture",
+                        AuthStyle::Bearer,
+                    )
+                    .with_input_capabilities({
+                        let mut types = ProviderInputCapabilities::disabled_for_all_file_types();
+                        types.image = pioneer_provider::InputTypeSupport::data_url_inline_only();
+                        types
+                    }),
+                )
+            } else {
+                Arc::new(OpenRouterProvider::with_base_url("fixture", &root))
+            };
+            let (instance, model) = if responses {
+                ("openai", MODEL)
+            } else {
+                ("openrouter", "openai/gpt-5.1")
+            };
+            let provider = Arc::new(LoopProvider {
+                inner,
+                requests: Default::default(),
+            });
+            // Real adapters and existing catalog models; only HTTP replies
+            // and the fixture tool execution are controlled here.
+            let registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+                instance,
+                provider.clone(),
+            ));
+            let harness = setup_phase_13_compaction_harness(registry).await;
+            let processor = &harness.processor;
+            let store = &harness.crud_store;
+            let workspace = &harness.workspace_id;
+            let (tx, mut rx) = mpsc::channel(256);
+            let connection =
+                register_authenticated_test_connection(processor.session_manager.as_ref(), tx)
+                    .await;
+            processor
+                .session_manager
+                .set_connection_workspace(connection, Some(workspace.clone()))
+                .await;
+            processor.bind_task_bridge().await;
+            processor.start_task_event_listener().await;
+            processor.bind_context_compaction().await;
+            processor
+                .agent_manager
+                .set_turn_tool_provider(Some(Arc::new(TurnTools(Arc::new(ParallelTools(
+                    Arc::new(tokio::sync::Semaphore::new(1)),
+                ))))))
+                .await;
+            let images = tempfile::tempdir().unwrap();
+            let image_path = images.path().join("detached-prefix.webp");
+            std::fs::write(
+                &image_path,
+                include_bytes!(
+                    "../../../../provider/tests/fixtures/capabilities/hermes-feature-connect.webp"
+                ),
+            )
+            .unwrap();
+            let parent = "detached-prefix-parent";
+            let started = processor
+                .thread_manager
+                .thread_start_seeded(
+                    connection,
+                    workspace.clone(),
+                    ThreadStartParams {
+                        thread_id: parent.into(),
+                        workspace_id: workspace.clone(),
+                        name: Some("Detached prefix regression".into()),
+                        model: Some(model.into()),
+                        model_provider: Some(instance.into()),
+                        sandbox: Some(SandboxMode::FullAccess),
+                        mode: Some(ThreadMode::Agent),
+                        origin_kind: Some(ThreadOriginKind::Collaborative),
+                        sidebar_visibility: Some(ThreadSidebarVisibility::Visible),
+                        visibility: None,
+                        agent_nickname: None,
+                        agent_role: None,
+                    },
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+            store
+                .upsert_thread_model(
+                    &started.response.thread,
+                    pioneer_protocol::PersistedActorRef::System,
+                )
+                .await
+                .unwrap();
+            let mut first_requests = Vec::new();
+            let mut first_wire = Vec::new();
+            let mut first_projection = None;
+            let mut previous_count = 0;
+            for (index, text) in ["first detached question", "second detached question"]
+                .into_iter()
+                .enumerate()
+            {
+                let turn = format!("detached-prefix-{index}");
+                let request_id = generate_test_request_id("sent-prefix", &turn);
+                let context = processor
+                    .session_manager
+                    .connection_context(connection)
+                    .await
+                    .unwrap();
+                let input = vec![
+                    UserInput::Text {
+                        text: "distinct first input component".into(),
+                        text_elements: vec![],
+                    },
+                    UserInput::Text {
+                        text: text.into(),
+                        text_elements: vec![],
+                    },
+                    UserInput::LocalImage {
+                        path: image_path.to_string_lossy().into_owned(),
+                    },
+                ];
+                Arc::clone(processor).process_owned_request(context, json!({
+                    "jsonrpc":"2.0", "id":request_id, "method":"turn/start", "params":{
+                        "thread_id":parent,"turn_id":turn,"input":input,
+                        "mode":"Agent","model":model,"model_provider":instance,
+                        "permission_profile":pioneer_protocol::TurnPermissionProfileSelection::full_access()
+                    }
+                }).to_string()).await;
+                let response = recv_response_by_id(&mut rx, &request_id).await;
+                let accepted: TurnStartResponse = serde_json::from_value(response.result).unwrap();
+                assert_eq!(accepted.turn.id, turn);
+                let tasks = processor
+                    .task_runtime
+                    .service()
+                    .list_tasks(TaskListParams {
+                        workspace_id: workspace.clone(),
+                        owner_kind: Some(TaskOwnerKind::Thread),
+                        owner_id: Some(parent.into()),
+                        limit: Some(10),
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap();
+                let task = tasks
+                    .tasks
+                    .iter()
+                    .find(|task| task.created_by_turn_id.as_deref() == Some(turn.as_str()))
+                    .unwrap();
+                assert_eq!(
+                    wait_for_task_status(store.clone(), &task.id, TaskStatus::Completed).await,
+                    TaskStatus::Completed
+                );
+                processor
+                    .process_due_task_deliveries(super::now_timestamp_secs().saturating_add(60), 10)
+                    .await
+                    .unwrap();
+                let run = wait_for_task_run_id(store.clone(), &task.id).await;
+                let lineage = wait_for_child_lineage_for_run(store.clone(), &run).await;
+                assert_ne!(
+                    lineage.child_thread_id, parent,
+                    "exercise real detached execution, not two direct Agent calls"
+                );
+                let requests = provider.requests.lock().unwrap().clone();
+                let mut sent = Vec::new();
+                for _ in previous_count..requests.len() {
+                    sent.push(wire.recv().await.unwrap());
+                }
+                if index == 0 {
+                    assert!(
+                        requests.len() >= 2,
+                        "the first execution must send actual tool results"
+                    );
+                    let prepared = requests[0]
+                        .messages
+                        .iter()
+                        .find(|message| {
+                            message
+                                .application_context
+                                .as_ref()
+                                .is_some_and(|m| m["kind"] == "turn_input")
+                        })
+                        .unwrap()
+                        .clone();
+                    assert!(prepared.content.ends_with(text));
+                    assert!(prepared.content.contains("distinct first input component"));
+                    assert_eq!(prepared.content_parts.len(), 1);
+                    assert!(sent[0].to_string().contains("data:image/webp;base64,"));
+                    first_projection = Some(prepared);
+                    first_wire = sent;
+                    first_requests = requests.clone();
+                    // Canonical UI/input dates use whole seconds, whereas
+                    // provider rounds retain fractions. Isolate this copy
+                    // regression from equal-second source ordering.
+                    let completed_second = phase_13_now_secs();
+                    timeout(Duration::from_secs(3), async {
+                        while phase_13_now_secs() <= completed_second {
+                            sleep(Duration::from_millis(10)).await;
+                        }
+                    })
+                    .await
+                    .unwrap();
+                } else {
+                    let first = &requests[previous_count];
+                    let prepared = first_projection.as_ref().unwrap();
+                    let positions = first
+                        .messages
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, message)| message.content == prepared.content)
+                        .map(|(i, _)| i)
+                        .collect::<Vec<_>>();
+                    assert_eq!(positions.len(), 1);
+                    assert_eq!(
+                        serde_json::to_value(&first.messages[positions[0]]).unwrap(),
+                        serde_json::to_value(prepared).unwrap()
+                    );
+                    assert!(!first.messages.iter().any(|message| message.role
+                        == pioneer_provider::Role::User
+                        && (message.content == "first detached question"
+                            || message.content
+                                == "distinct first input component\nfirst detached question")));
+                    let old_final = first
+                        .messages
+                        .iter()
+                        .position(|message| {
+                            message.role == pioneer_provider::Role::Assistant
+                                && message.content.contains("detached answer retained")
+                        })
+                        .unwrap();
+                    let current = first
+                        .messages
+                        .iter()
+                        .position(|message| {
+                            message
+                                .application_context
+                                .as_ref()
+                                .is_some_and(|m| m["kind"] == "turn_input")
+                                && message.content.ends_with(text)
+                        })
+                        .unwrap();
+                    assert!(positions[0] < old_final && old_final < current);
+                    let last = first_requests.last().unwrap();
+                    let old_tools = last
+                        .messages
+                        .iter()
+                        .filter(|m| m.role == pioneer_provider::Role::Tool)
+                        .map(|m| (m.tool_call_id.clone(), m.content.clone()))
+                        .collect::<Vec<_>>();
+                    assert_eq!(old_tools.len(), 2);
+                    assert_eq!(
+                        first
+                            .messages
+                            .iter()
+                            .filter(|m| m.role == pioneer_provider::Role::Tool)
+                            .map(|m| (m.tool_call_id.clone(), m.content.clone()))
+                            .collect::<Vec<_>>(),
+                        old_tools
+                    );
+                    let key = if responses { "input" } else { "messages" };
+                    let prior = first_wire.last().unwrap()[key].as_array().unwrap();
+                    let next = sent[0][key].as_array().unwrap();
+                    // Compare message bytes; system/developer delivery belongs
+                    // to the new execution's governing snapshot, not history.
+                    let visible = |items: &[serde_json::Value]| {
+                        items
+                            .iter()
+                            .filter(|item| {
+                                !matches!(item["role"].as_str(), Some("system" | "developer"))
+                            })
+                            .cloned()
+                            .collect::<Vec<_>>()
+                    };
+                    let prior = visible(prior);
+                    let next = visible(next);
+                    assert!(next.len() > prior.len());
+                    assert_eq!(
+                        &next[..prior.len()],
+                        prior.as_slice(),
+                        "raw parent input shifted the previously sent wire prefix"
+                    );
+                    assert!(next.last().unwrap().to_string().contains(text));
+                }
+                previous_count = requests.len();
+            }
+            server.abort();
+        }
+    });
 }

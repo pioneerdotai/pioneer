@@ -126,6 +126,105 @@ pub(crate) struct CLIRuntimeContextBuildInput<'a> {
     pub selected_capabilities: Option<CliRuntimeSelectedCapabilitiesInput>,
 }
 
+pub(crate) fn persist_inventory_mapping(
+    json: &str,
+    plan: &CompiledInstructionDeliveryPlan,
+) -> Result<String> {
+    let mut value: serde_json::Value = serde_json::from_str(json)?;
+    anyhow::ensure!(
+        value.is_object(),
+        "CLI runtime input mapping must be an object"
+    );
+    let sections = plan
+        .bundle
+        .sections
+        .iter()
+        .filter(|s| s.id == pioneer_promt::PromptSectionId::SelectedCapabilities)
+        .collect::<Vec<_>>();
+    value["pioneerInventory"] = serde_json::to_value(sections)?;
+    Ok(serde_json::to_string(&value)?)
+}
+
+pub(crate) fn apply_inventory_mapping(
+    plan: &mut CompiledInstructionDeliveryPlan,
+    json: Option<&str>,
+) -> Result<()> {
+    let Some(json) = json else {
+        return Ok(());
+    };
+    let value: serde_json::Value = serde_json::from_str(json)?;
+    let Some(sections) = value.get("pioneerInventory") else {
+        return Ok(());
+    };
+    let sections: Vec<pioneer_promt::PromptSection> = serde_json::from_value(sections.clone())?;
+    anyhow::ensure!(
+        sections.len() <= 1
+            && sections
+                .iter()
+                .all(|section| section.id == pioneer_promt::PromptSectionId::SelectedCapabilities),
+        "CLI inventory projection contains unexpected sections"
+    );
+    // Completion/continuity proves dispatch, not preservation of old text by
+    // the native CLI's automatic compaction. None of the current adapters
+    // exposes an atomic model-context retention receipt. Keep an unchanged
+    // bounded baseline in the new input rather than silently relying on a
+    // possibly summarized prior slice. Changed slices and removals below are
+    // self-contained replacements and do not require retained prior text.
+    let current = plan
+        .bundle
+        .sections
+        .iter()
+        .filter(|section| section.id == pioneer_promt::PromptSectionId::SelectedCapabilities)
+        .collect::<Vec<_>>();
+    if current.len() == sections.len()
+        && current.iter().zip(&sections).all(|(now, prior)| {
+            now.id == prior.id && now.title == prior.title && now.content == prior.content
+        })
+    {
+        return Ok(());
+    }
+    let mut baseline = plan.bundle.clone();
+    baseline.sections = sections;
+    plan.turn_context = plan.turn_context_with_inventory_baseline(Some(&baseline));
+    Ok(())
+}
+
+/// Freeze environment facts once before history preparation/compaction. The
+/// resulting Text item is part of the exact mapping persisted before dispatch.
+pub(crate) fn prepend_cli_environment_input(
+    mapping: &mut CLIRuntimeTurnInputMapping,
+    security: &pioneer_protocol::TurnExecutionSecuritySnapshot,
+) {
+    let now = chrono::Local::now();
+    mapping.input.insert(0, CLIRuntimeTurnInputItem::Text {
+        text: format!(
+            "Pioneer environment facts for this turn:\nDate: {} ({})\nFilesystem scope: {:?}\nApproval: {:?}",
+            now.format("%Y-%m-%d"),
+            now.format("%Z"),
+            security.sandbox.filesystem,
+            security.approval,
+        ),
+    });
+}
+
+/// Native system exports are installed independently of the user's selection.
+/// Resolve only explicit capabilities, keeping their original order.
+pub(crate) fn explicit_cli_skill_names(
+    capabilities: &[pioneer_protocol::TurnCapability],
+    plans: &[crate::cli_runtime::skills::CliRuntimeSkillInstallPlan],
+) -> Vec<String> {
+    capabilities
+        .iter()
+        .filter_map(|capability| match &capability.kind {
+            pioneer_protocol::TurnCapabilityKind::Skill { skill_id, .. } => plans
+                .iter()
+                .find(|plan| &plan.skill_id == skill_id)
+                .map(|plan| plan.install_name.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
 pub(crate) fn compile_cli_runtime_delivery_plan(
     prompt_root: &Path,
     input: CLIRuntimeContextBuildInput<'_>,
@@ -186,6 +285,9 @@ fn portable_history_line(message: &ChatMessage, message_index: usize) -> Result<
     // is projected through native CLI input items below; stable markers
     // retain its position and relationship to this historical message.
     let mut portable = pioneer_provider::history::portable_history_message(message);
+    // Delivery/recovery snapshots remain canonical metadata, not visible CLI
+    // history. Strip only this transport copy, shared by delivery and budgeting.
+    portable.application_context = None;
     portable.content_parts = message
         .content_parts
         .iter()
@@ -857,13 +959,14 @@ mod tests {
             "the complete tool round must survive atomically"
         );
         assert!(
-            !manifest
+            manifest
                 .section_ids
                 .contains(&"current_permissions".to_owned()),
-            "the default full-access profile has no extra permission guidance"
+            "the full-access profile is an explicit current-turn fact"
         );
-        assert!(plan.provider_instructions.text.contains("Selected Skills"));
-        assert!(plan.provider_instructions.text.contains("review"));
+        assert!(plan.turn_context.text.contains("Selected Skills"));
+        assert!(plan.turn_context.text.contains("$review"));
+        assert!(!plan.provider_instructions.text.contains("$review"));
         assert!(
             !plan
                 .bundle
@@ -872,7 +975,12 @@ mod tests {
                 .any(|diagnostic| diagnostic.section_id.as_deref() == Some("thread_context")),
             "accepted history must not be silently truncated by a second prompt budget"
         );
-        assert!(!plan.bundle.full_system_text.contains("Tool Usage"));
+        assert!(
+            !plan
+                .bundle
+                .full_system_text
+                .contains("- The filesystem hierarchy is:")
+        );
         assert!(!plan.bundle.full_system_text.contains("api prompt file"));
     }
 
@@ -1007,40 +1115,67 @@ mod tests {
         let root = temp_workspace("multimodal");
         let materialized = tempfile::tempdir().expect("materialized artifact root");
         let image_path = materialized.path().join("history.png");
-        let history = [ChatMessage {
-            provider_replay_state: Some(ProviderReplayState::new(
-                "native-provider",
-                serde_json::json!({"opaqueSecret":"must-not-cross"}),
-            )),
-            content_parts: vec![
-                MessageContentPart::Text {
-                    text: "look at the historical image".to_owned(),
-                },
-                MessageContentPart::Image {
-                    image: MessageAttachment {
-                        mime_type: "image/png".to_owned(),
-                        name: Some("history.png".to_owned()),
-                        size_bytes: Some(42),
-                        sha256: None,
-                        source: AttachmentDataSource::Path {
-                            path: image_path.display().to_string(),
-                        },
-                        artifact: Some(pioneer_provider::AttachmentArtifactContext {
-                            workspace_id: "workspace_1".to_owned(),
-                            artifact_id: "artifact_history_image".to_owned(),
-                            artifact_version_id: Some("version_history_image".to_owned()),
-                        }),
+        let mut assistant = ChatMessage::assistant_tool_calls(
+            Some("historical assistant answer"),
+            vec![ProviderToolCall {
+                id: "historical-io1-call".to_owned(),
+                name: "read_file".to_owned(),
+                arguments: "{}".to_owned(),
+            }],
+        );
+        assistant.reasoning_content = Some("visible historical reasoning".to_owned());
+        let history = [
+            ChatMessage {
+                application_context: Some(serde_json::json!({
+                    "version": 1,
+                    "kind": "turn_input",
+                    "context": "IO1_INTERNAL_CONTEXT_SENTINEL",
+                    "inventory": [{"content": "IO1_INTERNAL_INVENTORY_SENTINEL"}],
+                    "diagnostics": ["IO1_INTERNAL_DIAGNOSTIC_SENTINEL"],
+                    "announced": ["skills_runtime_prompt"],
+                    "documents": [{"content": "IO1_INTERNAL_DOCUMENT_SENTINEL"}],
+                    "document_sources": [{"path": "IO1_INTERNAL_DOCUMENT_SOURCE_SENTINEL"}],
+                })),
+                provider_replay_state: Some(ProviderReplayState::new(
+                    "native-provider",
+                    serde_json::json!({"opaqueSecret":"must-not-cross"}),
+                )),
+                content_parts: vec![
+                    MessageContentPart::Text {
+                        text: "look at the historical image".to_owned(),
                     },
-                },
-                MessageContentPart::File {
-                    file: MessageAttachment::from_url(
-                        "https://example.test/history.txt",
-                        "text/plain",
-                    ),
-                },
-            ],
-            ..ChatMessage::user("")
-        }];
+                    MessageContentPart::Image {
+                        image: MessageAttachment {
+                            mime_type: "image/png".to_owned(),
+                            name: Some("history.png".to_owned()),
+                            size_bytes: Some(42),
+                            sha256: None,
+                            source: AttachmentDataSource::Path {
+                                path: image_path.display().to_string(),
+                            },
+                            artifact: Some(pioneer_provider::AttachmentArtifactContext {
+                                workspace_id: "workspace_1".to_owned(),
+                                artifact_id: "artifact_history_image".to_owned(),
+                                artifact_version_id: Some("version_history_image".to_owned()),
+                            }),
+                        },
+                    },
+                    MessageContentPart::File {
+                        file: MessageAttachment::from_url(
+                            "https://example.test/history.txt",
+                            "text/plain",
+                        ),
+                    },
+                ],
+                ..ChatMessage::user(
+                    "<pioneer_turn_context>\nvisible historical turn context\n</pioneer_turn_context>\n\noriginal historical question",
+                )
+            },
+            assistant,
+            ChatMessage::tool_result("historical-io1-call", "read_file", "historical tool result"),
+        ];
+        let canonical = history.clone();
+        let canonical_json = serde_json::to_string(&history).unwrap();
         let plan = compile_cli_runtime_delivery_plan(
             root.as_path(),
             CLIRuntimeContextBuildInput {
@@ -1076,6 +1211,113 @@ mod tests {
         )
         .unwrap();
         let serialized = serde_json::to_string(&mapping.input).unwrap();
+        assert!(serialized.contains("visible historical turn context"));
+        assert!(serialized.contains("original historical question"));
+        assert!(serialized.contains("look at the historical image"));
+        assert!(serialized.contains("visible historical reasoning"));
+        assert!(!serialized.contains("application_context"));
+        for sentinel in [
+            "IO1_INTERNAL_CONTEXT_SENTINEL",
+            "IO1_INTERNAL_INVENTORY_SENTINEL",
+            "IO1_INTERNAL_DIAGNOSTIC_SENTINEL",
+            "IO1_INTERNAL_DOCUMENT_SENTINEL",
+            "IO1_INTERNAL_DOCUMENT_SOURCE_SENTINEL",
+        ] {
+            assert!(canonical_json.contains(sentinel));
+            assert!(
+                !serialized.contains(sentinel),
+                "internal metadata leaked: {sentinel}"
+            );
+        }
+        let text = mapping
+            .input
+            .iter()
+            .filter_map(|item| match item {
+                CLIRuntimeTurnInputItem::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.find("original historical question").unwrap()
+                < text.find("historical assistant answer").unwrap()
+        );
+        assert!(
+            text.find("historical assistant answer").unwrap()
+                < text.find("historical tool result").unwrap()
+        );
+        assert!(
+            text.find("historical tool result").unwrap() < text.find("current question").unwrap()
+        );
+        let lines = text
+            .split_once("<pioneer_conversation_history>\n")
+            .unwrap()
+            .1
+            .split_once("\n</pioneer_conversation_history>")
+            .unwrap()
+            .0;
+        let messages = lines
+            .lines()
+            .map(|line| serde_json::from_str::<ChatMessage>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].content, canonical[0].content);
+        assert_eq!(messages[0].content_parts[0], canonical[0].content_parts[0]);
+        assert_eq!(messages[1].content, canonical[1].content);
+        assert_eq!(messages[1].tool_calls, canonical[1].tool_calls);
+        assert_eq!(messages[2].role, pioneer_provider::Role::Tool);
+        assert_eq!(messages[2].content, canonical[2].content);
+        assert_eq!(messages[2].tool_call_id, canonical[2].tool_call_id);
+        assert_eq!(messages[2].name, canonical[2].name);
+        assert_eq!(
+            messages[1].reasoning_content,
+            canonical[1].reasoning_content
+        );
+        assert!(
+            messages
+                .iter()
+                .all(|message| message.application_context.is_none())
+        );
+
+        let mut without_metadata = history.clone();
+        for message in &mut without_metadata {
+            message.application_context = None;
+        }
+        let budget = completed_cli_history_budget(
+            &history,
+            "workspace_1",
+            Some(root.to_str().unwrap()),
+            CLIAgentRuntimeKind::Codex,
+        )
+        .unwrap();
+        let clean_budget = completed_cli_history_budget(
+            &without_metadata,
+            "workspace_1",
+            Some(root.to_str().unwrap()),
+            CLIAgentRuntimeKind::Codex,
+        )
+        .unwrap();
+        assert_eq!(
+            budget.0, clean_budget.0,
+            "budget must use the same metadata-free projection as delivery"
+        );
+        assert_eq!(budget.1, clean_budget.1);
+        let media = |entries: &[pioneer_provider::attachments::MediaInputEstimate]| {
+            entries
+                .iter()
+                .map(|entry| (entry.message, entry.part, entry.input_tokens))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(media(&budget.2), media(&clean_budget.2));
+        assert_eq!(
+            history, canonical,
+            "CLI projection must not mutate canonical history"
+        );
+        assert_eq!(serde_json::to_string(&history).unwrap(), canonical_json);
+        assert_eq!(
+            pioneer_provider::history::portable_history_message(&history[0]).application_context,
+            canonical[0].application_context
+        );
         assert!(serialized.contains("historical image message=0 part=1"));
         assert!(serialized.contains("history.png"));
         assert!(serialized.contains("https://example.test/history.txt"));
@@ -1617,17 +1859,14 @@ mod tests {
                 .section_ids
                 .contains(&"current_permissions".to_owned())
         );
+        assert!(plan.turn_context.text.contains("## Current Permissions"));
+        assert!(plan.turn_context.text.contains("- mode: supervised"));
         assert!(
-            plan.provider_instructions
+            !plan
+                .provider_instructions
                 .text
-                .contains("## Current Permissions")
+                .contains("Current Permissions")
         );
-        assert!(
-            plan.provider_instructions
-                .text
-                .contains("- mode: supervised")
-        );
-        assert!(!plan.turn_context.text.contains("Current Permissions"));
     }
 
     #[test]
@@ -1662,38 +1901,29 @@ mod tests {
                 .section_ids
                 .contains(&"selected_capabilities".to_owned())
         );
+        assert!(plan.provider_instructions.text.contains(
+            "Before answering or acting, determine whether an actually attached MCP capability"
+        ));
+        assert!(plan.turn_context.text.contains("2 executable MCP tool(s)"));
         assert!(
             plan.provider_instructions
                 .text
-                .contains("Before answering, determine whether the user's request")
+                .contains("check the runtime catalog or its available discovery mechanism")
         );
         assert!(
             plan.provider_instructions
                 .text
-                .contains("2 executable MCP tool(s)")
+                .contains("Do not invoke unrelated tools")
         );
         assert!(
             plan.provider_instructions
                 .text
-                .contains("through the runtime's available tool-discovery mechanism")
-        );
-        assert!(
-            plan.provider_instructions
-                .text
-                .contains("the user does not need to mention an MCP server, tool name")
+                .contains("Do not call absent tools")
         );
         assert!(!plan.provider_instructions.text.contains("tool_search"));
         assert!(!plan.provider_instructions.text.contains("ALL_TOOLS"));
-        assert!(
-            plan.provider_instructions
-                .text
-                .contains("resend: 1 tool(s)")
-        );
-        assert!(
-            plan.provider_instructions
-                .text
-                .contains("mcp_resend_send_email")
-        );
+        assert!(plan.turn_context.text.contains("resend: 1 tool(s)"));
+        assert!(plan.turn_context.text.contains("mcp_resend_send_email"));
         assert!(
             !plan
                 .provider_instructions
@@ -1702,5 +1932,175 @@ mod tests {
             "MCP-controlled descriptions must not enter governing context"
         );
         assert!(!plan.turn_context.text.contains("tool_search"));
+    }
+
+    #[test]
+    fn cli_new_turn_facts_preserve_saved_input_and_native_items() {
+        // One shared mapping is consumed by all three CLI adapters; their
+        // existing request fixtures own transport serialization separately.
+        for (runtime, label, kind) in [
+            ("codex", "Codex CLI", CLIAgentRuntimeKind::Codex),
+            ("claude", "Claude CLI", CLIAgentRuntimeKind::Claude),
+            ("opencode", "OpenCode", CLIAgentRuntimeKind::OpenCode),
+        ] {
+            let root = temp_workspace(&format!("turn-facts-{runtime}"));
+            let skills = ["second".to_owned(), "first".to_owned()];
+            let make_plan = |turn, cwd, selected: &[String], capabilities: bool| {
+                compile_cli_runtime_delivery_plan(
+                    &root,
+                    CLIRuntimeContextBuildInput {
+                        workspace_id: "workspace_facts",
+                        thread_id: "thread_facts",
+                        initiating_thread_id: "thread_facts",
+                        turn_id: turn,
+                        runtime_id: runtime,
+                        runtime_label: label,
+                        runtime_kind: kind,
+                        model: Some("model"),
+                        cwd: Some(cwd),
+                        permission_profile:
+                            pioneer_protocol::default_turn_permission_profile_snapshot(),
+                        history: None,
+                        selected_skill_names: selected,
+                        selected_capabilities: if capabilities {
+                            cli_runtime_mcp_capabilities_input(Some(&mcp_projection()))
+                        } else {
+                            None
+                        },
+                    },
+                )
+                .unwrap()
+            };
+            let first = make_plan("turn_before", "/before", &skills, true);
+            let original = vec![
+                CLIRuntimeTurnInputItem::Text {
+                    text: "original user command".to_owned(),
+                },
+                CLIRuntimeTurnInputItem::Image {
+                    url: "https://example.com/image.png".to_owned(),
+                },
+                CLIRuntimeTurnInputItem::Skill {
+                    name: "first".to_owned(),
+                    path: "/skills/first/SKILL.md".to_owned(),
+                },
+            ];
+            let mut mapping = CLIRuntimeTurnInputMapping {
+                input: original.clone(),
+                diagnostics: vec![],
+            };
+            super::prepend_cli_environment_input(
+                &mut mapping,
+                &pioneer_protocol::TurnExecutionSecuritySnapshot::unrestricted_full_access(
+                    "/before", 0,
+                ),
+            );
+            prepend_cli_turn_context_input(&mut mapping, &first, label);
+            let saved = serde_json::to_string(&mapping).unwrap();
+            assert!(saved.contains("Date:"));
+            assert!(saved.contains("Filesystem scope:"));
+            assert!(saved.contains("Approval:"));
+            assert_eq!(
+                serde_json::to_value(&mapping.input[2..]).unwrap(),
+                serde_json::to_value(&original).unwrap()
+            );
+            assert!(
+                first.turn_context.text.find("second").unwrap()
+                    < first.turn_context.text.find("first").unwrap()
+            );
+            let mut next = make_plan("turn_after", "/after", &[], true);
+            let persisted = super::persist_inventory_mapping(&saved, &first).unwrap();
+            let unknown = next.turn_context.clone();
+            assert!(unknown.text.contains("Selected Capabilities"));
+            super::apply_inventory_mapping(&mut next, Some(&persisted)).unwrap();
+            assert_eq!(
+                next.turn_context, unknown,
+                "native retention is unknown after automatic compaction; resend a bounded baseline"
+            );
+            // An older exact slice can differ at the same section ID/name.
+            // Descriptions/references are compared as full saved text, never
+            // treated as announced merely because their name was unchanged.
+            let mut older: serde_json::Value = serde_json::from_str(&persisted).unwrap();
+            older["pioneerInventory"][0]["content"] =
+                serde_json::json!("Former description and reference: tool:v1");
+            let older = serde_json::to_string(&older).unwrap();
+            let mut changed = make_plan("changed", "/after", &[], true);
+            super::apply_inventory_mapping(&mut changed, Some(&older)).unwrap();
+            assert!(
+                changed
+                    .turn_context
+                    .text
+                    .contains("Current bounded slice replaces")
+            );
+            assert!(changed.turn_context.text.contains("mcp_resend_send_email"));
+            assert!(!changed.turn_context.text.contains("tool:v1"));
+            let mut disabled = make_plan("disabled", "/after", &[], false);
+            super::apply_inventory_mapping(&mut disabled, Some(&persisted)).unwrap();
+            assert!(
+                disabled
+                    .turn_context
+                    .text
+                    .contains("Previously shown slice is no longer available")
+            );
+            assert!(!disabled.turn_context.text.contains("mcp_resend_send_email"));
+            let mut bootstrap = make_plan("bootstrap", "/after", &[], true);
+            super::apply_inventory_mapping(&mut bootstrap, None).unwrap();
+            assert!(
+                bootstrap
+                    .turn_context
+                    .text
+                    .contains("Selected Capabilities")
+            );
+            assert_eq!(first.provider_instructions, next.provider_instructions);
+            assert!(next.turn_context.text.contains("turn_after"));
+            assert!(next.turn_context.text.contains("/after"));
+            assert!(!next.turn_context.text.contains("$second"));
+            assert!(!next.turn_context.text.contains("$first"));
+            assert!(next.turn_context.text.contains("empty"));
+            // Replay uses the durable bytes, with the previous user context,
+            // attachments and native Skill item in their original positions.
+            let restored: CLIRuntimeTurnInputMapping = serde_json::from_str(&saved).unwrap();
+            assert_eq!(serde_json::to_string(&restored).unwrap(), saved);
+            let old_wire = serde_json::to_string(&restored.input).unwrap();
+            assert!(old_wire.contains("turn_before"));
+            assert!(!old_wire.contains("turn_after"));
+            assert!(old_wire.contains("/before"));
+            assert!(!old_wire.contains("/after"));
+        }
+    }
+
+    #[test]
+    fn explicit_cli_selection_keeps_order_and_excludes_required_exports() {
+        let plan = |id: &str, name: &str| crate::cli_runtime::skills::CliRuntimeSkillInstallPlan {
+            skill_id: pioneer_protocol::SkillId::new(id).unwrap(),
+            owner: None,
+            slug: name.to_owned(),
+            source: "/source".into(),
+            destination: "/destination".into(),
+            native_skills_root: "/native".into(),
+            receipt_path: "/receipt".into(),
+            runtime_id: "codex".to_owned(),
+            runtime_kind: "codex".to_owned(),
+            install_name: name.to_owned(),
+            skill_slug: name.to_owned(),
+            source_kind: "user".to_owned(),
+        };
+        let plans = [
+            plan("AAAAAAAAAAAAAAAAAAAAA", "first"),
+            plan("BBBBBBBBBBBBBBBBBBBBB", "second"),
+            plan("CCCCCCCCCCCCCCCCCCCCC", "pioneer-system-tasks"),
+        ];
+        let capabilities = [1, 0].map(|index| pioneer_protocol::TurnCapability {
+            id: pioneer_protocol::skill_capability_key(&plans[index].skill_id),
+            kind: pioneer_protocol::TurnCapabilityKind::Skill {
+                skill_id: plans[index].skill_id.clone(),
+                pack_id: None,
+            },
+            label: None,
+        });
+        assert_eq!(
+            super::explicit_cli_skill_names(&capabilities, &plans),
+            ["second", "first"]
+        );
+        assert!(super::explicit_cli_skill_names(&[], &plans).is_empty());
     }
 }

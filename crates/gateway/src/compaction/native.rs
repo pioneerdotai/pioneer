@@ -1015,6 +1015,8 @@ async fn refresh_native_history(
                             | "context"
                             | "item"
                             | "pending-input"
+                            | "pending-turn-input-projection"
+                            | "pending-runtime-context"
                             | "pending-assistant"
                             | "pending-tool"
                             | "pending-item"
@@ -1081,7 +1083,9 @@ async fn refresh_native_history(
                 "history unit crosses the current execution boundary"
             );
             if origin.sources.iter().any(|source| {
-                source.scope.starts_with("input:") || source.scope.starts_with("pending-input:")
+                source.scope.starts_with("input:")
+                    || source.scope.starts_with("pending-input:")
+                    || source.scope.starts_with("pending-turn-input-projection:")
             }) {
                 origin.protected_input = true;
             }

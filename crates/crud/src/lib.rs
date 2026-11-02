@@ -5266,7 +5266,7 @@ impl CrudStore {
                         OR (trt.status = 'cancelled' AND t.status = 'interrupted'))) \
                     OR (r.status IN ('succeeded', 'failed', 'cancelled', 'timed_out') \
                       AND CASE WHEN (EXISTS (SELECT 1 FROM turn_runtime_snapshot c WHERE c.turn_id = t.id) \
-                        OR EXISTS (SELECT 1 FROM turn_llm_context c WHERE c.turn_id = t.id AND c.source NOT IN ('assistant_round', 'tool_result_v2'))) \
+                        OR EXISTS (SELECT 1 FROM turn_llm_context c WHERE c.turn_id = t.id AND c.source NOT IN ('assistant_round', 'tool_result_v2', 'turn_input_projection_v1', 'runtime_context_v1', 'system_snapshot_v1'))) \
                         THEN CASE WHEN ({ready}) THEN 1 ELSE 0 END ELSE 0 END = 1)) \
                  ORDER BY t.updated_at ASC, t.id ASC LIMIT {limit_bind}",
                     ready = repositories::task_child_cleanup::render_ready(backend)),

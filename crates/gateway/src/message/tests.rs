@@ -40433,11 +40433,11 @@ async fn agent_mode_materializes_task_tools_and_chat_mode_does_not_impl() {
         .as_ref()
         .expect("agent request should include compiled prompt");
     assert!(
-        agent_prompt.full_system_text.contains("## Subagents"),
+        agent_prompt.full_system_text.contains("### Subagents"),
         "agent mode should explain attached subagents when task tools are available"
     );
     assert!(
-        agent_prompt.full_system_text.contains("## Tasks"),
+        agent_prompt.full_system_text.contains("### Tasks"),
         "agent mode should explain durable tasks when task tools are available"
     );
     let initial_tools = first_agent_request.tools.as_ref().expect("initial tools");
@@ -40552,11 +40552,11 @@ async fn agent_mode_materializes_task_tools_and_chat_mode_does_not_impl() {
     );
     if let Some(prompt) = first_chat_request.compiled_prompt.as_ref() {
         assert!(
-            !prompt.full_system_text.contains("## Subagents"),
+            !prompt.full_system_text.contains("### Subagents"),
             "chat mode without task tools should not advertise subagents"
         );
         assert!(
-            !prompt.full_system_text.contains("## Tasks"),
+            !prompt.full_system_text.contains("### Tasks"),
             "chat mode without task tools should not advertise durable tasks"
         );
     }
@@ -72076,10 +72076,15 @@ Gateway HTTP skill body"#
         .await
         .expect("turn llm context should load");
     assert!(
-        retained_context
-            .iter()
-            .all(|entry| matches!(entry.source.as_str(), "assistant_round" | "tool_result_v2")),
-        "terminal cleanup should retain only canonical provider context"
+        retained_context.iter().all(|entry| matches!(
+            entry.source.as_str(),
+            "assistant_round"
+                | "tool_result_v2"
+                | "turn_input_projection_v1"
+                | "runtime_context_v1"
+                | "system_snapshot_v1"
+        )),
+        "terminal cleanup should retain canonical provider context and prepared delivery snapshots"
     );
     assert!(
         retained_context
@@ -72090,6 +72095,16 @@ Gateway HTTP skill body"#
         "canonical full result must survive terminal cleanup exactly once for history and result_read"
     );
 
+    assert!(
+        retained_context
+            .iter()
+            .any(|entry| entry.source == "turn_input_projection_v1")
+    );
+    assert!(
+        retained_context
+            .iter()
+            .any(|entry| entry.source == "system_snapshot_v1")
+    );
     let canonical_result = retained_context
         .iter()
         .find(|entry| entry.source == "tool_result_v2" && entry.payload.contains(SECRET))
@@ -79580,7 +79595,7 @@ async fn chat_mode_russian_remember_does_not_mutate_agent_memory_impl() {
             request
                 .compiled_prompt
                 .as_ref()
-                .map(|prompt| !prompt.full_system_text.contains("## Memory Recall"))
+                .map(|prompt| !prompt.full_system_text.contains("### Memory Recall"))
                 .unwrap_or(true),
             "chat request should not include memory recall prompt"
         );
