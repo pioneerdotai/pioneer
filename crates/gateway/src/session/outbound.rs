@@ -30,7 +30,10 @@ struct Admission {
 }
 impl Admission {
     fn close(&self) {
-        self.usage.lock().unwrap().closed = true;
+        self.usage
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .closed = true;
         self.changed.notify_waiters();
     }
 }
@@ -42,7 +45,11 @@ pub(crate) struct Reservation {
 }
 impl Drop for Reservation {
     fn drop(&mut self) {
-        let mut u = self.admission.usage.lock().unwrap();
+        let mut u = self
+            .admission
+            .usage
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         u.count -= 1;
         u.bytes -= self.bytes;
         if self.class == AdmissionClass::Data {
@@ -121,14 +128,24 @@ impl SessionOutbound {
             let notified = self.admission.changed.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            if self.admission.usage.lock().unwrap().closed {
+            if self
+                .admission
+                .usage
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .closed
+            {
                 return;
             }
             notified.await;
         }
     }
     pub(crate) fn capacity(&self) -> usize {
-        let u = self.admission.usage.lock().unwrap();
+        let u = self
+            .admission
+            .usage
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         if u.closed {
             0
         } else {
@@ -143,7 +160,11 @@ impl SessionOutbound {
         class: AdmissionClass,
     ) -> Result<(), mpsc::error::TrySendError<Message>> {
         let bytes = message_bytes(&message);
-        let mut u = self.admission.usage.lock().unwrap();
+        let mut u = self
+            .admission
+            .usage
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         if u.closed || self.tx.is_closed() {
             return Err(mpsc::error::TrySendError::Closed(message));
         }
@@ -339,6 +360,21 @@ mod tests {
         let (tx, _rx) = SessionOutbound::channel(8, 100, 20);
         assert!(tx.try_send_data(text(81)).is_err());
         assert!(tx.try_send(text(1)).is_err());
+    }
+
+    #[tokio::test]
+    async fn writer_panic_retires_pending_and_late_producers() {
+        let (tx, mut rx) = SessionOutbound::channel(2, 100, 20);
+        tx.send(text(100)).await.unwrap();
+        let mut waiting = Box::pin(tx.send(text(1)));
+        assert!(waiting.as_mut().now_or_never().is_none());
+        let writer = tokio::spawn(async move {
+            let _held = rx.recv().await.unwrap();
+            panic!("writer failed while owning payload");
+        });
+        assert!(writer.await.unwrap_err().is_panic());
+        assert!(waiting.await.is_err());
+        assert!(tx.try_send_data(text(1)).is_err());
     }
 
     #[tokio::test]
