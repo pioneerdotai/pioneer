@@ -1,4 +1,4 @@
-//! Bounded pending work for the existing, single history controller worker.
+//! Bounded pending and active work for the existing history controller owner.
 //! Wake publication and the worker's wait predicate share this mutex. No RPC or
 //! domain lock is acquired while waiting. Limits are defensive resource budgets,
 //! not measured throughput optima.
@@ -33,12 +33,21 @@ fn discard(item: &Item, reason: QueueOutcome) {
 
 struct Pending {
     jobs: VecDeque<Item>,
-    executing: bool,
-    executing_recovery: bool,
+    #[cfg(test)]
+    test_reservation: Option<u64>,
+    active: Vec<Active>,
+    next_id: u64,
     wake: bool,
     closed: bool,
     senders: usize,
     interactive_streak: usize,
+}
+struct Active {
+    id: u64,
+    identity: super::registry::HistoryIdentity,
+    recovery: bool,
+    retired: bool,
+    response: Option<crate::rpc::JsonRpcResponseSender>,
 }
 struct Shared {
     pending: Mutex<Pending>,
@@ -56,8 +65,10 @@ pub(crate) fn channel() -> (ThreadControllerSender, ThreadControllerReceiver) {
     let shared = Arc::new(Shared {
         pending: Mutex::new(Pending {
             jobs: VecDeque::new(),
-            executing: false,
-            executing_recovery: false,
+            #[cfg(test)]
+            test_reservation: None,
+            active: Vec::new(),
+            next_id: 0,
             wake: false,
             closed: false,
             senders: 1,
@@ -126,6 +137,34 @@ impl ThreadControllerSender {
             false
         });
     }
+    /// Registry -> pending. Return handles so cancellation callbacks run after
+    /// both locks have been released, with applicability already revoked.
+    pub(crate) fn retire_history(
+        &self,
+        mut current: impl FnMut(&super::registry::HistoryIdentity) -> bool,
+        queued_current: impl FnMut(&ThreadControllerRequest) -> bool,
+    ) -> Vec<crate::rpc::JsonRpcResponseSender> {
+        self.retire_stale(queued_current);
+        let mut pending = self
+            .shared
+            .pending
+            .lock()
+            .expect("history pending poisoned");
+        let mut retired = Vec::new();
+        for active in &mut pending.active {
+            if !active.retired && !current(&active.identity) {
+                active.retired = true;
+                if let Some(response) = active.response.take() {
+                    retired.push(response);
+                }
+            }
+        }
+        if !retired.is_empty() {
+            pending.wake = true;
+            self.shared.ready.notify_one();
+        }
+        retired
+    }
     pub(crate) fn send(
         &self,
         value: ThreadControllerRequest,
@@ -167,13 +206,21 @@ impl ThreadControllerSender {
             }
             return Ok(());
         }
+        if pending.active.iter().any(|a| {
+            !a.retired && a.identity.semantic() && a.identity == item.value.history_identity()
+        }) {
+            if let Some((queue, bytes)) = &item.queue {
+                queue.coalesced_send(*bytes);
+            }
+            return Ok(());
+        }
         let ordinary = pending
             .jobs
             .iter()
             .filter(|job| !job.value.is_recovery())
             .count()
-            + usize::from(pending.executing && !pending.executing_recovery);
-        if pending.jobs.len() + usize::from(pending.executing) >= MAX_JOBS
+            + pending.active.iter().filter(|a| !a.recovery).count();
+        if pending.jobs.len() + pending.active.len() >= MAX_JOBS
             || (!item.value.is_recovery() && ordinary >= MAX_ORDINARY_JOBS)
             || !item.value.command_fits(MAX_COMMAND_BYTES)
         {
@@ -189,83 +236,169 @@ impl ThreadControllerSender {
     }
 }
 impl ThreadControllerReceiver {
-    /// Caller may hold the domain registry only for this nonblocking selection.
-    /// Registry -> pending is the sole lock order; producers release domain locks
-    /// before enqueue. Priority is evaluated now, rather than captured at enqueue.
-    pub(crate) fn take_by(
+    pub(crate) fn take_ready_by(
         &self,
         mut interactive: impl FnMut(&ThreadControllerRequest) -> bool,
-    ) -> Option<Item> {
-        let mut pending = self
+    ) -> Option<(u64, Item)> {
+        let mut p = self
             .shared
             .pending
             .lock()
             .expect("history pending poisoned");
-        assert!(!pending.executing);
-        let low = pending
+        let barrier_waiting = p.jobs.iter().any(|item| {
+            !matches!(
+                item.value,
+                ThreadControllerRequest::Semantic(_) | ThreadControllerRequest::Subscribe(_)
+            )
+        });
+        let eligible = |item: &Item| {
+            if matches!(item.value, ThreadControllerRequest::Subscribe(_)) {
+                return true;
+            }
+            let key = item.value.history_identity();
+            p.active.is_empty()
+                || (key.semantic()
+                    && !barrier_waiting
+                    && p.active.len() < 2
+                    && p.active
+                        .iter()
+                        .all(|a| a.identity.semantic() && a.identity.thread() != key.thread()))
+        };
+        let low = p
             .jobs
             .iter()
-            .position(|item| !interactive(&item.value));
-        let high = pending
+            .position(|i| eligible(i) && !interactive(&i.value));
+        let high = p
             .jobs
             .iter()
-            .position(|item| interactive(&item.value));
-        let index = if pending.interactive_streak >= INTERACTIVE_BURST {
+            .position(|i| eligible(i) && interactive(&i.value));
+        let index = if p.interactive_streak >= INTERACTIVE_BURST {
             low.or(high)
         } else {
             high.or(low)
         }?;
         if Some(index) == high {
-            pending.interactive_streak = pending.interactive_streak.saturating_add(1);
+            p.interactive_streak = p.interactive_streak.saturating_add(1);
         } else {
-            pending.interactive_streak = 0;
+            p.interactive_streak = 0;
         }
-        pending.executing = true;
-        pending.executing_recovery = pending.jobs[index].value.is_recovery();
-        pending.jobs.remove(index)
+        let item = p.jobs.remove(index).unwrap();
+        p.next_id = p
+            .next_id
+            .checked_add(1)
+            .expect("history reservation exhausted");
+        let id = p.next_id;
+        p.active.push(Active {
+            id,
+            identity: item.value.history_identity(),
+            recovery: item.value.is_recovery(),
+            retired: false,
+            response: None,
+        });
+        Some((id, item))
     }
-    /// The executing job owns a reserved slot, including while the RPC runs.
-    pub(crate) fn finish(&self, continuation: Option<Item>) {
-        let mut pending = self
+    pub(crate) fn attach(&self, id: u64, response: crate::rpc::JsonRpcResponseSender) -> bool {
+        let mut p = self
             .shared
             .pending
             .lock()
             .expect("history pending poisoned");
-        assert!(pending.executing);
-        pending.executing = false;
-        pending.executing_recovery = false;
+        let Some(a) = p.active.iter_mut().find(|a| a.id == id && !a.retired) else {
+            return false;
+        };
+        a.response = Some(response);
+        true
+    }
+    pub(crate) fn applicable(&self, id: u64) -> bool {
+        self.shared
+            .pending
+            .lock()
+            .expect("history pending poisoned")
+            .active
+            .iter()
+            .any(|a| a.id == id && !a.retired)
+    }
+    pub(crate) fn finish_active(&self, id: u64, continuation: Option<Item>) {
+        let mut p = self
+            .shared
+            .pending
+            .lock()
+            .expect("history pending poisoned");
+        let index = p
+            .active
+            .iter()
+            .position(|a| a.id == id)
+            .expect("history reservation");
+        p.active.remove(index);
         if let Some(item) = continuation {
-            if !pending.closed {
-                pending.jobs.push_back(item);
+            if !p.closed {
+                p.jobs.push_back(item);
             } else {
                 discard(&item, QueueOutcome::Dropped);
             }
         }
     }
-    pub(crate) fn wait(&self, delay: Option<Duration>) -> bool {
-        let pending = self
+    pub(crate) fn completion_wake(&self) -> Arc<dyn Fn() + Send + Sync> {
+        let weak = Arc::downgrade(&self.shared);
+        Arc::new(move || {
+            if let Some(shared) = weak.upgrade() {
+                let mut p = shared.pending.lock().expect("history pending poisoned");
+                p.wake = true;
+                shared.ready.notify_one();
+            }
+        })
+    }
+    /// Selection was exhausted before this call. Producers and completions set
+    /// wake under the same mutex; a full set of slots does not make us spin.
+    pub(crate) fn wait_ready(&self, delay: Option<Duration>) -> bool {
+        let p = self
             .shared
             .pending
             .lock()
             .expect("history pending poisoned");
-        let mut pending = match delay {
-            Some(delay) => {
+        let mut p = match delay {
+            Some(d) => {
                 self.shared
                     .ready
-                    .wait_timeout_while(pending, delay, |p| {
-                        !p.closed && !p.wake && p.jobs.is_empty()
-                    })
+                    .wait_timeout_while(p, d, |p| !p.closed && !p.wake)
                     .expect("history wait poisoned")
                     .0
             }
             None => self
                 .shared
                 .ready
-                .wait_while(pending, |p| !p.closed && !p.wake && p.jobs.is_empty())
+                .wait_while(p, |p| !p.closed && !p.wake)
                 .expect("history wait poisoned"),
         };
-        pending.wake = false;
-        !pending.closed
+        p.wake = false;
+        !p.closed
+    }
+    // Synchronous fixtures exercise the same reservation/selection algorithm.
+    #[cfg(test)]
+    pub(crate) fn take_by(
+        &self,
+        interactive: impl FnMut(&ThreadControllerRequest) -> bool,
+    ) -> Option<Item> {
+        let (id, item) = self.take_ready_by(interactive)?;
+        let mut p = self.shared.pending.lock().unwrap();
+        assert!(p.test_reservation.replace(id).is_none());
+        Some(item)
+    }
+    #[cfg(test)]
+    pub(crate) fn finish(&self, continuation: Option<Item>) {
+        let id = self
+            .shared
+            .pending
+            .lock()
+            .unwrap()
+            .test_reservation
+            .take()
+            .expect("fixture reservation");
+        self.finish_active(id, continuation);
+    }
+    #[cfg(test)]
+    pub(crate) fn wait(&self, delay: Option<Duration>) -> bool {
+        self.wait_ready(delay)
     }
     #[cfg(test)]
     pub(crate) fn try_recv(&self) -> Result<Item, std::sync::mpsc::TryRecvError> {
@@ -319,7 +452,16 @@ impl Drop for ThreadControllerReceiver {
         for item in pending.jobs.drain(..) {
             discard(&item, QueueOutcome::Dropped);
         }
+        let responses: Vec<_> = pending
+            .active
+            .drain(..)
+            .filter_map(|a| a.response)
+            .collect();
         self.shared.ready.notify_all();
+        drop(pending);
+        for response in responses {
+            response.cancel();
+        }
     }
 }
 

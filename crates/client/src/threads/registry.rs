@@ -1391,6 +1391,8 @@ impl ClientCore {
             drafts,
             Vec::new(),
         );
+        drop(registry);
+        self.retire_thread_controller_jobs();
     }
     pub fn clear_thread_stores(&self) {
         self.cancel_artifact_downloads(None);
@@ -1464,6 +1466,8 @@ impl ClientCore {
             drafts,
             Vec::new(),
         );
+        drop(registry);
+        self.retire_thread_controller_jobs();
     }
     pub fn tick_thread_conversations(&self) -> bool {
         let mut registry = self
@@ -1716,6 +1720,8 @@ impl ClientCore {
             drafts,
             vec![],
         );
+        drop(registry);
+        self.retire_thread_controller_jobs();
         self.notify_send_readiness();
     }
     pub(crate) fn publish_timeline_cancellation(&self, keys: &[SemanticTimelineRequestKey]) {
@@ -2759,7 +2765,7 @@ impl ClientCore {
         }
     }
 
-    fn wake_thread_timeline_requests(&self) {
+    pub(crate) fn wake_thread_timeline_requests(&self) {
         if let Some(sender) = self
             .thread_request_sender
             .lock()
@@ -5935,6 +5941,339 @@ mod tests {
             }
         }));
         id
+    }
+
+    struct HeldHistory(
+        std::sync::mpsc::Sender<(serde_json::Value, crate::rpc::JsonRpcResponseSender)>,
+    );
+    impl crate::rpc::JsonRpcRequestTransport for HeldHistory {
+        fn send_json_rpc_request(
+            &self,
+            _: String,
+            payload: String,
+            response: crate::rpc::JsonRpcResponseSender,
+        ) -> Result<(), String> {
+            self.0
+                .send((serde_json::from_str(&payload).unwrap(), response))
+                .unwrap();
+            Ok(())
+        }
+    }
+
+    fn history_owner_fixture() -> (
+        Arc<ClientCore>,
+        std::sync::mpsc::Receiver<(serde_json::Value, crate::rpc::JsonRpcResponseSender)>,
+        std::sync::mpsc::Receiver<Option<std::time::Duration>>,
+    ) {
+        let core = crate::catalog_test_support::settings_client();
+        connect_subscription_test(&core);
+        for id in ["a", "b", "c"] {
+            core.upsert_thread(thread(id, "ws"));
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        *core
+            .transport_runtime()
+            .ws_command_sender()
+            .test_requests
+            .lock()
+            .unwrap() = Some(Arc::new(HeldHistory(tx)));
+        let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
+        core.start_thread_request_controller(Some(waiting_tx));
+        (core, rx, waiting_rx)
+    }
+    fn queue_history(core: &ClientCore, id: &str) {
+        core.schedule_thread_semantic_request(SemanticTimelineRequestAction::ThreadTimelinePage {
+            key: SemanticTimelineRequestKey::ThreadNewest {
+                thread_id: id.into(),
+            },
+            params: pioneer_protocol::ThreadTimelinePageParams {
+                thread_id: id.into(),
+                anchor: pioneer_protocol::TimelinePageAnchor::Newest,
+                limit: Some(100),
+            },
+        })
+        .unwrap();
+    }
+    fn empty_history(id: &str) -> serde_json::Value {
+        let mut page = reconciliation_page(vec![], false, false);
+        page.thread_id = id.into();
+        serde_json::to_value(page).unwrap()
+    }
+
+    fn wait_history_owner_exit(waiting: &std::sync::mpsc::Receiver<Option<std::time::Duration>>) {
+        loop {
+            match waiting.recv_timeout(std::time::Duration::from_secs(5)) {
+                Ok(_) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(error) => panic!("history owner did not exit: {error}"),
+            }
+        }
+    }
+
+    #[test]
+    fn history_owner_serializes_same_thread_quanta_but_advances_other_thread() {
+        let (core, requests, waiting) = history_owner_fixture();
+        let watchdog = std::time::Duration::from_secs(5);
+        queue_history(&core, "a");
+        let (_, a) = requests.recv_timeout(watchdog).unwrap();
+        core.schedule_thread_semantic_request(SemanticTimelineRequestAction::ThreadTimelinePage {
+            key: SemanticTimelineRequestKey::ThreadBefore {
+                thread_id: "a".into(),
+                cursor: "older".into(),
+            },
+            params: pioneer_protocol::ThreadTimelinePageParams {
+                thread_id: "a".into(),
+                anchor: pioneer_protocol::TimelinePageAnchor::Before {
+                    cursor: pioneer_protocol::TimelineCursor {
+                        value: "older".into(),
+                    },
+                },
+                limit: Some(100),
+            },
+        })
+        .unwrap();
+        queue_history(&core, "b");
+        let (request, b) = requests.recv_timeout(watchdog).unwrap();
+        assert_eq!(
+            request["params"]["thread_id"], "b",
+            "same-thread quantum must wait for A"
+        );
+        a.send(Ok(empty_history("a"))).unwrap();
+        let (request, next_a) = requests.recv_timeout(watchdog).unwrap();
+        assert_eq!(request["params"]["thread_id"], "a");
+        assert!(b.is_active());
+        core.shutdown();
+        wait_history_owner_exit(&waiting);
+        assert!(!next_a.is_active());
+    }
+
+    #[test]
+    fn history_owner_runs_b_while_a_waits_and_third_waits_for_a_slot() {
+        let (core, requests, waiting) = history_owner_fixture();
+        let watchdog = std::time::Duration::from_secs(5);
+        queue_history(&core, "a");
+        let (a_request, a) = requests.recv_timeout(watchdog).unwrap();
+        assert_eq!(a_request["params"]["thread_id"], "a");
+        queue_history(&core, "b");
+        let (b_request, b) = requests
+            .recv_timeout(watchdog)
+            .expect("B starts without a reply to A");
+        assert_eq!(b_request["params"]["thread_id"], "b");
+        queue_history(&core, "c");
+        // The owner reaches its sleep boundary with both response handles held.
+        waiting.recv_timeout(watchdog).unwrap();
+        assert!(requests.try_recv().is_err());
+        b.send(Ok(empty_history("b"))).unwrap();
+        let (c_request, c) = requests
+            .recv_timeout(watchdog)
+            .expect("B completion releases a slot");
+        assert_eq!(c_request["params"]["thread_id"], "c");
+        assert!(core.thread_semantic_in_flight("b").is_empty());
+        assert!(!core.thread_semantic_in_flight("a").is_empty());
+        assert!(a.is_active());
+        core.shutdown();
+        // Waiting channel closes only after the actual owner has exited.
+        wait_history_owner_exit(&waiting);
+        assert!(!a.is_active());
+        assert!(!c.is_active());
+    }
+
+    #[test]
+    fn inline_history_completion_before_send_returns_releases_slot_and_wakes_owner() {
+        struct InlineReply(HeldHistory);
+        impl crate::rpc::JsonRpcRequestTransport for InlineReply {
+            fn send_json_rpc_request(
+                &self,
+                id: String,
+                payload: String,
+                response: crate::rpc::JsonRpcResponseSender,
+            ) -> Result<(), String> {
+                let request: serde_json::Value = serde_json::from_str(&payload).unwrap();
+                if request["params"]["thread_id"] == "b" {
+                    response.send(Ok(empty_history("b"))).unwrap();
+                    Ok(())
+                } else {
+                    crate::rpc::JsonRpcRequestTransport::send_json_rpc_request(
+                        &self.0, id, payload, response,
+                    )
+                }
+            }
+        }
+        let (core, _, waiting) = history_owner_fixture();
+        let (tx, requests) = std::sync::mpsc::channel();
+        *core
+            .transport_runtime()
+            .ws_command_sender()
+            .test_requests
+            .lock()
+            .unwrap() = Some(Arc::new(InlineReply(HeldHistory(tx))));
+        queue_history(&core, "a");
+        let (_, a) = requests
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        queue_history(&core, "b");
+        queue_history(&core, "c");
+        let (request, _) = requests
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(request["params"]["thread_id"], "c");
+        assert!(core.thread_semantic_in_flight("b").is_empty());
+        assert!(a.is_active());
+        core.shutdown();
+        wait_history_owner_exit(&waiting);
+    }
+
+    #[test]
+    fn history_waiter_is_owned_by_all_consumers_and_durable_demand() {
+        use crate::timeline::controller::{TimelineDemand, TimelineIntent};
+        for durable in [false, true] {
+            let (core, requests, waiting) = history_owner_fixture();
+            let action = SemanticTimelineRequestAction::ThreadTimelinePage {
+                key: SemanticTimelineRequestKey::ThreadNewest {
+                    thread_id: "a".into(),
+                },
+                params: pioneer_protocol::ThreadTimelinePageParams {
+                    thread_id: "a".into(),
+                    anchor: pioneer_protocol::TimelinePageAnchor::Newest,
+                    limit: Some(100),
+                },
+            };
+            if durable {
+                queue_history(&core, "a");
+            }
+            // Feed the real timeline owner immutable page plans. This isolates
+            // logical ownership from the unrelated viewport geometry planner.
+            for consumer in ["one", "two"] {
+                let demand = TimelineDemand {
+                    thread_id: "a".into(),
+                    consumer_id: consumer.into(),
+                    generation: 1,
+                    source_revision: 0,
+                    row_ids: vec![],
+                    threshold: 0,
+                    before: false,
+                    after: false,
+                    work: false,
+                    presented_rows: true,
+                    scroll_generation: 0,
+                    latest_user_turn_id: None,
+                    viewed_through_turn_id: None,
+                    viewed_row_ids: vec![],
+                    viewed_through_block: None,
+                    read_requires_unread: false,
+                    prefetch_on_visibility: false,
+                    boundary_request_limit: 1,
+                };
+                let plan = core.thread_registry.lock().unwrap().timeline.update(
+                    demand,
+                    vec![action.clone()],
+                    0,
+                );
+                for page in plan.pages {
+                    core.schedule_planned_timeline_request(page).unwrap();
+                }
+            }
+            let (_, response) = requests
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            for consumer in ["one", "two"] {
+                core.timeline_intent(TimelineIntent::Exit {
+                    thread_id: "a".into(),
+                    consumer_id: consumer.into(),
+                    generation: 1,
+                });
+                if consumer == "one" || durable {
+                    assert!(response.is_active());
+                } else {
+                    assert!(
+                        !response.is_active(),
+                        "last consumer retires exact RPC waiter"
+                    );
+                }
+            }
+            core.shutdown();
+            wait_history_owner_exit(&waiting);
+            assert!(!response.is_active());
+        }
+    }
+
+    #[test]
+    fn foreground_subscription_readiness_bypasses_full_history_slots() {
+        let (core, requests, waiting) = history_owner_fixture();
+        let watchdog = std::time::Duration::from_secs(5);
+        queue_history(&core, "a");
+        let (_, a) = requests.recv_timeout(watchdog).unwrap();
+        queue_history(&core, "b");
+        let (_, b) = requests.recv_timeout(watchdog).unwrap();
+        let sending = core.clone();
+        let foreground = std::thread::spawn(move || {
+            let budget = crate::rpc::RequestBudget::new(
+                std::time::Instant::now() + std::time::Duration::from_secs(5),
+            );
+            sending
+                .ensure_thread_subscription("c", "ws", &budget)
+                .unwrap()
+        });
+        let (request, response) = requests.recv_timeout(watchdog).unwrap();
+        assert_eq!(request["method"], "thread/start");
+        response
+            .send(Ok(serde_json::to_value(
+                pioneer_protocol::ThreadStartResponse {
+                    thread: thread("c", "ws"),
+                    sandbox: SandboxPolicy::from_mode(SandboxMode::FullAccess),
+                },
+            )
+            .unwrap()))
+            .unwrap();
+        assert!(foreground.join().unwrap().is_current());
+        // The warm Send prerequisite reuses readiness with history still blocked.
+        let budget = crate::rpc::RequestBudget::new(std::time::Instant::now() + watchdog);
+        assert!(
+            core.ensure_thread_subscription("c", "ws", &budget)
+                .unwrap()
+                .is_current()
+        );
+        assert!(requests.try_recv().is_err());
+        assert!(a.is_active() && b.is_active());
+        core.shutdown();
+        wait_history_owner_exit(&waiting);
+    }
+
+    #[test]
+    fn history_owner_retirement_cancels_exact_local_waiter_and_fences_recreated_store() {
+        for retirement in ["remove", "reconnect", "clear", "shutdown", "drop"] {
+            let (core, requests, waiting) = history_owner_fixture();
+            let watchdog = std::time::Duration::from_secs(5);
+            queue_history(&core, "a");
+            let (_, response) = requests.recv_timeout(watchdog).unwrap();
+            assert!(response.is_active());
+            match retirement {
+                "remove" => {
+                    core.remove_thread_store("a");
+                    core.upsert_thread(thread("a", "ws"));
+                }
+                "reconnect" => core.cancel_thread_requests(),
+                "clear" => core.clear_thread_stores(),
+                "shutdown" => core.shutdown(),
+                "drop" => {}
+                _ => unreachable!(),
+            }
+            if retirement != "drop" && retirement != "shutdown" {
+                assert!(
+                    !response.is_active(),
+                    "retirement must cancel without waiting for RPC timeout"
+                );
+                assert!(response.send(Ok(empty_history("a"))).is_err());
+                assert!(core.thread_semantic_in_flight("a").is_empty());
+            }
+            if retirement != "drop" {
+                core.shutdown();
+            }
+            drop(core);
+            wait_history_owner_exit(&waiting);
+            assert!(!response.is_active());
+            assert!(response.send(Ok(empty_history("a"))).is_err());
+        }
     }
 
     #[test]
@@ -11173,6 +11512,7 @@ mod tests {
         pioneer_observability::set_telemetry_enabled(false);
         pioneer_observability::set_telemetry_enabled(true);
         let core = core();
+        connect_subscription_test(&core);
         struct Cleanup {
             core: Arc<ClientCore>,
             enabled: bool,
@@ -13458,6 +13798,23 @@ mod tests {
     }
 }
 
+pub(crate) type HistoryApply = Box<
+    dyn FnOnce(&ClientCore, anyhow::Result<serde_json::Value>) -> Option<ThreadControllerRequest>
+        + Send,
+>;
+pub(crate) struct PreparedHistory {
+    pub(crate) rpc: Option<(&'static str, serde_json::Value)>,
+    pub(crate) apply: HistoryApply,
+}
+
+pub(crate) struct PreparedSemanticRequest {
+    pub(crate) rpc: Option<(&'static str, serde_json::Value)>,
+    request: ThreadSemanticRequest,
+    key: SemanticTimelineRequestKey,
+    initial_items: Option<HashMap<String, pioneer_protocol::TurnItem>>,
+    expected_turn: Option<String>,
+}
+
 /// An accepted request is tied to the incarnation of its source store.
 pub struct ThreadSemanticRequest {
     id: String,
@@ -14122,18 +14479,28 @@ impl ClientCore {
     pub fn execute_thread_semantic_request(
         &self,
         transport: &impl crate::rpc::JsonRpcRequestTransport,
-        mut request: ThreadSemanticRequest,
+        request: ThreadSemanticRequest,
     ) -> Option<ThreadSemanticRequest> {
+        let prepared = self.prepare_thread_semantic_request(request)?;
+        let result = prepared.rpc.as_ref().map_or_else(
+            || Ok(serde_json::Value::Null),
+            |(method, params)| {
+                crate::rpc::send_json_rpc_request_value(
+                    transport,
+                    method,
+                    params.clone(),
+                    crate::rpc::RPC_REQUEST_TIMEOUT,
+                )
+            },
+        );
+        self.complete_thread_semantic_request(prepared, result)
+    }
+
+    pub(crate) fn prepare_thread_semantic_request(
+        &self,
+        request: ThreadSemanticRequest,
+    ) -> Option<PreparedSemanticRequest> {
         use crate::timeline::semantic::*;
-        use crate::transport::ws::command_sender as commands;
-        enum Page {
-            Thread(
-                pioneer_protocol::ThreadTimelinePageResponse,
-                TopLevelPageMergeMode,
-            ),
-            Work(pioneer_protocol::TurnWorkPageResponse, WorkPageMergeMode),
-            Items(Vec<pioneer_protocol::TurnWorkItemsGetResponse>),
-        }
         if self.is_stopped() {
             return None;
         }
@@ -14170,22 +14537,88 @@ impl ClientCore {
                 Some(params.turn_id.clone())
             }
         };
+        let rpc = match request.action.clone() {
+            SemanticTimelineRequestAction::ThreadTimelinePage { mut params, .. } => {
+                if let Some(walk) = &request.reconciliation {
+                    params.anchor = walk.anchor.clone();
+                    if params.anchor != pioneer_protocol::TimelinePageAnchor::Newest {
+                        params.limit = Some(CACHED_TIMELINE_PAGE_LIMIT);
+                    }
+                }
+                Some((
+                    pioneer_protocol::constants::methods::THREAD_TIMELINE_PAGE,
+                    serde_json::to_value(params).expect("timeline params"),
+                ))
+            }
+            SemanticTimelineRequestAction::TurnWorkPage { params, .. } => Some((
+                pioneer_protocol::constants::methods::TURN_WORK_PAGE,
+                serde_json::to_value(params).expect("work params"),
+            )),
+            SemanticTimelineRequestAction::TurnWorkItemsGet { mut params, .. } => {
+                let end = (request.work_items.next
+                    + crate::timeline::controller::WORK_ITEM_CHUNK_LIMIT)
+                    .min(params.work_item_ids.len());
+                if request.work_items.next == end {
+                    None
+                } else {
+                    params.work_item_ids =
+                        params.work_item_ids[request.work_items.next..end].to_vec();
+                    Some((
+                        pioneer_protocol::constants::methods::TURN_WORK_ITEMS_GET,
+                        serde_json::to_value(params).expect("items params"),
+                    ))
+                }
+            }
+        };
+        let rpc = if request.work_items.capture_failed
+            || request
+                .reconciliation
+                .as_ref()
+                .is_some_and(|w| w.capture_failed)
+        {
+            None
+        } else {
+            rpc
+        };
+        Some(PreparedSemanticRequest {
+            rpc,
+            request,
+            key,
+            initial_items,
+            expected_turn,
+        })
+    }
+    pub(crate) fn complete_thread_semantic_request(
+        &self,
+        prepared: PreparedSemanticRequest,
+        response: anyhow::Result<serde_json::Value>,
+    ) -> Option<ThreadSemanticRequest> {
+        use crate::timeline::semantic::*;
+        let PreparedSemanticRequest {
+            mut request,
+            key,
+            initial_items,
+            expected_turn,
+            ..
+        } = prepared;
+        enum Page {
+            Thread(
+                pioneer_protocol::ThreadTimelinePageResponse,
+                TopLevelPageMergeMode,
+            ),
+            Work(pioneer_protocol::TurnWorkPageResponse, WorkPageMergeMode),
+            Items(Vec<pioneer_protocol::TurnWorkItemsGetResponse>),
+        }
         let result = if request.work_items.capture_failed
             || request
                 .reconciliation
                 .as_ref()
-                .is_some_and(|walk| walk.capture_failed)
+                .is_some_and(|w| w.capture_failed)
         {
             Err(anyhow::anyhow!(TimelineContinuationFull))
         } else {
-            match request.action.clone() {
-                SemanticTimelineRequestAction::ThreadTimelinePage { key, mut params } => {
-                    if let Some(reconciliation) = &request.reconciliation {
-                        params.anchor = reconciliation.anchor.clone();
-                        if params.anchor != pioneer_protocol::TimelinePageAnchor::Newest {
-                            params.limit = Some(CACHED_TIMELINE_PAGE_LIMIT);
-                        }
-                    }
+            match &request.action {
+                SemanticTimelineRequestAction::ThreadTimelinePage { key, .. } => {
                     let mode = match key {
                         SemanticTimelineRequestKey::ThreadBefore { .. } => {
                             TopLevelPageMergeMode::MergeBefore
@@ -14195,16 +14628,16 @@ impl ClientCore {
                         }
                         _ => TopLevelPageMergeMode::Merge,
                     };
-                    commands::thread_timeline_page(transport, params).map(|p| Page::Thread(p, mode))
+                    response.and_then(|v| Ok(Page::Thread(serde_json::from_value(v)?, mode)))
                 }
-                SemanticTimelineRequestAction::TurnWorkPage { key, params } => {
+                SemanticTimelineRequestAction::TurnWorkPage { key, .. } => {
                     let mode = match key {
                         SemanticTimelineRequestKey::TurnWorkBefore { .. } => {
                             WorkPageMergeMode::MergeBefore
                         }
                         _ => WorkPageMergeMode::MergeAfter,
                     };
-                    commands::turn_work_page(transport, params).map(|p| Page::Work(p, mode))
+                    response.and_then(|v| Ok(Page::Work(serde_json::from_value(v)?, mode)))
                 }
                 SemanticTimelineRequestAction::TurnWorkItemsGet { params, .. } => {
                     let end = (request.work_items.next
@@ -14213,16 +14646,9 @@ impl ClientCore {
                     if request.work_items.next == end {
                         Ok(Page::Items(std::mem::take(&mut request.work_items.pages)))
                     } else {
-                        commands::turn_work_items_get(
-                            transport,
-                            pioneer_protocol::TurnWorkItemsGetParams {
-                                thread_id: params.thread_id,
-                                turn_id: params.turn_id,
-                                work_item_ids: params.work_item_ids[request.work_items.next..end]
-                                    .to_vec(),
-                            },
-                        )
-                        .and_then(|page| {
+                        response.and_then(|v| {
+                            let page: pioneer_protocol::TurnWorkItemsGetResponse =
+                                serde_json::from_value(v)?;
                             let bytes = semantic_buffer_size(
                                 &page,
                                 SEMANTIC_CONTINUATION_BYTE_LIMIT
@@ -15141,7 +15567,79 @@ pub(crate) enum ThreadControllerRequest {
     },
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) enum HistoryIdentity {
+    Semantic {
+        id: String,
+        generation: u64,
+        request_generation: u64,
+        key: SemanticTimelineRequestKey,
+    },
+    Read(crate::timeline::controller::TimelineReadRequest),
+    Store {
+        id: String,
+        generation: u64,
+    },
+}
+impl HistoryIdentity {
+    pub(crate) fn thread(&self) -> &str {
+        match self {
+            Self::Semantic { id, .. } | Self::Store { id, .. } => id,
+            Self::Read(r) => &r.thread_id,
+        }
+    }
+    pub(crate) fn semantic(&self) -> bool {
+        matches!(self, Self::Semantic { .. })
+    }
+    pub(crate) fn current(&self, registry: &ThreadRegistry) -> bool {
+        match self {
+            Self::Semantic {
+                id,
+                generation,
+                request_generation,
+                key,
+            } => {
+                registry
+                    .stores
+                    .get(id)
+                    .is_some_and(|s| s.generation == *generation)
+                    && registry.timeline.accepts(key, *request_generation)
+            }
+            Self::Read(r) => registry.timeline.accepts_read(r),
+            Self::Store { id, generation } => registry
+                .stores
+                .get(id)
+                .is_some_and(|s| s.generation == *generation),
+        }
+    }
+}
+
 impl ThreadControllerRequest {
+    pub(crate) fn history_identity(&self) -> HistoryIdentity {
+        match self {
+            Self::Semantic(r) => HistoryIdentity::Semantic {
+                id: r.id.clone(),
+                generation: r.generation,
+                request_generation: r.request_generation,
+                key: crate::timeline::semantic::semantic_timeline_request_key(&r.action).clone(),
+            },
+            Self::Read(r) => HistoryIdentity::Read(r.clone()),
+            Self::ResumeJob(r) => HistoryIdentity::Store {
+                id: r.id.clone(),
+                generation: r.generation,
+            },
+            Self::Binding { id, generation, .. } => HistoryIdentity::Store {
+                id: id.clone(),
+                generation: *generation,
+            },
+            Self::Subscribe(r) => HistoryIdentity::Store {
+                id: r.id.clone(),
+                generation: r.generation,
+            },
+            Self::Resume => unreachable!("wake has no reservation"),
+        }
+    }
+
     pub(crate) fn is_recovery(&self) -> bool {
         matches!(self, Self::ResumeJob(_))
             || matches!(self, Self::Semantic(request) if request.recovery)
@@ -15298,7 +15796,14 @@ impl ClientCore {
                 .thread_registry
                 .lock()
                 .expect("thread registry poisoned");
-            sender.retire_stale(|request| registry.controller_request_current(request));
+            let retired = sender.retire_history(
+                |identity| identity.current(&registry),
+                |request| registry.controller_request_current(request),
+            );
+            drop(registry);
+            for response in retired {
+                response.cancel();
+            }
         }
     }
     pub fn schedule_thread_resume(&self, id: &str) -> anyhow::Result<()> {
@@ -15397,13 +15902,32 @@ impl ClientCore {
             }
         }
     }
+    #[cfg(test)]
     pub(crate) fn execute_thread_resume_quantum(
         &self,
         transport: &impl crate::rpc::JsonRpcRequestTransport,
-        mut request: ThreadResumeRequest,
+        request: ThreadResumeRequest,
     ) -> Option<ThreadResumeRequest> {
+        let prepared = self.prepare_thread_resume_quantum(request)?;
+        let (method, params) = prepared.rpc.as_ref().expect("resume RPC");
+        let result = crate::rpc::send_json_rpc_request_value(
+            transport,
+            method,
+            params.clone(),
+            crate::rpc::RPC_REQUEST_TIMEOUT,
+        );
+        match (prepared.apply)(self, result) {
+            Some(ThreadControllerRequest::ResumeJob(r)) => Some(r),
+            _ => None,
+        }
+    }
+    pub(crate) fn prepare_thread_resume_quantum(
+        &self,
+        mut request: ThreadResumeRequest,
+    ) -> Option<PreparedHistory> {
         use super::resume::*;
-        let id = request.id.as_str();
+        let id = request.id.clone();
+        let id = id.as_str();
         let generation = request.generation;
         let (turn_id, workspace) = {
             let mut registry = self
@@ -15450,172 +15974,198 @@ impl ClientCore {
             }
             (turn, store.coordinator.workspace_id.clone())
         };
-        let result = (|| -> anyhow::Result<Option<TurnResumeSnapshotReduction>> {
-            if request.continuation.is_none() {
-                let snapshot = crate::transport::ws::command_sender::turn_get(
-                    transport,
-                    turn_resume_turn_params(id.to_owned(), turn_id.clone()),
-                )?;
-                anyhow::ensure!(
-                    snapshot.workspace_id == workspace,
-                    "Resume response workspace mismatch"
-                );
-                if !turn_snapshot_matches_scope(id, &turn_id, &snapshot) {
-                    return Ok(Some(reduce_turn_resume_turn_snapshot(
-                        id, &turn_id, snapshot,
-                    )));
+        let rpc = if let Some(continuation) = &request.continuation {
+            (
+                pioneer_protocol::constants::methods::TURN_ITEMS_PAGE,
+                serde_json::to_value(turn_resume_items_page_params(
+                    id.to_owned(),
+                    turn_id.clone(),
+                    continuation.after,
+                ))
+                .expect("resume params"),
+            )
+        } else {
+            (
+                pioneer_protocol::constants::methods::TURN_GET,
+                serde_json::to_value(turn_resume_turn_params(id.to_owned(), turn_id.clone()))
+                    .expect("resume params"),
+            )
+        };
+        Some(PreparedHistory {
+            rpc: Some(rpc),
+            apply: Box::new(move |core, response| {
+                let id_owned = request.id.clone();
+                let id = id_owned.as_str();
+                let result = (|| -> anyhow::Result<Option<TurnResumeSnapshotReduction>> {
+                    if request.continuation.is_none() {
+                        let snapshot =
+                            serde_json::from_value::<pioneer_protocol::TurnGetResponse>(response?)?;
+                        anyhow::ensure!(
+                            snapshot.workspace_id == workspace,
+                            "Resume response workspace mismatch"
+                        );
+                        if !turn_snapshot_matches_scope(id, &turn_id, &snapshot) {
+                            return Ok(Some(reduce_turn_resume_turn_snapshot(
+                                id, &turn_id, snapshot,
+                            )));
+                        }
+                        anyhow::ensure!(
+                            super::history_scheduler::fits_serialized(&snapshot, 8 * 1024 * 1024),
+                            "Resume snapshot capacity exceeded"
+                        );
+                        request.continuation = Some(ThreadResumeContinuation {
+                            snapshot,
+                            after: None,
+                        });
+                        return Ok(None);
+                    }
+                    let continuation = request.continuation.as_mut().unwrap();
+                    let page =
+                        serde_json::from_value::<pioneer_protocol::TurnItemsResponse>(response?)?;
+                    let page = reduce_turn_resume_items_page(
+                        &continuation.snapshot,
+                        continuation.after,
+                        page,
+                    )?;
+                    {
+                        let mut registry = core
+                            .thread_registry
+                            .lock()
+                            .expect("thread registry poisoned");
+                        let store = registry
+                            .stores
+                            .get_mut(id)
+                            .ok_or_else(|| anyhow::anyhow!("Resume cancelled"))?;
+                        anyhow::ensure!(
+                            !core.is_stopped()
+                                && store.generation == generation
+                                && page.workspace_id == workspace
+                                && store.coordinator.conversation.in_flight_turn_id()
+                                    == Some(turn_id.as_str()),
+                            "Resume cancelled"
+                        );
+                        for event in page.replay_events {
+                            store.coordinator.conversation.apply(event);
+                        }
+                        let drafts = registry.publish(id);
+                        core.transition_directory(
+                            &mut registry,
+                            &ClientMutationAuthority { _private: () },
+                            drafts,
+                            vec![],
+                        );
+                    }
+                    if let Some(next) = page.next_cursor {
+                        continuation.after = Some(next);
+                        return Ok(None);
+                    }
+                    Ok(Some(reduce_turn_resume_turn_snapshot(
+                        id,
+                        &turn_id,
+                        request.continuation.take().unwrap().snapshot,
+                    )))
+                })();
+                if matches!(result, Ok(None)) {
+                    // Revalidate after the snapshot quantum as well as after item pages.
+                    let mut registry = core
+                        .thread_registry
+                        .lock()
+                        .expect("thread registry poisoned");
+                    if !core.is_stopped()
+                        && let Some(store) = registry
+                            .stores
+                            .get_mut(id)
+                            .filter(|store| store.generation == generation)
+                    {
+                        if store.coordinator.resume.in_progress
+                            && store.coordinator.conversation.in_flight_turn_id()
+                                == Some(turn_id.as_str())
+                        {
+                            drop(registry);
+                            return Some(ThreadControllerRequest::ResumeJob(request));
+                        }
+                        retire_moved_resume(store);
+                        let drafts = registry.publish(id);
+                        core.transition_directory(
+                            &mut registry,
+                            &ClientMutationAuthority { _private: () },
+                            drafts,
+                            vec![],
+                        );
+                    }
+                    return None;
                 }
-                anyhow::ensure!(
-                    super::history_scheduler::fits_serialized(&snapshot, 8 * 1024 * 1024),
-                    "Resume snapshot capacity exceeded"
-                );
-                request.continuation = Some(ThreadResumeContinuation {
-                    snapshot,
-                    after: None,
-                });
-                return Ok(None);
-            }
-            let continuation = request.continuation.as_mut().unwrap();
-            let page = crate::transport::ws::command_sender::turn_items_page(
-                transport,
-                turn_resume_items_page_params(id.to_owned(), turn_id.clone(), continuation.after),
-            )?;
-            let page =
-                reduce_turn_resume_items_page(&continuation.snapshot, continuation.after, page)?;
-            {
-                let mut registry = self
+                let mut registry = core
                     .thread_registry
                     .lock()
                     .expect("thread registry poisoned");
-                let store = registry
-                    .stores
-                    .get_mut(id)
-                    .ok_or_else(|| anyhow::anyhow!("Resume cancelled"))?;
-                anyhow::ensure!(
-                    !self.is_stopped()
-                        && store.generation == generation
-                        && page.workspace_id == workspace
-                        && store.coordinator.conversation.in_flight_turn_id()
-                            == Some(turn_id.as_str()),
-                    "Resume cancelled"
-                );
-                for event in page.replay_events {
-                    store.coordinator.conversation.apply(event);
+                let Some(store) = registry.stores.get_mut(id) else {
+                    return None;
+                };
+                if core.is_stopped() || store.generation != generation {
+                    return None;
                 }
-                let drafts = registry.publish(id);
-                self.transition_directory(
-                    &mut registry,
-                    &ClientMutationAuthority { _private: () },
-                    drafts,
-                    vec![],
-                );
-            }
-            if let Some(next) = page.next_cursor {
-                continuation.after = Some(next);
-                return Ok(None);
-            }
-            Ok(Some(reduce_turn_resume_turn_snapshot(
-                id,
-                &turn_id,
-                request.continuation.take().unwrap().snapshot,
-            )))
-        })();
-        if matches!(result, Ok(None)) {
-            // Revalidate after the snapshot quantum as well as after item pages.
-            let mut registry = self
-                .thread_registry
-                .lock()
-                .expect("thread registry poisoned");
-            if !self.is_stopped()
-                && let Some(store) = registry
-                    .stores
-                    .get_mut(id)
-                    .filter(|store| store.generation == generation)
-            {
-                if store.coordinator.resume.in_progress
-                    && store.coordinator.conversation.in_flight_turn_id() == Some(turn_id.as_str())
-                {
-                    drop(registry);
-                    return Some(request);
+                if store.coordinator.conversation.in_flight_turn_id() != Some(turn_id.as_str()) {
+                    retire_moved_resume(store);
+                    let drafts = registry.publish(id);
+                    core.transition_directory(
+                        &mut registry,
+                        &ClientMutationAuthority { _private: () },
+                        drafts,
+                        vec![],
+                    );
+                    return None;
                 }
-                retire_moved_resume(store);
-                let drafts = registry.publish(id);
-                self.transition_directory(
-                    &mut registry,
-                    &ClientMutationAuthority { _private: () },
-                    drafts,
-                    vec![],
-                );
-            }
-            return None;
-        }
-        let mut registry = self
-            .thread_registry
-            .lock()
-            .expect("thread registry poisoned");
-        let Some(store) = registry.stores.get_mut(id) else {
-            return None;
-        };
-        if self.is_stopped() || store.generation != generation {
-            return None;
-        }
-        if store.coordinator.conversation.in_flight_turn_id() != Some(turn_id.as_str()) {
-            retire_moved_resume(store);
-            let drafts = registry.publish(id);
-            self.transition_directory(
-                &mut registry,
-                &ClientMutationAuthority { _private: () },
-                drafts,
-                vec![],
-            );
-            return None;
-        }
-        finish_turn_resume_attempt(&mut store.coordinator.resume);
-        match result {
-            Ok(Some(TurnResumeSnapshotReduction::Apply(reduction))) => {
-                for event in reduction.replay_events {
-                    store.coordinator.conversation.apply(event);
-                }
-                if let Some(event) = reduction.terminal_event {
-                    store.coordinator.conversation.apply(event);
-                    if reduction.tick_conversation_after_terminal_event {
-                        store.coordinator.conversation.tick();
+                finish_turn_resume_attempt(&mut store.coordinator.resume);
+                match result {
+                    Ok(Some(TurnResumeSnapshotReduction::Apply(reduction))) => {
+                        for event in reduction.replay_events {
+                            store.coordinator.conversation.apply(event);
+                        }
+                        if let Some(event) = reduction.terminal_event {
+                            store.coordinator.conversation.apply(event);
+                            if reduction.tick_conversation_after_terminal_event {
+                                store.coordinator.conversation.tick();
+                            }
+                        }
+                        if let Some(delay) = reduction.schedule_after {
+                            schedule_turn_resume_after_state(
+                                &mut store.coordinator.resume,
+                                delay,
+                                std::time::Instant::now(),
+                            );
+                        }
+                        if reduction.reset_thread_resume {
+                            reset_thread_resume_coordinator(&mut store.coordinator.resume);
+                        }
+                    }
+                    Ok(Some(TurnResumeSnapshotReduction::ScopeMismatch {
+                        retry_after, ..
+                    })) => {
+                        schedule_turn_resume_after_state(
+                            &mut store.coordinator.resume,
+                            retry_after,
+                            std::time::Instant::now(),
+                        );
+                    }
+                    Ok(None) => unreachable!(),
+                    Err(_) => {
+                        apply_turn_resume_retry(
+                            Some(&mut store.coordinator.resume),
+                            std::time::Instant::now(),
+                        );
                     }
                 }
-                if let Some(delay) = reduction.schedule_after {
-                    schedule_turn_resume_after_state(
-                        &mut store.coordinator.resume,
-                        delay,
-                        std::time::Instant::now(),
-                    );
-                }
-                if reduction.reset_thread_resume {
-                    reset_thread_resume_coordinator(&mut store.coordinator.resume);
-                }
-            }
-            Ok(Some(TurnResumeSnapshotReduction::ScopeMismatch { retry_after, .. })) => {
-                schedule_turn_resume_after_state(
-                    &mut store.coordinator.resume,
-                    retry_after,
-                    std::time::Instant::now(),
+                let drafts = registry.publish(id);
+                core.transition_directory(
+                    &mut registry,
+                    &ClientMutationAuthority { _private: () },
+                    drafts,
+                    vec![],
                 );
-            }
-            Ok(None) => unreachable!(),
-            Err(_) => {
-                apply_turn_resume_retry(
-                    Some(&mut store.coordinator.resume),
-                    std::time::Instant::now(),
-                );
-            }
-        }
-        let drafts = registry.publish(id);
-        self.transition_directory(
-            &mut registry,
-            &ClientMutationAuthority { _private: () },
-            drafts,
-            vec![],
-        );
-        None
+                None
+            }),
+        })
     }
 }
 
@@ -16695,12 +17245,14 @@ impl ClientCore {
         }
     }
 
-    pub(crate) fn execute_thread_cli_binding_request(
+    pub(crate) fn prepare_thread_cli_binding_request(
         &self,
-        id: &str,
-        workspace: &str,
+        id: String,
+        workspace: String,
         generation: u64,
-    ) {
+    ) -> Option<PreparedHistory> {
+        let id = id.as_str();
+        let workspace = workspace.as_str();
         let auth = self.current_auth_ticket();
         let revision = self.gateway_session().startup.transport_revision;
         if self
@@ -16708,47 +17260,59 @@ impl ClientCore {
             .is_none_or(|token| token.generation != generation)
             || self.is_stopped()
         {
-            return;
+            return None;
         }
-        let result = crate::transport::ws::command_sender::cli_runtime_thread_binding_get(
-            &self.transport_runtime().ws_command_sender(),
-            pioneer_protocol::CLIRuntimeThreadBindingGetParams {
-                workspace_id: workspace.into(),
-                thread_id: id.into(),
-            },
-        );
-        if self.current_auth_ticket() != auth
-            || self.gateway_session().startup.transport_revision != revision
-        {
-            return;
-        }
-        let mut registry = self
-            .thread_registry
-            .lock()
-            .expect("thread registry poisoned");
-        let Some(store) = registry
-            .stores
-            .get_mut(id)
-            .filter(|store| store.generation == generation)
-        else {
-            return;
+        let params = pioneer_protocol::CLIRuntimeThreadBindingGetParams {
+            workspace_id: workspace.into(),
+            thread_id: id.into(),
         };
-        if self.is_stopped() {
-            return;
-        }
-        store.cli_binding = result
-            .ok()
-            .and_then(|r| r.binding)
-            .filter(|binding| binding.thread_id == id && binding.workspace_id == workspace);
-        let drafts = registry.publish(id);
-        self.transition_directory(
-            &mut registry,
-            &ClientMutationAuthority { _private: () },
-            drafts,
-            vec![],
-        );
-        drop(registry);
-        self.observe_composer_runtime(id, None, false);
+        let id = id.to_owned();
+        let workspace = workspace.to_owned();
+        Some(PreparedHistory {
+            rpc: Some((
+                pioneer_protocol::constants::methods::CLI_RUNTIME_THREAD_BINDING_GET,
+                serde_json::to_value(params).expect("binding params"),
+            )),
+            apply: Box::new(move |core, response| {
+                let id = id.as_str();
+                let workspace = workspace.as_str();
+                let result: anyhow::Result<pioneer_protocol::CLIRuntimeThreadBindingGetResponse> =
+                    response.and_then(|v| Ok(serde_json::from_value(v)?));
+                if core.current_auth_ticket() != auth
+                    || core.gateway_session().startup.transport_revision != revision
+                {
+                    return None;
+                }
+                let mut registry = core
+                    .thread_registry
+                    .lock()
+                    .expect("thread registry poisoned");
+                let Some(store) = registry
+                    .stores
+                    .get_mut(id)
+                    .filter(|store| store.generation == generation)
+                else {
+                    return None;
+                };
+                if core.is_stopped() {
+                    return None;
+                }
+                store.cli_binding = result
+                    .ok()
+                    .and_then(|r| r.binding)
+                    .filter(|binding| binding.thread_id == id && binding.workspace_id == workspace);
+                let drafts = registry.publish(id);
+                core.transition_directory(
+                    &mut registry,
+                    &ClientMutationAuthority { _private: () },
+                    drafts,
+                    vec![],
+                );
+                drop(registry);
+                core.observe_composer_runtime(id, None, false);
+                None
+            }),
+        })
     }
 }
 
@@ -17458,6 +18022,10 @@ impl ClientCore {
             let retired = registry.evict_inactive();
             if !retired.is_empty() {
                 self.transition(authority, retired, vec![]);
+                // Registry -> scheduler is the selection lock order. This is
+                // only a coalesced wake; exact waiter cancellation runs in the
+                // controller after this domain guard has been released.
+                self.wake_thread_timeline_requests();
             }
         }
         transition

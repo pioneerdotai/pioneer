@@ -2318,12 +2318,28 @@ impl crate::core::ClientCore {
         false
     }
 
+    #[cfg(test)]
     pub(crate) fn execute_timeline_read(&self, request: TimelineReadRequest) {
+        if let Some(prepared) = self.prepare_timeline_read(request) {
+            let (method, params) = prepared.rpc.as_ref().expect("read RPC");
+            let result = crate::rpc::send_json_rpc_request_value(
+                &self.transport_runtime().ws_command_sender(),
+                method,
+                params.clone(),
+                crate::rpc::RPC_REQUEST_TIMEOUT,
+            );
+            (prepared.apply)(self, result);
+        }
+    }
+    pub(crate) fn prepare_timeline_read(
+        &self,
+        request: TimelineReadRequest,
+    ) -> Option<crate::threads::registry::PreparedHistory> {
         if self.is_stopped() {
-            return;
+            return None;
         }
         let Some(token) = self.thread_operation_token(&request.thread_id) else {
-            return;
+            return None;
         };
         let auth = self.current_auth_ticket();
         {
@@ -2334,7 +2350,7 @@ impl crate::core::ClientCore {
             if !registry.timeline.accepts_read(&request)
                 || !registry.timeline_operation_matches(&token)
             {
-                return;
+                return None;
             }
             // Another session can advance the confirmed cursor while this
             // request is queued or waiting for retry.
@@ -2346,54 +2362,66 @@ impl crate::core::ClientCore {
                 registry
                     .timeline
                     .finish_read(&request, true, self.timeline_now_ms());
-                return;
+                return None;
             }
         }
-        let result = self.read_thread_cursor(pioneer_protocol::ThreadReadParams {
+        let params = pioneer_protocol::ThreadReadParams {
             through_block: request.through_block.clone(),
             thread_id: request.thread_id.clone(),
             through_turn_id: request.through_turn_id.clone(),
-        });
-        let auth_is_current = self.current_auth_ticket() == auth;
-        let mut registry = self
-            .thread_registry
-            .lock()
-            .expect("thread registry poisoned");
-        if self.is_stopped() || !registry.timeline_operation_matches(&token) {
-            return;
-        }
-        if !auth_is_current {
-            registry
-                .timeline
-                .finish_read(&request, false, self.timeline_now_ms());
-            return;
-        }
-        if let Ok(response) = &result {
-            if response.thread_id != request.thread_id
-                || !registry.timeline_workspace_matches(&request.thread_id, &response.workspace_id)
-            {
-                registry.timeline.finish_read_with_retry(
-                    &request,
-                    false,
-                    false,
-                    self.timeline_now_ms(),
-                );
-                return;
-            }
-        }
-        registry
-            .timeline
-            .finish_read(&request, result.is_ok(), self.timeline_now_ms());
-        // read_thread_cursor already fences auth/thread lifetime. A successful
-        // server cursor stays authoritative even if the viewport has moved.
-        if let Ok(response) = result {
-            self.apply_directory_read_locked(
-                &mut registry,
-                &response.workspace_id,
-                &response.thread_id,
-                &response.cursor,
-                response.unread_count,
-            );
-        }
+        };
+        Some(crate::threads::registry::PreparedHistory {
+            rpc: Some((
+                pioneer_protocol::constants::methods::THREAD_READ,
+                serde_json::to_value(params).expect("read params"),
+            )),
+            apply: Box::new(move |core, response| {
+                let result: anyhow::Result<pioneer_protocol::ThreadReadResponse> =
+                    response.and_then(|v| Ok(serde_json::from_value(v)?));
+                let auth_is_current = core.current_auth_ticket() == auth;
+                let mut registry = core
+                    .thread_registry
+                    .lock()
+                    .expect("thread registry poisoned");
+                if core.is_stopped() || !registry.timeline_operation_matches(&token) {
+                    return None;
+                }
+                if !auth_is_current {
+                    registry
+                        .timeline
+                        .finish_read(&request, false, core.timeline_now_ms());
+                    return None;
+                }
+                if let Ok(response) = &result {
+                    if response.thread_id != request.thread_id
+                        || !registry
+                            .timeline_workspace_matches(&request.thread_id, &response.workspace_id)
+                    {
+                        registry.timeline.finish_read_with_retry(
+                            &request,
+                            false,
+                            false,
+                            core.timeline_now_ms(),
+                        );
+                        return None;
+                    }
+                }
+                registry
+                    .timeline
+                    .finish_read(&request, result.is_ok(), core.timeline_now_ms());
+                // Auth and store incarnation were checked above. A successful
+                // server cursor stays authoritative even if the viewport has moved.
+                if let Ok(response) = result {
+                    core.apply_directory_read_locked(
+                        &mut registry,
+                        &response.workspace_id,
+                        &response.thread_id,
+                        &response.cursor,
+                        response.unread_count,
+                    );
+                }
+                None
+            }),
+        })
     }
 }
