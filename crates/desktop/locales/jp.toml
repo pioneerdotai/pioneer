@@ -980,13 +980,6 @@ description = "ゲートウェイの実行中、アイドル状態によるシ�
 label = "テレメトリを送信"
 description = "診断データとパフォーマンスデータの収集を許可します。"
 
-[settings.general.preflight_model]
-label = "Preflight モデル"
-description = "ターン前の内部計画に使うプロバイダーとモデルを選択します。デフォルトは現在のスレッドのモデルを使います。"
-default = "デフォルト"
-select_model = "モデルを選択"
-dialog_title = "Preflight モデルを選択"
-
 [settings.voice_input]
 label = "音声入力"
 description = "音声メッセージにローカル文字起こしモデルを使用します。"
@@ -1041,10 +1034,6 @@ description = "Pioneer が永続メモリをどのように使うかを制御し
 [settings.memory.enabled]
 label = "メモリ"
 description = "役立つ場合に、保存済みの事実やプロジェクトの決定を Pioneer が使用できるようにします。"
-
-[settings.memory.active_recall]
-label = "能動的な呼び出し"
-description = "文脈の多いタスク向けに、読み取り専用の追加メモリ呼び出し計画を実行します。"
 
 [settings.memory.proactive_writes]
 label = "能動的な書き込み"

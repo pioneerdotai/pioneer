@@ -1,4 +1,3 @@
-pub(crate) mod preflight;
 mod provider;
 mod skill_tools;
 mod skills;
@@ -9,11 +8,6 @@ mod validator;
 
 pub(crate) use provider::classify_provider_failure_message;
 
-use self::preflight::{
-    TurnPreflightOrchestratorInput, TurnPreflightOrchestratorResult, TurnPreflightTurnInput,
-    build_turn_preflight_diagnostics_snapshot, run_turn_preflight_orchestrator,
-    trace_turn_preflight_diagnostics,
-};
 use self::tool_retry_lifecycle::{
     ToolRetryLifecycleTracker, emit_tool_loop_budget_exceeded, emit_tool_retry_drafts,
     turn_item_type_code,
@@ -25,7 +19,6 @@ use crate::hooks::{
     EffectiveTurnPromptManifestHookContributionKind, EffectiveTurnPromptManifestHookDiagnosticCode,
     EffectiveTurnPromptManifestHookMetadata, EffectiveTurnPromptManifestHookSource,
     EffectiveTurnPromptSectionSet, run_agent_turn_policy_hook_phase,
-    run_agent_turn_post_preflight_prompt_context_hook_phase,
     run_agent_turn_prompt_compile_hook_phase, run_agent_turn_prompt_context_hook_phase,
     run_agent_turn_tool_materialization_hook_phase, run_noop_agent_turn_hook_phase,
     tool_bundle_contributions_from_bundles,
@@ -45,16 +38,9 @@ use crate::{
 use chrono::Local;
 use futures_util::{StreamExt, stream};
 use pioneer_hooks::{
-    HookActorKind, HookPhase, HookRuntime, HookToolName, TurnPostPreflightPromptContextHookInput,
-    TurnPostTurnDomain, TurnPostTurnDomainEventSummary, TurnPostTurnToolEventSummary,
-    TurnPostTurnToolStatus, TurnPrePolicyHookInput, TurnPrePromptCompileHookInput,
-    TurnPrePromptContextHookInput,
-};
-use pioneer_memory::hooks::{
-    MemoryEpisodicRecallCapabilities, MemoryTurnContext, MemoryTurnPolicy,
-    active_recall_thread_episodic_summary,
-    build_active_recall_local_preflight_plan_with_thread_summary,
-    deterministic_recall_context_summary, memory_turn_policy_from_hook_policy_set,
+    HookPhase, HookRuntime, HookToolName, TurnPostTurnDomain, TurnPostTurnDomainEventSummary,
+    TurnPostTurnToolEventSummary, TurnPostTurnToolStatus, TurnPrePolicyHookInput,
+    TurnPrePromptCompileHookInput, TurnPrePromptContextHookInput,
 };
 use pioneer_promt::{
     CompiledInstructionDeliveryPlan, CompiledPromptBundle, ExecutionContinuationRuntimeFactsInput,
@@ -88,7 +74,7 @@ use pioneer_provider::{
     AttachmentDataSource, CanonicalProviderRoundEnvelope, ChatMessage, ChatRequest,
     CompiledPromptPayload, InputContentType, MessageAttachment, MessageContentPart,
     NativeFileToolCapability, NativePatchWireShape, Provider, ProviderCallIdentity,
-    ProviderRegistry, ProviderTimeoutPolicy, ProviderToolCall, ReasoningConfig, ToolDefinition,
+    ProviderTimeoutPolicy, ProviderToolCall, ReasoningConfig, ToolDefinition,
     infer_mime_from_reference,
 };
 use pioneer_skills::{
@@ -96,14 +82,14 @@ use pioneer_skills::{
     SkillResolvedReason,
 };
 use pioneer_tools::{
-    FilePolicyChecker, FilePolicyOperation, FinalToolVisibility, PermissionApprovalBroker,
-    PermissionEvaluationContext, PreflightToolIndex, REQUEST_TOOLS_TOOL_NAME, RawToolCall,
-    RequestToolsResult, ToolErrorClass, ToolEventPayload, ToolLoopBudgetExceeded,
-    ToolLoopBudgetReason, ToolLoopGuard, ToolLoopGuardDecision, ToolLoopRoundAction,
-    ToolNoProgressGuard, ToolNoProgressGuardConfig, ToolNoProgressPreflightDecision, ToolOutcome,
-    ToolRecoveryView, ToolResultEnvelope, ToolResultView, ToolRetryController, ToolRetryDecision,
-    ToolRetryObservation, build_builtin_tools_with_security_snapshot,
-    build_tools_with_environment_and_security_snapshot, classify_tool_error,
+    FilePolicyChecker, FilePolicyOperation, PermissionApprovalBroker, PermissionEvaluationContext,
+    REQUEST_TOOLS_TOOL_NAME, RawToolCall, RequestToolsResult, ToolErrorClass, ToolEventPayload,
+    ToolLoopBudgetExceeded, ToolLoopBudgetReason, ToolLoopGuard, ToolLoopGuardDecision,
+    ToolLoopRoundAction, ToolNoProgressGuard, ToolNoProgressGuardConfig,
+    ToolNoProgressPreflightDecision, ToolOutcome, ToolRecoveryView, ToolResultEnvelope,
+    ToolResultView, ToolRetryController, ToolRetryDecision, ToolRetryObservation,
+    build_builtin_tools_with_security_snapshot, build_tools_with_environment_and_security_snapshot,
+    classify_tool_error,
 };
 use serde_json::{Value as JsonValue, json};
 use sha2::{Digest, Sha256};
@@ -2108,7 +2094,7 @@ fn prompt_text_has_inline_artifact_refs(text: &str) -> bool {
 
 fn render_artifact_reference_policy_prompt() -> String {
     [
-        "Some prior messages or recalled thread snippets may include compact artifact references.",
+        "Some prior messages may include compact artifact references.",
         "Artifact references are metadata only; they do not contain the file, image, or binary content.",
         "If an artifact's content is needed to answer correctly, reveal the artifact tool domain when needed and call artifact_read with the referenced artifactId, and versionId when present.",
         "artifact_read may return text content for readable artifacts or an attachment for binary artifacts such as images, audio, video, PDFs, or other files.",
@@ -2143,141 +2129,6 @@ fn hook_tool_names_from_strings(names: &[String]) -> Vec<HookToolName> {
     names
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn run_agent_turn_preflight_stage(
-    event_tx: Arc<AgentEventHub>,
-    provider_registry: Arc<ProviderRegistry>,
-    provider: Arc<dyn Provider>,
-    model: &str,
-    provider_tool_calling: bool,
-    tool_loop_config: &ToolLoopConfig,
-    effective_policy_set: &EffectiveTurnPolicySet,
-    effective_prompt_context_set: &EffectiveTurnPromptContextSet,
-    tool_index: PreflightToolIndex,
-    workspace_id: &str,
-    thread_id: &str,
-    turn_id: &str,
-    hook_runtime_context: &AgentTurnHookRuntimeContext,
-    input_text: &str,
-) -> TurnPreflightOrchestratorResult {
-    let memory_config = tool_loop_config.memory.active_recall.normalized();
-    let hook_policy_set = effective_policy_set.clone_hook_policy_set();
-    let memory_policy = match memory_turn_policy_from_hook_policy_set(&hook_policy_set) {
-        Some(Ok(policy)) => policy,
-        Some(Err(error)) => {
-            warn!(
-                thread_id,
-                turn_id,
-                error = %error,
-                "preflight memory policy decode failed; using memory no-use policy"
-            );
-            MemoryTurnPolicy::no_use()
-        }
-        None => MemoryTurnPolicy::no_use(),
-    };
-    let hook_prompt_context_set = effective_prompt_context_set.clone_hook_prompt_context_set();
-    let deterministic_summary = deterministic_recall_context_summary(&hook_prompt_context_set);
-    let prompt_context_input = TurnPrePromptContextHookInput::from_parts(
-        input_text,
-        Some(model.to_owned()),
-        Some(provider.name().to_owned()),
-    );
-    let memory_context = MemoryTurnContext {
-        workspace_id: workspace_id.to_owned(),
-        thread_id: thread_id.to_owned(),
-        conversation_thread_id: hook_runtime_context.conversation_thread_id.clone(),
-        turn_id: turn_id.to_owned(),
-        mode: ThreadMode::Agent,
-        input_text: input_text.to_owned(),
-        task_id: hook_runtime_context.task_id.clone(),
-        agent_id: hook_runtime_context.agent_id.clone(),
-        principal_id: (hook_runtime_context.actor_kind == HookActorKind::User)
-            .then(|| hook_runtime_context.actor_id.clone())
-            .flatten(),
-    };
-    // The production Memory hook runtime has no episodic provider. Keep
-    // preflight aligned; conversation history remains available via Threads.
-    let episodic_capabilities = MemoryEpisodicRecallCapabilities::default();
-    let thread_episodic_summary = active_recall_thread_episodic_summary(
-        &hook_prompt_context_set,
-        &memory_context,
-        &episodic_capabilities,
-    );
-    let active_recall = build_active_recall_local_preflight_plan_with_thread_summary(
-        &memory_context,
-        &prompt_context_input,
-        &memory_policy,
-        &memory_config,
-        &deterministic_summary,
-        episodic_capabilities,
-        thread_episodic_summary,
-        true,
-    );
-    let input_text_char_count = input_text.chars().count();
-    let input_text_preview = active_recall.decision_context.input_text_preview.clone();
-    let turn = TurnPreflightTurnInput {
-        has_workspace_id: !workspace_id.trim().is_empty(),
-        has_thread_id: !thread_id.trim().is_empty(),
-        has_turn_id: !turn_id.trim().is_empty(),
-        thread_mode: ThreadMode::Agent,
-        provider_tool_calling,
-        input_text_preview,
-        input_text_char_count,
-    };
-
-    run_turn_preflight_orchestrator(TurnPreflightOrchestratorInput {
-        usage_context: Some(preflight::PreflightUsageContext {
-            events: event_tx,
-            workspace: workspace_id.into(),
-            thread: thread_id.into(),
-            turn: turn_id.into(),
-        }),
-        provider_registry,
-        workspace_id: workspace_id.to_owned(),
-        thread_provider: provider,
-        thread_provider_name: prompt_context_input
-            .model_provider
-            .clone()
-            .unwrap_or_default(),
-        thread_model: model.to_owned(),
-        preflight_provider_name: tool_loop_config.preflight.provider_name.clone(),
-        preflight_model: tool_loop_config.preflight.model.clone(),
-        turn,
-        tool_index,
-        deterministic_summary,
-        active_recall,
-        timeout_ms: tool_loop_config.preflight.timeout_ms,
-        max_output_chars: tool_loop_config.preflight.max_output_chars,
-    })
-    .await
-}
-
-fn trace_agent_turn_preflight(
-    thread_id: &str,
-    turn_id: &str,
-    preflight: &TurnPreflightOrchestratorResult,
-    final_visible_tools: &[String],
-) {
-    let snapshot = build_turn_preflight_diagnostics_snapshot(
-        &preflight.local_modules,
-        &preflight.plan,
-        final_visible_tools,
-    );
-    trace_turn_preflight_diagnostics(thread_id, turn_id, &snapshot);
-}
-
-fn compute_agent_turn_final_visible_tools(
-    router: &pioneer_tools::ToolRouter,
-    preflight: &TurnPreflightOrchestratorResult,
-    current_visible_tools: &[String],
-) -> FinalToolVisibility {
-    router.compute_final_visible_tools(
-        &preflight.local_modules.tools.input.core_tools,
-        &preflight.plan.tools.visible_tools,
-        current_visible_tools,
-    )
-}
-
 fn warn_final_visible_tool_diagnostics(
     thread_id: &str,
     turn_id: &str,
@@ -2296,27 +2147,10 @@ fn warn_final_visible_tool_diagnostics(
     }
 }
 
-fn preflight_active_recall_prompt_context_input(
-    input_text: &str,
-    model: &str,
-    provider_name: &str,
-    preflight: &TurnPreflightOrchestratorResult,
-) -> Option<TurnPostPreflightPromptContextHookInput> {
-    let plan = serde_json::to_value(&preflight.plan.memory.active_recall.decision).ok()?;
-    Some(
-        TurnPostPreflightPromptContextHookInput::from_parts(
-            input_text.to_owned(),
-            Some(model.to_owned()),
-            Some(provider_name.to_owned()),
-        )
-        .with_active_memory_recall_preflight_plan(plan),
-    )
-}
-
 fn native_threads_policy_available(
     skills: &skills::TurnSkillResolution,
     delivered_skills_prompt: Option<&str>,
-    tool_index: &PreflightToolIndex,
+    available_tool_names: &[String],
     visible_tools: &[String],
     permission_profile: &TurnPermissionProfileSnapshot,
 ) -> bool {
@@ -2336,11 +2170,11 @@ fn native_threads_policy_available(
     if !visible("read_skill") {
         return false;
     }
-    let has_operations = tool_index.candidate_tools.iter().any(|tool| {
-        tool.name != "threads_start_options"
-            && pioneer_tools::THREADS_DOMAIN_TOOL_NAMES.contains(&tool.name.as_str())
-            && permitted(&tool.name)
-            && (visible(&tool.name) || visible("request_tools"))
+    let has_operations = available_tool_names.iter().any(|name| {
+        name != "threads_start_options"
+            && pioneer_tools::THREADS_DOMAIN_TOOL_NAMES.contains(&name.as_str())
+            && permitted(name)
+            && (visible(name) || visible("request_tools"))
     });
     has_operations
         && skills.result.active.iter().any(|skill| {
@@ -2648,9 +2482,6 @@ fn prompt_manifest_hook_source(
 fn prompt_manifest_hook_phase(phase: HookPhase) -> Option<PromptManifestHookPhase> {
     match phase {
         HookPhase::TurnPrePromptContext => Some(PromptManifestHookPhase::TurnPrePromptContext),
-        HookPhase::TurnPostPreflightPromptContext => {
-            Some(PromptManifestHookPhase::TurnPostPreflightPromptContext)
-        }
         HookPhase::TurnPrePromptCompile => Some(PromptManifestHookPhase::TurnPrePromptCompile),
         HookPhase::RuntimeTurnPreContext => Some(PromptManifestHookPhase::RuntimeTurnPreContext),
         HookPhase::TurnPrePolicy
@@ -2667,9 +2498,6 @@ fn prompt_manifest_hook_contribution_kind(
     match kind {
         EffectiveTurnPromptManifestHookContributionKind::PromptContext => {
             PromptManifestHookContributionKind::PromptContext
-        }
-        EffectiveTurnPromptManifestHookContributionKind::ThreadContext => {
-            PromptManifestHookContributionKind::ThreadContext
         }
         EffectiveTurnPromptManifestHookContributionKind::PromptSection => {
             PromptManifestHookContributionKind::PromptSection
@@ -2767,7 +2595,6 @@ pub(super) async fn execute_chat_turn_flow(
     turn_id: String,
     workspace_id: String,
     mode: ThreadMode,
-    provider_registry: Arc<ProviderRegistry>,
     provider: Arc<dyn Provider>,
     model: String,
     hook_runtime_context: AgentTurnHookRuntimeContext,
@@ -2859,7 +2686,6 @@ pub(super) async fn execute_chat_turn_flow(
         ThreadMode::Agent => {
             execute_agent_provider_response(
                 context_session.as_deref(),
-                provider_registry,
                 &provider,
                 model,
                 hook_runtime_context,
@@ -3571,7 +3397,6 @@ async fn preload_agent_model(
 
 async fn execute_agent_provider_response(
     context_session: Option<&crate::compaction::controller::NativeContextSession>,
-    provider_registry: Arc<ProviderRegistry>,
     provider: &Arc<dyn Provider>,
     model: String,
     hook_runtime_context: AgentTurnHookRuntimeContext,
@@ -3661,7 +3486,7 @@ async fn execute_agent_provider_response(
         ChatTurnError::Terminal(error.safe_message().to_owned())
     })?;
 
-    let mut effective_prompt_context_set = run_agent_turn_prompt_context_hook_phase(
+    let effective_prompt_context_set = run_agent_turn_prompt_context_hook_phase(
         hook_runtime.as_ref(),
         &hook_context,
         &effective_policy_set,
@@ -3998,45 +3823,6 @@ async fn execute_agent_provider_response(
             ChatTurnError::Terminal("turn tool materialization hook failed".to_owned())
         })?;
 
-        let turn_preflight = run_agent_turn_preflight_stage(
-            event_tx.clone(),
-            provider_registry.clone(),
-            provider.clone(),
-            model.as_str(),
-            provider_tool_calling,
-            &tool_loop_config,
-            &effective_policy_set,
-            &effective_prompt_context_set,
-            PreflightToolIndex {
-                core_tools: Vec::new(),
-                candidate_tools: Vec::new(),
-            },
-            workspace_id,
-            thread_id,
-            turn_id,
-            &hook_runtime_context,
-            user_input_text.as_str(),
-        )
-        .await;
-
-        trace_agent_turn_preflight(thread_id, turn_id, &turn_preflight, &[]);
-
-        if let Some(active_recall_input) = preflight_active_recall_prompt_context_input(
-            user_input_text.as_str(),
-            model.as_str(),
-            provider.name(),
-            &turn_preflight,
-        ) {
-            effective_prompt_context_set = run_agent_turn_post_preflight_prompt_context_hook_phase(
-                hook_runtime.as_ref(),
-                &hook_context,
-                &effective_policy_set,
-                &effective_prompt_context_set,
-                active_recall_input,
-            )
-            .await;
-        }
-
         let effective_prompt_section_set = run_agent_turn_prompt_compile_hook_phase(
             hook_runtime.as_ref(),
             &hook_context,
@@ -4299,7 +4085,7 @@ async fn execute_agent_provider_response(
     .with_permission_approval_broker(permission_approval_broker);
 
     // One trusted provider capability decision owns native filesystem-tool
-    // visibility for this turn.  Apply it before preflight so the core index,
+    // visibility for this turn.  Apply it before tool visibility so the core tools,
     // request_tools catalog and final provider schema cannot diverge.
     tools
         .router
@@ -4351,35 +4137,14 @@ async fn execute_agent_provider_response(
         },
     };
 
-    let turn_preflight = run_agent_turn_preflight_stage(
-        event_tx.clone(),
-        provider_registry,
-        provider.clone(),
-        model.as_str(),
-        provider_tool_calling,
-        &tool_loop_config,
-        &effective_policy_set,
-        &effective_prompt_context_set,
-        router.preflight_tool_index(),
-        workspace_id,
-        thread_id,
-        turn_id,
-        &hook_runtime_context,
-        user_input_text.as_str(),
-    )
-    .await;
-
     let mut requested_tool_names = restored_requested_tool_names(
         execution_checkpoint_context.as_ref(),
         workspace_id,
         thread_id,
         turn_id,
     );
-    let initial_visibility = compute_agent_turn_final_visible_tools(
-        router.as_ref(),
-        &turn_preflight,
-        &requested_tool_names,
-    );
+    let initial_visibility =
+        router.compute_final_visible_tools(&router.core_tool_names(), &requested_tool_names);
     requested_tool_names.retain(|name| initial_visibility.visible_tools.contains(name));
 
     warn_final_visible_tool_diagnostics(
@@ -4434,7 +4199,7 @@ async fn execute_agent_provider_response(
     let include_threads_policy = native_threads_policy_available(
         &skills_resolution,
         skills_prompt.as_deref(),
-        &router.preflight_tool_index(),
+        &router.available_tool_names(),
         &initial_visibility.visible_tools,
         &permission_profile,
     );
@@ -4451,30 +4216,7 @@ async fn execute_agent_provider_response(
     )
     .await?;
 
-    trace_agent_turn_preflight(
-        thread_id,
-        turn_id,
-        &turn_preflight,
-        initial_visibility.visible_tools.as_slice(),
-    );
-
-    if let Some(active_recall_input) = preflight_active_recall_prompt_context_input(
-        user_input_text.as_str(),
-        model.as_str(),
-        provider.name(),
-        &turn_preflight,
-    ) {
-        effective_prompt_context_set = run_agent_turn_post_preflight_prompt_context_hook_phase(
-            hook_runtime.as_ref(),
-            &hook_context,
-            &effective_policy_set,
-            &effective_prompt_context_set,
-            active_recall_input,
-        )
-        .await;
-    }
-
-    let effective_prompt_section_set = run_agent_turn_prompt_compile_hook_phase(
+    let mut effective_prompt_section_set = run_agent_turn_prompt_compile_hook_phase(
         hook_runtime.as_ref(),
         &hook_context,
         &effective_policy_set,
@@ -4514,7 +4256,7 @@ async fn execute_agent_provider_response(
             &effective_prompt_context_set,
         ),
     )?;
-    let prompt_runtime_sections = append_native_filesystem_capability_section(
+    let mut prompt_runtime_sections = append_native_filesystem_capability_section(
         prompt_runtime_sections,
         &native_file_tool_capability,
         filesystem_prompt_snapshot.as_ref(),
@@ -4564,6 +4306,11 @@ async fn execute_agent_provider_response(
     .await?;
 
     let mut visible_tool_names = initial_visibility.visible_tools;
+    let mut compiled_memory_tool_names = visible_tool_names
+        .iter()
+        .filter(|name| pioneer_tools::MEMORY_DOMAIN_TOOL_NAMES.contains(&name.as_str()))
+        .cloned()
+        .collect::<BTreeSet<_>>();
 
     let pending_tool_ui = Arc::new(Mutex::new(HashMap::<String, PendingToolUiState>::new()));
 
@@ -4959,6 +4706,54 @@ async fn execute_agent_provider_response(
             } else {
                 None
             };
+
+            // Discovery changes schemas without running retrieval. Refresh the existing
+            // operating contract only when the actual memory inventory changes.
+            if let Some(definitions) = tool_definitions.as_ref() {
+                let memory_tool_names = definitions.iter()
+                    .filter(|tool| pioneer_tools::MEMORY_DOMAIN_TOOL_NAMES.contains(&tool.name.as_str()))
+                    .map(|tool| tool.name.clone()).collect::<BTreeSet<_>>();
+                if memory_tool_names != compiled_memory_tool_names {
+                    let tool_names = definitions.iter().map(|tool| tool.name.clone()).collect::<Vec<_>>();
+                    effective_prompt_section_set = run_agent_turn_prompt_compile_hook_phase(
+                        hook_runtime.as_ref(), &hook_context, &effective_policy_set,
+                        &effective_prompt_context_set, Vec::new(),
+                        TurnPrePromptCompileHookInput::from_parts(true, hook_tool_names_from_strings(&tool_names)),
+                    ).await.map_err(|error| (
+                        ChatTurnError::Terminal(format!("turn prompt section hook failed after memory tool visibility changed: {}", error.kind())),
+                        current_thinking_id.clone(),
+                    ))?;
+                    let sections = prompt_sections_for_compile_from_hook_sections(&effective_prompt_section_set)
+                        .map_err(|error| (error, current_thinking_id.clone()))?;
+                    let runtime_sections = runtime_sections_with_execution_continuation_context(
+                        sections.runtime_sections.as_slice(), execution_window_index,
+                        execution_checkpoint_context.as_ref(), prior_visible_assistant_text.as_deref(),
+                        turn_tool_materialization.initiating_thread_id.as_deref(),
+                    );
+                    let runtime_sections = runtime_sections_with_artifact_reference_policy(
+                        runtime_sections, include_artifact_reference_policy,
+                    ).map_err(|error| (error, current_thinking_id.clone()))?;
+                    prompt_runtime_sections = append_native_filesystem_capability_section(
+                        runtime_sections, &native_file_tool_capability, filesystem_prompt_snapshot.as_ref(),
+                    ).map_err(|error| (error, current_thinking_id.clone()))?;
+                    let refreshed_instruction_plan = compile_agent_instruction_delivery_plan_with_prompt_root(
+                        tool_loop_config.computer_use.runtime_home_dir.as_path(), skills_prompt.clone(),
+                        applied_retry_instruction.clone(), prompt_runtime_sections.as_slice(), &permission_profile,
+                        include_task_orchestration_policy, include_threads_policy, include_html_policy,
+                        true, router.find_spec("cua_get_window_state").is_some(), continue_generation_hint,
+                        turn_tool_materialization.initiating_thread_id.as_deref(), thread_id, turn_id,
+                    ).map_err(|error| (error, current_thinking_id.clone()))?;
+                    active_compiled_prompt = Some(compiled_prompt_payload_from_delivery_plan(&refreshed_instruction_plan));
+                    emit_durable_event(event_tx.as_ref(), AgentDurableEvent::PromptManifestCompiled {
+                        thread_id: thread_id.to_owned(), turn_id: turn_id.to_owned(),
+                        manifest: prompt_manifest_from_bundle(&refreshed_instruction_plan.bundle,
+                            &EffectiveTurnPromptManifestHookMetadata::combined(
+                                effective_prompt_context_set.manifest_metadata(), effective_prompt_section_set.manifest_metadata(),
+                            ), capability_diagnostics.as_slice()),
+                    }).await.map_err(|error| (error, current_thinking_id.clone()))?;
+                    compiled_memory_tool_names = memory_tool_names;
+                }
+            }
 
             let round_compiled_prompt = if round_plan.tools_enabled {
                 active_compiled_prompt.clone()
@@ -7492,18 +7287,10 @@ mod tests {
             built
                 .router
                 .set_native_patch_wire_shape(capability.patch_shape);
-            let visibility = built
-                .router
-                .compute_final_visible_tools(&file_tools, &[], &[]);
+            let visibility = built.router.compute_final_visible_tools(&file_tools, &[]);
             for name in &file_tools {
                 assert!(visibility.visible_tools.contains(name), "{alias}/{name}");
-                assert!(
-                    built
-                        .router
-                        .preflight_tool_index()
-                        .core_tools
-                        .contains(name)
-                );
+                assert!(built.router.core_tool_names().contains(name));
             }
             built
                 .router
@@ -7611,7 +7398,7 @@ mod tests {
                 .set_blocked_tool_names([("apply_patch".to_owned(), "policy denied".to_owned())]);
             let blocked = built
                 .router
-                .compute_final_visible_tools(&file_tools, &[], &file_tools);
+                .compute_final_visible_tools(&file_tools, &file_tools);
             assert!(blocked.visible_tools.contains(&"read_file".to_owned()));
             assert!(!blocked.visible_tools.contains(&"apply_patch".to_owned()));
             for missing in ["", "unknown", "unsupported"] {
@@ -7619,10 +7406,9 @@ mod tests {
                 built
                     .router
                     .set_blocked_tool_names(super::native_file_tool_blocked_names(&unavailable));
-                let blocked =
-                    built
-                        .router
-                        .compute_final_visible_tools(&file_tools, &[], &file_tools);
+                let blocked = built
+                    .router
+                    .compute_final_visible_tools(&file_tools, &file_tools);
                 assert!(blocked.visible_tools.is_empty());
                 let sections = append_native_filesystem_capability_section(
                     Vec::new(),
@@ -8018,9 +7804,9 @@ mod tests {
     #[test]
     fn window_one_runtime_sections_do_not_add_execution_continuation_context() {
         let base_sections = vec![PromptRuntimeSectionInput {
-            id: PromptRuntimeSectionId::BuiltIn(PromptRuntimeBuiltInSectionId::MemoryRecall),
+            id: PromptRuntimeSectionId::BuiltIn(PromptRuntimeBuiltInSectionId::AgentsMd),
             title: None,
-            content: "memory recall".to_owned(),
+            content: "workspace instructions".to_owned(),
             max_chars: None,
             truncated: false,
         }];
@@ -9019,9 +8805,7 @@ mod tests {
                 .set_blocked_tool_names([("memory_forget".to_owned(), "revoked".to_owned())]);
             let mut restored = restored;
             restored.push("removed_tool".to_owned());
-            let visible = built
-                .router
-                .compute_final_visible_tools(&[], &[], &restored);
+            let visible = built.router.compute_final_visible_tools(&[], &restored);
             assert!(
                 visible
                     .visible_tools
@@ -9112,9 +8896,7 @@ mod tests {
         );
         let core_tools = vec!["request_tools".to_owned(), "read_file".to_owned()];
 
-        let core_only = built
-            .router
-            .compute_final_visible_tools(&core_tools, &[], &[]);
+        let core_only = built.router.compute_final_visible_tools(&core_tools, &[]);
         assert!(
             !core_only
                 .visible_tools
@@ -9122,11 +8904,9 @@ mod tests {
             "CUA must not be visible by default"
         );
 
-        let selected = built.router.compute_final_visible_tools(
-            &core_tools,
-            &["cua_get_window_state".to_owned()],
-            &[],
-        );
+        let selected = built
+            .router
+            .compute_final_visible_tools(&core_tools, &["cua_get_window_state".to_owned()]);
         assert_eq!(
             selected
                 .visible_tools
@@ -9215,7 +8995,6 @@ mod tests {
                 "memory_get".to_owned(),
                 "memory_forget".to_owned(),
             ],
-            &[],
         );
 
         assert_eq!(
@@ -9244,10 +9023,10 @@ mod tests {
 
         let visibility = built.router.compute_final_visible_tools(
             &["request_tools".to_owned(), "read_file".to_owned()],
-            &["memory_search".to_owned()],
             &[
                 "artifact_prepare".to_owned(),
                 "artifact_register".to_owned(),
+                "memory_search".to_owned(),
             ],
         );
 
@@ -9297,10 +9076,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tool_visibility_matrix_canonical_turn_types_and_fallbacks() {
+    async fn tool_visibility_matrix_restored_optional_tools() {
         let lazy_domain_tools = all_lazy_domain_tool_names();
         let built = build_tools_with_extension_names(&lazy_domain_tools);
-        let core_tools = built.router.preflight_tool_index().core_tools;
+        let core_tools = built.router.core_tool_names();
 
         let mut cases = vec![
             (
@@ -9349,7 +9128,7 @@ mod tests {
             let selected = selected.into_iter().map(str::to_owned).collect::<Vec<_>>();
             let visibility = built
                 .router
-                .compute_final_visible_tools(&core_tools, &selected, &[]);
+                .compute_final_visible_tools(&core_tools, &selected);
 
             assert_eq!(
                 visibility.visible_tools,
@@ -9373,10 +9152,7 @@ mod tests {
             assert_eq!(provider_tool_names, visibility.visible_tools, "{label}");
         }
 
-        let provider_final_failure =
-            built
-                .router
-                .compute_final_visible_tools(&core_tools, &[], &[]);
+        let provider_final_failure = built.router.compute_final_visible_tools(&core_tools, &[]);
         assert_eq!(provider_final_failure.visible_tools, core_tools);
         assert_lazy_domain_tools_hidden_except(&provider_final_failure.visible_tools, &[]);
         assert!(
@@ -9397,12 +9173,9 @@ mod tests {
             "mcp.workspace.read",
         ]);
         let built = build_tools_with_extension_names(&extension_names);
-        let core_tools = built.router.preflight_tool_index().core_tools;
+        let core_tools = built.router.core_tool_names();
 
-        let hidden_file_editing_task =
-            built
-                .router
-                .compute_final_visible_tools(&core_tools, &[], &[]);
+        let hidden_file_editing_task = built.router.compute_final_visible_tools(&core_tools, &[]);
         for dynamic in [
             "skill.file_editor",
             "skill.subtask_planner",
@@ -9413,7 +9186,7 @@ mod tests {
                 hidden_file_editing_task
                     .visible_tools
                     .contains(&dynamic.to_owned()),
-                "materialized dynamic tool `{dynamic}` must not depend on preflight"
+                "materialized dynamic tool `{dynamic}` must be initially visible"
             );
         }
         assert_lazy_domain_tools_hidden_except(&hidden_file_editing_task.visible_tools, &[]);
@@ -9422,7 +9195,6 @@ mod tests {
         let hidden_subtask_creating_task = built.router.compute_final_visible_tools(
             &core_tools,
             &["task_create".to_owned(), "task_wait".to_owned()],
-            &[],
         );
         assert!(
             hidden_subtask_creating_task
@@ -9443,7 +9215,6 @@ mod tests {
 
         let phase03_expanded_artifacts = built.router.compute_final_visible_tools(
             &core_tools,
-            &[],
             &[
                 "artifact_prepare".to_owned(),
                 "artifact_register".to_owned(),
@@ -9474,10 +9245,8 @@ mod tests {
             .map(heavy_hidden_domain_tool)
             .collect::<Vec<_>>();
         let built = build_tools_with_extension_specs(heavy_specs);
-        let core_tools = built.router.preflight_tool_index().core_tools;
-        let visibility = built
-            .router
-            .compute_final_visible_tools(&core_tools, &[], &[]);
+        let core_tools = built.router.core_tool_names();
+        let visibility = built.router.compute_final_visible_tools(&core_tools, &[]);
         built
             .router
             .set_model_visible_tools(&visibility.visible_tools)
@@ -9513,11 +9282,9 @@ mod tests {
         heavy_specs.push(heavy_hidden_domain_tool("skill.report_builder"));
         heavy_specs.push(heavy_hidden_domain_tool("mcp.filesystem.read"));
         let built = build_tools_with_extension_specs(heavy_specs);
-        let core_tools = built.router.preflight_tool_index().core_tools;
+        let core_tools = built.router.core_tool_names();
 
-        let core_visibility = built
-            .router
-            .compute_final_visible_tools(&core_tools, &[], &[]);
+        let core_visibility = built.router.compute_final_visible_tools(&core_tools, &[]);
         built
             .router
             .set_model_visible_tools(&core_visibility.visible_tools)
@@ -9538,7 +9305,6 @@ mod tests {
                 "artifact_prepare".to_owned(),
                 "artifact_register".to_owned(),
             ],
-            &[],
         );
         built
             .router
@@ -9555,7 +9321,6 @@ mod tests {
 
         let phase03_expanded = built.router.compute_final_visible_tools(
             &core_tools,
-            &[],
             &["task_create".to_owned(), "task_wait".to_owned()],
         );
         built

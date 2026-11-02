@@ -6511,7 +6511,6 @@ mod tests {
     fn test_tool_loop_config() -> ToolLoopConfig {
         ToolLoopConfig {
             provider: pioneer_provider::ProviderTimeoutPolicy::default(),
-            preflight: pioneer_agent::PreflightLoopConfig::default(),
             web: WebToolsConfig {
                 default_timeout_ms: 20_000,
                 hard_max_timeout_ms: 120_000,
@@ -6579,13 +6578,7 @@ mod tests {
                     allow_function_proxy_tools: true,
                 },
             },
-            memory: pioneer_memory::hooks::MemoryLoopConfig {
-                active_recall: pioneer_memory::hooks::MemoryActiveRecallConfig {
-                    mode: pioneer_memory::hooks::MemoryActiveRecallMode::DeterministicOnly,
-                    ..pioneer_memory::hooks::MemoryActiveRecallConfig::default()
-                },
-                ..pioneer_memory::hooks::MemoryLoopConfig::default()
-            },
+            memory: pioneer_memory::hooks::MemoryLoopConfig::default(),
             budget: ToolLoopBudgetConfig::default(),
             execution_windows: ExecutionWindowsConfig::default(),
             retry: ToolRetryBudgetConfig::default(),

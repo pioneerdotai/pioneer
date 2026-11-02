@@ -24,26 +24,8 @@ struct RankedMemorySearchHit {
     importance: f32,
     confidence: f32,
     recency_anchor_unix: i64,
-    quality_penalty_applied: bool,
-    low_source_context_penalty_applied: bool,
-    rejected_related_penalty_applied: bool,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct MemoryRankingDiagnostics {
-    pub exact_key_boost_count: usize,
-    pub quality_penalty_applied_count: usize,
-    pub low_source_context_penalty_count: usize,
-    pub rejected_related_penalty_count: usize,
-}
-
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct MemoryRankingResult {
-    pub hits: Vec<MemorySearchHit>,
-    pub diagnostics: MemoryRankingDiagnostics,
-}
-
-#[cfg(test)]
 pub fn rank_memory_search_hits(
     candidates: Vec<MemoryRankingCandidate>,
     query: &str,
@@ -53,27 +35,6 @@ pub fn rank_memory_search_hits(
     now_unix: i64,
     limit: u32,
 ) -> Vec<MemorySearchHit> {
-    rank_memory_search_hits_with_diagnostics(
-        candidates,
-        query,
-        requested_categories,
-        active_scopes,
-        config,
-        now_unix,
-        limit,
-    )
-    .hits
-}
-
-pub fn rank_memory_search_hits_with_diagnostics(
-    candidates: Vec<MemoryRankingCandidate>,
-    query: &str,
-    requested_categories: &[MemoryCategory],
-    active_scopes: &MemoryActiveScopes,
-    config: &MemoryRankingConfig,
-    now_unix: i64,
-    limit: u32,
-) -> MemoryRankingResult {
     let normalized_query = normalize_memory_query(query);
     let mut ranked = candidates
         .into_iter()
@@ -92,17 +53,14 @@ pub fn rank_memory_search_hits_with_diagnostics(
     ranked.sort_by(compare_ranked_hits);
     ranked.truncate(limit as usize);
 
-    let diagnostics = ranking_diagnostics(&ranked);
-    let hits = ranked
+    ranked
         .into_iter()
         .map(|ranked| {
             let mut hit = ranked.hit;
             hit.score = Some(ranked.final_score);
             hit
         })
-        .collect();
-
-    MemoryRankingResult { hits, diagnostics }
+        .collect()
 }
 
 fn rank_candidate(
@@ -166,18 +124,12 @@ fn rank_candidate(
         importance,
         confidence,
         recency_anchor_unix: candidate.recency_anchor_unix,
-        quality_penalty_applied: quality_adjustment.penalty_applied,
-        low_source_context_penalty_applied: quality_adjustment.low_source_context_penalty_applied,
-        rejected_related_penalty_applied: quality_adjustment.rejected_related_penalty_applied,
     }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 struct QualityAdjustment {
     score_delta: f32,
-    penalty_applied: bool,
-    low_source_context_penalty_applied: bool,
-    rejected_related_penalty_applied: bool,
 }
 
 fn quality_adjustment(
@@ -204,19 +156,14 @@ fn quality_adjustment(
     if quality.is_low_quality_source_context() {
         let penalty = config.low_evidence_source_penalty.max(0.0);
         adjustment.score_delta -= penalty;
-        adjustment.penalty_applied |= penalty > 0.0;
-        adjustment.low_source_context_penalty_applied |= penalty > 0.0;
     }
     if has_typed_quality && is_assistant_or_generated_source(quality.source_context_kind) {
         let penalty = config.assistant_or_generated_source_penalty.max(0.0);
         adjustment.score_delta -= penalty;
-        adjustment.penalty_applied |= penalty > 0.0;
     }
     if quality.is_rejected_related() {
         let penalty = config.rejected_related_penalty.max(0.0);
         adjustment.score_delta -= penalty;
-        adjustment.penalty_applied |= penalty > 0.0;
-        adjustment.rejected_related_penalty_applied |= penalty > 0.0;
     }
     if has_typed_quality
         && (quality.fact_class == MemoryFactClass::Unknown
@@ -227,7 +174,6 @@ fn quality_adjustment(
     {
         let penalty = config.ownership_ambiguity_penalty.max(0.0);
         adjustment.score_delta -= penalty;
-        adjustment.penalty_applied |= penalty > 0.0;
     }
 
     adjustment
@@ -238,24 +184,6 @@ fn has_typed_quality(quality: &MemoryRecallQualitySignals) -> bool {
         || !quality.quality_reason_codes.is_empty()
         || quality.fact_class != MemoryFactClass::Unknown
         || quality.ownership_class != MemoryOwnershipClass::AuditOnly
-}
-
-fn ranking_diagnostics(ranked: &[RankedMemorySearchHit]) -> MemoryRankingDiagnostics {
-    MemoryRankingDiagnostics {
-        exact_key_boost_count: ranked.iter().filter(|hit| hit.exact_key_match).count(),
-        quality_penalty_applied_count: ranked
-            .iter()
-            .filter(|hit| hit.quality_penalty_applied)
-            .count(),
-        low_source_context_penalty_count: ranked
-            .iter()
-            .filter(|hit| hit.low_source_context_penalty_applied)
-            .count(),
-        rejected_related_penalty_count: ranked
-            .iter()
-            .filter(|hit| hit.rejected_related_penalty_applied)
-            .count(),
-    }
 }
 
 fn is_direct_user_source(quality: &MemoryRecallQualitySignals) -> bool {
@@ -498,7 +426,7 @@ mod tests {
 
     #[test]
     fn ranking_quality_source_beats_low_quality_source_with_similar_backend_score() {
-        let result = rank_memory_search_hits_with_diagnostics(
+        let result = rank_memory_search_hits(
             vec![
                 MemoryRankingCandidate {
                     hit: record("low", None, MemoryCategory::Identity, 10),
@@ -521,8 +449,7 @@ mod tests {
             10,
         );
 
-        assert_eq!(result.hits[0].record.id, "high");
-        assert_eq!(result.diagnostics.quality_penalty_applied_count, 1);
+        assert_eq!(result[0].record.id, "high");
     }
 
     #[test]
@@ -555,7 +482,7 @@ mod tests {
 
     #[test]
     fn ranking_soft_penalties_do_not_suppress_records() {
-        let result = rank_memory_search_hits_with_diagnostics(
+        let result = rank_memory_search_hits(
             vec![MemoryRankingCandidate {
                 hit: record("low", None, MemoryCategory::Identity, 10),
                 backend_score: Some(0.5),
@@ -570,8 +497,7 @@ mod tests {
             10,
         );
 
-        assert_eq!(result.hits.len(), 1);
-        assert_eq!(result.diagnostics.quality_penalty_applied_count, 1);
+        assert_eq!(result.len(), 1);
     }
 
     #[test]

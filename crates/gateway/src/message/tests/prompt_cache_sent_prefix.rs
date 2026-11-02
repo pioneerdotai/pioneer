@@ -84,7 +84,7 @@ impl pioneer_agent::TurnToolProvider for TurnTools {
     }
 }
 
-// Only preflight planning and stream selection are fixture-owned. Main
+// Only stream selection is fixture-owned. Main
 // preparation, parsing, native replay, and HTTP serialization are real adapters.
 struct LoopProvider {
     inner: Arc<dyn Provider>,
@@ -114,9 +114,6 @@ impl Provider for LoopProvider {
         self.inner.prepare_input_budget(request).await
     }
     async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
-        if is_turn_preflight_request(&request) {
-            return Ok(test_turn_preflight_response_with_visible_tools(&NAMES));
-        }
         self.requests.lock().unwrap().push(request.clone());
         self.inner.chat(request).await
     }

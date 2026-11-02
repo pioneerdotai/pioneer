@@ -161,13 +161,6 @@ description = "Prevents idle sleep while the gateway is running. Closing a lapto
 label = "Send telemetry"
 description = "Allow diagnostic and performance data to be collected."
 
-[settings.general.preflight_model]
-label = "Preflight model"
-description = "Choose the provider and model for internal pre-turn planning. Default uses the current thread model."
-default = "Default"
-select_model = "Select model"
-dialog_title = "Select Preflight Model"
-
 [settings.voice_input]
 transcribe_while_recording = "Transcribe while recording"
 transcribe_while_recording_description = "When off, transcription starts after recording ends."
@@ -224,10 +217,6 @@ description = "Control how Pioneer uses durable memory."
 [settings.memory.enabled]
 label = "Memory"
 description = "Allow Pioneer to use saved facts and project decisions when useful."
-
-[settings.memory.active_recall]
-label = "Active recall"
-description = "Run extra read-only recall planning for context-heavy turns."
 
 [settings.memory.proactive_writes]
 label = "Proactive writes"

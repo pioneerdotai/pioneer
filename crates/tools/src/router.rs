@@ -15,7 +15,7 @@ use crate::spec::{
     ConfiguredToolSpec, ExecutionClass, PayloadKind, REQUEST_TOOLS_TOOL_NAME, ToolIdempotencyMode,
     ToolPayloadBinding, ToolPermissionMetadata, ToolRecoveryMetadata, ToolSpec,
 };
-use crate::tool_index::{PreflightToolIndex, build_preflight_tool_index};
+use crate::tool_index::CORE_TOOL_NAMES;
 use crate::visibility::{
     FinalToolVisibility, FinalToolVisibilityInput, ToolVisibilitySnapshot,
     compute_final_tool_visibility, materialized_dynamic_extension_tool_names,
@@ -204,12 +204,22 @@ impl ToolRouter {
         self.visibility.all_specs().to_vec()
     }
 
-    pub fn preflight_tool_index(&self) -> PreflightToolIndex {
-        let blocked_tool_names = self.blocked_tool_names_snapshot();
-        build_preflight_tool_index(self.specs.values().filter(|configured| {
-            self.has_handler(configured.spec.name.as_str())
-                && !blocked_tool_names.contains_key(configured.spec.name.as_str())
-        }))
+    pub fn available_tool_names(&self) -> Vec<String> {
+        let blocked = self.blocked_tool_names_snapshot();
+        self.specs
+            .keys()
+            .filter(|name| self.has_handler(name) && !blocked.contains_key(*name))
+            .cloned()
+            .collect()
+    }
+
+    pub fn core_tool_names(&self) -> Vec<String> {
+        let available = self.available_tool_names();
+        CORE_TOOL_NAMES
+            .iter()
+            .filter(|name| available.iter().any(|value| value == **name))
+            .map(|name| (*name).to_owned())
+            .collect()
     }
 
     pub async fn model_visible_specs(&self) -> Vec<ToolSpec> {
@@ -227,7 +237,6 @@ impl ToolRouter {
     pub fn compute_final_visible_tools(
         &self,
         core_tools: &[String],
-        preflight_visible_tools: &[String],
         current_visible_tools: &[String],
     ) -> FinalToolVisibility {
         let all_tool_names = self
@@ -247,7 +256,6 @@ impl ToolRouter {
         compute_final_tool_visibility(FinalToolVisibilityInput {
             core_tools: core_tools.to_vec(),
             current_visible_tools: current_visible_tools.to_vec(),
-            preflight_visible_tools: preflight_visible_tools.to_vec(),
             dynamic_tool_names,
             registered_tool_names: all_tool_names,
             available_tool_names,
@@ -779,10 +787,8 @@ mod tests {
             ExecutionClass::Shared,
         )]);
 
-        let index = router.preflight_tool_index();
-
-        assert!(index.core_tools.is_empty());
-        assert!(index.candidate_tools.is_empty());
+        assert!(router.core_tool_names().is_empty());
+        assert!(router.available_tool_names().is_empty());
     }
 
     #[test]

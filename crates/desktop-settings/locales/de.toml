@@ -161,13 +161,6 @@ description = "Verhindert, dass der Computer bei Inaktivität in den Ruhezustand
 label = "Telemetrie senden"
 description = "Erfassung von Diagnose- und Leistungsdaten erlauben."
 
-[settings.general.preflight_model]
-label = "Preflight-Modell"
-description = "Wähle Anbieter und Modell für die interne Planung vor einem Zug. Standard verwendet das Modell des aktuellen Threads."
-default = "Standard"
-select_model = "Modell auswählen"
-dialog_title = "Preflight-Modell auswählen"
-
 [settings.voice_input]
 transcribe_while_recording = "Während der Aufnahme transkribieren"
 transcribe_while_recording_description = "Wenn deaktiviert, beginnt die Transkription nach Ende der Aufnahme."
@@ -224,10 +217,6 @@ description = "Steuere, wie Pioneer dauerhaften Speicher verwendet."
 [settings.memory.enabled]
 label = "Speicher"
 description = "Pioneer darf gespeicherte Fakten und Projektentscheidungen verwenden, wenn es hilfreich ist."
-
-[settings.memory.active_recall]
-label = "Aktiver Abruf"
-description = "Zusätzliche schreibgeschützte Abrufplanung für kontextreiche Aufgaben ausführen."
 
 [settings.memory.proactive_writes]
 label = "Proaktives Speichern"

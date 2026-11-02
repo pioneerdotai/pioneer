@@ -10,13 +10,12 @@ use pioneer_memory::hooks::{
     AgentMemoryPostTurnExtractorProvider, AgentMemoryProvider, AgentMemoryWriteProvider,
     MemoryManifest, MemoryManifestActiveItem, MemoryManifestCandidateItem, MemoryManifestRequest,
     MemoryPostTurnExtractorContext, MemoryPostTurnExtractorRequest,
-    MemoryPostTurnResponseFormatError, MemoryRecallItem as AgentMemoryRecallItem,
-    MemoryRecallRequest, MemoryRecallSnapshot, MemoryToolMaterialization, MemoryTurnContext,
+    MemoryPostTurnResponseFormatError, MemoryToolMaterialization, MemoryTurnContext,
     validate_memory_post_turn_response_format,
 };
 use pioneer_memory::{
     MemoryManifestFailure, MemoryManifestFailureClass, MemoryManifestFailureStage,
-    MemoryModeRecallParams, MemoryOperationContext, MemoryRecallParams,
+    MemoryOperationContext,
 };
 use pioneer_protocol::{
     MemoryActor, MemoryActorKind, MemoryCandidateStatus, MemoryCandidatesListParams,
@@ -394,77 +393,6 @@ async fn authorize_post_turn_memory_upsert_execution(
 
 #[async_trait]
 impl AgentMemoryProvider for GatewayMemoryProvider {
-    async fn recall_memory(
-        &self,
-        context: MemoryTurnContext,
-        request: MemoryRecallRequest,
-    ) -> Result<MemoryRecallSnapshot, String> {
-        let processor = self.processor()?;
-        if !processor.memory_loop_config().deterministic_recall_enabled {
-            return Ok(MemoryRecallSnapshot {
-                items: Vec::new(),
-                diagnostics: vec![
-                    "memory deterministic recall disabled by runtime settings".into(),
-                ],
-                truncated: false,
-            });
-        }
-        let runtime = processor.memory_runtime();
-        if let Err(error) = runtime.ensure_enabled() {
-            return Ok(MemoryRecallSnapshot {
-                items: Vec::new(),
-                diagnostics: vec![format!("memory runtime unavailable: {error:#}")],
-                truncated: false,
-            });
-        }
-        let boundary = authorize_memory_execution(
-            processor.as_ref(),
-            context.workspace_id.as_str(),
-            context.thread_id.as_str(),
-            context.turn_id.as_str(),
-            context.principal_id.as_deref(),
-            MemoryExecutionAccess::Read,
-        )
-        .await?;
-
-        let response = runtime
-            .service()
-            .recall_for_prompt(
-                runtime.operation_context_for_authorized_turn(
-                    &context,
-                    None,
-                    boundary.scoped_collaboration,
-                ),
-                MemoryRecallParams {
-                    query: request.query,
-                    scopes: Vec::new(),
-                    categories: request.categories,
-                    top_k: request.top_k,
-                    max_chars: request.max_chars,
-                },
-            )
-            .await
-            .map_err(|error| format!("{error:#}"))?;
-
-        Ok(MemoryRecallSnapshot {
-            items: response
-                .items
-                .into_iter()
-                .map(|item| AgentMemoryRecallItem {
-                    memory_id: item.memory_id,
-                    scope: item.scope,
-                    category: item.category,
-                    key: item.key,
-                    content: item.content,
-                    score: item.score,
-                    updated_at: item.updated_at,
-                })
-                .collect(),
-            diagnostics: response.diagnostics,
-            truncated: false,
-        })
-    }
-
     async fn materialize_memory_tools(
         &self,
         context: MemoryTurnContext,
@@ -546,69 +474,6 @@ impl AgentMemoryProvider for GatewayMemoryProvider {
                 .into_iter()
                 .collect(),
             diagnostics: Vec::new(),
-        })
-    }
-
-    async fn recall_memory_mode(
-        &self,
-        context: MemoryTurnContext,
-        request: MemoryModeRecallParams,
-    ) -> Result<MemoryRecallSnapshot, String> {
-        let processor = self.processor()?;
-        let runtime = processor.memory_runtime();
-        if let Err(error) = runtime.ensure_enabled() {
-            return Ok(MemoryRecallSnapshot {
-                items: Vec::new(),
-                diagnostics: vec![format!("memory runtime unavailable: {error:#}")],
-                truncated: false,
-            });
-        }
-        let boundary = authorize_memory_execution(
-            processor.as_ref(),
-            context.workspace_id.as_str(),
-            context.thread_id.as_str(),
-            context.turn_id.as_str(),
-            context.principal_id.as_deref(),
-            MemoryExecutionAccess::Read,
-        )
-        .await?;
-
-        let response = runtime
-            .service()
-            .recall_mode_for_prompt(
-                runtime.operation_context_for_authorized_turn(
-                    &context,
-                    None,
-                    boundary.scoped_collaboration,
-                ),
-                request,
-            )
-            .await
-            .map_err(|error| format!("{error:#}"))?;
-
-        let mut diagnostics = response.diagnostics;
-        if let Some(skipped_reason) = response.skipped_reason {
-            diagnostics.push(format!(
-                "memory.active_recall.mode_skipped:{skipped_reason}"
-            ));
-        }
-
-        Ok(MemoryRecallSnapshot {
-            items: response
-                .items
-                .into_iter()
-                .map(|item| AgentMemoryRecallItem {
-                    memory_id: item.memory_id,
-                    scope: item.scope,
-                    category: item.category,
-                    key: item.key,
-                    content: item.content,
-                    score: item.score,
-                    updated_at: item.updated_at,
-                })
-                .collect(),
-            diagnostics,
-            truncated: response.truncated,
         })
     }
 }

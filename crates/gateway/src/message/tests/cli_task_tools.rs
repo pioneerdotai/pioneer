@@ -3880,8 +3880,8 @@ impl pioneer_memory::ThreadEpisodicMemvidBackend for RecordingRecallSearchBacken
 }
 
 #[test]
-fn admitted_cli_production_recall_uses_active_memory_and_keeps_explicit_history_search() {
-    run_standard_stack_message_test("active memory and explicit history search", async {
+fn admitted_cli_prompt_context_does_not_recall_and_keeps_explicit_history_search() {
+    run_standard_stack_message_test("no automatic recall and explicit history search", async {
         use crate::thread_episodic::ThreadEpisodicRecallService;
         use pioneer_crud::ThreadEpisodicWorkspaceActiveWriteSegmentRequest;
         use pioneer_hooks::*;
@@ -3956,9 +3956,6 @@ fn admitted_cli_production_recall_uses_active_memory_and_keeps_explicit_history_
         );
         assert!(backend.calls.load(Ordering::SeqCst) > 0);
         let search_calls = backend.calls.load(Ordering::SeqCst);
-        let mut memory_config = processor.memory_loop_config();
-        memory_config.active_recall.mode = pioneer_memory::hooks::MemoryActiveRecallMode::Hybrid;
-        processor.apply_memory_loop_config(memory_config);
         let mut config = processor
             .thread_episodic_runtime_config
             .read()
@@ -3978,7 +3975,7 @@ fn admitted_cli_production_recall_uses_active_memory_and_keeps_explicit_history_
             ("post_turn_extraction", "allow"),
             ("active_memory", "allow"),
             ("reason_code", "default_allow_read"),
-            ("source", "pre_memory_classifier"),
+            ("source", "default_fallback"),
         ] {
             policy.insert(
                 HookMetadataKey::new(key).unwrap(),
@@ -4004,25 +4001,32 @@ fn admitted_cli_production_recall_uses_active_memory_and_keeps_explicit_history_
             priority: 500,
             diagnostics: Vec::new(),
         }]);
+        let decoded_policy =
+            pioneer_memory::hooks::memory_turn_policy_from_hook_policy_set(&policies)
+                .expect("memory policy must exist")
+                .expect("the allow policy must decode before testing absence of recall");
+        assert_eq!(
+            decoded_policy.source,
+            pioneer_memory::hooks::MemoryPolicySource::DefaultFallback
+        );
+        assert_eq!(
+            decoded_policy.read_tools,
+            pioneer_memory::hooks::MemoryReadToolPolicy::Allow
+        );
+        assert_eq!(
+            decoded_policy.recall,
+            pioneer_memory::hooks::MemoryRecallPolicy::Allow
+        );
+        assert_eq!(
+            decoded_policy.prompt,
+            pioneer_memory::hooks::MemoryPromptPolicy::Full
+        );
         let hook_context = HookContext {
             workspace_id: Some(HookWorkspaceId::new(binding.workspace_id.clone()).unwrap()),
             thread_id: Some(HookThreadId::new(binding.thread_id.clone()).unwrap()),
             turn_id: Some(HookTurnId::new(turn_id.clone()).unwrap()),
             ..HookContext::default()
         };
-        let mixed_plan = json!({
-            "durable":{"status":"run","reasonCode":"provider_run","confidence":1.0,
-                "modes":["project"],"targets":[]},
-            "episodic":{"status":"run","reasonCode":"provider_run","confidence":1.0,
-                "queries":[{"mode":"current_thread","query":"searchneedle","targets":[]},
-                    {"mode":"related_thread","query":"searchneedle","targets":[]},
-                    {"mode":"workspace_thread","query":"searchneedle","targets":[]}]}
-        });
-        let stale_plan = json!({
-            "durable":{"status":"run","reasonCode":"provider_run","confidence":1.0,
-                "modes":["project","thread_episodic","workspace_thread","task_context"],"targets":[]},
-            "episodic":{"status":"skip","reasonCode":"provider_skip","confidence":1.0,"queries":[]}
-        });
         // Include the current conversation in the indexed corpus as well.
         crate::message::thread_search_tools::tests::seed(
             &processor,
@@ -4092,7 +4096,7 @@ fn admitted_cli_production_recall_uses_active_memory_and_keeps_explicit_history_
                     current.ensure_hook_runtime_with_run_store().await;
                 }
                 let runtime = current.hook_runtime.read().await.clone().unwrap();
-                let deterministic = runtime
+                let response = runtime
                     .run_phase_to_completion(
                         HookPhaseRequest::new(
                             HookPhase::TurnPrePromptContext,
@@ -4109,91 +4113,20 @@ fn admitted_cli_production_recall_uses_active_memory_and_keeps_explicit_history_
                     )
                     .await
                     .unwrap();
-                let rendered = serde_json::to_string(&deterministic.contributions).unwrap();
-                assert_eq!(
-                    rendered.contains("cobalt storage for audit logs"),
-                    state == "saved",
-                    "{state}: {deterministic:?}"
-                );
-                assert!(
-                    !rendered.contains("amber ledger storage"),
-                    "the second fact must exercise active recall rather than deterministic recall"
-                );
-                if state == "read_error" {
-                    assert!(
-                        deterministic
-                            .diagnostics
-                            .iter()
-                            .any(|d| d.code.as_str() == "memory.recall_failed"),
-                        "{deterministic:?}"
-                    );
-                }
-                let prompt_context = HookPromptContextSet::aggregate_hook_contributions(
-                    deterministic.contributions,
-                    HookPromptContextLimits::default(),
-                );
-                for (case, plan, expects_project) in [
-                    ("local", None, true),
-                    ("mixed", Some(mixed_plan.clone()), true),
-                    ("legacy_modes", Some(stale_plan.clone()), true),
-                    ("invalid", Some(json!({"obsolete":true})), true),
-                    (
-                        "episodic_only",
-                        Some(json!({
-                            "durable":{"status":"skip","reasonCode":"provider_skip","confidence":1.0,"modes":[],"targets":[]},
-                            "episodic":{"status":"run","reasonCode":"provider_run","confidence":1.0,
-                                "queries":[{"mode":"current_thread","query":"searchneedle","targets":[]}]}
-                        })),
-                        false,
-                    ),
-                    (
-                        "debug_fallback",
-                        Some(json!({
-                            "durable":{"status":"run","reasonCode":"provider_run","confidence":1.0,
-                                "modes":[],"targets":[],"debugFallback":true},
-                            "episodic":{"status":"skip","reasonCode":"provider_skip","confidence":1.0,"queries":[]}
-                        })),
-                        false,
-                    ),
+                let rendered = serde_json::to_string(&response.contributions).unwrap();
+                for absent in [
+                    "cobalt storage for audit logs",
+                    "amber ledger storage",
+                    "remembered in the other conversation",
+                    "own runner context",
                 ] {
-                    let mut input = TurnPostPreflightPromptContextHookInput::from_parts(
-                        "searchneedle",
-                        Some("test-model"),
-                        Some("openai"),
-                    );
-                    if let Some(plan) = plan {
-                        input = input.with_active_memory_recall_preflight_plan(plan);
-                    }
-                    let response = runtime
-                        .run_phase_to_completion(
-                            HookPhaseRequest::new(
-                                HookPhase::TurnPostPreflightPromptContext,
-                                hook_context.clone(),
-                                HookInput::turn_post_preflight_prompt_context(input),
-                            )
-                            .with_policy_set(policies.clone())
-                            .with_prompt_context_set(prompt_context.clone()),
-                        )
-                        .await
-                        .unwrap();
-                    let rendered = serde_json::to_string(&response.contributions).unwrap();
-                    if state == "saved" && expects_project {
-                        assert!(
-                            rendered.contains("amber ledger storage"),
-                            "active project operation must survive normalization: {response:?}"
-                        );
-                    }
-                    assert!(
-                        !rendered.contains("remembered in the other conversation"),
-                        "{response:?}"
-                    );
-                    assert!(!rendered.contains("own runner context"), "{response:?}");
-                    assert_eq!(
-                        backend.calls.load(Ordering::SeqCst),
-                        search_calls,
-                        "automatic recall must not search history: state={state}, reinstall={reinstall}, case={case}, response={response:?}"
-                    );
+                    assert!(!rendered.contains(absent), "{state}: {response:?}");
                 }
+                assert_eq!(
+                    backend.calls.load(Ordering::SeqCst),
+                    search_calls,
+                    "prompt preparation must not search history: {state}, reinstall={reinstall}"
+                );
             }
         }
         let tool = invoke_task(

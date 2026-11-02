@@ -6,11 +6,10 @@ use pioneer_hooks::{
     HookPromptSectionLimits, HookPromptSectionSet, HookRunStatus, HookRunSummary, HookRuntime,
     HookRuntimeError, HookSectionId, HookSubscription, HookSubscriptionId, HookTaskId,
     HookThreadId, HookToolBundleId, HookToolBundleSet, HookToolName, HookTurnId, HookWorkspaceId,
-    PromptContextContribution, PromptManifestDiagnosticContribution, ToolBundleContribution,
-    TurnPostPreflightPromptContextHookInput, TurnPostTurnDomainEventSummary, TurnPostTurnHookInput,
-    TurnPostTurnHookInputLimits, TurnPostTurnStatus, TurnPostTurnToolEventSummary,
-    TurnPrePolicyHookInput, TurnPrePromptCompileHookInput, TurnPrePromptContextHookInput,
-    TurnPreToolMaterializationHookInput,
+    PromptManifestDiagnosticContribution, ToolBundleContribution, TurnPostTurnDomainEventSummary,
+    TurnPostTurnHookInput, TurnPostTurnHookInputLimits, TurnPostTurnStatus,
+    TurnPostTurnToolEventSummary, TurnPrePolicyHookInput, TurnPrePromptCompileHookInput,
+    TurnPrePromptContextHookInput, TurnPreToolMaterializationHookInput,
 };
 use pioneer_memory::hooks::{
     MEMORY_ACCEPTED_TASK_RESULT_POST_TURN_FEATURE_FLAG, MemoryToolBundleArtifactStore,
@@ -26,7 +25,6 @@ const HOOK_MANIFEST_MESSAGE_MAX_CHARS: usize = 512;
 const REDACTED_HOOK_DIAGNOSTIC_MESSAGE: &str = "Hook diagnostic redacted.";
 const HOOK_BEST_EFFORT_FAILED_MESSAGE: &str = "Best-effort hook failed before prompt compilation.";
 const TOOL_BUNDLE_MISSING_ARTIFACT_DIAGNOSTIC_CODE: &str = "tool_bundle.missing_artifact";
-const MEMORY_THREAD_CONTEXT_CONTRIBUTION_ID: &str = "memory.active_recall.thread_context";
 const DURABLE_POST_TURN_HOOK_SNAPSHOT_VERSION: u16 = 1;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -527,17 +525,6 @@ impl EffectiveTurnPromptContextSet {
     pub(super) fn manifest_metadata(&self) -> &EffectiveTurnPromptManifestHookMetadata {
         &self.manifest
     }
-
-    fn with_additional_prompt_context_phase(
-        &self,
-        prompt_context_set: HookPromptContextSet,
-        manifest: EffectiveTurnPromptManifestHookMetadata,
-    ) -> Self {
-        Self {
-            contexts: merge_prompt_context_sets(&self.contexts, &prompt_context_set),
-            manifest: EffectiveTurnPromptManifestHookMetadata::combined(&self.manifest, &manifest),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -614,7 +601,6 @@ pub(super) struct EffectiveTurnPromptManifestHookSource {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum EffectiveTurnPromptManifestHookContributionKind {
     PromptContext,
-    ThreadContext,
     PromptSection,
 }
 
@@ -885,71 +871,6 @@ pub(super) async fn run_agent_turn_prompt_context_hook_phase(
     }
 }
 
-pub(super) async fn run_agent_turn_post_preflight_prompt_context_hook_phase(
-    runtime: Option<&Arc<HookRuntime>>,
-    context: &AgentTurnHookContext,
-    policy_set: &EffectiveTurnPolicySet,
-    prompt_context_set: &EffectiveTurnPromptContextSet,
-    input: TurnPostPreflightPromptContextHookInput,
-) -> EffectiveTurnPromptContextSet {
-    let _startup_hooks = pioneer_observability::turn_startup::current_stage(
-        pioneer_observability::turn_startup::Stage::HookPostPreflight,
-    );
-    let Some(runtime) = runtime else {
-        return prompt_context_set.clone();
-    };
-
-    let request = match build_phase_request_with_input(
-        context,
-        HookPhase::TurnPostPreflightPromptContext,
-        policy_set,
-        prompt_context_set,
-        HookInput::turn_post_preflight_prompt_context(input),
-    ) {
-        Ok(request) => request,
-        Err(error) => {
-            warn!(
-                phase = %HookPhase::TurnPostPreflightPromptContext,
-                error = %error,
-                "agent turn post-preflight prompt context hook phase failed to build request; preserving existing prompt context"
-            );
-            return prompt_context_set.clone();
-        }
-    };
-
-    match runtime.run_phase(request).await {
-        Ok(mut response) => {
-            for diagnostic in &response.diagnostics {
-                warn_hook_diagnostic(HookPhase::TurnPostPreflightPromptContext, diagnostic);
-            }
-            let hook_contributions = response.contributions;
-            let phase_diagnostics = std::mem::take(&mut response.diagnostics);
-            let mut post_preflight_context_set =
-                prompt_context_set_from_contributions(hook_contributions.clone());
-            post_preflight_context_set
-                .diagnostics
-                .extend(phase_diagnostics);
-            for diagnostic in &post_preflight_context_set.diagnostics {
-                warn_hook_diagnostic(HookPhase::TurnPostPreflightPromptContext, diagnostic);
-            }
-            let manifest = prompt_context_manifest_hook_metadata_from_phase_response(
-                &hook_contributions,
-                &response.runs,
-                &post_preflight_context_set,
-            );
-            prompt_context_set
-                .with_additional_prompt_context_phase(post_preflight_context_set, manifest)
-        }
-        Err(error) => {
-            warn_hook_prompt_context_runtime_error(
-                HookPhase::TurnPostPreflightPromptContext,
-                &error,
-            );
-            prompt_context_set.clone()
-        }
-    }
-}
-
 pub(super) async fn run_agent_turn_prompt_compile_hook_phase(
     runtime: Option<&Arc<HookRuntime>>,
     context: &AgentTurnHookContext,
@@ -1099,9 +1020,8 @@ fn prompt_context_manifest_hook_metadata_from_phase_response(
                     .push(EffectiveTurnPromptManifestHookSourceEntry {
                         source: run_source.clone(),
                         section_id: None,
-                        contribution_kind: prompt_context_manifest_contribution_kind(
-                            &context.contribution_id,
-                        ),
+                        contribution_kind:
+                            EffectiveTurnPromptManifestHookContributionKind::PromptContext,
                         contribution_id: Some(context.contribution_id.clone()),
                         priority: Some(context.priority),
                         source_count: Some(context.source_refs.len()),
@@ -1427,18 +1347,7 @@ fn prompt_manifest_hook_contribution_kind_order(
 ) -> u8 {
     match kind {
         EffectiveTurnPromptManifestHookContributionKind::PromptContext => 0,
-        EffectiveTurnPromptManifestHookContributionKind::ThreadContext => 1,
-        EffectiveTurnPromptManifestHookContributionKind::PromptSection => 2,
-    }
-}
-
-fn prompt_context_manifest_contribution_kind(
-    contribution_id: &HookContributionId,
-) -> EffectiveTurnPromptManifestHookContributionKind {
-    if contribution_id.as_str() == MEMORY_THREAD_CONTEXT_CONTRIBUTION_ID {
-        EffectiveTurnPromptManifestHookContributionKind::ThreadContext
-    } else {
-        EffectiveTurnPromptManifestHookContributionKind::PromptContext
+        EffectiveTurnPromptManifestHookContributionKind::PromptSection => 1,
     }
 }
 
@@ -1574,36 +1483,6 @@ fn prompt_context_set_from_contributions(
         contributions,
         HookPromptContextLimits::default(),
     )
-}
-
-fn merge_prompt_context_sets(
-    first: &HookPromptContextSet,
-    second: &HookPromptContextSet,
-) -> HookPromptContextSet {
-    let contributions = first
-        .entries
-        .iter()
-        .chain(second.entries.iter())
-        .map(|entry| PromptContextContribution {
-            contribution_id: entry.contribution_id.clone(),
-            domain: entry.domain.clone(),
-            priority: entry.priority,
-            content: entry.content.clone(),
-            max_chars: entry.max_chars,
-            source_refs: entry.source_refs.clone(),
-            diagnostics: entry.diagnostics.clone(),
-            truncated: entry.truncated,
-        });
-    let mut merged = HookPromptContextSet::aggregate_contributions(
-        contributions,
-        HookPromptContextLimits::default(),
-    );
-    merged.diagnostics.extend(first.diagnostics.iter().cloned());
-    merged
-        .diagnostics
-        .extend(second.diagnostics.iter().cloned());
-    merged.truncated = merged.truncated || first.truncated || second.truncated;
-    merged
 }
 
 fn prompt_section_set_from_contributions(
@@ -2413,23 +2292,6 @@ mod tests {
         HookRegistry, HookResult, HookSubscription, HookSubscriptionRegistry,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
-
-    #[test]
-    fn thread_context_prompt_contribution_has_distinct_manifest_kind() {
-        let thread_context_id = HookContributionId::new(MEMORY_THREAD_CONTEXT_CONTRIBUTION_ID)
-            .expect("valid thread context contribution id");
-        let durable_context_id = HookContributionId::new("memory.recall.context")
-            .expect("valid durable memory contribution id");
-
-        assert_eq!(
-            prompt_context_manifest_contribution_kind(&thread_context_id),
-            EffectiveTurnPromptManifestHookContributionKind::ThreadContext
-        );
-        assert_eq!(
-            prompt_context_manifest_contribution_kind(&durable_context_id),
-            EffectiveTurnPromptManifestHookContributionKind::PromptContext
-        );
-    }
 
     #[test]
     fn hook_runtime_context_conversation_scope_is_backward_compatible() {

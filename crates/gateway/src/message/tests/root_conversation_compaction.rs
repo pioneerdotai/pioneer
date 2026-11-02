@@ -998,7 +998,7 @@ async fn accepted_deliveries_coalesce_keep_frozen_outputs_and_preserve_work_arri
         "accepted result with delivery none must not prepare root"
     );
     // A later independent report is real new context, but an abandoned root
-    // stays cold. The Task still runs its mandatory Native preflight normally.
+    // stays cold. The Task still prepares its Native main request normally.
     clock.set(original_activity as u64 * 1000 + 28_800_000);
     let (monitor, candidate) = reviewed_task(
         &harness,

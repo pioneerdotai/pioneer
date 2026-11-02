@@ -2481,8 +2481,8 @@ pub enum PromptManifestHookTruncation {
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PromptManifestHookPhase {
+    #[serde(alias = "turn_post_preflight_prompt_context")]
     TurnPrePromptContext,
-    TurnPostPreflightPromptContext,
     TurnPrePromptCompile,
     RuntimeTurnPreContext,
 }
@@ -5801,6 +5801,21 @@ pub struct ContextCompressedNotification {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn legacy_prompt_manifest_phase_reads_and_serializes_as_current_context() {
+        let phase: super::PromptManifestHookPhase =
+            serde_json::from_str("\"turn_post_preflight_prompt_context\"")
+                .expect("historical manifests remain readable");
+        assert_eq!(phase, super::PromptManifestHookPhase::TurnPrePromptContext);
+        assert_eq!(
+            serde_json::to_string(&phase).unwrap(),
+            "\"turn_pre_prompt_context\""
+        );
+        assert!(
+            serde_json::from_str::<super::PromptManifestHookPhase>("\"unknown_phase\"").is_err()
+        );
+    }
+
     use super::*;
     use serde_json::json;
 

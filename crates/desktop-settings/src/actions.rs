@@ -30,13 +30,6 @@ impl SettingsScreenView {
     pub fn apply_model_catalog_proxy(&mut self, proxy_url: Option<String>, _: &mut Context<Self>) {
         self.intent(SettingsIntent::ModelCatalogProxy { proxy_url });
     }
-    pub fn apply_preflight_model_setting(
-        &mut self,
-        selection: GatewayMemoryModelSelection,
-        _: &mut Context<Self>,
-    ) {
-        self.intent(SettingsIntent::PreflightModel { selection });
-    }
     pub fn toggle_remote_access_settings_expanded(&mut self) {
         self.remote_access_settings_expanded = !self.remote_access_settings_expanded;
     }

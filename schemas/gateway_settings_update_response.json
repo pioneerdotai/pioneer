@@ -107,12 +107,6 @@
             "proxy_configured": false
           }
         },
-        "preflight_model": {
-          "$ref": "#/$defs/GatewayMemoryModelSelection",
-          "default": {
-            "source": "thread"
-          }
-        },
         "telemetry_enabled": {
           "type": "boolean",
           "default": true
@@ -150,16 +144,10 @@
     "GatewayMemorySettings": {
       "type": "object",
       "properties": {
-        "active_recall_enabled": {
-          "type": "boolean"
-        },
         "background_extraction_enabled": {
           "type": "boolean"
         },
         "debug_trace_enabled": {
-          "type": "boolean"
-        },
-        "deterministic_recall_enabled": {
           "type": "boolean"
         },
         "enabled": {
@@ -183,8 +171,6 @@
       },
       "required": [
         "enabled",
-        "deterministic_recall_enabled",
-        "active_recall_enabled",
         "tools_enabled",
         "proactive_writes_enabled",
         "background_extraction_enabled",
@@ -542,9 +528,6 @@
             "model_catalog": {
               "catalog_available": false,
               "proxy_configured": false
-            },
-            "preflight_model": {
-              "source": "thread"
             },
             "telemetry_enabled": true
           }

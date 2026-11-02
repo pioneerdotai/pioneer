@@ -20,46 +20,12 @@
         "proxy_configured": false
       }
     },
-    "preflight_model": {
-      "$ref": "#/$defs/GatewayMemoryModelSelection",
-      "default": {
-        "source": "thread"
-      }
-    },
     "telemetry_enabled": {
       "type": "boolean",
       "default": true
     }
   },
   "$defs": {
-    "GatewayMemoryModelSelection": {
-      "type": "object",
-      "properties": {
-        "model": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "model_provider": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "source": {
-          "$ref": "#/$defs/GatewayMemoryModelSelectionSource",
-          "default": "thread"
-        }
-      }
-    },
-    "GatewayMemoryModelSelectionSource": {
-      "type": "string",
-      "enum": [
-        "thread",
-        "custom"
-      ]
-    },
     "GatewayModelCatalogSettings": {
       "type": "object",
       "properties": {

@@ -12124,9 +12124,7 @@ mod tests {
     };
     use pioneer_config::GatewayWebToolsConfig;
     use pioneer_keystore::MemorySecretStore;
-    use pioneer_memory::hooks::{
-        MemoryActiveRecallConfig, MemoryActiveRecallMode, MemoryLoopConfig,
-    };
+    use pioneer_memory::hooks::MemoryLoopConfig;
     use pioneer_protocol::{
         ArtifactBindingDirection, ArtifactBindingKind, ArtifactCreatedByKind, ArtifactKind,
         ArtifactRole, ArtifactSummary, TaskAgentInputAttachmentKind, TaskAgentInputReferenceKind,
@@ -12666,7 +12664,6 @@ mod tests {
         let web = GatewayWebToolsConfig::default();
         ToolLoopConfig {
             provider: pioneer_provider::ProviderTimeoutPolicy::default(),
-            preflight: pioneer_agent::PreflightLoopConfig::default(),
             web: WebToolsConfig {
                 default_timeout_ms: web.default_timeout_ms,
                 hard_max_timeout_ms: web.hard_max_timeout_ms,
@@ -12734,13 +12731,7 @@ mod tests {
                     allow_function_proxy_tools: true,
                 },
             },
-            memory: MemoryLoopConfig {
-                active_recall: MemoryActiveRecallConfig {
-                    mode: MemoryActiveRecallMode::DeterministicOnly,
-                    ..MemoryActiveRecallConfig::default()
-                },
-                ..MemoryLoopConfig::default()
-            },
+            memory: MemoryLoopConfig::default(),
             budget: ToolLoopBudgetConfig::default(),
             execution_windows: pioneer_tools::ExecutionWindowsConfig::default(),
             retry: ToolRetryBudgetConfig::default(),

@@ -22,7 +22,6 @@ outbound_queue_capacity = 128
 # append to) Forwarded/X-Forwarded-For with one client IP.
 trusted_proxy_peers = []
 keepawake = false
-preflight_model = "thread"
 
 [gateway.telemetry]
 # User consent overrides `enabled` in gateway-settings.toml. This is the exact
@@ -265,8 +264,6 @@ enabled = true
 capsules_dir = "memory/capsules"
 allow_global_user_by_default = true
 allow_global_agent_by_default = false
-deterministic_recall_enabled = true
-active_recall_enabled = true
 tools_enabled = true
 proactive_writes_enabled = true
 background_extraction_enabled = true

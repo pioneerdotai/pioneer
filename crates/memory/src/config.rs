@@ -119,19 +119,13 @@ impl Default for MemoryRankingConfig {
 
 #[derive(Debug, Clone)]
 pub struct MemoryRecallConfig {
-    pub prompt_top_k: u32,
     pub tool_search_limit: u32,
-    pub max_prompt_chars: usize,
-    pub max_item_chars: usize,
 }
 
 impl Default for MemoryRecallConfig {
     fn default() -> Self {
         Self {
-            prompt_top_k: 8,
             tool_search_limit: 20,
-            max_prompt_chars: 4_000,
-            max_item_chars: 500,
         }
     }
 }

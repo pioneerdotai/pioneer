@@ -161,13 +161,6 @@ description = "Не дает системе уходить в сон из-за �
 label = "Отправлять телеметрию"
 description = "Разрешить собирать диагностические данные и данные о производительности."
 
-[settings.general.preflight_model]
-label = "Модель preflight"
-description = "Выберите провайдера и модель для внутреннего планирования перед ходом. По умолчанию используется модель текущего треда."
-default = "По умолчанию"
-select_model = "Выбрать модель"
-dialog_title = "Выбор модели preflight"
-
 [settings.voice_input]
 transcribe_while_recording = "Распознавать во время записи"
 transcribe_while_recording_description = "Если выключено, распознавание начнётся после завершения записи"
@@ -224,10 +217,6 @@ description = "Управляйте тем, как Pioneer использует 
 [settings.memory.enabled]
 label = "Память"
 description = "Разрешить Pioneer использовать сохранённые факты и проектные решения, когда это полезно."
-
-[settings.memory.active_recall]
-label = "Активное вспоминание"
-description = "Запускать дополнительное планирование чтения памяти для контекстных задач."
 
 [settings.memory.proactive_writes]
 label = "Проактивная запись"

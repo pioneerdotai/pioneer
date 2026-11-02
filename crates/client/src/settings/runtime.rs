@@ -82,9 +82,6 @@ pub enum SettingsIntent {
     Telemetry {
         enabled: bool,
     },
-    PreflightModel {
-        selection: GatewayMemoryModelSelection,
-    },
     CompactionModel {
         selection: GatewayModelSelection,
     },
@@ -154,7 +151,6 @@ impl SettingsIntent {
             | Self::RevokeSession { .. } => return None,
             Self::Keepawake { .. }
             | Self::Telemetry { .. }
-            | Self::PreflightModel { .. }
             | Self::CompactionModel { .. }
             | Self::ModelCatalogProxy { .. } => SettingsPage::General,
             Self::RemoteAccess { .. } => SettingsPage::RemoteAccess,
@@ -187,9 +183,6 @@ impl SettingsIntent {
             }
             Self::Telemetry { enabled } => {
                 g::telemetry_enabled_update_plan(Some(snapshot), *enabled).map(|p| p.update)
-            }
-            Self::PreflightModel { selection } => {
-                g::preflight_model_update_plan(Some(snapshot), selection.clone()).map(|p| p.update)
             }
             Self::CompactionModel { selection } => Some(GatewaySettingsUpdate {
                 general: Some(GatewayGeneralSettingsUpdate {
