@@ -62167,6 +62167,28 @@ async fn assert_turn_cancel_with_optional_busy_native_actor(
     let mut preserved_blocked_rows = Vec::new();
     let mut resumed_job_id: Option<String> = None;
 
+    if resume_direct {
+        // Drive recovery explicitly below, with the same durable listener
+        // startup used by the resilience worker, without a competing scanner.
+        let recovery_processor = Arc::downgrade(&processor);
+        processor
+            .recovery_coordinator
+            .set_listener_starter(Arc::new(move |thread_id| {
+                let recovery_processor = recovery_processor.clone();
+                Box::pin(async move {
+                    let processor = recovery_processor
+                        .upgrade()
+                        .ok_or_else(|| "fixture processor stopped".to_owned())?;
+                    processor
+                        .with_database_class(pioneer_sqlite::SqliteWriteClass::Critical)
+                        .ensure_agent_listener_task(&thread_id)
+                        .await
+                        .map_err(|error| format!("{error:#}"))
+                })
+            }))
+            .await;
+    }
+
     let thread_request_id = generate_test_request_id("turncancel", "thread");
     let thread_start_request = json!({
         "jsonrpc": "2.0",
