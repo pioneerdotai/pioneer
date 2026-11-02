@@ -2710,13 +2710,9 @@ async fn capability_persistence_order_impl() {
                 .first()
                 .and_then(|item| item["text"].as_str())
                 .expect("turn context should precede native user input");
-            assert!(context.contains("native Skill tool"));
-            assert!(
-                !native_turn
-                    .elevated_instructions
-                    .text()
-                    .contains("native Skill tool")
-            );
+            let directive = "Invoke every selected skill through Claude's native Skill tool";
+            assert!(context.contains(directive));
+            assert!(!native_turn.elevated_instructions.text().contains(directive));
             let beta = context
                 .find("- beta")
                 .expect("Claude turn context should include beta");
@@ -2731,7 +2727,7 @@ async fn capability_persistence_order_impl() {
                 input
                     .iter()
                     .filter_map(|item| item["text"].as_str())
-                    .filter(|text| text.contains("native Skill tool"))
+                    .filter(|text| text.contains(directive))
                     .count(),
                 1,
                 "selected-skill directive should appear once in turn input"
@@ -3185,19 +3181,25 @@ async fn claude_cli_runtime_new_skill_closes_one_cached_session_before_restart_i
         .await;
     let native = wait_for_recorded_cli_runtime_turn_start(&harness.cli_session).await;
     assert_eq!(harness.cli_session.closes.load(Ordering::SeqCst), 1);
-    assert!(
-        native
-            .elevated_instructions
-            .text()
-            .contains("native Skill tool")
+    let input = native.input.as_array().unwrap();
+    let context = input
+        .first()
+        .and_then(|item| item["text"].as_str())
+        .expect("turn context should precede native user input after session restart");
+    let directive = "Invoke every selected skill through Claude's native Skill tool";
+    assert!(context.contains(directive));
+    assert!(context.contains("- refresh"));
+    assert!(!native.elevated_instructions.text().contains(directive));
+    assert!(!native.elevated_instructions.text().contains("- refresh"));
+    assert_eq!(
+        input
+            .iter()
+            .filter_map(|item| item["text"].as_str())
+            .filter(|text| text.contains(directive))
+            .count(),
+        1,
+        "selected skill should be delivered once after session restart"
     );
-    assert!(native.elevated_instructions.text().contains("- refresh"));
-    assert!(native.input.as_array().unwrap().iter().all(|item| {
-        item["type"] != "text"
-            || item["text"]
-                .as_str()
-                .is_none_or(|text| !text.contains("native Skill tool"))
-    }));
 }
 
 #[test]
