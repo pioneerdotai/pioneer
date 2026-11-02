@@ -56,6 +56,16 @@
         "$ref": "#/$defs/ComposerPermissionModeOption"
       }
     },
+    "preparing_send": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ComposerPreparingSend"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "reconciliation": {
       "anyOf": [
         {
@@ -1325,6 +1335,29 @@
         "mode",
         "label",
         "description"
+      ]
+    },
+    "ComposerPreparingSend": {
+      "description": "Captured local Send payload, visible until the prepared optimistic commit.\nThis is Composer feedback, not a server turn or uploaded-artifact receipt.",
+      "type": "object",
+      "properties": {
+        "attachments": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ComposerAttachment"
+          }
+        },
+        "identity": {
+          "$ref": "#/$defs/ComposerOperationIdentity"
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "identity",
+        "text",
+        "attachments"
       ]
     },
     "ComposerReplyTarget": {

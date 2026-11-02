@@ -195,6 +195,16 @@ pub(crate) struct QueueState {
     native_revision: Option<u64>,
     native_oldest_recorded: bool,
 }
+/// Current owner numbers, without diagnostic strings or event counters.
+pub(crate) struct QueueNumbers {
+    pub kind: QueueKind,
+    pub depth: u64,
+    pub capacity: Option<usize>,
+    pub bytes: u64,
+    pub initial_depth_known: bool,
+    pub oldest_age_ms: Option<u64>,
+    pub bytes_known: bool,
+}
 impl QueueState {
     fn is_native_admission(&self) -> bool {
         matches!(
@@ -265,18 +275,29 @@ impl QueueState {
             native_oldest_recorded: false,
         }
     }
+    fn oldest_age_ms(&self, now: u64) -> Option<u64> {
+        if self.snapshot.initial_depth_known && self.native_oldest_recorded {
+            self.native_oldest
+                .map(|(at, age)| now.saturating_sub(at).saturating_add(age))
+        } else {
+            None
+        }
+    }
+    pub(crate) fn current_numbers(&self, now: u64) -> QueueNumbers {
+        QueueNumbers {
+            kind: self.snapshot.kind,
+            depth: self.snapshot.depth,
+            capacity: self.snapshot.capacity,
+            bytes: self.snapshot.bytes,
+            initial_depth_known: self.snapshot.initial_depth_known,
+            oldest_age_ms: self.oldest_age_ms(now),
+            bytes_known: self.snapshot.byte_quality == "known_payload_bytes",
+        }
+    }
     pub(crate) fn snapshot(&self, now: u64) -> QueueSnapshot {
         let mut value = self.snapshot.clone();
         value.snapshot_ms = now;
-        value.oldest_age_ms = None;
-        if self.native_oldest_recorded {
-            value.oldest_age_ms = self
-                .native_oldest
-                .map(|(at, age)| now.saturating_sub(at).saturating_add(age));
-        }
-        if !value.initial_depth_known {
-            value.oldest_age_ms = None;
-        }
+        value.oldest_age_ms = self.oldest_age_ms(now);
         value.age_coverage = if !value.initial_depth_known {
             "initial_depth_not_recorded"
         } else if value.depth == 0 {
@@ -1146,4 +1167,49 @@ mod tests {
         assert_eq!(s.queues[0].cancelled, 0);
         crate::set_telemetry_enabled(old);
     }
+}
+
+#[cfg(test)]
+pub(crate) fn current_fixture(
+    kind: QueueKind,
+    depth: u64,
+    known: bool,
+    head: Option<(u64, u64)>,
+    bytes_known: bool,
+) -> QueueState {
+    let mut state = QueueState::new(1, kind, Some(20), "fixture");
+    state.snapshot.depth = depth;
+    state.snapshot.bytes = 30;
+    state.snapshot.initial_depth_known = known;
+    state.snapshot.byte_quality = if bytes_known {
+        "known_payload_bytes"
+    } else {
+        "estimate_payload_bytes"
+    }
+    .into();
+    state.native_oldest_recorded = head.is_some();
+    state.native_oldest = head;
+    state
+}
+
+#[cfg(test)]
+#[test]
+fn numeric_head_uses_native_source_and_preserves_diagnostic_coverage() {
+    let mut state = current_fixture(QueueKind::EventDurable, 2, true, Some((800, 70)), true);
+    assert_eq!(state.current_numbers(1000).oldest_age_ms, Some(270));
+    assert_eq!(state.snapshot(1000).oldest_age_ms, Some(270));
+    assert_eq!(
+        state.snapshot(1000).age_coverage,
+        "observed_native_owner_head"
+    );
+    assert_eq!(state.current_numbers(700).oldest_age_ms, Some(70));
+    state.snapshot.initial_depth_known = false;
+    assert_eq!(state.current_numbers(1000).oldest_age_ms, None);
+    assert_eq!(
+        state.snapshot(1000).age_coverage,
+        "initial_depth_not_recorded"
+    );
+    state.snapshot.initial_depth_known = true;
+    state.native_oldest = Some((0, u64::MAX));
+    assert_eq!(state.current_numbers(1000).oldest_age_ms, Some(u64::MAX));
 }

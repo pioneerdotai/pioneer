@@ -37,3 +37,5 @@ pub use native_event::{
     BoundedNativeEventCodec, DEFAULT_MAX_RECOVERY_FRAME_BYTES, NativeEventBudget,
     NativeIngressError, NativeIngressErrorKind, SpooledNativeFrame,
 };
+
+pub mod executable_digest;
