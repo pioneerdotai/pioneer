@@ -248,7 +248,8 @@ async fn codex_title_deadline_waits_for_fresh_completion_and_keeps_manual_names(
             text_input()
         };
         let (mut processor, store, workspace) =
-            setup_execution_window_terminal_turn_with_input(thread, first, &input).await;
+            setup_execution_window_terminal_turn_with_input_and_mode(thread, first, &input, None)
+                .await;
         // Keep the conversation loaded across completion, replay, and the next turn.
         assert!(
             processor
