@@ -15,10 +15,10 @@ use pioneer_crud::{
     load_device, load_gateway_singleton, load_pending_local_session,
     load_pending_session_by_activation_locator_hash, load_pending_session_for_creator,
     load_principal_avatar, load_principal_by_id, load_principal_profile, load_session,
-    load_session_by_activation_hash, load_session_lease, mark_device_revoked, mark_session_revoked,
-    principal_kind_from_db, principal_status_from_db, record_failed_device_activation,
-    replace_current_refresh, revoke_session_family_for_refresh_reuse, touch_active_auth_session,
-    touch_active_device,
+    load_session_by_activation_hash, load_session_lease, load_session_leases, mark_device_revoked,
+    mark_session_revoked, principal_kind_from_db, principal_status_from_db,
+    record_failed_device_activation, replace_current_refresh,
+    revoke_session_family_for_refresh_reuse, touch_active_auth_session, touch_active_device,
 };
 use pioneer_protocol::{
     AUTH_DOMAIN_ID_LEN, AuthDeviceActivateParams, AuthDeviceCreateResponse, AuthDeviceSnapshot,
@@ -828,12 +828,7 @@ impl GatewayAuthService {
     ) -> Result<SessionLeaseFacts, AuthError> {
         let now_unix =
             unix_timestamp_secs().map_err(|_| AuthError::new(AuthErrorCode::InvalidCredential))?;
-        if now_unix >= principal.access_expires_at_unix {
-            return Err(AuthError::new(AuthErrorCode::CredentialExpired));
-        }
-        if principal.gateway_id != self.identity.gateway.id {
-            return Err(AuthError::new(AuthErrorCode::GatewayIdentityMismatch));
-        }
+        self.validate_session_lease_context(principal, now_unix)?;
         let row = trace_auth_me_database_read(
             trace,
             pioneer_observability::GatewayOperationStage::AuthMeLeaseFactsLoad,
@@ -842,6 +837,48 @@ impl GatewayAuthService {
         .await?
         .ok_or_else(|| AuthError::new(AuthErrorCode::InvalidCredential))?;
         validate_session_lease_facts(row, principal, now_unix)
+    }
+
+    /// Bounded unvalidated rows, scoped to this notification stage. Validation
+    /// below runs separately for each actual connection, even for a shared row.
+    pub(crate) async fn load_notification_session_leases(
+        &self,
+        session_ids: &[AuthSessionId],
+        database: &SqliteDatabase,
+    ) -> Result<std::collections::HashMap<String, AuthSessionLeaseRow>, AuthError> {
+        let rows = load_session_leases(database, session_ids)
+            .await
+            .map_err(storage_error)?;
+        Ok(rows
+            .into_iter()
+            .map(|row| (row.session_id.clone(), row))
+            .collect())
+    }
+
+    pub(crate) fn validate_notification_session_lease(
+        &self,
+        principal: &AuthenticatedSessionPrincipal,
+        row: Option<&AuthSessionLeaseRow>,
+    ) -> Result<SessionLeaseFacts, AuthError> {
+        let now_unix =
+            unix_timestamp_secs().map_err(|_| AuthError::new(AuthErrorCode::InvalidCredential))?;
+        self.validate_session_lease_context(principal, now_unix)?;
+        let row = row.ok_or_else(|| AuthError::new(AuthErrorCode::InvalidCredential))?;
+        validate_session_lease_facts(row.clone(), principal, now_unix)
+    }
+
+    fn validate_session_lease_context(
+        &self,
+        principal: &AuthenticatedSessionPrincipal,
+        now_unix: u64,
+    ) -> Result<(), AuthError> {
+        if now_unix >= principal.access_expires_at_unix {
+            return Err(AuthError::new(AuthErrorCode::CredentialExpired));
+        }
+        if principal.gateway_id != self.identity.gateway.id {
+            return Err(AuthError::new(AuthErrorCode::GatewayIdentityMismatch));
+        }
+        Ok(())
     }
 
     pub(crate) async fn resolve_active_view_grant_principal(
@@ -2395,7 +2432,8 @@ fn validate_session_lease_facts(
         .map_err(|_| AuthError::new(AuthErrorCode::InvalidCredential))?;
     let kind = principal_kind_from_db(&row.principal_kind).map_err(storage_error)?;
     let status = principal_status_from_db(&row.principal_status).map_err(storage_error)?;
-    if row.session_gateway_id != principal.gateway_id.as_str()
+    if row.session_id != principal.session_id.as_str()
+        || row.session_gateway_id != principal.gateway_id.as_str()
         || row.session_principal_id != principal.principal_id.as_str()
         || row.session_device_id != principal.device_id.as_str()
         || row.device_gateway_id != principal.gateway_id.as_str()
