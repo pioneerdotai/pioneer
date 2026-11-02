@@ -2671,7 +2671,10 @@ async fn capability_persistence_order_impl() {
                     }),
                 ]
             );
-            let instructions = native_turn.elevated_instructions.text();
+            let context = input
+                .first()
+                .and_then(|item| item["text"].as_str())
+                .expect("turn context should precede native user input");
             let (directive, beta_label, alpha_label, runtime_label) = match runtime_kind {
                 CLIAgentRuntimeKind::Codex => {
                     ("selected Skill input", "- $beta", "- $alpha", "Codex")
@@ -2679,44 +2682,60 @@ async fn capability_persistence_order_impl() {
                 CLIAgentRuntimeKind::OpenCode => ("OpenCode turn", "- beta", "- alpha", "OpenCode"),
                 CLIAgentRuntimeKind::Claude => unreachable!(),
             };
-            assert!(instructions.contains(directive));
-            let beta = instructions
+            assert!(context.contains(directive));
+            assert!(!native_turn.elevated_instructions.text().contains(directive));
+            let beta = context
                 .find(beta_label)
-                .unwrap_or_else(|| panic!("{runtime_label} instructions should include beta"));
-            let alpha = instructions
+                .unwrap_or_else(|| panic!("{runtime_label} turn context should include beta"));
+            let alpha = context
                 .find(alpha_label)
-                .unwrap_or_else(|| panic!("{runtime_label} instructions should include alpha"));
+                .unwrap_or_else(|| panic!("{runtime_label} turn context should include alpha"));
             assert!(
                 beta < alpha,
                 "selected {runtime_label} skill order must be preserved"
             );
-            assert!(input.iter().all(|item| {
-                item["type"] != "text"
-                    || item["text"]
-                        .as_str()
-                        .is_none_or(|text| !text.contains(directive))
-            }));
+            assert_eq!(
+                input
+                    .iter()
+                    .filter_map(|item| item["text"].as_str())
+                    .filter(|text| text.contains(directive))
+                    .count(),
+                1,
+                "selected-skill directive should appear once in turn input"
+            );
         } else {
             let input = native_turn.input.as_array().unwrap();
             assert!(input.iter().all(|item| item["type"] != "skill"));
-            let instructions = native_turn.elevated_instructions.text();
-            assert!(instructions.contains("native Skill tool"));
-            let beta = instructions
+            let context = input
+                .first()
+                .and_then(|item| item["text"].as_str())
+                .expect("turn context should precede native user input");
+            assert!(context.contains("native Skill tool"));
+            assert!(
+                !native_turn
+                    .elevated_instructions
+                    .text()
+                    .contains("native Skill tool")
+            );
+            let beta = context
                 .find("- beta")
-                .expect("Claude elevated instructions should include beta");
-            let alpha = instructions
+                .expect("Claude turn context should include beta");
+            let alpha = context
                 .find("- alpha")
-                .expect("Claude elevated instructions should include alpha");
+                .expect("Claude turn context should include alpha");
             assert!(
                 beta < alpha,
                 "selected Claude skill order must be preserved"
             );
-            assert!(input.iter().all(|item| {
-                item["type"] != "text"
-                    || item["text"]
-                        .as_str()
-                        .is_none_or(|text| !text.contains("native Skill tool"))
-            }));
+            assert_eq!(
+                input
+                    .iter()
+                    .filter_map(|item| item["text"].as_str())
+                    .filter(|text| text.contains("native Skill tool"))
+                    .count(),
+                1,
+                "selected-skill directive should appear once in turn input"
+            );
         }
     }
 }
