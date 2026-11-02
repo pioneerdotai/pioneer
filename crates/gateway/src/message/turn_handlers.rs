@@ -36,6 +36,32 @@ pub(super) struct PreparedApiProviderTurnStart {
     execution_security_snapshot: pioneer_protocol::TurnExecutionSecuritySnapshot,
 }
 
+/// Dispatch failures remain failures even when recovery was successfully scheduled.
+/// `Ok` only records actor acceptance followed by the running ownership update;
+/// it is not an exact-generation receipt or evidence of successful execution.
+/// Actor errors can include an indeterminate control outcome; an error is not
+/// permission to dispatch again without the existing durable reconciliation.
+#[derive(Debug)]
+pub(super) enum ApiProviderTurnDispatchFailure {
+    ActorStart(pioneer_agent::AgentStartError),
+    RunningOwnershipNotConfirmed,
+    OwnershipPersistence(anyhow::Error),
+}
+
+impl std::fmt::Display for ApiProviderTurnDispatchFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ActorStart(error) => write!(f, "actor start failed: {error}"),
+            Self::RunningOwnershipNotConfirmed => {
+                f.write_str("running execution ownership was not confirmed")
+            }
+            Self::OwnershipPersistence(error) => {
+                write!(f, "execution ownership persistence failed: {error:#}")
+            }
+        }
+    }
+}
+
 pub(super) enum ApiProviderTurnAdmission {
     New(PreparedApiProviderTurnStart),
     Replay(pioneer_protocol::TurnStartResponse),
@@ -1723,8 +1749,12 @@ impl MessageProcessor {
                 .await;
                 return;
             }
-            self.dispatch_prepared_api_provider_turn_start(prepared)
-                .await;
+            if let Err(failure) = self
+                .dispatch_prepared_api_provider_turn_start(prepared)
+                .await
+            {
+                warn!(failure = %failure, "accepted foreground turn dispatch requires reconciliation");
+            }
         })
     }
 
@@ -3277,7 +3307,7 @@ impl MessageProcessor {
     pub(super) async fn dispatch_prepared_api_provider_turn_start(
         &self,
         prepared: PreparedApiProviderTurnStart,
-    ) {
+    ) -> Result<(), ApiProviderTurnDispatchFailure> {
         let outcome = prepared.outcome;
         let start_result = self
             .agent_manager
@@ -3318,7 +3348,7 @@ impl MessageProcessor {
                 )
                 .await;
             }
-            return;
+            return Err(ApiProviderTurnDispatchFailure::ActorStart(error));
         }
 
         let now = now_timestamp_secs();
@@ -3332,12 +3362,18 @@ impl MessageProcessor {
             )
             .await;
         if !matches!(ownership_started, Ok(true)) {
-            let reason = match ownership_started {
-                Ok(false) => {
-                    "Turn execution ownership changed before native dispatch completed".to_owned()
-                }
+            let (failure, reason) = match ownership_started {
+                Ok(false) => (
+                    ApiProviderTurnDispatchFailure::RunningOwnershipNotConfirmed,
+                    "Turn execution ownership changed before native dispatch completed".to_owned(),
+                ),
                 Err(error) => {
-                    format!("failed to persist native Turn execution ownership: {error:#}")
+                    let reason =
+                        format!("failed to persist native Turn execution ownership: {error:#}");
+                    (
+                        ApiProviderTurnDispatchFailure::OwnershipPersistence(error),
+                        reason,
+                    )
                 }
                 Ok(true) => unreachable!(),
             };
@@ -3365,7 +3401,9 @@ impl MessageProcessor {
                 )
                 .await;
             }
+            return Err(failure);
         }
+        Ok(())
     }
 
     /// Builds the ordinary API-provider runtime payload for a agent domain

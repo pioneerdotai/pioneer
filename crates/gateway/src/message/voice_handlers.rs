@@ -814,8 +814,12 @@ impl MessageProcessor {
                         },
                     )
                     .await;
-                    self.dispatch_prepared_api_provider_turn_start(prepared)
-                        .await;
+                    if let Err(failure) = self
+                        .dispatch_prepared_api_provider_turn_start(prepared)
+                        .await
+                    {
+                        warn!(failure = %failure, "accepted voice turn dispatch requires reconciliation");
+                    }
                     return;
                 }
                 Ok(GatewayVoiceSessionPipelineOutcome::NoSpeech {
