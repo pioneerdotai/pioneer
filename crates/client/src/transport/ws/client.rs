@@ -275,10 +275,48 @@ impl Drop for ConnectionCommandReceiver {
     }
 }
 
+// Renewals must remain admissible while voice backpressure pauses the data FIFO.
+// Only one renewal may be pending; this ingress adds one bounded waiting slot.
+struct RenewalSender(tokio::sync::mpsc::Sender<WorkItem<ConnectionRpcCommand>>);
+struct RenewalReceiver(tokio::sync::mpsc::Receiver<WorkItem<ConnectionRpcCommand>>);
+
+fn renewal_channel() -> (RenewalSender, RenewalReceiver) {
+    let (tx, rx) = tokio::sync::mpsc::channel(1);
+    (RenewalSender(tx), RenewalReceiver(rx))
+}
+
+impl RenewalSender {
+    fn send(&self, command: ConnectionRpcCommand) -> Result<(), ()> {
+        self.0
+            .try_send(WorkItem::new(
+                command,
+                Boundary::ClientRpc,
+                WorkKind::ClientRpc,
+                ExecutorRole::ClientWs,
+            ))
+            .map_err(|error| {
+                error
+                    .into_inner()
+                    .value
+                    .fail("connection renewal unavailable");
+            })
+    }
+}
+
+impl Drop for RenewalReceiver {
+    fn drop(&mut self) {
+        self.0.close();
+        while let Ok(item) = self.0.try_recv() {
+            item.value.fail("websocket connection owner dropped");
+        }
+    }
+}
+
 struct ActiveConnectionTask {
     connection_id: u64,
     handle: JoinHandle<()>,
     rpc_tx: WsSender<ConnectionRpcCommand>,
+    renewal_tx: RenewalSender,
 }
 
 pub(crate) fn spawn_worker(
@@ -358,6 +396,7 @@ async fn handle_command(
         } => {
             abort_connection_task(connection_task).await;
             let (rpc_tx, rpc_rx) = work_channel(Boundary::ClientRpc);
+            let (renewal_tx, renewal_rx) = renewal_channel();
             *connection_task = Some(ActiveConnectionTask {
                 connection_id,
                 handle: tokio::spawn(pioneer_observability::work::inherit(
@@ -371,11 +410,13 @@ async fn handle_command(
                         retry_initial_failure,
                         event_tx.clone(),
                         ConnectionCommandReceiver(rpc_rx),
+                        renewal_rx,
                         None,
                         socket.clone(),
                     ),
                 )),
                 rpc_tx,
+                renewal_tx,
             });
         }
         GatewayWsCommand::Replace {
@@ -392,6 +433,7 @@ async fn handle_command(
                 Ok(stream) => {
                     abort_connection_task(connection_task).await;
                     let (rpc_tx, rpc_rx) = work_channel(Boundary::ClientRpc);
+                    let (renewal_tx, renewal_rx) = renewal_channel();
                     *connection_task = Some(ActiveConnectionTask {
                         connection_id,
                         handle: tokio::spawn(pioneer_observability::work::inherit(
@@ -405,11 +447,13 @@ async fn handle_command(
                                 true,
                                 event_tx.clone(),
                                 ConnectionCommandReceiver(rpc_rx),
+                                renewal_rx,
                                 Some(stream),
                                 socket.clone(),
                             ),
                         )),
                         rpc_tx,
+                        renewal_tx,
                     });
                     let _ = result_tx.send(Ok(()));
                 }
@@ -434,7 +478,7 @@ async fn handle_command(
                 .filter(|task| task.connection_id == connection_id)
             {
                 if task
-                    .rpc_tx
+                    .renewal_tx
                     .send(ConnectionRpcCommand::RenewAccess {
                         spec,
                         refresh_generation,
@@ -598,6 +642,7 @@ async fn run_connection_task(
     retry_initial_failure: bool,
     event_tx: GatewayWsEventSender,
     mut rpc_rx: ConnectionCommandReceiver,
+    mut renewal_rx: RenewalReceiver,
     mut established_stream: Option<GatewayWebSocket>,
     socket: Arc<Mutex<Option<SocketReceipt>>>,
 ) {
@@ -646,6 +691,7 @@ async fn run_connection_task(
                     connection_id,
                     &event_tx,
                     &mut rpc_rx.0,
+                    &mut renewal_rx.0,
                     receipt,
                     cancels,
                 )
@@ -881,6 +927,7 @@ async fn monitor_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Un
     connection_id: u64,
     event_tx: &GatewayWsEventSender,
     rpc_rx: &mut UnboundedReceiver<WorkItem<ConnectionRpcCommand>>,
+    renewal_rx: &mut tokio::sync::mpsc::Receiver<WorkItem<ConnectionRpcCommand>>,
     receipt: SocketReceipt,
     mut cancels: SocketCancelReceiver,
 ) -> String {
@@ -902,6 +949,9 @@ async fn monitor_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Un
     };
 
     let _lifetime = SocketLifetime(receipt.clone());
+    // One connection-owned frame; its voice reservation follows it into the writer.
+    // Keep the FIFO stopped until admission, but renewals have independent ingress.
+    let mut pending_data: Option<WriterFrame> = None;
     let mut prefer_commands = false;
     let mut prefer_cancels = true;
     let disconnect_reason = loop {
@@ -926,19 +976,32 @@ async fn monitor_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Un
                     break "websocket control writer handoff full or closed".to_owned();
                 }
             }
+            permit = data_tx.reserve(), if pending_data.is_some() => {
+                match permit {
+                    Ok(permit) => { permit.send(pending_data.take().expect("pending data frame")); }
+                    Err(_) => break "websocket data writer handoff closed".to_owned(),
+                }
+            }
             input = async {
+                let command = async {
+                    tokio::select! {
+                        item = renewal_rx.recv() => item,
+                        item = rpc_rx.recv(), if pending_data.is_none() => item,
+                    }
+                };
+                tokio::pin!(command);
                 let regular = async {
                 if prefer_commands {
                     tokio::select! {
                         biased;
-                        item = rpc_rx.recv() => Either::Left(item),
+                        item = &mut command => Either::Left(item),
                         payload = reader.next() => Either::Right(payload),
                     }
                 } else {
                     tokio::select! {
                         biased;
                         payload = reader.next() => Either::Right(payload),
-                        item = rpc_rx.recv() => Either::Left(item),
+                        item = &mut command => Either::Left(item),
                     }
                 }
                 };
@@ -1097,10 +1160,20 @@ async fn monitor_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Un
                         if !response_tx.is_active() { response_tx.cancel(); return None; }
                         waiters.requests.insert(request_id, response_tx.clone());
                         // Registration precedes admission, including a possible fast response.
-                        if data_tx.try_send(WriterFrame::new(Message::Text(payload.into()), Some(response_tx.clone()))).is_err() {
-                            let _ = response_tx.send(Err(crate::rpc::JsonRpcResponseError::transport(
-                                "websocket writer handoff full or closed",
-                            )));
+                        let frame = WriterFrame::new(Message::Text(payload.into()), Some(response_tx.clone()));
+                        match data_tx.try_send(frame) {
+                            Ok(()) => {}
+                            Err(tokio::sync::mpsc::error::TrySendError::Full(frame)) if matches!(&frame.message, Message::Text(payload)
+                                if serde_json::from_str::<serde_json::Value>(payload.as_ref()).ok()
+                                    .is_some_and(|rpc| rpc["method"] == pioneer_protocol::constants::methods::VOICE_SESSION_FINALIZE)) => {
+                                // Only voice Finalize waits; ordinary RPC overload stays unchanged.
+                                pending_data = Some(frame);
+                            }
+                            Err(_) => {
+                                let _ = response_tx.send(Err(crate::rpc::JsonRpcResponseError::transport(
+                                    "websocket writer handoff full or closed",
+                                )));
+                            }
                         }
                     }
                     Some(ConnectionRpcCommand::BinaryUploadChunk { upload_id, offset, payload, response_tx }) => {
@@ -1123,8 +1196,14 @@ async fn monitor_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Un
                         }
                     }
                     Some(ConnectionRpcCommand::VoiceBinaryChunk { payload }) => {
-                        if data_tx.try_send(WriterFrame::voice(payload)).is_err() {
-                            return Some("websocket voice writer handoff full or closed".to_owned());
+                        match data_tx.try_send(WriterFrame::voice(payload)) {
+                            Ok(()) => {}
+                            Err(tokio::sync::mpsc::error::TrySendError::Full(frame)) => {
+                                pending_data = Some(frame);
+                            }
+                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                                return Some("websocket voice writer handoff closed".to_owned());
+                            }
                         }
                     }
                     None => {
@@ -1144,6 +1223,9 @@ async fn monitor_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Un
     receipt.retire();
     waiters.fail_all(&disconnect_reason);
     fail_queued_connection_commands(rpc_rx, &disconnect_reason);
+    while let Ok(item) = renewal_rx.try_recv() {
+        item.value.fail(&disconnect_reason);
+    }
     disconnect_reason
 }
 
@@ -1177,6 +1259,7 @@ mod tests {
         let (events, _event_rx) = mpsc::channel();
         let events = GatewayWsEventSender::from(events);
         let (commands, mut command_rx) = work_channel(Boundary::ClientRpc);
+        let (renewals, mut renewal_rx) = renewal_channel();
         let (receipt, cancels) = SocketReceipt::new(7);
         let task = tokio::spawn(async move {
             monitor_connection(
@@ -1185,6 +1268,7 @@ mod tests {
                 7,
                 &events,
                 &mut command_rx,
+                &mut renewal_rx.0,
                 receipt,
                 cancels,
             )
@@ -1209,7 +1293,7 @@ mod tests {
             .unwrap();
         while !matches!(peer.next().await.unwrap().unwrap(), Message::Text(_)) {}
         let (ack, ack_rx) = mpsc::channel();
-        commands
+        renewals
             .send(ConnectionRpcCommand::RenewAccess {
                 spec: next,
                 refresh_generation: 2,
