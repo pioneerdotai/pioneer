@@ -1927,8 +1927,13 @@ mod bound_db_regressions {
     // Keep collection rounds separate: order within a collection is unspecified,
     // while order across Delta collections is meaningful.
     type Samples = BTreeMap<String, Vec<Vec<Sample>>>;
-    #[derive(Clone, Default, Debug)]
-    struct Sink(Arc<Mutex<Samples>>);
+    #[derive(Clone, Debug)]
+    struct Sink(Arc<Mutex<Samples>>, &'static [&'static str]);
+    impl Sink {
+        fn new(names: &'static [&'static str]) -> Self {
+            Self(Arc::new(Mutex::new(BTreeMap::new())), names)
+        }
+    }
     impl PushMetricExporter for Sink {
         async fn export(
             &self,
@@ -1936,6 +1941,11 @@ mod bound_db_regressions {
         ) -> opentelemetry_sdk::error::OTelSdkResult {
             let mut samples = self.0.lock().unwrap();
             for metric in metrics.scope_metrics().flat_map(|scope| scope.metrics()) {
+                // GatewayMetrics also registers observable gauges. Only collect
+                // this scenario's instruments; keep type checks strict for them.
+                if !self.1.contains(&metric.name()) {
+                    continue;
+                }
                 let mut rows = Vec::new();
                 match metric.data() {
                     AggregatedMetrics::F64(MetricData::Histogram(histogram)) => {
@@ -2010,7 +2020,12 @@ mod bound_db_regressions {
     // registration must neither split a series nor lose a measurement.
     #[test]
     fn bound_db_series_preserve_sdk_outputs_across_delta_and_rebind() {
-        let sink = Sink::default();
+        let sink = Sink::new(&[
+            "plain.duration",
+            "bound.duration",
+            "plain.count",
+            "bound.count",
+        ]);
         let reader = PeriodicReader::builder(sink.clone())
             .with_interval(Duration::from_secs(86400))
             .build();
@@ -2105,7 +2120,11 @@ mod bound_db_regressions {
         let _lock = crate::telemetry::tests::TELEMETRY_TEST_LOCK.lock().unwrap();
         let _reset = ConsentReset(crate::telemetry_enabled());
         crate::set_telemetry_enabled(true);
-        let sink = Sink::default();
+        let sink = Sink::new(&[
+            "pioneer.gateway.db.read.admission.queue.depth",
+            "pioneer.gateway.db.read.admission.active",
+            "pioneer.gateway.db.read.admission.events",
+        ]);
         let reader = PeriodicReader::builder(sink.clone())
             .with_interval(Duration::from_secs(86400))
             .build();
@@ -2218,7 +2237,7 @@ mod bound_db_regressions {
     #[test]
     fn sdk_exhausted_bound_owner_stays_overflow_until_drop_and_rebind() {
         use opentelemetry_sdk::metrics::Stream;
-        let sink = Sink::default();
+        let sink = Sink::new(&["bounded.count"]);
         let reader = PeriodicReader::builder(sink.clone())
             .with_interval(Duration::from_secs(86400))
             .build();
@@ -2286,7 +2305,10 @@ mod bound_db_regressions {
         let _lock = crate::telemetry::tests::TELEMETRY_TEST_LOCK.lock().unwrap();
         let _reset = ConsentReset(crate::telemetry_enabled());
         crate::set_telemetry_enabled(true);
-        let sink = Sink::default();
+        let sink = Sink::new(&[
+            "pioneer.gateway.db.operations",
+            "pioneer.gateway.db.operation.duration",
+        ]);
         let reader = PeriodicReader::builder(sink.clone())
             .with_interval(Duration::from_secs(86400))
             .build();
