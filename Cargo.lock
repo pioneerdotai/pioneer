@@ -10858,7 +10858,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-desktop-plugins"
-version = "0.66.0"
+version = "0.67.0"
 dependencies = [
  "gpui-kit",
  "pioneer-client",
@@ -11216,7 +11216,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-plugins"
-version = "0.66.0"
+version = "0.67.0"
 dependencies = [
  "anyhow",
  "hex",
