@@ -602,6 +602,8 @@ mod tests {
                     gateway_only_secret: SECRET_CANARY.to_owned(),
                     after_cancel_entered: tokio::sync::Notify::new(),
                     after_cancel_release: tokio::sync::Notify::new(),
+                    is_error: false,
+                    duration_ms: 3,
                 });
                 let mut limits = CliMcpFacadeLimits::default();
                 if mode != "joined-owned" {
