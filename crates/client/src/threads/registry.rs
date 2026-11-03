@@ -6696,34 +6696,35 @@ mod tests {
         assert!(core.thread_semantic_in_flight("b").is_empty());
     }
 
+    struct ResumeSnapshotPort(std::cell::RefCell<Vec<(String, String)>>);
+    impl crate::rpc::JsonRpcRequestTransport for ResumeSnapshotPort {
+        fn send_json_rpc_request(
+            &self,
+            _: String,
+            payload: String,
+            response: crate::rpc::JsonRpcResponseSender,
+        ) -> Result<(), String> {
+            let rpc: serde_json::Value = serde_json::from_str(&payload).unwrap();
+            let method = rpc["method"].as_str().unwrap().to_owned();
+            let turn = rpc["params"]["turn_id"].as_str().unwrap().to_owned();
+            self.0.borrow_mut().push((method.clone(), turn.clone()));
+            assert_eq!(method, "turn/get", "stale A items must never be sent");
+            response
+                .send(Ok(serde_json::to_value(
+                    pioneer_protocol::TurnGetResponse {
+                        thread_id: "a".into(),
+                        workspace_id: "ws".into(),
+                        turn: running_turn(&turn),
+                    },
+                )
+                .unwrap()))
+                .unwrap();
+            Ok(())
+        }
+    }
+
     #[test]
     fn queued_resume_continuation_cannot_consume_new_turn_ready_intent() {
-        struct SnapshotPort(std::cell::RefCell<Vec<(String, String)>>);
-        impl crate::rpc::JsonRpcRequestTransport for SnapshotPort {
-            fn send_json_rpc_request(
-                &self,
-                _: String,
-                payload: String,
-                response: crate::rpc::JsonRpcResponseSender,
-            ) -> Result<(), String> {
-                let rpc: serde_json::Value = serde_json::from_str(&payload).unwrap();
-                let method = rpc["method"].as_str().unwrap().to_owned();
-                let turn = rpc["params"]["turn_id"].as_str().unwrap().to_owned();
-                self.0.borrow_mut().push((method.clone(), turn.clone()));
-                assert_eq!(method, "turn/get", "stale A items must never be sent");
-                response
-                    .send(Ok(serde_json::to_value(
-                        pioneer_protocol::TurnGetResponse {
-                            thread_id: "a".into(),
-                            workspace_id: "ws".into(),
-                            turn: running_turn(&turn),
-                        },
-                    )
-                    .unwrap()))
-                    .unwrap();
-                Ok(())
-            }
-        }
         for reset_after_sweep in [false, true] {
             let core = crate::catalog_test_support::settings_client();
             core.upsert_thread(thread("a", "ws"));
@@ -6749,7 +6750,7 @@ mod tests {
             let ThreadControllerRequest::ResumeJob(request) = request else {
                 panic!()
             };
-            let port = SnapshotPort(Default::default());
+            let port = ResumeSnapshotPort(Default::default());
             let continuation = core.execute_thread_resume_quantum(&port, request).unwrap();
             let c = continuation.continuation.as_ref().unwrap();
             let stale = ThreadResumeRequest {
@@ -6818,6 +6819,194 @@ mod tests {
             assert!(core.execute_thread_resume_quantum(&port, stale).is_none());
             assert!(
                 core.thread_coordinator_snapshot("a")
+                    .unwrap()
+                    .resume
+                    .in_progress
+            );
+        }
+    }
+
+    #[test]
+    fn queued_resume_cleanup_recovers_after_cancellation_or_move_without_reset() {
+        use pioneer_observability::work::{Boundary, ExecutorRole, WorkItem, WorkKind};
+        let copy_continuation = |request: &ThreadResumeRequest| {
+            let c = request.continuation.as_ref().unwrap();
+            ThreadResumeRequest {
+                id: request.id.clone(),
+                generation: request.generation,
+                continuation: Some(ThreadResumeContinuation {
+                    attempt: c.attempt,
+                    snapshot: c.snapshot.clone(),
+                    after: c.after,
+                }),
+            }
+        };
+        for moved in [false, true] {
+            let core = crate::catalog_test_support::settings_client();
+            core.upsert_thread(thread("a", "ws"));
+            let (sender, receiver) = crate::threads::history_scheduler::channel();
+            *core.thread_request_sender.lock().unwrap() = Some(sender);
+            let start = |turn: &str| {
+                core.apply_thread_conversation_event(
+                    "ws",
+                    ConversationEvent::TurnStarted {
+                        thread_id: "a".into(),
+                        turn: running_turn(turn),
+                    },
+                    None,
+                );
+            };
+            let cancel = |turn: &str| {
+                let (token, params) = core.begin_thread_turn_cancellation("a", None).unwrap();
+                assert_eq!(params.turn_id, turn);
+                let mut cancelled = running_turn(turn);
+                cancelled.status = TurnStatus::Interrupted;
+                let event = crate::turns::cancel::turn_cancel_response_event(TurnCancelResponse {
+                    workspace_id: "ws".into(),
+                    thread_id: "a".into(),
+                    turn: cancelled,
+                });
+                assert!(core.finish_thread_turn_cancellation(&token, turn, event, false));
+            };
+            let port = ResumeSnapshotPort(Default::default());
+            start("A");
+            core.schedule_thread_resume("a").unwrap();
+            core.drive_due_thread_resumes();
+            let (request, carrier) = receiver.take_by(|_| false).unwrap().received(
+                Boundary::StdThread,
+                WorkKind::ClientCommand,
+                ExecutorRole::ClientController,
+            );
+            let ThreadControllerRequest::ResumeJob(request) = request else {
+                panic!()
+            };
+            let continuation = core.execute_thread_resume_quantum(&port, request).unwrap();
+            let old_running = copy_continuation(&continuation);
+            let old_missing = copy_continuation(&continuation);
+            receiver.finish(Some(WorkItem::from_carrier(
+                ThreadControllerRequest::ResumeJob(continuation),
+                carrier,
+                None,
+            )));
+
+            // Both lifecycle paths leave the Resume coordinator untouched.
+            // Cancellation removes the turn; a live new turn moves it to B.
+            if moved {
+                start("B");
+                core.schedule_thread_resume("a").unwrap();
+            } else {
+                cancel("A");
+                assert_eq!(
+                    core.thread_coordinator_snapshot("a")
+                        .unwrap()
+                        .conversation
+                        .in_flight_turn_id(),
+                    None
+                );
+            }
+            assert!(
+                core.thread_coordinator_snapshot("a")
+                    .unwrap()
+                    .resume
+                    .in_progress
+            );
+            core.retire_thread_controller_jobs();
+            core.drive_due_thread_resumes();
+            if core
+                .thread_coordinator_snapshot("a")
+                .unwrap()
+                .resume
+                .in_progress
+            {
+                let (request, _) = receiver
+                    .take_by(|_| false)
+                    .expect("unfinished attempt must retain a cleanup owner after sweep")
+                    .received(
+                        Boundary::StdThread,
+                        WorkKind::ClientCommand,
+                        ExecutorRole::ClientController,
+                    );
+                let ThreadControllerRequest::ResumeJob(request) = request else {
+                    panic!()
+                };
+                assert!(core.execute_thread_resume_quantum(&port, request).is_none());
+                receiver.finish(None);
+            }
+            let coordinator = core.thread_coordinator_snapshot("a").unwrap();
+            let resume = &coordinator.resume;
+            assert!(
+                !resume.in_progress,
+                "no orphaned logical attempt after prepare"
+            );
+            assert_eq!(resume.next_attempt_at.is_some(), moved);
+            if !moved {
+                start("B");
+                core.schedule_thread_resume("a").unwrap();
+            }
+            // No further event/reset/rotation or timeout: discovery alone must
+            // now admit B using the ready intent or existing recovery deadline.
+            core.drive_due_thread_resumes();
+            let (request, carrier) = receiver
+                .take_by(|_| false)
+                .expect("B begins without an additional recovery trigger")
+                .received(
+                    Boundary::StdThread,
+                    WorkKind::ClientCommand,
+                    ExecutorRole::ClientController,
+                );
+            let ThreadControllerRequest::ResumeJob(request) = request else {
+                panic!()
+            };
+            let continuation = core.execute_thread_resume_quantum(&port, request).unwrap();
+            receiver.finish(Some(WorkItem::from_carrier(
+                ThreadControllerRequest::ResumeJob(continuation),
+                carrier,
+                None,
+            )));
+            assert_eq!(
+                *port.0.borrow(),
+                [
+                    ("turn/get".into(), "A".into()),
+                    ("turn/get".into(), "B".into()),
+                ]
+            );
+            assert!(core.prepare_thread_resume_quantum(old_running).is_none());
+            assert!(
+                core.thread_coordinator_snapshot("a")
+                    .unwrap()
+                    .resume
+                    .in_progress
+            );
+            // Missing turn must also check the attempt receipt before reset.
+            cancel("B");
+            assert!(core.prepare_thread_resume_quantum(old_missing).is_none());
+            assert!(
+                core.thread_coordinator_snapshot("a")
+                    .unwrap()
+                    .resume
+                    .in_progress
+            );
+            core.retire_thread_controller_jobs();
+            if core
+                .thread_coordinator_snapshot("a")
+                .unwrap()
+                .resume
+                .in_progress
+            {
+                let (request, _) = receiver.take_by(|_| false).unwrap().received(
+                    Boundary::StdThread,
+                    WorkKind::ClientCommand,
+                    ExecutorRole::ClientController,
+                );
+                let ThreadControllerRequest::ResumeJob(request) = request else {
+                    panic!()
+                };
+                assert!(core.prepare_thread_resume_quantum(request).is_none());
+                receiver.finish(None);
+            }
+            assert!(
+                !core
+                    .thread_coordinator_snapshot("a")
                     .unwrap()
                     .resume
                     .in_progress
@@ -16382,10 +16571,10 @@ impl ThreadRegistry {
             R::ResumeJob(request) => self.stores.get(&request.id).is_some_and(|store| {
                 store.generation == request.generation
                     && request.continuation.as_ref().is_none_or(|c| {
-                        c.attempt == store.resume_attempt
-                            && store.coordinator.resume.in_progress
-                            && store.coordinator.conversation.in_flight_turn_id()
-                                == Some(c.snapshot.turn.id.as_str())
+                        // This queued item still owns logical cleanup if its
+                        // turn disappeared or moved. Let guarded prepare apply
+                        // the existing reset/recovery policy before releasing it.
+                        c.attempt == store.resume_attempt && store.coordinator.resume.in_progress
                     })
             }),
             R::Resume => false,
@@ -16583,6 +16772,14 @@ impl ClientCore {
             {
                 return None;
             }
+            // Check the receipt before even missing-turn cleanup: an old queued
+            // continuation must not reset a newer attempt after a sweep race.
+            if request.continuation.as_ref().is_some_and(|continuation| {
+                continuation.attempt != store.resume_attempt
+                    || !store.coordinator.resume.in_progress
+            }) {
+                return None;
+            }
             let Some(turn) = store
                 .coordinator
                 .conversation
@@ -16600,11 +16797,6 @@ impl ClientCore {
                 return None;
             };
             if let Some(continuation) = &request.continuation {
-                if continuation.attempt != store.resume_attempt
-                    || !store.coordinator.resume.in_progress
-                {
-                    return None;
-                }
                 if continuation.snapshot.turn.id != turn {
                     retire_moved_resume(store);
                     let drafts = registry.publish(id);
