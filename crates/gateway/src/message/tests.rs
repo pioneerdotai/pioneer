@@ -14060,7 +14060,7 @@ async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_comman
         assert_eq!(
             output_messages
                 .iter()
-                .filter(|m| m.content == command)
+                .filter(|m| prepared_user_text(m) == command)
                 .count(),
             1
         );
@@ -27409,9 +27409,13 @@ async fn recovered_hidden_task_run_dispatches_restored_child_main_without_planne
     let restored_context = requests[child_main_pos]
         .messages
         .iter()
-        .filter_map(|message| message.application_context.as_ref())
-        .filter(|metadata| metadata["kind"] == "turn_input")
-        .filter_map(|metadata| metadata["context"].as_str())
+        .filter(|message| {
+            message
+                .application_context
+                .as_ref()
+                .is_some_and(|metadata| metadata["kind"] == "continuation_context")
+        })
+        .map(|message| message.content.as_str())
         .find(|context| context.contains("Execution Continuation"))
         .expect("restored child input should include execution continuation context");
     assert!(
@@ -37567,10 +37571,10 @@ async fn cli_task_bootstrap_honors_empty_parent_context_policy_impl() {
     );
     assert_eq!(adapter_messages.len(), 3);
     assert!(
-        adapter_messages[1]["text"]
+        adapter_messages[0]["text"]
             .as_str()
             .unwrap()
-            .contains("<pioneer_turn_context>")
+            .contains("Runtime:")
     );
     assert!(
         !adapter_messages[0].to_string().contains(current_marker),

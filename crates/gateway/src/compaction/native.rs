@@ -483,10 +483,10 @@ async fn prepare_native_projection_with_prepared(
         if request.messages.iter().any(|message| {
             message.content_parts.iter().any(|part| match part {
                 pioneer_provider::MessageContentPart::File { file } => {
-                    matches!(&file.source, pioneer_provider::AttachmentDataSource::Reference { reference } if reference.starts_with("pioneer-artifact:"))
+                    file.artifact.is_some() || matches!(&file.source, pioneer_provider::AttachmentDataSource::Reference { reference } if reference.starts_with("pioneer-artifact:"))
                 }
                 pioneer_provider::MessageContentPart::Image { image } => {
-                    matches!(&image.source, pioneer_provider::AttachmentDataSource::Reference { reference } if reference.starts_with("pioneer-artifact:"))
+                    image.artifact.is_some() || matches!(&image.source, pioneer_provider::AttachmentDataSource::Reference { reference } if reference.starts_with("pioneer-artifact:"))
                 }
                 pioneer_provider::MessageContentPart::Text { .. }
                 | pioneer_provider::MessageContentPart::Audio { .. }

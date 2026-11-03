@@ -10693,7 +10693,11 @@ impl MessageProcessor {
                         resolved_is_image == expected_image,
                         "historical attachment kind changed after accepted capture"
                     );
-                    *attachment = resolved.attachment;
+                    // Validate availability even for saved materialized bytes, but
+                    // preserve their accepted representation on subsequent requests.
+                    if matches!(attachment.source, pioneer_provider::AttachmentDataSource::Reference { .. }) {
+                        *attachment = resolved.attachment;
+                    }
                 }
             }
             Ok(history)
