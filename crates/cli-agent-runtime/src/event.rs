@@ -645,8 +645,8 @@ pub fn map_codex_notification_event(
         }),
         "thread/goal/updated" => map_codex_thread_goal_updated(notification, options),
         "thread/goal/cleared" => map_codex_thread_goal_cleared(notification, options),
-        "thread/tokenUsage/updated"
-        | "fuzzyFileSearch/sessionUpdated"
+        "thread/tokenUsage/updated" => map_codex_usage(notification, options),
+        "fuzzyFileSearch/sessionUpdated"
         | "fuzzyFileSearch/sessionCompleted"
         | "windowsSandbox/setupCompleted" => raw_notification_with_payload(
             notification,
@@ -1182,6 +1182,36 @@ fn normalize_event_kind(kind: &str) -> String {
         .collect()
 }
 
+fn map_codex_usage(
+    notification: &CodexJsonlRpcNotificationEvent,
+    options: RuntimeEventMappingOptions,
+) -> RuntimeEvent {
+    let Some(params) = notification.params.as_ref() else {
+        return raw_notification(notification, options, "missing usage payload");
+    };
+    let Some(turn) = string_path(params, &["turnId"]) else {
+        return raw_notification(notification, options, "missing usage turn binding");
+    };
+    let thread = string_path(params, &["threadId"]);
+    RuntimeEvent::ItemCompleted(RuntimeItemCompleted {
+        native_thread_id: thread.clone(),
+        native_turn_id: turn.clone(),
+        native_item_id: format!(
+            "codex_usage_{}_{}",
+            thread.as_deref().unwrap_or_default(),
+            turn
+        ),
+        item_kind: "tokenUsage".into(),
+        text: None,
+        summary: Vec::new(),
+        content: Vec::new(),
+        phase: RuntimeAgentMessagePhase::FinalAnswer,
+        metadata: Some(crate::usage::codex_app_usage(&params["tokenUsage"])),
+        native_item_redacted: None,
+        native: None,
+    })
+}
+
 fn raw_notification(
     notification: &CodexJsonlRpcNotificationEvent,
     options: RuntimeEventMappingOptions,
@@ -1232,6 +1262,25 @@ fn native_notification(
     notification: &CodexJsonlRpcNotificationEvent,
     options: RuntimeEventMappingOptions,
 ) -> Option<RuntimeNativeEvent> {
+    if !options.include_redacted_native_payload
+        && matches!(
+            notification.method.as_str(),
+            "turn/started" | "turn/completed"
+        )
+    {
+        let timing = crate::usage::counters(
+            &notification.params.as_ref()?["turn"],
+            &["startedAt", "completedAt", "durationMs"],
+        );
+        return timing
+            .as_object()
+            .filter(|m| !m.is_empty())
+            .map(|_| RuntimeNativeEvent {
+                method: notification.method.clone(),
+                payload_redacted: Some(serde_json::json!({"turn":timing})),
+                raw_redacted: None,
+            });
+    }
     options
         .include_redacted_native_payload
         .then(|| RuntimeNativeEvent {
@@ -1772,6 +1821,32 @@ mod tests {
     use crate::driver::JsonlRpcId;
     use chrono::TimeZone;
     use serde_json::json;
+
+    #[test]
+    fn codex_usage_wire_is_numeric_without_debug_and_bound_to_native_turn() {
+        let event = map_codex_notification_event(
+            &CodexJsonlRpcNotificationEvent {
+                method: "thread/tokenUsage/updated".into(),
+                params: Some(json!({"threadId":"thread", "turnId":"turn", "tokenUsage":{
+                    "total":{"inputTokens":100,"cachedInputTokens":80,"outputTokens":13,"reasoningOutputTokens":4,"accessToken":"SECRET"},
+                    "last":{"inputTokens":20}, "modelContextWindow":200000
+                }, "authorization":"SECRET"})),
+                raw: json!({"apiKey":"SECRET"}),
+            },
+            RuntimeEventMappingOptions::default(),
+        );
+        let RuntimeEvent::ItemCompleted(item) = event else {
+            panic!("expected usage item");
+        };
+        assert_eq!(item.native_thread_id.as_deref(), Some("thread"));
+        assert_eq!(item.native_turn_id, "turn");
+        let usage = item.metadata.unwrap();
+        assert_eq!(usage["input_tokens"], 100);
+        assert_eq!(usage["output_tokens"], 13);
+        assert_eq!(usage["native_usage"]["last"]["inputTokens"], 20);
+        assert!(usage["cache_creation_input_tokens"].is_null());
+        assert!(!usage.to_string().contains("SECRET"));
+    }
 
     #[test]
     fn command_output_is_durable_in_both_ingress_queues() {

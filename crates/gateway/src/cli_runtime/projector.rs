@@ -75,11 +75,17 @@ impl CLIRuntimeProjectedEvents {
     }
 }
 
+pub(crate) fn is_supplemental_statistics(event: &AgentDurableEvent) -> bool {
+    matches!(event, AgentDurableEvent::ItemCompleted { notification }
+        if matches!(&notification.item, TurnItem::SystemEvent { code: Some(code), .. }
+            if matches!(code.as_str(), "provider_usage" | "cli_native_turn_timing")))
+}
+
 pub(crate) fn project_cli_runtime_event(
     context: &CLIRuntimeProjectorContext,
     event: &RuntimeEvent,
 ) -> CLIRuntimeProjectedEvents {
-    match event {
+    let mut projected = match event {
         RuntimeEvent::TurnCompleted(_) => {
             CLIRuntimeProjectedEvents::durable(AgentDurableEvent::TurnCompleted {
                 thread_id: context.thread_id.clone(),
@@ -147,7 +153,76 @@ pub(crate) fn project_cli_runtime_event(
         | RuntimeEvent::AppListUpdated(_) => {
             CLIRuntimeProjectedEvents::ignored(event_kind_name(event).to_owned())
         }
+    };
+    if let Some(timing) = project_cli_runtime_timing(context, event) {
+        projected.durable.insert(0, timing);
     }
+    projected
+}
+
+/// Project only observed native timing, without a Pioneer lifecycle transition.
+pub(crate) fn project_cli_runtime_timing(
+    context: &CLIRuntimeProjectorContext,
+    event: &RuntimeEvent,
+) -> Option<AgentDurableEvent> {
+    let (thread, turn, native) = match event {
+        RuntimeEvent::TurnStarted(e) => (
+            e.native_thread_id.as_deref(),
+            Some(e.native_turn_id.as_str()),
+            e.native.as_ref(),
+        ),
+        RuntimeEvent::TurnCompleted(e) => (
+            e.native_thread_id.as_deref(),
+            Some(e.native_turn_id.as_str()),
+            e.native.as_ref(),
+        ),
+        RuntimeEvent::TurnFailed(e) => (
+            e.native_thread_id.as_deref(),
+            e.native_turn_id.as_deref(),
+            e.native.as_ref(),
+        ),
+        RuntimeEvent::TurnInterrupted(e) => (
+            e.native_thread_id.as_deref(),
+            Some(e.native_turn_id.as_str()),
+            e.native.as_ref(),
+        ),
+        _ => return None,
+    };
+    let turn = turn?;
+    let native =
+        native.filter(|n| matches!(n.method.as_str(), "turn/started" | "turn/completed"))?;
+    let timing = pioneer_cli_agent_runtime::usage::counters(
+        &native.payload_redacted.as_ref().unwrap_or(&JsonValue::Null)["turn"],
+        &["startedAt", "completedAt", "durationMs"],
+    );
+    if !timing.as_object().is_some_and(|m| !m.is_empty()) {
+        return None;
+    }
+    // This is a deterministic encoding of existing native identity, not a new
+    // execution ID. Payload/timestamps do not define replay identity.
+    use sha2::{Digest, Sha256};
+    let identity = json!([context.turn_id, thread, turn, native.method]).to_string();
+    let id = format!(
+        "cli_native_timing_{}",
+        hex::encode(Sha256::digest(identity.as_bytes()))
+    );
+    Some(AgentDurableEvent::ItemCompleted {
+        notification: ItemCompletedNotification {
+            workspace_id: context.workspace_id.clone(),
+            thread_id: context.thread_id.clone(),
+            turn_id: context.turn_id.clone(),
+            item: TurnItem::SystemEvent {
+                id,
+                level: SystemEventLevel::Info,
+                message: "CLI native turn timing".into(),
+                code: Some("cli_native_turn_timing".into()),
+                details: Some(json!({"runtime":"codex", "scope":"turn",
+                    "observation_kind":"cli_native_turn_timing",
+                    "native_thread_id":thread,"native_turn_id":turn,"native_method":native.method,
+                    "native_timing":timing,"timestamp_unit":"unix_seconds","duration_unit":"milliseconds"})),
+            },
+        },
+    })
 }
 
 fn project_runtime_error(
@@ -798,6 +873,45 @@ fn started_turn_item(
 }
 
 fn completed_turn_item(completed: &RuntimeItemCompleted) -> TurnItem {
+    if completed.item_kind == "tokenUsage" {
+        let mut usage = completed.metadata.clone().unwrap_or_else(|| json!({}));
+        if let Some(usage) = usage.as_object_mut() {
+            usage.insert("native_thread_id".into(), json!(completed.native_thread_id));
+            usage.insert("native_turn_id".into(), json!(completed.native_turn_id));
+        }
+        // Codex values can recur after a reset. Only the persisted local
+        // receipt identifies replay; matching content is not replay evidence.
+        let id = if usage["runtime"] == "codex" {
+            let receipt = usage["observation_id"].as_str().map(str::to_owned);
+            usage["replay_identity"] = json!(if receipt.is_some() {
+                "local_journal_receipt"
+            } else {
+                "unknown"
+            });
+            usage["baseline"] = json!("unknown");
+            usage["native_replay_identity"] = json!("unavailable");
+            format!(
+                "cli_usage:{}",
+                receipt.unwrap_or_else(|| pioneer_protocol::generate_id(24))
+            )
+        } else {
+            use sha2::{Digest, Sha256};
+            let digest = hex::encode(Sha256::digest(usage.to_string().as_bytes()));
+            format!("{}:{digest}", completed.native_item_id)
+        };
+        return TurnItem::SystemEvent {
+            id,
+            level: SystemEventLevel::Info,
+            message: "CLI usage observation".into(),
+            code: Some("provider_usage".into()),
+            details: Some(json!({
+                "schema_version": 1,
+                "complete": false,
+                "usage": usage,
+                "observation_kind": "cli_native_statistics",
+            })),
+        };
+    }
     if is_agent_message_kind(completed.item_kind.as_str()) {
         return TurnItem::AgentMessage {
             id: completed.native_item_id.clone(),
@@ -1752,6 +1866,89 @@ mod tests {
             RuntimeEventMappingOptions::default(),
         );
         project_cli_runtime_event(&context(), &event)
+    }
+
+    #[test]
+    fn native_timing_identity_preserves_segments_and_idempotent_replay() {
+        let project = |turn: &str| {
+            project_codex_notification(
+                "turn/started",
+                json!({
+                    "threadId":"native-thread", "turn":{"id":turn,"startedAt":10}
+                }),
+            )
+            .durable
+        };
+        let first = project("segment-one");
+        assert_eq!(first, project("segment-one"));
+        let second = project("segment-two");
+        assert_ne!(first, second);
+        for (events, turn) in [(first, "segment-one"), (second, "segment-two")] {
+            assert_eq!(events.len(), 1);
+            let AgentDurableEvent::ItemCompleted { notification } = &events[0] else {
+                panic!("timing only")
+            };
+            let TurnItem::SystemEvent {
+                details: Some(details),
+                ..
+            } = &notification.item
+            else {
+                panic!("timing")
+            };
+            assert_eq!(details["native_turn_id"], turn);
+            assert_eq!(details["native_thread_id"], "native-thread");
+            assert_eq!(details["native_timing"]["startedAt"], 10);
+        }
+    }
+
+    #[test]
+    fn codex_usage_projection_deduplicates_receipts_not_counter_content() {
+        use pioneer_cli_agent_runtime::codex::CodexJsonlRpcNotificationEvent;
+        use pioneer_cli_agent_runtime::event::{
+            RuntimeEventMappingOptions, map_codex_notification_event,
+        };
+        let project = |receipt: &str| {
+            let mut event = map_codex_notification_event(
+                &CodexJsonlRpcNotificationEvent {
+                    method: "thread/tokenUsage/updated".into(),
+                    params: Some(json!({"threadId":"thread", "turnId":"turn",
+                    "tokenUsage":{"total":{"inputTokens":100,"cachedInputTokens":80},
+                    "secret":"SECRET"}})),
+                    raw: json!({}),
+                },
+                RuntimeEventMappingOptions::default(),
+            );
+            let RuntimeEvent::ItemCompleted(item) = &mut event else {
+                panic!("usage")
+            };
+            item.metadata.as_mut().unwrap()["observation_id"] = json!(receipt);
+            project_cli_runtime_event(&context(), &event)
+                .durable
+                .remove(0)
+        };
+        let first = project("saved-receipt-one");
+        let replay = project("saved-receipt-one");
+        let repeated_counters = project("saved-receipt-two");
+        let item = |event: AgentDurableEvent| {
+            let AgentDurableEvent::ItemCompleted { notification } = event else {
+                panic!("item")
+            };
+            notification.item
+        };
+        let first = item(first);
+        assert_eq!(first, item(replay));
+        assert_ne!(first, item(repeated_counters));
+        let encoded = serde_json::to_string(&first).unwrap();
+        assert!(!encoded.contains("SECRET"));
+        let TurnItem::SystemEvent {
+            details: Some(details),
+            ..
+        } = first
+        else {
+            panic!("usage")
+        };
+        assert_eq!(details["usage"]["baseline"], "unknown");
+        assert_eq!(details["usage"]["native_replay_identity"], "unavailable");
     }
 
     #[test]

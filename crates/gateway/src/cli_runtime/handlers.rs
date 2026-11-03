@@ -3894,7 +3894,7 @@ impl MessageProcessor {
                         return;
                     }
                     if cli_runtime_event_requires_native_journal(&event) {
-                        notification_processor
+                        let observation_id = notification_processor
                             .persist_codex_native_transport_event(
                                 &notification_instance,
                                 "notification",
@@ -3903,6 +3903,13 @@ impl MessageProcessor {
                                 debug_native_events,
                             )
                             .await;
+                        if let RuntimeEvent::ItemCompleted(item) = &mut event {
+                            if item.item_kind == "tokenUsage" {
+                                if let Some(id) = observation_id {
+                                    item.metadata.get_or_insert_with(|| json!({}))["observation_id"] = json!(id);
+                                }
+                            }
+                        }
                     }
                     notification_processor
                         .handle_cli_runtime_timeline_event(&notification_instance, event)
@@ -3976,7 +3983,7 @@ impl MessageProcessor {
                         .await;
                     continue;
                 }
-                request_processor
+                let _ = request_processor
                     .persist_codex_native_transport_event(
                         &request_instance,
                         "server_request",
@@ -4214,10 +4221,10 @@ impl MessageProcessor {
         native_method: &str,
         params: Option<&JsonValue>,
         include_payload: bool,
-    ) {
+    ) -> Option<String> {
         if !self.cli_runtime_instance_is_current(instance).await {
             self.audit_stale_cli_runtime_process_activity(instance, "native_journal");
-            return;
+            return None;
         }
         let key = instance.key();
         let native_thread_id = params.and_then(|params| {
@@ -4244,7 +4251,7 @@ impl MessageProcessor {
         } else {
             None
         };
-        let payload = if include_payload {
+        let mut payload = if include_payload {
             json!({
                 "sessionGeneration": instance.generation(),
                 "transportKind": transport_kind,
@@ -4258,6 +4265,14 @@ impl MessageProcessor {
                 "nativeItemId": native_item_id,
             })
         };
+        // Statistics are a bounded contract, independent of transcript/debug retention.
+        // The row ID identifies this local receipt, never a native request or sequence.
+        if native_method == "thread/tokenUsage/updated" {
+            payload["cliUsage"] = pioneer_cli_agent_runtime::usage::codex_app_usage(
+                &params.unwrap_or(&JsonValue::Null)["tokenUsage"],
+            );
+        }
+        let observation_id = generate_id(24);
         let payload_redacted_json = match serde_json::to_string(&payload) {
             Ok(payload) => payload,
             Err(error) => {
@@ -4269,13 +4284,13 @@ impl MessageProcessor {
                     error = %format!("{error:#}"),
                     "failed to serialize Codex native event payload"
                 );
-                return;
+                return None;
             }
         };
         if let Err(error) = self
             .crud_store
             .append_cli_runtime_native_event(NewCliRuntimeNativeEvent {
-                id: generate_id(24),
+                id: observation_id.clone(),
                 runtime_id: key.runtime_id.clone(),
                 runtime_kind: "codex".to_owned(),
                 workspace_id: Some(key.workspace_id.clone()),
@@ -4298,7 +4313,9 @@ impl MessageProcessor {
                 error = %format!("{error:#}"),
                 "failed to persist Codex native event"
             );
+            return None;
         }
+        Some(observation_id)
     }
 
     pub(crate) async fn persist_cli_runtime_canonical_event(
@@ -5926,6 +5943,39 @@ impl MessageProcessor {
         Ok(true)
     }
 
+    async fn publish_cli_runtime_supplemental_timing(
+        &self,
+        instance: &CliSessionInstanceId,
+        binding: &pioneer_crud::CliRuntimeTurnBindingRecord,
+        event: &RuntimeEvent,
+        turn_transition: Option<&Arc<tokio::sync::OwnedMutexGuard<()>>>,
+        terminal_delivery: Option<&pioneer_protocol::CliRuntimeBlockedTurnGuard>,
+    ) {
+        let context = crate::cli_runtime::projector::CLIRuntimeProjectorContext {
+            workspace_id: binding.workspace_id.clone(),
+            thread_id: binding.thread_id.clone(),
+            turn_id: binding.turn_id.clone(),
+            recovery: None,
+            codex_retry_attempt_id: None,
+        };
+        if let Some(timing) =
+            crate::cli_runtime::projector::project_cli_runtime_timing(&context, event)
+        {
+            if let Err(error) = self
+                .publish_cli_runtime_durable_guarded(
+                    instance,
+                    timing,
+                    turn_transition,
+                    terminal_delivery.cloned(),
+                )
+                .await
+            {
+                warn!(turn_id = binding.turn_id, error = %error,
+                    "failed to persist supplemental native completion timing");
+            }
+        }
+    }
+
     async fn process_bound_cli_runtime_event_inner(
         &self,
         instance: &CliSessionInstanceId,
@@ -6153,6 +6203,14 @@ impl MessageProcessor {
                 );
                 return false;
             };
+            self.publish_cli_runtime_supplemental_timing(
+                instance,
+                &turn_binding,
+                &event,
+                turn_transition,
+                terminal_delivery,
+            )
+            .await;
             match self
                 .crud_store
                 .terminalize_cli_runtime_execution_segment(
@@ -6196,6 +6254,14 @@ impl MessageProcessor {
                     let Some(source) = terminal_delivery else {
                         return false;
                     };
+                    self.publish_cli_runtime_supplemental_timing(
+                        instance,
+                        &turn_binding,
+                        &event,
+                        turn_transition,
+                        terminal_delivery,
+                    )
+                    .await;
                     match self
                         .continue_cli_attached_task_work(
                             instance,
@@ -6566,6 +6632,7 @@ impl MessageProcessor {
         };
         let projected = crate::cli_runtime::projector::project_cli_runtime_event(&context, &event);
         for durable in projected.durable {
+            let supplemental = crate::cli_runtime::projector::is_supplemental_statistics(&durable);
             if let Err(error) = self
                 .publish_cli_runtime_durable_guarded(
                     instance,
@@ -6585,6 +6652,9 @@ impl MessageProcessor {
                     error = %error,
                     "failed to commit CLI runtime durable event"
                 );
+                if supplemental {
+                    continue;
+                }
                 return false;
             }
         }
@@ -7227,13 +7297,19 @@ impl MessageProcessor {
         };
         let projected = crate::cli_runtime::projector::project_cli_runtime_event(&context, &event);
         for durable in projected.durable {
-            self.publish_cli_runtime_durable_and_wait_inner(instance, durable, turn_transition)
+            let supplemental = crate::cli_runtime::projector::is_supplemental_statistics(&durable);
+            if let Err(error) = self
+                .publish_cli_runtime_durable_and_wait_inner(instance, durable, turn_transition)
                 .await
-                .map_err(|error| {
-                    anyhow::anyhow!(
-                        "failed to persist authoritative snapshot lifecycle event: {error}"
-                    )
-                })?;
+            {
+                if supplemental {
+                    warn!("failed to persist supplemental CLI statistics during reconciliation");
+                    continue;
+                }
+                return Err(anyhow::anyhow!(
+                    "failed to persist authoritative snapshot lifecycle event: {error}"
+                ));
+            }
         }
         let event_hub = self.ensure_cli_runtime_execution_event_hub(instance).await;
         for snapshot in projected.snapshot {
@@ -14402,7 +14478,8 @@ fn cli_runtime_event_confirms_recovery(event: &RuntimeEvent) -> bool {
             !cli_runtime_item_is_native_user_message(item.item_kind.as_str())
         }
         RuntimeEvent::ItemCompleted(item) => {
-            !cli_runtime_item_is_native_user_message(item.item_kind.as_str())
+            item.item_kind != "tokenUsage"
+                && !cli_runtime_item_is_native_user_message(item.item_kind.as_str())
         }
         RuntimeEvent::ItemUpdated(item) => {
             !cli_runtime_item_is_native_user_message(item.item_kind.as_str())

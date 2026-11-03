@@ -2047,6 +2047,8 @@ struct ClaudeStreamClient {
 
 #[derive(Default)]
 struct ClaudeStreamState {
+    usage_message_id: Option<String>,
+    usage_message_counters: JsonValue,
     native_thread_id: Option<String>,
     active_turn_id: Option<String>,
     observed_turn_id: Option<String>,
@@ -2280,6 +2282,8 @@ impl ClaudeStreamClient {
             let mut state = self.state.lock().await;
             state.native_thread_id = Some(native_thread_id.clone());
             state.active_turn_id = Some(native_turn_id.clone());
+            state.usage_message_id = None;
+            state.usage_message_counters = JsonValue::Null;
             state.observed_turn_id = Some(native_turn_id.clone());
             state.reconciliation_events.clear();
             state.last_turn_observation = None;
@@ -2931,6 +2935,50 @@ impl ClaudeStreamClient {
             return Vec::new();
         };
         match event_type {
+            Some("message_start") if value["parent_tool_use_id"].is_null() => {
+                state.usage_message_id = event["message"]["id"].as_str().map(str::to_owned);
+                state.usage_message_counters =
+                    pioneer_cli_agent_runtime::usage::claude_usage(&event["message"]["usage"]);
+                let Some(message) = state.usage_message_id.as_deref() else {
+                    return Vec::new();
+                };
+                let mut usage = pioneer_cli_agent_runtime::usage::claude_result(
+                    &json!({"usage":state.usage_message_counters}),
+                );
+                usage["scope"] = json!("request_snapshot");
+                usage["native_message_id"] = json!(message);
+                vec![claude_usage_item(
+                    &native_thread_id,
+                    &native_turn_id,
+                    message,
+                    usage,
+                )]
+            }
+            Some("message_delta") if value["parent_tool_use_id"].is_null() => {
+                let counters = pioneer_cli_agent_runtime::usage::claude_usage(&event["usage"]);
+                if let (Some(existing), Some(incoming)) = (
+                    state.usage_message_counters.as_object_mut(),
+                    counters.as_object(),
+                ) {
+                    for (key, value) in incoming {
+                        existing.insert(key.clone(), value.clone());
+                    }
+                }
+                let Some(message) = state.usage_message_id.as_deref() else {
+                    return Vec::new();
+                };
+                let mut usage = pioneer_cli_agent_runtime::usage::claude_result(
+                    &json!({"usage":state.usage_message_counters}),
+                );
+                usage["scope"] = json!("request_snapshot");
+                usage["native_message_id"] = json!(message);
+                vec![claude_usage_item(
+                    &native_thread_id,
+                    &native_turn_id,
+                    message,
+                    usage,
+                )]
+            }
             Some("content_block_delta") => {
                 let delta = event.get("delta").cloned().unwrap_or(JsonValue::Null);
                 let delta_type = delta.get("type").and_then(JsonValue::as_str);
@@ -3015,6 +3063,24 @@ impl ClaudeStreamClient {
             .cloned()
             .unwrap_or_default();
         let mut events = Vec::new();
+        if value["message"]["usage"].is_object() && value["parent_tool_use_id"].is_null() {
+            let state = self.state.lock().await;
+            if let (Some(thread), Some(turn), Some(message)) = (
+                state.native_thread_id.as_deref(),
+                state.active_turn_id.as_deref(),
+                value["message"]["id"].as_str(),
+            ) {
+                let mut metadata = pioneer_cli_agent_runtime::usage::claude_result(
+                    &json!({"usage":value["message"]["usage"]}),
+                );
+                metadata["scope"] = json!("request_snapshot");
+                metadata["native_message_id"] = json!(message);
+                if let Some(model) = value["message"]["model"].as_str() {
+                    metadata["model"] = json!(model);
+                }
+                events.push(claude_usage_item(thread, turn, message, metadata));
+            }
+        }
         for (index, block) in content.into_iter().enumerate() {
             match block.get("type").and_then(JsonValue::as_str) {
                 Some("text") => {
@@ -3434,6 +3500,12 @@ impl ClaudeStreamClient {
             Some("interrupted" | "cancelled" | "canceled")
         );
         let mut events = Vec::new();
+        events.push(claude_usage_item(
+            &native_thread_id,
+            &native_turn_id,
+            "result",
+            pioneer_cli_agent_runtime::usage::claude_result(&value),
+        ));
         if !state.emitted_final_text
             && let Some(result) = value
                 .get("result")
@@ -3765,6 +3837,27 @@ fn claude_image_media_type(path: &str) -> Option<&'static str> {
         ("image", "webp") => Some("image/webp"),
         _ => None,
     }
+}
+
+fn claude_usage_item(
+    thread: &str,
+    turn: &str,
+    identity: &str,
+    metadata: JsonValue,
+) -> RuntimeEvent {
+    RuntimeEvent::ItemCompleted(RuntimeItemCompleted {
+        native_thread_id: Some(thread.to_owned()),
+        native_turn_id: turn.to_owned(),
+        native_item_id: format!("claude_usage_{turn}_{identity}"),
+        item_kind: "tokenUsage".into(),
+        text: None,
+        summary: Vec::new(),
+        content: Vec::new(),
+        phase: RuntimeAgentMessagePhase::FinalAnswer,
+        metadata: Some(metadata),
+        native_item_redacted: None,
+        native: None,
+    })
 }
 
 fn native_event(method: &str, raw: JsonValue) -> RuntimeNativeEvent {
