@@ -736,6 +736,12 @@ impl MessageProcessor {
         }
         .into_directory_summary();
 
+        for thread in &response_payload.threads {
+            self.foreground_starts
+                .before_thread_snapshot(&thread.id)
+                .await;
+        }
+
         let response_encode_stage =
             trace.stage(pioneer_observability::GatewayOperationStage::ThreadTreeResponseEncode);
         let response = match JsonRpcResponse::from_result(request_id, &response_payload) {

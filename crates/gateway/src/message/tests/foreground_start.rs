@@ -737,6 +737,141 @@ async fn direct_progress_and_blocked_share_the_start_dependency_without_waiting_
 }
 
 #[tokio::test]
+async fn thread_tree_terminal_snapshots_join_start_for_persisted_and_memory_sources() {
+    for loaded_memory in [false, true] {
+        let mut f = Fixture::new().await;
+        f.processor
+            .arm_completed_history_preparation_barrier(PUBLICATION);
+        drop(f.accepted(f.start(f.params(TURN)).await).await);
+        f.reached().await;
+        timeout(Duration::from_secs(10), f.entered.notified())
+            .await
+            .unwrap();
+        f.release.notify_one();
+        f.terminal(TURN).await;
+        wait_for_thread_manager_turn_status(
+            &f.processor.thread_manager,
+            THREAD,
+            TURN,
+            TurnStatus::Completed,
+        )
+        .await;
+
+        let mut persisted = f
+            .store
+            .list_threads_for_workspace(&f.workspace, 500)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|thread| thread.id == THREAD)
+            .unwrap();
+        assert_eq!(
+            persisted.turns.last().unwrap().status,
+            TurnStatus::Completed
+        );
+        let mut reader = (*f.processor).clone();
+        let expected_name = if loaded_memory {
+            // Force the actual updated_at merge to choose memory, preserving
+            // the real completed turn. The wire name proves that source won.
+            persisted.updated_at += 60 * 60 * 1000;
+            persisted.name = Some("Memory tree snapshot".into());
+            reader
+                .thread_manager
+                .system_thread_restore_persisted(persisted.clone(), None)
+                .await
+                .unwrap();
+            persisted.name
+        } else {
+            // Cold snapshot reader; canonical DB, session and the exact
+            // startup/publication owner remain shared with the real execution.
+            reader.thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
+            assert!(reader.thread_manager.turn_get(THREAD, TURN).await.is_none());
+            persisted.name
+        };
+        let entry = f.processor.foreground_starts.entry(THREAD, TURN).unwrap();
+        let connection = f.connection;
+        let id = generate_test_request_id("foreground", "tree-terminal");
+        let request = json!({"jsonrpc":"2.0", "id":id, "method":"thread/tree",
+            "params":{"workspace_id":f.workspace}})
+        .to_string();
+        let tree = tokio::spawn(async move {
+            reader
+                .process_request_for_connection(connection, &request)
+                .await;
+        });
+        // Emitted by the actual RPC's existing wait after registration and
+        // Pending check. Removing the tree dependency cannot reach this signal.
+        timeout(
+            Duration::from_secs(10),
+            entry.publication_wait_joined.notified(),
+        )
+        .await
+        .unwrap();
+        while let Ok(Message::Text(text)) = f.rx.try_recv() {
+            let value: JsonValue = serde_json::from_str(&text).unwrap();
+            assert_ne!(value["id"], json!(id), "tree response escaped Pending");
+            assert!(
+                !value["method"]
+                    .as_str()
+                    .is_some_and(|method| method.starts_with("item/")
+                        || matches!(
+                            method,
+                            events::TURN_STARTED
+                                | events::TURN_COMPLETED
+                                | events::TURN_FAILED
+                                | events::TURN_BLOCKED
+                        )),
+                "dependent event escaped held publication: {value}"
+            );
+        }
+        f.processor.release_completed_history_preparation_barrier();
+        timeout(Duration::from_secs(10), async {
+            let mut started = false;
+            loop {
+                let Message::Text(text) = f.rx.recv().await.unwrap() else {
+                    continue;
+                };
+                let value: JsonValue = serde_json::from_str(&text).unwrap();
+                if value["method"] == events::TURN_STARTED && value["params"]["turn"]["id"] == TURN
+                {
+                    assert!(!started);
+                    started = true;
+                }
+                if (value["params"]["turn_id"] == TURN || value["params"]["turn"]["id"] == TURN)
+                    && value["method"].as_str().is_some_and(|method| {
+                        method.starts_with("item/")
+                            || matches!(
+                                method,
+                                events::TURN_COMPLETED | events::TURN_FAILED | events::TURN_BLOCKED
+                            )
+                    })
+                {
+                    assert!(started, "dependent event preceded start: {value}");
+                }
+                if value["id"] == json!(id) {
+                    assert!(started, "terminal tree preceded start: {value}");
+                    let response: pioneer_protocol::ThreadTreeResponse =
+                        serde_json::from_value(value["result"].clone()).unwrap();
+                    let thread = response.threads.iter().find(|t| t.id == THREAD).unwrap();
+                    assert_eq!(thread.name, expected_name);
+                    assert_eq!(thread.turns.last().unwrap().id, TURN);
+                    assert_eq!(thread.turns.last().unwrap().status, TurnStatus::Completed);
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        timeout(Duration::from_secs(10), tree)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(f.calls.load(Ordering::SeqCst), 1);
+        f.close().await;
+    }
+}
+
+#[tokio::test]
 async fn snapshot_observation_and_shutdown_do_not_allow_a_late_initial_start() {
     let mut f = Fixture::new().await;
     f.processor
