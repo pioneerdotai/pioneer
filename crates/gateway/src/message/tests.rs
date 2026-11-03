@@ -42391,7 +42391,7 @@ async fn fanout_task_event_through(processor: &MessageProcessor, task_id: &str, 
                 break;
             }
             processor
-                .for_background_reconciliation()
+                .scoped_for_background_reconciliation()
                 .task_event_fanout_quantum()
                 .await
                 .unwrap();
