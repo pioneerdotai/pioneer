@@ -4328,7 +4328,7 @@ impl RecoveryCoordinator {
         })
     }
 
-    async fn retained_provider_history_for_turn(
+    pub(crate) async fn retained_provider_history_for_turn(
         &self,
         turn_id: &str,
     ) -> Result<Vec<RetainedProviderHistoryMessage>> {
@@ -5181,6 +5181,58 @@ fn assemble_canonical_provider_history(
     let mut pending: Option<PendingRound> = None;
     for row in rows {
         match row.source.as_str() {
+            "system_snapshot_v1" | "turn_input_projection_v1" | "runtime_context_v1" => {
+                if let Some(previous) = pending.take() {
+                    flush_round(
+                        turn_id,
+                        previous,
+                        resumable_item_ids,
+                        recovered,
+                        &mut retained,
+                    )?;
+                }
+                let view: pioneer_tools::ToolResultView = serde_json::from_str(&row.payload)?;
+                let pioneer_tools::ToolResultView::Json {
+                    value,
+                    truncated: false,
+                } = view
+                else {
+                    bail!("incomplete retained runtime context")
+                };
+                let mut message: ChatMessage = serde_json::from_value(value)?;
+                if row.source == "system_snapshot_v1" {
+                    let metadata = message
+                        .application_context
+                        .as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("system snapshot metadata missing"))?;
+                    anyhow::ensure!(
+                        metadata.get("kind").and_then(serde_json::Value::as_str)
+                            == Some("system_snapshot"),
+                        "invalid system snapshot kind"
+                    );
+                    let _: pioneer_provider::CompiledPromptPayload = serde_json::from_value(
+                        metadata
+                            .get("system")
+                            .ok_or_else(|| anyhow::anyhow!("system snapshot payload missing"))?
+                            .clone(),
+                    )?;
+                }
+                if let Some(origin) = message
+                    .application_context
+                    .as_ref()
+                    .and_then(|metadata| metadata.get("origin"))
+                {
+                    message.provenance = serde_json::from_value(origin.clone())?;
+                }
+                anyhow::ensure!(
+                    message.role == Role::User,
+                    "retained runtime context must be user-level"
+                );
+                retained.push(RetainedProviderHistoryMessage {
+                    sequence: row.sequence,
+                    message,
+                });
+            }
             "assistant_round" => {
                 if let Some(previous) = pending.take() {
                     flush_round(
@@ -5540,6 +5592,69 @@ mod tests {
             tool_name: tool_name.map(str::to_owned),
             payload,
         }
+    }
+
+    #[test]
+    fn recovery_preserves_saved_input_and_runtime_context_in_chronological_order() {
+        let mut input = ChatMessage::user(
+            "<pioneer_turn_context>\nDate: 2026-11-01\n</pioneer_turn_context>\n\noriginal input",
+        );
+        let origin = pioneer_agent::compaction::history::pending_origin(
+            "workspace",
+            "thread",
+            "turn",
+            "turn-input-projection",
+            pioneer_agent::compaction::history::PendingOriginKind::TurnInputProjection,
+            "turn-input-projection",
+        );
+        input.application_context = Some(serde_json::json!({"kind":"turn_input","origin":origin}));
+        let event = ChatMessage::user("Retry budget exhausted: prepare final answer.");
+        let payload = |message: &ChatMessage| {
+            serde_json::to_string(&pioneer_tools::ToolResultView::Json {
+                value: serde_json::to_value(message).unwrap(),
+                truncated: false,
+            })
+            .unwrap()
+        };
+        let rows = vec![
+            retained_history_row(
+                20,
+                "runtime_context_v1",
+                Some("retry-1"),
+                None,
+                payload(&event),
+            ),
+            retained_history_row(
+                10,
+                "turn_input_projection_v1",
+                Some("turn-input-projection"),
+                None,
+                payload(&input),
+            ),
+        ];
+        let restored = assemble_retained_provider_history("turn", rows).unwrap();
+        assert_eq!(restored.len(), 2);
+        assert_eq!(restored[0].message.content, input.content);
+        assert_eq!(restored[0].message.provenance, Some(origin));
+        assert_eq!(
+            restored[0].message.application_context,
+            input.application_context
+        );
+        assert_eq!(restored[1].message.content, event.content);
+        assert_eq!(restored[0].sequence, 10);
+        assert_eq!(restored[1].sequence, 20);
+        let malformed = retained_history_row(
+            30,
+            "runtime_context_v1",
+            Some("retry-2"),
+            None,
+            serde_json::to_string(&pioneer_tools::ToolResultView::Json {
+                value: serde_json::to_value(&event).unwrap(),
+                truncated: true,
+            })
+            .unwrap(),
+        );
+        assert!(assemble_retained_provider_history("turn", vec![malformed]).is_err());
     }
 
     #[test]

@@ -6882,6 +6882,7 @@ async fn pending_runtime_origins_resolve_versions_with_scope_and_whole_round_ide
         NativeHistoryLayout, PendingOriginKind, pending_origin,
     };
     use pioneer_provider::{ChatMessage, ProviderToolCall};
+    use sha2::Digest;
     let f = fixture("fixture", vec![], true, false).await;
     let db = f.store.database_connection();
     db.execute_unprepared("INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload,created_at) VALUES ('input','turn',0,'text','accepted','{\"type\":\"text\",\"text\":\"accepted\"}',CURRENT_TIMESTAMP)").await.unwrap();
@@ -6963,6 +6964,183 @@ async fn pending_runtime_origins_resolve_versions_with_scope_and_whole_round_ide
     assert!(layout.units[1].complete);
     assert_eq!(layout.message_indexes[1], vec![1, 2]);
     assert_eq!(*f.provider.count.borrow(), 0);
+
+    // Exercise the actual durable append -> Gateway origin resolver -> CRUD
+    // source validation path for the new user projection and runtime events.
+    for (source, kind, item, context_kind) in [
+        (
+            "turn_input_projection_v1",
+            PendingOriginKind::TurnInputProjection,
+            "turn-input-projection",
+            "turn_input",
+        ),
+        (
+            "runtime_context_v1",
+            PendingOriginKind::RuntimeContext,
+            "inventory-baseline-fixture",
+            "inventory_baseline",
+        ),
+    ] {
+        let mut message = ChatMessage::user("saved runtime context");
+        message.provenance = Some(pending_origin("ws", "thread", "turn", item, kind, item));
+        if source == "turn_input_projection_v1" {
+            message
+                .provenance
+                .as_mut()
+                .unwrap()
+                .sources
+                .extend(messages[0].provenance.as_ref().unwrap().sources.clone());
+        }
+        message.application_context = Some(serde_json::json!({
+            "version": 1, "kind": context_kind,
+            "origin": message.provenance,
+        }));
+        let payload = pioneer_tools::ToolResultView::Json {
+            value: serde_json::to_value(&message).unwrap(),
+            truncated: false,
+        };
+        let appended = f
+            .store
+            .append_turn_llm_context(
+                pioneer_crud::NewTurnLlmContextEntry {
+                    turn_id: "turn".into(),
+                    item_id: Some(item.into()),
+                    attempt_id: None,
+                    sequence: 0,
+                    source: source.into(),
+                    tool_name: Some(String::new()),
+                    payload: serde_json::to_string(&payload).unwrap(),
+                    output_policy_snapshot: "{}".into(),
+                    created_at: chrono::Utc::now().fixed_offset(),
+                    expires_at: None,
+                },
+                &format!("runtime-locator-{source}"),
+            )
+            .await
+            .unwrap();
+
+        let mut projected = vec![message];
+        origins::resolve_message_origins(
+            &f.store,
+            "ws",
+            "thread",
+            "turn",
+            &allowed,
+            &mut projected,
+        )
+        .await
+        .unwrap();
+        let origin = projected[0].provenance.as_ref().unwrap();
+        assert_eq!(
+            origin.sources.len(),
+            if source == "turn_input_projection_v1" {
+                2
+            } else {
+                1
+            }
+        );
+        assert_eq!(origin.sources[0].scope, "context:turn");
+        assert_eq!(origin.sources[0].id, appended.entry.id);
+        assert!(!origin.sources[0].version.is_empty());
+        assert_eq!(projected[0].content, "saved runtime context");
+
+        if source == "turn_input_projection_v1" {
+            // Task completion freezes/restores this composite projection before
+            // it can publish the child result. Preserve context + clean-input
+            // dependencies without restoring the original command a second time.
+            let reference = pioneer_compaction::frozen::FrozenMessageRef {
+                logical_turn_id: origin.logical_turn_id.clone(),
+                source_thread: origin.thread_id.clone(),
+                context_thread: origin.context_thread.clone(),
+                unit_id: origin.unit_id.clone(),
+                sources: origin
+                    .sources
+                    .iter()
+                    .map(|source| pioneer_compaction::SourceRef {
+                        scope: source.scope.clone(),
+                        id: source.id.clone(),
+                        version: source.version.clone(),
+                    })
+                    .collect(),
+                event_input_role: None,
+                source_aliases: vec![],
+                ambiguous_input_aliases: vec![],
+                publication_aliases: None,
+                inherited: false,
+                complete: true,
+                protected_input: true,
+                wire_sha256: hex::encode(sha2::Sha256::digest(
+                    serde_json::to_vec(&projected[0]).unwrap(),
+                )),
+                replay_source: None,
+                tool_item_id: None,
+                tool_call_id: None,
+                tool_name: None,
+            };
+            for execution in [false, true] {
+                let restored = super::frozen::restore_entries_page_for_test(
+                    &f.store,
+                    "ws",
+                    std::slice::from_ref(&reference),
+                    execution,
+                )
+                .await
+                .unwrap();
+                let restored = restored[0].as_ref().unwrap();
+                assert_eq!(restored.content, projected[0].content);
+                assert_eq!(
+                    restored.application_context,
+                    projected[0].application_context
+                );
+                assert_eq!(
+                    restored.provenance.as_ref().unwrap().sources,
+                    origin.sources
+                );
+            }
+            let mut corrupt = reference.clone();
+            corrupt.wire_sha256 = "0".repeat(64);
+            assert!(
+                super::frozen::restore_entries_page_for_test(&f.store, "ws", &[corrupt], false,)
+                    .await
+                    .is_err()
+            );
+            let mut changed = reference.clone();
+            changed.sources[1].version = "input-revision:999".into();
+            assert!(
+                super::frozen::restore_entries_page_for_test(&f.store, "ws", &[changed], false,)
+                    .await
+                    .is_err()
+            );
+        }
+
+        for (workspace, thread, turn, item) in [
+            ("other-workspace", "thread", "turn", item),
+            ("ws", "other-thread", "turn", item),
+            ("ws", "thread", "other-turn", item),
+            ("ws", "thread", "turn", "missing-item"),
+        ] {
+            assert!(
+                f.store
+                    .compaction_context_reference_for_item(workspace, thread, turn, item, source,)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+    // A persisted system snapshot is metadata, not a model-facing locator.
+    assert!(
+        f.store
+            .compaction_context_reference_for_item(
+                "ws",
+                "thread",
+                "turn",
+                "snapshot",
+                "system_snapshot_v1",
+            )
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]
@@ -27298,6 +27476,9 @@ async fn task_input_copy_normalization_survives_capture_restore_and_keeps_distin
             .keys()
             .any(|copy| copy.source.id == "nested-copy-257")
     );
+    for full_coverage in [true, false] {
+        Box::pin(assert_prepared_task_input_copy_restore(full_coverage)).await;
+    }
     let calls = f.provider.calls.lock().unwrap();
     assert!(!calls.is_empty());
     for call in calls.iter() {
@@ -27309,6 +27490,559 @@ async fn task_input_copy_normalization_survives_capture_restore_and_keeps_distin
         assert!(input.reference_only.iter().all(|unit| {
             !unit.text.contains("nested-copy-257") && !unit.text.contains("historical-copy-0")
         }));
+    }
+}
+
+// The same normalization owner also exercises the runtime context producer's
+// durable composite, rather than fabricating an all-input provenance shape.
+async fn assert_prepared_task_input_copy_restore(full_coverage: bool) {
+    use pioneer_protocol::{ItemCompletedNotification, TurnItem, UserMessageAttachment};
+    use pioneer_provider::{ChatMessage, ProviderCallIdentity, ProviderToolCall};
+    let f = fixture("unused", vec![], true, false).await;
+    for sql in [
+        "DELETE FROM turn_event WHERE id='source'",
+        "UPDATE turn SET status='completed' WHERE id='turn'",
+        "INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload,created_at) VALUES ('prepared-original','turn',0,'text','same question','{\"type\":\"text\",\"text\":\"same question\"}',CURRENT_TIMESTAMP)",
+        "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES ('prepared-child','ws','','agent','fixture','fixture','active','task_run','internal',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('prepared-turn','prepared-child','completed','conversation','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        "INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload,created_at) VALUES ('prepared-copy','prepared-turn',0,'text','same question','{\"type\":\"text\",\"text\":\"same question\"}',CURRENT_TIMESTAMP)",
+        "INSERT INTO thread_lineage(child_thread_id,parent_thread_id,root_thread_id,depth,created_at) VALUES ('prepared-child','thread','thread',1,CURRENT_TIMESTAMP)",
+        "INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,created_by_turn_id,executor_kind,status,title,goal) VALUES ('prepared-task','ws','thread','thread','thread','turn','agent','running','Prepared task','same question')",
+        "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES ('prepared-run','prepared-task','prepared-run',1,1,'running','agent')",
+        "INSERT INTO task_run_turn(id,task_id,run_id,thread_id,turn_id,kind,round,sequence,status,created_at) VALUES ('prepared-run-turn','prepared-task','prepared-run','prepared-child','prepared-turn','initial',0,1,'completed',CURRENT_TIMESTAMP)",
+    ] {
+        f.store
+            .database_connection()
+            .execute_unprepared(sql)
+            .await
+            .unwrap();
+    }
+    let second_input = pioneer_protocol::UserInput::Text {
+        text: "unique second input".into(),
+        text_elements: vec![],
+    };
+    for (turn, id) in [
+        ("turn", "prepared-original-two"),
+        ("prepared-turn", "prepared-copy-two"),
+    ] {
+        if turn == "prepared-turn" && !full_coverage {
+            continue;
+        }
+        f.store.database_connection().execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload,created_at) VALUES (?,?,1,'text',?,?,CURRENT_TIMESTAMP)",
+            [id.into(), turn.into(), "unique second input".into(), serde_json::to_string(&second_input).unwrap().into()],
+        )).await.unwrap();
+    }
+    let mut launch: pioneer_protocol::TaskMetadata = serde_json::from_str(
+        &task_input_launch_metadata("thread", "turn", "same question"),
+    )
+    .unwrap();
+    launch
+        .composer_work
+        .as_mut()
+        .unwrap()
+        .launch
+        .input
+        .push(second_input);
+    f.store
+        .database_connection()
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE task SET metadata_json=? WHERE id='prepared-task'",
+            [serde_json::to_string(&launch).unwrap().into()],
+        ))
+        .await
+        .unwrap();
+    let skill = UserMessageAttachment::Skill {
+        capability: pioneer_protocol::TurnSkillCapabilitySummary {
+            skill_id: pioneer_protocol::SkillId::new("AAAAAAAAAAAAAAAAAAAAA").unwrap(),
+            label: "Selected skill".into(),
+            owner: Some("workspace".into()),
+            slug: "selected-skill".into(),
+            source_kind: "user".into(),
+            pack: None,
+        },
+    };
+    for id in ["user_turn", "independent-capability-item"] {
+        f.store
+            .materialize_item_completed(
+                ItemCompletedNotification {
+                    workspace_id: "ws".into(),
+                    thread_id: "thread".into(),
+                    turn_id: "turn".into(),
+                    item: TurnItem::UserMessage {
+                        id: id.into(),
+                        text: "same question\nunique second input".into(),
+                        attachments: vec![skill.clone()],
+                    },
+                },
+                chrono::Utc::now().timestamp(),
+            )
+            .await
+            .unwrap();
+    }
+    for thread in ["thread", "prepared-child"] {
+        super::history::prepare_history(&f.store, "ws", thread)
+            .await
+            .unwrap();
+    }
+    let fence = f.store.compaction_history_read_fence().await.unwrap();
+    let raw = super::history::load_task_line_history_turns(
+        &f.store,
+        "ws",
+        "thread",
+        &std::collections::BTreeSet::from(["turn".into()]),
+        &fence,
+    )
+    .await
+    .unwrap();
+    let allowed = std::collections::BTreeSet::from(["thread".into(), "prepared-child".into()]);
+    let parent = super::frozen::capture(&f.store, "ws", "thread", &allowed, &raw)
+        .await
+        .unwrap();
+    save_task_input_snapshot(
+        &f,
+        "prepared-run",
+        "prepared-task",
+        "thread",
+        "turn",
+        &parent,
+    )
+    .await;
+    let saved = ChatMessage::user(
+        "<pioneer_turn_context>\nselected skill AAAAAAAAAAAAAAAAAAAAA\n</pioneer_turn_context>\n\nsame question",
+    );
+    let mut saved = saved;
+    if full_coverage {
+        saved.content.push_str("\nunique second input");
+    }
+    saved.application_context = Some(serde_json::json!({"version":1,"kind":"turn_input",
+        "context":"selected skill AAAAAAAAAAAAAAAAAAAAA", "inventory":[], "announced":[]}));
+    let round = pioneer_provider::CanonicalProviderRoundEnvelope {
+        ui_copies: None,
+        version: 1,
+        round_id: "prepared-skill-round".into(),
+        termination: pioneer_provider::ProviderTermination::ToolCalls,
+        message: ChatMessage::assistant_tool_calls(
+            Some("Read selected skill"),
+            vec![ProviderToolCall {
+                id: "read-skill-call".into(),
+                name: "read_skill".into(),
+                arguments: "{\"reference\":\"exact-version\"}".into(),
+            }],
+        ),
+        calls: vec![ProviderCallIdentity {
+            provider_call_id: "read-skill-call".into(),
+            turn_item_id: "read-skill-item".into(),
+            ordinal: 0,
+        }],
+    };
+    let result = ChatMessage::tool_result(
+        "read-skill-call",
+        "read_skill",
+        "immutable selected skill body",
+    );
+    for (sequence, item, source, payload) in [
+        (
+            0,
+            "turn-input-projection",
+            "turn_input_projection_v1",
+            serde_json::to_string(&pioneer_tools::ToolResultView::Json {
+                value: serde_json::to_value(&saved).unwrap(),
+                truncated: false,
+            })
+            .unwrap(),
+        ),
+        (
+            1,
+            "prepared-skill-round",
+            "assistant_round",
+            serde_json::to_string(&round).unwrap(),
+        ),
+        (
+            2,
+            "read-skill-item",
+            "tool_result_v2",
+            serde_json::to_string(&pioneer_tools::ToolResultView::Json {
+                value: serde_json::to_value(&result).unwrap(),
+                truncated: false,
+            })
+            .unwrap(),
+        ),
+    ] {
+        f.store
+            .append_turn_llm_context(
+                pioneer_crud::NewTurnLlmContextEntry {
+                    turn_id: "prepared-turn".into(),
+                    item_id: Some(item.into()),
+                    attempt_id: None,
+                    sequence,
+                    source: source.into(),
+                    tool_name: Some(if sequence == 2 { "read_skill" } else { "" }.into()),
+                    payload,
+                    output_policy_snapshot: "{}".into(),
+                    created_at: chrono::Utc::now().fixed_offset(),
+                    expires_at: None,
+                },
+                &format!("prepared-fixture-{sequence}"),
+            )
+            .await
+            .unwrap();
+    }
+    let fence = f.store.compaction_history_read_fence().await.unwrap();
+    let own =
+        super::history::load_task_line_history(&f.store, "ws", "prepared-child", None, &fence)
+            .await
+            .unwrap();
+    let prepared = own
+        .iter()
+        .find(|message| message.application_context == saved.application_context)
+        .unwrap()
+        .clone();
+    assert_eq!(
+        serde_json::to_value(&prepared).unwrap(),
+        serde_json::to_value(&saved).unwrap()
+    );
+    assert_eq!(
+        prepared.provenance.as_ref().unwrap().sources.len(),
+        if full_coverage { 3 } else { 2 }
+    );
+    assert!(
+        prepared
+            .provenance
+            .as_ref()
+            .unwrap()
+            .sources
+            .iter()
+            .any(|s| s.scope == "context:prepared-turn")
+    );
+    let mut history = raw.clone();
+    history.extend(own.clone());
+    let proofs = f
+        .store
+        .compaction_task_input_copy_aliases(
+            "ws",
+            &["prepared-copy".into(), "prepared-copy-two".into()],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        proofs.len(),
+        if full_coverage { 2 } else { 1 },
+        "exercise full/partial durable coverage, not missing launch evidence"
+    );
+    let before_normalization = history.clone();
+    super::history::normalize_task_input_copies(&f.store, "ws", &mut history)
+        .await
+        .unwrap();
+    let kept = history
+        .iter()
+        .find(|m| m.application_context == saved.application_context)
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(kept).unwrap(),
+        serde_json::to_value(&saved).unwrap()
+    );
+    assert_eq!(
+        kept.provenance.as_ref().unwrap().sources,
+        prepared.provenance.as_ref().unwrap().sources
+    );
+    if !full_coverage {
+        // One exact launch-copy leaf does not authorize removing the raw
+        // composite, its unique second text, or its capability projection.
+        assert_eq!(history, before_normalization);
+        assert!(
+            history
+                .iter()
+                .any(|message| message.content == "same question\nunique second input")
+        );
+        let frozen = super::frozen::capture(&f.store, "ws", "prepared-child", &allowed, &history)
+            .await
+            .unwrap();
+        let mut restored = super::frozen::restore(&f.store, "ws", &allowed, &frozen)
+            .await
+            .unwrap();
+        assert_eq!(restored, history);
+        super::history::normalize_task_input_copies(&f.store, "ws", &mut restored)
+            .await
+            .unwrap();
+        assert_eq!(restored, history);
+        return;
+    }
+    let aliases = &kept.provenance.as_ref().unwrap().source_aliases;
+    assert_eq!(aliases.len(), 2);
+    assert_eq!(aliases[0].represented_source.scope, "input:prepared-turn");
+    assert_eq!(aliases[0].source.id, "prepared-original");
+    assert!(
+        aliases
+            .iter()
+            .any(|alias| alias.source.id == "prepared-original-two"
+                && alias.represented_source.id == "prepared-copy-two")
+    );
+    assert!(
+        aliases
+            .iter()
+            .all(|alias| alias.represented_source.scope == "input:prepared-turn")
+    );
+    assert!(
+        !history
+            .iter()
+            .any(|m| m.content == "same question\nunique second input")
+    );
+    let event_ids = history
+        .iter()
+        .flat_map(|m| m.provenance.iter())
+        .flat_map(|p| &p.sources)
+        .filter(|s| s.scope == "event:turn")
+        .map(|s| s.id.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    let event_metadata = super::history::historical_event_projections(
+        &f.store,
+        "ws",
+        "thread",
+        raw.iter()
+            .flat_map(|m| m.provenance.iter())
+            .flat_map(|p| &p.sources)
+            .filter(|s| s.scope == "event:turn")
+            .map(|s| SourceRef {
+                scope: s.scope.clone(),
+                id: s.id.clone(),
+                version: s.version.clone(),
+            })
+            .collect::<Vec<_>>(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        event_metadata.len(),
+        2,
+        "both canonical and independent capability items must be exercised"
+    );
+    let raw_capability_source = event_metadata
+        .iter()
+        .find(|event| event.item_id.as_deref() == Some("user_turn"))
+        .unwrap()
+        .reference
+        .id
+        .clone();
+    for event in event_metadata {
+        assert_eq!(
+            event_ids.contains(&event.reference.id),
+            event.item_id.as_deref() == Some("independent-capability-item")
+        );
+    }
+    let read = history
+        .iter()
+        .position(|m| m.name.as_deref() == Some("read_skill"))
+        .unwrap();
+    assert_eq!(history[read].content, result.content);
+    assert_eq!(
+        history[read - 1].tool_calls.as_ref().unwrap()[0].id,
+        "read-skill-call"
+    );
+    let descriptor = super::frozen::capture(&f.store, "ws", "prepared-child", &allowed, &history)
+        .await
+        .unwrap();
+    let restored = super::frozen::restore(&f.store, "ws", &allowed, &descriptor)
+        .await
+        .unwrap();
+    assert_eq!(
+        restored, history,
+        "composite dependencies and alias evidence survive literal restore"
+    );
+    // Independent metadata is not a second input; use the real branch composer
+    // to resolve its overlapping source before copy normalization.
+    let mut replay = super::frozen::compose_frozen_basis(
+        &f.store,
+        "ws",
+        "prepared-child",
+        &allowed,
+        &restored,
+        &raw,
+    )
+    .await
+    .unwrap();
+    super::history::normalize_task_input_copies(&f.store, "ws", &mut replay)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(&replay).unwrap(),
+        serde_json::to_value(&restored).unwrap()
+    );
+
+    // All aliases for a composite must fit together, including during the
+    // retain-copies evidence phase before checkpoint/policy selection.
+    for slots in [1, 2] {
+        for retain in [false, true] {
+            let mut input = prepared.clone();
+            let origin = input.provenance.as_mut().unwrap();
+            let represented_source = origin
+                .sources
+                .iter()
+                .find(|s| s.id == "prepared-copy")
+                .unwrap()
+                .clone();
+            origin.source_aliases = (0..pioneer_compaction::REPLAY_ALIAS_LIMIT - slots)
+                .map(|index| pioneer_provider::MessageSourceAlias {
+                    represented_thread_id: "prepared-child".into(),
+                    represented_source: represented_source.clone(),
+                    thread_id: "prior-alias-scope".into(),
+                    source: pioneer_provider::MessageSourceRef {
+                        scope: "input:prior-alias-turn".into(),
+                        id: format!("prior-alias-{index}"),
+                        version: "input-revision:1".into(),
+                    },
+                })
+                .collect();
+            let mut bounded = raw.clone();
+            bounded.push(input);
+            if retain {
+                super::history::prepare_task_input_copy_evidence_with_resolver(
+                    &f.store,
+                    "ws",
+                    &mut bounded,
+                    &mut super::coverage::CheckpointGraphResolver::default(),
+                )
+                .await
+                .unwrap();
+            } else {
+                super::history::normalize_task_input_copies(&f.store, "ws", &mut bounded)
+                    .await
+                    .unwrap();
+            }
+            let kept = bounded
+                .iter()
+                .find(|message| message.application_context == saved.application_context)
+                .unwrap();
+            let new_aliases = kept
+                .provenance
+                .as_ref()
+                .unwrap()
+                .source_aliases
+                .iter()
+                .filter(|alias| alias.thread_id == "thread")
+                .collect::<Vec<_>>();
+            assert_eq!(new_aliases.len(), if slots == 2 { 2 } else { 0 });
+            assert_eq!(
+                bounded
+                    .iter()
+                    .any(|message| message.content == "same question\nunique second input"),
+                retain || slots == 1
+            );
+            assert_eq!(
+                serde_json::to_value(kept).unwrap(),
+                serde_json::to_value(&saved).unwrap()
+            );
+            if retain {
+                super::history::normalize_task_input_copies(&f.store, "ws", &mut bounded)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    bounded
+                        .iter()
+                        .any(|message| message.content == "same question\nunique second input"),
+                    slots == 1
+                );
+            }
+        }
+    }
+
+    for control in [
+        "stale-context",
+        "mixed-turn",
+        "incomplete",
+        "mutated-payload",
+        "protected",
+        "ambiguous",
+        "competing",
+    ] {
+        let mut input = prepared.clone();
+        let mut raw = raw.clone();
+        match control {
+            "stale-context" => input.provenance.as_mut().unwrap().sources[0]
+                .version
+                .push_str("-stale"),
+            "mixed-turn" => {
+                input.provenance.as_mut().unwrap().sources[1].scope = "input:turn".into()
+            }
+            "incomplete" => input.provenance.as_mut().unwrap().complete = false,
+            "mutated-payload" => input.content.push_str(" modified after capture"),
+            "protected" => {
+                raw.iter_mut()
+                    .find(|m| m.content == "same question\nunique second input")
+                    .unwrap()
+                    .provenance
+                    .as_mut()
+                    .unwrap()
+                    .protected_input = true
+            }
+            "ambiguous" => {
+                let source = raw
+                    .iter()
+                    .find(|m| m.content == "same question\nunique second input")
+                    .unwrap()
+                    .provenance
+                    .as_ref()
+                    .unwrap()
+                    .sources[0]
+                    .clone();
+                input
+                    .provenance
+                    .as_mut()
+                    .unwrap()
+                    .ambiguous_input_aliases
+                    .push(pioneer_provider::MessageSourceIdentity {
+                        thread_id: "thread".into(),
+                        source,
+                    });
+            }
+            "competing" => {
+                let source = raw
+                    .iter()
+                    .find(|message| message.content == "same question\nunique second input")
+                    .unwrap()
+                    .provenance
+                    .as_ref()
+                    .unwrap()
+                    .sources[0]
+                    .clone();
+                let origin = input.provenance.as_mut().unwrap();
+                for represented_source in origin
+                    .sources
+                    .iter()
+                    .filter(|source| source.scope == "input:prepared-turn")
+                    .cloned()
+                    .collect::<Vec<_>>()
+                {
+                    origin
+                        .source_aliases
+                        .push(pioneer_provider::MessageSourceAlias {
+                            represented_thread_id: "prepared-child".into(),
+                            represented_source,
+                            thread_id: "thread".into(),
+                            source: source.clone(),
+                        });
+                }
+            }
+            _ => unreachable!(),
+        }
+        raw.push(input);
+        super::history::normalize_task_input_copies(&f.store, "ws", &mut raw)
+            .await
+            .unwrap();
+        assert!(
+            raw.iter()
+                .any(|m| m.content == "same question\nunique second input"),
+            "{control} must retain the raw input"
+        );
+        assert!(
+            raw.iter()
+                .flat_map(|message| message.provenance.iter())
+                .flat_map(|origin| &origin.sources)
+                .any(|source| source.id == raw_capability_source),
+            "{control} must also retain the linked metadata"
+        );
     }
 }
 #[test]

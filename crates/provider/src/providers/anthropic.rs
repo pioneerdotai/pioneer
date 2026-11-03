@@ -2584,7 +2584,7 @@ mod tests {
             model: "claude-sonnet-4-20250514".into(),
             messages: vec![
                 ChatMessage::system("legacy system prompt should be ignored"),
-                ChatMessage::user("Hello"),
+                ChatMessage::user("turn-facts-2026-11-02\nHello"),
             ],
             temperature: None,
             max_tokens: None,
@@ -2610,6 +2610,12 @@ mod tests {
         );
         assert_eq!(api_messages.len(), 1);
         assert_eq!(api_messages[0].role, "user");
+        assert!(
+            serde_json::to_string(&api_messages)
+                .unwrap()
+                .contains("turn-facts-2026-11-02")
+        );
+        assert!(!system.unwrap().contains("turn-facts-2026-11-02"));
     }
 
     #[test]

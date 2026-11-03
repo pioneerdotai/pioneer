@@ -572,16 +572,20 @@ mod tests {
                     .iter()
                     .any(|section| section.id == pioneer_promt::PromptSectionId::ThreadsPolicy)
             );
-            assert!(!plan.bundle.sections.iter().any(|section| matches!(
-                section.id,
-                pioneer_promt::PromptSectionId::TasksPolicy
-                    | pioneer_promt::PromptSectionId::SubagentsPolicy
-            )));
-            assert!(
-                plan.provider_instructions
-                    .text
-                    .contains("- pioneer/threads: `skill:Th7kE4qP9mNs2vX6aR8cZ`")
-            );
+            for policy in [
+                pioneer_promt::PromptSectionId::TasksPolicy,
+                pioneer_promt::PromptSectionId::SubagentsPolicy,
+            ] {
+                assert!(
+                    plan.bundle
+                        .sections
+                        .iter()
+                        .any(|section| section.id == policy)
+                );
+            }
+            let reference = "- pioneer/threads: `skill:Th7kE4qP9mNs2vX6aR8cZ`";
+            assert!(plan.turn_context.text.contains(reference));
+            assert!(!plan.provider_instructions.text.contains(reference));
         }
     }
 
@@ -901,3 +905,7 @@ Use the ordinary weather procedure.
         assert_eq!(bindings[0].resolved_reason, "agent_catalog");
     }
 }
+
+#[cfg(test)]
+#[path = "package_inventory_tests.rs"]
+mod package_inventory_tests;

@@ -12,6 +12,8 @@ pub enum PendingOriginKind {
     Assistant,
     ToolResult,
     ToolItem,
+    TurnInputProjection,
+    RuntimeContext,
 }
 /// A locator is resolved against durable metadata before it can become eligible
 /// work. It contains no guessed revision or copied transcript.
@@ -28,6 +30,8 @@ pub fn pending_origin(
         PendingOriginKind::Assistant => "pending-assistant",
         PendingOriginKind::ToolResult => "pending-tool",
         PendingOriginKind::ToolItem => "pending-item",
+        PendingOriginKind::TurnInputProjection => "pending-turn-input-projection",
+        PendingOriginKind::RuntimeContext => "pending-runtime-context",
     };
     pioneer_provider::MessageProvenance {
         logical_turn_id: None,
@@ -43,7 +47,10 @@ pub fn pending_origin(
         source_aliases: vec![],
         ambiguous_input_aliases: vec![],
         complete: true,
-        protected_input: matches!(kind, PendingOriginKind::Input),
+        protected_input: matches!(
+            kind,
+            PendingOriginKind::Input | PendingOriginKind::TurnInputProjection
+        ),
         inherited: false,
     }
 }
@@ -65,6 +72,8 @@ fn execution_turn_key(origin: &pioneer_provider::MessageProvenance) -> Option<(S
                     | "pending-assistant"
                     | "pending-tool"
                     | "pending-input"
+                    | "pending-turn-input-projection"
+                    | "pending-runtime-context"
             )
             .then_some(turn)
         })

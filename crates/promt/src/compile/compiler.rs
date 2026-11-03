@@ -33,12 +33,17 @@ fn build_identity_section() -> PromptSection {
     }
 }
 
-fn build_safety_section() -> PromptSection {
+fn build_safety_section(cli: bool) -> PromptSection {
     PromptSection {
         id: PromptSectionId::AssistantSafety,
         stability: PromptStability::Stable,
         title: content::SECTION_TITLE_ASSISTANT_SAFETY.to_owned(),
-        content: content::ASSISTANT_SAFETY_LINES.join("\n"),
+        content: if cli {
+            content::AUTHORITY_POLICY_LINES.as_slice()
+        } else {
+            content::ASSISTANT_SAFETY_LINES.as_slice()
+        }
+        .join("\n"),
         sources: Vec::new(),
     }
 }
@@ -53,12 +58,17 @@ fn build_artifact_output_contract_section() -> PromptSection {
     }
 }
 
-fn build_tool_usage_policy_section() -> PromptSection {
+fn build_tool_usage_policy_section(cli: bool) -> PromptSection {
     PromptSection {
         id: PromptSectionId::ToolUsagePolicy,
         stability: PromptStability::Stable,
         title: content::SECTION_TITLE_TOOL_USAGE_POLICY.to_owned(),
-        content: content::TOOL_USAGE_POLICY_PROMPT.to_owned(),
+        content: if cli {
+            content::CLI_SKILL_USAGE_POLICY_PROMPT
+        } else {
+            content::SKILL_USAGE_POLICY_PROMPT
+        }
+        .to_owned(),
         sources: Vec::new(),
     }
 }
@@ -551,12 +561,25 @@ pub fn compile_prompt(input: PromptCompileInput) -> anyhow::Result<CompiledPromp
 
     let mut sections = Vec::<PromptSection>::new();
 
+    // CLI already supplied these rules in its runtime instruction block. Split
+    // that existing supplement into the same logical groups, without loading
+    // API identity documents or adding API filesystem policy to CLI profiles.
+    let has_cli_supplement = profile == PromptProfile::CliRuntime
+        && input.runtime_sections.iter().any(|section| {
+            matches!(
+                section.id,
+                PromptRuntimeSectionId::BuiltIn(
+                    PromptRuntimeBuiltInSectionId::PioneerCliRuntimeInstructions
+                )
+            )
+        });
+
     if policy::include_identity_base(profile) {
         sections.push(build_identity_section());
     }
 
-    if policy::include_safety(profile) {
-        sections.push(build_safety_section());
+    if policy::include_safety(profile) || has_cli_supplement {
+        sections.push(build_safety_section(has_cli_supplement));
     }
 
     if policy::include_artifact_output_contract(profile) {
@@ -566,8 +589,20 @@ pub fn compile_prompt(input: PromptCompileInput) -> anyhow::Result<CompiledPromp
     let has_runtime_filesystem_capability = input.runtime_sections.iter().any(|section| {
         section.id.manifest_id() == crate::section::FILESYSTEM_CAPABILITY_RUNTIME_SECTION_ID
     });
+    if policy::include_tool_usage_policy(profile) || has_cli_supplement {
+        sections.push(build_tool_usage_policy_section(has_cli_supplement));
+    }
     if policy::include_tool_usage_policy(profile) && !has_runtime_filesystem_capability {
-        sections.push(build_tool_usage_policy_section());
+        sections.push(PromptSection {
+            id: PromptSectionId::Dynamic(
+                crate::PromptDynamicSectionId::new(FILESYSTEM_CAPABILITY_RUNTIME_SECTION_ID)
+                    .expect("static filesystem section id"),
+            ),
+            stability: PromptStability::Stable,
+            title: "Filesystem Operations".to_owned(),
+            content: content::TOOL_USAGE_POLICY_PROMPT.to_owned(),
+            sources: Vec::new(),
+        });
     }
 
     if policy::include_workspace_context(profile) {
@@ -673,6 +708,8 @@ pub fn compile_prompt(input: PromptCompileInput) -> anyhow::Result<CompiledPromp
     if profile == PromptProfile::AssistantNone {
         sections.retain(|section| section.id == PromptSectionId::IdentityBase);
     }
+
+    sections.sort_by_key(|section| section.id.instruction_order());
 
     let stable_sections = sections
         .iter()
@@ -822,7 +859,7 @@ mod tests {
         std::fs::write(root.join("IDENTITY.md"), "Name: Pioneer").expect("write IDENTITY");
         std::fs::write(root.join("USER.md"), "Name: Alex").expect("write USER");
 
-        let compiled = compile_prompt(PromptCompileInput {
+        let mut input = PromptCompileInput {
             workspace_root: root,
             profile: PromptProfile::AssistantFull,
             skills_prompt: Some("[Skills]\n- skill-a".to_owned()),
@@ -837,8 +874,8 @@ mod tests {
             dynamic_context: Some("ctx".to_owned()),
             extra_system: Some("extra".to_owned()),
             limits: PromptLimits::default(),
-        })
-        .expect("compile");
+        };
+        let compiled = compile_prompt(input.clone()).expect("compile");
 
         let section_ids = compiled
             .sections
@@ -849,25 +886,153 @@ mod tests {
         assert_eq!(
             section_ids,
             vec![
-                PromptSectionId::IdentityBase,
                 PromptSectionId::AssistantSafety,
-                PromptSectionId::ArtifactOutputContract,
-                PromptSectionId::ToolUsagePolicy,
+                PromptSectionId::IdentityBase,
                 PromptSectionId::SoulCore,
                 PromptSectionId::IdentityCore,
                 PromptSectionId::UserPersona,
+                PromptSectionId::ToolUsagePolicy,
+                PromptSectionId::Dynamic(
+                    PromptDynamicSectionId::new(FILESYSTEM_CAPABILITY_RUNTIME_SECTION_ID).unwrap()
+                ),
+                PromptSectionId::ArtifactOutputContract,
                 PromptSectionId::ToolRecoveryPolicy,
-                PromptSectionId::RecoveryContinuation,
+                PromptSectionId::ExtraSystem,
                 PromptSectionId::SkillsRuntimePrompt,
+                PromptSectionId::RecoveryContinuation,
                 PromptSectionId::RetryRuntimeInstruction,
                 PromptSectionId::DynamicContext,
-                PromptSectionId::ExtraSystem,
             ]
         );
+
+        input.include_task_orchestration_policy = true;
+        input.include_threads_policy = true;
+        input.include_html_policy = true;
+        let outer =
+            agents_md_runtime_section("Outer scope rule\nRepeated rule\nRepeated rule", None);
+        let inner = agents_md_runtime_section("Inner scope override", None);
+        let memory = memory_recall_runtime_section("Memory operating contract");
+        input.runtime_sections = vec![memory.clone(), outer.clone(), inner.clone()];
+        let first = compile_prompt(input.clone()).unwrap();
+        input.runtime_sections = vec![outer, inner, memory];
+        let second = compile_prompt(input).unwrap();
+        assert_eq!(
+            first, second,
+            "known producers cannot change instruction order"
+        );
+        let saved = first.clone();
+        let plan = crate::compile_instruction_delivery_plan(first).unwrap();
+        assert_eq!(
+            plan.bundle, saved,
+            "delivery does not rewrite its source snapshot"
+        );
+        assert_eq!(
+            plan.sections
+                .iter()
+                .find(|s| s.section_id == FILESYSTEM_CAPABILITY_RUNTIME_SECTION_ID)
+                .unwrap()
+                .trust,
+            crate::InstructionTrust::Pioneer,
+            "separating the compiler's filesystem fallback preserves its provenance",
+        );
+        assert_eq!(
+            plan.provider_instructions.section_ids,
+            vec![
+                "assistant_safety",
+                "identity_base",
+                "soul_core",
+                "identity_core",
+                "user_persona",
+                "agents_md",
+                "agents_md",
+                "tool_usage_policy",
+                FILESYSTEM_CAPABILITY_RUNTIME_SECTION_ID,
+                "tasks_policy",
+                "subagents_policy",
+                "threads_policy",
+                "memory_recall",
+                "artifact_output_contract",
+                "html_policy",
+                "tool_recovery_policy",
+                "extra_system",
+            ]
+        );
+        let text = &plan.provider_instructions.text;
+        let mut previous = None;
+        for heading in [
+            "Safety and authority",
+            "Agent profile",
+            "Project instructions",
+            "Tools and capabilities",
+            "Outputs",
+            "Error recovery",
+        ] {
+            let label = format!("## {heading}\n");
+            assert_eq!(text.matches(&label).count(), 1);
+            let at = text.find(&label).unwrap();
+            assert!(previous.is_none_or(|p| p < at));
+            previous = Some(at);
+        }
+        assert!(!text.contains("## Soul Core\n"));
+        assert!(!text.contains("## Identity Core\n"));
+        assert!(
+            text.find("Outer scope rule").unwrap() < text.find("Inner scope override").unwrap()
+        );
+        assert_eq!(
+            text.matches("Repeated rule").count(),
+            2,
+            "document repetition is untouched"
+        );
+        for id in [
+            PromptSectionId::SoulCore,
+            PromptSectionId::IdentityCore,
+            PromptSectionId::UserPersona,
+        ] {
+            assert_eq!(
+                compiled.sections.iter().find(|s| s.id == id),
+                second.sections.iter().find(|s| s.id == id),
+                "document content, source and stability stay unchanged",
+            );
+        }
+        for rule in [
+            "Delivery is separate from execution",
+            "Do not finish the parent turn",
+            "thread turn",
+            "all six preview images",
+            "no extra artifact_register",
+            "Read each guide named by a capability policy",
+            "Only provide a final answer after tools succeed",
+        ] {
+            assert!(text.contains(rule), "missing unique contract: {rule}");
+        }
+        assert_eq!(
+            text.matches("call read_skill before specialized actions")
+                .count(),
+            1
+        );
+        assert_eq!(
+            text.matches("Instructions do not expose tools, grant permissions")
+                .count(),
+            1
+        );
+        assert!(!text.contains("## Extra System"));
+        assert!(
+            text.contains("extra"),
+            "legacy caller rules stay in their own elevated section"
+        );
+        let minimal_ids = compiled.sections.iter().map(|s| &s.id).collect::<Vec<_>>();
+        for absent in [
+            PromptSectionId::TasksPolicy,
+            PromptSectionId::SubagentsPolicy,
+            PromptSectionId::ThreadsPolicy,
+            PromptSectionId::HtmlPolicy,
+        ] {
+            assert!(!minimal_ids.contains(&&absent));
+        }
     }
 
     #[test]
-    fn native_filesystem_capability_replaces_static_tool_policy_and_is_prioritized() {
+    fn native_filesystem_capability_replaces_fallback_without_removing_skill_contract() {
         let root = temp_workspace("filesystem_capability");
         let capability_id = PromptDynamicSectionId::new(FILESYSTEM_CAPABILITY_RUNTIME_SECTION_ID)
             .expect("filesystem capability section id");
@@ -932,6 +1097,11 @@ mod tests {
                 .count(),
             1
         );
+        assert!(
+            compiled
+                .full_system_text
+                .contains(crate::content::SKILL_USAGE_POLICY_PROMPT)
+        );
     }
 
     #[test]
@@ -976,17 +1146,17 @@ mod tests {
             tasks_section.stability,
             crate::section::PromptStability::Dynamic
         );
-        assert!(compiled.dynamic_system_text.contains("## Subagents"));
-        assert!(compiled.dynamic_system_text.contains("## Tasks"));
+        assert!(compiled.dynamic_system_text.contains("### Subagents"));
+        assert!(compiled.dynamic_system_text.contains("### Tasks"));
         assert!(
             compiled
                 .dynamic_system_text
-                .contains("find `pioneer/subagents` in Internal Skill References")
+                .contains("`pioneer/subagents` guide in Internal Skill References")
         );
         assert!(
             compiled
                 .dynamic_system_text
-                .contains("find `pioneer/tasks` in Internal Skill References")
+                .contains("`pioneer/tasks` guide in Internal Skill References")
         );
         assert!(
             compiled
@@ -1006,14 +1176,23 @@ mod tests {
         assert!(!compiled.dynamic_system_text.contains("task_create"));
         assert!(!compiled.dynamic_system_text.contains("task_accept"));
 
-        assert!(subagents_section.content.contains("read_skill"));
+        assert!(
+            compiled
+                .stable_system_text
+                .contains("call read_skill before specialized actions")
+        );
+        assert!(
+            compiled
+                .stable_system_text
+                .contains("Read each guide named by a capability policy")
+        );
         assert!(subagents_section.content.contains("attached subagents"));
         assert!(
             subagents_section
                 .content
                 .contains("parent agent owns the user outcome")
         );
-        assert!(tasks_section.content.contains("read_skill"));
+        assert!(tasks_section.content.contains("`pioneer/tasks` guide"));
         assert!(
             tasks_section
                 .content
@@ -1051,7 +1230,7 @@ mod tests {
             .find(|section| section.id == PromptSectionId::ToolUsagePolicy)
             .expect("tool usage section should be present");
         assert_eq!(tool_usage_section.stability, PromptStability::Stable);
-        assert!(compiled.stable_system_text.contains("## Tool Usage"));
+        assert!(compiled.stable_system_text.contains("### Tool Usage"));
         assert!(
             compiled
                 .stable_system_text
@@ -1088,7 +1267,35 @@ mod tests {
         assert!(!compiled.stable_system_text.contains("edit_file"));
         assert!(!compiled.stable_system_text.contains("partial edits"));
 
-        assert!(tool_usage_section.content.contains("`read_file`"));
+        let filesystem_section = compiled
+            .sections
+            .iter()
+            .find(|section| {
+                section.id
+                    == PromptSectionId::Dynamic(
+                        PromptDynamicSectionId::new(
+                            crate::section::FILESYSTEM_CAPABILITY_RUNTIME_SECTION_ID,
+                        )
+                        .expect("valid filesystem section id"),
+                    )
+            })
+            .expect("filesystem section should be present");
+        assert!(filesystem_section.content.contains("`read_file`"));
+        assert!(
+            filesystem_section
+                .content
+                .contains("`apply_patch` as the only general text mutator")
+        );
+        assert!(
+            filesystem_section
+                .content
+                .contains("complete Add/Update/Move/Delete syntax")
+        );
+        assert!(
+            tool_usage_section
+                .content
+                .contains("call read_skill before specialized actions")
+        );
         assert!(!tool_usage_section.content.contains("AppliedPatchLog"));
         assert!(
             !tool_usage_section
@@ -1139,7 +1346,7 @@ mod tests {
             memory_section.stability,
             crate::section::PromptStability::Dynamic
         );
-        assert!(compiled.dynamic_system_text.contains("## Memory Recall"));
+        assert!(compiled.dynamic_system_text.contains("### Memory Recall"));
         assert!(
             compiled
                 .dynamic_system_text
@@ -1331,7 +1538,7 @@ mod tests {
 
         assert!(agents_index < memory_index);
         assert!(memory_index < execution_continuation_index);
-        assert!(execution_continuation_index < runtime_dynamic_index);
+        assert!(runtime_dynamic_index < execution_continuation_index);
         assert!(memory_index < runtime_dynamic_index);
         assert!(runtime_dynamic_index < hook_index);
     }
@@ -1649,6 +1856,72 @@ mod tests {
     }
 
     #[test]
+    fn governing_identity_document_edits_and_deletions_refresh_only_new_delivery() {
+        let root = temp_workspace("governing_document_delivery");
+        let compile = || {
+            crate::compile_instruction_delivery_plan(
+                compile_prompt(PromptCompileInput {
+                    workspace_root: root.clone(),
+                    profile: PromptProfile::AssistantFull,
+                    skills_prompt: None,
+                    retry_instruction: None,
+                    include_tool_recovery_policy: true,
+                    include_task_orchestration_policy: false,
+                    include_threads_policy: false,
+                    include_html_policy: false,
+                    continue_generation_hint: false,
+                    runtime_sections: vec![],
+                    dynamic_sections: vec![],
+                    dynamic_context: None,
+                    extra_system: None,
+                    limits: PromptLimits::default(),
+                })
+                .unwrap(),
+            )
+            .unwrap()
+        };
+        for name in ["SOUL.md", "IDENTITY.md", "USER.md"] {
+            let path = root.join(name);
+            let old_rule = format!("original governing rule in {name}");
+            std::fs::write(&path, &old_rule).unwrap();
+            let original = compile();
+            let frozen = original.provider_instructions.clone();
+            // No skill inventory or tools were supplied: the constant contract
+            // remains elevated but explicitly requires availability.
+            assert!(
+                frozen.text.contains(
+                    "read_skill plus its supplied exact skill:<id> reference are available"
+                )
+            );
+            assert!(
+                frozen.text.contains(
+                    "Permissions, sandbox, approvals, filesystem scope, MCP projection and tool authorization are enforced by Gateway"
+                )
+            );
+            assert!(
+                frozen
+                    .text
+                    .contains("For package skills, resolve relative assets")
+            );
+            assert!(frozen.text.contains(&old_rule));
+            assert!(!original.turn_context.text.contains(&old_rule));
+            let new_rule = format!("updated governing rule in {name}");
+            std::fs::write(&path, &new_rule).unwrap();
+            let edited = compile();
+            assert_ne!(edited.provider_instructions.fingerprint, frozen.fingerprint);
+            assert!(edited.provider_instructions.text.contains(&new_rule));
+            assert!(!edited.provider_instructions.text.contains(&old_rule));
+            std::fs::remove_file(&path).unwrap();
+            let removed = compile();
+            assert_ne!(removed.provider_instructions, edited.provider_instructions);
+            assert!(!removed.provider_instructions.text.contains(&new_rule));
+            assert!(!removed.provider_instructions.text.contains(&old_rule));
+            assert_eq!(original.provider_instructions, frozen);
+            assert!(original.provider_instructions.text.contains(&old_rule));
+        }
+    }
+
+    #[test]
     fn changing_dynamic_input_does_not_change_stable_fingerprint() {
         let root = temp_workspace("stable_vs_dynamic");
         std::fs::write(root.join("SOUL.md"), "Voice: direct and concise").expect("write SOUL");
@@ -1897,14 +2170,14 @@ mod tests {
         })
         .expect("compile");
 
-        assert!(compiled.full_system_text.contains("## Soul Core"));
+        assert!(compiled.full_system_text.contains("## Agent profile"));
         assert!(compiled.full_system_text.contains("## Core Truths"));
         assert!(
             compiled
                 .full_system_text
                 .contains("You're not a chatbot. You're becoming someone.")
         );
-        assert!(compiled.full_system_text.contains("## Identity Core"));
+        assert!(!compiled.full_system_text.contains("## Identity Core"));
         assert!(compiled.full_system_text.contains("### Who Am I?"));
         assert!(compiled.full_system_text.contains("- Name: Pioneer"));
         assert!(
