@@ -731,6 +731,7 @@ impl MessageProcessor {
                         turn_params,
                         requested_reasoning_effort.as_deref(),
                         crate::authorization::ExecutionAdmissionEntryPoint::VoiceTurn,
+                        crate::message::turn_handlers::ApiProviderTurnPreparation::AllowNew,
                         execution_admission,
                     )
                     .await

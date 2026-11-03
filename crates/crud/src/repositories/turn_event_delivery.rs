@@ -337,6 +337,42 @@ pub async fn mark_delivered<C: ConnectionTrait>(
     Ok(affected == 1)
 }
 
+/// A foreground start dependency is not a delivery attempt. Release its claim
+/// with a short eligibility delay, preserving the error/attempt budget.
+pub async fn defer_for_foreground_start<C: ConnectionTrait>(
+    db: &C,
+    id: &str,
+    claim_token: &str,
+    now: DateTimeWithTimeZone,
+) -> Result<bool> {
+    let affected = turn_event_delivery::Entity::update_many()
+        .col_expr(
+            turn_event_delivery::Column::Status,
+            Expr::value(DELIVERY_STATUS_PENDING),
+        )
+        .col_expr(
+            turn_event_delivery::Column::NextRunAt,
+            Expr::value(now + chrono::Duration::seconds(1)),
+        )
+        .col_expr(
+            turn_event_delivery::Column::ClaimToken,
+            Expr::value(Option::<String>::None),
+        )
+        .col_expr(
+            turn_event_delivery::Column::ClaimExpiresAt,
+            Expr::value(Option::<DateTimeWithTimeZone>::None),
+        )
+        .col_expr(turn_event_delivery::Column::UpdatedAt, Expr::value(now))
+        .filter(turn_event_delivery::Column::Id.eq(id.to_owned()))
+        .filter(turn_event_delivery::Column::Consumer.eq(CONSUMER_LIVE_NOTIFICATION))
+        .filter(turn_event_delivery::Column::Status.eq(DELIVERY_STATUS_DELIVERING))
+        .filter(turn_event_delivery::Column::ClaimToken.eq(claim_token.to_owned()))
+        .exec(db)
+        .await?
+        .rows_affected;
+    Ok(affected == 1)
+}
+
 pub async fn mark_failed<C: ConnectionTrait>(
     db: &C,
     id: &str,

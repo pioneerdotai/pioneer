@@ -5551,6 +5551,26 @@ impl CrudStore {
         .await
     }
 
+    /// Release a LIVE claim pending its foreground start without consuming a
+    /// normal delivery retry. The exact claim token fences replacement workers.
+    pub async fn defer_turn_event_delivery_for_foreground_start(
+        &self,
+        id: &str,
+        claim_token: &str,
+        now_unix: i64,
+    ) -> Result<bool> {
+        self.run_serialized_write(|| async {
+            turn_event_delivery::defer_for_foreground_start(
+                &self.connection,
+                id,
+                claim_token,
+                unix_to_datetime(now_unix),
+            )
+            .await
+        })
+        .await
+    }
+
     pub async fn fail_turn_event_delivery(
         &self,
         id: &str,
@@ -14934,6 +14954,34 @@ impl CrudStore {
         self.run_serialized_write(|| async {
             turn_execution::heartbeat_owner(&self.connection, owner_id.as_str(), lease_seconds)
                 .await
+        })
+        .await
+    }
+
+    /// Initial native handoff CAS, fenced against accepted terminal and exact
+    /// process ownership generation in the same serialized write transaction.
+    pub async fn mark_turn_execution_running_current(
+        &self,
+        expected: &TurnExecutionRecord,
+        lease_seconds: i64,
+    ) -> Result<bool> {
+        self.run_serialized_write(|| async {
+            let tx = self.connection.begin().await?;
+            if turn_event_projection_stream_state::has_accepted_terminal(&tx, &expected.turn_id)
+                .await?
+            {
+                return Ok(false);
+            }
+            let now = chrono::Utc::now().fixed_offset();
+            let updated = turn_execution::mark_running_current(
+                &tx,
+                expected,
+                now,
+                now + chrono::Duration::seconds(lease_seconds),
+            )
+            .await?;
+            tx.commit().await?;
+            Ok(updated)
         })
         .await
     }

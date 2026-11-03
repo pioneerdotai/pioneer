@@ -42504,6 +42504,43 @@ async fn task_progress_refreshes_parent_task_anchor_preview_impl() {
     assert_eq!(forwarded.thread_id, thread_id);
     assert_eq!(forwarded.turn_id, turn_id);
     assert_eq!(forwarded.delta, " 🦀**");
+
+    // Exercise the actual forwarding resolver against a pending target startup.
+    // The source child is running; checking only its turn misses this dependency.
+    let pending_parent = timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok(entry) = processor.foreground_starts.admit(thread_id, turn_id) {
+                break entry;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    processor
+        .handle_progress_agent_event(AgentProgressEvent::ItemDelta {
+            notification: ItemDeltaNotification {
+                workspace_id: workspace_id.clone(),
+                thread_id: lineage.child_thread_id.clone(),
+                turn_id: lineage.child_turn_id.clone(),
+                item_id: reasoning_id.into(),
+                delta: "withheld-parent-progress".into(),
+                stream: Some(ItemDeltaStream::AgentMessage),
+                payload: None,
+                markdown: None,
+                markdown_version: None,
+            },
+        })
+        .await;
+    while let Ok(Message::Text(text)) = rx.try_recv() {
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert!(
+            value["params"]["delta"] != "withheld-parent-progress",
+            "child reasoning bypassed its actual parent's startup dependency"
+        );
+    }
+    drop(pending_parent);
+
     assert_eq!(
         forwarded.markdown,
         Some(super::markdown::parse_markdown_document("**проверка 🦀**"))
@@ -49390,6 +49427,7 @@ async fn turn_start_security_snapshot_native_turn_is_persisted_before_dispatch()
             },
             None,
             crate::authorization::ExecutionAdmissionEntryPoint::InteractiveTurn,
+            crate::message::turn_handlers::ApiProviderTurnPreparation::AllowNew,
             execution_admission,
         )
         .await
@@ -49518,6 +49556,7 @@ async fn native_turn_start_same_request_replays_durable_outcome_without_dispatch
             params.clone(),
             None,
             crate::authorization::ExecutionAdmissionEntryPoint::InteractiveTurn,
+            crate::message::turn_handlers::ApiProviderTurnPreparation::AllowNew,
             execution_admission.clone(),
         )
         .await
@@ -49535,6 +49574,7 @@ async fn native_turn_start_same_request_replays_durable_outcome_without_dispatch
             params.clone(),
             None,
             crate::authorization::ExecutionAdmissionEntryPoint::InteractiveTurn,
+            crate::message::turn_handlers::ApiProviderTurnPreparation::AllowNew,
             execution_admission.clone(),
         )
         .await
@@ -49558,6 +49598,7 @@ async fn native_turn_start_same_request_replays_durable_outcome_without_dispatch
             conflicting,
             None,
             crate::authorization::ExecutionAdmissionEntryPoint::InteractiveTurn,
+            crate::message::turn_handlers::ApiProviderTurnPreparation::AllowNew,
             execution_admission,
         )
         .await
@@ -49648,6 +49689,7 @@ async fn turn_start_security_audit_events_include_snapshot_reference() {
             },
             None,
             crate::authorization::ExecutionAdmissionEntryPoint::InteractiveTurn,
+            crate::message::turn_handlers::ApiProviderTurnPreparation::AllowNew,
             execution_admission,
         )
         .await

@@ -1716,6 +1716,7 @@ async fn exercise_initial_native_stop(phase: InitialStopPhase) {
             params,
             None,
             crate::authorization::ExecutionAdmissionEntryPoint::InteractiveTurn,
+            crate::message::turn_handlers::ApiProviderTurnPreparation::AllowNew,
             admission,
         )
         .await
@@ -2922,3 +2923,6 @@ async fn exercise_initial_native_stop(phase: InitialStopPhase) {
     assert_eq!(repeat.turn, terminal);
     assert_eq!(calls.load(Ordering::SeqCst), expected_calls);
 }
+
+#[path = "foreground_start.rs"]
+mod foreground_start;

@@ -1678,15 +1678,20 @@ impl MessageProcessor {
                 self.defer_native_turn_control_transition(&preparation)
                     .await?;
             }
-            self.send_notification_to_thread_subscribers(
-                &preparation.thread_id,
-                events::THREAD_UPDATED,
-                &ThreadUpdatedNotification {
-                    thread,
-                    placement: None,
-                },
-            )
-            .await;
+            if !self
+                .foreground_starts
+                .pending(&preparation.thread_id, &preparation.turn_id)
+            {
+                self.send_notification_to_thread_subscribers(
+                    &preparation.thread_id,
+                    events::THREAD_UPDATED,
+                    &ThreadUpdatedNotification {
+                        thread,
+                        placement: None,
+                    },
+                )
+                .await;
+            }
             #[cfg(test)]
             self.completed_history_preparation_barrier
                 .wait_if_armed(
@@ -3052,12 +3057,17 @@ impl MessageProcessor {
 
                 // Source/job is already committed atomically; wake only advances execution.
                 self.spawn_thread_episodic_index_run();
-                self.send_notification_to_thread_subscribers(
-                    notification.thread_id.as_str(),
-                    events::ITEM_UPDATED,
-                    &notification,
-                )
-                .await;
+                if !self
+                    .foreground_starts
+                    .pending(&notification.thread_id, &notification.turn_id)
+                {
+                    self.send_notification_to_thread_subscribers(
+                        notification.thread_id.as_str(),
+                        events::ITEM_UPDATED,
+                        &notification,
+                    )
+                    .await;
+                }
                 self.notify_semantic_timeline_item_changed(
                     notification.workspace_id.as_str(),
                     notification.thread_id.as_str(),
@@ -4565,6 +4575,21 @@ impl MessageProcessor {
         &self,
         delivery: pioneer_crud::ClaimedTurnEventDeliveryRecord,
     ) -> Result<()> {
+        if delivery.consumer == pioneer_crud::NATIVE_TURN_EVENT_LIVE_CONSUMER
+            && self.foreground_starts.pending(
+                delivery.event.payload.thread_id(),
+                delivery.event.payload.turn_id(),
+            )
+        {
+            self.crud_store
+                .defer_turn_event_delivery_for_foreground_start(
+                    &delivery.id,
+                    &delivery.claim_token,
+                    now_timestamp_secs(),
+                )
+                .await?;
+            return Ok(());
+        }
         let result = tokio::time::timeout(
             Duration::from_secs(5),
             self.deliver_native_turn_event(&delivery),
@@ -4731,6 +4756,14 @@ impl MessageProcessor {
         &self,
         payload: &pioneer_crud::CanonicalTurnEventPayload,
     ) -> Result<()> {
+        // A pending foreground publisher never occupies a delivery slot while
+        // waiting. Existing claimed-delivery failure/retry owns the event body.
+        if self
+            .foreground_starts
+            .pending(payload.thread_id(), payload.turn_id())
+        {
+            bail!("foreground start publication is pending");
+        }
         use pioneer_crud::CanonicalTurnEventPayload as Event;
 
         let terminal = match payload {
@@ -6244,12 +6277,17 @@ impl MessageProcessor {
                 self.enrich_item_delta_markdown(&mut notification, item_type)
                     .await;
                 let delta_method = Self::item_delta_event_method(notification.stream);
-                self.send_progress_notification_to_thread_subscribers(
-                    notification.thread_id.as_str(),
-                    delta_method,
-                    &notification,
-                )
-                .await;
+                if !self
+                    .foreground_starts
+                    .pending(&notification.thread_id, &notification.turn_id)
+                {
+                    self.send_progress_notification_to_thread_subscribers(
+                        notification.thread_id.as_str(),
+                        delta_method,
+                        &notification,
+                    )
+                    .await;
+                }
 
                 if matches!(item_type, Some(TurnItemType::Reasoning)) {
                     self.forward_child_reasoning_delta_to_parent_turn(&notification)
@@ -6338,22 +6376,24 @@ impl MessageProcessor {
                 delta,
                 payload,
             } => {
-                self.send_progress_notification_to_thread_subscribers(
-                    &thread_id,
-                    Self::item_delta_event_method(Some(stream)),
-                    &pioneer_protocol::ItemDeltaNotification {
-                        workspace_id,
-                        thread_id: thread_id.clone(),
-                        turn_id,
-                        item_id,
-                        stream: Some(stream),
-                        delta,
-                        payload,
-                        markdown: None,
-                        markdown_version: None,
-                    },
-                )
-                .await;
+                if !self.foreground_starts.pending(&thread_id, &turn_id) {
+                    self.send_progress_notification_to_thread_subscribers(
+                        &thread_id,
+                        Self::item_delta_event_method(Some(stream)),
+                        &pioneer_protocol::ItemDeltaNotification {
+                            workspace_id,
+                            thread_id: thread_id.clone(),
+                            turn_id,
+                            item_id,
+                            stream: Some(stream),
+                            delta,
+                            payload,
+                            markdown: None,
+                            markdown_version: None,
+                        },
+                    )
+                    .await;
+                }
             }
             AgentProgressEvent::TaskProgress { .. } => {}
         }
@@ -7405,12 +7445,14 @@ impl MessageProcessor {
                     .await
                 {
                     Ok(()) => {
-                        self.send_notification_to_thread_subscribers(
-                            thread_id.as_str(),
-                            events::ITEM_COMPLETED,
-                            &completed,
-                        )
-                        .await;
+                        if !self.foreground_starts.pending(&thread_id, &outcome.turn_id) {
+                            self.send_notification_to_thread_subscribers(
+                                thread_id.as_str(),
+                                events::ITEM_COMPLETED,
+                                &completed,
+                            )
+                            .await;
+                        }
                         self.notify_semantic_timeline_item_changed(
                             completed.workspace_id.as_str(),
                             completed.thread_id.as_str(),
@@ -9028,12 +9070,17 @@ impl MessageProcessor {
             return;
         }
 
-        self.send_notification_to_thread_subscribers(
-            notification.thread_id.as_str(),
-            events::ITEM_TIMEOUT_DETECTED,
-            &notification,
-        )
-        .await;
+        if !self
+            .foreground_starts
+            .pending(&notification.thread_id, &notification.turn_id)
+        {
+            self.send_notification_to_thread_subscribers(
+                notification.thread_id.as_str(),
+                events::ITEM_TIMEOUT_DETECTED,
+                &notification,
+            )
+            .await;
+        }
         self.notify_semantic_timeline_work_item_id_changed(
             notification.workspace_id.as_str(),
             notification.thread_id.as_str(),
@@ -9416,6 +9463,12 @@ impl MessageProcessor {
         parent_delta.thread_id = target.parent_thread_id;
         parent_delta.turn_id = target.parent_turn_id;
 
+        if self
+            .foreground_starts
+            .pending(&parent_delta.thread_id, &parent_delta.turn_id)
+        {
+            return;
+        }
         let delta_method = Self::item_delta_event_method(parent_delta.stream);
         self.send_progress_notification_to_thread_subscribers(
             parent_delta.thread_id.as_str(),
@@ -10853,12 +10906,15 @@ impl MessageProcessor {
             return false;
         }
 
-        self.send_notification_to_thread_subscribers(
-            thread_id.as_str(),
-            events::TURN_BLOCKED,
-            &turn_blocked,
-        )
-        .await;
+        // The canonical blocked event already owns retry through LIVE.
+        if !self.foreground_starts.pending(&thread_id, &turn_id) {
+            self.send_notification_to_thread_subscribers(
+                thread_id.as_str(),
+                events::TURN_BLOCKED,
+                &turn_blocked,
+            )
+            .await;
+        }
         self.notify_semantic_timeline_turn_state_changed(
             turn_blocked.workspace_id.as_str(),
             turn_blocked.thread_id.as_str(),
@@ -12261,12 +12317,14 @@ impl MessageProcessor {
             placement: None,
         };
 
-        self.send_notification_to_thread_subscribers(
-            thread_id,
-            events::THREAD_UPDATED,
-            &notification,
-        )
-        .await;
+        if !self.foreground_starts.pending_thread(thread_id) {
+            self.send_notification_to_thread_subscribers(
+                thread_id,
+                events::THREAD_UPDATED,
+                &notification,
+            )
+            .await;
+        }
         self.notify_thread_tree_changed(notification.thread.workspace_id)
             .await;
     }

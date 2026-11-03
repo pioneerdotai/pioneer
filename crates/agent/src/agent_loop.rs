@@ -637,7 +637,7 @@ pub(super) async fn run_agent_loop(
                     run_id,
                 )));
 
-                let _ = ack.send(Ok(()));
+                let _ = ack.send(Ok(run_id));
             }
             AgentCommand::TurnTaskFinished {
                 turn_id,
