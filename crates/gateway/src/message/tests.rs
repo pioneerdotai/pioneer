@@ -42614,7 +42614,7 @@ async fn task_anchor_publication_scenario(scenario: &str) {
                 "actual task fanout must finish while publisher is held"
             );
             processor.release_completed_history_preparation_barrier();
-            live_wake.claim_barrier.release();
+            // Drain with one LIVE claimant, just as in the ordered scenario below.
             timeout(Duration::from_secs(10), async {
                 let mut started = false;
                 loop {
@@ -42673,7 +42673,8 @@ async fn task_anchor_publication_scenario(scenario: &str) {
                 }
             })
             .await
-            .unwrap();
+            .expect("blocked work snapshot must drain after start while the LIVE worker is parked");
+            live_wake.claim_barrier.release();
             cancel_task_for_test(
                 &processor,
                 pioneer_protocol::TaskCancelParams {
@@ -42836,7 +42837,8 @@ async fn task_anchor_publication_scenario(scenario: &str) {
             "eager update overtook queued A: {value}"
         );
     }
-    live_wake.claim_barrier.release();
+    // Keep the background LIVE owner parked while this fixture drains claims.
+    // Its synthetic future clock must not expire a concurrent worker's lease.
     timeout(Duration::from_secs(10), async {
         let (mut completed, mut a, mut b) = (false, false, false);
         let mut final_preview = None;
@@ -42917,7 +42919,8 @@ async fn task_anchor_publication_scenario(scenario: &str) {
         }
     })
     .await
-    .unwrap();
+    .expect("task anchor A and B must drain in order while the LIVE worker is parked");
+    live_wake.claim_barrier.release();
     if scenario != "ordered" {
         cancel_task_for_test(
             &processor,
