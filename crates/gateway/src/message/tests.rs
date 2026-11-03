@@ -4034,6 +4034,7 @@ struct GuardAwareProvider {
 }
 
 struct CreateThenHangProvider {
+    hold_until_cancelled: bool,
     next_index: AtomicUsize,
     root_main_started: Notify,
     root_after_create: Notify,
@@ -5131,6 +5132,9 @@ impl Provider for CreateThenHangProvider {
             });
         }
         if is_child_task_request(&request) {
+            if self.hold_until_cancelled {
+                return std::future::pending().await;
+            }
             sleep(Duration::from_secs(10)).await;
             return Ok(ChatResponse {
                 messages: Vec::new(),
@@ -5145,6 +5149,9 @@ impl Provider for CreateThenHangProvider {
         // Reaching the next parent request proves task_create returned through
         // the real tool loop, including its durable item acknowledgement.
         self.root_after_create.notify_one();
+        if self.hold_until_cancelled {
+            return std::future::pending().await;
+        }
         sleep(Duration::from_secs(10)).await;
         Ok(ChatResponse {
             messages: Vec::new(),
@@ -5177,6 +5184,7 @@ impl Provider for CreateThenHangProvider {
 impl CreateThenHangProvider {
     fn new() -> Self {
         Self {
+            hold_until_cancelled: false,
             next_index: AtomicUsize::new(0),
             root_main_started: Notify::new(),
             root_after_create: Notify::new(),
@@ -42408,7 +42416,13 @@ async fn task_anchor_publication_scenario(scenario: &str) {
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
-    let provider = Arc::new(CreateThenHangProvider::new());
+    // Publication and LIVE barriers may outlive the shared provider's ten-second
+    // delay. Keep both turns alive until this scenario explicitly cancels them,
+    // so terminal fanout cannot race the A/B progress snapshots.
+    let provider = Arc::new(CreateThenHangProvider {
+        hold_until_cancelled: true,
+        ..CreateThenHangProvider::new()
+    });
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "openai",
         provider.clone(),
