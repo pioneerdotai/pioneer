@@ -707,7 +707,7 @@ pub(crate) struct QueryCpuLayer;
 pub(crate) fn target_enabled(target: &str) -> bool {
     // Keep lifecycle callbacks enabled after capture closes. Never enable
     // verbose SQLx/SeaORM spans or events as a side effect of capture.
-    target == TARGET || (target == "pioneer_sqlite::pool" && crate::telemetry_enabled())
+    target == TARGET
 }
 fn key_for<S>(id: &Id, ctx: &LayerContext<'_, S>) -> Option<Key>
 where
@@ -1547,10 +1547,10 @@ pub(crate) mod tests {
                         .spawn(move || {
                             tracing::dispatcher::with_default(&thread_dispatch, || {
                                 let _outer = worker_span.enter();
-                                // A nested pool span sees the same ancestor. It must
+                                // A nested private span sees the same ancestor. It must
                                 // not create a second CPU segment.
                                 let nested =
-                                    tracing::trace_span!(target: "pioneer_sqlite::pool", "nested");
+                                    tracing::trace_span!(target: "pioneer_sqlite::query_cpu", "nested");
                                 let _nested = nested.enter();
                                 ready.wait();
                                 release.wait();
@@ -1618,7 +1618,7 @@ pub(crate) mod tests {
                             release.wait();
                             // Enter/exit after sealing must still balance cleanup.
                             let nested =
-                                tracing::trace_span!(target: "pioneer_sqlite::pool", "late_nested");
+                                tracing::trace_span!(target: "pioneer_sqlite::query_cpu", "late_nested");
                             let _nested = nested.enter();
                         });
                     })

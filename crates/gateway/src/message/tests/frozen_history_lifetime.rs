@@ -138,6 +138,7 @@ async fn delivery(h: &Phase13CompactionHarness, id: &str, thread: &str, turn: &s
 #[derive(Clone, Copy)]
 enum FixtureMode {
     Normal,
+    TurnContext,
     WorkerLegacy,
     Aggregate { legacy: bool },
     UnderstatedOutput { shared: bool },
@@ -199,6 +200,45 @@ async fn fixture_with_mode(mode: FixtureMode) -> FrozenFixture {
         true,
     )
     .await;
+    if matches!(mode, FixtureMode::TurnContext) {
+        for (item, source, kind, content) in [
+            (
+                "turn-input-projection",
+                "turn_input_projection_v1",
+                "turn_input",
+                "[saved turn context]\ninput retained delivered work",
+            ),
+            (
+                "runtime-observation",
+                "runtime_context_v1",
+                "runtime_event",
+                "[saved runtime observation]",
+            ),
+        ] {
+            let mut message = ChatMessage::user(content);
+            message.application_context = Some(serde_json::json!({"version":1,"kind":kind}));
+            h.crud_store
+                .append_turn_llm_context(
+                    pioneer_crud::NewTurnLlmContextEntry {
+                        turn_id: "frozen-source-turn".into(),
+                        item_id: Some(item.into()),
+                        attempt_id: None,
+                        sequence: 0,
+                        source: source.into(),
+                        tool_name: None,
+                        payload:
+                            serde_json::json!({"kind":"json","truncated":false,"value":message})
+                                .to_string(),
+                        output_policy_snapshot: "{}".into(),
+                        created_at: chrono::Utc::now().fixed_offset(),
+                        expires_at: None,
+                    },
+                    item,
+                )
+                .await
+                .unwrap();
+        }
+    }
     let db = h.crud_store.database_connection();
     for (sql, values) in [
         (
@@ -245,6 +285,41 @@ async fn fixture_with_mode(mode: FixtureMode) -> FrozenFixture {
         .await
         .unwrap();
     assert!(!refs.is_empty());
+    if matches!(mode, FixtureMode::TurnContext) {
+        assert!(refs.iter().any(|reference| {
+            reference.sources.len() == 2
+                && reference
+                    .sources
+                    .iter()
+                    .any(|source| source.scope == "context:frozen-source-turn")
+                && reference
+                    .sources
+                    .iter()
+                    .any(|source| source.scope == "input:frozen-source-turn")
+        }));
+        let restored = crate::turn_runtime_snapshot::restore_history_json(
+            &h.crud_store,
+            &h.workspace_id,
+            &std::collections::BTreeSet::from(["frozen-source".into()]),
+            &serde_json::to_string(&output.history).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            restored
+                .iter()
+                .filter(|message| message.content.contains("input retained delivered work"))
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>(),
+            ["[saved turn context]\ninput retained delivered work"],
+            "frozen replay must preserve the prepared input without reviving its raw copy"
+        );
+        assert!(
+            restored
+                .iter()
+                .any(|message| message.content == "[saved runtime observation]")
+        );
+    }
     let mut imports = vec![];
     for (ordinal, target) in refs.iter().enumerate() {
         for source in &target.sources {
@@ -474,7 +549,7 @@ async fn fixture_with_mode(mode: FixtureMode) -> FrozenFixture {
         )
         .await
         .unwrap();
-    let checkpoint = if matches!(mode, FixtureMode::Normal) {
+    let checkpoint = if matches!(mode, FixtureMode::Normal | FixtureMode::TurnContext) {
         let summarizer = Arc::new(
             pioneer_agent::compaction::NativeSummarizer::new(provider, selection, budget).unwrap(),
         );
@@ -818,7 +893,7 @@ async fn expire_and_sweep(f: &FrozenFixture) {
 #[tokio::test]
 async fn published_local_checkpoint_with_nonempty_proofs_survives_expired_origin_through_processor()
 {
-    let f = fixture().await;
+    let f = fixture_with_mode(FixtureMode::TurnContext).await;
     expire_and_sweep(&f).await;
     materialize(
         &f.h,

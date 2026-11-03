@@ -475,6 +475,32 @@ async fn queued_cleanup_revalidates_late_lineage_receipt_and_capsule_without_sel
         .await
         .unwrap();
     tx.commit().await.unwrap();
+    // These durable model-history rows outlive the transient child capsule.
+    // Exercise the real insert/cleanup/discovery paths, not a copied source predicate.
+    for (sequence, source) in [
+        "turn_input_projection_v1",
+        "runtime_context_v1",
+        "system_snapshot_v1",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        store
+            .insert_turn_llm_context(NewTurnLlmContextEntry {
+                turn_id: "gated_child".into(),
+                item_id: Some(source.into()),
+                attempt_id: None,
+                sequence: sequence as i64 + 1,
+                source: source.into(),
+                tool_name: None,
+                payload: "{}".into(),
+                output_policy_snapshot: "{}".into(),
+                created_at: unix_to_datetime(AT),
+                expires_at: None,
+            })
+            .await
+            .unwrap();
+    }
     let scopes_before = scope::Entity::find()
         .order_by_asc(scope::Column::ScopeKind)
         .order_by_asc(scope::Column::ScopeKey)
@@ -498,13 +524,24 @@ async fn queued_cleanup_revalidates_late_lineage_receipt_and_capsule_without_sel
             "committed capsule/root removal must invalidate its completed storage dependencies"
         );
     }
-    assert!(
-        store
-            .list_turn_llm_context("gated_child")
-            .await
-            .unwrap()
-            .is_empty()
+    let mut retained_sources = store
+        .list_turn_llm_context("gated_child")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| row.source)
+        .collect::<Vec<_>>();
+    retained_sources.sort();
+    assert_eq!(
+        retained_sources,
+        [
+            "runtime_context_v1",
+            "system_snapshot_v1",
+            "turn_input_projection_v1",
+        ],
+        "capsule cleanup must preserve model history while removing transient context"
     );
+    assert!(discovered(&store, 64).await.is_empty());
     assert!(
         point::Entity::find_by_id("gated_child")
             .one(&store.connection)
@@ -535,6 +572,29 @@ async fn queued_cleanup_revalidates_late_lineage_receipt_and_capsule_without_sel
         .finish_child_point(&empty_capsule_claim, None, true)
         .await
         .unwrap();
+    store
+        .insert_turn_llm_context(NewTurnLlmContextEntry {
+            turn_id: "gated_child".into(),
+            item_id: Some("late-runtime-observation".into()),
+            attempt_id: None,
+            sequence: 4,
+            source: "runtime_context_v1".into(),
+            tool_name: None,
+            payload: "{}".into(),
+            output_policy_snapshot: "{}".into(),
+            created_at: unix_to_datetime(AT + 3),
+            expires_at: None,
+        })
+        .await
+        .unwrap();
+    assert!(
+        point::Entity::find_by_id("gated_child")
+            .one(&store.connection)
+            .await
+            .unwrap()
+            .is_none(),
+        "a model-history append must not create a transient capsule obligation"
+    );
     publish_capsule(&store, "gated_child").await;
     assert!(
         point::Entity::find_by_id("gated_child")

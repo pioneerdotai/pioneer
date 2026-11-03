@@ -1,14 +1,13 @@
 use super::*;
 
-pub(in crate::hooks) struct MemoryPolicyClassifierHook {
-    pub(in crate::hooks) policy_provider: Option<Arc<dyn AgentMemoryTurnPolicyProvider>>,
+pub(in crate::hooks) struct MemoryPolicyHook {
     pub(in crate::hooks) state: Arc<MemoryHookTurnStateStore>,
 }
 
 #[async_trait::async_trait]
-impl HookHandler for MemoryPolicyClassifierHook {
+impl HookHandler for MemoryPolicyHook {
     fn id(&self) -> HookId {
-        HookId::new(MEMORY_POLICY_CLASSIFIER_HOOK_ID).expect("static hook id is valid")
+        HookId::new(MEMORY_POLICY_HOOK_ID).expect("static hook id is valid")
     }
 
     fn kind(&self) -> HookKind {
@@ -20,7 +19,7 @@ impl HookHandler for MemoryPolicyClassifierHook {
     }
 
     fn capabilities(&self) -> HookCapabilities {
-        memory_policy_classifier_capabilities()
+        memory_policy_capabilities()
     }
 
     async fn execute(&self, request: HookHandlerRequest) -> HookResult<HookHandlerResponse> {
@@ -54,9 +53,7 @@ impl HookHandler for MemoryPolicyClassifierHook {
         };
         let (policy_request, request_diagnostics) =
             memory_turn_policy_request_from_metadata(&request.context.metadata);
-        let policy =
-            resolve_memory_turn_policy(self.policy_provider.as_ref(), context, policy_request)
-                .await;
+        let policy = resolve_memory_turn_policy(context, policy_request).await;
         let turn_context = MemoryTurnContext {
             workspace_id: workspace_id.to_owned(),
             thread_id: thread_id.to_owned(),

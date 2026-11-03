@@ -192,13 +192,15 @@ pub(super) fn memory_post_turn_eligibility_input_from_request(
     policy: MemoryPostTurnEligibilityPolicy,
 ) -> MemoryPostTurnEligibilityInput {
     let has_user_text = input
-        .user_text
+        .extraction_user_text
         .as_ref()
+        .or(input.user_text.as_ref())
         .map(|text| !text.text.trim().is_empty())
         .unwrap_or(false);
     let has_assistant_text = input
-        .assistant_text
+        .extraction_assistant_text
         .as_ref()
+        .or(input.assistant_text.as_ref())
         .map(|text| !text.text.trim().is_empty())
         .unwrap_or(false);
     let has_tool_events = !input.tool_events.is_empty();

@@ -371,6 +371,8 @@ struct PendingSource {
     portable_identity: String,
     owner_stamp: String,
     bytes: i64,
+    eligible: bool,
+    invalid_root: bool,
 }
 
 async fn pending_source(
@@ -389,6 +391,8 @@ async fn pending_source(
                     .column_as(key, "owner")
                     .columns([Col::PortableRevision, Col::PortableIdentity])
                     .expr_as(Expr::cust(owner_stamp_sql(family)), "owner_stamp")
+                    .expr_as(Expr::cust(eligibility_sql(family)), "eligible")
+                    .expr_as(Expr::cust(invalid_root_sql(family)), "invalid_root")
                     .expr_as(
                         Func::cust(Alias::new("octet_length")).arg(Expr::col(field)),
                         "bytes",
@@ -557,16 +561,31 @@ impl PortablePayloadProgress {
             observe::outcome(observe::Outcome::NoWork);
             return Ok(false);
         };
-        let row = pending_source(
-            store,
-            family,
-            self.after[index].as_deref(),
-            Some(upper),
-            false,
-        )
-        .await?;
-        if let Some(row) = row {
-            self.after[family as usize] = Some(row.owner.clone());
+        // Seek one key at a time and stop at the first eligible source. This
+        // bounds refusals to 64 per quantum without projecting an eligible tail
+        // that would be discarded and read again on the next family visit.
+        // Each await releases DB capacity; no candidate cache survives quanta.
+        for _ in 0..64 {
+            let Some(row) = pending_source(
+                store,
+                family,
+                self.after[index].as_deref(),
+                Some(upper),
+                false,
+            )
+            .await?
+            else {
+                self.after[index] = None;
+                self.upper[index] = None;
+                break;
+            };
+            self.after[index] = Some(row.owner.clone());
+            ensure!(!row.invalid_root, "invalid frozen history counters");
+            if !row.eligible {
+                // Outcome describes the entire quantum, not individual skips.
+                // A later read/counter failure must retain Error classification.
+                continue;
+            }
             let payload_id = pioneer_protocol::generate_id(PAYLOAD_ID_LEN);
             self.pending = Some(Preparation {
                 family,
@@ -608,8 +627,8 @@ impl PortablePayloadProgress {
             });
             return Ok(true);
         }
-        self.after[family as usize] = None;
-        self.upper[family as usize] = None;
+        // No preparation/cleanup work: let the worker retain its idle sleep
+        // even when the database contains only temporarily ineligible rows.
         observe::outcome(observe::Outcome::NoWork);
         Ok(false)
     }
@@ -1605,21 +1624,23 @@ pub(crate) async fn after_database_owners<T>(
         .await
 }
 
-async fn publish(
-    store: &CrudStore,
-    family: Family,
-    owner: &str,
-    revision: i64,
-    identity: &str,
-    owner_stamp: &str,
-    prepared: &Prepared,
-) -> Result<()> {
+// Availability refusals are expected; malformed persisted header counters are
+// not. Match frozen_lifetime::header_bounds, including expired backing headers.
+fn invalid_root_sql(family: Family) -> String {
+    if !matches!(family, Family::CliMapping | Family::TaskHistory) {
+        return "0".into();
+    }
     let (table, _, _) = family.spec();
-    let _phase = observe::stage(observe::Stage::Publish);
-    let tx = store.connection.begin().await?;
-    // Source revision triggers cover logical payload and ownership updates.
-    // Unknown/expired roots cannot pass the existing verified root trigger.
-    // Revalidate Task/run/workspace at publication, not from preparation.
+    format!(
+        "EXISTS(SELECT 1 FROM compaction_frozen_history h WHERE h.id={table}.frozen_manifest_id AND NOT (h.expired IN (0,1) AND h.ready IN (0,1) AND h.message_count>=0 AND h.import_count>=0 AND h.next_ordinal BETWEEN 0 AND h.message_count AND h.next_import BETWEEN 0 AND h.import_count AND (h.ready=0 OR (h.next_ordinal=h.message_count AND h.next_import=h.import_count))))"
+    )
+}
+
+// Correlated ownership/root predicates are shared by bounded discovery and
+// atomic publication. SeaORM has no typed relation for all these heterogeneous
+// owners; keep the existing correlated SQL expressions on the Entity path.
+fn eligibility_sql(family: Family) -> String {
+    let (table, _, _) = family.spec();
     let owner_guard = match family {
         Family::TaskHistory => {
             " AND EXISTS(SELECT 1 FROM task t JOIN task_run r ON r.task_id=t.id WHERE r.id=task_run_conversation_snapshot.run_id AND t.id=task_run_conversation_snapshot.task_id AND t.workspace_id=task_run_conversation_snapshot.workspace_id)"
@@ -1639,6 +1660,27 @@ async fn publish(
     } else {
         String::new()
     };
+    format!(
+        "({}){}",
+        owner_guard.trim_start_matches(" AND "),
+        root_guard
+    )
+}
+
+async fn publish(
+    store: &CrudStore,
+    family: Family,
+    owner: &str,
+    revision: i64,
+    identity: &str,
+    owner_stamp: &str,
+    prepared: &Prepared,
+) -> Result<()> {
+    let _phase = observe::stage(observe::Stage::Publish);
+    let tx = store.connection.begin().await?;
+    // Source revision triggers cover logical payload and ownership updates.
+    // Unknown/expired roots cannot pass the existing verified root trigger.
+    // Revalidate Task/run/workspace at publication, not from preparation.
     let affected = target!(family, |Target, Col, key, field, reference| {
         let mut update = Target::update_many()
             .col_expr(reference, Expr::value(prepared.header.id.clone()))
@@ -1647,12 +1689,7 @@ async fn publish(
             .filter(Col::PortableIdentity.eq(identity))
             .filter(Expr::cust(owner_stamp_sql(family)).eq(owner_stamp))
             .filter(reference.is_null())
-            .filter(Expr::cust(owner_guard.trim_start_matches(" AND ")));
-        if !root_guard.is_empty() {
-            update = update.filter(Expr::cust(
-                root_guard.trim_start_matches(" AND ").to_owned(),
-            ));
-        }
+            .filter(Expr::cust(eligibility_sql(family)));
         if let Some(projection) = &prepared.projection {
             update = update.col_expr(field, Expr::value(projection.clone()));
         }
@@ -1670,14 +1707,30 @@ async fn publish(
             "portable staged header disappeared before publication"
         );
     }
-    tx.commit().await?;
-    // A stale/unavailable owner is not committed completion. Diagnose it and
-    // use the existing worker's bounded backoff rather than repeatedly encoding
-    // an expired root or orphan source without an observable refusal.
-    if affected != 1 {
-        observe::outcome(observe::Outcome::Stale);
+    ensure!(
+        affected <= 1,
+        "portable publication affected invalid row count"
+    );
+    if affected == 0 && matches!(family, Family::CliMapping | Family::TaskHistory) {
+        let invalid = target!(family, |Target, Col, key, field, reference| {
+            Target::find()
+                .select_only()
+                .expr(Expr::cust(invalid_root_sql(family)))
+                .filter(key.eq(owner))
+                .into_tuple::<bool>()
+                .one(&tx)
+                .await?
+        });
+        ensure!(invalid != Some(true), "invalid frozen history counters");
     }
-    ensure!(affected == 1, "portable source changed before publication");
+    tx.commit().await?;
+    // A CAS miss is expected when source/owner/root changes during preparation.
+    // Leave the staged header retired; dropping Preparation releases its hold,
+    // and ordinary bounded cleanup reclaims it. No source completion is stored.
+    if affected == 0 {
+        observe::outcome(observe::Outcome::Stale);
+        return Ok(());
+    }
     let raw = prepared.header.raw == 1;
     let original = prepared.header.original_bytes as u64;
     let encoded = if raw {
@@ -1762,6 +1815,8 @@ mod tests {
     use super::*;
     use pioneer_observability::{live, work};
 
+    static TELEMETRY_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     #[derive(Default)]
     struct ReleaseObserver {
         token: std::sync::atomic::AtomicU64,
@@ -1804,6 +1859,7 @@ mod tests {
 
     #[tokio::test]
     async fn initial_capture_rejection_records_only_after_transaction_release() {
+        let _telemetry_lock = TELEMETRY_TEST_LOCK.lock().await;
         use std::sync::atomic::Ordering::SeqCst;
         struct Reset(bool);
         impl Drop for Reset {
@@ -2084,6 +2140,278 @@ mod tests {
         }
         panic!("legacy source was not discovered");
     }
+    #[tokio::test]
+    async fn publication_refusals_preserve_source_and_cleanup_but_sql_errors_propagate() {
+        for mutation in [
+            "UPDATE compaction_frozen_history SET expired=1 WHERE id='root'",
+            "DELETE FROM task_run WHERE id='run'",
+            "UPDATE task_run SET task_id='another-task' WHERE id='run'",
+            "UPDATE task SET workspace_id='another-workspace',status='completed' WHERE id='task'",
+            "DELETE FROM task WHERE id='task'",
+            "UPDATE task SET owner_id='another-thread' WHERE id='task'",
+            "UPDATE task_run_conversation_snapshot SET history_json='[]',frozen_manifest_id=NULL WHERE run_id='run'",
+            "CREATE TRIGGER fixture_publish_fault BEFORE UPDATE OF history_json_payload_id ON task_run_conversation_snapshot BEGIN SELECT RAISE(ABORT,'fixture publication fault'); END",
+        ] {
+            let (_dir, store) = reservation_fixture().await;
+            for sql in [
+                "INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,created_by_turn_id,executor_kind,status,title,goal) VALUES('task','ws','thread','thread','thread','turn','agent','running','fixture','fixture')",
+                "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES('run','task','run',1,1,'succeeded','agent')",
+                "INSERT INTO compaction_frozen_history(id,workspace_id,owner_thread,identity_sha256,message_count,next_ordinal,import_count,next_import,imports_sha256,ready) VALUES('root','ws','thread','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',0,0,0,0,'',1)",
+            ] {
+                store.connection.execute_unprepared(sql).await.unwrap();
+            }
+            let mut history =
+                serde_json::to_string(&pioneer_compaction::frozen::FrozenHistoryRef {
+                    format: 1,
+                    manifest_id: "root".into(),
+                    messages: 0,
+                    identity_sha256: "a".repeat(64),
+                })
+                .unwrap();
+            // Preserve exact JSON bytes while ensuring real staged blocks for
+            // refusal/hold/cleanup coverage, including a final-publication race.
+            history.push_str(&" ".repeat(200_000));
+            store
+                .insert_task_run_conversation_snapshot_if_absent(
+                    crate::NewTaskRunConversationSnapshot {
+                        run_id: "run".into(),
+                        task_id: "task".into(),
+                        workspace_id: "ws".into(),
+                        conversation_thread_id: "thread".into(),
+                        source_turn_id: None,
+                        history_json: history.clone(),
+                        created_at: chrono::Utc::now().fixed_offset(),
+                    },
+                )
+                .await
+                .unwrap();
+            let mut progress = PortablePayloadProgress::default();
+            pending_preparation(&mut progress, &store).await;
+            // Stop after finalization and raw block cleanup, immediately before
+            // atomic publication. No sleeps or race-dependent timing.
+            let mut prepared = progress.pending.take().unwrap();
+            for _ in 0..30 {
+                let no_blocks = block::Entity::find()
+                    .filter(block::Column::PayloadId.eq(&prepared.prepared.header.id))
+                    .one(&store.connection)
+                    .await
+                    .unwrap()
+                    .is_none();
+                if prepared.prepared.finalized && (prepared.prepared.header.raw != 1 || no_blocks) {
+                    break;
+                }
+                assert!(!prepared.step(&store).await.unwrap());
+            }
+            assert!(prepared.prepared.finalized);
+            assert_eq!(prepared.prepared.header.raw, 0);
+            assert!(
+                block::Entity::find()
+                    .filter(block::Column::PayloadId.eq(&prepared.prepared.header.id))
+                    .one(&store.connection)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            let id = prepared.prepared.header.id.clone();
+            store.connection.execute_unprepared(mutation).await.unwrap();
+            let expected_error = mutation.starts_with("CREATE TRIGGER");
+            progress.pending = Some(prepared);
+            let result = progress.quantum(&store).await;
+            if expected_error {
+                assert!(
+                    result.is_err(),
+                    "SQLite failure must reach worker error backoff"
+                );
+            } else {
+                assert!(
+                    result.unwrap(),
+                    "stale preparation completes without error backoff"
+                );
+            }
+            assert!(progress.pending.is_none());
+            let source = pioneer_entity::task_run_conversation_snapshot::Entity::find_by_id("run")
+                .one(&store.connection)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(source.history_json_payload_id.is_none());
+            assert_eq!(
+                source.history_json,
+                if mutation.contains("history_json='[]'") {
+                    "[]"
+                } else {
+                    &history
+                }
+            );
+            assert_eq!(
+                value::Entity::find_by_id(&id)
+                    .one(&store.connection)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .retired,
+                1
+            );
+            // Rejected staging remains protected while a reader holds it, then
+            // ordinary bounded cleanup can reclaim both header and blocks.
+            let hold = PayloadReadHold::capture(&id, Family::TaskHistory).unwrap();
+            assert!(!cleanup(&store, None).await.unwrap().0);
+            assert!(
+                value::Entity::find_by_id(&id)
+                    .one(&store.connection)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            drop(hold);
+            for _ in 0..10 {
+                cleanup(&store, None).await.unwrap();
+            }
+            assert!(
+                value::Entity::find_by_id(&id)
+                    .one(&store.connection)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                block::Entity::find()
+                    .filter(block::Column::PayloadId.eq(&id))
+                    .one(&store.connection)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn discovery_skip_before_corruption_records_quantum_error() {
+        use sea_orm::Statement;
+        let _telemetry_lock = TELEMETRY_TEST_LOCK.lock().await;
+        let (_dir, store) = reservation_fixture().await;
+        store.connection.execute_unprepared(
+            "INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,created_by_turn_id,executor_kind,status,title,goal) VALUES('task','ws','thread','thread','thread','turn','agent','running','fixture','fixture')"
+        ).await.unwrap();
+        for (number, id) in [(1_i64, "a-skip"), (2, "b-damaged")] {
+            store.connection.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+                "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES(?,'task',?,1,?,'succeeded','agent')", [id.into(), id.into(), number.into()]
+            )).await.unwrap();
+            store.connection.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+                "INSERT INTO compaction_frozen_history(id,workspace_id,owner_thread,identity_sha256,message_count,next_ordinal,import_count,next_import,imports_sha256,ready) VALUES(?,'ws','thread',?,0,0,0,0,'',1)", [id.into(), "a".repeat(64).into()]
+            )).await.unwrap();
+            let history = serde_json::to_string(&pioneer_compaction::frozen::FrozenHistoryRef {
+                format: 1,
+                manifest_id: id.into(),
+                messages: 0,
+                identity_sha256: "a".repeat(64),
+            })
+            .unwrap();
+            store
+                .insert_task_run_conversation_snapshot_if_absent(
+                    crate::NewTaskRunConversationSnapshot {
+                        run_id: id.into(),
+                        task_id: "task".into(),
+                        workspace_id: "ws".into(),
+                        conversation_thread_id: "thread".into(),
+                        source_turn_id: None,
+                        history_json: history,
+                        created_at: chrono::Utc::now().fixed_offset(),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        store
+            .connection
+            .execute_unprepared("UPDATE compaction_frozen_history SET expired=1")
+            .await
+            .unwrap();
+        struct Reset(bool);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                pioneer_observability::set_telemetry_enabled(self.0);
+            }
+        }
+        let _reset = Reset(pioneer_observability::telemetry_enabled());
+        pioneer_observability::set_telemetry_enabled(true);
+        for corrupted in [false, true] {
+            if corrupted {
+                // A damaged, unsealed legacy backing header. Retain the admitted
+                // source and the valid expired predecessor without weakening guards.
+                store
+                    .connection
+                    .execute_unprepared(
+                        "DELETE FROM compaction_frozen_history WHERE id='b-damaged'",
+                    )
+                    .await
+                    .unwrap();
+                store.connection.execute_unprepared(
+                    "INSERT INTO compaction_frozen_history(id,workspace_id,owner_thread,identity_sha256,message_count,next_ordinal,import_count,next_import,imports_sha256,ready) VALUES('b-damaged','ws','thread','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',0,-1,0,0,'',0)"
+                ).await.unwrap();
+            }
+            let mut progress = PortablePayloadProgress::default();
+            let mut observed = false;
+            // Find the Task history quantum by its public observation, without
+            // coupling the assertion to the order of families in the round.
+            for _ in 0..10 {
+                let owner = caller();
+                let token = owner.context().unwrap().token;
+                let result = owner.scope(progress.quantum(&store)).await;
+                let terminals: Vec<_> = live::snapshot()
+                    .unwrap()
+                    .journal
+                    .into_iter()
+                    .filter_map(|r| match r.payload {
+                        live::JournalPayload::Work(w)
+                            if w.context.parent == Some(token)
+                                && matches!(w.state, live::WorkState::Terminal(_))
+                                && w.portable_payload.is_some() =>
+                        {
+                            Some(w)
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(terminals.len(), 1);
+                let operation = terminals[0].portable_payload.unwrap();
+                if operation.family != observe::Family::TaskHistory {
+                    assert!(!result.unwrap());
+                    continue;
+                }
+                if corrupted {
+                    assert_eq!(
+                        result.unwrap_err().to_string(),
+                        "invalid frozen history counters"
+                    );
+                } else {
+                    assert!(!result.unwrap());
+                }
+                assert_eq!(operation.family, observe::Family::TaskHistory);
+                assert_eq!(operation.mode, observe::Mode::Background);
+                assert_eq!(
+                    operation.outcome,
+                    Some(if corrupted {
+                        observe::Outcome::Error
+                    } else {
+                        observe::Outcome::NoWork
+                    })
+                );
+                assert_eq!(
+                    terminals[0].state,
+                    live::WorkState::Terminal(if corrupted {
+                        work::Outcome::Failed
+                    } else {
+                        work::Outcome::Completed
+                    })
+                );
+                observed = true;
+                break;
+            }
+            assert!(observed, "Task history discovery must receive service");
+        }
+    }
+
     fn collide_with(store: &CrudStore, progress: &mut PortablePayloadProgress, id: &str) {
         let pending = progress.pending.as_mut().unwrap();
         assert!(!pending.prepared.installed);

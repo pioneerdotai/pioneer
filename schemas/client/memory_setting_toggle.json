@@ -4,7 +4,6 @@
   "type": "string",
   "enum": [
     "Enabled",
-    "ActiveRecall",
     "ProactiveWrites",
     "BackgroundExtraction",
     "DebugTrace"

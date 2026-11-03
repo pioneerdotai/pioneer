@@ -178,6 +178,215 @@ pub fn bounded_usage(value: &Value) -> Value {
     visit(value, 0, &mut 128, "").unwrap_or_else(|| json!({}))
 }
 
+/// Contract identifiers shared by CLI evidence producers and persistence.
+pub fn cli_statistics_identifier(value: &Value) -> Option<&str> {
+    value.as_str().filter(|s| {
+        !s.is_empty()
+            && s.len() <= 128
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"-_.:/".contains(&b))
+    })
+}
+
+/// CLI-only evidence extension. Never called by API wire deserializers.
+/// Bounded independently of API metrics: 8 models, 8 responses, 128-byte
+/// identifiers and 12 KiB total, leaving room below the 32 KiB journal limit.
+/// Arrays are evidence, never additional normalized spend.
+pub fn bounded_cli_statistics(value: &Value) -> Value {
+    fn ident(value: &Value) -> Option<Value> {
+        cli_statistics_identifier(value).map(|s| Value::String(s.into()))
+    }
+    fn nullable_counters(value: &Value, names: &[&str]) -> Value {
+        let mut out = json!({});
+        for name in names {
+            if let Some(n) = value[*name].as_u64() {
+                out[*name] = n.into();
+            } else if value.get(*name).is_some_and(Value::is_null) {
+                out[*name] = Value::Null;
+            }
+        }
+        out
+    }
+    fn fields(value: &Value, numbers: &[&str], strings: &[&str]) -> Value {
+        let mut out = json!({});
+        for key in numbers {
+            if let Some(n) = value[*key].as_u64() {
+                out[*key] = n.into();
+            }
+        }
+        for key in strings {
+            if let Some(s) = ident(&value[*key]) {
+                out[*key] = s;
+            }
+        }
+        for key in ["costUSD", "cost_usd", "total_cost_usd"] {
+            if let Some(n) = value[key].as_f64().filter(|n| n.is_finite() && *n >= 0.) {
+                out[key] = json!(n);
+            }
+        }
+        out
+    }
+    let mut out = fields(
+        value,
+        &[
+            "duration_ms",
+            "duration_api_ms",
+            "num_turns",
+            "ttft_ms",
+            "ttft_stream_ms",
+            "time_to_request_ms",
+            "time_to_request_from_spawn_ms",
+            "input_tokens",
+            "output_tokens",
+            "cached_input_tokens",
+            "cache_write_input_tokens",
+            "reasoning_output_tokens",
+            "cache_read_input_tokens",
+            "cache_creation_input_tokens",
+            "reasoning_tokens",
+            "total_tokens",
+            "visible_output_tokens",
+        ],
+        &[
+            "runtime",
+            "scope",
+            "semantics",
+            "model_usage_scope",
+            "cost_scope",
+            "cost_basis",
+        ],
+    );
+    let mut models = serde_json::Map::new();
+    if let Some(values) = value["model_usage"].as_object() {
+        for (name, model) in values
+            .iter()
+            .filter(|(name, _)| ident(&json!(name)).is_some())
+            .take(8)
+        {
+            let mut entry = fields(
+                model,
+                &[
+                    "inputTokens",
+                    "outputTokens",
+                    "thinkingTokens",
+                    "cacheReadInputTokens",
+                    "cacheCreationInputTokens",
+                    "cacheCreationEphemeral5mInputTokens",
+                    "cacheCreationEphemeral1hInputTokens",
+                    "webSearchRequests",
+                    "contextWindow",
+                    "maxOutputTokens",
+                ],
+                &["canonicalModel", "provider"],
+            );
+            if matches!(
+                model["costBasis"].as_str(),
+                Some("list" | "managed" | "unknown")
+            ) {
+                entry["costBasis"] = model["costBasis"].clone();
+            }
+            models.insert(name.clone(), entry);
+        }
+        out["model_usage"] = models.into();
+        out["model_usage_truncated"] =
+            json!(values.len() > out["model_usage"].as_object().unwrap().len());
+    }
+    // Aggregate evidence covers all responses, independently of retained detail.
+    if value["native_tokens"].is_object() {
+        let mut native =
+            nullable_counters(&value["native_tokens"], &["input", "output", "reasoning"]);
+        if value["native_tokens"]["cache"].is_object() {
+            native["cache"] =
+                nullable_counters(&value["native_tokens"]["cache"], &["read", "write"]);
+        }
+        out["native_tokens"] = native;
+    }
+    if value["known_partial_tokens"].is_object() {
+        out["known_partial_tokens"] = nullable_counters(
+            &value["known_partial_tokens"],
+            &["input", "output", "reasoning", "cache_read", "cache_write"],
+        );
+    }
+    let token_fields = ["input", "output", "reasoning", "total", "read", "write"];
+    if let Some(responses) = value["responses"].as_array() {
+        let retained: Vec<_> = responses
+            .iter()
+            .take(8)
+            .map(|response| {
+                let mut entry = fields(
+                    response,
+                    &["duration_ms"],
+                    &["id", "sessionID", "parentID", "modelID", "providerID"],
+                );
+                entry["model"] = fields(&response["model"], &[], &["id", "providerID", "variant"]);
+                entry["time"] = fields(
+                    &response["time"],
+                    &["created", "streamed", "completed"],
+                    &[],
+                );
+                entry["native_tokens"] = fields(&response["native_tokens"], &token_fields, &[]);
+                entry["native_tokens"]["cache"] =
+                    fields(&response["native_tokens"]["cache"], &["read", "write"], &[]);
+                entry
+            })
+            .collect();
+        out["responses_truncated"] = json!(responses.len() > retained.len());
+        out["responses"] = retained.into();
+    }
+    if value["native_usage"].is_object() {
+        let native = &value["native_usage"];
+        let numbers = [
+            "inputTokens",
+            "cachedInputTokens",
+            "cacheWriteInputTokens",
+            "outputTokens",
+            "reasoningOutputTokens",
+            "totalTokens",
+            "modelContextWindow",
+            "input_tokens",
+            "output_tokens",
+            "cache_read_input_tokens",
+            "cache_creation_input_tokens",
+            "thinking_tokens",
+            "reasoning_tokens",
+        ];
+        let mut entry = fields(native, &numbers, &[]);
+        for key in ["total", "last"] {
+            if native[key].is_object() {
+                entry[key] = fields(&native[key], &numbers, &[]);
+            }
+        }
+        for (key, numbers) in [
+            (
+                "cache_creation",
+                &["ephemeral_5m_input_tokens", "ephemeral_1h_input_tokens"][..],
+            ),
+            (
+                "server_tool_use",
+                &["web_search_requests", "web_fetch_requests"][..],
+            ),
+        ] {
+            if native[key].is_object() {
+                entry[key] = fields(&native[key], numbers, &[]);
+            }
+        }
+        out["native_usage"] = entry;
+    }
+    for key in ["responses_truncated", "model_usage_truncated"] {
+        if value[key] == true {
+            out[key] = json!(true);
+        }
+    }
+    // Hard byte budget: discard tail evidence, retain aggregate counters/timing.
+    for key in ["responses", "model_usage"] {
+        if out.to_string().len() > 12 * 1024 {
+            out.as_object_mut().unwrap().remove(key);
+            out[&format!("{key}_truncated")] = json!(true);
+        }
+    }
+    out
+}
+
 impl<const API: u8> WireUsage<API> {
     pub(crate) fn normalized(&self) -> TokenUsage {
         let raw = &self.0;

@@ -36,7 +36,6 @@ mod mcp_oauth;
 mod mcp_secrets;
 mod mcp_service;
 mod member;
-mod memory_policy;
 mod memory_runtime;
 mod memory_tools;
 mod message;
@@ -82,7 +81,7 @@ use pioneer_config::{
 };
 use pioneer_crud::CrudStore;
 use pioneer_hooks::HookAwaitPolicy;
-use pioneer_memory::hooks::{MemoryActiveRecallMode, MemoryLoopConfig};
+use pioneer_memory::hooks::MemoryLoopConfig;
 use pioneer_protocol::AuthDeviceCreateResponse;
 use pioneer_protocol::GatewayReadinessStatus;
 use pioneer_provider::{
@@ -634,12 +633,6 @@ async fn run_gateway_until_shutdown_inner(
 
     let tool_loop_config = ToolLoopConfig {
         provider: provider_timeout_policy,
-        preflight: pioneer_agent::PreflightLoopConfig {
-            provider_name: config.gateway.preflight_model.model_provider_override(),
-            model: config.gateway.preflight_model.model_override(),
-            timeout_ms: None,
-            max_output_chars: None,
-        },
         web: WebToolsConfig {
             default_timeout_ms: web_cfg.default_timeout_ms,
             hard_max_timeout_ms: web_cfg.hard_max_timeout_ms,
@@ -1375,12 +1368,7 @@ fn build_cli_runtime_manager(
 
 fn memory_loop_config_from_gateway_memory_config(config: &GatewayMemoryConfig) -> MemoryLoopConfig {
     let mut memory = MemoryLoopConfig::default();
-    memory.deterministic_recall_enabled = config.enabled && config.deterministic_recall_enabled;
     memory.tools_enabled = config.enabled && config.tools_enabled;
-
-    if !config.enabled || !config.active_recall_enabled || !memory.deterministic_recall_enabled {
-        memory.active_recall.mode = MemoryActiveRecallMode::Disabled;
-    }
 
     memory.post_turn_extractor.enabled = config.enabled && config.proactive_writes_enabled;
     memory.post_turn_extractor.provider_enabled = config.enabled && config.proactive_writes_enabled;
@@ -1467,13 +1455,7 @@ pub(crate) fn memory_loop_config_from_gateway_memory_settings(
     settings: &GatewayMemorySettings,
 ) -> MemoryLoopConfig {
     let mut memory = MemoryLoopConfig::default();
-    memory.deterministic_recall_enabled = settings.enabled && settings.deterministic_recall_enabled;
     memory.tools_enabled = settings.enabled && settings.tools_enabled;
-
-    if !settings.enabled || !settings.active_recall_enabled || !memory.deterministic_recall_enabled
-    {
-        memory.active_recall.mode = MemoryActiveRecallMode::Disabled;
-    }
 
     memory.post_turn_extractor.enabled = settings.enabled && settings.proactive_writes_enabled;
     memory.post_turn_extractor.provider_enabled =
@@ -1656,7 +1638,6 @@ mod runtime_tests {
         GatewayToolsConfig,
     };
     use pioneer_hooks::HookAwaitPolicy;
-    use pioneer_memory::hooks::MemoryActiveRecallMode;
     use pioneer_protocol::{GatewayVoiceInputProvider, GatewayVoiceInputRuntimePhase};
     use pioneer_skills::SkillTrustLevel;
     use std::sync::Arc;
@@ -1783,12 +1764,7 @@ mod runtime_tests {
         let loop_config =
             memory_loop_config_from_gateway_memory_config(&GatewayMemoryConfig::default());
 
-        assert!(loop_config.deterministic_recall_enabled);
         assert!(loop_config.tools_enabled);
-        assert_eq!(
-            loop_config.active_recall.mode,
-            MemoryActiveRecallMode::Hybrid
-        );
         assert!(loop_config.post_turn_extractor.enabled);
         assert!(loop_config.post_turn_extractor.provider_enabled);
         assert!(loop_config.post_turn_extractor.proactive_writes_enabled);
@@ -1808,12 +1784,7 @@ mod runtime_tests {
             ..GatewayMemoryConfig::default()
         });
 
-        assert!(!loop_config.deterministic_recall_enabled);
         assert!(!loop_config.tools_enabled);
-        assert_eq!(
-            loop_config.active_recall.mode,
-            MemoryActiveRecallMode::Disabled
-        );
         assert!(!loop_config.post_turn_extractor.enabled);
         assert!(!loop_config.post_turn_extractor.provider_enabled);
         assert!(!loop_config.post_turn_extractor.proactive_writes_enabled);
@@ -1877,8 +1848,6 @@ mod runtime_tests {
     #[test]
     fn gateway_memory_config_can_disable_individual_product_features() {
         let loop_config = memory_loop_config_from_gateway_memory_config(&GatewayMemoryConfig {
-            deterministic_recall_enabled: false,
-            active_recall_enabled: true,
             tools_enabled: false,
             proactive_writes_enabled: false,
             background_extraction_enabled: false,
@@ -1886,12 +1855,7 @@ mod runtime_tests {
             ..GatewayMemoryConfig::default()
         });
 
-        assert!(!loop_config.deterministic_recall_enabled);
         assert!(!loop_config.tools_enabled);
-        assert_eq!(
-            loop_config.active_recall.mode,
-            MemoryActiveRecallMode::Disabled
-        );
         assert!(!loop_config.post_turn_extractor.enabled);
         assert!(!loop_config.post_turn_extractor.provider_enabled);
         assert!(!loop_config.post_turn_extractor.proactive_writes_enabled);

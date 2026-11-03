@@ -969,7 +969,6 @@ impl AgentMarkdownBufferStats {
 #[derive(Clone)]
 struct MemoryBridgeProviders {
     memory_provider: Arc<crate::memory_tools::GatewayMemoryProvider>,
-    memory_policy_provider: Arc<crate::memory_policy::GatewayMemoryTurnPolicyProvider>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -2117,10 +2116,6 @@ impl MessageProcessor {
         let memory_provider = Arc::new(crate::memory_tools::GatewayMemoryProvider::new(
             Arc::downgrade(self),
         ));
-        let memory_policy_provider =
-            Arc::new(crate::memory_policy::GatewayMemoryTurnPolicyProvider::new(
-                self.provider_registry.clone(),
-            ));
         self.agent_manager
             .set_memory_provider(Some(memory_provider.clone()))
             .await;
@@ -2130,14 +2125,8 @@ impl MessageProcessor {
         self.agent_manager
             .set_memory_post_turn_extractor_provider(Some(memory_provider.clone()))
             .await;
-        self.agent_manager
-            .set_memory_turn_policy_provider(Some(memory_policy_provider.clone()))
-            .await;
 
-        let bridge = MemoryBridgeProviders {
-            memory_provider,
-            memory_policy_provider,
-        };
+        let bridge = MemoryBridgeProviders { memory_provider };
         *self.memory_bridge_providers.write().await = Some(bridge.clone());
         self.install_memory_hook_runtime(bridge).await;
     }
@@ -2149,10 +2138,6 @@ impl MessageProcessor {
                 bridge.memory_provider.clone(),
                 Some(bridge.memory_provider.clone()),
                 Some(bridge.memory_provider.clone()),
-                Some(bridge.memory_policy_provider),
-                // Pre-turn recall uses saved active memories. Conversation
-                // history is searched explicitly through the Threads tools.
-                None,
                 self.agent_manager.memory_tool_bundle_artifact_store(),
                 self.memory_loop_config(),
             ))
@@ -5652,7 +5637,6 @@ impl MessageProcessor {
         ));
         let normalized_tool_loop_config = ToolLoopConfig {
             provider: pioneer_provider::ProviderTimeoutPolicy::default(),
-            preflight: pioneer_agent::PreflightLoopConfig::default(),
             web: pioneer_tools::WebToolsConfig {
                 default_timeout_ms: web.default_timeout_ms,
                 hard_max_timeout_ms: web.hard_max_timeout_ms,
@@ -5722,13 +5706,7 @@ impl MessageProcessor {
                     allow_function_proxy_tools: true,
                 },
             },
-            memory: pioneer_memory::hooks::MemoryLoopConfig {
-                active_recall: pioneer_memory::hooks::MemoryActiveRecallConfig {
-                    mode: pioneer_memory::hooks::MemoryActiveRecallMode::DeterministicOnly,
-                    ..pioneer_memory::hooks::MemoryActiveRecallConfig::default()
-                },
-                ..pioneer_memory::hooks::MemoryLoopConfig::default()
-            },
+            memory: pioneer_memory::hooks::MemoryLoopConfig::default(),
             budget: pioneer_tools::ToolLoopBudgetConfig::default(),
             execution_windows: pioneer_tools::ExecutionWindowsConfig::default(),
             retry: pioneer_tools::ToolRetryBudgetConfig::default(),

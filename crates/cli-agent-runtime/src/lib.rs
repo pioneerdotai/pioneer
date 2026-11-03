@@ -25,6 +25,7 @@ pub mod registry;
 pub mod reserved_args;
 pub mod service;
 pub mod session;
+pub mod usage;
 
 pub const CLI_AGENT_RUNTIME_BOUNDARY: &str = "cli-agent-runtime";
 

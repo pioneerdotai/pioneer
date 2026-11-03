@@ -1429,6 +1429,21 @@ async fn known_rooted_import_without_preview_does_not_pin_an_independent_preview
             "tool_result_v2",
             json!({"kind":"json","truncated":false,"value":message}).to_string(),
         ),
+        (
+            "turn-input-projection",
+            "turn_input_projection_v1",
+            json!({"kind":"json","truncated":false,"value":ChatMessage::user("prepared input")}).to_string(),
+        ),
+        (
+            "runtime-observation",
+            "runtime_context_v1",
+            json!({"kind":"json","truncated":false,"value":ChatMessage::user("runtime observation")}).to_string(),
+        ),
+        (
+            "system-snapshot",
+            "system_snapshot_v1",
+            json!({"kind":"json","truncated":false,"value":ChatMessage::user("")}).to_string(),
+        ),
     ] {
         f.store
             .append_turn_llm_context(
@@ -1458,6 +1473,15 @@ async fn known_rooted_import_without_preview_does_not_pin_an_independent_preview
     assert!(
         !path.exists(),
         "known ordinary imported context must not pin unrelated preview bytes"
+    );
+    assert_eq!(
+        f.store
+            .list_turn_llm_context("independent-preview-turn")
+            .await
+            .unwrap()
+            .len(),
+        5,
+        "retiring preview bytes must retain the canonical model history"
     );
     let row = db
         .query_one_raw(Statement::from_sql_and_values(

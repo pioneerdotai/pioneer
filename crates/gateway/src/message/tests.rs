@@ -188,8 +188,7 @@ use pioneer_hooks::{
 };
 use pioneer_keystore::{MemorySecretStore, SecretFilter, SecretId, SecretKind, SecretStore};
 use pioneer_memory::hooks::{
-    AgentMemoryProvider, MEMORY_ACCEPTED_TASK_RESULT_POST_TURN_FEATURE_FLAG, MemoryRecallRequest,
-    MemoryTurnContext,
+    AgentMemoryProvider, MEMORY_ACCEPTED_TASK_RESULT_POST_TURN_FEATURE_FLAG, MemoryTurnContext,
 };
 use pioneer_protocol::{
     AgentDurableEvent, AgentExecutionBackend, AgentProgressEvent, ArtifactCapabilitiesResponse,
@@ -2642,6 +2641,64 @@ async fn capability_persistence_order_impl() {
             runtime_kind,
             CLIAgentRuntimeKind::Codex | CLIAgentRuntimeKind::OpenCode
         ) {
+            // Read the actual dispatch saved before native start, using a fresh
+            // repository handle rather than serializing the helper result.
+            let reopened = CrudStore::new(harness.crud_store.database_connection());
+            let saved = reopened
+                .get_cli_runtime_turn_binding(&turn_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let saved_mapping: JsonValue = serde_json::from_str(&saved.input_mapping_json).unwrap();
+            assert_eq!(saved_mapping["input"], native_turn.input);
+            let required = saved_mapping["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|item| item["text"].as_str())
+                .find(|text| text.starts_with("Current required Pioneer skill exports"))
+                .expect("required references must cross dispatch persistence");
+            for name in [
+                "pioneer-system-tasks",
+                "pioneer-system-subagents",
+                "pioneer-system-html",
+                "pioneer-system-threads",
+            ] {
+                assert!(required.contains(name));
+            }
+            assert!(!required.contains("# alpha"));
+            assert!(!required.contains("# beta"));
+            let saved_skills = saved_mapping["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|item| item["type"] == "skill")
+                .collect::<Vec<_>>();
+            assert_eq!(
+                saved_skills.len(),
+                2,
+                "required exports must remain references"
+            );
+            // Duplicate admission must use the persisted logical Turn, without
+            // invoking skills again or rewriting the saved dispatch payload.
+            let starts_before = harness.cli_session.turn_starts.lock().await.len();
+            harness
+                .processor
+                .process_request_for_connection(harness.connection_id, &request)
+                .await;
+            assert_eq!(
+                harness.cli_session.turn_starts.lock().await.len(),
+                starts_before
+            );
+            assert_eq!(
+                reopened
+                    .get_cli_runtime_turn_binding(&turn_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .input_mapping_json,
+                saved.input_mapping_json
+            );
             let input = native_turn.input.as_array().unwrap();
             let skill_items = input
                 .iter()
@@ -2674,7 +2731,10 @@ async fn capability_persistence_order_impl() {
                     }),
                 ]
             );
-            let instructions = native_turn.elevated_instructions.text();
+            let context = input
+                .first()
+                .and_then(|item| item["text"].as_str())
+                .expect("turn context should precede native user input");
             let (directive, beta_label, alpha_label, runtime_label) = match runtime_kind {
                 CLIAgentRuntimeKind::Codex => {
                     ("selected Skill input", "- $beta", "- $alpha", "Codex")
@@ -2682,44 +2742,56 @@ async fn capability_persistence_order_impl() {
                 CLIAgentRuntimeKind::OpenCode => ("OpenCode turn", "- beta", "- alpha", "OpenCode"),
                 CLIAgentRuntimeKind::Claude => unreachable!(),
             };
-            assert!(instructions.contains(directive));
-            let beta = instructions
+            assert!(context.contains(directive));
+            assert!(!native_turn.elevated_instructions.text().contains(directive));
+            let beta = context
                 .find(beta_label)
-                .unwrap_or_else(|| panic!("{runtime_label} instructions should include beta"));
-            let alpha = instructions
+                .unwrap_or_else(|| panic!("{runtime_label} turn context should include beta"));
+            let alpha = context
                 .find(alpha_label)
-                .unwrap_or_else(|| panic!("{runtime_label} instructions should include alpha"));
+                .unwrap_or_else(|| panic!("{runtime_label} turn context should include alpha"));
             assert!(
                 beta < alpha,
                 "selected {runtime_label} skill order must be preserved"
             );
-            assert!(input.iter().all(|item| {
-                item["type"] != "text"
-                    || item["text"]
-                        .as_str()
-                        .is_none_or(|text| !text.contains(directive))
-            }));
+            assert_eq!(
+                input
+                    .iter()
+                    .filter_map(|item| item["text"].as_str())
+                    .filter(|text| text.contains(directive))
+                    .count(),
+                1,
+                "selected-skill directive should appear once in turn input"
+            );
         } else {
             let input = native_turn.input.as_array().unwrap();
             assert!(input.iter().all(|item| item["type"] != "skill"));
-            let instructions = native_turn.elevated_instructions.text();
-            assert!(instructions.contains("native Skill tool"));
-            let beta = instructions
+            let context = input
+                .first()
+                .and_then(|item| item["text"].as_str())
+                .expect("turn context should precede native user input");
+            let directive = "Invoke every selected skill through Claude's native Skill tool";
+            assert!(context.contains(directive));
+            assert!(!native_turn.elevated_instructions.text().contains(directive));
+            let beta = context
                 .find("- beta")
-                .expect("Claude elevated instructions should include beta");
-            let alpha = instructions
+                .expect("Claude turn context should include beta");
+            let alpha = context
                 .find("- alpha")
-                .expect("Claude elevated instructions should include alpha");
+                .expect("Claude turn context should include alpha");
             assert!(
                 beta < alpha,
                 "selected Claude skill order must be preserved"
             );
-            assert!(input.iter().all(|item| {
-                item["type"] != "text"
-                    || item["text"]
-                        .as_str()
-                        .is_none_or(|text| !text.contains("native Skill tool"))
-            }));
+            assert_eq!(
+                input
+                    .iter()
+                    .filter_map(|item| item["text"].as_str())
+                    .filter(|text| text.contains(directive))
+                    .count(),
+                1,
+                "selected-skill directive should appear once in turn input"
+            );
         }
     }
 }
@@ -3169,19 +3241,25 @@ async fn claude_cli_runtime_new_skill_closes_one_cached_session_before_restart_i
         .await;
     let native = wait_for_recorded_cli_runtime_turn_start(&harness.cli_session).await;
     assert_eq!(harness.cli_session.closes.load(Ordering::SeqCst), 1);
-    assert!(
-        native
-            .elevated_instructions
-            .text()
-            .contains("native Skill tool")
+    let input = native.input.as_array().unwrap();
+    let context = input
+        .first()
+        .and_then(|item| item["text"].as_str())
+        .expect("turn context should precede native user input after session restart");
+    let directive = "Invoke every selected skill through Claude's native Skill tool";
+    assert!(context.contains(directive));
+    assert!(context.contains("- refresh"));
+    assert!(!native.elevated_instructions.text().contains(directive));
+    assert!(!native.elevated_instructions.text().contains("- refresh"));
+    assert_eq!(
+        input
+            .iter()
+            .filter_map(|item| item["text"].as_str())
+            .filter(|text| text.contains(directive))
+            .count(),
+        1,
+        "selected skill should be delivered once after session restart"
     );
-    assert!(native.elevated_instructions.text().contains("- refresh"));
-    assert!(native.input.as_array().unwrap().iter().all(|item| {
-        item["type"] != "text"
-            || item["text"]
-                .as_str()
-                .is_none_or(|text| !text.contains("native Skill tool"))
-    }));
 }
 
 #[test]
@@ -3891,7 +3969,6 @@ enum MemoryAgentE2eScript {
 struct MemoryAgentE2eProvider {
     name: &'static str,
     script: MemoryAgentE2eScript,
-    policy_requests: std::sync::Mutex<Vec<ChatRequest>>,
     main_requests: std::sync::Mutex<Vec<ChatRequest>>,
     next_main_index: AtomicUsize,
 }
@@ -3996,7 +4073,7 @@ impl pioneer_sqlite::SqliteWriteObserver for NativeSchedulingObserver {
     }
 }
 
-struct PreflightCaptureProvider {
+struct MainCaptureProvider {
     text: String,
     requests: std::sync::Mutex<Vec<ChatRequest>>,
     native_media: Option<CaptureSummaryProvider>,
@@ -4004,7 +4081,6 @@ struct PreflightCaptureProvider {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PromptParityRequestKind {
-    TurnPreflight,
     Main,
     PostTurnExtractor,
 }
@@ -4012,7 +4088,6 @@ enum PromptParityRequestKind {
 #[derive(Default)]
 struct PromptParityCaptureProvider {
     requests: std::sync::Mutex<Vec<ChatRequest>>,
-    visible_tools: Vec<String>,
 }
 
 struct HangingChildProvider {
@@ -4399,7 +4474,7 @@ impl CaptureSummaryProvider {
     }
 }
 
-impl PreflightCaptureProvider {
+impl MainCaptureProvider {
     fn new(text: impl Into<String>) -> Self {
         Self {
             text: text.into(),
@@ -4420,19 +4495,12 @@ impl PreflightCaptureProvider {
     fn snapshot_requests(&self) -> Vec<ChatRequest> {
         self.requests
             .lock()
-            .expect("preflight capture requests lock")
+            .expect("main capture requests lock")
             .clone()
     }
 }
 
 impl PromptParityCaptureProvider {
-    fn with_visible_tools(visible_tools: Vec<String>) -> Self {
-        Self {
-            requests: std::sync::Mutex::new(Vec::new()),
-            visible_tools,
-        }
-    }
-
     fn take_requests(&self) -> Vec<ChatRequest> {
         std::mem::take(&mut *self.requests.lock().expect("prompt parity requests lock"))
     }
@@ -4633,11 +4701,11 @@ impl Provider for CaptureSummaryProvider {
 }
 
 #[async_trait::async_trait]
-impl Provider for PreflightCaptureProvider {
+impl Provider for MainCaptureProvider {
     fn name(&self) -> &str {
         self.native_media
             .as_ref()
-            .map_or("preflight-capture", |provider| provider.name())
+            .map_or("main-capture", |provider| provider.name())
     }
 
     fn capabilities(&self) -> ProviderCapabilities {
@@ -4660,19 +4728,15 @@ impl Provider for PreflightCaptureProvider {
     async fn list_models(&self) -> anyhow::Result<Vec<pioneer_protocol::ProviderModelInfo>> {
         match &self.native_media {
             Some(provider) => provider.list_models().await,
-            None => anyhow::bail!("preflight capture does not expose model discovery"),
+            None => anyhow::bail!("main capture does not expose model discovery"),
         }
     }
 
     async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
-        let preflight = is_turn_preflight_request(&request);
         self.requests
             .lock()
-            .expect("preflight capture requests lock")
+            .expect("main capture requests lock")
             .push(request);
-        if preflight {
-            return Ok(test_turn_preflight_response());
-        }
         Ok(text_response(self.text.clone()))
     }
 
@@ -4715,14 +4779,6 @@ impl Provider for PromptParityCaptureProvider {
             .expect("prompt parity requests lock")
             .push(request);
         Ok(match kind {
-            Some(PromptParityRequestKind::TurnPreflight) => {
-                let visible_tools = self
-                    .visible_tools
-                    .iter()
-                    .map(String::as_str)
-                    .collect::<Vec<_>>();
-                test_turn_preflight_response_with_visible_tools(visible_tools.as_slice())
-            }
             Some(PromptParityRequestKind::PostTurnExtractor) => text_response(r#"{"facts":[]}"#),
             Some(PromptParityRequestKind::Main) | None => {
                 text_response("PROMPT PARITY ASSISTANT RESPONSE")
@@ -4800,12 +4856,8 @@ impl Provider for HangingChildProvider {
     }
 
     async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
-        let preflight = is_turn_preflight_request(&request);
         let child_main = is_child_task_main_request(&request)
             || (self.hang_any_compiled_request && request.compiled_prompt.is_some());
-        if preflight {
-            return Ok(test_turn_preflight_response());
-        }
         if child_main {
             self.child_main_calls.fetch_add(1, Ordering::SeqCst);
             return futures_util::future::pending::<anyhow::Result<ChatResponse>>().await;
@@ -4846,11 +4898,9 @@ impl Provider for ConcurrentComposerHistoryProvider {
     }
 
     async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
-        if is_turn_preflight_request(&request) {
-            return Ok(test_turn_preflight_response());
-        }
         let current_command = request.messages.last().and_then(|message| {
-            (message.role == pioneer_provider::Role::User).then(|| message.content.clone())
+            (message.role == pioneer_provider::Role::User)
+                .then(|| prepared_user_text(message).to_owned())
         });
         self.requests
             .lock()
@@ -4976,8 +5026,10 @@ impl Provider for GuardAwareProvider {
     }
 
     async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
-        if is_turn_preflight_request(&request) {
-            return Ok(test_task_turn_preflight_response());
+        if let Some(response) =
+            request_optional_fixture_tools(&request, &["task_create", "task_wait"])
+        {
+            return Ok(response);
         }
         if request.messages.iter().any(|message| {
             message
@@ -5120,8 +5172,8 @@ impl Provider for CreateThenHangProvider {
     }
 
     async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
-        if is_turn_preflight_request(&request) {
-            return Ok(test_task_turn_preflight_response());
+        if let Some(response) = request_optional_fixture_tools(&request, &["task_create"]) {
+            return Ok(response);
         }
         if request.messages.iter().any(|message| {
             message
@@ -5497,7 +5549,8 @@ async fn memory_settings_update_reinstalls_memory_hook_runtime() {
     let mut harness = setup_memory_gateway_harness("settings_reinstall_memory_hooks", true).await;
     harness.processor.bind_memory_bridge_if_enabled().await;
 
-    assert_memory_hook_subscription(&harness.processor, "memory.active_recall.default", true).await;
+    assert_memory_hook_subscription(&harness.processor, "memory.active_recall.default", false)
+        .await;
     assert_memory_hook_subscription(
         &harness.processor,
         "memory.post_turn_extractor.default",
@@ -5514,8 +5567,7 @@ async fn memory_settings_update_reinstalls_memory_hook_runtime() {
             "update": {
                 "memory": {
                     "enabled": true,
-                    "deterministic_recall_enabled": true,
-                    "active_recall_enabled": false,
+
                     "tools_enabled": true,
                     "proactive_writes_enabled": false,
                     "background_extraction_enabled": true,
@@ -5552,8 +5604,7 @@ async fn memory_settings_update_reinstalls_memory_hook_runtime() {
             "update": {
                 "memory": {
                     "enabled": true,
-                    "deterministic_recall_enabled": true,
-                    "active_recall_enabled": true,
+
                     "tools_enabled": true,
                     "proactive_writes_enabled": true,
                     "background_extraction_enabled": true,
@@ -5574,7 +5625,8 @@ async fn memory_settings_update_reinstalls_memory_hook_runtime() {
         .await;
     let _ = recv_response_by_id(&mut harness.rx, enable_request_id.as_str()).await;
 
-    assert_memory_hook_subscription(&harness.processor, "memory.active_recall.default", true).await;
+    assert_memory_hook_subscription(&harness.processor, "memory.active_recall.default", false)
+        .await;
     assert_memory_hook_subscription(
         &harness.processor,
         "memory.post_turn_extractor.default",
@@ -6140,9 +6192,6 @@ impl Provider for VerticalUnfinishedSiblingProvider {
             .lock()
             .expect("vertical unfinished sibling request lock poisoned")
             .push(request.clone());
-        if is_turn_preflight_request(&request) {
-            return Ok(test_turn_preflight_response());
-        }
         if request.compiled_prompt.is_some()
             && request.messages.iter().any(|message| {
                 message
@@ -6190,9 +6239,6 @@ impl Provider for VerticalCollaborativeSourceProvider {
     }
 
     async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
-        if is_turn_preflight_request(&request) {
-            return Ok(test_turn_preflight_response());
-        }
         self.requests
             .lock()
             .expect("vertical Collaborative source request lock poisoned")
@@ -6298,11 +6344,6 @@ impl Provider for VerticalReadSkillProvider {
     }
 
     async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
-        if is_turn_preflight_request(&request) {
-            return Ok(test_turn_preflight_response_with_visible_tools(&[
-                "read_skill",
-            ]));
-        }
         self.requests
             .lock()
             .expect("vertical native request lock poisoned")
@@ -6359,7 +6400,6 @@ impl MemoryAgentE2eProvider {
         Self {
             name,
             script,
-            policy_requests: std::sync::Mutex::new(Vec::new()),
             main_requests: std::sync::Mutex::new(Vec::new()),
             next_main_index: AtomicUsize::new(0),
         }
@@ -6369,13 +6409,6 @@ impl MemoryAgentE2eProvider {
         self.main_requests
             .lock()
             .expect("memory e2e provider main requests lock poisoned")
-            .clone()
-    }
-
-    fn snapshot_policy_requests(&self) -> Vec<ChatRequest> {
-        self.policy_requests
-            .lock()
-            .expect("memory e2e provider policy requests lock poisoned")
             .clone()
     }
 }
@@ -6398,22 +6431,6 @@ impl Provider for MemoryAgentE2eProvider {
     }
 
     async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
-        if is_memory_policy_classifier_request(&request) {
-            self.policy_requests
-                .lock()
-                .expect("memory e2e provider policy requests lock poisoned")
-                .push(request);
-            return Ok(ChatResponse {
-                messages: Vec::new(),
-                text: memory_policy_json_for_script(self.script),
-                usage: None,
-                reasoning_content: None,
-                provider_replay_state: None,
-                termination: pioneer_provider::ProviderTermination::Complete,
-                tool_calls: Vec::new(),
-            });
-        }
-
         self.main_requests
             .lock()
             .expect("memory e2e provider main requests lock poisoned")
@@ -6441,14 +6458,6 @@ impl Provider for MemoryAgentE2eProvider {
     }
 }
 
-fn is_memory_policy_classifier_request(request: &ChatRequest) -> bool {
-    request.messages.iter().any(|message| {
-        message
-            .content
-            .contains("Pioneer memory turn policy classifier")
-    })
-}
-
 fn is_memory_post_turn_extractor_request(request: &ChatRequest) -> bool {
     request.messages.iter().any(|message| {
         message
@@ -6458,9 +6467,7 @@ fn is_memory_post_turn_extractor_request(request: &ChatRequest) -> bool {
 }
 
 fn prompt_parity_request_kind(request: &ChatRequest) -> Option<PromptParityRequestKind> {
-    if is_turn_preflight_request(request) {
-        Some(PromptParityRequestKind::TurnPreflight)
-    } else if is_memory_post_turn_extractor_request(request) {
+    if is_memory_post_turn_extractor_request(request) {
         Some(PromptParityRequestKind::PostTurnExtractor)
     } else if request.compiled_prompt.is_some() {
         Some(PromptParityRequestKind::Main)
@@ -6499,6 +6506,17 @@ fn canonical_provider_messages_for_artifact_parity(
             message.content =
                 canonical_prompt_text_for_parity(message.content.as_str(), turn_private_paths);
         }
+        if let Some(metadata) = message.application_context.as_mut() {
+            if metadata["kind"] == "turn_input" {
+                let context = metadata["context"].as_str().expect("prepared context");
+                metadata["context"] = json!(canonical_prompt_text_for_parity(
+                    context,
+                    turn_private_paths
+                ));
+                message.content =
+                    canonical_prompt_text_for_parity(&message.content, turn_private_paths);
+            }
+        }
         for content_part in &mut message.content_parts {
             let attachment = match content_part {
                 pioneer_provider::MessageContentPart::File { file } => file,
@@ -6533,6 +6551,36 @@ fn canonical_provider_messages_for_artifact_parity(
         }
     }
     messages
+}
+
+fn prepared_user_text(message: &pioneer_provider::ChatMessage) -> &str {
+    let Some(metadata) = message
+        .application_context
+        .as_ref()
+        .filter(|metadata| metadata["kind"] == "turn_input")
+    else {
+        return &message.content;
+    };
+    let context = metadata["context"].as_str().expect("turn context text");
+    message
+        .content
+        .strip_prefix(&format!(
+            "<pioneer_turn_context>\n{context}\n</pioneer_turn_context>\n\n"
+        ))
+        .expect("prepared input must contain its exact saved context prefix")
+}
+
+fn assert_prepared_user_text(message: &pioneer_provider::ChatMessage, original: &str) {
+    let metadata = message
+        .application_context
+        .as_ref()
+        .expect("prepared input metadata");
+    assert_eq!(metadata["kind"], "turn_input");
+    let context = metadata["context"].as_str().expect("turn context text");
+    assert_eq!(
+        message.content,
+        format!("<pioneer_turn_context>\n{context}\n</pioneer_turn_context>\n\n{original}")
+    );
 }
 
 fn canonical_prompt_text_for_parity(text: &str, turn_private_paths: &[&str]) -> String {
@@ -6577,10 +6625,10 @@ fn assert_exact_chat_request_parity(stage: &str, direct: &ChatRequest, child: &C
 }
 
 fn canonical_execution_thread_for_parity(text: &str, expected_thread_id: &str) -> String {
-    let expected = format!("Execution thread: {expected_thread_id}");
+    let expected = format!("Thread: {expected_thread_id}");
     assert_eq!(
         text.lines()
-            .filter(|line| line.starts_with("Execution thread: "))
+            .filter(|line| line.starts_with("Thread: "))
             .collect::<Vec<_>>(),
         vec![expected.as_str()],
         "runtime prompt must identify the actual execution thread before parity normalization"
@@ -6588,7 +6636,7 @@ fn canonical_execution_thread_for_parity(text: &str, expected_thread_id: &str) -
     text.split('\n')
         .map(|line| {
             if line == expected {
-                "Execution thread: <verified execution thread>"
+                "Thread: <verified execution thread>"
             } else {
                 line
             }
@@ -6674,20 +6722,131 @@ fn canonical_main_request_execution_thread_for_parity(
     expected_thread_id: &str,
     history_thread_id: &str,
     history_turn_id: &str,
+    expected_actor_id: Option<&str>,
 ) -> ChatRequest {
     // Independent executions must advertise their own thread, not the same ID.
     // Validate that identity against the fixture/lineage before comparing content.
     let mut request = request.clone();
-    let prompt = request
-        .compiled_prompt
-        .as_mut()
-        .expect("main parity request must have a compiled prompt");
-    prompt.dynamic_system_text =
-        canonical_execution_thread_for_parity(&prompt.dynamic_system_text, expected_thread_id);
-    prompt.full_system_text =
-        canonical_execution_thread_for_parity(&prompt.full_system_text, expected_thread_id);
+    assert!(
+        request.compiled_prompt.is_some(),
+        "main parity request must have a compiled prompt"
+    );
+    let current_turn = request
+        .messages
+        .iter()
+        .rev()
+        .find_map(|message| {
+            let metadata = message.application_context.as_ref()?;
+            (metadata["kind"] == "turn_input").then(|| {
+                let context = metadata["context"].as_str().expect("prepared context");
+                assert_eq!(
+                    context
+                        .lines()
+                        .find_map(|line| line.strip_prefix("Thread: ")),
+                    Some(expected_thread_id)
+                );
+                context
+                    .lines()
+                    .find_map(|line| line.strip_prefix("Turn: "))
+                    .expect("current turn identity")
+                    .to_owned()
+            })
+        })
+        .expect("main parity request must carry turn input");
     for message in &mut request.messages {
         canonical_recorded_history_identity_for_parity(message, history_thread_id, history_turn_id);
+        let Some(metadata) = message.application_context.as_ref() else {
+            continue;
+        };
+        // Origins are runtime ownership metadata rather than provider-wire content.
+        // Verify the owner before removing this copy from the wire comparison.
+        if let Some(origin) = metadata.get("origin") {
+            let owner = origin["thread_id"].as_str().expect("context origin thread");
+            assert!(owner == expected_thread_id || owner == history_thread_id);
+            let unit = origin["unit_id"].as_str().expect("context origin unit");
+            assert!(
+                unit.starts_with(&format!("{current_turn}:"))
+                    || unit.starts_with(&format!("{history_turn_id}:"))
+            );
+        }
+        if metadata["kind"] == "turn_input" {
+            let original = prepared_user_text(message).to_owned();
+            let context = metadata["context"].as_str().expect("prepared context");
+            let actual_thread = context
+                .lines()
+                .find_map(|line| line.strip_prefix("Thread: "))
+                .expect("context thread");
+            let actual_turn = context
+                .lines()
+                .find_map(|line| line.strip_prefix("Turn: "))
+                .expect("context turn");
+            assert!(actual_thread == expected_thread_id || actual_thread == history_thread_id);
+            assert!(actual_turn == current_turn || actual_turn == history_turn_id);
+            let origin = &metadata["origin"];
+            assert_eq!(origin["thread_id"].as_str(), Some(actual_thread));
+            assert_eq!(
+                origin["unit_id"],
+                format!("{actual_turn}:turn-input-projection")
+            );
+            let initiator = format!("Initiating thread: {history_thread_id}");
+            assert_eq!(
+                context
+                    .lines()
+                    .filter(|line| line.starts_with("Initiating thread: "))
+                    .collect::<Vec<_>>(),
+                vec![initiator.as_str()]
+            );
+            let actor = format!(
+                "Actor: {}",
+                if actual_turn == history_turn_id {
+                    "unavailable"
+                } else {
+                    expected_actor_id.unwrap_or("unavailable")
+                }
+            );
+            assert_eq!(
+                context
+                    .lines()
+                    .filter(|line| line.starts_with("Actor: "))
+                    .collect::<Vec<_>>(),
+                vec![actor.as_str()]
+            );
+            let thread_canonical = canonical_execution_thread_for_parity(context, actual_thread);
+            let expected_turn_line = format!("Turn: {actual_turn}");
+            assert_eq!(
+                context
+                    .lines()
+                    .filter(|line| line.starts_with("Turn: "))
+                    .collect::<Vec<_>>(),
+                vec![expected_turn_line.as_str()]
+            );
+            let canonical = thread_canonical
+                .split('\n')
+                .map(|line| {
+                    if line == expected_turn_line {
+                        "Turn: <verified execution turn>"
+                    } else if line == initiator {
+                        "Initiating thread: <verified initiating thread>"
+                    } else if line == actor {
+                        "Actor: <verified execution actor>"
+                    } else {
+                        line
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            message.content = format!(
+                "<pioneer_turn_context>\n{canonical}\n</pioneer_turn_context>\n\n{original}"
+            );
+            message.application_context.as_mut().unwrap()["context"] = json!(canonical);
+        }
+        message
+            .application_context
+            .as_mut()
+            .unwrap()
+            .as_object_mut()
+            .expect("application metadata object")
+            .remove("origin");
     }
     request
 }
@@ -6696,17 +6855,17 @@ fn canonical_main_request_execution_thread_for_parity(
 fn prompt_parity_normalizes_only_verified_execution_identity() {
     assert_eq!(
         canonical_execution_thread_for_parity(
-            "Initiating thread: unavailable\nExecution thread: actual\nOther: actual\n",
+            "Initiating thread: unavailable\nThread: actual\nOther: actual\n",
             "actual",
         ),
-        "Initiating thread: unavailable\nExecution thread: <verified execution thread>\nOther: actual\n"
+        "Initiating thread: unavailable\nThread: <verified execution thread>\nOther: actual\n"
     );
 }
 
 #[test]
 #[should_panic(expected = "runtime prompt must identify the actual execution thread")]
 fn prompt_parity_rejects_wrong_execution_identity() {
-    canonical_execution_thread_for_parity("Execution thread: unrelated", "actual");
+    canonical_execution_thread_for_parity("Thread: unrelated", "actual");
 }
 
 fn assert_exact_chat_request_parity_with_turn_private_paths(
@@ -6799,28 +6958,6 @@ async fn wait_for_prompt_parity_request_count(
     false
 }
 
-fn memory_policy_json_for_script(script: MemoryAgentE2eScript) -> String {
-    let value = match script {
-        MemoryAgentE2eScript::ChatCapture => json!({
-            "intent": "normal",
-            "recall": "allow",
-            "prompt": "full",
-            "readTools": "allow",
-            "rememberTool": "allow",
-            "forgetTool": "allow",
-            "postTurnExtraction": "disabled",
-            "activeMemory": "disabled",
-            "explicitRemember": false,
-            "explicitForget": false,
-            "forgetTargetHint": null,
-            "language": "ru",
-            "confidence": 0.9,
-            "reasonCode": "default_allow_read"
-        }),
-    };
-    serde_json::to_string(&value).expect("policy json should serialize")
-}
-
 fn memory_agent_e2e_response(
     script: MemoryAgentE2eScript,
     _round: usize,
@@ -6843,58 +6980,29 @@ fn text_response(text: impl Into<String>) -> ChatResponse {
     }
 }
 
-fn test_turn_preflight_response() -> ChatResponse {
-    test_turn_preflight_response_with_visible_tools(&[])
-}
-
-fn test_task_turn_preflight_response() -> ChatResponse {
-    test_turn_preflight_response_with_visible_tools(&[
-        "task_create",
-        "task_wait",
-        "task_result",
-        "task_accept",
-        "task_revise",
-        "task_cancel",
-        "task_update",
-        "task_detach",
-        "task_list",
-        "task_get",
-        "task_reschedule",
-        "task_pause",
-        "task_resume",
-    ])
-}
-
-fn test_turn_preflight_response_with_visible_tools(tool_names: &[&str]) -> ChatResponse {
-    text_response(json!({ "tools": { "visibleTools": tool_names } }).to_string())
-}
-
-fn sequenced_tool_provider_preflight_response(
-    request: &ChatRequest,
-    first_tool_calls: &[ProviderToolCall],
-) -> ChatResponse {
-    let task_needed = first_tool_calls
-        .iter()
-        .any(|tool_call| tool_call.name.starts_with("task_"))
-        || request
-            .messages
-            .iter()
-            .any(|message| message.content.contains("delegate a task"));
-
-    if task_needed {
-        test_task_turn_preflight_response()
-    } else {
-        test_turn_preflight_response()
-    }
-}
-
-fn is_turn_preflight_request(request: &ChatRequest) -> bool {
-    request.tools.is_none()
-        && request.tool_choice.is_none()
-        && request.messages.iter().any(|message| {
-            message.content.contains("internal turn preflight planner")
-                && message.content.contains("Structured input JSON")
+fn request_optional_fixture_tools(request: &ChatRequest, names: &[&str]) -> Option<ChatResponse> {
+    let tools = request.tools.as_ref()?;
+    let domains = pioneer_tools::BuiltinToolDomain::ALL
+        .into_iter()
+        .filter(|domain| {
+            names.iter().any(|name| {
+                domain.tool_names().contains(name) && !tools.iter().any(|tool| tool.name == *name)
+            })
         })
+        .map(|domain| domain.as_str())
+        .collect::<Vec<_>>();
+    if domains.is_empty() || !tools.iter().any(|tool| tool.name == "request_tools") {
+        return None;
+    }
+    Some(ChatResponse {
+        tool_calls: vec![ProviderToolCall {
+            id: "fixture_request_optional_tools".into(),
+            name: "request_tools".into(),
+            arguments: json!({"domains": domains, "reason": "Need optional tools for the fixture scenario."}).to_string(),
+        }],
+        termination: pioneer_provider::ProviderTermination::ToolCalls,
+        ..text_response("")
+    })
 }
 
 fn extract_task_id_from_messages(messages: &[pioneer_provider::ChatMessage]) -> Option<String> {
@@ -6964,13 +7072,19 @@ impl Provider for SequencedToolProvider {
     }
 
     async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
-        if is_turn_preflight_request(&request) {
-            return Ok(sequenced_tool_provider_preflight_response(
-                &request,
-                &self.first_tool_calls,
-            ));
+        let index = self.next_index.load(Ordering::SeqCst);
+        let next_calls = self
+            .tool_call_rounds
+            .as_ref()
+            .and_then(|rounds| rounds.get(index))
+            .unwrap_or(&self.first_tool_calls);
+        let names = next_calls
+            .iter()
+            .map(|call| call.name.as_str())
+            .collect::<Vec<_>>();
+        if let Some(response) = request_optional_fixture_tools(&request, &names) {
+            return Ok(response);
         }
-
         self.requests
             .lock()
             .expect("sequenced tool provider lock poisoned")
@@ -7054,18 +7168,18 @@ impl Provider for DirectAgentSandboxProvider {
 
     async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
         let child = Self::is_child_request(&request);
-        if is_turn_preflight_request(&request) {
-            return Ok(if child {
-                test_turn_preflight_response_with_visible_tools(&["exec_command"])
-            } else {
-                test_turn_preflight_response_with_visible_tools(&[
-                    "threads_start_options",
+        if !child
+            && let Some(response) = request_optional_fixture_tools(
+                &request,
+                &[
                     "thread_create",
                     "threads_turn_start",
-                ])
-            });
+                    "threads_start_options",
+                ],
+            )
+        {
+            return Ok(response);
         }
-
         if child {
             return Ok(match self.child_round.fetch_add(1, Ordering::SeqCst) {
                 0 => ChatResponse {
@@ -9441,7 +9555,6 @@ pub(crate) fn test_tool_loop_config() -> ToolLoopConfig {
     let web = GatewayWebToolsConfig::default();
     ToolLoopConfig {
         provider: pioneer_provider::ProviderTimeoutPolicy::default(),
-        preflight: pioneer_agent::PreflightLoopConfig::default(),
         web: WebToolsConfig {
             default_timeout_ms: web.default_timeout_ms,
             hard_max_timeout_ms: web.hard_max_timeout_ms,
@@ -9512,13 +9625,7 @@ pub(crate) fn test_tool_loop_config() -> ToolLoopConfig {
                 allow_function_proxy_tools: true,
             },
         },
-        memory: pioneer_memory::hooks::MemoryLoopConfig {
-            active_recall: pioneer_memory::hooks::MemoryActiveRecallConfig {
-                mode: pioneer_memory::hooks::MemoryActiveRecallMode::DeterministicOnly,
-                ..pioneer_memory::hooks::MemoryActiveRecallConfig::default()
-            },
-            ..pioneer_memory::hooks::MemoryLoopConfig::default()
-        },
+        memory: pioneer_memory::hooks::MemoryLoopConfig::default(),
         budget: ToolLoopBudgetConfig::default(),
         execution_windows: pioneer_tools::ExecutionWindowsConfig::default(),
         retry: ToolRetryBudgetConfig::default(),
@@ -13111,14 +13218,14 @@ async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_comman
             request
                 .messages
                 .last()
-                .is_some_and(|message| message.content == "ASYNC_TASK_B")
+                .is_some_and(|message| prepared_user_text(message) == "ASYNC_TASK_B")
         })
         .expect("Task B main request should be captured");
     assert_eq!(
         task_b_request
             .messages
             .iter()
-            .filter(|message| message.content == "ASYNC_TASK_B")
+            .filter(|message| prepared_user_text(message) == "ASYNC_TASK_B")
             .count(),
         1,
         "Task B must receive exactly one actionable current command"
@@ -13415,9 +13522,9 @@ async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_comman
         later
             .iter()
             .filter(|message| {
-                matches!(message.content.as_str(), "ASYNC_TASK_A" | "ASYNC_TASK_B")
+                matches!(prepared_user_text(message), "ASYNC_TASK_A" | "ASYNC_TASK_B")
             })
-            .map(|message| message.content.as_str())
+            .map(prepared_user_text)
             .collect::<Vec<_>>(),
         vec!["ASYNC_TASK_A", "ASYNC_TASK_B"]
     );
@@ -13452,7 +13559,9 @@ async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_comman
     .await
     .unwrap();
     assert_eq!(
-        last.iter().filter(|m| m.content == "ASYNC_TASK_B").count(),
+        last.iter()
+            .filter(|m| prepared_user_text(m) == "ASYNC_TASK_B")
+            .count(),
         1
     );
     assert_eq!(
@@ -13463,7 +13572,7 @@ async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_comman
     );
     assert!(
         last.iter()
-            .all(|m| m.content != "ASYNC_TASK_A" && !m.content.contains("A complete"))
+            .all(|m| prepared_user_text(m) != "ASYNC_TASK_A" && !m.content.contains("A complete"))
     );
     assert!(last.iter().any(
         |m| m.provenance.as_ref().unwrap().logical_turn_id.as_deref()
@@ -14011,7 +14120,7 @@ async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_comman
         assert_eq!(
             output_messages
                 .iter()
-                .filter(|m| m.content == command)
+                .filter(|m| prepared_user_text(m) == command)
                 .count(),
             1
         );
@@ -14094,7 +14203,7 @@ async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_comman
             if let Some(request) = provider.snapshot_requests().into_iter().find(|r| {
                 r.messages
                     .last()
-                    .is_some_and(|m| m.content == "ASYNC_TASK_C")
+                    .is_some_and(|m| prepared_user_text(m) == "ASYNC_TASK_C")
             }) {
                 break request;
             }
@@ -15167,7 +15276,7 @@ async fn detached_composer_live_ordering_impl() {
         .set_connection_workspace(connection, Some(workspace.clone()))
         .await;
     let provider = Arc::new(
-        PreflightCaptureProvider::new(
+        MainCaptureProvider::new(
             r#"<task_result>{"summary":"detached result","data":{}}</task_result>"#,
         )
         .with_native_attachments(),
@@ -15525,11 +15634,10 @@ async fn detached_composer_live_ordering_impl() {
     );
     let requests = provider.snapshot_requests();
     let main = requests
-        .iter()
-        .find(|request| !is_turn_preflight_request(request))
+        .first()
         .expect("large Composer input must reach the recording provider");
     let user = main.messages.last().unwrap();
-    assert_eq!(user.content, full_text);
+    assert_prepared_user_text(user, &full_text);
     assert!(matches!(user.content_parts.as_slice(),
         [pioneer_provider::MessageContentPart::File { file }]
             if file.name.as_deref() == Some("large-composer-context.pdf")));
@@ -15955,7 +16063,7 @@ async fn turn_start_with_artifact_input_materializes_user_message_attachment_and
         .messages
         .last()
         .expect("provider request should include user message");
-    assert_eq!(user_message.content, "summarize");
+    assert_prepared_user_text(user_message, "summarize");
     assert!(matches!(
         user_message.content_parts.as_slice(),
         [pioneer_provider::MessageContentPart::File { file }]
@@ -16113,20 +16221,15 @@ async fn followup_history_preserves_typed_recorded_artifact_version() {
         .iter()
         .find(|message| !message.content_parts.is_empty())
         .expect("the recorded attachment must survive as typed canonical history");
-    let input_reference = second_request
-        .messages
-        .iter()
-        .find_map(|message| {
-            message
-                .content
-                .strip_prefix("Что за машина?\nHistorical input reference: ")
-        })
-        .expect("the original question and typed artifact input must remain together");
     assert_eq!(
-        serde_json::from_str::<serde_json::Value>(input_reference).unwrap(),
-        json!({
-            "type": "artifact", "artifactId": artifact.artifact_id, "versionId": artifact.version_id,
-        })
+        prepared_user_text(artifact_history_message),
+        "Что за машина?",
+        "the original question and typed artifact input must remain together"
+    );
+    assert_eq!(
+        artifact_history_message.content,
+        requests[0].messages.last().unwrap().content,
+        "history must retain the exact prepared input sent on the first turn"
     );
     assert!(
         matches!(
@@ -26447,15 +26550,15 @@ async fn waiting_review_detach_is_blocked_and_candidate_stays_active_impl() {
 }
 
 #[test]
-fn hidden_task_agent_run_uses_preflight_before_child_main_prompt_compile() {
+fn hidden_task_agent_run_dispatches_child_main_without_planner() {
     run_standard_stack_message_test(
-        "hidden Task preflight ordering",
-        hidden_task_agent_run_uses_preflight_before_child_main_prompt_compile_body(),
+        "hidden Task main dispatch",
+        hidden_task_agent_run_dispatches_child_main_without_planner_body(),
     );
 }
 
-async fn hidden_task_agent_run_uses_preflight_before_child_main_prompt_compile_body() {
-    let provider = Arc::new(PreflightCaptureProvider::new("hidden child completed"));
+async fn hidden_task_agent_run_dispatches_child_main_without_planner_body() {
+    let provider = Arc::new(MainCaptureProvider::new("hidden child completed"));
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "openai",
         provider.clone(),
@@ -26521,21 +26624,14 @@ async fn hidden_task_agent_run_uses_preflight_before_child_main_prompt_compile_b
     );
 
     let requests = provider.snapshot_requests();
-    let preflight_pos = requests
-        .iter()
-        .position(is_turn_preflight_request)
-        .expect("hidden child task should call preflight");
     let child_main_pos = requests
         .iter()
         .position(is_child_task_main_request)
         .expect("hidden child task should call main provider after prompt compile");
-    assert!(
-        preflight_pos < child_main_pos,
-        "hidden child task preflight must run before the main child provider request"
+    assert_eq!(
+        child_main_pos, 0,
+        "main dispatch must be the first provider request"
     );
-    assert!(requests[preflight_pos].tools.is_none());
-    assert!(requests[preflight_pos].tool_choice.is_none());
-    assert!(requests[preflight_pos].compiled_prompt.is_none());
     assert!(requests[child_main_pos].compiled_prompt.is_some());
 }
 
@@ -26636,10 +26732,10 @@ fn compaction_task_admission_freezes_the_accepted_destination() {
 }
 
 #[test]
-fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_prompt_compile() {
+fn recovered_hidden_task_run_dispatches_restored_child_main_without_planner() {
     run_standard_stack_message_test(
-        "recovered hidden Task preflight ordering",
-        recovered_hidden_task_run_uses_preflight_before_restored_child_main_prompt_compile_body(
+        "recovered hidden Task main dispatch",
+        recovered_hidden_task_run_dispatches_restored_child_main_without_planner_body(
             TaskAttachmentMode::Detached,
             false,
         ),
@@ -26650,7 +26746,7 @@ fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_prompt_co
 fn compaction_attached_task_restores_its_frozen_basis_without_changing_hook_scope() {
     run_compaction_message_test(
         "attached Task frozen basis and recovery",
-        recovered_hidden_task_run_uses_preflight_before_restored_child_main_prompt_compile_body(
+        recovered_hidden_task_run_dispatches_restored_child_main_without_planner_body(
             TaskAttachmentMode::Attached,
             false,
         ),
@@ -26661,14 +26757,14 @@ fn compaction_attached_task_restores_its_frozen_basis_without_changing_hook_scop
 fn recovered_task_public_stop_preserves_prompt_manifest_and_canonical_identity() {
     run_standard_stack_message_test(
         "recovered Task Stop before prompt compilation",
-        recovered_hidden_task_run_uses_preflight_before_restored_child_main_prompt_compile_body(
+        recovered_hidden_task_run_dispatches_restored_child_main_without_planner_body(
             TaskAttachmentMode::Detached,
             true,
         ),
     );
 }
 
-async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_prompt_compile_body(
+async fn recovered_hidden_task_run_dispatches_restored_child_main_without_planner_body(
     attachment: TaskAttachmentMode,
     stop_before_prompt: bool,
 ) {
@@ -27125,9 +27221,7 @@ async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_pro
         .agent_manager
         .remove_thread(lineage.child_thread_id.as_str())
         .await;
-    let recovery_provider = Arc::new(PreflightCaptureProvider::new(
-        "recovered hidden child completed",
-    ));
+    let recovery_provider = Arc::new(MainCaptureProvider::new("recovered hidden child completed"));
     let recovery_provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "openai",
         recovery_provider.clone(),
@@ -27354,47 +27448,40 @@ async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_pro
     assert_eq!(recovered_execution.id, execution.id);
 
     let requests = recovery_provider.snapshot_requests();
-    let preflight_pos = requests
-        .iter()
-        .position(is_turn_preflight_request)
-        .expect("recovered hidden child task should call preflight");
     let child_main_pos = requests
         .iter()
         .position(|request| {
             if composer_recovery {
-                !is_turn_preflight_request(request) && request.compiled_prompt.is_some()
+                request.compiled_prompt.is_some()
             } else {
                 is_child_task_main_request(request)
             }
         })
         .expect("recovered hidden child task should call main provider after prompt compile");
-    assert!(
-        preflight_pos < child_main_pos,
-        "recovered hidden child task preflight must run before the restored main child provider request"
+    assert_eq!(
+        child_main_pos, 0,
+        "main dispatch must be the first provider request"
     );
-    assert!(requests[preflight_pos].compiled_prompt.is_none());
     assert!(requests[child_main_pos].compiled_prompt.is_some());
-    let restored_prompt = requests[child_main_pos]
-        .compiled_prompt
-        .as_ref()
-        .expect("restored child main request should have compiled prompt");
+    let restored_context = requests[child_main_pos]
+        .messages
+        .iter()
+        .filter(|message| {
+            message
+                .application_context
+                .as_ref()
+                .is_some_and(|metadata| metadata["kind"] == "continuation_context")
+        })
+        .map(|message| message.content.as_str())
+        .find(|context| context.contains("Execution Continuation"))
+        .expect("restored child input should include execution continuation context");
     assert!(
-        restored_prompt
-            .full_system_text
-            .contains("Execution Continuation"),
-        "restored child prompt should include execution continuation section"
+        restored_context.contains("Completed window: index=1"),
+        "restored child input should include checkpoint window facts"
     );
     assert!(
-        restored_prompt
-            .full_system_text
-            .contains("Completed window: index=1"),
-        "restored child prompt should include checkpoint window facts"
-    );
-    assert!(
-        restored_prompt
-            .full_system_text
-            .contains("Original request preview: Recovered hidden preflight child"),
-        "restored child prompt should include checkpoint original request facts"
+        restored_context.contains("Original request preview: Recovered hidden preflight child"),
+        "restored child input should include checkpoint original request facts"
     );
     let recovered_main_request = &requests[child_main_pos];
     assert!(
@@ -27416,7 +27503,7 @@ async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_pro
             recovered_main_request
                 .messages
                 .iter()
-                .any(|message| &message.content == text),
+                .any(|message| prepared_user_text(message) == text),
             "recovery must send the entire Composer request, not its short Task goal"
         );
         assert_eq!(
@@ -29250,7 +29337,7 @@ async fn assert_composer_work_replays_exact_launch_payload_for_permission(
         "composer-launch",
     )
     .await;
-    let provider = Arc::new(PreflightCaptureProvider::new(
+    let provider = Arc::new(MainCaptureProvider::new(
         r#"<task_result>{"summary":"composer payload complete","data":{"rawText":"composer payload complete"}}</task_result>"#,
     ));
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
@@ -29602,8 +29689,7 @@ async fn assert_composer_work_replays_exact_launch_payload_for_permission(
 
     let requests = provider.snapshot_requests();
     let main_request = requests
-        .iter()
-        .find(|request| !is_turn_preflight_request(request))
+        .first()
         .expect("child main provider request should be captured");
     assert_eq!(main_request.model, "composer-selected-model");
     assert_eq!(
@@ -29623,7 +29709,7 @@ async fn assert_composer_work_replays_exact_launch_payload_for_permission(
         .messages
         .last()
         .expect("main request should include composer user input");
-    assert_eq!(user_message.content, "Use the exact composer request");
+    assert_prepared_user_text(user_message, "Use the exact composer request");
     assert!(matches!(
         user_message.content_parts.as_slice(),
         [pioneer_provider::MessageContentPart::File { file }]
@@ -29633,9 +29719,8 @@ async fn assert_composer_work_replays_exact_launch_payload_for_permission(
         .compiled_prompt
         .as_ref()
         .expect("child main request should carry a compiled prompt");
-    assert!(compiled_prompt.full_system_text.contains("[Skills]"));
-    assert!(compiled_prompt.full_system_text.contains("composer-launch"));
-    assert!(compiled_prompt.full_system_text.contains(&format!(
+    assert!(user_message.content.contains("composer-launch"));
+    assert!(user_message.content.contains(&format!(
         "Exact skill reference for read_skill: `skill:{skill_id}`"
     )));
     assert!(
@@ -35437,9 +35522,6 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
                         request.messages.len() > 1
                             && request.messages.first().is_none_or(|message| {
                                 message.content != pioneer_compaction::summary::INSTRUCTIONS
-                                    && !message.content.starts_with(
-                                        "You are an internal turn preflight planner for Pioneer.",
-                                    )
                             })
                             && request
                                 .messages
@@ -37527,8 +37609,30 @@ async fn cli_task_bootstrap_honors_empty_parent_context_policy_impl() {
         .filter(|item| item["type"] == "skill")
         .map(|item| item["name"].as_str().unwrap())
         .collect::<Vec<_>>();
+    assert!(
+        skill_names.is_empty(),
+        "required system exports must not invoke native skills for an empty selection"
+    );
+    let reference_messages = adapter_input
+        .iter()
+        .filter_map(|item| item["text"].as_str())
+        .filter_map(|text| {
+            text.strip_prefix("Current required Pioneer skill exports (replaces earlier required-export references): ")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(reference_messages.len(), 1);
+    let required_exports: JsonValue = serde_json::Deserializer::from_str(reference_messages[0])
+        .into_iter::<JsonValue>()
+        .next()
+        .unwrap()
+        .unwrap();
     assert_eq!(
-        skill_names,
+        required_exports
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|export| export["name"].as_str().unwrap())
+            .collect::<Vec<_>>(),
         vec![
             "pioneer-system-tasks",
             "pioneer-system-subagents",
@@ -37539,18 +37643,30 @@ async fn cli_task_bootstrap_honors_empty_parent_context_policy_impl() {
     let adapter_messages = adapter_input
         .iter()
         .filter(|item| item["type"] == "text")
+        .filter(|item| {
+            !item["text"]
+                .as_str()
+                .unwrap()
+                .starts_with("Current required Pioneer skill exports")
+        })
         .collect::<Vec<_>>();
     assert_eq!(
         adapter_input.len(),
-        adapter_messages.len() + skill_names.len()
+        adapter_messages.len() + reference_messages.len()
     );
-    assert_eq!(adapter_messages.len(), 2);
+    assert_eq!(adapter_messages.len(), 3);
+    assert!(
+        adapter_messages[0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Runtime:")
+    );
     assert!(
         !adapter_messages[0].to_string().contains(current_marker),
         "the current command must not be replayed as accepted history"
     );
     assert!(
-        adapter_messages[1]
+        adapter_messages[2]
             .get("text")
             .and_then(serde_json::Value::as_str)
             .is_some_and(
@@ -37815,7 +37931,8 @@ async fn assert_detached_native_child_turn_cancellation(native_api: bool) {
         .await
         .expect("recording CLI runtimes should seed authoritative readiness");
     processor.bind_task_bridge().await;
-    processor.start_task_event_listener().await;
+    // This fixture drives the durable fanout dispatcher explicitly below.
+    // A competing background listener would make projection order probabilistic.
 
     let parent_thread_id = "thr_native_child_turn_cancel";
     let source_turn_id = "turn_native_child_turn_cancel_source";
@@ -38006,6 +38123,26 @@ async fn assert_detached_native_child_turn_cancellation(native_api: bool) {
         assert_eq!(receipts.iter().filter(|r| r.run_id == run.id).count(), 1);
     }
 
+    let mut fanout_drained = false;
+    for _ in 0..32 {
+        let summary =
+            drain_test_notifications_while(&mut rx, processor.task_event_fanout_quantum())
+                .await
+                .expect("cancellation fanout should run");
+        assert_eq!(
+            summary.errors, 0,
+            "cancellation fanout must not defer errors"
+        );
+        if summary.pending == Some(false) {
+            fanout_drained = true;
+            break;
+        }
+    }
+    assert!(
+        fanout_drained,
+        "cancellation fanout must drain its bounded queue"
+    );
+
     let parent_occurrence_turn_id = lineage
         .created_by_turn_id
         .as_deref()
@@ -38019,11 +38156,16 @@ async fn assert_detached_native_child_turn_cancellation(native_api: bool) {
         "parent TaskRun occurrences are execution-free projections"
     );
 
-    let parent_anchor = wait_for_task_anchor_item_status(
-        crud_store.clone(),
-        parent_occurrence_turn_id,
-        crate::task_tools::task_run_anchor_id(run.id.as_str()).as_str(),
-        TaskStatus::Cancelled,
+    // Keep the subscribed client reading while the fanout worker publishes
+    // cancellation. A full notification queue would stall the card refresh.
+    let parent_anchor = drain_test_notifications_while(
+        &mut rx,
+        wait_for_task_anchor_item_status(
+            crud_store.clone(),
+            parent_occurrence_turn_id,
+            crate::task_tools::task_run_anchor_id(run.id.as_str()).as_str(),
+            TaskStatus::Cancelled,
+        ),
     )
     .await;
     assert_eq!(parent_anchor.status, TaskStatus::Cancelled);
@@ -38078,11 +38220,14 @@ async fn assert_detached_native_child_turn_cancellation(native_api: bool) {
         TurnStatus::Interrupted,
         "late delivery must not turn a cancelled occurrence into Completed"
     );
-    let reloaded_anchor = wait_for_task_anchor_item_status(
-        crud_store,
-        parent_occurrence_turn_id,
-        crate::task_tools::task_run_anchor_id(run.id.as_str()).as_str(),
-        TaskStatus::Cancelled,
+    let reloaded_anchor = drain_test_notifications_while(
+        &mut rx,
+        wait_for_task_anchor_item_status(
+            crud_store,
+            parent_occurrence_turn_id,
+            crate::task_tools::task_run_anchor_id(run.id.as_str()).as_str(),
+            TaskStatus::Cancelled,
+        ),
     )
     .await;
     assert_eq!(reloaded_anchor.status, TaskStatus::Cancelled);
@@ -38290,12 +38435,6 @@ async fn detached_composer_work_matches_parent_llm_prompts_end_to_end_impl() {
     }
     let child_requests = provider.take_requests();
 
-    let direct_preflight =
-        single_prompt_parity_request(&direct_requests, PromptParityRequestKind::TurnPreflight);
-    let child_preflight =
-        single_prompt_parity_request(&child_requests, PromptParityRequestKind::TurnPreflight);
-    assert_exact_chat_request_parity("turn preflight", direct_preflight, child_preflight);
-
     let direct_main = single_prompt_parity_request(&direct_requests, PromptParityRequestKind::Main);
     let child_main = single_prompt_parity_request(&child_requests, PromptParityRequestKind::Main);
     let lineage = wait_for_child_lineage_for_run(
@@ -38312,12 +38451,14 @@ async fn detached_composer_work_matches_parent_llm_prompts_end_to_end_impl() {
         direct_parent_thread_id,
         direct_parent_thread_id,
         direct_seed_turn_id,
+        None,
     );
     let child_main = canonical_main_request_execution_thread_for_parity(
         child_main,
         &lineage.child_thread_id,
         task_parent_thread_id,
         task_seed_turn_id,
+        Some(task.task.id.as_str()),
     );
     assert_exact_chat_request_parity("main turn", &direct_main, &child_main);
 
@@ -38372,12 +38513,7 @@ async fn detached_composer_work_matches_full_parent_llm_request_end_to_end_impl(
         pioneer_protocol::SkillId::new("V".repeat(21)).expect("valid parity skill id");
     let dynamic_skill_tool_name = format!("skill.{expected_skill_id}.fetch-context");
     let mcp_capability_id = "mcp-tool:workspace:resend:send";
-    let provider = Arc::new(PromptParityCaptureProvider::with_visible_tools(vec![
-        "task_create".to_owned(),
-        "read_skill".to_owned(),
-        dynamic_skill_tool_name.clone(),
-        "mcp_resend_send".to_owned(),
-    ]));
+    let provider = Arc::new(PromptParityCaptureProvider::default());
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "openai",
         provider.clone(),
@@ -38763,7 +38899,6 @@ async fn detached_composer_work_matches_full_parent_llm_request_end_to_end_impl(
     let child_requests = provider.take_requests();
 
     let expected_stages = vec![
-        PromptParityRequestKind::TurnPreflight,
         PromptParityRequestKind::Main,
         PromptParityRequestKind::PostTurnExtractor,
     ];
@@ -38773,7 +38908,7 @@ async fn detached_composer_work_matches_full_parent_llm_request_end_to_end_impl(
             .filter_map(prompt_parity_request_kind)
             .collect::<Vec<_>>(),
         expected_stages,
-        "foreground full-parity execution should issue exactly the three expected LLM stages"
+        "foreground full-parity execution should issue exactly the two expected LLM stages"
     );
     assert_eq!(
         child_requests
@@ -38781,7 +38916,7 @@ async fn detached_composer_work_matches_full_parent_llm_request_end_to_end_impl(
             .filter_map(prompt_parity_request_kind)
             .collect::<Vec<_>>(),
         expected_stages,
-        "detached full-parity execution should issue exactly the three expected LLM stages"
+        "detached full-parity execution should issue exactly the two expected LLM stages"
     );
     assert_eq!(
         direct_requests.len(),
@@ -38794,10 +38929,6 @@ async fn detached_composer_work_matches_full_parent_llm_request_end_to_end_impl(
         "detached full-parity execution must not issue an unclassified LLM request"
     );
 
-    let direct_preflight =
-        single_prompt_parity_request(&direct_requests, PromptParityRequestKind::TurnPreflight);
-    let child_preflight =
-        single_prompt_parity_request(&child_requests, PromptParityRequestKind::TurnPreflight);
     let direct_artifact_output_root_canonical = std::fs::canonicalize(&direct_artifact_output_root)
         .expect("direct full-parity artifact output root should canonicalize")
         .to_string_lossy()
@@ -38808,26 +38939,6 @@ async fn detached_composer_work_matches_full_parent_llm_request_end_to_end_impl(
         .into_owned();
     let direct_artifact_output_root = direct_artifact_output_root.to_string_lossy().into_owned();
     let child_artifact_output_root = child_artifact_output_root.to_string_lossy().into_owned();
-    assert_exact_chat_request_parity_with_turn_private_paths(
-        "full turn preflight",
-        direct_preflight,
-        child_preflight,
-        &[
-            direct_artifact_output_root_canonical.as_str(),
-            direct_artifact_output_root.as_str(),
-        ],
-        &[
-            child_artifact_output_root_canonical.as_str(),
-            child_artifact_output_root.as_str(),
-        ],
-    );
-    for expected_tool in ["task_create", "read_skill"] {
-        assert!(
-            direct_preflight.messages[0].content.contains(expected_tool),
-            "full preflight prompt should expose indexed tool `{expected_tool}`"
-        );
-    }
-
     let direct_main = single_prompt_parity_request(&direct_requests, PromptParityRequestKind::Main);
     let child_main = single_prompt_parity_request(&child_requests, PromptParityRequestKind::Main);
     let direct_main = canonical_main_request_execution_thread_for_parity(
@@ -38835,12 +38946,14 @@ async fn detached_composer_work_matches_full_parent_llm_request_end_to_end_impl(
         direct_parent_thread_id,
         direct_parent_thread_id,
         direct_seed_turn_id,
+        None,
     );
     let child_main = canonical_main_request_execution_thread_for_parity(
         child_main,
         &lineage.child_thread_id,
         task_parent_thread_id,
         task_seed_turn_id,
+        Some(task.task.id.as_str()),
     );
     assert_exact_chat_request_parity_with_turn_private_paths(
         "full main turn",
@@ -38879,8 +38992,12 @@ async fn detached_composer_work_matches_full_parent_llm_request_end_to_end_impl(
         .iter()
         .map(|tool| tool.name.as_str())
         .collect::<HashSet<_>>();
+    assert!(
+        !tool_names.contains("task_create"),
+        "task domain starts hidden"
+    );
     for expected_tool in [
-        "task_create",
+        "request_tools",
         "read_skill",
         dynamic_skill_tool_name.as_str(),
         "mcp_resend_send",
@@ -38894,9 +39011,9 @@ async fn detached_composer_work_matches_full_parent_llm_request_end_to_end_impl(
         .messages
         .last()
         .expect("full main request should include a user message");
-    assert_eq!(
-        user_message.content,
-        "Verify the complete parent and detached child LLM request."
+    assert_prepared_user_text(
+        user_message,
+        "Verify the complete parent and detached child LLM request.",
     );
     assert!(matches!(
         user_message.content_parts.as_slice(),
@@ -38907,17 +39024,12 @@ async fn detached_composer_work_matches_full_parent_llm_request_end_to_end_impl(
                         && reference.artifact_version_id == direct_artifact.version_id
                 })
     ));
-    let compiled_prompt = direct_main
-        .compiled_prompt
-        .as_ref()
-        .expect("full main request should include a compiled prompt");
-    assert!(compiled_prompt.full_system_text.contains("[Skills]"));
     assert!(
-        compiled_prompt
-            .full_system_text
-            .contains("full-parity-skill")
+        direct_main.compiled_prompt.is_some(),
+        "full main request should include a compiled prompt"
     );
-    assert!(compiled_prompt.full_system_text.contains(&format!(
+    assert!(user_message.content.contains("full-parity-skill"));
+    assert!(user_message.content.contains(&format!(
         "Exact skill reference for read_skill: `skill:{skill_id}`"
     )));
 
@@ -40547,7 +40659,14 @@ async fn agent_mode_materializes_task_tools_and_chat_mode_does_not_impl() {
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
-    let provider = Arc::new(SequencedToolProvider::new(Vec::new(), "done"));
+    let provider = Arc::new(SequencedToolProvider::new(
+        vec![ProviderToolCall {
+            id: "request_task_domain".to_owned(),
+            name: "request_tools".to_owned(),
+            arguments: json!({"domains": ["task"], "reason": "Need task tools to verify Agent mode discovery."}).to_string(),
+        }],
+        "done",
+    ));
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "parent",
         provider.clone(),
@@ -40591,6 +40710,11 @@ async fn agent_mode_materializes_task_tools_and_chat_mode_does_not_impl() {
     );
 
     let agent_requests = provider.snapshot_requests();
+    assert_eq!(
+        agent_requests.len(),
+        2,
+        "capture initial and post-discovery main requests"
+    );
     let first_agent_request = agent_requests
         .first()
         .expect("agent request should be captured");
@@ -40599,14 +40723,35 @@ async fn agent_mode_materializes_task_tools_and_chat_mode_does_not_impl() {
         .as_ref()
         .expect("agent request should include compiled prompt");
     assert!(
-        agent_prompt.full_system_text.contains("## Subagents"),
+        agent_prompt.full_system_text.contains("### Subagents"),
         "agent mode should explain attached subagents when task tools are available"
     );
     assert!(
-        agent_prompt.full_system_text.contains("## Tasks"),
+        agent_prompt.full_system_text.contains("### Tasks"),
         "agent mode should explain durable tasks when task tools are available"
     );
-    let tool_names = first_agent_request
+    let initial_tools = first_agent_request.tools.as_ref().expect("initial tools");
+    assert!(
+        initial_tools
+            .iter()
+            .any(|tool| tool.name == "request_tools")
+    );
+    assert!(
+        initial_tools
+            .iter()
+            .all(|tool| !tool.name.starts_with("task_"))
+    );
+    let revealed_request = &agent_requests[1];
+    assert!(
+        revealed_request
+            .messages
+            .iter()
+            .any(|message| message.role == pioneer_provider::Role::Tool
+                && message.tool_call_id.as_deref() == Some("request_task_domain")
+                && message.content.contains("task_create")),
+        "the next request must contain the real discovery result"
+    );
+    let tool_names = revealed_request
         .tools
         .as_ref()
         .expect("agent mode should expose tools")
@@ -40697,11 +40842,11 @@ async fn agent_mode_materializes_task_tools_and_chat_mode_does_not_impl() {
     );
     if let Some(prompt) = first_chat_request.compiled_prompt.as_ref() {
         assert!(
-            !prompt.full_system_text.contains("## Subagents"),
+            !prompt.full_system_text.contains("### Subagents"),
             "chat mode without task tools should not advertise subagents"
         );
         assert!(
-            !prompt.full_system_text.contains("## Tasks"),
+            !prompt.full_system_text.contains("### Tasks"),
             "chat mode without task tools should not advertise durable tasks"
         );
     }
@@ -40990,14 +41135,17 @@ async fn task_create_inherits_exact_turn_capabilities_for_attached_and_backgroun
                     })
             })
             .expect("child model request should contain its task marker");
-        let compiled_prompt = child_request
-            .compiled_prompt
-            .as_ref()
-            .expect("child model request should contain its compiled prompt");
         assert!(
-            compiled_prompt.full_system_text.contains(&format!(
-                "Exact skill reference for read_skill: `skill:{skill_id}`"
-            )),
+            child_request.compiled_prompt.is_some(),
+            "child model request should contain its compiled prompt"
+        );
+        assert!(
+            child_request
+                .messages
+                .iter()
+                .any(|message| message.content.contains(&format!(
+                    "Exact skill reference for read_skill: `skill:{skill_id}`"
+                ))),
             "selected Skill must appear in the child runtime prompt"
         );
         let tool_names = child_request
@@ -53913,17 +54061,23 @@ async fn codex_goal_segments_share_one_pioneer_turn_and_fence_subagents_impl() {
             }),
         )
         .await;
-    processor
-        .handle_cli_runtime_timeline_event(
-            session_handle.instance(),
-            RuntimeEvent::TurnCompleted(RuntimeTurnCompleted {
-                native_thread_id: Some(native_thread_id.to_owned()),
-                native_turn_id: first_segment_id.to_owned(),
-                status: "completed".to_owned(),
-                native: None,
-            }),
-        )
-        .await;
+    let first_completion = RuntimeEvent::TurnCompleted(RuntimeTurnCompleted {
+        native_thread_id: Some(native_thread_id.to_owned()),
+        native_turn_id: first_segment_id.to_owned(),
+        status: "completed".to_owned(),
+        native: Some(pioneer_cli_agent_runtime::event::RuntimeNativeEvent {
+            method: "turn/completed".into(),
+            payload_redacted: Some(
+                json!({"turn":{"startedAt":10,"completedAt":11,"durationMs":1000}}),
+            ),
+            raw_redacted: None,
+        }),
+    });
+    for _ in 0..2 {
+        processor
+            .handle_cli_runtime_timeline_event(session_handle.instance(), first_completion.clone())
+            .await;
+    }
 
     let (_, intermediate_turn) = crud_store
         .get_turn(thread_id, turn_id)
@@ -53965,7 +54119,13 @@ async fn codex_goal_segments_share_one_pioneer_turn_and_fence_subagents_impl() {
                 native_thread_id: Some(native_thread_id.to_owned()),
                 native_turn_id: submission_id.to_owned(),
                 status: "completed".to_owned(),
-                native: None,
+                native: Some(pioneer_cli_agent_runtime::event::RuntimeNativeEvent {
+                    method: "turn/completed".into(),
+                    payload_redacted: Some(
+                        json!({"turn":{"startedAt":10,"completedAt":11,"durationMs":1000}}),
+                    ),
+                    raw_redacted: None,
+                }),
             }),
         )
         .await;
@@ -54081,7 +54241,13 @@ async fn codex_goal_segments_share_one_pioneer_turn_and_fence_subagents_impl() {
                 native_thread_id: Some(native_thread_id.to_owned()),
                 native_turn_id: second_segment_id.to_owned(),
                 status: "completed".to_owned(),
-                native: None,
+                native: Some(pioneer_cli_agent_runtime::event::RuntimeNativeEvent {
+                    method: "turn/completed".into(),
+                    payload_redacted: Some(
+                        json!({"turn":{"startedAt":10,"completedAt":11,"durationMs":1000}}),
+                    ),
+                    raw_redacted: None,
+                }),
             }),
         )
         .await;
@@ -54091,6 +54257,35 @@ async fn codex_goal_segments_share_one_pioneer_turn_and_fence_subagents_impl() {
         .expect("Goal-held turn should load")
         .expect("Goal-held turn should exist");
     assert_eq!(held_turn.status, TurnStatus::InProgress);
+    let items = crud_store
+        .list_turn_items_by_type(turn_id, "system_event")
+        .await
+        .unwrap();
+    let timings = items
+        .iter()
+        .filter_map(|item| match item {
+            TurnItem::SystemEvent {
+                code: Some(code),
+                details: Some(details),
+                ..
+            } if code == "cli_native_turn_timing" => Some(details),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        timings.len(),
+        3,
+        "each intermediate native segment retains timing"
+    );
+    for native_turn in [first_segment_id, submission_id, second_segment_id] {
+        assert!(
+            timings
+                .iter()
+                .any(|details| details["native_turn_id"] == native_turn
+                    && details["native_thread_id"] == native_thread_id
+                    && details["native_timing"]["durationMs"] == 1000)
+        );
+    }
 
     processor
         .handle_cli_runtime_timeline_event(
@@ -61089,9 +61284,9 @@ fn agents_doc_turn_prompt_uses_root_inheritance_and_folder_override() {
             .last()
             .and_then(|request| request.compiled_prompt.as_ref())
             .expect("root provider request should include compiled prompt")
-            .dynamic_system_text
+            .full_system_text
             .clone();
-        assert!(root_prompt.contains("## AGENTS.md"));
+        assert!(root_prompt.contains("### AGENTS.md"));
         assert!(root_prompt.contains("effective AGENTS.md for this thread tree scope"));
         assert!(root_prompt.contains("Root only instruction"));
 
@@ -61134,7 +61329,7 @@ fn agents_doc_turn_prompt_uses_root_inheritance_and_folder_override() {
             .last()
             .and_then(|request| request.compiled_prompt.as_ref())
             .expect("inherited provider request should include compiled prompt")
-            .dynamic_system_text
+            .full_system_text
             .clone();
         assert!(inherited_prompt.contains("Root only instruction"));
         assert!(inherited_prompt.contains("explicit user messages take precedence"));
@@ -61164,7 +61359,7 @@ fn agents_doc_turn_prompt_uses_root_inheritance_and_folder_override() {
             .last()
             .and_then(|request| request.compiled_prompt.as_ref())
             .expect("folder provider request should include compiled prompt")
-            .dynamic_system_text
+            .full_system_text
             .clone();
         assert!(folder_prompt.contains("effective AGENTS.md for this thread tree scope"));
         assert!(folder_prompt.contains("Folder only instruction"));
@@ -61809,16 +62004,7 @@ fn phase_11_prompt_manifest_hook_sources_roundtrip_existing_event() {
                 release: provider_release,
             }),
         ));
-        // Preflight runs before manifest compilation and window registration.
-        // Let it finish through its own provider so the barrier gates only the
-        // main response, after the actor's durable startup events have ACKed.
-        let preflight_provider = Arc::new(PreflightCaptureProvider::new("unexpected main request"));
-        provider_registry
-            .insert("preflight-capture", preflight_provider.clone())
-            .expect("preflight provider should fit the bounded test registry");
-        let mut tool_loop_config = test_tool_loop_config();
-        tool_loop_config.preflight.provider_name = Some("preflight-capture".to_owned());
-        tool_loop_config.preflight.model = Some("test-model".to_owned());
+        let tool_loop_config = test_tool_loop_config();
         let processor = MessageProcessor::new(
             thread_manager.clone(),
             provider_registry,
@@ -61876,12 +62062,6 @@ fn phase_11_prompt_manifest_hook_sources_roundtrip_existing_event() {
         tokio::time::timeout(Duration::from_secs(10), provider_entered.notified())
             .await
             .expect("manifest fixture provider should enter after durable startup");
-        let preflight_requests = preflight_provider.snapshot_requests();
-        assert!(
-            !preflight_requests.is_empty(),
-            "preflight should run before main provider entry"
-        );
-        assert!(preflight_requests.iter().all(is_turn_preflight_request));
         let window = crud_store
             .latest_turn_execution_window(turn_id)
             .await
@@ -62346,6 +62526,29 @@ async fn assert_turn_cancel_with_optional_busy_native_actor(
     });
     let mut committed_events = None;
     let mut preserved_blocked_rows = Vec::new();
+    let mut resumed_job_id: Option<String> = None;
+
+    if resume_direct {
+        // Drive recovery explicitly below, with the same durable listener
+        // startup used by the resilience worker, without a competing scanner.
+        let recovery_processor = Arc::downgrade(&processor);
+        processor
+            .recovery_coordinator
+            .set_listener_starter(Arc::new(move |thread_id| {
+                let recovery_processor = recovery_processor.clone();
+                Box::pin(async move {
+                    let processor = recovery_processor
+                        .upgrade()
+                        .ok_or_else(|| "fixture processor stopped".to_owned())?;
+                    processor
+                        .with_database_class(pioneer_sqlite::SqliteWriteClass::Critical)
+                        .ensure_agent_listener_task(&thread_id)
+                        .await
+                        .map_err(|error| format!("{error:#}"))
+                })
+            }))
+            .await;
+    }
 
     let thread_request_id = generate_test_request_id("turncancel", "thread");
     let thread_start_request = json!({
@@ -62480,6 +62683,19 @@ async fn assert_turn_cancel_with_optional_busy_native_actor(
                 .await
                 .unwrap()
         );
+        if resume_direct {
+            ensure_test_superuser_execution_turn(&processor, &workspace_id, thread_id, turn_id)
+                .await;
+            assert!(
+                crud_store_for_assert
+                    .set_turn_execution_security_snapshot(
+                        turn_id,
+                        &test_full_access_execution_security_snapshot(),
+                    )
+                    .await
+                    .unwrap()
+            );
+        }
         for cycle in 0..if resume_direct { 2 } else { 1 } {
             processor
                 .agent_manager
@@ -62491,41 +62707,94 @@ async fn assert_turn_cancel_with_optional_busy_native_actor(
                 .ensure_agent_listener_task(thread_id)
                 .await
                 .unwrap();
-            processor
-                .agent_manager
-                .start_turn_with_hook_context_permission_profile_and_security_snapshot(
-                    thread_id,
-                    turn_id,
-                    if with_effects {
-                        ThreadMode::Agent
-                    } else {
-                        ThreadMode::Chat
-                    },
-                    pioneer_agent::AgentTurnHookRuntimeContext::default(),
-                    "test-model",
-                    "delayed",
-                    HashMap::new(),
-                    pioneer_skills::SkillCatalogSnapshot {
-                        version: 1,
-                        generated_at_unix: 0,
-                        skills: Vec::new(),
-                    },
-                    vec![UserInput::Text {
-                        text: "hello".to_owned(),
-                        text_elements: Vec::new(),
-                    }],
-                    Vec::new(),
-                    Vec::new(),
-                    HashMap::new(),
-                    Vec::new(),
-                    default_test_permission_profile(),
-                    test_full_access_execution_security_snapshot(),
-                )
+            if let Some(job_id) = resumed_job_id.as_deref() {
+                // Let the recovery owner checkpoint the interrupted window and
+                // commit its continuation before starting the replacement actor.
+                // Replaying window 1 directly bypasses that durable lifecycle.
+                let now = now_timestamp_secs();
+                let mut claimed = crud_store_for_assert
+                    .claim_due_recovery_jobs(now, 45, 1)
+                    .await
+                    .unwrap();
+                assert_eq!(claimed.len(), 1);
+                assert_eq!(claimed[0].id, job_id);
+                let events = processor
+                    .recovery_coordinator
+                    .run_claimed_recovery_job_for_test(claimed.remove(0), now)
+                    .await
+                    .unwrap();
+                assert!(
+                    events.iter().any(|event| matches!(
+                        event,
+                        crate::resilience::RecoveryCoordinatorEvent::RetryAttemptStarted {
+                            job_id: started_job_id,
+                            ..
+                        } if started_job_id == job_id
+                    )),
+                    "blocked cancellation fixture should restart through recovery: events={events:?}, job={:?}, execution={:?}",
+                    crud_store_for_assert
+                        .get_recovery_job(job_id)
+                        .await
+                        .unwrap(),
+                    crud_store_for_assert
+                        .get_turn_execution(turn_id)
+                        .await
+                        .unwrap(),
+                );
+            } else {
+                processor
+                    .agent_manager
+                    .start_turn_with_hook_context_permission_profile_and_security_snapshot(
+                        thread_id,
+                        turn_id,
+                        if with_effects {
+                            ThreadMode::Agent
+                        } else {
+                            ThreadMode::Chat
+                        },
+                        pioneer_agent::AgentTurnHookRuntimeContext::default(),
+                        "test-model",
+                        "delayed",
+                        HashMap::new(),
+                        pioneer_skills::SkillCatalogSnapshot {
+                            version: 1,
+                            generated_at_unix: 0,
+                            skills: Vec::new(),
+                        },
+                        vec![UserInput::Text {
+                            text: "hello".to_owned(),
+                            text_elements: Vec::new(),
+                        }],
+                        Vec::new(),
+                        Vec::new(),
+                        HashMap::new(),
+                        Vec::new(),
+                        default_test_permission_profile(),
+                        test_full_access_execution_security_snapshot(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            if tokio::time::timeout(Duration::from_secs(5), entered.notified())
                 .await
-                .unwrap();
-            tokio::time::timeout(Duration::from_secs(5), entered.notified())
-                .await
-                .unwrap();
+                .is_err()
+            {
+                let observation = processor
+                    .agent_manager
+                    .observe_turn(thread_id, turn_id)
+                    .await;
+                let stored = crud_store_for_assert.get_turn(thread_id, turn_id).await;
+                let authority = processor.guard_execution_commit(turn_id).await;
+                let execution = crud_store_for_assert.get_turn_execution(turn_id).await;
+                let recovery = if let Some(job_id) = resumed_job_id.as_deref() {
+                    Some(crud_store_for_assert.get_recovery_job(job_id).await)
+                } else {
+                    None
+                };
+                panic!(
+                    "provider barrier was not reached in cycle {cycle}: actor={observation:?}, stored={stored:?}, authority={authority:?}, execution={execution:?}, recovery={recovery:?}"
+                );
+            }
             // The provider cannot finish until release; it stays unreleased throughout cancellation.
             assert!(
                 crud_store_for_assert
@@ -62677,20 +62946,32 @@ async fn assert_turn_cancel_with_optional_busy_native_actor(
                     )
                     .await
                     .unwrap();
-                assert!(matches!(
-                    crud_store_for_assert
-                        .resume_blocked_turn_recovery(
-                            thread_id,
-                            turn_id,
-                            Some(&job.id),
-                            now,
-                            processor.turn_execution_owner_id.as_ref(),
-                            now + 100
-                        )
+                // Resume through the lifecycle owner so both the durable Turn
+                // and its in-memory projection are InProgress before the actor
+                // waits for the durable control-registration ACK.
+                let resumed = processor
+                    .resume_blocked_turn_control(
+                        &workspace_id,
+                        thread_id,
+                        turn_id,
+                        Some(&job.id),
+                        now,
+                    )
+                    .await
+                    .unwrap()
+                    .expect("blocked cancellation fixture should resume");
+                assert_eq!(resumed.id, job.id);
+                assert_eq!(
+                    processor
+                        .thread_manager
+                        .turn_get(thread_id, turn_id)
                         .await
-                        .unwrap(),
-                    pioneer_crud::BlockedTurnRecoveryResumeOutcome::Resumed(_)
-                ));
+                        .unwrap()
+                        .1
+                        .status,
+                    TurnStatus::InProgress
+                );
+                resumed_job_id = Some(job.id);
                 assert_eq!(
                     crud_store_for_assert
                         .native_cancellation_context(turn_id)
@@ -71601,7 +71882,12 @@ async fn turn_start_emits_full_lifecycle_notifications_and_echoes_text() {
     let item_delta: ItemDeltaNotification =
         serde_json::from_value(item_delta_params).expect("item delta params must decode");
     assert_eq!(item_delta.item_id, agent_item_id);
-    assert_eq!(item_delta.delta, "Echo this back");
+    assert!(item_delta.delta.starts_with("<pioneer_turn_context>\n"));
+    assert!(
+        item_delta
+            .delta
+            .ends_with("</pioneer_turn_context>\n\nEcho this back")
+    );
 
     assert_eq!(item_completed_notification.method, events::ITEM_COMPLETED);
     let item_completed_params = item_completed_notification
@@ -71612,7 +71898,7 @@ async fn turn_start_emits_full_lifecycle_notifications_and_echoes_text() {
     match item_completed.item {
         pioneer_protocol::TurnItem::AgentMessage { id, text, .. } => {
             assert_eq!(id, agent_item_id);
-            assert_eq!(text, "Echo this back");
+            assert_eq!(text, item_delta.delta);
         }
         other => panic!("expected agent message item, got {other:?}"),
     }
@@ -72156,10 +72442,15 @@ Gateway HTTP skill body"#
         .await
         .expect("turn llm context should load");
     assert!(
-        retained_context
-            .iter()
-            .all(|entry| matches!(entry.source.as_str(), "assistant_round" | "tool_result_v2")),
-        "terminal cleanup should retain only canonical provider context"
+        retained_context.iter().all(|entry| matches!(
+            entry.source.as_str(),
+            "assistant_round"
+                | "tool_result_v2"
+                | "turn_input_projection_v1"
+                | "runtime_context_v1"
+                | "system_snapshot_v1"
+        )),
+        "terminal cleanup should retain canonical provider context and prepared delivery snapshots"
     );
     assert!(
         retained_context
@@ -72170,6 +72461,16 @@ Gateway HTTP skill body"#
         "canonical full result must survive terminal cleanup exactly once for history and result_read"
     );
 
+    assert!(
+        retained_context
+            .iter()
+            .any(|entry| entry.source == "turn_input_projection_v1")
+    );
+    assert!(
+        retained_context
+            .iter()
+            .any(|entry| entry.source == "system_snapshot_v1")
+    );
     let canonical_result = retained_context
         .iter()
         .find(|entry| entry.source == "tool_result_v2" && entry.payload.contains(SECRET))
@@ -79627,129 +79928,6 @@ async fn memory_provider_disabled_runtime_materializes_no_tools() {
 }
 
 #[tokio::test]
-async fn memory_provider_recall_calls_memory_service() {
-    let mut harness = setup_memory_gateway_harness("provider_recall", true).await;
-    let recall_context = memory_tool_context(&harness, "provider_recall");
-    let thread_start_id = memory_request_id("providerthread");
-    let thread_start_request = json!({
-        "jsonrpc": "2.0",
-        "id": thread_start_id.as_str(),
-        "method": "thread/start",
-        "params": {
-            "thread_id": recall_context.thread_id.clone(),
-            "workspace_id": harness.workspace_id.clone(),
-            "model": "test-model",
-            "model_provider": "openai",
-            "mode": "Agent"
-        }
-    });
-    harness
-        .processor
-        .process_request_for_connection(
-            harness.connection_id,
-            thread_start_request.to_string().as_str(),
-        )
-        .await;
-    let (thread_response, _) = recv_response_and_notification_by_id_method(
-        &mut harness.rx,
-        thread_start_id.as_str(),
-        events::THREAD_STARTED,
-    )
-    .await;
-    let thread_payload: ThreadStartResponse =
-        serde_json::from_value(thread_response.result).expect("thread start response");
-    let provider =
-        crate::memory_tools::GatewayMemoryProvider::new(Arc::downgrade(&harness.processor));
-    harness
-        .crud_store
-        .materialize_turn_start(
-            &thread_payload.thread,
-            SandboxMode::FullAccess,
-            &Turn {
-                work_owner: Default::default(),
-                id: recall_context.turn_id.clone(),
-                status: TurnStatus::InProgress,
-                turn_kind: Default::default(),
-                origin: Default::default(),
-                mode: Default::default(),
-                author: None,
-                reply_to_turn_id: None,
-                mentions: Vec::new(),
-                message_revision: 0,
-                message_deleted: false,
-                error: None,
-                prompt_manifest: None,
-                permission_profile: default_test_permission_profile(),
-            },
-            &[],
-            pioneer_protocol::PersistedActorRef::Principal(
-                authenticated_test_superuser().principal_id.clone(),
-            ),
-        )
-        .await
-        .expect("turn start should persist for recall scope");
-    persist_test_execution_authorization_context(
-        harness.processor.as_ref(),
-        harness.connection_id,
-        recall_context.workspace_id.as_str(),
-        recall_context.thread_id.as_str(),
-        recall_context.turn_id.as_str(),
-    )
-    .await;
-    let remember_payload = harness
-        .processor
-        .memory_runtime()
-        .service()
-        .remember(
-            harness
-                .processor
-                .memory_runtime()
-                .operation_context_for_authorized_turn(&recall_context, None, true),
-            MemoryRememberParams {
-                provenance: Some(pioneer_protocol::MemoryProvenance {
-                    source_thread_id: Some(recall_context.thread_id.clone()),
-                    source_turn_id: Some(recall_context.turn_id.clone()),
-                    source_item_id: None,
-                    created_by: None,
-                }),
-                ..memory_remember_params(
-                    MemoryScope {
-                        kind: MemoryScopeKind::Thread,
-                        key: recall_context.effective_conversation_thread_id().to_owned(),
-                    },
-                    MemoryCategory::ProjectFact,
-                    Some("phase09_provider_recall"),
-                    "phase09 provider recall should find the green papaya preference",
-                )
-            },
-        )
-        .await
-        .expect("authorized thread-capsule memory seed should persist");
-    let snapshot = provider
-        .recall_memory(
-            recall_context,
-            MemoryRecallRequest {
-                query: "green papaya".to_owned(),
-                categories: Vec::new(),
-                top_k: Some(5),
-                max_chars: Some(500),
-            },
-        )
-        .await
-        .expect("provider recall should succeed");
-
-    assert!(snapshot.diagnostics.is_empty());
-    assert!(
-        snapshot
-            .items
-            .iter()
-            .any(|item| item.memory_id == remember_payload.record.id)
-    );
-
-    let _ = std::fs::remove_dir_all(harness.runtime_home);
-}
-
-#[tokio::test]
 async fn memory_bridge_not_bound_when_runtime_disabled() {
     let harness = setup_memory_gateway_harness("bridge_disabled", false).await;
 
@@ -79790,10 +79968,6 @@ async fn chat_mode_russian_remember_does_not_mutate_agent_memory_impl() {
     )
     .await;
 
-    assert!(
-        chat_provider.snapshot_policy_requests().is_empty(),
-        "chat mode should not run memory policy classifier"
-    );
     let chat_requests = chat_provider.snapshot_main_requests();
     assert!(
         chat_requests.iter().any(|request| request
@@ -79815,7 +79989,7 @@ async fn chat_mode_russian_remember_does_not_mutate_agent_memory_impl() {
             request
                 .compiled_prompt
                 .as_ref()
-                .map(|prompt| !prompt.full_system_text.contains("## Memory Recall"))
+                .map(|prompt| !prompt.full_system_text.contains("### Memory Recall"))
                 .unwrap_or(true),
             "chat request should not include memory recall prompt"
         );
@@ -79888,24 +80062,6 @@ async fn memory_owner_facts_survive_a_new_thread() {
             Some(&json!(
                 memory_tool_context(&harness, "owner_first").thread_id
             )),
-        );
-        let recall = provider
-            .recall_memory(
-                memory_tool_context(&harness, "owner_second"),
-                MemoryRecallRequest {
-                    query: content.to_owned(),
-                    categories: Vec::new(),
-                    top_k: Some(5),
-                    max_chars: Some(1000),
-                },
-            )
-            .await
-            .unwrap();
-        assert!(
-            recall
-                .items
-                .iter()
-                .any(|item| json!(item.memory_id) == remembered["memoryId"])
         );
         let manifest = provider
             .load_memory_manifest(
@@ -80982,7 +81138,10 @@ async fn wait_for_task_anchor_item_status(
     item_id: &str,
     expected_status: TaskStatus,
 ) -> TaskTurnItem {
-    for _ in 0..100 {
+    // Fanout uses bounded pages and a five-second periodic wake when a bus
+    // notification is coalesced. Allow multiple quanta, as the turn-status
+    // waiter does, while still requiring the exact durable card status.
+    for _ in 0..1_200 {
         if let Some(TurnItem::Task { item }) = crud_store
             .get_turn_item(turn_id, item_id)
             .await
@@ -82025,11 +82184,6 @@ async fn check_native_overflow_twice(with_tool: bool, cli_summary: bool) {
             capabilities
         }
         async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
-            if is_turn_preflight_request(&request) {
-                return Ok(sequenced_tool_provider_preflight_response(
-                    &request, &self.1,
-                ));
-            }
             let first = {
                 let mut requests = self.0.lock().unwrap();
                 requests.push(request);
@@ -82780,7 +82934,7 @@ async fn native_foreground_controller_uses_interactive_database_scope() {
                 request
                     .messages
                     .iter()
-                    .any(|message| message.content == "small foreground request")
+                    .any(|message| prepared_user_text(message) == "small foreground request")
             }) {
                 break;
             }
@@ -82796,7 +82950,7 @@ async fn native_foreground_controller_uses_interactive_database_scope() {
             request
                 .messages
                 .iter()
-                .any(|message| message.content == "small foreground request")
+                .any(|message| prepared_user_text(message) == "small foreground request")
         })
         .expect("native foreground request was not captured");
     assert!(foreground_request.messages.iter().any(|message| {
@@ -82816,7 +82970,7 @@ async fn native_foreground_controller_uses_interactive_database_scope() {
     let current_index = foreground_request
         .messages
         .iter()
-        .position(|message| message.content == "small foreground request")
+        .position(|message| prepared_user_text(message) == "small foreground request")
         .unwrap();
     assert!(
         prior_index < current_index,
@@ -83203,10 +83357,17 @@ async fn compaction_native_controller_runs_on_real_turn_and_checks_short_complet
     let request = requests
         .iter()
         .find(|request| {
-            request
-                .messages
-                .iter()
-                .any(|message| message.content == "native controller current input")
+            request.messages.iter().any(|message| {
+                message
+                    .content
+                    .ends_with("\n\nnative controller current input")
+                    && message
+                        .application_context
+                        .as_ref()
+                        .and_then(|value| value.get("kind"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some("turn_input")
+            })
         })
         .unwrap();
     assert!(
@@ -83217,7 +83378,15 @@ async fn compaction_native_controller_runs_on_real_turn_and_checks_short_complet
         request
             .messages
             .iter()
-            .find(|message| message.content == "native controller current input")
+            .find(|message| message
+                .content
+                .ends_with("\n\nnative controller current input")
+                && message
+                    .application_context
+                    .as_ref()
+                    .and_then(|value| value.get("kind"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("turn_input"))
             .unwrap()
             .provenance
             .as_ref()
@@ -88115,7 +88284,7 @@ async fn failed_codex_summary_journal_retains_decoder_numeric_evidence_without_c
     let transcript = concat!(
         "{\"type\":\"thread.started\",\"thread_id\":\"SECRET_SESSION\"}\n",
         "{\"type\":\"turn.started\"}\n",
-        "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":100,\"output_tokens\":0,\"cached_input_tokens\":80,\"prompt\":\"SECRET_PROMPT\"}}\n"
+        "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":100,\"output_tokens\":0,\"cached_input_tokens\":80,\"cache_write_input_tokens\":3,\"reasoning_output_tokens\":0,\"prompt\":\"SECRET_PROMPT\"}}\n"
     );
     let mut observed = pioneer_provider::TokenUsage {
         provider: Some("codex-cli".into()),
@@ -88149,7 +88318,10 @@ async fn failed_codex_summary_journal_retains_decoder_numeric_evidence_without_c
     assert_eq!(retained.input_tokens, Some(100));
     assert_eq!(retained.output_tokens, Some(0));
     assert_eq!(retained.cache_read_input_tokens, Some(80));
-    assert_eq!(retained.cache_write_input_tokens, None);
+    assert_eq!(retained.cache_write_input_tokens, Some(3));
+    let evidence = &retained.raw_usage.as_ref().unwrap()["cli_statistics"];
+    assert_eq!(evidence["cache_write_input_tokens"], 3);
+    assert_eq!(evidence["reasoning_output_tokens"], 0);
     assert_eq!(retained.physical_attempt_id, None);
     assert_eq!(retained.generation_id, None);
     assert_eq!(
@@ -88162,6 +88334,96 @@ async fn failed_codex_summary_journal_retains_decoder_numeric_evidence_without_c
     );
     assert!(!rows[0].usage_json.contains("SECRET"));
     assert!(!rows[0].usage_json.contains("no final answer"));
+}
+
+#[tokio::test]
+async fn claude_service_optional_statistics_survive_normalization_and_journal_readback() {
+    use pioneer_cli_agent_runtime::{
+        claude::service::ensure_process_outcome, service::ObservedServiceUsage,
+    };
+    let (_, store, workspace) =
+        setup_execution_window_terminal_turn("thr_claude_stats", "turn_claude_stats").await;
+    // Old 0.2.79 and expanded 0.3.317 native result contracts, both optional.
+    for expanded in [false, true] {
+        let mut terminal = json!({"type":"result", "subtype":"error_during_execution",
+            "usage":{"input_tokens":1,"cache_read_input_tokens":2,
+                "cache_creation_input_tokens":3,"output_tokens":9,"api_key":"SECRET"},
+            "duration_ms":120,"duration_api_ms":90,"num_turns":2,"total_cost_usd":0.25,
+            "modelUsage":{"claude-sonnet":{"inputTokens":20,"outputTokens":9,
+                "cacheReadInputTokens":2,"cacheCreationInputTokens":3,"costUSD":0.25}},
+            "result":"SECRET_TRANSCRIPT", "credentials":"SECRET_CREDENTIALS"});
+        if expanded {
+            terminal["ttft_ms"] = json!(10);
+            terminal["ttft_stream_ms"] = json!(11);
+            terminal["time_to_request_ms"] = json!(12);
+            terminal["time_to_request_from_spawn_ms"] = json!(13);
+            let model = &mut terminal["modelUsage"]["claude-sonnet"];
+            model["thinkingTokens"] = json!(4);
+            model["cacheCreationEphemeral5mInputTokens"] = json!(1);
+            model["cacheCreationEphemeral1hInputTokens"] = json!(2);
+            model["canonicalModel"] = json!("claude-sonnet");
+            model["provider"] = json!("anthropic");
+            model["costBasis"] = json!("list");
+            model["transcript"] = json!("SECRET_MODEL_TRANSCRIPT");
+        }
+        let error =
+            ensure_process_outcome(&serde_json::to_vec(&terminal).unwrap(), false).unwrap_err();
+        let raw = &error.downcast_ref::<ObservedServiceUsage>().unwrap().0;
+        let owner = format!("claude-stats-{expanded}");
+        let mut observed = pioneer_provider::TokenUsage {
+            provider: Some("claude-cli".into()),
+            ..Default::default()
+        };
+        let call =
+            crate::usage_journal::Call::start(&store, &workspace, "summary", &owner, &observed)
+                .await
+                .unwrap();
+        crate::compaction::apply_cli_usage(&mut observed, raw);
+        // Partial same-call enrichment must recompute the complete input.
+        crate::compaction::apply_cli_usage(&mut observed, &json!({"cache_read_input_tokens":4}));
+        call.record("failed", &observed).await.unwrap();
+        call.record("failed", &observed).await.unwrap();
+        let reopened = CrudStore::new(store.database_connection());
+        let rows = reopened
+            .provider_usage_page(&workspace, &owner, "", 100)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        let retained: pioneer_provider::TokenUsage =
+            serde_json::from_str(&rows[0].usage_json).unwrap();
+        assert_eq!(retained.input_tokens, Some(8));
+        assert_eq!(retained.output_tokens, Some(9));
+        let stats = &retained.raw_usage.as_ref().unwrap()["cli_statistics"];
+        assert_eq!(stats["duration_ms"], 120);
+        assert_eq!(stats["duration_api_ms"], 90);
+        assert_eq!(stats["num_turns"], 2);
+        assert_eq!(
+            stats["model_usage_scope"],
+            "session_snapshot_including_subagents"
+        );
+        assert_eq!(stats["model_usage"]["claude-sonnet"]["inputTokens"], 20);
+        assert_eq!(stats["model_usage"]["claude-sonnet"]["costUSD"], 0.25);
+        if expanded {
+            assert_eq!(stats["ttft_ms"], 10);
+            assert_eq!(stats["ttft_stream_ms"], 11);
+            assert_eq!(stats["time_to_request_ms"], 12);
+            assert_eq!(stats["time_to_request_from_spawn_ms"], 13);
+            let model = &stats["model_usage"]["claude-sonnet"];
+            assert_eq!(model["thinkingTokens"], 4);
+            assert_eq!(model["cacheCreationEphemeral5mInputTokens"], 1);
+            assert_eq!(model["cacheCreationEphemeral1hInputTokens"], 2);
+            assert_eq!(model["canonicalModel"], "claude-sonnet");
+            assert_eq!(model["provider"], "anthropic");
+            assert_eq!(model["costBasis"], "list");
+        } else {
+            assert_eq!(stats["ttft_ms"], serde_json::Value::Null);
+            assert_eq!(
+                stats["model_usage"]["claude-sonnet"]["thinkingTokens"],
+                serde_json::Value::Null
+            );
+        }
+        assert!(!rows[0].usage_json.contains("SECRET"));
+    }
 }
 
 #[tokio::test]
@@ -88883,6 +89145,12 @@ fn native_gateway_cancellation_persists_and_processes_hook_cleanup_without_repea
 
 #[test]
 fn native_direct_cancellation_after_activated_blocked_resume_preserves_old_worker_rows() {
+    // nextest runs this test in its own process; include rejection codes from
+    // spawned actor/listener tasks when the provider barrier is never reached.
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .with_test_writer()
+        .try_init();
     run_standard_stack_message_test(
         "direct cancellation after activated Blocked resume",
         assert_turn_cancel_with_optional_busy_native_actor(true, true, true),
@@ -89533,14 +89801,33 @@ async fn opencode_v2_summary_totals_and_native_categories_reach_completion_and_j
     )
     .await;
     let selected = serde_json::json!({"providerID":"local","id":"model"});
-    let step = serde_json::json!({"type":"assistant","model":selected,"content":[{"type":"text","text":"Summary"}],"tokens":{"input":10,"output":3,"reasoning":7,"cache":{"read":80,"write":20}}});
+    let step = serde_json::json!({"type":"assistant","id":"response-id","sessionID":"session-id","model":selected,"cost":0.25,"time":{"created":100,"streamed":105,"completed":130},"api_key":"SECRET","content":[{"type":"text","text":"Summary"}],"tokens":{"input":10,"output":3,"reasoning":7,"cache":{"read":80,"write":20}}});
+    let mut partial_steps = vec![step.clone(); 64];
+    partial_steps[63]["tokens"]["cache"]
+        .as_object_mut()
+        .unwrap()
+        .remove("read");
     let cases = [
+        (
+            serde_json::json!(partial_steps),
+            None,
+            Some(640),
+            Some(640),
+            Some(448),
+        ),
         (
             serde_json::json!([step]),
             Some(110_u64),
             Some(10_u64),
             Some(10_u64),
             Some(7_u64),
+        ),
+        (
+            serde_json::json!(vec![step.clone(); 64]),
+            Some(7040),
+            Some(640),
+            Some(640),
+            Some(448),
         ),
         (
             serde_json::json!([step, step]),
@@ -89618,14 +89905,37 @@ async fn opencode_v2_summary_totals_and_native_categories_reach_completion_and_j
         assert_eq!(rows[0].status, "completed");
         let retained: pioneer_provider::TokenUsage =
             serde_json::from_str(&rows[0].usage_json).unwrap();
+        let statistics = &retained.raw_usage.as_ref().unwrap()["cli_statistics"];
+        if messages
+            .as_array()
+            .unwrap()
+            .first()
+            .is_some_and(|m| m["id"] == "response-id")
+        {
+            let response = &statistics["responses"][0];
+            assert_eq!(response["id"], "response-id");
+            assert_eq!(response["sessionID"], "session-id");
+            assert_eq!(response["model"]["id"], "model");
+            assert_eq!(response["model"]["providerID"], "local");
+            assert_eq!(response["cost_usd"], 0.25);
+            assert_eq!(response["time"]["created"], 100);
+            assert_eq!(response["time"]["streamed"], 105);
+            assert_eq!(response["time"]["completed"], 130);
+            assert_eq!(response["duration_ms"], 30);
+        }
+        if messages.as_array().unwrap().len() == 64 {
+            assert_eq!(statistics["responses"].as_array().unwrap().len(), 8);
+            assert_eq!(statistics["responses_truncated"], true);
+            assert_eq!(statistics["cost_usd"], 16.0);
+        }
+        assert!(rows[0].usage_json.len() <= 32768);
+        assert!(!rows[0].usage_json.contains("SECRET"));
+        assert!(!rows[0].usage_json.contains("Summary"));
         assert_eq!(retained.input_tokens, completion.input_tokens);
         assert_eq!(retained.output_tokens, completion.output_tokens);
         assert_eq!(retained.uncached_input_tokens, uncached);
         assert_eq!(retained.reasoning_tokens, reasoning);
-        assert_eq!(
-            retained.raw_usage.as_ref().unwrap()["native_tokens"],
-            raw["native_tokens"]
-        );
+        assert_eq!(statistics["native_tokens"], raw["native_tokens"]);
         assert_eq!(
             retained.cache_read_input_tokens,
             raw["cache_read_input_tokens"].as_u64()
@@ -89634,6 +89944,22 @@ async fn opencode_v2_summary_totals_and_native_categories_reach_completion_and_j
             retained.cache_write_input_tokens,
             raw["cache_creation_input_tokens"].as_u64()
         );
+        assert_eq!(
+            statistics["known_partial_tokens"],
+            raw["known_partial_tokens"]
+        );
+        assert_eq!(
+            statistics["visible_output_tokens"],
+            raw["visible_output_tokens"]
+        );
+        if messages.as_array().unwrap().len() == 64 && input.is_none() {
+            assert_eq!(
+                statistics["native_tokens"]["cache"]["read"],
+                serde_json::Value::Null
+            );
+            assert_eq!(statistics["known_partial_tokens"]["cache_read"], 5040);
+            assert_eq!(statistics["known_partial_tokens"]["input"], 640);
+        }
         crate::compaction::apply_cli_usage(&mut observed, &raw);
         assert_eq!(observed.input_tokens, input);
         assert_eq!(observed.output_tokens, output);

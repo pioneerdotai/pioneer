@@ -1940,7 +1940,7 @@ mod tests {
             model: "gemini-2.0-flash".into(),
             messages: vec![
                 ChatMessage::system("legacy prompt should be ignored"),
-                ChatMessage::user("Hello"),
+                ChatMessage::user("turn-facts-2026-11-02\nHello"),
             ],
             temperature: None,
             max_tokens: None,
@@ -1965,6 +1965,8 @@ mod tests {
         assert_eq!(sys.parts.len(), 2);
         assert_eq!(sys.parts[0].text.as_deref(), Some("Stable rules"));
         assert_eq!(sys.parts[1].text.as_deref(), Some("Dynamic runtime"));
+        let wire = serde_json::to_value(&api_req.contents).unwrap();
+        assert!(wire.to_string().contains("turn-facts-2026-11-02"));
     }
 
     #[test]

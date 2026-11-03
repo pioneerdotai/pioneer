@@ -42,6 +42,7 @@ pub(crate) fn bounded_usage(value: &serde_json::Value) -> serde_json::Value {
         "input_tokens",
         "output_tokens",
         "cached_input_tokens",
+        "cache_write_input_tokens",
         "cache_read_input_tokens",
         "cache_creation_input_tokens",
         "reasoning_tokens",
@@ -50,6 +51,44 @@ pub(crate) fn bounded_usage(value: &serde_json::Value) -> serde_json::Value {
         if let Some(count) = value["usage"][key].as_u64() {
             result.insert(key.into(), count.into());
         }
+    }
+    for key in ["cache_creation", "server_tool_use"] {
+        let bounded = crate::usage::claude_usage(&value["usage"]);
+        if let Some(value) = bounded.get(key) {
+            result.insert(key.into(), value.clone());
+        }
+    }
+    for key in [
+        "duration_ms",
+        "duration_api_ms",
+        "num_turns",
+        "ttft_ms",
+        "ttft_stream_ms",
+        "time_to_request_ms",
+        "time_to_request_from_spawn_ms",
+    ] {
+        if let Some(n) = value[key].as_u64() {
+            result.insert(key.into(), n.into());
+        }
+    }
+    let claude = crate::usage::claude_result(value);
+    if value["modelUsage"].is_object() {
+        result.insert("model_usage".into(), claude["model_usage"].clone());
+        result.insert(
+            "model_usage_truncated".into(),
+            claude["model_usage_truncated"].clone(),
+        );
+        result.insert(
+            "model_usage_scope".into(),
+            "session_snapshot_including_subagents".into(),
+        );
+    }
+    if value["total_cost_usd"].is_number() {
+        result.insert("cost_basis".into(), "claude_sdk_estimate".into());
+        result.insert(
+            "cost_scope".into(),
+            "session_snapshot_including_subagents".into(),
+        );
     }
     if let Some(cost) = value["total_cost_usd"]
         .as_f64()
@@ -66,7 +105,16 @@ pub(crate) fn bounded_usage(value: &serde_json::Value) -> serde_json::Value {
 pub(crate) fn bounded_codex_usage(value: &serde_json::Value) -> serde_json::Value {
     let mut result = bounded_usage(value);
     // Codex exec does not report Claude SDK cost estimates.
-    result.as_object_mut().unwrap().remove("total_cost_usd");
+    for key in [
+        "total_cost_usd",
+        "cost_basis",
+        "cost_scope",
+        "model_usage_truncated",
+        "model_usage",
+        "model_usage_scope",
+    ] {
+        result.as_object_mut().unwrap().remove(key);
+    }
     if let Some(count) = value["usage"]["reasoning_output_tokens"].as_u64() {
         result["reasoning_output_tokens"] = count.into();
     }

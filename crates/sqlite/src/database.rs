@@ -1,4 +1,6 @@
-use crate::query_scope::{DiagnosticStream, ScopedFuture, observe_control, open_stream};
+use crate::query_scope::{
+    DiagnosticStream, PoolFutureExt, ScopedFuture, observe_control, open_stream,
+};
 use async_trait::async_trait;
 use pioneer_observability::portable_payload::{
     Family as PortableFamily, NativeOutcome, NativeRead,
@@ -12,11 +14,10 @@ use sea_orm::{
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use tracing::Instrument;
 
 use crate::reader::{
     MaintenanceReadLimiter, SqliteMaintenanceReadPermit, SqliteReadClass, SqliteReadObserver,
-    SqliteReadOperation, SqliteReadOutcome, noop_read_observer, reader_pool_span,
+    SqliteReadOperation, SqliteReadOutcome, noop_read_observer, reader_pool_context,
 };
 use crate::writer::{
     SqliteQueryStream, SqliteTransaction, SqliteWriteClass, SqliteWriteConnection,
@@ -93,7 +94,7 @@ impl SqliteReadPool {
                 )),
                 "bootstrap",
             )
-            .instrument(reader_pool_span(class))
+            .in_pool(reader_pool_context(class))
             .await?
             .ok_or_else(|| DbErr::Custom("PRAGMA query_only returned no row".to_owned()))?;
             Ok(row.try_get::<i64>("", "query_only")? != 0)
@@ -115,7 +116,7 @@ impl SqliteReadPool {
                 pioneer_observability::turn_startup::Stage::DbExecute,
             );
             observe_control(self.connection.ping(), "ping")
-                .instrument(reader_pool_span(class))
+                .in_pool(reader_pool_context(class))
                 .await
         }
         .await;
@@ -153,7 +154,7 @@ impl SqliteReadPool {
                 pioneer_observability::turn_startup::Stage::DbExecute,
             );
             query_cpu::observe(self.connection.query_one_raw(statement))
-                .instrument(reader_pool_span(class))
+                .in_pool(reader_pool_context(class))
                 .await
         }
         .await;
@@ -243,7 +244,7 @@ impl SqliteReadPool {
                 expected_bytes,
             )
         })
-        .instrument(reader_pool_span(class))
+        .in_pool(reader_pool_context(class))
         .await;
         if let Some(native) = native {
             let (outcome, bytes) = match &result {
@@ -276,7 +277,7 @@ impl SqliteReadPool {
                 pioneer_observability::turn_startup::Stage::DbExecute,
             );
             query_cpu::observe(self.connection.query_all_raw(statement))
-                .instrument(reader_pool_span(class))
+                .in_pool(reader_pool_context(class))
                 .await
         }
         .await;
@@ -298,7 +299,7 @@ impl SqliteReadPool {
         let result = async {
             let permit = self.acquire(class).await?;
             let stream = open_stream(self.connection.stream_raw(statement))
-                .instrument(reader_pool_span(class))
+                .in_pool(reader_pool_context(class))
                 .await?;
             Ok((stream, permit))
         }
@@ -321,15 +322,18 @@ impl SqliteReadPool {
                     .begin_with_config(None, Some(AccessMode::ReadOnly)),
                 "begin",
             )
-            .instrument(reader_pool_span(class))
+            .in_pool(reader_pool_context(class))
             .await?;
             Ok((transaction, permit))
         }
         .await;
         match result {
-            Ok((transaction, permit)) => {
-                Ok(SqliteReadTransaction::new(transaction, permit, operation))
-            }
+            Ok((transaction, permit)) => Ok(SqliteReadTransaction::new(
+                transaction,
+                permit,
+                operation,
+                class,
+            )),
             Err(error) => {
                 operation.finish(SqliteReadOutcome::Error);
                 Err(error)
@@ -347,6 +351,7 @@ pub struct SqliteReadTransaction {
     inner: Option<DatabaseTransaction>,
     _maintenance_permit: Option<SqliteMaintenanceReadPermit>,
     operation: Option<SqliteReadOperation>,
+    class: SqliteReadClass,
 }
 
 impl std::fmt::Debug for SqliteReadTransaction {
@@ -360,11 +365,13 @@ impl SqliteReadTransaction {
         inner: DatabaseTransaction,
         maintenance_permit: Option<SqliteMaintenanceReadPermit>,
         operation: SqliteReadOperation,
+        class: SqliteReadClass,
     ) -> Self {
         Self {
             inner: Some(inner),
             _maintenance_permit: maintenance_permit,
             operation: Some(operation),
+            class,
         }
     }
 
@@ -382,6 +389,7 @@ impl SqliteReadTransaction {
                 .commit(),
             "commit",
         )
+        .in_pool(reader_pool_context(self.class))
         .await;
         self._maintenance_permit.take();
         if let Some(operation) = self.operation.as_mut() {
@@ -403,6 +411,7 @@ impl SqliteReadTransaction {
                 .rollback(),
             "rollback",
         )
+        .in_pool(reader_pool_context(self.class))
         .await;
         self._maintenance_permit.take();
         if let Some(operation) = self.operation.as_mut() {
@@ -421,6 +430,7 @@ impl SqliteReadTransaction {
 impl Drop for SqliteReadTransaction {
     fn drop(&mut self) {
         if self.inner.is_some() {
+            let _pool = reader_pool_context(self.class).enter();
             let scope = QueryScope::control("rollback_drop");
             let _entered = scope.enter();
             drop(self.inner.take());
@@ -455,12 +465,16 @@ impl ConnectionTrait for SqliteReadTransaction {
 
     async fn query_one_raw(&self, statement: Statement) -> Result<Option<QueryResult>, DbErr> {
         SqliteReadPool::ensure_read_statement(&statement)?;
-        query_cpu::observe(self.inner().query_one_raw(statement)).await
+        query_cpu::observe(self.inner().query_one_raw(statement))
+            .in_pool(reader_pool_context(self.class))
+            .await
     }
 
     async fn query_all_raw(&self, statement: Statement) -> Result<Vec<QueryResult>, DbErr> {
         SqliteReadPool::ensure_read_statement(&statement)?;
-        query_cpu::observe(self.inner().query_all_raw(statement)).await
+        query_cpu::observe(self.inner().query_all_raw(statement))
+            .in_pool(reader_pool_context(self.class))
+            .await
     }
 
     fn support_returning(&self) -> bool {
@@ -486,9 +500,15 @@ impl StreamTrait for SqliteReadTransaction {
         Box::pin(async move {
             SqliteReadPool::ensure_read_statement(&statement)?;
             let scope = QueryScope::new();
-            let result = ScopedFuture::new(self.inner().stream_raw(statement), &scope).await;
+            let result = ScopedFuture::new(self.inner().stream_raw(statement), &scope)
+                .in_pool(reader_pool_context(self.class))
+                .await;
             match result {
-                Ok(stream) => Ok(DiagnosticStream::new(stream, scope)),
+                Ok(stream) => Ok(DiagnosticStream::new(
+                    stream,
+                    scope,
+                    Some(reader_pool_context(self.class)),
+                )),
                 Err(error) => {
                     scope.finish(false);
                     Err(error)

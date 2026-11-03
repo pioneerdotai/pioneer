@@ -113,12 +113,6 @@ impl SettingsScreenView {
                         cx,
                     ))
                     .child(Self::render_settings_divider(cx))
-                    .child(Self::render_preflight_model_setting(
-                        settings.general.preflight_model.clone(),
-                        desktop_entity.clone(),
-                        cx,
-                    ))
-                    .child(Self::render_settings_divider(cx))
                     .child(self.render_compaction_model_setting(&settings.general, cx))
                     .child(Self::render_settings_divider(cx))
                     .child(self.voice.clone().expect("general voice surface"))
@@ -795,18 +789,6 @@ impl SettingsScreenView {
 
         if memory.enabled {
             settings = settings.child(Self::render_settings_divider(cx)).child(
-                Self::render_memory_toggle_row(
-                    "settings-memory-active-recall",
-                    MemorySettingToggle::ActiveRecall,
-                    memory.active_recall_enabled,
-                    t!("settings.memory.active_recall.label").to_string(),
-                    t!("settings.memory.active_recall.description").to_string(),
-                    desktop_entity.clone(),
-                    cx,
-                ),
-            );
-
-            settings = settings.child(Self::render_settings_divider(cx)).child(
                 Self::render_thread_episodic_toggle_row(
                     "settings-memory-thread-context",
                     ThreadEpisodicSettingToggle::Enabled,
@@ -897,138 +879,6 @@ impl SettingsScreenView {
             .w_full()
             .py_3()
             .child(div().text_xs().opacity(0.65).child(message))
-            .into_any_element()
-    }
-
-    fn render_preflight_model_setting(
-        selection: GatewayMemoryModelSelection,
-        desktop_entity: Entity<Self>,
-        _cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let selected_provider = selection.model_provider_override();
-        let selected_model = selection.model_override();
-        let is_custom =
-            settings_memory::gateway_memory_model_selection_has_custom_model(&selection);
-        let selection_label = settings_memory::gateway_memory_model_selection_display_label(
-            &selection,
-            t!("settings.general.preflight_model.default").to_string(),
-        );
-
-        v_flex()
-            .w_full()
-            .gap_3()
-            .py_3()
-            .justify_between()
-            .items_start()
-            .child(
-                v_flex()
-                    .min_w_0()
-                    .flex_1()
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_semibold()
-                            .child(t!("settings.general.preflight_model.label").to_string()),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .opacity(0.6)
-                            .child(t!("settings.general.preflight_model.description").to_string()),
-                    ),
-            )
-            .child(
-                h_flex()
-                    .w_full()
-                    .gap_6()
-                    .items_center()
-                    .justify_between()
-                    .mt_0p5()
-                    .child(
-                        div()
-                            .min_w_0()
-                            .flex_1()
-                            .text_sm()
-                            .font_medium()
-                            .overflow_hidden()
-                            .text_ellipsis()
-                            .child(selection_label),
-                    )
-                    .child(
-                        h_flex()
-                            .flex_none()
-                            .gap_1()
-                            .child(
-                                small_outline_button(("settings-preflight-model", 0usize))
-                                    .label(
-                                        t!("settings.general.preflight_model.select_model")
-                                            .to_string(),
-                                    )
-                                    .on_click({
-                                        let desktop_entity = desktop_entity.clone();
-                                        let selected_provider = selected_provider.clone();
-                                        let selected_model = selected_model.clone();
-                                        move |_, window, cx| {
-                                            let _ = desktop_entity.update(cx, |view, cx| {
-                                                let workspace_id = view.model_selector_workspace_id();
-                                                view.open_model_selector_dialog(
-                                                    ModelSelectorDialogOptions {
-                                                        title: t!(
-                                                            "settings.general.preflight_model.dialog_title"
-                                                        )
-                                                        .to_string(),
-                                                        selected_provider: selected_provider
-                                                            .clone(),
-                                                        selected_model: selected_model.clone(),
-                                                        selected_reasoning_effort: None,
-                                                        mode: ProviderModelSelectorMode::Chat,
-                                                        workspace_id,
-                                                        client: view
-                                                            .config.client
-                                                            .clone(),
-                                                        on_save: Rc::new(
-                                                            move |view: &mut SettingsScreenView,
-                                                                  selection: ModelSelectorSelection,
-                                                                  cx| {
-                                                                let model_selection = pioneer_client::settings::memory::gateway_memory_model_selection_from_model_selector(selection);
-                                                                view.apply_preflight_model_setting(
-                                                                    model_selection,
-                                                                    cx,
-                                                                );
-                                                                true
-                                                            },
-                                                        ),
-                                                    },
-                                                    window,
-                                                    cx,
-                                                );
-                                            });
-                                        }
-                                    }),
-                            )
-                            .when(is_custom, |row| {
-                                row.child(div().flex_none().child(
-                                    small_outline_button(("settings-preflight-model", 1usize))
-                                        .label(
-                                            t!("settings.general.preflight_model.default")
-                                                .to_string(),
-                                        )
-                                        .on_click({
-                                            let desktop_entity = desktop_entity.clone();
-                                            move |_, _, cx| {
-                                                let _ = desktop_entity.update(cx, |view, cx| {
-                                                    view.apply_preflight_model_setting(
-                                                        GatewayMemoryModelSelection::thread(),
-                                                        cx,
-                                                    );
-                                                    cx.notify();
-                                                });
-                                            }
-                                        }),
-                                ))
-                            }),
-                    ),
-            )
             .into_any_element()
     }
 
@@ -2469,7 +2319,7 @@ mod tests {
     }
 
     #[::core::prelude::v1::test]
-    fn settings_general_view_owns_preflight_model_selector() {
+    fn settings_general_view_preserves_settings_order() {
         let source = production_view_source();
         let general_view = source
             .split("fn render_settings_general")
@@ -2479,11 +2329,9 @@ mod tests {
             .next()
             .expect("general renderer body exists");
 
-        assert!(general_view.contains("render_preflight_model_setting"));
         assert!(general_view.contains("render_telemetry_setting"));
         assert!(general_view.contains("render_model_catalog_setting"));
         assert!(general_view.contains("self.remote.clone()"));
-        assert!(general_view.contains("settings.general.preflight_model"));
         assert!(include_str!("screen.rs").contains("self.render_remote_access_setting"));
         assert!(
             general_view
@@ -2496,7 +2344,6 @@ mod tests {
         );
         assert!(!general_view.contains("\"settings-general-thread-context\""));
         assert!(!general_view.contains("settings.general.thread_context"));
-        assert!(source.contains("\"settings-preflight-model\""));
         assert!(source.contains("\"settings-telemetry\""));
         assert!(source.contains("\"settings-model-catalog-proxy-clear\""));
 
@@ -2661,8 +2508,6 @@ mod tests {
             .next()
             .expect("memory renderer body exists");
 
-        assert!(memory_view.contains("\"settings-memory-active-recall\""));
-        assert!(memory_view.contains("settings.memory.active_recall"));
         assert!(memory_view.contains("\"settings-memory-post-turn-extractor-model\""));
         assert!(memory_view.contains("MemoryModelSetting::PostTurnExtractor"));
         assert!(memory_view.contains("\"settings-memory-thread-context\""));
@@ -2709,10 +2554,6 @@ mod tests {
         assert!(vector_model_view.contains("render_voice_input_download_progress"));
         assert!(!memory_view.contains("ThreadEpisodicSettingToggle::Indexing"));
         assert!(!memory_view.contains("ThreadEpisodicSettingToggle::Recall"));
-        assert!(!memory_view.contains("render_preflight_model_setting"));
-        assert!(!memory_view.contains("settings.general.preflight_model"));
-        assert!(!memory_view.contains("settings.memory.active_recall_model"));
-        assert!(!memory_view.contains("settings-memory-active-recall-model"));
     }
 
     #[::core::prelude::v1::test]
@@ -2767,13 +2608,12 @@ mod tests {
     }
 
     #[::core::prelude::v1::test]
-    fn settings_locale_keys_cover_preflight_and_memory_model_rows() {
+    fn settings_locale_keys_cover_memory_model_rows() {
         let en = include_str!("../locales/en.toml");
         let ru = include_str!("../locales/ru.toml");
 
         for source in [en, ru] {
             for key in [
-                "[settings.general.preflight_model]",
                 "select_model",
                 "dialog_title",
                 "[settings.remote_access]",
@@ -2787,12 +2627,10 @@ mod tests {
                 "refill_required",
                 "local_status_installed",
                 "[settings.memory.thread_context]",
-                "[settings.memory.active_recall]",
                 "[settings.memory.proactive_writes_model]",
             ] {
                 assert!(source.contains(key), "missing locale key `{key}`");
             }
-            assert!(!source.contains("[settings.memory.active_recall_model]"));
         }
     }
 

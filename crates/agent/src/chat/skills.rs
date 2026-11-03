@@ -483,7 +483,10 @@ mod tests {
                 pioneer_tools::dynamic_unknown_output_policy(),
             )
         });
-        let index = pioneer_tools::build_preflight_tool_index(&specifications);
+        let index = specifications
+            .iter()
+            .map(|spec| spec.spec.name.clone())
+            .collect::<Vec<_>>();
         let visible = vec!["read_skill".to_owned(), "request_tools".to_owned()];
         let permission = pioneer_protocol::default_turn_permission_profile_snapshot();
         // No Threads operation has been opened. request_tools makes the hidden
@@ -519,9 +522,7 @@ mod tests {
                 }
                 "read-index" => candidate.runtime_plan.read_skill_index.clear(),
                 "request-tools" => visible.retain(|name| name != "request_tools"),
-                "capability" => index
-                    .candidate_tools
-                    .retain(|tool| tool.name == "threads_start_options"),
+                "capability" => index.retain(|name| name == "threads_start_options"),
                 "denied" => permission
                     .effective_policy
                     .denied_tools
@@ -571,16 +572,20 @@ mod tests {
                     .iter()
                     .any(|section| section.id == pioneer_promt::PromptSectionId::ThreadsPolicy)
             );
-            assert!(!plan.bundle.sections.iter().any(|section| matches!(
-                section.id,
-                pioneer_promt::PromptSectionId::TasksPolicy
-                    | pioneer_promt::PromptSectionId::SubagentsPolicy
-            )));
-            assert!(
-                plan.provider_instructions
-                    .text
-                    .contains("- pioneer/threads: `skill:Th7kE4qP9mNs2vX6aR8cZ`")
-            );
+            for policy in [
+                pioneer_promt::PromptSectionId::TasksPolicy,
+                pioneer_promt::PromptSectionId::SubagentsPolicy,
+            ] {
+                assert!(
+                    plan.bundle
+                        .sections
+                        .iter()
+                        .any(|section| section.id == policy)
+                );
+            }
+            let reference = "- pioneer/threads: `skill:Th7kE4qP9mNs2vX6aR8cZ`";
+            assert!(plan.turn_context.text.contains(reference));
+            assert!(!plan.provider_instructions.text.contains(reference));
         }
     }
 
@@ -900,3 +905,7 @@ Use the ordinary weather procedure.
         assert_eq!(bindings[0].resolved_reason, "agent_catalog");
     }
 }
+
+#[cfg(test)]
+#[path = "package_inventory_tests.rs"]
+mod package_inventory_tests;

@@ -135,10 +135,7 @@ pub use spec::{
     ToolPermissionMetadata, ToolRecoveryMetadata, ToolRetryClass, ToolSpec,
     builtin_tool_recovery_metadata, builtin_tool_specs,
 };
-pub use tool_index::{
-    PREFLIGHT_CORE_FILE_TOOL_NAMES, PREFLIGHT_CORE_TOOL_NAMES, PreflightCandidateToolDescriptor,
-    PreflightToolIndex, build_preflight_tool_index, filesystem_catalog_snapshot,
-};
+pub use tool_index::{CORE_FILE_TOOL_NAMES, CORE_TOOL_NAMES, filesystem_catalog_snapshot};
 pub use visibility::{
     FinalToolVisibility, FinalToolVisibilityInput, ToolVisibilityDiagnostic,
     ToolVisibilityDiagnosticCode, ToolVisibilitySnapshot, ToolVisibilitySource,

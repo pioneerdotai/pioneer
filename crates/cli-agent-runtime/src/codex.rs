@@ -5401,8 +5401,7 @@ const CODEX_NOTIFICATION_MAX_PENDING_PROGRESS_BYTES: usize = 64 * 1024;
 fn codex_notification_is_progress(method: &str) -> bool {
     matches!(
         method,
-        "thread/tokenUsage/updated"
-            | "account/rateLimits/updated"
+        "account/rateLimits/updated"
             | "turn/plan/updated"
             | "turn/diff/updated"
             | "item/agentMessage/delta"
@@ -5478,8 +5477,7 @@ fn merge_codex_progress_notification(
 fn codex_notification_progress_is_snapshot(method: &str) -> bool {
     matches!(
         method,
-        "thread/tokenUsage/updated"
-            | "account/rateLimits/updated"
+        "account/rateLimits/updated"
             | "turn/plan/updated"
             | "turn/diff/updated"
             | "item/reasoning/summaryPartAdded"
@@ -9133,6 +9131,46 @@ while read line; do :; done
                 .is_err(),
             "normal backpressure must not be reported as dropped lifecycle data"
         );
+    }
+
+    #[tokio::test]
+    async fn notification_ingress_preserves_usage_reset_and_repeated_values() {
+        let (client, mut server_reader, mut server_writer) = client_pair_with_capacities(1, 1, 4);
+        let mut notifications = client.take_notification_receiver().unwrap();
+        // Keep the output capacity at one while several updates for the same
+        // turn enter the real RPC reader/dispatcher/ordered ingress.
+        for input in [80, 100, 0, 20, 100] {
+            let line = json!({"method":"thread/tokenUsage/updated","params":{
+                "threadId":"thread", "turnId":"turn",
+                "tokenUsage":{"total":{"inputTokens":input}}
+            }})
+            .to_string()
+                + "\n";
+            server_writer.write_all(line.as_bytes()).await.unwrap();
+        }
+        let request = {
+            let client = client.clone();
+            tokio::spawn(async move {
+                client
+                    .request_value("account/read", Some(json!({})), Duration::from_secs(2))
+                    .await
+            })
+        };
+        let rpc = read_server_line(&mut server_reader).await;
+        let response = json!({"id":rpc["id"],"result":{}}).to_string() + "\n";
+        server_writer.write_all(response.as_bytes()).await.unwrap();
+        request.await.unwrap().unwrap();
+        for expected in [80, 100, 0, 20, 100] {
+            let notification = tokio::time::timeout(Duration::from_secs(2), notifications.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(notification.method, "thread/tokenUsage/updated");
+            assert_eq!(
+                notification.params.as_ref().unwrap()["tokenUsage"]["total"]["inputTokens"],
+                expected
+            );
+        }
     }
 
     #[tokio::test]

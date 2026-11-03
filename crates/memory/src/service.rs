@@ -37,20 +37,14 @@ use crate::quality::{classify_semantic_memory_fact, resolve_semantic_write_sourc
 use crate::quality_gate::{
     MemoryQualityGate, MemoryQualityGateInput, memory_quality_gate_input_from_semantic_write,
 };
-use crate::ranking::{
-    MemoryRankingCandidate, MemoryRankingDiagnostics, rank_memory_search_hits_with_diagnostics,
-};
-use crate::recall::{
-    MemoryModeRecallParams, MemoryModeRecallResponse, MemoryRecallItem, MemoryRecallMode,
-    MemoryRecallParams, MemoryRecallResponse, MemoryRecallTarget, compact_recall_content,
-};
+use crate::ranking::{MemoryRankingCandidate, rank_memory_search_hits};
 use crate::recall_visibility::{
     MemoryRecallQualitySignals, MemoryRecallVisibility, decide_memory_recall_visibility,
     memory_recall_quality_signals_for_row, memory_recall_visibility_input_for_row,
 };
 use crate::write::{
-    SemanticWritePrepared, build_memory_canonical_key, merge_metadata, metadata_normalized_value,
-    normalize_semantic_text, prepare_semantic_write, semantic_metadata,
+    SemanticWritePrepared, merge_metadata, metadata_normalized_value, normalize_semantic_text,
+    prepare_semantic_write, semantic_metadata,
 };
 use anyhow::{Context, Result, bail};
 use pioneer_crud::{
@@ -71,16 +65,15 @@ use pioneer_protocol::{
     MemoryCandidatesListParams, MemoryCandidatesListResponse, MemoryCandidatesMergeParams,
     MemoryCandidatesMergeResponse, MemoryCandidatesRejectParams, MemoryCandidatesRejectResponse,
     MemoryCandidatesSuppressSimilarParams, MemoryCandidatesSuppressSimilarResponse, MemoryCategory,
-    MemoryDurability, MemoryExplicitness, MemoryExtractorCertainty, MemoryForgetParams,
-    MemoryForgetResponse, MemoryForgetTarget, MemoryGetParams, MemoryGetResponse, MemoryIntent,
-    MemoryLifecycleActor, MemoryLifecycleActorKind, MemoryLifecycleReasonCode, MemoryListParams,
-    MemoryListResponse, MemoryProvenance, MemoryQualityDecision, MemoryRecord,
-    MemoryRememberParams, MemoryRememberResponse, MemoryScope, MemoryScopeClarity, MemoryScopeHint,
-    MemoryScopeKind, MemorySearchHit, MemorySearchParams, MemorySearchResponse,
-    MemorySemanticFields, MemorySemanticWriteDisposition, MemorySemanticWriteParams,
-    MemorySemanticWriteResponse, MemorySemanticWriteRouteInfo, MemorySensitivity,
-    MemorySensitivityHint, MemorySourceContextKind, MemoryStatus, MemoryWriteEvidence,
-    MemoryWriteRelation, generate_id,
+    MemoryExplicitness, MemoryForgetParams, MemoryForgetResponse, MemoryForgetTarget,
+    MemoryGetParams, MemoryGetResponse, MemoryIntent, MemoryLifecycleActor,
+    MemoryLifecycleActorKind, MemoryLifecycleReasonCode, MemoryListParams, MemoryListResponse,
+    MemoryProvenance, MemoryQualityDecision, MemoryRecord, MemoryRememberParams,
+    MemoryRememberResponse, MemoryScope, MemoryScopeClarity, MemoryScopeHint, MemoryScopeKind,
+    MemorySearchHit, MemorySearchParams, MemorySearchResponse, MemorySemanticFields,
+    MemorySemanticWriteDisposition, MemorySemanticWriteParams, MemorySemanticWriteResponse,
+    MemorySemanticWriteRouteInfo, MemorySensitivity, MemorySensitivityHint,
+    MemorySourceContextKind, MemoryStatus, MemoryWriteEvidence, MemoryWriteRelation, generate_id,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -97,92 +90,7 @@ const REPAIR_JOB_MEMVID_STALE_VECTOR: &str = "memvid_stale_vector";
 const REPAIR_PRIORITY_DEFAULT: i64 = 10;
 const REPAIR_MAX_ATTEMPTS_DEFAULT: i32 = 3;
 const POLICY_ACTION_SEMANTIC_WRITE: &str = "semantic_write";
-
-#[derive(Debug, Clone)]
-struct MemorySearchWithDiagnostics {
-    response: MemorySearchResponse,
-    diagnostics: Vec<String>,
-}
-
-#[derive(Debug, Clone, Default)]
-struct MemoryRecallServiceDiagnostics {
-    stale_backend_hit_count: usize,
-    visibility_suppression_counts: BTreeMap<&'static str, usize>,
-    ranking: MemoryRankingDiagnostics,
-}
-
-impl MemoryRecallServiceDiagnostics {
-    fn record_stale_backend_hit(&mut self) {
-        self.stale_backend_hit_count += 1;
-    }
-
-    fn record_visibility(&mut self, visibility: MemoryRecallVisibility) {
-        if visibility.is_visible() {
-            return;
-        }
-        *self
-            .visibility_suppression_counts
-            .entry(visibility.as_str())
-            .or_insert(0) += 1;
-    }
-
-    fn extend_ranking(&mut self, ranking: &MemoryRankingDiagnostics) {
-        self.ranking.exact_key_boost_count += ranking.exact_key_boost_count;
-        self.ranking.quality_penalty_applied_count += ranking.quality_penalty_applied_count;
-        self.ranking.low_source_context_penalty_count += ranking.low_source_context_penalty_count;
-        self.ranking.rejected_related_penalty_count += ranking.rejected_related_penalty_count;
-    }
-
-    fn into_safe_strings(self) -> Vec<String> {
-        let mut diagnostics = Vec::new();
-        if self.stale_backend_hit_count > 0 {
-            diagnostics.push(format!(
-                "memory.recall_visibility.backend_stale_ids:{}",
-                self.stale_backend_hit_count
-            ));
-        }
-        let suppressed_count = self
-            .visibility_suppression_counts
-            .values()
-            .copied()
-            .sum::<usize>();
-        if suppressed_count > 0 {
-            diagnostics.push(format!(
-                "memory.recall_visibility.suppressed_count:{suppressed_count}"
-            ));
-            for (reason, count) in self.visibility_suppression_counts {
-                diagnostics.push(format!(
-                    "memory.recall_visibility.suppressed:{reason}:{count}"
-                ));
-            }
-        }
-        if self.ranking.exact_key_boost_count > 0 {
-            diagnostics.push(format!(
-                "memory.recall_ranking.exact_key_boost_count:{}",
-                self.ranking.exact_key_boost_count
-            ));
-        }
-        if self.ranking.quality_penalty_applied_count > 0 {
-            diagnostics.push(format!(
-                "memory.recall_ranking.quality_penalty_applied_count:{}",
-                self.ranking.quality_penalty_applied_count
-            ));
-        }
-        if self.ranking.low_source_context_penalty_count > 0 {
-            diagnostics.push(format!(
-                "memory.recall_ranking.low_source_context_penalty_count:{}",
-                self.ranking.low_source_context_penalty_count
-            ));
-        }
-        if self.ranking.rejected_related_penalty_count > 0 {
-            diagnostics.push(format!(
-                "memory.recall_ranking.rejected_related_penalty_count:{}",
-                self.ranking.rejected_related_penalty_count
-            ));
-        }
-        diagnostics
-    }
-}
+const CANDIDATE_EVIDENCE_MERGE_MAX_ATTEMPTS: usize = 4;
 
 pub struct MemoryService {
     store: Arc<CrudStore>,
@@ -574,22 +482,81 @@ impl MemoryService {
         let existing = if let Some(target_id) = params.target_memory_id.as_deref() {
             let target = self
                 .store
-                .get_agent_memory_record(target_id, false)
+                .get_agent_memory_record(target_id, true)
                 .await?
                 .ok_or(crate::MemoryWriteFailure::AuthorizationOrDomain)?;
-            if target.scope != params.scope
-                || !self.row_control_plane_visible(&target, &context, &[], now)
-            {
+            if target.scope != params.scope {
                 return Err(crate::MemoryWriteFailure::AuthorizationOrDomain.into());
             }
-            if linked
-                .iter()
-                .chain(canonical_record.iter())
-                .any(|row| row.id != target.id)
-            {
-                return Err(crate::MemoryWriteFailure::AuthorizationOrDomain.into());
+            if target.status == MemoryStatus::Superseded {
+                // Only the immediate, still-current successor with this exact
+                // source/fact is an applied correction. Never follow A→B→C.
+                let current = linked
+                    .as_ref()
+                    .or(canonical_record.as_ref())
+                    .ok_or(crate::MemoryWriteFailure::AuthorizationOrDomain)?;
+                let metadata = current
+                    .metadata_json
+                    .as_deref()
+                    .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok());
+                let applied = params.semantic.intent == MemoryIntent::ExplicitStore
+                    && params.semantic.explicitness == MemoryExplicitness::Explicit
+                    && params.source_context_kind
+                        == Some(MemorySourceContextKind::DirectUserConversation)
+                    && self.row_control_plane_visible(
+                        &target,
+                        &context,
+                        &[MemoryStatus::Superseded],
+                        now,
+                    )
+                    && self.row_control_plane_visible(current, &context, &[], now)
+                    && target.superseded_by.as_deref() == Some(current.id.as_str())
+                    && linked
+                        .iter()
+                        .chain(canonical_record.iter())
+                        .all(|row| row.id == current.id)
+                    && current.scope == target.scope
+                    && current.namespace == target.namespace
+                    && current.key == target.key
+                    && current.category == params.semantic.category
+                    && provenance
+                        .source_turn_id
+                        .as_deref()
+                        .is_some_and(|id| !id.is_empty())
+                    && current.source_thread_id == provenance.source_thread_id
+                    && current.source_turn_id == provenance.source_turn_id
+                    && current.source_item_id == provenance.source_item_id
+                    && metadata.as_ref().is_some_and(|metadata| {
+                        metadata
+                            .get("target_memory_id")
+                            .and_then(serde_json::Value::as_str)
+                            == Some(target_id)
+                            && metadata
+                                .pointer("/semantic/semantic_fingerprint")
+                                .and_then(serde_json::Value::as_str)
+                                == Some(prepared.semantic_fingerprint.as_str())
+                    })
+                    && params.evidence.as_ref().is_some_and(|evidence| {
+                        crate::write::evidence_metadata_has_source(
+                            current.metadata_json.as_deref(),
+                            evidence,
+                        )
+                    });
+                if !applied {
+                    return Err(crate::MemoryWriteFailure::AuthorizationOrDomain.into());
+                }
+                Some(current.clone())
+            } else {
+                if !self.row_control_plane_visible(&target, &context, &[], now)
+                    || linked
+                        .iter()
+                        .chain(canonical_record.iter())
+                        .any(|row| row.id != target.id)
+                {
+                    return Err(crate::MemoryWriteFailure::AuthorizationOrDomain.into());
+                }
+                Some(target)
             }
-            Some(target)
         } else {
             linked.or(canonical_record)
         };
@@ -899,27 +866,16 @@ impl MemoryService {
                 )
                 .await?
         {
-            let merged_metadata = merge_metadata(
-                pending.metadata_json.as_deref(),
-                semantic_metadata(
-                    &params.semantic,
-                    &prepared,
-                    params.client_provided_key.as_deref(),
-                    Some("semantic_pending_duplicate"),
-                ),
-                params.evidence.as_ref(),
-                now,
-            )?;
             let updated = self
-                .store
-                .update_agent_memory_candidate_metadata(
-                    pending.id.as_str(),
-                    pending.reason.clone(),
-                    Some(merged_metadata),
+                .merge_semantic_candidate_evidence(
+                    &context,
+                    &params,
+                    &prepared,
+                    pending,
                     now,
+                    "semantic_pending_duplicate",
                 )
-                .await?
-                .unwrap_or(pending);
+                .await?;
             let pending_id = updated.id.clone();
             let pending_workspace_id = updated.workspace_id.clone();
             let (quality_input, quality_decision) = self.semantic_quality_decision(
@@ -1063,7 +1019,7 @@ impl MemoryService {
             MemorySemanticWriteDisposition::CreatePendingCandidate
                 | MemorySemanticWriteDisposition::RejectSuppressed
         ) {
-            let candidate = self
+            let (candidate, created, evidence_merged) = self
                 .create_semantic_candidate(
                     &relation_context,
                     &params,
@@ -1086,9 +1042,9 @@ impl MemoryService {
                 semantic_fingerprint: prepared.semantic_fingerprint,
                 record: None,
                 candidate: Some(candidate),
-                created: true,
+                created,
                 superseded_memory_id: None,
-                evidence_merged: false,
+                evidence_merged,
                 route: None,
             };
             let quality_record = self
@@ -1319,9 +1275,7 @@ impl MemoryService {
         context: MemoryOperationContext,
         params: MemorySearchParams,
     ) -> Result<MemorySearchResponse> {
-        self.search_with_diagnostics(context, params)
-            .await
-            .map(|result| result.response)
+        self.search_records(context, params).await
     }
 
     pub async fn inspect_memory_debug(
@@ -1674,11 +1628,11 @@ impl MemoryService {
             .map(|events| events.iter().map(memory_debug_event_trace).collect())
     }
 
-    async fn search_with_diagnostics(
+    async fn search_records(
         &self,
         context: MemoryOperationContext,
         params: MemorySearchParams,
-    ) -> Result<MemorySearchWithDiagnostics> {
+    ) -> Result<MemorySearchResponse> {
         let query = params.query.trim();
         let backend_query = normalize_backend_search_query(query);
         if backend_query.is_empty() {
@@ -1704,7 +1658,6 @@ impl MemoryService {
             .context("failed to search memory backend")?;
 
         let backend_returned_any = !backend_hits.is_empty();
-        let mut diagnostics = MemoryRecallServiceDiagnostics::default();
         let mut candidates = Vec::new();
         let mut seen_memory_ids = BTreeSet::new();
         for hit in backend_hits {
@@ -1716,7 +1669,6 @@ impl MemoryService {
             else {
                 self.enqueue_stale_backend_repair(hit.memory_id.as_str(), now)
                     .await?;
-                diagnostics.record_stale_backend_hit();
                 continue;
             };
             if !scope_matches(&row.scope, &active_scopes.scopes)
@@ -1726,14 +1678,7 @@ impl MemoryService {
             }
             let recency_anchor_unix = recency_anchor_unix(&row);
             let Some((record, quality)) = self
-                .hydrate_visible_row_with_quality_and_diagnostics(
-                    row,
-                    &context,
-                    &params.statuses,
-                    now,
-                    true,
-                    Some(&mut diagnostics),
-                )
+                .hydrate_visible_row_with_quality(row, &context, &params.statuses, now, true)
                 .await?
             else {
                 continue;
@@ -1780,14 +1725,7 @@ impl MemoryService {
                 };
                 let recency_anchor_unix = recency_anchor_unix(&row);
                 let Some((record, quality)) = self
-                    .hydrate_visible_row_with_quality_and_diagnostics(
-                        row,
-                        &context,
-                        &params.statuses,
-                        now,
-                        true,
-                        Some(&mut diagnostics),
-                    )
+                    .hydrate_visible_row_with_quality(row, &context, &params.statuses, now, true)
                     .await?
                 else {
                     continue;
@@ -1806,7 +1744,7 @@ impl MemoryService {
                 });
             }
         }
-        let ranking = rank_memory_search_hits_with_diagnostics(
+        let hits = rank_memory_search_hits(
             candidates,
             query,
             &params.categories,
@@ -1815,362 +1753,9 @@ impl MemoryService {
             now,
             limit,
         );
-        diagnostics.extend_ranking(&ranking.diagnostics);
-
-        Ok(MemorySearchWithDiagnostics {
-            response: MemorySearchResponse {
-                hits: ranking.hits,
-                next_cursor: None,
-            },
-            diagnostics: diagnostics.into_safe_strings(),
-        })
-    }
-
-    pub async fn recall_for_prompt(
-        &self,
-        context: MemoryOperationContext,
-        params: MemoryRecallParams,
-    ) -> Result<MemoryRecallResponse> {
-        let top_k = self.normalized_prompt_top_k(params.top_k);
-        let max_chars = params
-            .max_chars
-            .unwrap_or(self.config.recall.max_prompt_chars)
-            .min(self.config.recall.max_prompt_chars);
-        let search = self
-            .search_with_diagnostics(
-                context,
-                MemorySearchParams {
-                    query: params.query,
-                    scopes: params.scopes,
-                    categories: params.categories,
-                    statuses: Vec::new(),
-                    limit: Some(top_k),
-                    cursor: None,
-                    include_provenance: false,
-                },
-            )
-            .await?;
-
-        let mut remaining_chars = max_chars;
-        let item_max_chars = self.config.recall.max_item_chars.max(1);
-        let mut items = Vec::new();
-        for hit in search.response.hits {
-            if remaining_chars == 0 {
-                break;
-            }
-            let content =
-                compact_recall_content(&hit.record.content, item_max_chars.min(remaining_chars));
-            if content.is_empty() {
-                continue;
-            }
-            remaining_chars = remaining_chars.saturating_sub(content.chars().count());
-            items.push(MemoryRecallItem {
-                memory_id: hit.record.id,
-                scope: hit.record.scope,
-                category: hit.record.category,
-                key: hit.record.key,
-                content,
-                score: hit.score,
-                updated_at: hit.record.updated_at,
-            });
-        }
-
-        Ok(MemoryRecallResponse {
-            items,
-            diagnostics: search.diagnostics,
-        })
-    }
-
-    pub async fn recall_mode_for_prompt(
-        &self,
-        context: MemoryOperationContext,
-        params: MemoryModeRecallParams,
-    ) -> Result<MemoryModeRecallResponse> {
-        let top_k = self.normalized_prompt_top_k(params.top_k);
-        let max_chars = params
-            .max_chars
-            .unwrap_or(self.config.recall.max_prompt_chars)
-            .min(self.config.recall.max_prompt_chars);
-        if params.mode == MemoryRecallMode::ExactCanonical {
-            return self
-                .recall_exact_canonical_for_prompt(context, params, top_k, max_chars)
-                .await;
-        }
-        if matches!(
-            params.mode,
-            MemoryRecallMode::ThreadEpisodic | MemoryRecallMode::TaskContext
-        ) {
-            return Ok(MemoryModeRecallResponse {
-                diagnostics: vec![format!(
-                    "memory.active_recall.mode_native_provider_required:{}",
-                    params.mode.as_str()
-                )],
-                skipped_reason: Some(format!("{}_native_provider_required", params.mode.as_str())),
-                ..MemoryModeRecallResponse::default()
-            });
-        }
-
-        let scopes = memory_recall_mode_scopes(&context, params.mode);
-        if scopes.is_empty() {
-            return Ok(MemoryModeRecallResponse {
-                skipped_reason: Some(format!("{}_scope_unavailable", params.mode.as_str())),
-                ..MemoryModeRecallResponse::default()
-            });
-        }
-        let categories = memory_recall_mode_categories(params.mode);
-        let rows = match self
-            .store
-            .list_agent_memory_records(AgentMemoryListFilter {
-                scopes,
-                workspace_guard: context.workspace_guard(),
-                namespace: None,
-                key: None,
-                categories: categories.clone(),
-                statuses: Vec::new(),
-                include_expired: false,
-                include_deleted: false,
-                include_superseded: false,
-                allowed_source_thread_ids: context.accessible_source_thread_ids(),
-                owned_scopes: context.source_access.owned_scopes(),
-                limit: Some(u64::from(top_k)),
-            })
-            .await
-        {
-            Ok(rows) => rows,
-            Err(_)
-                if matches!(
-                    params.mode,
-                    MemoryRecallMode::ThreadEpisodic | MemoryRecallMode::TaskContext
-                ) =>
-            {
-                return Ok(MemoryModeRecallResponse {
-                    diagnostics: vec![format!(
-                        "memory.active_recall.mode_scope_unavailable:{}",
-                        params.mode.as_str()
-                    )],
-                    skipped_reason: Some(format!("{}_scope_unavailable", params.mode.as_str())),
-                    ..MemoryModeRecallResponse::default()
-                });
-            }
-            Err(error) => return Err(error),
-        };
-
-        let mode = params.mode;
-        self.recall_items_from_control_rows(
-            context,
-            rows,
-            top_k,
-            max_chars,
-            params.mode.as_str(),
-            &categories,
-        )
-        .await
-        .map(|mut response| {
-            response.diagnostics.push(format!(
-                "memory.active_recall.mode_executed:{}",
-                mode.as_str()
-            ));
-            response
-        })
-    }
-
-    async fn recall_exact_canonical_for_prompt(
-        &self,
-        context: MemoryOperationContext,
-        params: MemoryModeRecallParams,
-        top_k: u32,
-        max_chars: usize,
-    ) -> Result<MemoryModeRecallResponse> {
-        let targets = params
-            .targets
-            .iter()
-            .filter(|target| exact_target_has_lookup_key(&context, target))
-            .collect::<Vec<_>>();
-        if targets.is_empty() {
-            return Ok(MemoryModeRecallResponse {
-                skipped_reason: Some("missing_canonical_target".to_owned()),
-                ..MemoryModeRecallResponse::default()
-            });
-        }
-
-        let mut rows = Vec::new();
-        let mut seen = BTreeSet::new();
-        for target in &targets {
-            if rows.len() >= top_k as usize {
-                break;
-            }
-            let scopes = exact_target_scopes(&context, target);
-            if scopes.is_empty() {
-                continue;
-            }
-            let categories = target.category.into_iter().collect::<Vec<_>>();
-            for key in exact_target_lookup_keys(&context, target) {
-                // Semantic targets can be bound to a legacy keyed record.
-                // Follow the explicit link without renaming its stored key.
-                for scope in &scopes {
-                    if let Some(row) = self
-                        .store
-                        .get_agent_memory_by_identity(scope.clone(), "default", &key)
-                        .await?
-                    {
-                        if (categories.is_empty() || categories.contains(&row.category))
-                            && self.row_control_plane_visible(
-                                &row,
-                                &context,
-                                &[],
-                                context.now_or(current_unix()),
-                            )
-                            && seen.insert(row.id.clone())
-                        {
-                            rows.push(row);
-                        }
-                        if rows.len() >= top_k as usize {
-                            break;
-                        }
-                    }
-                }
-                if rows.len() >= top_k as usize {
-                    break;
-                }
-                let target_rows = self
-                    .store
-                    .list_agent_memory_records(AgentMemoryListFilter {
-                        scopes: scopes.clone(),
-                        workspace_guard: context.workspace_guard(),
-                        namespace: None,
-                        key: Some(key),
-                        categories: categories.clone(),
-                        statuses: Vec::new(),
-                        include_expired: false,
-                        include_deleted: false,
-                        include_superseded: false,
-                        allowed_source_thread_ids: context.accessible_source_thread_ids(),
-                        owned_scopes: context.source_access.owned_scopes(),
-                        limit: Some(u64::from(top_k)),
-                    })
-                    .await?;
-                for row in target_rows {
-                    if seen.insert(row.id.clone()) {
-                        rows.push(row);
-                    }
-                    if rows.len() >= top_k as usize {
-                        break;
-                    }
-                }
-                if rows.len() >= top_k as usize {
-                    break;
-                }
-            }
-        }
-
-        let ranking_query = targets
-            .iter()
-            .flat_map(|target| exact_target_lookup_keys(&context, target))
-            .collect::<Vec<_>>()
-            .join(" ");
-        self.recall_items_from_control_rows(
-            context,
-            rows,
-            top_k,
-            max_chars,
-            ranking_query.as_str(),
-            &[],
-        )
-        .await
-        .map(|mut response| {
-            response
-                .diagnostics
-                .push("memory.active_recall.mode_executed:exact_canonical".to_owned());
-            response
-        })
-    }
-
-    async fn recall_items_from_control_rows(
-        &self,
-        context: MemoryOperationContext,
-        rows: Vec<AgentMemoryControlRecord>,
-        top_k: u32,
-        max_chars: usize,
-        ranking_query: &str,
-        requested_categories: &[MemoryCategory],
-    ) -> Result<MemoryModeRecallResponse> {
-        let now = context.now_or(current_unix());
-        let mut remaining_chars = max_chars;
-        let item_max_chars = self.config.recall.max_item_chars.max(1);
-        let raw_count = rows.len();
-        let mut candidates = Vec::new();
-        let mut truncated = false;
-        let mut diagnostics = MemoryRecallServiceDiagnostics::default();
-        for row in rows {
-            let recency_anchor_unix = recency_anchor_unix(&row);
-            let Some((record, quality)) = self
-                .hydrate_visible_row_with_quality_and_diagnostics(
-                    row,
-                    &context,
-                    &[],
-                    now,
-                    true,
-                    Some(&mut diagnostics),
-                )
-                .await?
-            else {
-                continue;
-            };
-            candidates.push(MemoryRankingCandidate {
-                hit: MemorySearchHit {
-                    record,
-                    score: None,
-                    snippet: None,
-                    matched_terms: Vec::new(),
-                },
-                backend_score: None,
-                recency_anchor_unix,
-                quality,
-            });
-        }
-        let active_scopes = context.active_scopes(&[]);
-        let ranking = rank_memory_search_hits_with_diagnostics(
-            candidates,
-            ranking_query,
-            requested_categories,
-            &active_scopes,
-            &self.config.ranking,
-            now,
-            top_k,
-        );
-        diagnostics.extend_ranking(&ranking.diagnostics);
-
-        let mut items = Vec::new();
-        for hit in ranking.hits {
-            if items.len() >= top_k as usize || remaining_chars == 0 {
-                truncated = true;
-                break;
-            }
-            let content =
-                compact_recall_content(&hit.record.content, item_max_chars.min(remaining_chars));
-            if content.is_empty() {
-                continue;
-            }
-            remaining_chars = remaining_chars.saturating_sub(content.chars().count());
-            items.push(MemoryRecallItem {
-                memory_id: hit.record.id,
-                scope: hit.record.scope,
-                category: hit.record.category,
-                key: hit.record.key,
-                content,
-                score: hit.score,
-                updated_at: hit.record.updated_at,
-            });
-        }
-        if raw_count > items.len() && items.len() >= top_k as usize {
-            truncated = true;
-        }
-
-        Ok(MemoryModeRecallResponse {
-            items,
-            diagnostics: diagnostics.into_safe_strings(),
-            truncated,
-            skipped_reason: None,
+        Ok(MemorySearchResponse {
+            hits,
+            next_cursor: None,
         })
     }
 
@@ -2364,6 +1949,7 @@ impl MemoryService {
 
         let candidates = rows
             .into_iter()
+            .filter(|row| context.scope_read_denial(&row.scope).is_none())
             .map(|row| {
                 crud_candidate_to_protocol(row).map_err(|error| {
                     error.context(crate::manifest_failure::InvalidStoredMemoryData)
@@ -3028,7 +2614,7 @@ impl MemoryService {
             });
         }
 
-        let candidate = self
+        let (candidate, created, evidence_merged) = self
             .create_semantic_candidate(
                 &context,
                 &params,
@@ -3075,9 +2661,9 @@ impl MemoryService {
             semantic_fingerprint: prepared.semantic_fingerprint,
             record: None,
             candidate: Some(candidate),
-            created: true,
+            created,
             superseded_memory_id: None,
-            evidence_merged: false,
+            evidence_merged,
             route: None,
         })
     }
@@ -3093,16 +2679,16 @@ impl MemoryService {
         now: i64,
         reason: &str,
         policy_output: Option<&MemoryCandidatePolicyOutput>,
-    ) -> Result<MemoryCandidate> {
+    ) -> Result<(MemoryCandidate, bool, bool)> {
         let provenance = semantic_write_provenance(params, context);
         let metadata_json = if let Some(policy_output) = policy_output {
             metadata_json_with_candidate_policy(metadata_json, policy_output)?
         } else {
             metadata_json
         };
-        let candidate = self
+        let (candidate, created) = self
             .store
-            .insert_agent_memory_candidate(
+            .insert_agent_memory_candidate_with_outcome(
                 NewAgentMemoryCandidate {
                     id: None,
                     scope: params.scope.clone(),
@@ -3124,7 +2710,74 @@ impl MemoryService {
                 now,
             )
             .await?;
-        crud_candidate_to_protocol(candidate)
+        if created {
+            return Ok((crud_candidate_to_protocol(candidate)?, true, false));
+        }
+        let candidate = self
+            .merge_semantic_candidate_evidence(
+                context,
+                params,
+                prepared,
+                candidate,
+                now,
+                "semantic_candidate_duplicate",
+            )
+            .await?;
+        Ok((crud_candidate_to_protocol(candidate)?, false, true))
+    }
+
+    async fn merge_semantic_candidate_evidence(
+        &self,
+        context: &MemoryOperationContext,
+        params: &MemorySemanticWriteParams,
+        prepared: &SemanticWritePrepared,
+        mut candidate: AgentMemoryCandidateRecord,
+        now: i64,
+        source: &str,
+    ) -> Result<AgentMemoryCandidateRecord> {
+        for attempt in 0..CANDIDATE_EVIDENCE_MERGE_MAX_ATTEMPTS {
+            if candidate.scope != params.scope
+                || candidate.namespace != prepared.canonical.namespace
+                || candidate.dedupe_key.as_deref() != Some(prepared.dedupe_key.as_str())
+                || !candidate_workspace_visible(&candidate, context)
+            {
+                return Err(crate::MemoryWriteFailure::AuthorizationOrDomain.into());
+            }
+            // Owned snapshot only: no reader, transaction or writer reservation
+            // is held during JSON work. CAS revalidates this exact base at commit.
+            let merged_metadata = merge_metadata(
+                candidate.metadata_json.as_deref(),
+                semantic_metadata(
+                    &params.semantic,
+                    prepared,
+                    params.client_provided_key.as_deref(),
+                    Some(source),
+                ),
+                params.evidence.as_ref(),
+                now,
+            )?;
+            if let Some(updated) = self
+                .store
+                .update_agent_memory_candidate_metadata_if_unchanged(
+                    candidate.id.as_str(),
+                    candidate.metadata_json.clone(),
+                    Some(merged_metadata),
+                )
+                .await?
+            {
+                return Ok(updated);
+            }
+            if attempt + 1 < CANDIDATE_EVIDENCE_MERGE_MAX_ATTEMPTS {
+                candidate = self
+                    .store
+                    .get_agent_memory_candidate(candidate.id.as_str(), context.workspace_guard())
+                    .await?
+                    .ok_or(crate::MemoryWriteFailure::AuthorizationOrDomain)?;
+            }
+        }
+        // Contention is not a successful merge. Reuse the existing durable retry
+        // classification/budget, without a model call or detached retry task.
+        Err(crate::MemoryWriteFailure::StorageTransient.into())
     }
 
     async fn resolve_forget_targets(
@@ -3282,33 +2935,10 @@ impl MemoryService {
         now: i64,
         record_access: bool,
     ) -> Result<Option<(MemoryRecord, MemoryRecallQualitySignals)>> {
-        self.hydrate_visible_row_with_quality_and_diagnostics(
-            row,
-            context,
-            allowed_statuses,
-            now,
-            record_access,
-            None,
-        )
-        .await
-    }
-
-    async fn hydrate_visible_row_with_quality_and_diagnostics(
-        &self,
-        row: AgentMemoryControlRecord,
-        context: &MemoryOperationContext,
-        allowed_statuses: &[MemoryStatus],
-        now: i64,
-        record_access: bool,
-        diagnostics: Option<&mut MemoryRecallServiceDiagnostics>,
-    ) -> Result<Option<(MemoryRecord, MemoryRecallQualitySignals)>> {
         let quality = self.recall_quality_signals_for_row(&row).await?;
         let visibility = self
             .row_recall_visibility_with_quality(&row, context, allowed_statuses, now, &quality)
             .await?;
-        if let Some(diagnostics) = diagnostics {
-            diagnostics.record_visibility(visibility);
-        }
         if !visibility.is_visible() {
             return Ok(None);
         }
@@ -3864,14 +3494,6 @@ impl MemoryService {
             .max(1)
     }
 
-    fn normalized_prompt_top_k(&self, top_k: Option<u32>) -> u32 {
-        top_k
-            .unwrap_or(self.config.recall.prompt_top_k)
-            .min(self.config.recall.prompt_top_k)
-            .min(self.config.max_limit)
-            .max(1)
-    }
-
     fn backend_candidate_limit(&self, final_limit: u32) -> u32 {
         let multiplier = self.config.ranking.backend_candidate_multiplier.max(1);
         final_limit
@@ -4279,139 +3901,6 @@ fn category_matches(
     categories.is_empty() || categories.contains(&category)
 }
 
-fn memory_recall_mode_scopes(
-    context: &MemoryOperationContext,
-    mode: MemoryRecallMode,
-) -> Vec<MemoryScope> {
-    let active_scopes = context.effective_scopes(&[]);
-    let allowed_kinds: &[MemoryScopeKind] = match mode {
-        MemoryRecallMode::Profile => &[MemoryScopeKind::User],
-        MemoryRecallMode::Project => &[MemoryScopeKind::Workspace],
-        MemoryRecallMode::Durable => &[
-            MemoryScopeKind::User,
-            MemoryScopeKind::Workspace,
-            MemoryScopeKind::Agent,
-        ],
-        MemoryRecallMode::ThreadEpisodic => &[MemoryScopeKind::Thread],
-        MemoryRecallMode::TaskContext => &[MemoryScopeKind::Task],
-        MemoryRecallMode::ExactCanonical => &[],
-    };
-    active_scopes
-        .into_iter()
-        .filter(|scope| allowed_kinds.contains(&scope.kind))
-        .collect()
-}
-
-fn exact_target_scopes(
-    context: &MemoryOperationContext,
-    target: &MemoryRecallTarget,
-) -> Vec<MemoryScope> {
-    let active_scopes = context.effective_scopes(&[]);
-    match target.scope_kind {
-        Some(scope_kind) => active_scopes
-            .into_iter()
-            .filter(|scope| scope.kind == scope_kind)
-            .collect(),
-        None => active_scopes,
-    }
-}
-
-fn exact_target_has_lookup_key(
-    context: &MemoryOperationContext,
-    target: &MemoryRecallTarget,
-) -> bool {
-    target
-        .canonical_key
-        .as_ref()
-        .is_some_and(|key| !key.trim().is_empty())
-        || !exact_target_lookup_keys(context, target).is_empty()
-}
-
-fn exact_target_lookup_keys(
-    context: &MemoryOperationContext,
-    target: &MemoryRecallTarget,
-) -> Vec<String> {
-    if let Some(key) = target
-        .canonical_key
-        .as_ref()
-        .map(|key| key.trim())
-        .filter(|key| !key.is_empty())
-    {
-        return vec![key.to_owned()];
-    }
-    let Some(category) = target.category else {
-        return Vec::new();
-    };
-    let Some(subject) = target.subject else {
-        return Vec::new();
-    };
-    let Some(attribute) = target.attribute else {
-        return Vec::new();
-    };
-
-    exact_target_scopes(context, target)
-        .into_iter()
-        .filter_map(|scope| {
-            let semantic = MemorySemanticFields {
-                intent: MemoryIntent::ImplicitCandidate,
-                explicitness: MemoryExplicitness::Unclear,
-                category,
-                subject,
-                attribute,
-                subject_key: None,
-                custom_subject: None,
-                custom_attribute: None,
-                scope_hint: canonical_scope_hint_for_scope(&scope),
-                durability: MemoryDurability::Unknown,
-                sensitivity: MemorySensitivityHint::Unknown,
-                certainty: MemoryExtractorCertainty::Medium,
-            };
-            build_memory_canonical_key(&scope, &semantic)
-                .ok()
-                .map(|canonical| canonical.key)
-        })
-        .collect()
-}
-
-fn canonical_scope_hint_for_scope(scope: &MemoryScope) -> MemoryScopeHint {
-    match scope.kind {
-        MemoryScopeKind::User => MemoryScopeHint::UserGlobal,
-        MemoryScopeKind::Workspace => MemoryScopeHint::ProjectWorkspace,
-        MemoryScopeKind::Agent => {
-            if scope.key.starts_with("global:agent:") {
-                MemoryScopeHint::AgentGlobal
-            } else {
-                MemoryScopeHint::AgentWorkspace
-            }
-        }
-        MemoryScopeKind::Thread | MemoryScopeKind::Task => MemoryScopeHint::Unknown,
-    }
-}
-
-fn memory_recall_mode_categories(mode: MemoryRecallMode) -> Vec<MemoryCategory> {
-    match mode {
-        MemoryRecallMode::Profile => vec![
-            MemoryCategory::Identity,
-            MemoryCategory::Preference,
-            MemoryCategory::Biography,
-            MemoryCategory::Relationship,
-            MemoryCategory::CommunicationStyle,
-            MemoryCategory::RecurringInstruction,
-        ],
-        MemoryRecallMode::Project => vec![
-            MemoryCategory::ProjectDecision,
-            MemoryCategory::ProjectPolicy,
-            MemoryCategory::ProjectFact,
-            MemoryCategory::Procedure,
-            MemoryCategory::Constraint,
-        ],
-        MemoryRecallMode::Durable
-        | MemoryRecallMode::ThreadEpisodic
-        | MemoryRecallMode::TaskContext
-        | MemoryRecallMode::ExactCanonical => Vec::new(),
-    }
-}
-
 #[derive(Debug)]
 struct MemoryPublicationConflict;
 
@@ -4565,6 +4054,9 @@ fn lifecycle_actor_to_crud(
 }
 
 fn workspace_visible(row: &AgentMemoryControlRecord, context: &MemoryOperationContext) -> bool {
+    if context.scope_read_denial(&row.scope).is_some() {
+        return false;
+    }
     match row.workspace_id.as_deref() {
         Some(row_workspace_id) => context
             .workspace_id
@@ -4582,6 +4074,9 @@ fn candidate_workspace_visible(
     candidate: &AgentMemoryCandidateRecord,
     context: &MemoryOperationContext,
 ) -> bool {
+    if context.scope_read_denial(&candidate.scope).is_some() {
+        return false;
+    }
     let workspace_visible = match candidate.workspace_id.as_deref() {
         Some(candidate_workspace_id) => context
             .workspace_id
@@ -4636,6 +4131,12 @@ fn validate_memory_write_scope(
     context: &MemoryOperationContext,
     resolved_scope: &MemoryScopeResolution,
 ) -> Result<()> {
+    if resolved_scope.scope.kind == MemoryScopeKind::User
+        && resolved_scope.workspace_id.is_some()
+        && resolved_scope.workspace_id != context.workspace_id
+    {
+        bail!("user memory scope is outside the authorized workspace");
+    }
     if !context.source_access.requires_authoritative_provenance() {
         return Ok(());
     }
@@ -4688,7 +4189,17 @@ mod tests {
     use sea_orm::Database;
 
     async fn test_service() -> (MemoryService, Arc<CrudStore>) {
-        let connection = Database::connect("sqlite::memory:")
+        test_service_with_config(MemoryServiceConfig::default()).await
+    }
+
+    async fn test_service_with_config(
+        config: MemoryServiceConfig,
+    ) -> (MemoryService, Arc<CrudStore>) {
+        let mut options = sea_orm::ConnectOptions::new("sqlite::memory:");
+        options
+            .max_connections(1)
+            .map_sqlx_sqlite_opts(|options| options.pragma("foreign_keys", "OFF"));
+        let connection = Database::connect(options)
             .await
             .expect("sqlite memory connects");
         Migrator::up(&connection, None)
@@ -4698,7 +4209,7 @@ mod tests {
         let service = MemoryService::new(
             store.clone(),
             Arc::new(InMemoryMemoryBackend::default()),
-            MemoryServiceConfig::default(),
+            config,
         );
         (service, store)
     }
@@ -4800,7 +4311,404 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(
             metadata_evidence_count(records[0].metadata_json.as_deref().unwrap_or("{}")),
-            2
+            1
         );
+    }
+
+    #[tokio::test]
+    async fn workspace_user_writes_list_and_update_only_their_workspace() {
+        let (service, _) = test_service().await;
+        let mut first = duplicate_safe_context();
+        first.workspace_id = Some("one".into());
+        first.allow_global_user = false;
+        let mut second = first.clone();
+        second.workspace_id = Some("two".into());
+        let mut one = user_name_semantic_params();
+        one.scope.key = "workspace:one:user:default".into();
+        one.semantic.scope_hint = MemoryScopeHint::UserWorkspace;
+        let mut two = one.clone();
+        two.scope.key = "workspace:two:user:default".into();
+        let a = service
+            .write_semantic_memory(first.clone(), one.clone())
+            .await
+            .unwrap();
+        let b = service
+            .write_semantic_memory(second.clone(), two.clone())
+            .await
+            .unwrap();
+        assert_ne!(a.record.as_ref().unwrap().id, b.record.as_ref().unwrap().id);
+        for (context, id) in [
+            (first.clone(), a.record.unwrap().id),
+            (second.clone(), b.record.unwrap().id),
+        ] {
+            let listed = service
+                .list(context, MemoryListParams::default())
+                .await
+                .unwrap();
+            assert_eq!(listed.records.len(), 1);
+            assert_eq!(listed.records[0].id, id);
+        }
+        // A global record still exists but is hidden when global reads are off.
+        service
+            .write_semantic_memory(duplicate_safe_context(), user_name_semantic_params())
+            .await
+            .unwrap();
+        for (context, foreign) in [
+            (first.clone(), two.scope.clone()),
+            (second.clone(), one.scope.clone()),
+        ] {
+            for scope in [foreign, user_name_semantic_params().scope] {
+                assert!(
+                    service
+                        .list(
+                            context.clone(),
+                            MemoryListParams {
+                                scopes: vec![scope],
+                                ..Default::default()
+                            }
+                        )
+                        .await
+                        .unwrap()
+                        .records
+                        .is_empty()
+                );
+            }
+        }
+        let mut scoped = first.clone();
+        scoped.mutation_boundary = crate::MemoryMutationBoundary::thread_capsule("root", None);
+        assert!(
+            service
+                .list(
+                    scoped,
+                    MemoryListParams {
+                        scopes: vec![one.scope.clone()],
+                        ..Default::default()
+                    }
+                )
+                .await
+                .unwrap()
+                .records
+                .is_empty()
+        );
+        assert!(service.write_semantic_memory(first, two).await.is_err());
+        assert!(service.write_semantic_memory(second, one).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn applied_correction_replays_once_and_cannot_rollback_an_independent_successor() {
+        let (service, store) = test_service().await;
+        let context = duplicate_safe_context();
+        let initial = service
+            .write_semantic_memory(context.clone(), user_name_semantic_params())
+            .await
+            .unwrap()
+            .record
+            .unwrap();
+        let mut correction = user_name_semantic_params();
+        correction.target_memory_id = Some(initial.id.clone());
+        correction.value = Some("Alex".into());
+        correction.content = "User name is Alex".into();
+        correction.evidence.as_mut().unwrap().source_turn_id = Some("correction-turn".into());
+        correction.evidence.as_mut().unwrap().quote_or_span = Some("My name is Alex".into());
+        let changed = service
+            .write_semantic_memory(context.clone(), correction.clone())
+            .await
+            .unwrap();
+        let b = changed.record.unwrap();
+        let evidence = b.metadata.get("evidence").cloned();
+        let mut unrelated = correction.clone();
+        unrelated.evidence.as_mut().unwrap().source_turn_id = Some("unrelated-turn".into());
+        assert!(
+            service
+                .write_semantic_memory(context.clone(), unrelated)
+                .await
+                .is_err()
+        );
+        let replay = service
+            .write_semantic_memory(context.clone(), correction.clone())
+            .await
+            .unwrap();
+        assert_eq!(replay.relation, MemoryWriteRelation::Duplicate);
+        let replay = replay.record.unwrap();
+        assert_eq!(replay.id, b.id);
+        assert_eq!(replay.metadata.get("evidence"), evidence.as_ref());
+        let mut independent = correction.clone();
+        independent.target_memory_id = Some(b.id.clone());
+        independent.value = Some("Sasha".into());
+        independent.content = "User name is Sasha".into();
+        independent.evidence.as_mut().unwrap().source_turn_id = Some("independent-turn".into());
+        independent.evidence.as_mut().unwrap().quote_or_span = Some("My name is Sasha".into());
+        let c = service
+            .write_semantic_memory(context.clone(), independent)
+            .await
+            .unwrap()
+            .record
+            .unwrap();
+        assert!(
+            service
+                .write_semantic_memory(context, correction)
+                .await
+                .is_err()
+        );
+        let current = store
+            .get_agent_memory_record(&c.id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.id, c.id);
+        assert_eq!(current.status, MemoryStatus::Active);
+    }
+
+    #[tokio::test]
+    async fn stale_candidate_replay_preserves_new_evidence_and_lifecycle_metadata() {
+        for conflict in [true, false] {
+            let mut config = MemoryServiceConfig::default();
+            config.candidate_policy.review_enabled = true;
+            let (service, store) = test_service_with_config(config).await;
+            let mut context = duplicate_safe_context();
+            context.workspace_id = Some("candidate_workspace".into());
+            let now = context.now_unix.unwrap();
+            let mut params = user_name_semantic_params();
+            params.scope.key = "workspace:candidate_workspace:user:default".into();
+            params.semantic.scope_hint = MemoryScopeHint::UserWorkspace;
+            let mut seed = params.clone();
+            if !conflict {
+                // A remains active, but B has a distinct workspace identity so
+                // the existing ordinary pending-duplicate path is exercised.
+                seed.scope.key = "default".into();
+                seed.semantic.scope_hint = MemoryScopeHint::UserGlobal;
+            }
+            let a = service
+                .write_semantic_memory(context.clone(), seed)
+                .await
+                .unwrap()
+                .record
+                .unwrap();
+            let original_a = store
+                .get_agent_memory_record(&a.id, true)
+                .await
+                .unwrap()
+                .unwrap();
+            params.semantic.intent = MemoryIntent::ImplicitCandidate;
+            params.content = "Имя пользователя: Борис".into();
+            params.value = Some("Борис".into());
+            params.disposition = Some(if conflict {
+                MemorySemanticWriteDisposition::RouteToCandidatePolicy
+            } else {
+                MemorySemanticWriteDisposition::CreatePendingCandidate
+            });
+            let evidence = params.evidence.as_mut().unwrap();
+            evidence.source_turn_id = Some("T1".into());
+            evidence.source_item_id = None;
+            evidence.quote_or_span = Some("Меня зовут Борис".into());
+            let b = service
+                .write_semantic_memory(context.clone(), params.clone())
+                .await
+                .unwrap();
+            assert!(b.created);
+            let id = b.candidate.unwrap().id;
+            params.disposition = Some(MemorySemanticWriteDisposition::RouteToCandidatePolicy);
+            if !conflict {
+                let pending_replay = service
+                    .write_semantic_memory(context.clone(), params.clone())
+                    .await
+                    .unwrap();
+                assert_eq!(pending_replay.relation, MemoryWriteRelation::Duplicate);
+                assert!(!pending_replay.created);
+                assert_eq!(pending_replay.candidate.as_ref().unwrap().id, id);
+                assert!(pending_replay.evidence_merged);
+            }
+            let prepared = prepare_semantic_write(
+                &params.scope,
+                &params.semantic,
+                params.value.as_deref().unwrap(),
+            )
+            .unwrap();
+
+            // Both real snapshots are taken before either merge commits.
+            let replay_snapshot = store
+                .get_agent_memory_candidate(&id, context.workspace_guard())
+                .await
+                .unwrap()
+                .unwrap();
+            let confirmation_snapshot = store
+                .get_agent_memory_candidate(&id, context.workspace_guard())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                replay_snapshot.metadata_json,
+                confirmation_snapshot.metadata_json
+            );
+            assert_eq!(
+                metadata_evidence_count(replay_snapshot.metadata_json.as_deref().unwrap()),
+                1
+            );
+            let initial_status = if conflict {
+                MemoryCandidateStatus::AskOnUse
+            } else {
+                MemoryCandidateStatus::Pending
+            };
+            assert_eq!(replay_snapshot.status, initial_status);
+            let mut confirmation = params.clone();
+            confirmation.evidence.as_mut().unwrap().source_turn_id = Some("T2".into());
+            let confirmed = service
+                .merge_semantic_candidate_evidence(
+                    &context,
+                    &confirmation,
+                    &prepared,
+                    confirmation_snapshot,
+                    now,
+                    "semantic_candidate_duplicate",
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                metadata_evidence_count(confirmed.metadata_json.as_deref().unwrap()),
+                2
+            );
+
+            // A separate lifecycle operation changes status AND JSON before the
+            // stale replay attempts its write. Evidence merging must preserve both.
+            let lifecycle = serde_json::json!({"action": "reject", "reason": "keep active A"});
+            let lifecycle_metadata = candidate_metadata_with_lifecycle(
+                confirmed.metadata_json.as_deref(),
+                lifecycle.clone(),
+            )
+            .unwrap();
+            let decided = service
+                .update_candidate_status(
+                    &context,
+                    confirmed,
+                    MemoryCandidateStatus::Rejected,
+                    "keep active A".into(),
+                    None,
+                    Some(lifecycle_metadata),
+                    now,
+                )
+                .await
+                .unwrap();
+            let stale_metadata = merge_metadata(
+                replay_snapshot.metadata_json.as_deref(),
+                semantic_metadata(
+                    &params.semantic,
+                    &prepared,
+                    None,
+                    Some("semantic_candidate_duplicate"),
+                ),
+                params.evidence.as_ref(),
+                now,
+            )
+            .unwrap();
+            // Conflict is explicit; an unchanged-source replay cannot replace T2.
+            assert!(
+                store
+                    .update_agent_memory_candidate_metadata_if_unchanged(
+                        &id,
+                        replay_snapshot.metadata_json.clone(),
+                        Some(stale_metadata),
+                    )
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            // Exercise the same retry/recompute helper used by pending and
+            // conflict callers, still starting from the original count=1 snapshot.
+            let merged = service
+                .merge_semantic_candidate_evidence(
+                    &context,
+                    &params,
+                    &prepared,
+                    replay_snapshot,
+                    now,
+                    "semantic_candidate_duplicate",
+                )
+                .await
+                .unwrap();
+            assert_eq!(merged.id, id);
+            assert_eq!(merged.status, MemoryCandidateStatus::Rejected);
+            assert_eq!(merged.decision_reason, decided.decision_reason);
+            assert_eq!(merged.decided_at_unix, decided.decided_at_unix);
+            assert_eq!(merged.reason, decided.reason);
+            assert_eq!(merged.source_turn_id.as_deref(), Some("T1"));
+            let metadata: serde_json::Value =
+                serde_json::from_str(merged.metadata_json.as_deref().unwrap()).unwrap();
+            assert_eq!(metadata["candidate_lifecycle"], lifecycle);
+            assert_eq!(metadata["evidence"]["count"], 2);
+            let sources = metadata["evidence"]["sources"].as_array().unwrap();
+            assert_eq!(sources.len(), 2);
+            assert_eq!(sources[0]["source_turn_id"], "T1");
+            assert_eq!(sources[1]["source_turn_id"], "T2");
+            // A following full service replay must neither add nor remove a witness.
+            let replay = service
+                .write_semantic_memory(context.clone(), params.clone())
+                .await
+                .unwrap();
+            assert!(!replay.created);
+            let after = store
+                .get_agent_memory_candidate(&id, context.workspace_guard())
+                .await
+                .unwrap()
+                .unwrap();
+            let after_metadata: serde_json::Value =
+                serde_json::from_str(after.metadata_json.as_deref().unwrap()).unwrap();
+            assert_eq!(after_metadata["evidence"], metadata["evidence"]);
+            assert_eq!(after_metadata["candidate_lifecycle"], lifecycle);
+            assert_eq!(after.status, MemoryCandidateStatus::Rejected);
+            assert_eq!(
+                store
+                    .get_agent_memory_record(&a.id, true)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                original_a
+            );
+            let candidates = store
+                .list_agent_memory_candidates(AgentMemoryCandidateListFilter {
+                    scopes: vec![params.scope],
+                    statuses: vec![MemoryCandidateStatus::Rejected],
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            assert_eq!(candidates.len(), 1);
+            assert_eq!(candidates[0].id, id);
+            let events = store
+                .list_workspace_agent_memory_events("candidate_workspace", 100)
+                .await
+                .unwrap();
+            let creations: Vec<_> = events
+                .iter()
+                .filter(|event| event.event_kind == "candidate_created")
+                .collect();
+            assert_eq!(creations.len(), 1);
+            assert_eq!(creations[0].candidate_id.as_deref(), Some(id.as_str()));
+        }
+    }
+
+    #[tokio::test]
+    async fn assertion_explicitness_and_storage_intent_have_independent_policy_outcomes() {
+        for direct in [true, false] {
+            let (service, _) = test_service().await;
+            let mut params = user_name_semantic_params();
+            params.semantic.intent = MemoryIntent::ImplicitCandidate;
+            params.semantic.explicitness = if direct {
+                MemoryExplicitness::Explicit
+            } else {
+                MemoryExplicitness::Implicit
+            };
+            params.disposition = Some(MemorySemanticWriteDisposition::RouteToCandidatePolicy);
+            let result = service
+                .write_semantic_memory(duplicate_safe_context(), params)
+                .await
+                .unwrap();
+            if direct {
+                assert!(result.record.is_some());
+                assert!(result.candidate.is_none());
+            } else {
+                assert!(result.record.is_none());
+                assert!(result.candidate.is_some());
+            }
+        }
     }
 }

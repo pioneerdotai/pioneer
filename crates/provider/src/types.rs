@@ -577,6 +577,10 @@ pub struct MessageProvenance {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ChatMessage {
+    /// Pioneer-owned delivery metadata. Never serialized by provider wire adapters.
+    /// Input constructors and provider-response parsers leave it empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub application_context: Option<serde_json::Value>,
     #[serde(skip)]
     pub provenance: Option<MessageProvenance>,
     pub role: Role,
@@ -598,6 +602,7 @@ pub struct ChatMessage {
 impl ChatMessage {
     pub fn system(content: impl Into<String>) -> Self {
         Self {
+            application_context: None,
             provenance: None,
             role: Role::System,
             content: content.into(),
@@ -612,6 +617,7 @@ impl ChatMessage {
 
     pub fn user(content: impl Into<String>) -> Self {
         Self {
+            application_context: None,
             provenance: None,
             role: Role::User,
             content: content.into(),
@@ -626,6 +632,7 @@ impl ChatMessage {
 
     pub fn assistant(content: impl Into<String>) -> Self {
         Self {
+            application_context: None,
             provenance: None,
             role: Role::Assistant,
             content: content.into(),
@@ -640,6 +647,7 @@ impl ChatMessage {
 
     pub fn tool(content: impl Into<String>) -> Self {
         Self {
+            application_context: None,
             provenance: None,
             role: Role::Tool,
             content: content.into(),
@@ -674,6 +682,7 @@ impl ChatMessage {
         provider_replay_state: Option<ProviderReplayState>,
     ) -> Self {
         Self {
+            application_context: None,
             provenance: None,
             role: Role::Assistant,
             content: content.map(Into::into).unwrap_or_default(),
@@ -692,6 +701,7 @@ impl ChatMessage {
         content: impl Into<String>,
     ) -> Self {
         Self {
+            application_context: None,
             provenance: None,
             role: Role::Tool,
             content: content.into(),
@@ -706,6 +716,7 @@ impl ChatMessage {
 
     pub fn user_parts(parts: Vec<MessageContentPart>) -> Self {
         Self {
+            application_context: None,
             provenance: None,
             role: Role::User,
             content: String::new(),
@@ -1131,6 +1142,18 @@ impl TokenUsage {
             accounting
         );
         if let Some(raw) = &snapshot.raw_usage {
+            let cli = matches!(
+                self.provider.as_deref(),
+                Some("codex-cli" | "claude-cli" | "opencode-cli")
+            );
+            // A later partial snapshot cannot restore evidence already discarded
+            // earlier in this call. This is CLI-only; API merge stays unchanged.
+            let truncation = ["responses_truncated", "model_usage_truncated"].map(|key| {
+                self.raw_usage
+                    .as_ref()
+                    .is_some_and(|prior| prior["cli_statistics"][key] == true)
+                    || raw["cli_statistics"][key] == true
+            });
             let target = self.raw_usage.get_or_insert_with(|| serde_json::json!({}));
             if let (Some(target), Some(raw)) = (target.as_object_mut(), raw.as_object()) {
                 fn merge(
@@ -1157,7 +1180,24 @@ impl TokenUsage {
                 }
                 merge(target, raw);
             }
+            let statistics = cli.then(|| {
+                let mut statistics = crate::usage::bounded_cli_statistics(
+                    &self.raw_usage.as_ref().unwrap()["cli_statistics"],
+                );
+                for (key, truncated) in ["responses_truncated", "model_usage_truncated"]
+                    .into_iter()
+                    .zip(truncation)
+                {
+                    if truncated {
+                        statistics[key] = serde_json::json!(true);
+                    }
+                }
+                statistics
+            });
             self.raw_usage = self.raw_usage.as_ref().map(crate::usage::bounded_usage);
+            if let Some(statistics) = statistics {
+                self.raw_usage.as_mut().unwrap()["cli_statistics"] = statistics;
+            }
         }
         // Gemini thoughts are separate from candidates. A partial cumulative
         // snapshot must not replace the earlier candidate count with thoughts.

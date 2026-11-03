@@ -2,9 +2,9 @@
 use super::authorization_scope::{TaskScopeAlias as S, task_scope_query};
 use anyhow::{Context, Result};
 use pioneer_entity::{
-    gateway_principal, task, task_delivery, task_inbox_activation, task_result_candidate, task_run,
-    task_run_read, task_run_turn, thread, thread_membership, user_notification_outbox, workspace,
-    workspace_membership,
+    gateway_principal, task, task_actor_contract, task_delivery, task_inbox_activation,
+    task_occurrence_contract, task_result_candidate, task_run, task_run_read, task_run_turn,
+    thread, thread_membership, user_notification_outbox, workspace, workspace_membership,
 };
 use sea_orm::sea_query::{
     Alias, Asterisk, CommonTableExpression, Condition, Expr, ExprTrait, Func, JoinType, OnConflict,
@@ -311,6 +311,228 @@ fn unread_condition(access: &TaskCompletionInboxAccess<'_>) -> Condition {
         .add(after_sequence(Expr::from(access_start_query(access, true))))
 }
 
+/// A retry moves occurrence.run_id, but occurrence_id stays the first run ID.
+/// Keep the direct UNIQUE(run_id) route for legacy contracts; otherwise prove
+/// the original group identity using bounded PK/unique probes, never ancestry.
+fn completion_occurrence_id() -> Expr {
+    use task_occurrence_contract::Column as O;
+    use task_run::Column as R;
+    let direct = Alias::new("inbox_direct_occurrence");
+    let candidate = Alias::new("inbox_attempt");
+    let origin = Alias::new("inbox_origin");
+    let occurrence = Alias::new("inbox_retry_occurrence");
+    let bound = Alias::new("inbox_bound_attempt");
+    let source = Alias::new("inbox_attempt_source");
+    let direct_id = Query::select()
+        .column((direct.clone(), O::OccurrenceId))
+        .from_as(task_occurrence_contract::Entity, direct.clone())
+        .and_where(Expr::col((direct.clone(), O::RunId)).equals((InboxAlias::Run, R::Id)))
+        .and_where(Expr::col((direct, O::TaskId)).equals((S::Task, task::Column::Id)))
+        .to_owned();
+    let valid_retry = |attempt: Alias, source: Alias| {
+        Query::select()
+            .expr(Expr::val(1))
+            .from_as(task_run::Entity, source.clone())
+            .and_where(
+                Expr::col((source.clone(), R::Id)).equals((attempt.clone(), R::RetryOfRunId)),
+            )
+            .and_where(Expr::col((source.clone(), R::Id)).equals((attempt.clone(), R::ParentRunId)))
+            .and_where(Expr::col((source.clone(), R::TaskId)).equals((attempt.clone(), R::TaskId)))
+            .and_where(
+                Expr::col((source.clone(), R::RunGroupId)).equals((attempt.clone(), R::RunGroupId)),
+            )
+            .and_where(
+                Expr::col((source.clone(), R::AttemptNumber))
+                    .add(1)
+                    .eq(Expr::col((attempt.clone(), R::AttemptNumber))),
+            )
+            .and_where(
+                Expr::col((source, R::RunNumber)).lt(Expr::col((attempt.clone(), R::RunNumber))),
+            )
+            .to_owned()
+    };
+    let original_id = Query::select()
+        .column((occurrence.clone(), O::OccurrenceId))
+        // CROSS JOIN preserves the exact candidate -> unique origin -> PK
+        // occurrence -> PK bound-run lookup order, including on empty sets.
+        .from_as(task_run::Entity, candidate.clone())
+        .cross_join(task_run::Entity.table_ref().alias(origin.clone()))
+        .cross_join(
+            task_occurrence_contract::Entity
+                .table_ref()
+                .alias(occurrence.clone()),
+        )
+        .cross_join(task_run::Entity.table_ref().alias(bound.clone()))
+        .and_where(Expr::col((candidate.clone(), R::Id)).equals((InboxAlias::Run, R::Id)))
+        .and_where(Expr::col((candidate.clone(), R::TaskId)).equals((S::Task, task::Column::Id)))
+        .and_where(Expr::col((candidate.clone(), R::AttemptNumber)).gte(1))
+        .and_where(Expr::col((origin.clone(), R::TaskId)).equals((candidate.clone(), R::TaskId)))
+        .and_where(
+            Expr::col((origin.clone(), R::RunGroupId)).equals((candidate.clone(), R::RunGroupId)),
+        )
+        .and_where(Expr::col((origin.clone(), R::AttemptNumber)).eq(1))
+        .and_where(Expr::col((origin.clone(), R::RetryOfRunId)).is_null())
+        .and_where(Expr::col((occurrence.clone(), O::OccurrenceId)).equals((origin, R::Id)))
+        .and_where(
+            Expr::col((occurrence.clone(), O::TaskId)).equals((candidate.clone(), R::TaskId)),
+        )
+        .and_where(Expr::col((bound.clone(), R::Id)).equals((occurrence.clone(), O::RunId)))
+        .and_where(Expr::col((bound.clone(), R::TaskId)).equals((candidate.clone(), R::TaskId)))
+        .and_where(
+            Expr::col((bound.clone(), R::RunGroupId)).equals((candidate.clone(), R::RunGroupId)),
+        )
+        .and_where(
+            Expr::col((bound.clone(), R::AttemptNumber))
+                .gt(Expr::col((candidate.clone(), R::AttemptNumber))),
+        )
+        // Occurrence retry generation also advances on same-run resume; it is
+        // not the TaskRun attempt number and contributes no identity evidence.
+        .and_where(Expr::exists(valid_retry(
+            bound,
+            Alias::new("inbox_bound_source"),
+        )))
+        .cond_where(
+            Condition::any()
+                .add(
+                    Condition::all()
+                        .add(Expr::col((candidate.clone(), R::AttemptNumber)).eq(1))
+                        .add(Expr::col((candidate.clone(), R::RetryOfRunId)).is_null()),
+                )
+                .add(
+                    Condition::all()
+                        .add(Expr::col((candidate.clone(), R::AttemptNumber)).gt(1))
+                        .add(Expr::exists(valid_retry(candidate, source))),
+                ),
+        )
+        .to_owned();
+    Func::coalesce([Expr::from(direct_id), Expr::from(original_id)]).into()
+}
+
+/// Exclude only positively identified internal output. Missing/unknown durable
+/// facts retain the legacy inbox scope; current Task policy is never consulted.
+fn internal_completion() -> Expr {
+    use task_actor_contract::Column as C;
+    use task_occurrence_contract::Column as O;
+    let actor = Alias::new("inbox_actor");
+    let occurrence = Alias::new("inbox_occurrence");
+    let target = Alias::new("inbox_target");
+    // CASE protects JSON functions from malformed legacy text independently of
+    // SQLite's freedom to reorder WHERE terms. NULL cannot prove internal work.
+    let safe_json = |value: Expr| -> Expr {
+        Expr::case(
+            Func::cust(Alias::new("json_valid"))
+                .arg(value.clone())
+                .eq(1),
+            value,
+        )
+        .finally(Expr::val("{}"))
+        .into()
+    };
+    let creator = safe_json(Expr::col((actor.clone(), C::CreatorJson)));
+    let plan = safe_json(Expr::col((occurrence.clone(), O::DeliveryPlanJson)));
+    let extract = |json: &Expr, path: &str| -> Expr {
+        Func::cust(Alias::new("json_extract"))
+            .args([json.clone(), Expr::val(path)])
+            .into()
+    };
+    let kind = |json: &Expr, path: &str| -> Expr {
+        Func::cust(Alias::new("json_type"))
+            .args([json.clone(), Expr::val(path)])
+            .into()
+    };
+    let internal_target = Query::select()
+        .expr(Expr::val(1))
+        .from_as(thread::Entity, target.clone())
+        .and_where(
+            Expr::col((target.clone(), thread::Column::Id)).eq(extract(&plan, "$.policy.threadId")),
+        )
+        .and_where(
+            Expr::col((target.clone(), thread::Column::WorkspaceId))
+                .equals((S::Task, task::Column::WorkspaceId)),
+        )
+        .and_where(Expr::col((target, thread::Column::AccessClass)).eq("internal"))
+        .to_owned();
+    let destination = Condition::any()
+        .add(
+            Condition::all()
+                .add(extract(&plan, "$.policy.mode").eq("none"))
+                .add(extract(&plan, "$.presentationThreadId").is_null()),
+        )
+        .add(
+            Condition::all()
+                .add(extract(&plan, "$.policy.mode").eq("thread"))
+                .add(kind(&plan, "$.policy.threadId").eq("text"))
+                .add(extract(&plan, "$.policy.threadTarget").is_in([
+                    "origin_thread",
+                    "current_thread",
+                    "collaboration_root",
+                    "exact_thread",
+                ]))
+                .add(
+                    extract(&plan, "$.presentationThreadId")
+                        .eq(extract(&plan, "$.policy.threadId")),
+                )
+                .add(Expr::exists(internal_target)),
+        );
+    let optional_text = |path: &str| {
+        Condition::any()
+            .add(kind(&plan, path).is_null())
+            .add(kind(&plan, path).is_in(["null", "text"]))
+    };
+    let evidence = Query::select()
+        .expr(Expr::val(1))
+        .from_as(task_actor_contract::Entity, actor.clone())
+        .inner_join(
+            task_occurrence_contract::Entity
+                .table_ref()
+                .alias(occurrence.clone()),
+            Condition::all()
+                .add(
+                    Expr::col((occurrence.clone(), O::OccurrenceId)).eq(completion_occurrence_id()),
+                )
+                .add(Expr::col((occurrence, O::TaskId)).equals((S::Task, task::Column::Id))),
+        )
+        .and_where(Expr::col((actor.clone(), C::TaskId)).equals((S::Task, task::Column::Id)))
+        .and_where(Expr::col((actor, C::WorkspaceId)).equals((S::Task, task::Column::WorkspaceId)))
+        .and_where(extract(&creator, "$.kind").eq("agent_execution"))
+        .and_where(kind(&creator, "$.id").eq("text"))
+        .and_where(Func::char_length(extract(&creator, "$.id")).eq(21))
+        .and_where(
+            Func::cust(Alias::new("glob"))
+                .args([Expr::val("*[^a-zA-Z0-9]*"), extract(&creator, "$.id")])
+                .eq(0),
+        )
+        .and_where(kind(&plan, "$.routingVersion").eq("integer"))
+        .and_where(extract(&plan, "$.routingVersion").eq(1))
+        .and_where(kind(&plan, "$.policy.includeResult").is_in(["true", "false"]))
+        .and_where(extract(&plan, "$.policy.format").is_in(["summary", "full_result"]))
+        .and_where(
+            Func::cust(Alias::new("json_remove"))
+                .args([
+                    plan.clone(),
+                    Expr::val("$.routingVersion"),
+                    Expr::val("$.policy"),
+                    Expr::val("$.presentationThreadId"),
+                ])
+                .eq("{}"),
+        )
+        .cond_where(optional_text("$.policy.threadId"))
+        .cond_where(optional_text("$.policy.webhookUrl"))
+        .cond_where(
+            Condition::any()
+                .add(extract(&plan, "$.policy.threadTarget").is_null())
+                .add(extract(&plan, "$.policy.threadTarget").is_in([
+                    "origin_thread",
+                    "current_thread",
+                    "collaboration_root",
+                    "exact_thread",
+                ])),
+        )
+        .cond_where(destination)
+        .to_owned();
+    Expr::exists(evidence)
+}
+
 fn relation(access: &TaskCompletionInboxAccess<'_>, workspace_scan: bool) -> SelectStatement {
     relation_with_access(access, workspace_scan, workspace_scan)
 }
@@ -372,7 +594,8 @@ fn relation_with_access(
             ),
         )
         .and_where(Expr::col((S::Thread, thread::Column::Id)).is_not_null())
-        .cond_where(access_condition(access, unread_access));
+        .cond_where(access_condition(access, unread_access))
+        .and_where(internal_completion().not());
     query
 }
 

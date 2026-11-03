@@ -308,7 +308,7 @@ pub(crate) async fn context_will_create<C: ConnectionTrait>(
     source: &str,
 ) -> Result<bool> {
     use pioneer_entity::turn_llm_context as context;
-    if matches!(source, "assistant_round" | "tool_result_v2") {
+    if super::compaction::model_history_context_source(source) {
         return Ok(false);
     }
     lock_capsule_turn(db, id).await?;
@@ -316,7 +316,7 @@ pub(crate) async fn context_will_create<C: ConnectionTrait>(
         .select_only()
         .column(context::Column::Id)
         .filter(context::Column::TurnId.eq(id))
-        .filter(context::Column::Source.is_not_in(["assistant_round", "tool_result_v2"]))
+        .filter(context::Column::Source.is_not_in(super::compaction::MODEL_HISTORY_CONTEXT_SOURCES))
         .lock_exclusive()
         .into_tuple::<String>()
         .one(db)

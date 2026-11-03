@@ -4104,6 +4104,7 @@ impl TaskAgentExecutor {
                 resolved_artifacts,
                 runtime_environment,
                 history,
+                Vec::new(),
                 execution_checkpoint_context,
                 runtime_permission_profile,
                 child_security_snapshot,
@@ -4695,6 +4696,11 @@ impl TaskAgentExecutor {
             .context("failed to resolve restored task permission profile")?;
         let runtime_security_snapshot =
             load_required_task_child_execution_security_snapshot(processor, child_turn_id).await?;
+        let retained_provider_history = processor
+            .recovery_coordinator
+            .retained_provider_history_for_turn(child_turn_id)
+            .await
+            .context("failed to hydrate retained Task provider history")?;
         processor
             .agent_manager
             .start_turn_with_hook_context_and_execution_checkpoint_permission_profile_security_snapshot_and_agent_skill_overlay(
@@ -4712,6 +4718,7 @@ impl TaskAgentExecutor {
                 resolved_artifacts,
                 runtime_environment,
                 history,
+                retained_provider_history,
                 execution_checkpoint_context,
                 runtime_permission_profile,
                 runtime_security_snapshot,
@@ -12124,9 +12131,7 @@ mod tests {
     };
     use pioneer_config::GatewayWebToolsConfig;
     use pioneer_keystore::MemorySecretStore;
-    use pioneer_memory::hooks::{
-        MemoryActiveRecallConfig, MemoryActiveRecallMode, MemoryLoopConfig,
-    };
+    use pioneer_memory::hooks::MemoryLoopConfig;
     use pioneer_protocol::{
         ArtifactBindingDirection, ArtifactBindingKind, ArtifactCreatedByKind, ArtifactKind,
         ArtifactRole, ArtifactSummary, TaskAgentInputAttachmentKind, TaskAgentInputReferenceKind,
@@ -12666,7 +12671,6 @@ mod tests {
         let web = GatewayWebToolsConfig::default();
         ToolLoopConfig {
             provider: pioneer_provider::ProviderTimeoutPolicy::default(),
-            preflight: pioneer_agent::PreflightLoopConfig::default(),
             web: WebToolsConfig {
                 default_timeout_ms: web.default_timeout_ms,
                 hard_max_timeout_ms: web.hard_max_timeout_ms,
@@ -12734,13 +12738,7 @@ mod tests {
                     allow_function_proxy_tools: true,
                 },
             },
-            memory: MemoryLoopConfig {
-                active_recall: MemoryActiveRecallConfig {
-                    mode: MemoryActiveRecallMode::DeterministicOnly,
-                    ..MemoryActiveRecallConfig::default()
-                },
-                ..MemoryLoopConfig::default()
-            },
+            memory: MemoryLoopConfig::default(),
             budget: ToolLoopBudgetConfig::default(),
             execution_windows: pioneer_tools::ExecutionWindowsConfig::default(),
             retry: ToolRetryBudgetConfig::default(),

@@ -206,9 +206,9 @@ fn keyboard_navigation_reaches_virtualized_history_without_reading_it(cx: &mut T
         );
     });
     assert_eq!(
-        cx.debug_bounds("task-inbox-viewport").unwrap(),
-        viewport,
-        "keyboard navigation scrolls rows inside the fixed viewport"
+        cx.debug_bounds("task-inbox-popup").unwrap().top(),
+        popup.top(),
+        "popup stays anchored while the history scrolls"
     );
     assert_eq!(
         cx.debug_bounds("task-inbox-footer").unwrap(),

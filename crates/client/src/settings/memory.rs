@@ -11,7 +11,6 @@ use crate::composer::model_selection::ModelSelectorSelection;
 #[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub enum MemorySettingToggle {
     Enabled,
-    ActiveRecall,
     ProactiveWrites,
     BackgroundExtraction,
     DebugTrace,
@@ -36,7 +35,6 @@ pub fn apply_memory_setting(
 ) {
     match toggle {
         MemorySettingToggle::Enabled => memory.enabled = enabled,
-        MemorySettingToggle::ActiveRecall => memory.active_recall_enabled = enabled,
         MemorySettingToggle::ProactiveWrites => memory.proactive_writes_enabled = enabled,
         MemorySettingToggle::BackgroundExtraction => memory.background_extraction_enabled = enabled,
         MemorySettingToggle::DebugTrace => memory.debug_trace_enabled = enabled,
@@ -160,9 +158,8 @@ mod tests {
     fn memory_toggles_update_only_the_requested_field() {
         let base = GatewayMemorySettings::default();
         let updated =
-            memory_settings_with_toggle(base.clone(), MemorySettingToggle::ActiveRecall, false);
-        assert!(!updated.active_recall_enabled);
-        assert_eq!(updated.enabled, base.enabled);
+            memory_settings_with_toggle(base.clone(), MemorySettingToggle::Enabled, false);
+        assert!(!updated.enabled);
         assert_eq!(
             updated.proactive_writes_enabled,
             base.proactive_writes_enabled
@@ -190,7 +187,6 @@ mod tests {
 
         assert_eq!(updated.proactive_writes_model, custom);
         assert_eq!(updated.enabled, base.enabled);
-        assert_eq!(updated.active_recall_enabled, base.active_recall_enabled);
     }
 
     #[test]

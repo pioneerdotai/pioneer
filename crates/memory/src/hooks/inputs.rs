@@ -12,30 +12,6 @@ pub(super) fn turn_pre_policy_input(
     }
 }
 
-pub(super) fn turn_pre_prompt_context_input(
-    request: &HookHandlerRequest,
-) -> HookResult<&TurnPrePromptContextHookInput> {
-    match &request.input.payload {
-        HookInputPayload::TurnPrePromptContext(input) => Ok(input),
-        _ => Err(memory_hook_error(
-            "memory.invalid_input",
-            "memory deterministic recall hook expected turn pre-prompt-context input",
-        )),
-    }
-}
-
-pub(super) fn turn_post_preflight_prompt_context_input(
-    request: &HookHandlerRequest,
-) -> HookResult<&TurnPostPreflightPromptContextHookInput> {
-    match &request.input.payload {
-        HookInputPayload::TurnPostPreflightPromptContext(input) => Ok(input),
-        _ => Err(memory_hook_error(
-            "memory.invalid_input",
-            "memory active recall hook expected turn post-preflight prompt-context input",
-        )),
-    }
-}
-
 pub(super) fn turn_pre_tool_materialization_allows_tools(request: &HookHandlerRequest) -> bool {
     match &request.input.payload {
         HookInputPayload::TurnPreToolMaterialization(input) => input.provider_tool_calling,

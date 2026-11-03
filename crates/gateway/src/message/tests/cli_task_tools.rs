@@ -2324,32 +2324,78 @@ fn cli_automatic_orchestration_skills_coexist_with_selected_user_names() {
                 );
                 let starts = harness.cli_session.turn_starts.lock().await;
                 let start = &starts[0];
-                let instructions = start.elevated_instructions.text();
+                let turn_text = start
+                    .input
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|item| item["text"].as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n");
                 if kind == CLIAgentRuntimeKind::Claude {
-                    assert!(instructions.contains(&format!("Selected skills:\n- {user_name}\n- pioneer-system-tasks\n- pioneer-system-subagents\n- pioneer-system-html\n- pioneer-system-threads")),
-                        "application order must retain the user's selected skill before automatic system skills");
+                    assert!(
+                        turn_text.contains(&format!("Selected skills:\n- {user_name}")),
+                        "turn context must identify the user's explicit skill selection"
+                    );
                 }
-                for name in [
-                    "pioneer-system-tasks",
-                    "pioneer-system-subagents",
-                    "pioneer-system-html",
-                    "pioneer-system-threads",
-                    user_name,
-                ] {
-                    assert!(instructions.contains(name), "{kind:?}: {name}");
-                    if kind != CLIAgentRuntimeKind::Claude {
-                        assert!(start.input.as_array().unwrap().iter().any(|item| {
-                            item["type"] == "skill"
-                                && item["name"] == name
-                                && item["path"]
-                                    == harness
-                                        .native_home
-                                        .join("skills")
-                                        .join(name)
-                                        .join("SKILL.md")
-                                        .display()
-                                        .to_string()
-                        }));
+                if kind != CLIAgentRuntimeKind::Claude {
+                    let native_skills = start
+                        .input
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .filter(|item| item["type"] == "skill")
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        native_skills.len(),
+                        1,
+                        "only the explicit user selection invokes a skill"
+                    );
+                    assert_eq!(native_skills[0]["name"], user_name);
+                    assert_eq!(
+                        native_skills[0]["path"],
+                        exported_user.join("SKILL.md").display().to_string()
+                    );
+                    let references = start
+                        .input
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .filter_map(|item| item["text"].as_str())
+                        .filter_map(|text| {
+                            text.strip_prefix("Current required Pioneer skill exports (replaces earlier required-export references): ")
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(references.len(), 1);
+                    let exports: serde_json::Value =
+                        serde_json::Deserializer::from_str(references[0])
+                            .into_iter::<serde_json::Value>()
+                            .next()
+                            .unwrap()
+                            .unwrap();
+                    let exports = exports.as_array().unwrap();
+                    assert_eq!(exports.len(), 4);
+                    for slug in ["tasks", "subagents", "html", "threads"] {
+                        let name = format!("pioneer-system-{slug}");
+                        let export = exports
+                            .iter()
+                            .find(|export| export["name"] == name)
+                            .unwrap();
+                        assert_eq!(
+                            export["path"],
+                            harness
+                                .native_home
+                                .join("skills")
+                                .join(&name)
+                                .join("SKILL.md")
+                                .display()
+                                .to_string()
+                        );
+                        assert!(
+                            export["folderHash"]
+                                .as_str()
+                                .is_some_and(|hash| !hash.is_empty())
+                        );
                     }
                 }
                 // Claude receives the same selected names/paths through the
@@ -2845,7 +2891,13 @@ fn cli_parent_native_completion_continues_with_existing_attached_work() {
                 native_thread_id: Some(binding.native_thread_id.clone()),
                 native_turn_id: binding.native_turn_id.clone().unwrap(),
                 status: "completed".to_owned(),
-                native: None,
+                native: (kind == CLIAgentRuntimeKind::Codex).then(|| {
+                    pioneer_cli_agent_runtime::event::RuntimeNativeEvent {
+                        method: "turn/completed".into(),
+                        payload_redacted: Some(json!({"turn":{"completedAt":15,"durationMs":250}})),
+                        raw_redacted: None,
+                    }
+                }),
             });
             processor
                 .handle_cli_runtime_timeline_event(handle.instance(), terminal.clone())
@@ -2877,6 +2929,17 @@ fn cli_parent_native_completion_continues_with_existing_attached_work() {
                     .status,
                 TurnStatus::InProgress
             );
+            if kind == CLIAgentRuntimeKind::Codex {
+                let items = processor
+                    .crud_store
+                    .list_turn_items_by_type(&turn_id, "system_event")
+                    .await
+                    .unwrap();
+                assert_eq!(items.iter().filter(|item| matches!(item,
+                    TurnItem::SystemEvent { code:Some(code),details:Some(details),.. }
+                    if code == "cli_native_turn_timing" && details["native_turn_id"] == binding.native_turn_id.as_deref().unwrap()
+                        && details["native_timing"]["durationMs"] == 250)).count(), 1);
+            }
             let next = processor
                 .crud_store
                 .latest_cli_runtime_turn_attempt(&turn_id)
@@ -3880,8 +3943,8 @@ impl pioneer_memory::ThreadEpisodicMemvidBackend for RecordingRecallSearchBacken
 }
 
 #[test]
-fn admitted_cli_production_recall_uses_active_memory_and_keeps_explicit_history_search() {
-    run_standard_stack_message_test("active memory and explicit history search", async {
+fn admitted_cli_prompt_context_does_not_recall_and_keeps_explicit_history_search() {
+    run_standard_stack_message_test("no automatic recall and explicit history search", async {
         use crate::thread_episodic::ThreadEpisodicRecallService;
         use pioneer_crud::ThreadEpisodicWorkspaceActiveWriteSegmentRequest;
         use pioneer_hooks::*;
@@ -3956,9 +4019,6 @@ fn admitted_cli_production_recall_uses_active_memory_and_keeps_explicit_history_
         );
         assert!(backend.calls.load(Ordering::SeqCst) > 0);
         let search_calls = backend.calls.load(Ordering::SeqCst);
-        let mut memory_config = processor.memory_loop_config();
-        memory_config.active_recall.mode = pioneer_memory::hooks::MemoryActiveRecallMode::Hybrid;
-        processor.apply_memory_loop_config(memory_config);
         let mut config = processor
             .thread_episodic_runtime_config
             .read()
@@ -3978,7 +4038,7 @@ fn admitted_cli_production_recall_uses_active_memory_and_keeps_explicit_history_
             ("post_turn_extraction", "allow"),
             ("active_memory", "allow"),
             ("reason_code", "default_allow_read"),
-            ("source", "pre_memory_classifier"),
+            ("source", "default_fallback"),
         ] {
             policy.insert(
                 HookMetadataKey::new(key).unwrap(),
@@ -4004,25 +4064,32 @@ fn admitted_cli_production_recall_uses_active_memory_and_keeps_explicit_history_
             priority: 500,
             diagnostics: Vec::new(),
         }]);
+        let decoded_policy =
+            pioneer_memory::hooks::memory_turn_policy_from_hook_policy_set(&policies)
+                .expect("memory policy must exist")
+                .expect("the allow policy must decode before testing absence of recall");
+        assert_eq!(
+            decoded_policy.source,
+            pioneer_memory::hooks::MemoryPolicySource::DefaultFallback
+        );
+        assert_eq!(
+            decoded_policy.read_tools,
+            pioneer_memory::hooks::MemoryReadToolPolicy::Allow
+        );
+        assert_eq!(
+            decoded_policy.recall,
+            pioneer_memory::hooks::MemoryRecallPolicy::Allow
+        );
+        assert_eq!(
+            decoded_policy.prompt,
+            pioneer_memory::hooks::MemoryPromptPolicy::Full
+        );
         let hook_context = HookContext {
             workspace_id: Some(HookWorkspaceId::new(binding.workspace_id.clone()).unwrap()),
             thread_id: Some(HookThreadId::new(binding.thread_id.clone()).unwrap()),
             turn_id: Some(HookTurnId::new(turn_id.clone()).unwrap()),
             ..HookContext::default()
         };
-        let mixed_plan = json!({
-            "durable":{"status":"run","reasonCode":"provider_run","confidence":1.0,
-                "modes":["project"],"targets":[]},
-            "episodic":{"status":"run","reasonCode":"provider_run","confidence":1.0,
-                "queries":[{"mode":"current_thread","query":"searchneedle","targets":[]},
-                    {"mode":"related_thread","query":"searchneedle","targets":[]},
-                    {"mode":"workspace_thread","query":"searchneedle","targets":[]}]}
-        });
-        let stale_plan = json!({
-            "durable":{"status":"run","reasonCode":"provider_run","confidence":1.0,
-                "modes":["project","thread_episodic","workspace_thread","task_context"],"targets":[]},
-            "episodic":{"status":"skip","reasonCode":"provider_skip","confidence":1.0,"queries":[]}
-        });
         // Include the current conversation in the indexed corpus as well.
         crate::message::thread_search_tools::tests::seed(
             &processor,
@@ -4092,7 +4159,7 @@ fn admitted_cli_production_recall_uses_active_memory_and_keeps_explicit_history_
                     current.ensure_hook_runtime_with_run_store().await;
                 }
                 let runtime = current.hook_runtime.read().await.clone().unwrap();
-                let deterministic = runtime
+                let response = runtime
                     .run_phase_to_completion(
                         HookPhaseRequest::new(
                             HookPhase::TurnPrePromptContext,
@@ -4109,91 +4176,20 @@ fn admitted_cli_production_recall_uses_active_memory_and_keeps_explicit_history_
                     )
                     .await
                     .unwrap();
-                let rendered = serde_json::to_string(&deterministic.contributions).unwrap();
-                assert_eq!(
-                    rendered.contains("cobalt storage for audit logs"),
-                    state == "saved",
-                    "{state}: {deterministic:?}"
-                );
-                assert!(
-                    !rendered.contains("amber ledger storage"),
-                    "the second fact must exercise active recall rather than deterministic recall"
-                );
-                if state == "read_error" {
-                    assert!(
-                        deterministic
-                            .diagnostics
-                            .iter()
-                            .any(|d| d.code.as_str() == "memory.recall_failed"),
-                        "{deterministic:?}"
-                    );
-                }
-                let prompt_context = HookPromptContextSet::aggregate_hook_contributions(
-                    deterministic.contributions,
-                    HookPromptContextLimits::default(),
-                );
-                for (case, plan, expects_project) in [
-                    ("local", None, true),
-                    ("mixed", Some(mixed_plan.clone()), true),
-                    ("legacy_modes", Some(stale_plan.clone()), true),
-                    ("invalid", Some(json!({"obsolete":true})), true),
-                    (
-                        "episodic_only",
-                        Some(json!({
-                            "durable":{"status":"skip","reasonCode":"provider_skip","confidence":1.0,"modes":[],"targets":[]},
-                            "episodic":{"status":"run","reasonCode":"provider_run","confidence":1.0,
-                                "queries":[{"mode":"current_thread","query":"searchneedle","targets":[]}]}
-                        })),
-                        false,
-                    ),
-                    (
-                        "debug_fallback",
-                        Some(json!({
-                            "durable":{"status":"run","reasonCode":"provider_run","confidence":1.0,
-                                "modes":[],"targets":[],"debugFallback":true},
-                            "episodic":{"status":"skip","reasonCode":"provider_skip","confidence":1.0,"queries":[]}
-                        })),
-                        false,
-                    ),
+                let rendered = serde_json::to_string(&response.contributions).unwrap();
+                for absent in [
+                    "cobalt storage for audit logs",
+                    "amber ledger storage",
+                    "remembered in the other conversation",
+                    "own runner context",
                 ] {
-                    let mut input = TurnPostPreflightPromptContextHookInput::from_parts(
-                        "searchneedle",
-                        Some("test-model"),
-                        Some("openai"),
-                    );
-                    if let Some(plan) = plan {
-                        input = input.with_active_memory_recall_preflight_plan(plan);
-                    }
-                    let response = runtime
-                        .run_phase_to_completion(
-                            HookPhaseRequest::new(
-                                HookPhase::TurnPostPreflightPromptContext,
-                                hook_context.clone(),
-                                HookInput::turn_post_preflight_prompt_context(input),
-                            )
-                            .with_policy_set(policies.clone())
-                            .with_prompt_context_set(prompt_context.clone()),
-                        )
-                        .await
-                        .unwrap();
-                    let rendered = serde_json::to_string(&response.contributions).unwrap();
-                    if state == "saved" && expects_project {
-                        assert!(
-                            rendered.contains("amber ledger storage"),
-                            "active project operation must survive normalization: {response:?}"
-                        );
-                    }
-                    assert!(
-                        !rendered.contains("remembered in the other conversation"),
-                        "{response:?}"
-                    );
-                    assert!(!rendered.contains("own runner context"), "{response:?}");
-                    assert_eq!(
-                        backend.calls.load(Ordering::SeqCst),
-                        search_calls,
-                        "automatic recall must not search history: state={state}, reinstall={reinstall}, case={case}, response={response:?}"
-                    );
+                    assert!(!rendered.contains(absent), "{state}: {response:?}");
                 }
+                assert_eq!(
+                    backend.calls.load(Ordering::SeqCst),
+                    search_calls,
+                    "prompt preparation must not search history: {state}, reinstall={reinstall}"
+                );
             }
         }
         let tool = invoke_task(

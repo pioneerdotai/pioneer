@@ -1758,9 +1758,8 @@ mod tests {
     use futures_util::{StreamExt, stream::BoxStream};
     use migration::{Migrator, MigratorTrait};
     use pioneer_agent::{
-        AgentManager, PreflightLoopConfig, SkillsDependenciesLoopConfig, SkillsLoopConfig,
-        SkillsRuntimeLoopConfig, SkillsSecurityLoopConfig, SkillsValidationLoopConfig,
-        ToolLoopConfig,
+        AgentManager, SkillsDependenciesLoopConfig, SkillsLoopConfig, SkillsRuntimeLoopConfig,
+        SkillsSecurityLoopConfig, SkillsValidationLoopConfig, ToolLoopConfig,
     };
     use pioneer_entity::turn;
     use pioneer_memory::hooks::MemoryLoopConfig;
@@ -2110,22 +2109,10 @@ mod tests {
         }
 
         async fn chat(&self, request: ChatRequest) -> AnyhowResult<ChatResponse> {
-            let is_preflight = request.compiled_prompt.is_none();
             self.requests
                 .lock()
                 .expect("native request lock")
                 .push(request);
-            if is_preflight {
-                return Ok(ChatResponse {
-                    messages: Vec::new(),
-                    text: r#"{"tools":{"visibleTools":[]}}"#.to_owned(),
-                    usage: None,
-                    reasoning_content: None,
-                    provider_replay_state: None,
-                    termination: pioneer_provider::ProviderTermination::Complete,
-                    tool_calls: Vec::new(),
-                });
-            }
             if self.round.fetch_add(1, Ordering::SeqCst) == 0 {
                 return Ok(ChatResponse {
                     messages: Vec::new(),
@@ -2416,7 +2403,6 @@ mod tests {
     fn agent_tool_loop_config() -> ToolLoopConfig {
         ToolLoopConfig {
             provider: pioneer_provider::ProviderTimeoutPolicy::default(),
-            preflight: PreflightLoopConfig::default(),
             web: WebToolsConfig::default(),
             computer_use: ComputerUseToolsConfig::default(),
             skills: SkillsLoopConfig {
@@ -3101,21 +3087,27 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(native_requests.len() >= 2);
         let first = &native_requests[0];
-        let compiled = first
-            .compiled_prompt
-            .as_ref()
-            .expect("native request must use production prompt compiler");
         assert!(
-            compiled
-                .full_system_text
+            first.compiled_prompt.is_some(),
+            "native request must use production prompt compiler"
+        );
+        let prepared_input = first
+            .messages
+            .iter()
+            .find(|message| {
+                message
+                    .application_context
+                    .as_ref()
+                    .is_some_and(|metadata| metadata["kind"] == "turn_input")
+            })
+            .expect("native request must carry prepared turn input");
+        assert!(
+            prepared_input
+                .content
                 .contains(&format!("skill:{skill_id}"))
         );
-        assert!(compiled.full_system_text.contains(version_id.as_str()));
-        assert!(
-            compiled
-                .full_system_text
-                .contains("Verify release checksum")
-        );
+        assert!(prepared_input.content.contains(version_id.as_str()));
+        assert!(prepared_input.content.contains("Verify release checksum"));
         assert!(
             first
                 .tools

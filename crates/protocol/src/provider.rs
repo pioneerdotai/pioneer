@@ -433,18 +433,40 @@ pub struct ObservedProviderUsageTotals {
     pub unconfirmed_dispatches: usize,
     pub known_input_tokens: u64,
     pub known_output_tokens: u64,
+    /// Cache totals are paired with full input totals; missing is never zero.
+    pub known_cache_read_input_tokens: u64,
+    pub cache_ratio_input_tokens: u64,
+    pub missing_cache_ratio_attempts: usize,
     pub missing_input_attempts: usize,
     pub missing_output_attempts: usize,
     pub incomplete_attempts: usize,
+    /// Native cost snapshots by their accounting scope. SDK estimates and
+    /// unknown-origin runtime amounts are deliberately not a confirmed bill.
+    pub cli_cost_observations: std::collections::BTreeMap<String, serde_json::Value>,
+    /// Native session snapshots with unknown selected-range baseline/replay epoch.
+    /// These are evidence, not consumption attributable to the supplied range.
+    pub unattributed_session_observations: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
-/// Supply canonical current items (or ordered item snapshots). Last snapshot
-/// wins for each observation. Retries have distinct observations and are counted
-/// once, including reported partial usage on failed attempts.
+impl ObservedProviderUsageTotals {
+    /// Weighted observed cache hit rate, available only with a complete denominator.
+    pub fn cache_hit_rate(&self) -> Option<f64> {
+        (self.unattributed_session_observations.is_empty()
+            && self.missing_cache_ratio_attempts == 0
+            && self.cache_ratio_input_tokens > 0)
+            .then(|| {
+                self.known_cache_read_input_tokens as f64 / self.cache_ratio_input_tokens as f64
+            })
+    }
+}
+
+/// Fold durable usage observations. Session totals with no attested range baseline
+/// remain unattributed evidence, even when counters decrease or repeat. CLI
+/// observations do not establish physical requests or billing.
 pub fn observed_provider_usage_totals<'a>(
     items: impl IntoIterator<Item = &'a crate::TurnItem>,
 ) -> ObservedProviderUsageTotals {
-    let mut observations = std::collections::BTreeMap::new();
+    let mut observations = Vec::new();
     for item in items {
         if let crate::TurnItem::SystemEvent {
             id,
@@ -452,24 +474,165 @@ pub fn observed_provider_usage_totals<'a>(
             details: Some(details),
             ..
         } = item
-            && code.as_deref() == Some("provider_usage")
-            && details["schema_version"].as_u64() == Some(1)
         {
-            observations.insert(id, details);
+            if code.as_deref() == Some("provider_usage")
+                && details["schema_version"].as_u64() == Some(1)
+            {
+                observations.push((id, details.clone()));
+            } else if code.as_deref() == Some("agent_runtime_item")
+                && details["nativeItemKind"] == "tokenUsage"
+                && details["semantics"] == "opencode_v2_exclusive_cache_separate_reasoning"
+            {
+                // Compatibility for already persisted OpenCode V2 observations.
+                // These are turn aggregates, not confirmed physical requests.
+                observations.push((
+                    id,
+                    serde_json::json!({
+                        "usage": details, "complete": details["status"] == "completed"
+                    }),
+                ));
+            }
         }
     }
+    // Fold overlapping main-loop message/result evidence into one turn bucket.
+    // Session-inclusive modelUsage never participates in these categories.
+    let mut claude = std::collections::BTreeMap::<(String, String), Vec<serde_json::Value>>::new();
+    observations.retain(|(_, details)| {
+        let u = &details["usage"];
+        if u["runtime"] == "claude" {
+            if let (Some(thread), Some(turn)) =
+                (u["native_thread_id"].as_str(), u["native_turn_id"].as_str())
+            {
+                claude
+                    .entry((thread.into(), turn.into()))
+                    .or_default()
+                    .push(details.clone());
+                return false;
+            }
+        }
+        true
+    });
+    let mut folded = Vec::new();
+    for ((thread, turn), snapshots) in claude {
+        let fields = ["input_tokens", "output_tokens", "cache_read_input_tokens"];
+        let mut terminal = [None::<u64>; 3];
+        let mut messages = std::collections::BTreeMap::<String, [Option<u64>; 3]>::new();
+        let mut expected = None;
+        let mut result = serde_json::json!({"usage":{"runtime":"claude", "scope":"turn_snapshot", "native_thread_id":thread,"native_turn_id":turn}});
+        let max = |a: Option<u64>, b: Option<u64>| match (a, b) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        };
+        for d in snapshots {
+            let u = &d["usage"];
+            if u["scope"] == "turn_snapshot" {
+                for (i, field) in fields.iter().enumerate() {
+                    terminal[i] = max(terminal[i], u[*field].as_u64());
+                }
+                expected = u["num_turns"].as_u64().or(expected);
+                for field in ["total_cost_usd", "cost_basis", "model_usage"] {
+                    if !u[field].is_null() {
+                        result["usage"][field] = u[field].clone();
+                    }
+                }
+            } else if u["scope"] == "request_snapshot" {
+                if let Some(id) = u["native_message_id"].as_str() {
+                    let counters = messages.entry(id.into()).or_insert([None; 3]);
+                    for (i, field) in fields.iter().enumerate() {
+                        counters[i] = max(counters[i], u[*field].as_u64());
+                    }
+                }
+            }
+        }
+        let coverage = !messages.is_empty() && expected.is_none_or(|n| n == messages.len() as u64);
+        let fallback: [Option<u64>; 3] = std::array::from_fn(|i| {
+            coverage
+                .then(|| {
+                    messages
+                        .values()
+                        .try_fold(0_u64, |sum, counters| sum.checked_add(counters[i]?))
+                })
+                .flatten()
+        });
+        for (i, field) in fields.iter().enumerate() {
+            result["usage"][*field] = serde_json::json!(terminal[i].or(fallback[i]));
+        }
+        // Keep observed categories even when their scopes cannot form a ratio.
+        let coherent =
+            !(terminal[0].is_none() && terminal[2].is_some() && terminal[2] != fallback[2]
+                || terminal[2].is_none() && terminal[0].is_some() && terminal[0] != fallback[0]);
+        result["usage"]["cache_ratio_consistent"] = serde_json::json!(coherent);
+        result["complete"] = serde_json::json!(terminal.iter().all(Option::is_some));
+        folded.push((format!("claude:{thread}:{turn}"), result));
+    }
+    observations.extend(folded.iter().map(|(id, d)| (id, d.clone())));
     // Delivery replay can materialize the same physical attempt under another
     // item ID. Cumulative counts take the maximum; missing never erases known.
-    let mut distinct =
-        std::collections::BTreeMap::<String, (Option<u64>, Option<u64>, bool, bool)>::new();
+    let mut distinct = std::collections::BTreeMap::<
+        String,
+        (Option<u64>, Option<u64>, bool, bool, Option<u64>, bool),
+    >::new();
+    let mut costs = std::collections::BTreeMap::<String, serde_json::Value>::new();
+    let mut session_evidence = std::collections::BTreeMap::new();
     for (id, details) in observations {
+        let usage = &details["usage"];
+        let native_thread = usage["native_thread_id"].as_str();
+        let native_turn = usage["native_turn_id"].as_str();
+        if usage["scope"] == "session_snapshot" {
+            // No native sequence/epoch/baseline is available. A counter decrease
+            // could also be late replay; numeric equality cannot identify replay.
+            // Preserve every durable observation but exclude session history from
+            // consumption of an arbitrary selected turn/range (including forks).
+            session_evidence.insert(id.to_owned(), usage.clone());
+            continue;
+        }
+        if let (Some(runtime), Some(thread)) = (usage["runtime"].as_str(), native_thread) {
+            let (amount, scope, basis, key) = if runtime == "claude" {
+                (
+                    usage["total_cost_usd"].as_f64(),
+                    "session_including_subagents",
+                    "claude_sdk_estimate",
+                    format!("{runtime}:{thread}"),
+                )
+            } else {
+                (
+                    usage["cost_usd"].as_f64(),
+                    "turn",
+                    "opencode_reported_unknown_origin",
+                    format!("{runtime}:{thread}:{}", native_turn.unwrap_or(id)),
+                )
+            };
+            if let Some(amount) = amount.filter(|n| n.is_finite() && *n >= 0.) {
+                let record = costs.entry(key).or_insert(serde_json::json!({}));
+                if record["amount_usd"]
+                    .as_f64()
+                    .is_none_or(|prior| amount >= prior)
+                {
+                    *record = serde_json::json!({"amount_usd":amount,"scope":scope,"basis":basis,"confirmed_billing":false});
+                }
+            }
+        }
         let physical = details["physical_attempt_id"].as_str();
-        let key = physical
-            .map(|p| format!("physical:{p}"))
-            .unwrap_or_else(|| format!("observation:{id}"));
-        let value = distinct
-            .entry(key)
-            .or_insert((None, None, false, physical.is_some()));
+        let key = if let (Some(runtime), Some(thread), Some(turn)) =
+            (usage["runtime"].as_str(), native_thread, native_turn)
+        {
+            if usage["scope"] == "request_snapshot" {
+                format!(
+                    "cli-message:{runtime}:{thread}:{}",
+                    usage["native_message_id"].as_str().unwrap_or(id)
+                )
+            } else {
+                format!("cli-turn:{runtime}:{thread}:{turn}")
+            }
+        } else {
+            physical
+                .map(|p| format!("physical:{p}"))
+                .unwrap_or_else(|| format!("observation:{id}"))
+        };
+        let value =
+            distinct
+                .entry(key)
+                .or_insert((None, None, false, physical.is_some(), None, true));
         let max = |a: Option<u64>, b: Option<u64>| match (a, b) {
             (Some(a), Some(b)) => Some(a.max(b)),
             (a, b) => a.or(b),
@@ -477,9 +640,34 @@ pub fn observed_provider_usage_totals<'a>(
         value.0 = max(value.0, details["usage"]["input_tokens"].as_u64());
         value.1 = max(value.1, details["usage"]["output_tokens"].as_u64());
         value.2 |= details["complete"].as_bool() == Some(true);
+        value.5 &= usage["cache_ratio_consistent"] != false;
+        value.4 = max(
+            value.4,
+            details["usage"]["cache_read_input_tokens"].as_u64(),
+        );
     }
-    let mut totals = ObservedProviderUsageTotals::default();
-    for (input, output, complete, physical) in distinct.values() {
+    let mut totals = ObservedProviderUsageTotals {
+        cli_cost_observations: costs,
+        unattributed_session_observations: session_evidence,
+        ..Default::default()
+    };
+    for (input, output, complete, physical, cached, coherent) in distinct.values() {
+        match (input, cached) {
+            (Some(input), Some(cached)) if cached <= input && *coherent => {
+                // If aggregation overflows, a measured ratio is unavailable.
+                match (
+                    totals.cache_ratio_input_tokens.checked_add(*input),
+                    totals.known_cache_read_input_tokens.checked_add(*cached),
+                ) {
+                    (Some(input), Some(cached)) => {
+                        totals.cache_ratio_input_tokens = input;
+                        totals.known_cache_read_input_tokens = cached;
+                    }
+                    _ => totals.missing_cache_ratio_attempts += 1,
+                }
+            }
+            _ => totals.missing_cache_ratio_attempts += 1,
+        }
         totals.attempts += 1;
         if *physical {
             totals.confirmed_physical_attempts += 1;
@@ -518,6 +706,201 @@ mod usage_observation_tests {
                 "usage":{"input_tokens":input,"output_tokens":output}})),
         }
     }
+    #[test]
+    fn legacy_opencode_usage_and_weighted_cache_denominator_survive_replay() {
+        let legacy = crate::TurnItem::SystemEvent {
+            id: "native-turn:usage".into(),
+            level: crate::SystemEventLevel::Info,
+            message: "OpenCode usage".into(),
+            code: Some("agent_runtime_item".into()),
+            details: Some(serde_json::json!({
+                "nativeItemKind":"tokenUsage", "status":"completed",
+                "semantics":"opencode_v2_exclusive_cache_separate_reasoning",
+                "input_tokens":100, "output_tokens":12, "cache_read_input_tokens":80
+            })),
+        };
+        let mut small = item("codex-turn", Some(10), Some(2), false);
+        if let crate::TurnItem::SystemEvent {
+            details: Some(details),
+            ..
+        } = &mut small
+        {
+            details["usage"]["cache_read_input_tokens"] = serde_json::json!(0);
+        }
+        let totals = observed_provider_usage_totals([&legacy, &legacy, &small]);
+        assert_eq!(totals.attempts, 2);
+        assert_eq!(totals.confirmed_physical_attempts, 0);
+        assert_eq!(totals.known_input_tokens, 110);
+        assert_eq!(totals.known_output_tokens, 14);
+        assert_eq!(totals.cache_hit_rate(), Some(80.0 / 110.0));
+        let unknown = item("missing-cache", Some(1), None, false);
+        assert_eq!(
+            observed_provider_usage_totals([&legacy, &unknown]).cache_hit_rate(),
+            None
+        );
+    }
+
+    #[test]
+    fn partial_snapshot_does_not_erase_known_zero_and_cache_ratio_rejects_overflow() {
+        let first = item("turn", Some(0), Some(3), false);
+        let later = item("turn", None, None, true);
+        let totals = observed_provider_usage_totals([&first, &later]);
+        assert_eq!(totals.attempts, 1);
+        assert_eq!(totals.missing_input_attempts, 0);
+        assert_eq!(totals.known_output_tokens, 3);
+        assert_eq!(totals.incomplete_attempts, 0);
+        let mut huge = item("huge", Some(u64::MAX), None, true);
+        let mut extra = item("extra", Some(1), None, true);
+        for item in [&mut huge, &mut extra] {
+            if let crate::TurnItem::SystemEvent {
+                details: Some(details),
+                ..
+            } = item
+            {
+                details["usage"]["cache_read_input_tokens"] = serde_json::json!(0);
+            }
+        }
+        assert_eq!(
+            observed_provider_usage_totals([&huge, &extra]).cache_hit_rate(),
+            None
+        );
+    }
+
+    #[test]
+    fn claude_main_loop_aggregate_replaces_messages_but_never_adds_model_snapshots() {
+        let make = |id: &str, scope: &str, turn: &str, input, output| {
+            let mut item = item(id, input, output, true);
+            if let crate::TurnItem::SystemEvent {
+                details: Some(d), ..
+            } = &mut item
+            {
+                d["usage"]["runtime"] = serde_json::json!("claude");
+                d["usage"]["scope"] = serde_json::json!(scope);
+                d["usage"]["native_thread_id"] = serde_json::json!("session");
+                d["usage"]["native_turn_id"] = serde_json::json!(turn);
+                d["usage"]["native_message_id"] = serde_json::json!("message");
+                d["usage"]["cache_read_input_tokens"] = serde_json::json!(0);
+                d["usage"]["model_usage"] = serde_json::json!({"model":{"inputTokens":99999}});
+                if scope == "turn_snapshot" {
+                    d["usage"]["total_cost_usd"] = serde_json::json!(0.25);
+                }
+            }
+            item
+        };
+        let message = make(
+            "message-snapshot",
+            "request_snapshot",
+            "t1",
+            Some(10),
+            Some(1),
+        );
+        let result = make("result", "turn_snapshot", "t1", Some(30), Some(5));
+        let partial = make(
+            "message-partial",
+            "request_snapshot",
+            "t2",
+            Some(7),
+            Some(2),
+        );
+        let missing = make("error-result", "turn_snapshot", "t2", None, None);
+        let totals =
+            observed_provider_usage_totals([&message, &result, &result, &partial, &missing]);
+        assert_eq!(totals.known_input_tokens, 37);
+        assert_eq!(totals.known_output_tokens, 7);
+        assert_eq!(totals.cli_cost_observations.len(), 1);
+        assert_eq!(
+            totals.cli_cost_observations["claude:session"]["amount_usd"],
+            0.25
+        );
+        assert_eq!(
+            totals.cli_cost_observations["claude:session"]["confirmed_billing"],
+            false
+        );
+        assert_eq!(totals.confirmed_physical_attempts, 0);
+    }
+
+    #[test]
+    fn codex_session_snapshots_with_unknown_baseline_are_not_range_consumption() {
+        let make = |id: &str, thread: &str, count: u64| {
+            let mut item = item(id, Some(count), Some(0), false);
+            if let crate::TurnItem::SystemEvent {
+                details: Some(d), ..
+            } = &mut item
+            {
+                d["usage"]["runtime"] = serde_json::json!("codex");
+                d["usage"]["scope"] = serde_json::json!("session_snapshot");
+                d["usage"]["native_thread_id"] = serde_json::json!(thread);
+                d["usage"]["cache_read_input_tokens"] = serde_json::json!(0);
+            }
+            item
+        };
+        let before = make("before", "native", 100);
+        let reset = make("reset", "native", 0);
+        let after = make("after", "native", 20);
+        let resumed = make("resumed-delivery", "native", 20);
+        let recreated = make("recreated", "new-native", 5);
+        let totals = observed_provider_usage_totals([
+            &before, &reset, &after, &before, &resumed, &recreated,
+        ]);
+        assert_eq!(totals.known_input_tokens, 0);
+        assert_eq!(totals.unattributed_session_observations.len(), 5);
+        assert_eq!(totals.confirmed_physical_attempts, 0);
+        assert_eq!(totals.cache_hit_rate(), None);
+    }
+
+    #[test]
+    fn partial_claude_result_preserves_coherent_request_input_cache_pair() {
+        let mut request = item("request", Some(100), Some(4), false);
+        let mut result = item("result", None, Some(6), true);
+        for (entry, scope) in [
+            (&mut request, "request_snapshot"),
+            (&mut result, "turn_snapshot"),
+        ] {
+            if let crate::TurnItem::SystemEvent {
+                details: Some(d), ..
+            } = entry
+            {
+                d["usage"]["runtime"] = serde_json::json!("claude");
+                d["usage"]["scope"] = serde_json::json!(scope);
+                d["usage"]["native_thread_id"] = serde_json::json!("session");
+                d["usage"]["native_turn_id"] = serde_json::json!("turn");
+                d["usage"]["native_message_id"] = serde_json::json!("message");
+                d["usage"]["cache_read_input_tokens"] = serde_json::json!(80);
+            }
+        }
+        let totals = observed_provider_usage_totals([&request, &result, &request]);
+        assert_eq!(totals.attempts, 1);
+        assert_eq!(totals.known_input_tokens, 100);
+        assert_eq!(totals.known_output_tokens, 6);
+        assert_eq!(totals.cache_hit_rate(), Some(0.8));
+        assert_eq!(
+            totals.incomplete_attempts, 1,
+            "fallback is observed evidence, not a full turn assertion"
+        );
+        if let crate::TurnItem::SystemEvent {
+            details: Some(d), ..
+        } = &mut request
+        {
+            d["usage"]["cache_read_input_tokens"] = serde_json::json!(70);
+        }
+        let conflict = observed_provider_usage_totals([&request, &result]);
+        assert_eq!(conflict.known_input_tokens, 100);
+        assert_eq!(conflict.known_output_tokens, 6);
+        assert_eq!(conflict.missing_input_attempts, 0);
+        assert_eq!(conflict.incomplete_attempts, 1);
+        assert_eq!(conflict.cache_hit_rate(), None);
+        if let crate::TurnItem::SystemEvent {
+            details: Some(d), ..
+        } = &mut result
+        {
+            d["usage"]["num_turns"] = serde_json::json!(2);
+        }
+        let incomplete = observed_provider_usage_totals([&request, &result]);
+        assert_eq!(incomplete.attempts, 1);
+        assert_eq!(incomplete.missing_input_attempts, 1);
+        assert_eq!(incomplete.cache_hit_rate(), None);
+    }
+
     #[test]
     fn physical_attempt_identity_deduplicates_distinct_delivery_items() {
         let mut a = item("delivery-a", Some(10), Some(2), true);

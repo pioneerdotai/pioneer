@@ -727,7 +727,6 @@ mod tests {
                 trusted_proxy_peers: Vec::new(),
                 outbound_queue_capacity: 128,
                 keepawake: false,
-                preflight_model: Default::default(),
                 telemetry: Default::default(),
                 thread: GatewayThreadConfig {
                     default_model: Some("gpt-5.4".to_owned()),
