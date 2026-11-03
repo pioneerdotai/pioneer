@@ -42738,7 +42738,25 @@ async fn task_anchor_publication_scenario(scenario: &str) {
         );
     }
 
+    // Progress text is redacted at the public boundary. Use public task titles
+    // to distinguish immutable A/B snapshots without exposing private progress.
+    let title_a = "Task anchor snapshot A";
+    let title_b = "Task anchor snapshot B";
+    processor
+        .task_runtime
+        .service()
+        .update_task(
+            pioneer_tasks::TaskMutationContext::default(),
+            TaskUpdateParams {
+                task_id: task_id.clone(),
+                title: Some(title_a.into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
     let progress_message = "TaskAgentExecutor is checking task anchor projection";
+    let public_progress = "Task progress updated.";
     let progress_event = crud_store
         .append_task_event(
             TaskEventPayload::Progress {
@@ -42757,9 +42775,11 @@ async fn task_anchor_publication_scenario(scenario: &str) {
         crud_store.clone(),
         turn_id,
         crate::task_tools::task_anchor_id(task_id.as_str()).as_str(),
-        progress_message,
+        public_progress,
     )
     .await;
+    assert_eq!(anchor.title, title_a);
+    assert_eq!(anchor.progress_preview.as_deref(), Some(public_progress));
     if scenario == "ordered" {
         assert_eq!(anchor.run_id.as_deref(), Some(run_id.as_str()));
         assert_eq!(
@@ -42825,6 +42845,19 @@ async fn task_anchor_publication_scenario(scenario: &str) {
     .unwrap();
     // Actual B after Pending=false, before any A LIVE delivery. This must retain
     // A's canonical owner; eager B followed by old A would roll the client back.
+    processor
+        .task_runtime
+        .service()
+        .update_task(
+            pioneer_tasks::TaskMutationContext::default(),
+            TaskUpdateParams {
+                task_id: task_id.clone(),
+                title: Some(title_b.into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
     let latest_progress = "anchor B after start before LIVE drain";
     let b = crud_store
         .append_task_event(
@@ -42855,6 +42888,7 @@ async fn task_anchor_publication_scenario(scenario: &str) {
     // Its synthetic future clock must not expire a concurrent worker's lease.
     let (mut completed, mut a, mut b) = (false, false, false);
     let mut final_preview = None;
+    let mut final_title = None;
     let mut last_claim = None;
     let drain_result = timeout(Duration::from_secs(10), async {
         loop {
@@ -42900,15 +42934,20 @@ async fn task_anchor_publication_scenario(scenario: &str) {
                 if let TurnItem::Task { item } = item
                     && item.task_id == task_id
                 {
-                    if item.progress_preview.as_deref() == Some(progress_message) {
+                    if item.title == title_a
+                        && item.progress_preview.as_deref() == Some(public_progress)
+                    {
                         assert!(completed, "A preceded initial task completion");
                         assert!(!b, "A rolled back B");
                         a = true;
                     }
-                    if item.progress_preview.as_deref() == Some(latest_progress) {
+                    if item.title == title_b
+                        && item.progress_preview.as_deref() == Some(public_progress)
+                    {
                         assert!(completed && a);
                         b = true;
                     }
+                    final_title = Some(item.title);
                     final_preview = item.progress_preview;
                 }
             }
@@ -42928,7 +42967,8 @@ async fn task_anchor_publication_scenario(scenario: &str) {
                 .unwrap()
                 .is_some();
             if b && !queued {
-                assert_eq!(final_preview.as_deref(), Some(latest_progress));
+                assert_eq!(final_title.as_deref(), Some(title_b));
+                assert_eq!(final_preview.as_deref(), Some(public_progress));
                 break;
             }
             tokio::task::yield_now().await;
