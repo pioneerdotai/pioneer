@@ -269,7 +269,7 @@ use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::{Alias, Expr, ExprTrait, Query};
 use sea_orm::{
     ColumnTrait, ConnectionTrait, Database, DatabaseTransaction, EntityTrait, QueryFilter,
-    QueryOrder, Set, TransactionTrait,
+    QueryOrder, QuerySelect, Set, TransactionTrait,
 };
 use serde_json::{Value as JsonValue, json};
 use sha2::{Digest, Sha256};
@@ -42853,9 +42853,10 @@ async fn task_anchor_publication_scenario(scenario: &str) {
     }
     // Keep the background LIVE owner parked while this fixture drains claims.
     // Its synthetic future clock must not expire a concurrent worker's lease.
-    timeout(Duration::from_secs(10), async {
-        let (mut completed, mut a, mut b) = (false, false, false);
-        let mut final_preview = None;
+    let (mut completed, mut a, mut b) = (false, false, false);
+    let mut final_preview = None;
+    let mut last_claim = None;
+    let drain_result = timeout(Duration::from_secs(10), async {
         loop {
             for claim in crud_store
                 .claim_due_turn_event_deliveries(
@@ -42866,6 +42867,7 @@ async fn task_anchor_publication_scenario(scenario: &str) {
                 .await
                 .unwrap()
             {
+                last_claim = Some((claim.event.turn_id.clone(), claim.event.sequence));
                 processor
                     .process_claimed_native_turn_event_delivery(claim)
                     .await
@@ -42932,8 +42934,30 @@ async fn task_anchor_publication_scenario(scenario: &str) {
             tokio::task::yield_now().await;
         }
     })
-    .await
-    .expect("task anchor A and B must drain in order while the LIVE worker is parked");
+    .await;
+    if drain_result.is_err() {
+        let pending = pioneer_entity::turn_event_delivery::Entity::find()
+            .filter(pioneer_entity::turn_event_delivery::Column::TurnId.eq(turn_id))
+            .filter(
+                pioneer_entity::turn_event_delivery::Column::Consumer
+                    .eq(pioneer_crud::NATIVE_TURN_EVENT_LIVE_CONSUMER),
+            )
+            .filter(pioneer_entity::turn_event_delivery::Column::Status.is_in([
+                "pending",
+                "delivering",
+                "failed",
+            ]))
+            .order_by_asc(pioneer_entity::turn_event_delivery::Column::Sequence)
+            .limit(64)
+            .all(&crud_store.database_connection())
+            .await
+            .unwrap();
+        panic!(
+            "task anchors must drain with LIVE parked: scenario={scenario}, \
+             completed={completed}, a={a}, b={b}, final_preview={final_preview:?}, \
+             last_claim={last_claim:?}, pending={pending:?}"
+        );
+    }
     live_wake.claim_barrier.release();
     if scenario != "ordered" {
         cancel_task_for_test(
