@@ -37929,7 +37929,8 @@ async fn assert_detached_native_child_turn_cancellation(native_api: bool) {
         .await
         .expect("recording CLI runtimes should seed authoritative readiness");
     processor.bind_task_bridge().await;
-    processor.start_task_event_listener().await;
+    // This fixture drives the durable fanout dispatcher explicitly below.
+    // A competing background listener would make projection order probabilistic.
 
     let parent_thread_id = "thr_native_child_turn_cancel";
     let source_turn_id = "turn_native_child_turn_cancel_source";
@@ -38119,6 +38120,26 @@ async fn assert_detached_native_child_turn_cancellation(native_api: bool) {
             .unwrap();
         assert_eq!(receipts.iter().filter(|r| r.run_id == run.id).count(), 1);
     }
+
+    let mut fanout_drained = false;
+    for _ in 0..32 {
+        let summary =
+            drain_test_notifications_while(&mut rx, processor.task_event_fanout_quantum())
+                .await
+                .expect("cancellation fanout should run");
+        assert_eq!(
+            summary.errors, 0,
+            "cancellation fanout must not defer errors"
+        );
+        if summary.pending == Some(false) {
+            fanout_drained = true;
+            break;
+        }
+    }
+    assert!(
+        fanout_drained,
+        "cancellation fanout must drain its bounded queue"
+    );
 
     let parent_occurrence_turn_id = lineage
         .created_by_turn_id
