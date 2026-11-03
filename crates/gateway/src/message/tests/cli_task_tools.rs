@@ -2338,29 +2338,64 @@ fn cli_automatic_orchestration_skills_coexist_with_selected_user_names() {
                         "turn context must identify the user's explicit skill selection"
                     );
                 }
-                for name in [
-                    "pioneer-system-tasks",
-                    "pioneer-system-subagents",
-                    "pioneer-system-html",
-                    "pioneer-system-threads",
-                    user_name,
-                ] {
-                    if kind == CLIAgentRuntimeKind::Claude && name == user_name {
-                        assert!(turn_text.contains(name), "{kind:?}: {name}");
-                    }
-                    if kind != CLIAgentRuntimeKind::Claude {
-                        assert!(start.input.as_array().unwrap().iter().any(|item| {
-                            item["type"] == "skill"
-                                && item["name"] == name
-                                && item["path"]
-                                    == harness
-                                        .native_home
-                                        .join("skills")
-                                        .join(name)
-                                        .join("SKILL.md")
-                                        .display()
-                                        .to_string()
-                        }));
+                if kind != CLIAgentRuntimeKind::Claude {
+                    let native_skills = start
+                        .input
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .filter(|item| item["type"] == "skill")
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        native_skills.len(),
+                        1,
+                        "only the explicit user selection invokes a skill"
+                    );
+                    assert_eq!(native_skills[0]["name"], user_name);
+                    assert_eq!(
+                        native_skills[0]["path"],
+                        exported_user.join("SKILL.md").display().to_string()
+                    );
+                    let references = start
+                        .input
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .filter_map(|item| item["text"].as_str())
+                        .filter_map(|text| {
+                            text.strip_prefix("Current required Pioneer skill exports (replaces earlier required-export references): ")
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(references.len(), 1);
+                    let exports: serde_json::Value =
+                        serde_json::Deserializer::from_str(references[0])
+                            .into_iter::<serde_json::Value>()
+                            .next()
+                            .unwrap()
+                            .unwrap();
+                    let exports = exports.as_array().unwrap();
+                    assert_eq!(exports.len(), 4);
+                    for slug in ["tasks", "subagents", "html", "threads"] {
+                        let name = format!("pioneer-system-{slug}");
+                        let export = exports
+                            .iter()
+                            .find(|export| export["name"] == name)
+                            .unwrap();
+                        assert_eq!(
+                            export["path"],
+                            harness
+                                .native_home
+                                .join("skills")
+                                .join(&name)
+                                .join("SKILL.md")
+                                .display()
+                                .to_string()
+                        );
+                        assert!(
+                            export["folderHash"]
+                                .as_str()
+                                .is_some_and(|hash| !hash.is_empty())
+                        );
                     }
                 }
                 // Claude receives the same selected names/paths through the

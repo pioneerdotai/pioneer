@@ -37607,8 +37607,30 @@ async fn cli_task_bootstrap_honors_empty_parent_context_policy_impl() {
         .filter(|item| item["type"] == "skill")
         .map(|item| item["name"].as_str().unwrap())
         .collect::<Vec<_>>();
+    assert!(
+        skill_names.is_empty(),
+        "required system exports must not invoke native skills for an empty selection"
+    );
+    let reference_messages = adapter_input
+        .iter()
+        .filter_map(|item| item["text"].as_str())
+        .filter_map(|text| {
+            text.strip_prefix("Current required Pioneer skill exports (replaces earlier required-export references): ")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(reference_messages.len(), 1);
+    let required_exports: JsonValue = serde_json::Deserializer::from_str(reference_messages[0])
+        .into_iter::<JsonValue>()
+        .next()
+        .unwrap()
+        .unwrap();
     assert_eq!(
-        skill_names,
+        required_exports
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|export| export["name"].as_str().unwrap())
+            .collect::<Vec<_>>(),
         vec![
             "pioneer-system-tasks",
             "pioneer-system-subagents",
@@ -37619,10 +37641,16 @@ async fn cli_task_bootstrap_honors_empty_parent_context_policy_impl() {
     let adapter_messages = adapter_input
         .iter()
         .filter(|item| item["type"] == "text")
+        .filter(|item| {
+            !item["text"]
+                .as_str()
+                .unwrap()
+                .starts_with("Current required Pioneer skill exports")
+        })
         .collect::<Vec<_>>();
     assert_eq!(
         adapter_input.len(),
-        adapter_messages.len() + skill_names.len()
+        adapter_messages.len() + reference_messages.len()
     );
     assert_eq!(adapter_messages.len(), 3);
     assert!(
