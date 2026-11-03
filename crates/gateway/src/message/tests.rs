@@ -42718,6 +42718,7 @@ async fn task_anchor_publication_scenario(scenario: &str) {
                     && item.task_id == task_id
                 {
                     if item.progress_preview.as_deref() == Some(progress_message) {
+                        assert!(completed, "A preceded initial task completion");
                         assert!(!b, "A rolled back B");
                         a = true;
                     }
