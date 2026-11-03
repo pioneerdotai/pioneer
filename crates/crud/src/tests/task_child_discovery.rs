@@ -561,7 +561,7 @@ async fn queued_cleanup_revalidates_late_lineage_receipt_and_capsule_without_sel
             turn_id: "gated_child".into(),
             item_id: Some("late-runtime-observation".into()),
             attempt_id: None,
-            sequence: 0,
+            sequence: 4,
             source: "runtime_context_v1".into(),
             tool_name: None,
             payload: "{}".into(),

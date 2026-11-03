@@ -14143,7 +14143,7 @@ async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_comman
             if let Some(request) = provider.snapshot_requests().into_iter().find(|r| {
                 r.messages
                     .last()
-                    .is_some_and(|m| m.content == "ASYNC_TASK_C")
+                    .is_some_and(|m| prepared_user_text(m) == "ASYNC_TASK_C")
             }) {
                 break request;
             }
@@ -16161,18 +16161,15 @@ async fn followup_history_preserves_typed_recorded_artifact_version() {
         .iter()
         .find(|message| !message.content_parts.is_empty())
         .expect("the recorded attachment must survive as typed canonical history");
-    let input_reference = second_request
-        .messages
-        .iter()
-        .find_map(|message| {
-            prepared_user_text(message).strip_prefix("Что за машина?\nHistorical input reference: ")
-        })
-        .expect("the original question and typed artifact input must remain together");
     assert_eq!(
-        serde_json::from_str::<serde_json::Value>(input_reference).unwrap(),
-        json!({
-            "type": "artifact", "artifactId": artifact.artifact_id, "versionId": artifact.version_id,
-        })
+        prepared_user_text(artifact_history_message),
+        "Что за машина?",
+        "the original question and typed artifact input must remain together"
+    );
+    assert_eq!(
+        artifact_history_message.content,
+        requests[0].messages.last().unwrap().content,
+        "history must retain the exact prepared input sent on the first turn"
     );
     assert!(
         matches!(
@@ -27446,7 +27443,7 @@ async fn recovered_hidden_task_run_dispatches_restored_child_main_without_planne
             recovered_main_request
                 .messages
                 .iter()
-                .any(|message| &message.content == text),
+                .any(|message| prepared_user_text(message) == text),
             "recovery must send the entire Composer request, not its short Task goal"
         );
         assert_eq!(
