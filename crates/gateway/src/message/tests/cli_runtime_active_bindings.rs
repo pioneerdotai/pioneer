@@ -1,4 +1,5 @@
 use super::*;
+use crate::cli_runtime::session_instance::CliSessionInstanceOrigin;
 use crate::message::cli_runtime::CliRuntimeStaleTurnScan;
 use crate::message::turn_handlers::CliRuntimeLaunchSpecRestore;
 use pioneer_entity::{turn, turn_cli_runtime_binding as binding, turn_liveness};
@@ -4496,5 +4497,334 @@ async fn independently_heartbeating_owner_keeps_terminal_authority_and_cancellat
         heartbeat.abort();
         assert!(heartbeat.await.unwrap_err().is_cancelled());
         // The heartbeat probe was cancelled; do not leave a release permit.
+    }
+}
+
+// Real wire reader/ordered queue -> native mapping -> existing receipt journal
+// -> durable projection -> DB readback. No native process/model is needed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn codex_usage_receipts_survive_database_replay_without_range_attribution() {
+    use pioneer_cli_agent_runtime::codex::CodexJsonlRpcClient;
+    use pioneer_cli_agent_runtime::event::{
+        RuntimeEventMappingOptions, map_codex_notification_event,
+    };
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, split};
+    let temp = tempfile::tempdir().unwrap();
+    let (processor, store, _, workspace) =
+        blocked_observation_fixture(&temp.path().join("usage-receipts.sqlite"), "codex", true)
+            .await;
+    let key = CLIAgentRuntimeSessionKey::new(&workspace, "codex", BLOCKED_THREAD).unwrap();
+    let context = crate::cli_runtime::projector::CLIRuntimeProjectorContext {
+        workspace_id: workspace.clone(),
+        thread_id: BLOCKED_THREAD.into(),
+        turn_id: BLOCKED_TURN.into(),
+        recovery: None,
+        codex_retry_attempt_id: None,
+    };
+    let (client_stream, server_stream) = tokio::io::duplex(8192);
+    let (client_read, client_write) = split(client_stream);
+    let (server_read, mut server_write) = split(server_stream);
+    let mut server_reader = BufReader::new(server_read);
+    let client = CodexJsonlRpcClient::new_with_channel_capacity(
+        BufReader::new(client_read),
+        client_write,
+        1,
+        1,
+        4,
+    );
+    let mut notifications = client.take_notification_receiver().unwrap();
+    // Delay consumption until the RPC response barrier. All notifications must
+    // enter the actual reader and ordered ingress while output capacity is one.
+    for total in [80, 100, 0, 20, 100] {
+        let line = json!({"method":"thread/tokenUsage/updated","params":{
+            "threadId":BLOCKED_NATIVE_THREAD,"turnId":BLOCKED_TURN,
+            "tokenUsage":{"total":{"inputTokens":total,"outputTokens":0},
+                "last":{"inputTokens":total},"credentials":"SECRET"},
+            "transcript":"SECRET"}})
+        .to_string()
+            + "\n";
+        server_write.write_all(line.as_bytes()).await.unwrap();
+    }
+    let barrier = {
+        let client = client.clone();
+        tokio::spawn(async move {
+            client
+                .request_value("account/read", Some(json!({})), Duration::from_secs(2))
+                .await
+        })
+    };
+    let mut request_line = String::new();
+    timeout(
+        Duration::from_secs(2),
+        server_reader.read_line(&mut request_line),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let request: JsonValue = serde_json::from_str(&request_line).unwrap();
+    let response = json!({"id":request["id"],"result":{}}).to_string() + "\n";
+    server_write.write_all(response.as_bytes()).await.unwrap();
+    barrier.await.unwrap().unwrap();
+    let mut saved_receipts = Vec::new();
+    for expected in [80, 100, 0, 20, 100] {
+        let notification = timeout(Duration::from_secs(2), notifications.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(notification.method, "thread/tokenUsage/updated");
+        assert_eq!(
+            notification.params.as_ref().unwrap()["tokenUsage"]["total"]["inputTokens"],
+            expected
+        );
+        let mut event =
+            map_codex_notification_event(&notification, RuntimeEventMappingOptions::default());
+        let RuntimeEvent::ItemCompleted(item) = &mut event else {
+            panic!("usage expected")
+        };
+        let now = chrono::Utc::now().fixed_offset();
+        // IDs originate from the same existing local journal contract. They
+        // describe durable receipts, never native sequence or request identity.
+        let id = pioneer_protocol::generate_id(24);
+        store
+            .append_cli_runtime_native_event(pioneer_crud::NewCliRuntimeNativeEvent {
+                id: id.clone(),
+                runtime_id: "codex".into(),
+                runtime_kind: "codex".into(),
+                workspace_id: Some(workspace.clone()),
+                thread_id: Some(BLOCKED_THREAD.into()),
+                turn_id: Some(BLOCKED_TURN.into()),
+                native_thread_id: Some(BLOCKED_NATIVE_THREAD.into()),
+                native_turn_id: Some(BLOCKED_TURN.into()),
+                native_method: notification.method.clone(),
+                payload_redacted_json: json!({"cliUsage":item.metadata}).to_string(),
+                sequence: now.timestamp_millis(),
+                created_at: now,
+            })
+            .await
+            .unwrap();
+        saved_receipts.push(id.clone());
+        item.metadata.as_mut().unwrap()["observation_id"] = json!(id);
+        let projected = crate::cli_runtime::projector::project_cli_runtime_event(&context, &event);
+        for durable in projected.durable {
+            processor
+                .publish_cli_runtime_durable_and_wait(&key.to_session_instance(), durable.clone())
+                .await
+                .unwrap();
+            // Actual duplicate delivery of the same persisted receipt.
+            processor
+                .publish_cli_runtime_durable_and_wait(&key.to_session_instance(), durable)
+                .await
+                .unwrap();
+        }
+    }
+    let reopened = CrudStore::new(store.database_connection());
+    let stored = reopened
+        .list_turn_items_by_type(BLOCKED_TURN, "system_event")
+        .await
+        .unwrap();
+    assert_eq!(
+        stored
+            .iter()
+            .filter(|item| matches!(item,
+        TurnItem::SystemEvent { code: Some(code), .. } if code == "provider_usage"))
+            .count(),
+        5
+    );
+    let mut items = Vec::new();
+    for (id, total) in saved_receipts.into_iter().zip([80, 100, 0, 20, 100]) {
+        let receipt = reopened
+            .get_cli_runtime_native_event(&id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!receipt.payload_redacted_json.contains("SECRET"));
+        let item = reopened
+            .get_turn_item(BLOCKED_TURN, &format!("cli_usage:{id}"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(&item, TurnItem::SystemEvent { details: Some(details), .. }
+            if details["usage"]["input_tokens"] == total)
+        );
+        items.push(item);
+    }
+    let totals = pioneer_protocol::observed_provider_usage_totals(&items);
+    assert_eq!(totals.unattributed_session_observations.len(), 5);
+    assert_eq!(totals.known_input_tokens, 0);
+    assert_eq!(totals.known_output_tokens, 0);
+    assert_eq!(totals.cache_hit_rate(), None);
+    // Restart/resume/fork or a selected suffix does not establish zero baseline.
+    let suffix = pioneer_protocol::observed_provider_usage_totals(&items[3..]);
+    assert_eq!(suffix.unattributed_session_observations.len(), 2);
+    assert_eq!(suffix.known_input_tokens, 0);
+}
+
+// Exercise the real durable publisher ACK and ItemCompleted consumer, with a
+// storage fault that leaves recovery writes available. Code-only/API and
+// mismatched-binding controls must retain the canonical failure policy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_statistics_materialization_failure_rejects_ack_without_opening_recovery() {
+    use pioneer_cli_agent_runtime::event::{RuntimeNativeEvent, RuntimeTurnStarted};
+    use pioneer_protocol::SystemEventLevel;
+    for case in ["usage", "timing", "api_usage", "ordinary", "wrong_binding"] {
+        let temp = tempfile::tempdir().unwrap();
+        let (processor, store, _, workspace) = blocked_observation_fixture(
+            &temp.path().join("statistics-failure.sqlite"),
+            "codex",
+            true,
+        )
+        .await;
+        let key = CLIAgentRuntimeSessionKey::new(&workspace, "codex", BLOCKED_THREAD).unwrap();
+        let context = crate::cli_runtime::projector::CLIRuntimeProjectorContext {
+            workspace_id: workspace.clone(),
+            thread_id: BLOCKED_THREAD.into(),
+            turn_id: BLOCKED_TURN.into(),
+            recovery: None,
+            codex_retry_attempt_id: None,
+        };
+        let native = if case == "timing" {
+            RuntimeEvent::TurnStarted(RuntimeTurnStarted {
+                native_thread_id: Some(BLOCKED_NATIVE_THREAD.into()),
+                native_turn_id: BLOCKED_TURN.into(),
+                native: Some(RuntimeNativeEvent {
+                    method: "turn/started".into(),
+                    payload_redacted: Some(json!({"turn":{"startedAt":100}})),
+                    raw_redacted: None,
+                }),
+            })
+        } else {
+            RuntimeEvent::ItemCompleted(RuntimeItemCompleted {
+                native_thread_id: Some(BLOCKED_NATIVE_THREAD.into()),
+                native_turn_id: BLOCKED_TURN.into(),
+                native_item_id: "usage-fault".into(),
+                item_kind: "tokenUsage".into(),
+                text: None,
+                summary: Vec::new(),
+                content: Vec::new(),
+                phase: RuntimeAgentMessagePhase::FinalAnswer,
+                metadata: Some(
+                    json!({"runtime":"codex", "scope":"session_snapshot", "input_tokens":100}),
+                ),
+                native_item_redacted: None,
+                native: None,
+            })
+        };
+        let mut event = crate::cli_runtime::projector::project_cli_runtime_event(&context, &native)
+            .durable
+            .into_iter()
+            .next()
+            .unwrap();
+        let AgentDurableEvent::ItemCompleted { notification } = &mut event else {
+            panic!("statistics must project as ItemCompleted")
+        };
+        let TurnItem::SystemEvent {
+            id,
+            level,
+            code,
+            details,
+            ..
+        } = &mut notification.item
+        else {
+            panic!("statistics must be a SystemEvent")
+        };
+        *id = "g1_fault".into();
+        *level = SystemEventLevel::Info;
+        match case {
+            "api_usage" => {
+                *details = Some(
+                    json!({"schema_version":1,"usage":{"provider":"openai","input_tokens":100}}),
+                )
+            }
+            "ordinary" => *code = Some("ordinary_statistics".into()),
+            "wrong_binding" => {
+                details.as_mut().unwrap()["usage"]["native_thread_id"] =
+                    json!("another-native-thread")
+            }
+            _ => {}
+        }
+        store.database_connection().execute_unprepared(
+            "CREATE TRIGGER reject_cli_statistics BEFORE INSERT ON turn_event \
+             WHEN NEW.event_type='item/completed' AND json_extract(NEW.payload,'$.payload.item.id')='g1_fault' \
+             BEGIN SELECT RAISE(ABORT,'injected statistics storage failure'); END;"
+        ).await.unwrap();
+        let result = processor
+            .publish_cli_runtime_durable_and_wait(&key.to_session_instance(), event)
+            .await;
+        match result {
+            Err(pioneer_runtime_events::ExecutionEventHubError::CommitRejected(rejection)) => {
+                assert_eq!(rejection.code(), "projection_failed", "{case}");
+            }
+            other => panic!("expected statistics storage rejection for {case}, got {other:?}"),
+        }
+        assert!(
+            store
+                .get_turn_item(BLOCKED_TURN, "g1_fault")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let supplemental = matches!(case, "usage" | "timing");
+        let jobs = pioneer_entity::recovery_job::Entity::find()
+            .filter(pioneer_entity::recovery_job::Column::TurnId.eq(BLOCKED_TURN))
+            .all(&store.database_connection())
+            .await
+            .unwrap();
+        assert_eq!(jobs.is_empty(), supplemental, "{case}");
+        store
+            .database_connection()
+            .execute_unprepared("DROP TRIGGER reject_cli_statistics")
+            .await
+            .unwrap();
+        if supplemental {
+            assert_eq!(
+                store
+                    .get_turn(BLOCKED_THREAD, BLOCKED_TURN)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .1
+                    .status,
+                TurnStatus::InProgress
+            );
+            assert_eq!(
+                store
+                    .get_cli_runtime_turn_binding(BLOCKED_TURN)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                "running"
+            );
+            let handle = processor
+                .cli_runtime_manager
+                .as_ref()
+                .unwrap()
+                .existing_session(&key)
+                .await
+                .unwrap();
+            processor
+                .handle_cli_runtime_timeline_event(
+                    handle.instance(),
+                    RuntimeEvent::TurnCompleted(RuntimeTurnCompleted {
+                        native_thread_id: Some(BLOCKED_NATIVE_THREAD.into()),
+                        native_turn_id: BLOCKED_TURN.into(),
+                        status: "completed".into(),
+                        native: None,
+                    }),
+                )
+                .await;
+            assert_eq!(
+                store
+                    .get_turn(BLOCKED_THREAD, BLOCKED_TURN)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .1
+                    .status,
+                TurnStatus::Completed
+            );
+            assert!(!has_recovery(&store, BLOCKED_TURN).await);
+        }
     }
 }

@@ -1142,6 +1142,18 @@ impl TokenUsage {
             accounting
         );
         if let Some(raw) = &snapshot.raw_usage {
+            let cli = matches!(
+                self.provider.as_deref(),
+                Some("codex-cli" | "claude-cli" | "opencode-cli")
+            );
+            // A later partial snapshot cannot restore evidence already discarded
+            // earlier in this call. This is CLI-only; API merge stays unchanged.
+            let truncation = ["responses_truncated", "model_usage_truncated"].map(|key| {
+                self.raw_usage
+                    .as_ref()
+                    .is_some_and(|prior| prior["cli_statistics"][key] == true)
+                    || raw["cli_statistics"][key] == true
+            });
             let target = self.raw_usage.get_or_insert_with(|| serde_json::json!({}));
             if let (Some(target), Some(raw)) = (target.as_object_mut(), raw.as_object()) {
                 fn merge(
@@ -1168,7 +1180,24 @@ impl TokenUsage {
                 }
                 merge(target, raw);
             }
+            let statistics = cli.then(|| {
+                let mut statistics = crate::usage::bounded_cli_statistics(
+                    &self.raw_usage.as_ref().unwrap()["cli_statistics"],
+                );
+                for (key, truncated) in ["responses_truncated", "model_usage_truncated"]
+                    .into_iter()
+                    .zip(truncation)
+                {
+                    if truncated {
+                        statistics[key] = serde_json::json!(true);
+                    }
+                }
+                statistics
+            });
             self.raw_usage = self.raw_usage.as_ref().map(crate::usage::bounded_usage);
+            if let Some(statistics) = statistics {
+                self.raw_usage.as_mut().unwrap()["cli_statistics"] = statistics;
+            }
         }
         // Gemini thoughts are separate from candidates. A partial cumulative
         // snapshot must not replace the earlier candidate count with thoughts.
