@@ -1128,6 +1128,47 @@ pub struct ClientCore {
     publication_ready: std::sync::Condvar,
 }
 
+pub(crate) struct HistoryAuthority {
+    auth: (u64, Option<u64>),
+    transport: Option<crate::transport::ws::runtime::ConnectionRequestTransport>,
+}
+impl HistoryAuthority {
+    pub(crate) fn capture(core: &ClientCore) -> Self {
+        let auth = core.current_auth_ticket();
+        let transport = auth.1.map(|c| {
+            core.transport_runtime
+                .ws_command_sender()
+                .requests_for_connection(c)
+        });
+        Self { auth, transport }
+    }
+    pub(crate) fn is_current(&self, core: &ClientCore) -> bool {
+        self.auth == core.current_auth_ticket()
+            && self
+                .transport
+                .as_ref()
+                .is_none_or(|t| t.scope().is_none() || t.is_current())
+    }
+    // Apply lock order: identity -> registry -> HTTP access -> captured socket.
+    // Decoding precedes these guards; publication and cancellation follow them.
+    pub(crate) fn lock<'a>(&'a self, core: &'a ClientCore) -> (impl Sized + 'a, bool) {
+        let identity = core
+            .identity_authorization
+            .lock()
+            .expect("identity owner poisoned");
+        let current = identity.history_ticket_matches(self.auth.0);
+        (identity, current)
+    }
+    pub(crate) fn lock_transport(&self) -> (impl Sized + '_, bool) {
+        let guard = self
+            .transport
+            .as_ref()
+            .map(|t| t.history_apply_fence(self.auth.1));
+        let current = guard.as_ref().is_some_and(|g| g.1);
+        (guard, current)
+    }
+}
+
 struct HistoryFlight {
     reservation: u64,
     response: crate::rpc::JsonRpcResponseSender,
@@ -2182,11 +2223,11 @@ impl ClientCore {
                         while index < flights.len() {
                             let flight = &flights[index];
                             let current = receiver.applicable(flight.reservation)
-                                && flight.auth == core.current_auth_ticket()
-                                && flight
-                                    .transport
-                                    .as_ref()
-                                    .is_none_or(|t| t.scope().is_none() || t.is_current());
+                                && HistoryAuthority {
+                                    auth: flight.auth,
+                                    transport: flight.transport.clone(),
+                                }
+                                .is_current(&core);
                             if !current || std::time::Instant::now() >= flight.response.deadline() {
                                 flight.response.cancel();
                             }
@@ -2202,7 +2243,8 @@ impl ClientCore {
                                 continue;
                             };
                             let mut flight = flights.remove(index);
-                            let apply = std::mem::replace(&mut flight.apply, Box::new(|_, _| None));
+                            let apply =
+                                std::mem::replace(&mut flight.apply, Box::new(|_, _, _| None));
                             // Physical retirement is not logical finalization. Discard
                             // stale payloads, but run the same reducer's exact-generation
                             // error path so continuing-session rotation cannot strand work.
@@ -2212,7 +2254,15 @@ impl ClientCore {
                                 Err(anyhow::anyhow!("History request authority retired"))
                             };
                             let continuation = flight.work.run(|| {
-                                apply(&core, result).map(|request| {
+                                apply(
+                                    &core,
+                                    result,
+                                    Some(&HistoryAuthority {
+                                        auth: flight.auth,
+                                        transport: flight.transport.clone(),
+                                    }),
+                                )
+                                .map(|request| {
                                     Self::history_continuation(request, flight.queue.clone())
                                 })
                             });
@@ -2251,12 +2301,8 @@ impl ClientCore {
                             let mut processing = queue.as_ref().map(|q| q.processing());
                             // Capture network authority before domain preparation, then
                             // revalidate it before sending or accepting any payload.
-                            let auth = core.current_auth_ticket();
-                            let transport = auth.1.map(|connection| {
-                                core.transport_runtime
-                                    .ws_command_sender()
-                                    .requests_for_connection(connection)
-                            });
+                            let HistoryAuthority { auth, transport } =
+                                HistoryAuthority::capture(&core);
                             let prepared = work.run(|| core.prepare_history_request(request));
                             if let Some(processing) = &mut processing {
                                 processing.processed();
@@ -2417,8 +2463,8 @@ impl ClientCore {
                     .map(|mut prepared| crate::threads::registry::PreparedHistory {
                         identity: None,
                         rpc: prepared.rpc.take(),
-                        apply: Box::new(move |core, result| {
-                            core.complete_thread_semantic_request(prepared, result)
+                        apply: Box::new(move |core, result, authority| {
+                            core.complete_thread_semantic_request(prepared, result, authority)
                                 .map(R::Semantic)
                         }),
                     })
@@ -2497,7 +2543,7 @@ impl ClientCore {
                 )
             },
         );
-        (prepared.apply)(self, result)
+        (prepared.apply)(self, result, None)
     }
 
     pub(crate) fn start_gateway_event_dispatcher(self: &Arc<Self>) {

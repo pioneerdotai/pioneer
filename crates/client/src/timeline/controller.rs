@@ -2328,7 +2328,7 @@ impl crate::core::ClientCore {
                 params.clone(),
                 crate::rpc::RPC_REQUEST_TIMEOUT,
             );
-            (prepared.apply)(self, result);
+            (prepared.apply)(self, result, None);
         }
     }
     pub(crate) fn prepare_timeline_read(
@@ -2376,14 +2376,26 @@ impl crate::core::ClientCore {
                 pioneer_protocol::constants::methods::THREAD_READ,
                 serde_json::to_value(params).expect("read params"),
             )),
-            apply: Box::new(move |core, response| {
+            apply: Box::new(move |core, response, authority| {
                 let result: anyhow::Result<pioneer_protocol::ThreadReadResponse> =
                     response.and_then(|v| Ok(serde_json::from_value(v)?));
                 let auth_is_current = core.current_auth_ticket() == auth;
+                let authority_guard = authority.map(|a| a.lock(core));
+                let result = if authority_guard.as_ref().is_some_and(|a| !a.1) {
+                    Err(anyhow::anyhow!("Read authority retired at apply"))
+                } else {
+                    result
+                };
                 let mut registry = core
                     .thread_registry
                     .lock()
                     .expect("thread registry poisoned");
+                let transport_guard = authority.map(|a| a.lock_transport());
+                let result = if transport_guard.as_ref().is_some_and(|a| !a.1) {
+                    Err(anyhow::anyhow!("Read socket retired at apply"))
+                } else {
+                    result
+                };
                 if core.is_stopped()
                     || !registry.timeline_operation_matches(&token)
                     || !registry.timeline.accepts_read(&request)
@@ -2415,14 +2427,29 @@ impl crate::core::ClientCore {
                     .finish_read(&request, result.is_ok(), core.timeline_now_ms());
                 // Auth and store incarnation were checked above. A successful
                 // server cursor stays authoritative even if the viewport has moved.
-                if let Ok(response) = result {
-                    core.apply_directory_read_locked(
+                let publication = if let Ok(response) = result {
+                    let changed = core.apply_directory_read_locked(
                         &mut registry,
                         &response.workspace_id,
                         &response.thread_id,
                         &response.cursor,
                         response.unread_count,
                     );
+                    changed.then_some(response.workspace_id)
+                } else {
+                    None
+                };
+                drop(transport_guard);
+                drop(authority_guard);
+                if let Some(workspace) = publication {
+                    let draft = registry.navigation.drafts.get(&workspace).cloned();
+                    if let Some(publication) =
+                        registry
+                            .directory
+                            .project(&workspace, draft.as_deref(), false, None)
+                    {
+                        core.publish_workspace_tree(publication);
+                    }
                 }
                 None
             }),
