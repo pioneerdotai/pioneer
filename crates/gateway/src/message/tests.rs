@@ -4036,6 +4036,7 @@ struct GuardAwareProvider {
 struct CreateThenHangProvider {
     next_index: AtomicUsize,
     root_main_started: Notify,
+    root_after_create: Notify,
 }
 
 #[async_trait::async_trait]
@@ -5141,6 +5142,9 @@ impl Provider for CreateThenHangProvider {
                 tool_calls: Vec::new(),
             });
         }
+        // Reaching the next parent request proves task_create returned through
+        // the real tool loop, including its durable item acknowledgement.
+        self.root_after_create.notify_one();
         sleep(Duration::from_secs(10)).await;
         Ok(ChatResponse {
             messages: Vec::new(),
@@ -5175,6 +5179,7 @@ impl CreateThenHangProvider {
         Self {
             next_index: AtomicUsize::new(0),
             root_main_started: Notify::new(),
+            root_after_create: Notify::new(),
         }
     }
 
@@ -42455,6 +42460,15 @@ async fn task_progress_refreshes_parent_task_anchor_preview_impl() {
     let run_id = wait_for_task_run_id(crud_store.clone(), task_id.as_str()).await;
     let lineage = wait_for_child_lineage_for_run(crud_store.clone(), run_id.as_str()).await;
     assert_eq!(lineage.parent_thread_id, thread_id);
+
+    timeout(
+        Duration::from_secs(5),
+        provider.root_after_create.notified(),
+    )
+    .await
+    .expect(
+        "task_create must finish and reach the next parent provider request while start is held",
+    );
 
     let progress_message = "TaskAgentExecutor is checking task anchor projection";
     let progress_event = crud_store
