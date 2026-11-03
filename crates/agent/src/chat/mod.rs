@@ -1972,17 +1972,6 @@ fn append_native_filesystem_capability_section(
     let content = format!(
         "When filesystem tools are available, use `read_file`, `list_dir`, `grep_files`, and `apply_patch` for their respective operations. Use `apply_patch` as the general UTF-8 text editor and follow its complete syntax and examples exactly. {apply_patch_input} Resolve relative paths from the cwd in the current turn context. Filesystem roots in that context describe scope; the runtime enforces authorization for every operation. Read unfamiliar files before updating them. If a call fails, follow the returned error and next action instead of repeating the same call or switching to shell editing. If filesystem tools are unavailable, do not invent a replacement text editor."
     );
-    let availability = if capability.is_supported() {
-        "Provider filesystem projection: `read_file`, `list_dir`, `grep_files`, `apply_patch`. Actual visibility and authorization are determined by current tools and runtime policy.".to_owned()
-    } else {
-        format!(
-            "Provider filesystem projection: `read_file` and `apply_patch` are not available ({reason}).",
-            reason = capability
-                .reason
-                .as_deref()
-                .unwrap_or("the selected model connection does not support them")
-        )
-    };
     let mut sections = runtime_sections
         .into_iter()
         .filter(|section| section.id.manifest_id() != FILESYSTEM_CAPABILITY_RUNTIME_SECTION_ID)
@@ -1994,6 +1983,16 @@ fn append_native_filesystem_capability_section(
         max_chars: None,
         truncated: false,
     });
+    if capability.is_supported() {
+        return Ok(sections);
+    }
+    let availability = format!(
+        "Provider filesystem projection: `read_file` and `apply_patch` are not available ({reason}).",
+        reason = capability
+            .reason
+            .as_deref()
+            .unwrap_or("the selected model connection does not support them")
+    );
     // Native callers build this set from fresh hook contributions on each
     // compile. Merge with any existing capability facts, preserving their
     // provenance/channel and budget; never put the current inventory in rules.
@@ -2019,6 +2018,83 @@ fn append_native_filesystem_capability_section(
     Ok(sections)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn native_turn_context(
+    now: &chrono::DateTime<Local>,
+    model: &str,
+    provider: &str,
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+    hook_runtime_context: &AgentTurnHookRuntimeContext,
+    security: &TurnExecutionSecuritySnapshot,
+    permission_profile: &TurnPermissionProfileSnapshot,
+    capabilities: &[TurnCapability],
+) -> String {
+    format!(
+        "## Execution\n\nDate: {} ({})\nRuntime: API\nModel: {}\nProvider: {}\n\n## Environment\n\nCwd: {}\nFilesystem scope: {}\nPermission mode: {:?}\n{}\n\n## Conversation\n\nWorkspace: {}\nThread: {}\nInitiating thread: {}\nTurn: {}\nActor: {}\n\n## Skills\n\nExplicit selection: {}",
+        now.format("%Y-%m-%d"),
+        now.format("%:z"),
+        model,
+        provider,
+        security.sandbox.cwd,
+        native_filesystem_scope(Some(security)),
+        permission_profile.mode,
+        native_approval_description(&security.approval),
+        workspace_id,
+        thread_id,
+        hook_runtime_context
+            .conversation_thread_id
+            .as_deref()
+            .unwrap_or(thread_id),
+        turn_id,
+        hook_runtime_context
+            .actor_id
+            .as_deref()
+            .unwrap_or("unavailable"),
+        serde_json::to_string(
+            &normalize_turn_capabilities(capabilities)
+                .skill_refs
+                .iter()
+                .map(|reference| serde_json::json!({
+                    "reference": reference.capability_id(), "label": reference.label
+                }))
+                .collect::<Vec<_>>()
+        )
+        .expect("explicit skill references serialize")
+    )
+}
+
+fn native_approval_description(
+    policy: &pioneer_protocol::TurnApprovalScopePolicySnapshot,
+) -> String {
+    let scopes = [
+        (policy.allow_once, "once"),
+        (policy.allow_for_turn, "turn"),
+        (policy.allow_for_session, "session"),
+        (policy.allow_always, "always"),
+    ]
+    .into_iter()
+    .filter_map(|(enabled, label)| enabled.then_some(label))
+    .collect::<Vec<_>>();
+    if scopes.is_empty() && !policy.request_permissions {
+        return "Approval prompts: unavailable".to_owned();
+    }
+    format!(
+        "Approval prompts: {}\nAdditional permissions requests: {}",
+        if scopes.is_empty() {
+            "no action approval scopes".to_owned()
+        } else {
+            format!("available (scopes: {})", scopes.join(", "))
+        },
+        if policy.request_permissions {
+            "available"
+        } else {
+            "unavailable"
+        }
+    )
+}
+
 fn native_filesystem_scope(snapshot: Option<&TurnExecutionSecuritySnapshot>) -> String {
     let Some(snapshot) = snapshot else {
         return "The trusted turn filesystem scope is unavailable; do not attempt filesystem operations.".to_owned();
@@ -2026,9 +2102,7 @@ fn native_filesystem_scope(snapshot: Option<&TurnExecutionSecuritySnapshot>) -> 
     let cwd = snapshot.sandbox.cwd.as_str();
     if snapshot.sandbox.filesystem.kind == pioneer_protocol::TurnFilesystemSandboxKind::Unrestricted
     {
-        return format!(
-            "The current working directory is `{cwd}`; relative paths resolve from it. Filesystem access is unrestricted for this turn, so absolute paths are accepted."
-        );
+        return "unrestricted".to_owned();
     }
 
     let writable = FilePolicyChecker::allowed_roots(snapshot, FilePolicyOperation::Write)
@@ -2691,7 +2765,17 @@ fn prepare_context_metadata(
 ) -> (String, serde_json::Value) {
     let baseline = retained_inventory_bundle(plan, history);
     let payload = plan.turn_context_with_inventory_baseline(baseline.as_ref());
-    let context = format!("{environment}\n{}", payload.text);
+    // Both fragments are owned native turn projections. The entry already
+    // opens Skills for the explicit selection; append its bounded references.
+    let facts = payload
+        .text
+        .strip_prefix("## Skills\n\n")
+        .unwrap_or(&payload.text);
+    let context = if facts.is_empty() {
+        environment.to_owned()
+    } else {
+        format!("{environment}\n\n{facts}")
+    };
     let inventory = plan
         .bundle
         .sections
@@ -3336,37 +3420,17 @@ pub(super) async fn execute_chat_turn_flow(
     let security = execution_security_snapshot
         .as_ref()
         .expect("security snapshot checked");
-    let context = format!(
-        "Date: {} ({})\nRuntime: native API\nModel: {}\nWorkspace: {}\nThread: {}\nTurn: {}\nCwd: {}\nFilesystem scope: {}\nPermission: {:?}\nApproval: {:?}\nExplicit skills: {:?}",
-        now.format("%Y-%m-%d"),
-        now.format("%Z"),
-        model,
-        workspace_id,
-        thread_id,
-        turn_id,
-        security.sandbox.cwd,
-        native_filesystem_scope(Some(security)),
-        permission_profile.mode,
-        security.approval,
-        normalize_turn_capabilities(&capabilities).skill_refs
-    );
-    let context = format!(
-        "{context}\nProvider: {}\nProvider instance: {}\nInitiating thread: {}\nActor: {}",
+    let context = native_turn_context(
+        &now,
+        &model,
         provider.name(),
-        context_session
-            .as_ref()
-            .map_or("unavailable", |session| session
-                .context
-                .provider_instance
-                .as_str()),
-        hook_runtime_context
-            .conversation_thread_id
-            .as_deref()
-            .unwrap_or(&thread_id),
-        hook_runtime_context
-            .actor_id
-            .as_deref()
-            .unwrap_or("unavailable")
+        &workspace_id,
+        &thread_id,
+        &turn_id,
+        &hook_runtime_context,
+        security,
+        &permission_profile,
+        &capabilities,
     );
     let result = match mode {
         ThreadMode::Message => unreachable!("message mode is rejected before provider execution"),
@@ -8454,6 +8518,11 @@ mod tests {
             .content
             .as_str();
 
+        assert!(
+            !sections
+                .iter()
+                .any(|section| section.content.contains("Provider filesystem projection:"))
+        );
         assert!(content.contains("exactly one JSON field named `patch`"));
         assert!(content.contains("cwd in the current turn context"));
         assert!(!content.contains("/tmp/pioneer-filesystem-prompt"));
@@ -8463,6 +8532,68 @@ mod tests {
         assert!(!lowered.contains("wire shape"));
         assert!(!lowered.contains("proposal"));
         assert!(!lowered.contains("if-match"));
+    }
+
+    #[test]
+    fn native_turn_security_facts_preserve_effective_scope_and_approval_semantics() {
+        use pioneer_protocol::{TurnApprovalScopePolicySnapshot as Approval, TurnPermissionMode};
+        let mut snapshot = TurnExecutionSecuritySnapshot::unrestricted_full_access("/", 1);
+        snapshot.sandbox.filesystem.kind = pioneer_protocol::TurnFilesystemSandboxKind::Restricted;
+        for (approval, expected) in [
+            (Approval::full_access(), "Approval prompts: unavailable"),
+            (
+                Approval::supervised(),
+                "Approval prompts: available (scopes: once, turn)\nAdditional permissions requests: available",
+            ),
+            (
+                Approval::auto_accept_edits(),
+                "Approval prompts: available (scopes: once, turn)\nAdditional permissions requests: available",
+            ),
+            (
+                Approval {
+                    allow_once: false,
+                    allow_for_turn: false,
+                    allow_for_session: true,
+                    allow_always: true,
+                    request_permissions: false,
+                },
+                "Approval prompts: available (scopes: session, always)\nAdditional permissions requests: unavailable",
+            ),
+            (
+                Approval {
+                    request_permissions: true,
+                    ..Approval::full_access()
+                },
+                "Approval prompts: no action approval scopes\nAdditional permissions requests: available",
+            ),
+        ] {
+            snapshot.approval = approval;
+            let context = super::native_turn_context(
+                &chrono::Local::now(),
+                "selected-model",
+                "provider",
+                "workspace",
+                "execution",
+                "turn",
+                &crate::AgentTurnHookRuntimeContext {
+                    conversation_thread_id: Some("initiating".into()),
+                    actor_id: Some("actor".into()),
+                    ..Default::default()
+                },
+                &snapshot,
+                &snapshot.permission_profile,
+                &[],
+            );
+            assert_eq!(
+                snapshot.permission_profile.mode,
+                TurnPermissionMode::FullAccess
+            );
+            assert!(context.contains("Permission mode: FullAccess"));
+            assert!(context.contains(expected));
+            assert!(!context.contains("Filesystem scope: unrestricted"));
+            assert!(!context.contains("TurnApprovalScopePolicySnapshot"));
+            assert!(context.contains("Thread: execution\nInitiating thread: initiating\nTurn: turn\nActor: actor\n\n## Skills\n\nExplicit selection: []"));
+        }
     }
 
     fn execution_checkpoint_context_fixture() -> ExecutionCheckpointContext {

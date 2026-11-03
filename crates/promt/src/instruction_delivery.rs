@@ -134,7 +134,7 @@ impl CompiledInstructionDeliveryPlan {
                 });
             }
         }
-        let text = render_sections(&selected);
+        let text = render_turn_sections(&selected, self.bundle.profile);
         CompiledInstructionPayload {
             fingerprint: sha256_hex(&text),
             text,
@@ -198,11 +198,13 @@ pub fn compile_instruction_delivery_plan(
         bundle.sections.as_slice(),
         sections.as_slice(),
         InstructionDeliveryChannel::ProviderInstructions,
+        bundle.profile,
     );
     let turn_context = compile_rendered_channel(
         bundle.sections.as_slice(),
         sections.as_slice(),
         InstructionDeliveryChannel::TurnContext,
+        bundle.profile,
     );
 
     if provider_instructions.is_empty()
@@ -354,10 +356,52 @@ fn instruction_trust(id: &PromptSectionId) -> InstructionTrust {
     }
 }
 
+// Only native turn facts use this layout. CLI and governing documents keep
+// their existing renderer; section content and inventory identity stay intact.
+fn render_turn_sections(sections: &[PromptSection], profile: PromptProfile) -> String {
+    if profile == PromptProfile::CliRuntime {
+        return render_sections(sections);
+    }
+    let mut skills = Vec::new();
+    let mut tools = Vec::new();
+    let mut other = Vec::new();
+    for section in sections
+        .iter()
+        .filter(|section| !section.content.trim().is_empty())
+    {
+        match &section.id {
+            PromptSectionId::SkillsRuntimePrompt | PromptSectionId::SelectedSkills => {
+                skills.push(section.content.trim().to_owned());
+            }
+            PromptSectionId::SelectedCapabilities => tools.push(section.content.trim().to_owned()),
+            PromptSectionId::Dynamic(id)
+                if id.as_str() == crate::REQUEST_TOOLS_HIDDEN_DOMAIN_SECTION_ID =>
+            {
+                tools.push(format!(
+                    "### {}\n\n{}",
+                    section.title.trim(),
+                    section.content.trim()
+                ));
+            }
+            _ => other.push(render_sections(std::slice::from_ref(section))),
+        }
+    }
+    let mut groups = Vec::new();
+    if !skills.is_empty() {
+        groups.push(format!("## Skills\n\n{}", skills.join("\n\n")));
+    }
+    if !tools.is_empty() {
+        groups.push(format!("## Tools\n\n{}", tools.join("\n\n")));
+    }
+    groups.extend(other);
+    groups.join("\n\n")
+}
+
 fn compile_rendered_channel(
     prompt_sections: &[PromptSection],
     plan_sections: &[InstructionSectionPlan],
     channel: InstructionDeliveryChannel,
+    profile: PromptProfile,
 ) -> CompiledInstructionPayload {
     let mut selected = prompt_sections
         .iter()
@@ -370,7 +414,11 @@ fn compile_rendered_channel(
     // equal keys preserve source/override order. Persisted payload replay
     // bypasses this renderer and remains byte-for-byte unchanged.
     selected.sort_by_key(|section| section.id.instruction_order());
-    let text = render_sections(selected.as_slice());
+    let text = if channel == InstructionDeliveryChannel::TurnContext {
+        render_turn_sections(&selected, profile)
+    } else {
+        render_sections(&selected)
+    };
     CompiledInstructionPayload {
         fingerprint: sha256_hex(text.as_str()),
         text,
@@ -462,6 +510,23 @@ mod tests {
                     section(PromptSectionId::ExtraSystem, "external system text"),
                     section(PromptSectionId::MemoryRecall, "memory operating contract"),
                     section(PromptSectionId::DynamicContext, "current date and cwd"),
+                    section(
+                        PromptSectionId::SkillsRuntimePrompt,
+                        "[Internal Skill References]\n- pioneer/tasks: `skill:exact`\n  version: 2; package fingerprint: sha256:fixture; binding: system",
+                    ),
+                    section(
+                        PromptSectionId::SelectedCapabilities,
+                        "read_file unavailable",
+                    ),
+                    section(
+                        PromptSectionId::Dynamic(
+                            crate::PromptDynamicSectionId::new(
+                                crate::REQUEST_TOOLS_HIDDEN_DOMAIN_SECTION_ID,
+                            )
+                            .unwrap(),
+                        ),
+                        "call request_tools with domains: [\"task\"]",
+                    ),
                 ],
             );
 
@@ -485,6 +550,10 @@ mod tests {
                     .contains("current date and cwd")
             );
             assert!(plan.turn_context.text.contains("current date and cwd"));
+            assert!(plan.turn_context.text.starts_with("## Skills\n\n[Internal Skill References]\n- pioneer/tasks: `skill:exact`\n  version: 2; package fingerprint: sha256:fixture; binding: system\n\n## Tools\n\nread_file unavailable\n\n### Section\n\ncall request_tools with domains: [\"task\"]"));
+            assert!(!plan.turn_context.text.contains("Selected Capabilities"));
+            assert!(!plan.provider_instructions.text.contains("skill:exact"));
+
             assert_eq!(
                 plan.sections[0].channel,
                 InstructionDeliveryChannel::ProviderInstructions
