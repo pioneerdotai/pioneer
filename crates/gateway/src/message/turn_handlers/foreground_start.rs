@@ -39,6 +39,8 @@ pub(crate) struct StartObligation {
     activated: tokio::sync::Notify,
     mandatory_ready: AtomicBool,
     published: tokio::sync::Notify,
+    #[cfg(test)]
+    pub(crate) publication_wait_joined: tokio::sync::Notify,
 }
 
 tokio::task_local! {
@@ -89,6 +91,8 @@ impl StartObligation {
             if !self.pending.load(Ordering::Acquire) {
                 return;
             }
+            #[cfg(test)]
+            self.publication_wait_joined.notify_one();
             changed.await;
         }
     }
@@ -190,6 +194,8 @@ impl ForegroundStartOwners {
             activated: tokio::sync::Notify::new(),
             mandatory_ready: AtomicBool::new(false),
             published: tokio::sync::Notify::new(),
+            #[cfg(test)]
+            publication_wait_joined: tokio::sync::Notify::new(),
         });
         state
             .entries

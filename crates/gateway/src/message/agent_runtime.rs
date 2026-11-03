@@ -7529,12 +7529,14 @@ impl MessageProcessor {
                     item: failed_item,
                 };
                 match self
-                    .crud_store
-                    .materialize_item_completed(completed.clone(), event_timestamp)
+                    .materialize_independent_item_lifecycle(
+                        pioneer_crud::CanonicalTurnEventPayload::ItemCompleted(completed.clone()),
+                        event_timestamp,
+                    )
                     .await
                 {
-                    Ok(()) => {
-                        if !self.foreground_starts.pending(&thread_id, &outcome.turn_id) {
+                    Ok(live) => {
+                        if !live {
                             self.send_notification_to_thread_subscribers(
                                 thread_id.as_str(),
                                 events::ITEM_COMPLETED,
@@ -9139,30 +9141,80 @@ impl MessageProcessor {
             .await
     }
 
+    /// Task service/recovery own these mutations independently of provider
+    /// execution. Choosing LIVE changes only optional delivery, not authority.
+    /// Once a completion/timeout joined LIVE, its durable receipt keeps later
+    /// updates behind the same canonical sequence even after Pending releases.
+    pub(super) async fn materialize_independent_item_lifecycle(
+        &self,
+        event: pioneer_crud::CanonicalTurnEventPayload,
+        timestamp: i64,
+    ) -> Result<bool> {
+        use pioneer_crud::CanonicalTurnEventPayload as Event;
+        let item_id = match &event {
+            Event::ItemCompleted(n) => n.item.item_id(),
+            Event::ItemUpdated(n) => n.item.item_id(),
+            Event::ItemTimeoutDetected(n) => n.item_id.as_str(),
+            _ => bail!("independent item lifecycle requires completion, update or timeout"),
+        };
+        let live = self
+            .foreground_starts
+            .pending(event.thread_id(), event.turn_id())
+            || self
+                .crud_store
+                .independent_item_uses_live_delivery(event.thread_id(), event.turn_id(), item_id)
+                .await?;
+        if live {
+            // The unowned CRUD API preserves task/recovery authority after
+            // parent Stop/replacement. Provider-owned append remains fenced.
+            self.crud_store
+                .materialize_native_agent_turn_event(event, timestamp, None)
+                .await?;
+            self.kick_native_turn_event_deliveries();
+        } else {
+            match event {
+                Event::ItemCompleted(n) => {
+                    self.crud_store
+                        .materialize_item_completed(n, timestamp)
+                        .await?
+                }
+                Event::ItemUpdated(n) => {
+                    self.crud_store
+                        .materialize_item_updated(n, timestamp)
+                        .await?
+                }
+                Event::ItemTimeoutDetected(n) => {
+                    self.crud_store
+                        .materialize_item_timeout_detected(n, timestamp)
+                        .await?
+                }
+                _ => unreachable!(),
+            }
+        }
+        Ok(live)
+    }
+
     async fn persist_and_send_item_timeout_detected(
         &self,
         notification: pioneer_protocol::ItemTimeoutDetectedNotification,
         event_timestamp: i64,
     ) {
-        if let Err(error) = self
-            .crud_store
-            .materialize_item_timeout_detected(notification.clone(), event_timestamp)
+        let live = match self
+            .materialize_independent_item_lifecycle(
+                pioneer_crud::CanonicalTurnEventPayload::ItemTimeoutDetected(notification.clone()),
+                event_timestamp,
+            )
             .await
         {
-            warn!(
-                thread_id = notification.thread_id.as_str(),
-                turn_id = notification.turn_id.as_str(),
-                item_id = notification.item_id.as_str(),
-                error = %format!("{error:#}"),
-                "failed to persist item timeout recovery timeline event; skipping live notification"
-            );
-            return;
-        }
-
-        if !self
-            .foreground_starts
-            .pending(&notification.thread_id, &notification.turn_id)
-        {
+            Ok(live) => live,
+            Err(error) => {
+                warn!(thread_id = notification.thread_id, turn_id = notification.turn_id,
+                    item_id = notification.item_id, error = %format!("{error:#}"),
+                    "failed to persist item timeout recovery timeline event; skipping live notification");
+                return;
+            }
+        };
+        if !live {
             self.send_notification_to_thread_subscribers(
                 notification.thread_id.as_str(),
                 events::ITEM_TIMEOUT_DETECTED,

@@ -173,20 +173,24 @@ impl Fixture {
         while let Ok(Message::Text(text)) = self.rx.try_recv() {
             let value: JsonValue = serde_json::from_str(&text).unwrap();
             assert!(
-                !matches!(
-                    value["method"].as_str(),
-                    Some(
-                        events::TURN_STARTED
-                            | events::TURN_COMPLETED
-                            | events::TURN_FAILED
-                            | events::TURN_BLOCKED
-                            | events::ITEM_STARTED
-                            | events::ITEM_COMPLETED
-                            | events::ITEM_UPDATED
-                            | events::ITEM_COMMAND_EXECUTION_OUTPUT_DELTA
-                            | events::ITEM_AGENT_MESSAGE_DELTA
-                    )
-                ),
+                !value["method"]
+                    .as_str()
+                    .is_some_and(|method| method.starts_with("item/"))
+                    && !matches!(
+                        value["method"].as_str(),
+                        Some(
+                            events::TURN_STARTED
+                                | events::TURN_COMPLETED
+                                | events::TURN_FAILED
+                                | events::TURN_BLOCKED
+                                | events::ITEM_STARTED
+                                | events::ITEM_COMPLETED
+                                | events::ITEM_UPDATED
+                                | events::ITEM_TIMEOUT_DETECTED
+                                | events::ITEM_COMMAND_EXECUTION_OUTPUT_DELTA
+                                | events::ITEM_AGENT_MESSAGE_DELTA
+                        )
+                    ),
                 "dependent event escaped the start owner: {value}"
             );
         }
@@ -259,12 +263,12 @@ async fn stalled_start_fanout_allows_rpc_ack_handoff_and_durable_fast_terminal_i
     }
     f.no_dependent_events();
     f.processor.release_completed_history_preparation_barrier();
-    let start = recv_notification_by_method(&mut f.rx, events::TURN_STARTED).await;
-    assert_eq!(start.params.unwrap()["turn"]["id"], TURN);
-    // Drive the existing durable retry owner with a due timestamp; no sorting mock.
+    // Keep every relevant wire event from the held-drain through terminal.
+    // A method-search helper here would silently discard terminal -> start.
     timeout(Duration::from_secs(10), async {
+        let (mut started, mut terminal) = (false, false);
         loop {
-            let deliveries = f
+            for delivery in f
                 .store
                 .claim_due_turn_event_deliveries(
                     pioneer_crud::NATIVE_TURN_EVENT_LIVE_CONSUMER,
@@ -272,18 +276,51 @@ async fn stalled_start_fanout_allows_rpc_ack_handoff_and_durable_fast_terminal_i
                     64,
                 )
                 .await
-                .unwrap();
-            for delivery in deliveries {
+                .unwrap()
+            {
                 f.processor
                     .process_claimed_native_turn_event_delivery(delivery)
                     .await
                     .unwrap();
             }
-            if completion_live_delivery(&f.store, TURN).await.status == "delivered" {
+            while let Ok(Message::Text(text)) = f.rx.try_recv() {
+                let value: JsonValue = serde_json::from_str(&text).unwrap();
+                let params = &value["params"];
+                if params["turn_id"] != TURN && params["turn"]["id"] != TURN {
+                    continue;
+                }
+                if value["method"] == events::TURN_STARTED {
+                    assert!(!started, "duplicate initial start: {value}");
+                    started = true;
+                } else if value["method"]
+                    .as_str()
+                    .is_some_and(|method| method.starts_with("item/"))
+                    || matches!(
+                        value["method"].as_str(),
+                        Some(
+                            events::TURN_COMPLETED
+                                | events::TURN_FAILED
+                                | events::TURN_BLOCKED
+                                | events::ITEM_STARTED
+                                | events::ITEM_COMPLETED
+                                | events::ITEM_UPDATED
+                                | events::ITEM_AGENT_MESSAGE_DELTA
+                                | events::ITEM_COMMAND_EXECUTION_OUTPUT_DELTA
+                        )
+                    )
+                {
+                    assert!(started, "dependent event preceded start: {value}");
+                    if value["method"] == events::TURN_COMPLETED {
+                        terminal = true;
+                    }
+                }
+            }
+            if terminal && completion_live_delivery(&f.store, TURN).await.status == "delivered" {
                 break;
             }
             tokio::task::yield_now().await;
         }
+        assert!(started && terminal);
     })
     .await
     .unwrap();
@@ -336,19 +373,44 @@ async fn dropping_accepted_response_releases_publication_but_not_execution() {
 
 #[tokio::test]
 async fn duplicate_request_joins_publication_and_retains_canonical_ids_without_another_provider() {
-    let f = Fixture::new().await;
+    let mut f = Fixture::new().await;
     f.processor
         .arm_completed_history_preparation_barrier(PUBLICATION);
     let accepted = f.accepted(f.start(f.params(TURN)).await).await;
     let canonical = accepted.response.turn.id.clone();
     drop(accepted);
     f.reached().await;
-    let replay = f.start(f.params(TURN)).await;
-    assert!(!replay.is_finished());
+    let entry = f.processor.foreground_starts.entry(THREAD, TURN).unwrap();
+    let processor = f.processor.clone();
+    let connection = f.connection;
+    let id = generate_test_request_id("foreground", "duplicate-pending");
+    let request =
+        json!({"jsonrpc":"2.0","id":id,"method":"turn/start","params":f.params(TURN)}).to_string();
+    let replay = tokio::spawn(async move {
+        processor
+            .process_request_for_connection(connection, &request)
+            .await;
+    });
+    // Test-only notification is emitted from the real publication wait after
+    // registration and the Pending predicate. Removing replay's wait misses it.
+    timeout(
+        Duration::from_secs(10),
+        entry.publication_wait_joined.notified(),
+    )
+    .await
+    .unwrap();
+    while let Ok(Message::Text(text)) = f.rx.try_recv() {
+        let value: JsonValue = serde_json::from_str(&text).unwrap();
+        assert_ne!(value["id"], json!(id), "replay answered before publication");
+        assert_ne!(value["method"], events::TURN_STARTED);
+    }
     f.processor.release_completed_history_preparation_barrier();
-    let replay = f.accepted(replay).await;
-    assert_eq!(replay.response.turn.id, canonical);
-    drop(replay);
+    timeout(Duration::from_secs(10), replay)
+        .await
+        .unwrap()
+        .unwrap();
+    let replay = recv_response_by_id(&mut f.rx, &id).await;
+    assert_eq!(replay.result["turn"]["id"], canonical);
     timeout(Duration::from_secs(10), f.entered.notified())
         .await
         .unwrap();
@@ -1418,4 +1480,170 @@ async fn unfinished_owned_startup_is_discovered_by_a_fresh_process_recovery_owne
     assert_eq!(f.calls.load(Ordering::SeqCst), 0);
     restored.shutdown_resilience_workers().await;
     f.close().await;
+}
+
+#[tokio::test]
+async fn timeout_and_synthetic_failed_item_keep_durable_live_obligations_during_startup() {
+    for timeout_case in [true, false] {
+        let mut f = Fixture::new().await;
+        f.processor
+            .arm_completed_history_preparation_barrier(PUBLICATION);
+        drop(f.accepted(f.start(f.params(TURN)).await).await);
+        f.reached().await;
+        timeout(Duration::from_secs(10), f.entered.notified())
+            .await
+            .unwrap();
+        let item_id = "startup-command-recovery";
+        let started_at = now_timestamp_secs();
+        f.store
+            .materialize_native_agent_turn_event(
+                pioneer_crud::CanonicalTurnEventPayload::ItemStarted(
+                    pioneer_protocol::ItemStartedNotification {
+                        workspace_id: f.workspace.clone(),
+                        thread_id: THREAD.into(),
+                        turn_id: TURN.into(),
+                        item: command_execution_item(item_id),
+                    },
+                ),
+                started_at,
+                Some(pioneer_crud::TurnItemAttemptDeadlines {
+                    lease_expires_at_unix: Some(started_at + 1),
+                    idle_deadline_at_unix: Some(started_at + 1),
+                    hard_deadline_at_unix: Some(started_at + 1),
+                }),
+            )
+            .await
+            .unwrap();
+        let due = started_at + 2;
+        if timeout_case {
+            // Real command deadline discovery and CAS, then actual timeout owner.
+            let candidate = f
+                .processor
+                .timeout_supervisor
+                .list_timeout_candidates(due, 64)
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|c| c.item_id == item_id)
+                .expect("actual command deadline must be due");
+            assert!(
+                f.processor
+                    .timeout_supervisor
+                    .transition_timeout_candidate(&candidate, due)
+                    .await
+                    .unwrap()
+            );
+            timeout(
+                Duration::from_secs(10),
+                f.processor.handle_timeout_candidate(candidate, due),
+            )
+            .await
+            .unwrap();
+            let events = pioneer_entity::turn_event::Entity::find()
+                .filter(pioneer_entity::turn_event::Column::TurnId.eq(TURN))
+                .filter(
+                    pioneer_entity::turn_event::Column::EventType.eq(events::ITEM_TIMEOUT_DETECTED),
+                )
+                .all(&f.store.database_connection())
+                .await
+                .unwrap();
+            assert_eq!(
+                events.len(),
+                1,
+                "timeout acceptance precedes optional publication"
+            );
+        } else {
+            // Runtime failure exhaustion retains an in-progress tool payload;
+            // unlike timeout's own terminalization this exercises the actual
+            // synthetic failed-completion producer, not a prefailed fixture.
+            let job = f
+                .processor
+                .recovery_coordinator
+                .enqueue_runtime_failure_job(
+                    &crate::resilience::RuntimeFailureCandidate {
+                        turn_id: TURN.into(),
+                        item_id: item_id.into(),
+                        item_type: pioneer_protocol::TurnItemType::CommandExecution,
+                        trigger: pioneer_protocol::RecoveryTrigger::RuntimeFailure,
+                        action: pioneer_protocol::RecoveryAction::RetryAttempt,
+                        reason: "fixture permanent command runtime failure".into(),
+                        base_backoff_secs: 0,
+                        max_attempts: 0,
+                        max_wall_clock_secs: 60,
+                        no_progress_limit: 1,
+                        metadata: pioneer_protocol::ToolMetadata::empty(),
+                    },
+                    started_at,
+                )
+                .await
+                .unwrap()
+                .into_job();
+            assert!(
+                f.store
+                    .mark_recovery_job_terminal(
+                        &job.id,
+                        pioneer_protocol::RecoveryJobStatus::Exhausted,
+                        Some("fixture exhausted command recovery".into()),
+                        started_at
+                    )
+                    .await
+                    .unwrap()
+            );
+            assert!(
+                timeout(
+                    Duration::from_secs(10),
+                    f.processor.handle_recovery_event(
+                        crate::resilience::RecoveryCoordinatorEvent::RecoveryExhausted(
+                            crate::resilience::RecoveryTerminalOutcome {
+                                job_id: job.id,
+                                turn_id: TURN.into(),
+                                item_id: item_id.into(),
+                                item_type: pioneer_protocol::TurnItemType::CommandExecution,
+                                attempt_number: 1,
+                                status: pioneer_protocol::RecoveryJobStatus::Exhausted,
+                                error_message: "fixture exhausted command recovery".into(),
+                            }
+                        ),
+                        started_at,
+                    )
+                )
+                .await
+                .unwrap()
+            );
+            assert!(matches!(
+                f.store.get_turn_item(TURN, item_id).await.unwrap(),
+                Some(TurnItem::CommandExecution {
+                    status: ToolCallStatus::Failed,
+                    ..
+                })
+            ));
+        }
+        f.no_dependent_events();
+        f.processor.release_completed_history_preparation_barrier();
+        timeout(Duration::from_secs(10), async {
+            let (mut started, mut observed) = (false, false);
+            while !observed {
+                for claim in f.store.claim_due_turn_event_deliveries(pioneer_crud::NATIVE_TURN_EVENT_LIVE_CONSUMER,
+                    now_timestamp_secs() + 600, 64).await.unwrap() {
+                    f.processor.process_claimed_native_turn_event_delivery(claim).await.unwrap();
+                }
+                while let Ok(Message::Text(text)) = f.rx.try_recv() {
+                    let value: JsonValue = serde_json::from_str(&text).unwrap();
+                    if value["method"] == events::TURN_STARTED && value["params"]["turn"]["id"] == TURN { started = true; }
+                    if value["params"]["turn_id"] != TURN { continue; }
+                    if timeout_case && value["method"] == events::ITEM_TIMEOUT_DETECTED && value["params"]["item_id"] == item_id {
+                        assert!(started); observed = true;
+                    }
+                    if !timeout_case && value["method"] == events::ITEM_COMPLETED {
+                        let n: pioneer_protocol::ItemCompletedNotification = serde_json::from_value(value["params"].clone()).unwrap();
+                        if matches!(n.item, TurnItem::CommandExecution { id, status: ToolCallStatus::Failed, .. } if id == item_id) {
+                            assert!(started); observed = true;
+                        }
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        }).await.unwrap();
+        f.close().await;
+    }
 }

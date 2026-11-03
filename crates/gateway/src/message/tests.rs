@@ -42368,6 +42368,36 @@ fn task_progress_refreshes_parent_task_anchor_preview() {
 }
 
 async fn task_progress_refreshes_parent_task_anchor_preview_impl() {
+    for scenario in ["ordered", "parent_stop", "foreign_replacement"] {
+        task_anchor_publication_scenario(scenario).await;
+    }
+}
+
+async fn fanout_task_event_through(processor: &MessageProcessor, task_id: &str, sequence: i64) {
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if processor
+                .crud_store
+                .get_task_event_fanout_cursor(task_id)
+                .await
+                .unwrap()
+                .is_some_and(|cursor| cursor >= sequence)
+            {
+                break;
+            }
+            processor
+                .for_background_reconciliation()
+                .task_event_fanout_quantum()
+                .await
+                .unwrap();
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("actual task fanout must acknowledge its durable event while optional LIVE is held");
+}
+
+async fn task_anchor_publication_scenario(scenario: &str) {
     let (tx, mut rx) = mpsc::channel(128);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
@@ -42408,6 +42438,10 @@ async fn task_progress_refreshes_parent_task_anchor_preview_impl() {
     )
     .await;
     while rx.try_recv().is_ok() {}
+    // Existing LIVE worker barrier, independent of the publication barrier.
+    // Keep queued A undrained even when start later releases.
+    let live_wake = processor.native_turn_event_delivery_workers.live.clone();
+    live_wake.claim_barrier.arm("timer");
     processor.arm_completed_history_preparation_barrier("__foreground_start_before_publication__");
     let start_id = generate_test_request_id("anchor", "held-start");
     let request = json!({"jsonrpc":"2.0", "id":start_id,"method":"turn/start", "params":{
@@ -42470,12 +42504,66 @@ async fn task_progress_refreshes_parent_task_anchor_preview_impl() {
         "task_create must finish and reach the next parent provider request while start is held",
     );
 
+    timeout(
+        Duration::from_secs(5),
+        live_wake.claim_barrier.wait_until_reached(),
+    )
+    .await
+    .unwrap();
+    if scenario != "ordered" {
+        let detached = detach_task_for_test(
+            &processor,
+            pioneer_protocol::TaskDetachParams {
+                task_id: task_id.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            detached.task.lifecycle_policy.as_ref().unwrap().attachment,
+            TaskAttachmentMode::Detached
+        );
+        if scenario == "parent_stop" {
+            assert!(
+                timeout(
+                    Duration::from_secs(5),
+                    processor.mark_turn_interrupted(
+                        thread_id.into(),
+                        turn_id.into(),
+                        "Stop with detached task".into()
+                    )
+                )
+                .await
+                .unwrap()
+            );
+        } else {
+            let original = crud_store
+                .get_turn_execution(turn_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let at = original.lease_until.timestamp() + 1;
+            let replacement = crud_store
+                .claim_expired_turn_execution(&original, "foreign-task-anchor-owner", at, at + 60)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_ne!(replacement.owner_id, original.owner_id);
+        }
+        let task = crud_store.get_task(&task_id).await.unwrap().unwrap();
+        assert_ne!(
+            task.task.status,
+            TaskStatus::Cancelled,
+            "detached task survives its parent"
+        );
+    }
+
     let progress_message = "TaskAgentExecutor is checking task anchor projection";
     let progress_event = crud_store
         .append_task_event(
             TaskEventPayload::Progress {
                 task_id: task_id.clone(),
-                run_id: Some(run_id.clone()),
+                run_id: (scenario == "ordered").then(|| run_id.clone()),
                 message: progress_message.to_owned(),
                 details: None,
             },
@@ -42483,10 +42571,7 @@ async fn task_progress_refreshes_parent_task_anchor_preview_impl() {
         )
         .await
         .expect("progress event should append");
-    processor
-        .emit_task_event(progress_event)
-        .await
-        .expect("progress event should refresh parent task anchor");
+    fanout_task_event_through(&processor, &task_id, progress_event.sequence).await;
 
     let anchor = wait_for_task_anchor_progress_preview(
         crud_store.clone(),
@@ -42495,15 +42580,19 @@ async fn task_progress_refreshes_parent_task_anchor_preview_impl() {
         progress_message,
     )
     .await;
-    assert_eq!(anchor.run_id.as_deref(), Some(run_id.as_str()));
-    assert_eq!(
-        anchor.child_thread_id.as_deref(),
-        Some(lineage.child_thread_id.as_str())
-    );
-    assert_eq!(
-        anchor.child_turn_id.as_deref(),
-        Some(lineage.child_turn_id.as_str())
-    );
+    if scenario == "ordered" {
+        assert_eq!(anchor.run_id.as_deref(), Some(run_id.as_str()));
+        assert_eq!(
+            anchor.child_thread_id.as_deref(),
+            Some(lineage.child_thread_id.as_str())
+        );
+        assert_eq!(
+            anchor.child_turn_id.as_deref(),
+            Some(lineage.child_turn_id.as_str())
+        );
+    } else {
+        assert_eq!(anchor.attachment, TaskAttachmentMode::Detached);
+    }
 
     // task_create persistence and the actual parent progress refresh have both
     // completed. Neither eager item fanout may bypass the held start.
@@ -42521,31 +42610,163 @@ async fn task_progress_refreshes_parent_task_anchor_preview_impl() {
         );
     }
     processor.release_completed_history_preparation_barrier();
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let Message::Text(text) = rx.recv().await.unwrap() else {
+                continue;
+            };
+            let value: JsonValue = serde_json::from_str(&text).unwrap();
+            assert!(
+                !(value["params"]["turn_id"] == turn_id
+                    && matches!(
+                        value["method"].as_str(),
+                        Some(events::ITEM_COMPLETED | events::ITEM_UPDATED)
+                    )),
+                "LIVE must still be held: {value}"
+            );
+            if value["method"] == events::TURN_STARTED && value["params"]["turn"]["id"] == turn_id {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!processor.foreground_starts.pending(thread_id, turn_id));
+    timeout(Duration::from_secs(5), async {
+        while processor
+            .foreground_starts
+            .entry(thread_id, turn_id)
+            .is_some()
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    // Actual B after Pending=false, before any A LIVE delivery. This must retain
+    // A's canonical owner; eager B followed by old A would roll the client back.
+    let latest_progress = "anchor B after start before LIVE drain";
+    let b = crud_store
+        .append_task_event(
+            TaskEventPayload::Progress {
+                task_id: task_id.clone(),
+                run_id: (scenario == "ordered").then(|| run_id.clone()),
+                message: latest_progress.into(),
+                details: None,
+            },
+            now_timestamp_secs(),
+        )
+        .await
+        .unwrap();
+    fanout_task_event_through(&processor, &task_id, b.sequence).await;
+    while let Ok(Message::Text(text)) = rx.try_recv() {
+        let value: JsonValue = serde_json::from_str(&text).unwrap();
+        assert!(
+            !(value["params"]["thread_id"] == thread_id
+                && value["params"]["turn_id"] == turn_id
+                && matches!(
+                    value["method"].as_str(),
+                    Some(events::ITEM_COMPLETED | events::ITEM_UPDATED)
+                )),
+            "eager update overtook queued A: {value}"
+        );
+    }
+    live_wake.claim_barrier.release();
     timeout(Duration::from_secs(10), async {
-        let (mut started, mut completed, mut refreshed) = (false, false, false);
-        while !completed || !refreshed {
-            for claim in crud_store.claim_due_turn_event_deliveries(pioneer_crud::NATIVE_TURN_EVENT_LIVE_CONSUMER, now_timestamp_secs() + 600, 64).await.unwrap() {
-                processor.process_claimed_native_turn_event_delivery(claim).await.unwrap();
+        let (mut completed, mut a, mut b) = (false, false, false);
+        let mut final_preview = None;
+        loop {
+            for claim in crud_store
+                .claim_due_turn_event_deliveries(
+                    pioneer_crud::NATIVE_TURN_EVENT_LIVE_CONSUMER,
+                    now_timestamp_secs() + 600,
+                    64,
+                )
+                .await
+                .unwrap()
+            {
+                processor
+                    .process_claimed_native_turn_event_delivery(claim)
+                    .await
+                    .unwrap();
             }
             while let Ok(Message::Text(text)) = rx.try_recv() {
                 let value: JsonValue = serde_json::from_str(&text).unwrap();
-                if value["method"] == events::TURN_STARTED && value["params"]["turn"]["id"] == turn_id { started = true; }
-                if value["params"]["thread_id"] != thread_id || value["params"]["turn_id"] != turn_id { continue; }
-                match value["method"].as_str() {
+                if value["params"]["thread_id"] != thread_id
+                    || value["params"]["turn_id"] != turn_id
+                {
+                    continue;
+                }
+                let item = match value["method"].as_str() {
                     Some(events::ITEM_COMPLETED) => {
-                        let n: ItemCompletedNotification = serde_json::from_value(value["params"].clone()).unwrap();
-                        if matches!(n.item, TurnItem::Task { item } if item.task_id == task_id) { assert!(started); completed = true; }
+                        let n: ItemCompletedNotification =
+                            serde_json::from_value(value["params"].clone()).unwrap();
+                        if matches!(&n.item, TurnItem::Task { item } if item.task_id == task_id) {
+                            assert!(!b);
+                            completed = true;
+                        }
+                        n.item
                     }
                     Some(events::ITEM_UPDATED) => {
-                        let n: ItemUpdatedNotification = serde_json::from_value(value["params"].clone()).unwrap();
-                        if matches!(n.item, TurnItem::Task { item } if item.task_id == task_id && item.progress_preview.as_deref() == Some(progress_message)) { assert!(started); refreshed = true; }
+                        serde_json::from_value::<ItemUpdatedNotification>(value["params"].clone())
+                            .unwrap()
+                            .item
                     }
-                    _ => {},
+                    _ => continue,
+                };
+                if let TurnItem::Task { item } = item
+                    && item.task_id == task_id
+                {
+                    if item.progress_preview.as_deref() == Some(progress_message) {
+                        assert!(!b, "A rolled back B");
+                        a = true;
+                    }
+                    if item.progress_preview.as_deref() == Some(latest_progress) {
+                        assert!(completed && a);
+                        b = true;
+                    }
+                    final_preview = item.progress_preview;
                 }
+            }
+            let queued = pioneer_entity::turn_event_delivery::Entity::find()
+                .filter(pioneer_entity::turn_event_delivery::Column::TurnId.eq(turn_id))
+                .filter(
+                    pioneer_entity::turn_event_delivery::Column::Consumer
+                        .eq(pioneer_crud::NATIVE_TURN_EVENT_LIVE_CONSUMER),
+                )
+                .filter(pioneer_entity::turn_event_delivery::Column::Status.is_in([
+                    "pending",
+                    "delivering",
+                    "failed",
+                ]))
+                .one(&crud_store.database_connection())
+                .await
+                .unwrap()
+                .is_some();
+            if b && !queued {
+                assert_eq!(final_preview.as_deref(), Some(latest_progress));
+                break;
             }
             tokio::task::yield_now().await;
         }
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
+    if scenario != "ordered" {
+        cancel_task_for_test(
+            &processor,
+            pioneer_protocol::TaskCancelParams {
+                task_id: task_id.clone(),
+                reason: Some("fixture cleanup".into()),
+                scope: pioneer_protocol::TaskCancelScope::AttachedSubtree,
+            },
+        )
+        .await
+        .unwrap();
+        processor.foreground_starts.shutdown().await;
+        processor.agent_manager.remove_thread(thread_id).await;
+        return;
+    }
 
     // Exercise the real child lineage/resolver and parent subscription path.
     wait_for_thread_manager_turn_status(

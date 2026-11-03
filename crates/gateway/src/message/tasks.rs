@@ -1214,27 +1214,21 @@ impl MessageProcessor {
             .await
     }
 
-    /// A Pending native source turn uses its existing durable LIVE owner.
-    /// Capture once before commit: opening the gate during the write must not
-    /// turn a deferred event into a suppressed generic projection.
+    /// Independent task anchors retain their canonical LIVE owner after start
+    /// publication; generic/occurrence anchors retain their eager path.
     pub(crate) async fn persist_task_anchor_event(
         &self,
         event: pioneer_crud::CanonicalTurnEventPayload,
         timestamp: i64,
     ) -> Result<bool> {
         if self
-            .foreground_starts
-            .pending(event.thread_id(), event.turn_id())
+            .materialize_independent_item_lifecycle(event.clone(), timestamp)
+            .await?
         {
-            self.materialize_native_agent_turn_event(event, timestamp, None)
-                .await?;
             return Ok(true);
         }
         match event {
             pioneer_crud::CanonicalTurnEventPayload::ItemCompleted(notification) => {
-                self.crud_store
-                    .materialize_item_completed(notification.clone(), timestamp)
-                    .await?;
                 self.send_notification_to_thread_subscribers(
                     &notification.thread_id,
                     events::ITEM_COMPLETED,
@@ -1243,9 +1237,6 @@ impl MessageProcessor {
                 .await;
             }
             pioneer_crud::CanonicalTurnEventPayload::ItemUpdated(notification) => {
-                self.crud_store
-                    .materialize_item_updated(notification.clone(), timestamp)
-                    .await?;
                 self.send_notification_to_thread_subscribers(
                     &notification.thread_id,
                     events::ITEM_UPDATED,

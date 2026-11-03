@@ -5551,6 +5551,23 @@ impl CrudStore {
         .await
     }
 
+    /// Existing canonical/LIVE receipts retain an independent item's delivery
+    /// owner after its startup publication and process-local obligation retire.
+    pub async fn independent_item_uses_live_delivery(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        item_id: &str,
+    ) -> Result<bool> {
+        turn_event_delivery::independent_item_uses_live(
+            &self.connection,
+            thread_id,
+            turn_id,
+            item_id,
+        )
+        .await
+    }
+
     /// Release a LIVE claim pending its foreground start without consuming a
     /// normal delivery retry. The exact claim token fences replacement workers.
     pub async fn defer_turn_event_delivery_for_foreground_start(

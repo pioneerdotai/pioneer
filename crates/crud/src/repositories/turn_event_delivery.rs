@@ -5,7 +5,7 @@ use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::{Expr, ExprTrait, Query, SimpleExpr};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, EntityTrait, QueryFilter,
-    QueryOrder, QuerySelect, Set,
+    QueryOrder, QuerySelect, QueryTrait, Set,
 };
 
 use crate::events::{AppendedTurnEvent, TurnEventPayload};
@@ -24,6 +24,78 @@ const DB_ID_LEN: usize = 21;
 pub struct ClaimedTurnEventDelivery {
     pub row: turn_event_delivery::Model,
     pub claim_token: String,
+}
+
+/// A LIVE completion retains delivery ownership for later independent item
+/// updates. A LIVE timeout retains it for recovery events in that source turn.
+/// Receipts, including delivered ones, share canonical history's lifetime;
+/// neither publication release nor projection-receipt compaction revokes them.
+/// TaskRun occurrences keep their established presentation/delivery owner.
+pub async fn independent_item_uses_live<C: ConnectionTrait>(
+    db: &C,
+    thread_id: &str,
+    turn_id: &str,
+    item_id: &str,
+) -> Result<bool> {
+    use pioneer_entity::{compaction_event_revision, turn, turn_event};
+    // Probe metadata by its source primary key for this turn's completions;
+    // do not build an item-ID list by scanning the entire revision table.
+    let item_event = Expr::exists(
+        Query::select()
+            .expr(Expr::val(1_i64))
+            .from(compaction_event_revision::Entity)
+            .and_where(
+                Expr::col((
+                    compaction_event_revision::Entity,
+                    compaction_event_revision::Column::SourceId,
+                ))
+                .eq(Expr::col((turn_event::Entity, turn_event::Column::Id))),
+            )
+            .and_where(compaction_event_revision::Column::TurnId.eq(turn_id))
+            .and_where(compaction_event_revision::Column::ItemId.eq(item_id))
+            .and_where(compaction_event_revision::Column::Present.eq(1))
+            .to_owned(),
+    );
+    let completions = turn_event::Entity::find()
+        .select_only()
+        .column(turn_event::Column::Id)
+        .filter(turn_event::Column::TurnId.eq(turn_id))
+        .filter(
+            turn_event::Column::EventType.eq(pioneer_protocol::constants::events::ITEM_COMPLETED),
+        )
+        .filter(item_event)
+        .into_query();
+    let timeouts = turn_event::Entity::find()
+        .select_only()
+        .column(turn_event::Column::Id)
+        .filter(turn_event::Column::TurnId.eq(turn_id))
+        .filter(
+            turn_event::Column::EventType
+                .eq(pioneer_protocol::constants::events::ITEM_TIMEOUT_DETECTED),
+        )
+        .into_query();
+    let conversations = turn::Entity::find()
+        .select_only()
+        .column(turn::Column::Id)
+        .filter(turn::Column::Id.eq(turn_id))
+        .filter(turn::Column::TurnKind.eq("conversation"))
+        .into_query();
+    Ok(turn_event_delivery::Entity::find()
+        .select_only()
+        .column(turn_event_delivery::Column::Id)
+        .filter(turn_event_delivery::Column::ThreadId.eq(thread_id))
+        .filter(turn_event_delivery::Column::TurnId.eq(turn_id))
+        .filter(turn_event_delivery::Column::TurnId.in_subquery(conversations))
+        .filter(turn_event_delivery::Column::Consumer.eq(CONSUMER_LIVE_NOTIFICATION))
+        .filter(
+            Condition::any()
+                .add(turn_event_delivery::Column::EventId.in_subquery(completions))
+                .add(turn_event_delivery::Column::EventId.in_subquery(timeouts)),
+        )
+        .into_tuple::<String>()
+        .one(db)
+        .await?
+        .is_some())
 }
 
 pub async fn insert_pending_for_event<C: ConnectionTrait>(
