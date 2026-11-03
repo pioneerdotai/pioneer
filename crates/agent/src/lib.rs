@@ -3240,6 +3240,7 @@ impl AgentManager {
             reasoning_effort,
             permission_profile,
             execution_security_snapshot,
+            None,
         )
         .await.map(|_| ())
     }
@@ -3263,6 +3264,7 @@ impl AgentManager {
         reasoning_effort: Option<&str>,
         permission_profile: TurnPermissionProfileSnapshot,
         execution_security_snapshot: TurnExecutionSecuritySnapshot,
+        expected_actor_generation: Option<u64>,
     ) -> Result<AgentStartReceipt, AgentStartError> {
         let reasoning = reasoning_config_from_effort(reasoning_effort)?;
         self.start_turn_with_hook_context_and_execution_checkpoint_and_reasoning(
@@ -3284,6 +3286,7 @@ impl AgentManager {
             reasoning,
             permission_profile,
             Some(execution_security_snapshot),
+            expected_actor_generation,
         )
         .await
     }
@@ -3453,6 +3456,7 @@ impl AgentManager {
             reasoning,
             permission_profile,
             Some(execution_security_snapshot),
+            None,
         )
         .await
         .map(|_| ())
@@ -3540,6 +3544,7 @@ impl AgentManager {
             None,
             permission_profile,
             Some(execution_security_snapshot),
+            None,
         )
         .await
         .map(|_| ())
@@ -3566,12 +3571,16 @@ impl AgentManager {
         reasoning: Option<ReasoningConfig>,
         permission_profile: TurnPermissionProfileSnapshot,
         execution_security_snapshot: Option<TurnExecutionSecuritySnapshot>,
+        expected_actor_generation: Option<u64>,
     ) -> Result<AgentStartReceipt, AgentStartError> {
         let (command_tx, actor_generation, outcomes) = {
             let state = self.state.read().await;
             let Some(thread) = state.threads.get(thread_id) else {
                 return Err(AgentStartError::ThreadNotFound);
             };
+            if expected_actor_generation.is_some_and(|generation| generation != thread.generation) {
+                return Err(AgentStartError::ThreadNotFound);
+            }
             (
                 thread.command_tx.clone(),
                 thread.generation,
@@ -3879,18 +3888,21 @@ impl AgentManager {
     }
 
     /// Cancel only the incarnation that acknowledged this initial start.
+    /// Gateway startup also supplies its original durable owner so cancellation
+    /// cannot terminalize an execution which replaced that accepted run.
     pub async fn cancel_started_turn(
         &self,
         thread_id: &str,
         receipt: &AgentStartReceipt,
         reason: &str,
+        execution_owner: Option<(&str, u64)>,
     ) -> Result<bool, AgentControlError> {
         self.cancel_turn_owned(
             thread_id,
             &receipt.turn_id,
             reason,
             Some((receipt.actor_generation, receipt.run_id)),
-            None,
+            execution_owner.map(|(owner, generation)| (owner.to_owned(), generation)),
         )
         .await
     }
@@ -4123,6 +4135,31 @@ impl AgentManager {
                 .cancellation_context_registered
                 .load(Ordering::Acquire))
         .then_some((thread.generation, control.run_id))
+    }
+
+    /// Initial activation source, read from the same control plane as Stop.
+    pub async fn initial_start_receipt(
+        &self,
+        preparation: &pioneer_protocol::NativeTerminalEffectPreparation,
+    ) -> Option<AgentStartReceipt> {
+        let state = self.state.read().await;
+        let thread = state.threads.get(&preparation.thread_id)?;
+        let control = thread.control_plane.execution_for(&preparation.turn_id)?;
+        if thread.workspace_id != preparation.workspace_id
+            || !control.initial_cancellation_registration
+            || preparation.batch_id
+                != format!(
+                    "{}:terminal-effects:{}:{}",
+                    preparation.turn_id, control.run_id, preparation.runtime_generation
+                )
+        {
+            return None;
+        }
+        Some(AgentStartReceipt {
+            turn_id: preparation.turn_id.clone(),
+            actor_generation: thread.generation,
+            run_id: control.run_id,
+        })
     }
 
     /// A queued initial Stop remains owned by this exact actor/run even after

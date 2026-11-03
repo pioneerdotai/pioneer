@@ -4251,6 +4251,7 @@ async fn start_agent_skill_delivery_turn(
             None,
             pioneer_protocol::default_turn_permission_profile_snapshot(),
             test_full_access_security_snapshot(),
+            None,
         )
         .await
         .expect("turn should start");
@@ -15158,7 +15159,7 @@ async fn initial_start_receipt_cannot_cancel_a_later_run_in_the_same_actor() {
     assert!(!manager.start_receipt_is_current(thread_id, &original).await);
     assert!(matches!(
         manager
-            .cancel_started_turn(thread_id, &original, "stale initial dispatch")
+            .cancel_started_turn(thread_id, &original, "stale initial dispatch", None)
             .await,
         Err(AgentControlError::TurnMismatch)
     ));
@@ -15195,6 +15196,7 @@ async fn initial_start_ack_timeout_keeps_generation_evidence_and_retires_the_act
                 HashMap::new(), SkillCatalogSnapshot { version: 0, generated_at_unix: 0, skills: Vec::new() },
                 Vec::new(), Vec::new(), Vec::new(), Vec::new(), HashMap::new(), Vec::new(), None,
                 pioneer_protocol::default_turn_permission_profile_snapshot(), test_full_access_security_snapshot(),
+                None,
             ).await
         })
     };

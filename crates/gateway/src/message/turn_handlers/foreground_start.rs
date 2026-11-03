@@ -18,6 +18,8 @@ pub(crate) struct ForegroundStartOwners {
     state: SyncMutex<AdmissionState>,
     tasks: TaskTracker,
     shutdown: CancellationToken,
+    #[cfg(test)]
+    pub(crate) snapshot_waiting: tokio::sync::Notify,
 }
 
 /// Dropping the acceptance after the reply enqueue attempt releases publication.
@@ -31,7 +33,10 @@ pub(crate) struct StartObligation {
     thread_id: String,
     pending: AtomicBool,
     publisher_started: AtomicBool,
-    admitted: AtomicBool,
+    pub(crate) execution: SyncMutex<Option<pioneer_crud::TurnExecutionRecord>>,
+    pub(crate) actor_generation: SyncMutex<Option<u64>>,
+    activation: SyncMutex<Option<Result<(), String>>>,
+    activated: tokio::sync::Notify,
     mandatory_ready: AtomicBool,
     published: tokio::sync::Notify,
 }
@@ -40,14 +45,37 @@ tokio::task_local! {
     static PREPARING_START: Arc<StartObligation>;
 }
 
+#[cfg(test)]
+tokio::task_local! { pub(crate) static FOREGROUND_UNREAD_EXTRAS: (); }
+
 /// Called by the existing preparation owner only after its durable New commit.
 /// The task-local receipt prevents a conflicting/replayed request (including a
 /// voice preparation on another task) from acquiring this failure obligation.
-pub(super) fn note_committed_start() {
-    let _ = PREPARING_START.try_with(|entry| entry.admitted.store(true, Ordering::Release));
+pub(super) fn note_committed_start(execution: pioneer_crud::TurnExecutionRecord) {
+    let _ = PREPARING_START.try_with(|entry| {
+        *entry.execution.lock().unwrap_or_else(|e| e.into_inner()) = Some(execution);
+    });
+}
+
+pub(super) fn preparing_foreground_start() -> bool {
+    PREPARING_START.try_with(|_| ()).is_ok()
+}
+
+pub(super) fn note_start_actor(generation: u64) {
+    let _ = PREPARING_START.try_with(|entry| {
+        *entry
+            .actor_generation
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(generation);
+    });
 }
 
 impl StartObligation {
+    pub(crate) fn activation_result(&self, result: Result<(), String>) {
+        *self.activation.lock().unwrap_or_else(|e| e.into_inner()) = Some(result);
+        self.activated.notify_waiters();
+    }
+
     fn finish_publication(&self) {
         self.pending.store(false, Ordering::Release);
         self.published.notify_waiters();
@@ -102,6 +130,10 @@ impl ForegroundStartOwners {
 
     pub(crate) async fn before_turn_snapshot(&self, thread_id: &str, turn_id: &str) {
         if let Some(entry) = self.entry(thread_id, turn_id) {
+            #[cfg(test)]
+            if entry.pending.load(Ordering::Acquire) {
+                self.snapshot_waiting.notify_one();
+            }
             entry.wait().await;
         }
     }
@@ -121,7 +153,7 @@ impl ForegroundStartOwners {
         }
     }
 
-    fn entry(&self, thread_id: &str, turn_id: &str) -> Option<Arc<StartObligation>> {
+    pub(crate) fn entry(&self, thread_id: &str, turn_id: &str) -> Option<Arc<StartObligation>> {
         self.state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -152,7 +184,10 @@ impl ForegroundStartOwners {
             thread_id: thread_id.to_owned(),
             pending: AtomicBool::new(true),
             publisher_started: AtomicBool::new(false),
-            admitted: AtomicBool::new(false),
+            execution: SyncMutex::new(None),
+            actor_generation: SyncMutex::new(None),
+            activation: SyncMutex::new(None),
+            activated: tokio::sync::Notify::new(),
             mandatory_ready: AtomicBool::new(false),
             published: tokio::sync::Notify::new(),
         });
@@ -253,8 +288,6 @@ impl MessageProcessor {
         let ownership_guard = PreparationGuard(entry.clone());
         let processor = self.clone();
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-        let thread_id = params.thread_id.trim().to_owned();
-        let turn_id = params.turn_id.trim().to_owned();
         // Admission and task registration share the shutdown lock. No await or
         // I/O while held. A closed tracker cannot strand an admitted obligation.
         {
@@ -288,14 +321,21 @@ impl MessageProcessor {
                         "foreground startup owner panicked",
                     )),
                 };
-                if result.is_err() && _guard.0.admitted.load(Ordering::Acquire) {
-                    processor
-                        .settle_foreground_start_failure(
-                            &thread_id,
-                            &turn_id,
-                            _guard.0.mandatory_ready.load(Ordering::Acquire),
-                        )
-                        .await;
+                if result.is_err() {
+                    let execution = _guard
+                        .0
+                        .execution
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone();
+                    if let Some(execution) = execution {
+                        processor
+                            .settle_foreground_start_failure(
+                                &execution,
+                                _guard.0.mandatory_ready.load(Ordering::Acquire),
+                            )
+                            .await;
+                    }
                 }
                 let _ = ready_tx.send(result);
             });
@@ -307,58 +347,134 @@ impl MessageProcessor {
 
     async fn settle_foreground_start_failure(
         &self,
-        thread_id: &str,
-        turn_id: &str,
+        expected: &pioneer_crud::TurnExecutionRecord,
         mandatory_ready: bool,
     ) {
-        loop {
-            let settled = async {
-                let Some(execution) = self.crud_store.get_turn_execution(turn_id).await? else {
-                    return Ok::<_, anyhow::Error>(true);
-                };
-                if execution.owner_id != self.turn_execution_owner_id.as_ref()
-                    || execution.owner_generation != 1
-                    || self
-                        .crud_store
-                        .native_turn_has_accepted_terminal(turn_id)
-                        .await?
-                    || self
-                        .crud_store
-                        .find_unresolved_recovery_job_for_turn(turn_id)
-                        .await?
-                        .is_some()
-                {
-                    return Ok(true);
-                }
-                if !mandatory_ready {
-                    return Ok(self
-                        .mark_turn_blocked(
-                            thread_id.to_owned(),
-                            turn_id.to_owned(),
-                            "mandatory foreground startup preparation did not complete".to_owned(),
-                        )
-                        .await);
-                }
-                Ok(self
-                    .report_turn_failure(
-                        thread_id.to_owned(),
-                        turn_id.to_owned(),
-                        TurnFailureRecoveryKind::TurnDispatch,
-                        "foreground startup did not complete acceptance".to_owned(),
-                    )
-                    .await)
-            }
-            .await;
-            if matches!(settled, Ok(true)) {
+        // Advisory fast exit only. The write below MUST repeat this predicate
+        // atomically; replacement may win after this read.
+        if let Ok(Some(current)) = self.crud_store.get_turn_execution(&expected.turn_id).await {
+            if current.owner_id != expected.owner_id
+                || current.owner_generation != expected.owner_generation
+            {
                 return;
             }
-            // Own the live-process Starting obligation until recovery can commit.
-            // At process shutdown the durable receipt remains for foreign recovery.
+        }
+        #[cfg(test)]
+        self.completed_history_preparation_barrier
+            .wait_if_armed(
+                "__foreground_failure_before_settlement__",
+                &self.foreground_starts.shutdown,
+            )
+            .await;
+        loop {
+            let settled = async {
+                if mandatory_ready {
+                    // The existing recovery scanner discovers our Recovering
+                    // receipts too. No unfenced recovery job or actor mutation.
+                    self.crud_store
+                        .settle_foreground_start_for_recovery(expected)
+                        .await?;
+                } else {
+                    let Some((workspace_id, mut turn)) = self
+                        .crud_store
+                        .get_turn(&expected.thread_id, &expected.turn_id)
+                        .await?
+                    else {
+                        return Ok::<_, anyhow::Error>(());
+                    };
+                    if turn.status != TurnStatus::InProgress {
+                        return self.mirror_foreground_refusal(expected).await;
+                    }
+                    turn.status = TurnStatus::Blocked;
+                    turn.error =
+                        Some("mandatory foreground startup preparation did not complete".into());
+                    let event = pioneer_crud::CanonicalTurnEventPayload::TurnBlocked(
+                        pioneer_protocol::TurnBlockedNotification {
+                            workspace_id,
+                            thread_id: expected.thread_id.clone(),
+                            turn: turn.clone(),
+                            resume: None,
+                        },
+                    );
+                    match self
+                        .crud_store
+                        .materialize_unactivated_turn_refusal_owned(
+                            event,
+                            now_timestamp_secs(),
+                            expected.clone(),
+                        )
+                        .await
+                    {
+                        Ok(()) => {
+                            self.mirror_foreground_refusal(expected).await?;
+                            self.kick_native_turn_event_deliveries();
+                        }
+                        Err(error)
+                            if error
+                                .downcast_ref::<pioneer_crud::UnactivatedTurnPhaseChanged>()
+                                .is_some() => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+                Ok(())
+            }
+            .await;
+            if settled.is_ok() {
+                return;
+            }
             tokio::select! {
                 _ = self.foreground_starts.shutdown.cancelled() => return,
                 _ = tokio::time::sleep(Duration::from_secs(2)) => {},
             }
         }
+    }
+
+    async fn mirror_foreground_refusal(
+        &self,
+        expected: &pioneer_crud::TurnExecutionRecord,
+    ) -> anyhow::Result<()> {
+        let Some((workspace, terminal)) = self
+            .crud_store
+            .get_turn(&expected.thread_id, &expected.turn_id)
+            .await?
+        else {
+            return Ok(());
+        };
+        if workspace != expected.workspace_id || terminal.status != TurnStatus::Blocked {
+            return Ok(());
+        }
+        // Terminal acceptance fences claims in the writer. Revalidate its exact
+        // owner and projection under the existing memory transition lock too.
+        self.thread_manager
+            .commit_terminal_turn_if_current(
+                &expected.workspace_id,
+                &expected.thread_id,
+                &terminal,
+                async {
+                    let current = self
+                        .crud_store
+                        .get_turn_execution(&expected.turn_id)
+                        .await?;
+                    let projected = self
+                        .crud_store
+                        .get_turn(&expected.thread_id, &expected.turn_id)
+                        .await?;
+                    let owned = current.is_some_and(|current| {
+                        current.owner_id == expected.owner_id
+                            && current.owner_generation == expected.owner_generation
+                            && current.status == pioneer_crud::TurnExecutionStatus::Blocked
+                    }) && projected.is_some_and(|(_, projected)| projected == terminal);
+                    if owned {
+                        // No actor/progress was activated before mandatory-ready.
+                        // Resume shares this memory lock; remove only this proven
+                        // terminal's preparation lease before it may reopen.
+                        self.execution_leases.finish(&expected.turn_id).await;
+                    }
+                    Ok(owned)
+                },
+            )
+            .await?;
+        Ok(())
     }
 
     async fn prepare_and_dispatch_foreground_start(
@@ -441,25 +557,22 @@ impl MessageProcessor {
                 "failed to commit native turn start lifecycle: {error:#}"
             ))
         })?;
-        let execution = self
-            .crud_store
-            .get_turn_execution(&prepared.outcome.started_notification.turn.id)
-            .await
-            .map_err(|error| {
-                TurnStartFailure::internal(format!(
-                    "failed to capture startup execution: {error:#}"
-                ))
-            })?
-            .ok_or_else(|| TurnStartFailure::internal("startup execution is missing"))?;
-        if execution.owner_id != self.turn_execution_owner_id.as_ref() {
-            return Err(TurnStartFailure::unavailable(
-                "startup execution ownership changed",
-            ));
-        }
+        let execution = entry
+            .execution
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .ok_or_else(|| TurnStartFailure::internal("original startup execution is missing"))?;
+        let actor_generation = *entry
+            .actor_generation
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let actor_generation = actor_generation
+            .ok_or_else(|| TurnStartFailure::internal("startup actor is missing"))?;
         entry.mandatory_ready.store(true, Ordering::Release);
         let response = prepared.outcome.response.clone();
         let (release, after_reply) = tokio::sync::oneshot::channel();
-        self.spawn_foreground_start_publication(&prepared.outcome, entry, after_reply);
+        self.spawn_foreground_start_publication(&prepared.outcome, entry.clone(), after_reply);
         #[cfg(test)]
         self.completed_history_preparation_barrier
             .wait_if_armed(
@@ -467,17 +580,84 @@ impl MessageProcessor {
                 &self.foreground_starts.shutdown,
             )
             .await;
-        self.dispatch_prepared_api_provider_turn_start_current(prepared, Some(&execution))
+        let receipt = self
+            .dispatch_prepared_api_provider_turn_start_current(
+                prepared,
+                Some((&execution, actor_generation)),
+            )
             .await
             .map_err(|error| {
                 TurnStartFailure::unavailable(format!(
                     "native startup handoff not confirmed: {error}"
                 ))
             })?;
+        if let Some(receipt) = receipt {
+            if let Err(error) = self
+                .await_foreground_activation(&entry, &execution, &receipt)
+                .await
+            {
+                let _ = self
+                    .agent_manager
+                    .cancel_started_turn(
+                        &execution.thread_id,
+                        &receipt,
+                        "initial activation was not confirmed",
+                        Some((&execution.owner_id, execution.owner_generation)),
+                    )
+                    .await;
+                return Err(error);
+            }
+        }
         Ok(ForegroundAcceptance {
             response,
             _release: Some(release),
         })
+    }
+
+    async fn await_foreground_activation(
+        &self,
+        entry: &StartObligation,
+        expected: &pioneer_crud::TurnExecutionRecord,
+        receipt: &pioneer_agent::AgentStartReceipt,
+    ) -> Result<(), TurnStartFailure> {
+        loop {
+            let changed = entry.activated.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let activation = entry
+                .activation
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            if matches!(activation, Some(Ok(()))) {
+                return Ok(());
+            }
+            if self
+                .crud_store
+                .native_turn_has_accepted_terminal(&expected.turn_id)
+                .await
+                .map_err(|e| TurnStartFailure::internal(e.to_string()))?
+            {
+                return Ok(());
+            }
+            if let Some(Err(reason)) = activation {
+                return Err(TurnStartFailure::unavailable(reason));
+            }
+            if !self
+                .agent_manager
+                .start_receipt_is_current(&expected.thread_id, receipt)
+                .await
+            {
+                return Err(TurnStartFailure::unavailable(
+                    "startup actor retired before activation",
+                ));
+            }
+            tokio::select! {
+                _ = self.foreground_starts.shutdown.cancelled() => return Err(TurnStartFailure::unavailable("startup shutdown before activation")),
+                _ = changed => {},
+                _ = tokio::time::sleep(Duration::from_millis(100)) => {},
+            }
+        }
     }
 
     fn spawn_foreground_start_publication(
@@ -534,6 +714,7 @@ impl MessageProcessor {
                 _ = processor.foreground_starts.shutdown.cancelled() => {},
                 _ = publish => {},
             }
+            let capacity = guard.0.clone();
             drop(guard);
             processor.kick_native_turn_event_deliveries();
             // No dependent live delivery waits for unread or title preparation.
@@ -558,10 +739,13 @@ impl MessageProcessor {
                     processor.spawn_initial_thread_title_task(notification.thread_id, title);
                 }
             };
+            #[cfg(test)]
+            let extras = FOREGROUND_UNREAD_EXTRAS.scope((), extras);
             tokio::select! {
                 _ = processor.foreground_starts.shutdown.cancelled() => {},
                 _ = extras => {},
             }
+            drop(capacity);
         });
     }
 }

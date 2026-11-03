@@ -42391,17 +42391,61 @@ async fn task_progress_refreshes_parent_task_anchor_preview_impl() {
 
     let thread_id = "thr_task_anchor_progress";
     let turn_id = "turn_task_anchor_progress";
-    start_thread_and_turn(
-        &processor,
-        connection_id,
+    let thread_request = json!({"jsonrpc":"2.0", "id":"req_thread_start_0001", "method":"thread/start",
+        "params":{"thread_id":thread_id,"workspace_id":workspace_id,"mode":"Agent","model":"test-model","model_provider":"openai"}});
+    processor
+        .process_request_for_connection(connection_id, &thread_request.to_string())
+        .await;
+    let _ = recv_response_and_notification_by_id_method(
         &mut rx,
-        workspace_id.as_str(),
-        thread_id,
-        turn_id,
-        "Agent",
-        "openai",
+        "req_thread_start_0001",
+        events::THREAD_STARTED,
     )
     .await;
+    while rx.try_recv().is_ok() {}
+    processor.arm_completed_history_preparation_barrier("__foreground_start_before_publication__");
+    let start_id = generate_test_request_id("anchor", "held-start");
+    let request = json!({"jsonrpc":"2.0", "id":start_id,"method":"turn/start", "params":{
+        "thread_id":thread_id,"turn_id":turn_id,"mode":"Agent","model":"test-model","model_provider":"openai",
+        "execution_backend":{"type":"apiProvider","provider":"openai"},
+        "input":[{"type":"text","text":"delegate a task"}]}});
+    timeout(
+        Duration::from_secs(10),
+        processor.process_request_for_connection(connection_id, &request.to_string()),
+    )
+    .await
+    .unwrap();
+    // Inspect every entry while finding the ACK: a helper must not discard an
+    // early anchor emitted by task_create before this response.
+    timeout(Duration::from_secs(10), async {
+        loop {
+            let Message::Text(text) = rx.recv().await.unwrap() else {
+                continue;
+            };
+            let value: JsonValue = serde_json::from_str(&text).unwrap();
+            assert!(
+                !(value["params"]["thread_id"] == thread_id
+                    && value["params"]["turn_id"] == turn_id
+                    && matches!(
+                        value["method"].as_str(),
+                        Some(events::ITEM_COMPLETED | events::ITEM_UPDATED)
+                    )),
+                "anchor bypassed held start: {value}"
+            );
+            if value["id"] == json!(start_id) {
+                assert!(value.get("result").is_some(), "{value}");
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    timeout(
+        Duration::from_secs(10),
+        processor.wait_for_completed_history_preparation_barrier(),
+    )
+    .await
+    .unwrap();
 
     timeout(Duration::from_secs(5), provider.wait_for_root_main())
         .await
@@ -42446,6 +42490,48 @@ async fn task_progress_refreshes_parent_task_anchor_preview_impl() {
         anchor.child_turn_id.as_deref(),
         Some(lineage.child_turn_id.as_str())
     );
+
+    // task_create persistence and the actual parent progress refresh have both
+    // completed. Neither eager item fanout may bypass the held start.
+    while let Ok(Message::Text(text)) = rx.try_recv() {
+        let value: JsonValue = serde_json::from_str(&text).unwrap();
+        assert_ne!(value["method"], events::TURN_STARTED);
+        assert!(
+            !(value["params"]["thread_id"] == thread_id
+                && value["params"]["turn_id"] == turn_id
+                && matches!(
+                    value["method"].as_str(),
+                    Some(events::ITEM_COMPLETED | events::ITEM_UPDATED)
+                )),
+            "anchor bypassed held start: {value}"
+        );
+    }
+    processor.release_completed_history_preparation_barrier();
+    timeout(Duration::from_secs(10), async {
+        let (mut started, mut completed, mut refreshed) = (false, false, false);
+        while !completed || !refreshed {
+            for claim in crud_store.claim_due_turn_event_deliveries(pioneer_crud::NATIVE_TURN_EVENT_LIVE_CONSUMER, now_timestamp_secs() + 600, 64).await.unwrap() {
+                processor.process_claimed_native_turn_event_delivery(claim).await.unwrap();
+            }
+            while let Ok(Message::Text(text)) = rx.try_recv() {
+                let value: JsonValue = serde_json::from_str(&text).unwrap();
+                if value["method"] == events::TURN_STARTED && value["params"]["turn"]["id"] == turn_id { started = true; }
+                if value["params"]["thread_id"] != thread_id || value["params"]["turn_id"] != turn_id { continue; }
+                match value["method"].as_str() {
+                    Some(events::ITEM_COMPLETED) => {
+                        let n: ItemCompletedNotification = serde_json::from_value(value["params"].clone()).unwrap();
+                        if matches!(n.item, TurnItem::Task { item } if item.task_id == task_id) { assert!(started); completed = true; }
+                    }
+                    Some(events::ITEM_UPDATED) => {
+                        let n: ItemUpdatedNotification = serde_json::from_value(value["params"].clone()).unwrap();
+                        if matches!(n.item, TurnItem::Task { item } if item.task_id == task_id && item.progress_preview.as_deref() == Some(progress_message)) { assert!(started); refreshed = true; }
+                    }
+                    _ => {},
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    }).await.unwrap();
 
     // Exercise the real child lineage/resolver and parent subscription path.
     wait_for_thread_manager_turn_status(

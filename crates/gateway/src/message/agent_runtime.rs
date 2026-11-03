@@ -995,10 +995,10 @@ impl MessageProcessor {
                                     ));
                                 };
                                 let this = this.with_database_class(SqliteWriteClass::Critical);
-                                this.commit_durable_agent_event(event).await
+                                this.commit_leased_durable_agent_event(event, actor_generation).await
                             } else {
                                 #[cfg(test)]
-                                { test_this.as_ref().expect("test listener owner").commit_durable_agent_event(event).await }
+                                { test_this.as_ref().expect("test listener owner").commit_leased_durable_agent_event(event, actor_generation).await }
                                 #[cfg(not(test))]
                                 { Err(DurableCommitRejection::permanent(
                                     "processor_stopped",
@@ -1554,6 +1554,7 @@ impl MessageProcessor {
         &self,
         preparation: pioneer_protocol::NativeTerminalEffectPreparation,
         initial_turn: bool,
+        foreground: Option<Arc<super::turn_handlers::foreground_start::StartObligation>>,
     ) -> Result<(), DurableCommitRejection> {
         if initial_turn {
             #[cfg(test)]
@@ -1563,15 +1564,43 @@ impl MessageProcessor {
                     &tokio_util::sync::CancellationToken::new(),
                 )
                 .await;
-            let result = self
-                .crud_store
-                .persist_native_cancellation_context(
-                    preparation.clone(),
-                    self.turn_execution_owner_id.as_ref(),
-                    now_timestamp_secs(),
-                    true,
-                )
-                .await;
+            let result = if let Some(entry) = foreground.as_ref() {
+                let expected = entry
+                    .execution
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+                let generation = *entry
+                    .actor_generation
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let source = self.agent_manager.initial_start_receipt(&preparation).await;
+                match (expected, generation, source) {
+                    (Some(expected), Some(generation), Some(source))
+                        if source.actor_generation == generation =>
+                    {
+                        self.crud_store
+                            .confirm_foreground_start_cancellation_context(
+                                preparation.clone(),
+                                &expected,
+                                now_timestamp_secs(),
+                            )
+                            .await
+                    }
+                    _ => Err(anyhow::anyhow!(
+                        "foreground activation actor retired or cancelled"
+                    )),
+                }
+            } else {
+                self.crud_store
+                    .persist_native_cancellation_context(
+                        preparation.clone(),
+                        self.turn_execution_owner_id.as_ref(),
+                        now_timestamp_secs(),
+                        true,
+                    )
+                    .await
+            };
             let result = match result {
                 Err(error) => {
                     // A handed-off initial Stop still owns this registration
@@ -1605,6 +1634,17 @@ impl MessageProcessor {
                         &tokio_util::sync::CancellationToken::new(),
                     )
                     .await;
+            }
+            if let Some(entry) = foreground {
+                // Retryable storage failures retain the obligation; a definitive
+                // outcome wakes only this startup, never optional publication.
+                if result.is_ok() {
+                    entry.activation_result(Ok(()));
+                } else if let Err(error) = &result {
+                    if !error.is_retryable() {
+                        entry.activation_result(Err(format!("{error:?}")));
+                    }
+                }
             }
             return result;
         }
@@ -1856,6 +1896,37 @@ impl MessageProcessor {
         message_future(async move { self.commit_durable_agent_event(event).await.is_ok() })
     }
 
+    async fn commit_leased_durable_agent_event(
+        &self,
+        event: AgentDurableEvent,
+        actor_generation: u64,
+    ) -> Result<(), DurableCommitRejection> {
+        let initial = match &event {
+            AgentDurableEvent::NativeCancellationContextPrepared {
+                preparation,
+                initial_turn: true,
+            } => Some(preparation.clone()),
+            _ => None,
+        };
+        // Construct before the first await: the canonical owner captures any
+        // foreground obligation, including across retirement while guards wait.
+        let commit = self.commit_durable_agent_event(event);
+        if let Some(preparation) = initial {
+            if self
+                .agent_manager
+                .initial_start_receipt(&preparation)
+                .await
+                .is_none_or(|receipt| receipt.actor_generation != actor_generation)
+            {
+                return Err(DurableCommitRejection::permanent(
+                    "stale_initial_actor",
+                    "initial registration actor was retired",
+                ));
+            }
+        }
+        commit.await
+    }
+
     pub(crate) fn commit_durable_agent_event<'a>(
         &'a self,
         event: AgentDurableEvent,
@@ -1869,6 +1940,15 @@ impl MessageProcessor {
         cli_blocked_guard: Option<pioneer_protocol::CliRuntimeBlockedTurnGuard>,
         mut turn_transition: Option<Arc<tokio::sync::OwnedMutexGuard<()>>>,
     ) -> MessageFuture<'a, Result<(), DurableCommitRejection>> {
+        let foreground_activation = match &event {
+            AgentDurableEvent::NativeCancellationContextPrepared {
+                preparation,
+                initial_turn: true,
+            } => self
+                .foreground_starts
+                .entry(&preparation.thread_id, &preparation.turn_id),
+            _ => None,
+        };
         let terminal_delivery = cli_blocked_guard
             .as_ref()
             .filter(|guard| guard.terminal_delivery_id.is_some())
@@ -2180,8 +2260,12 @@ impl MessageProcessor {
                     } => Some(if already_committed {
                         Ok(())
                     } else {
-                        self.prepare_native_turn_control(preparation.clone(), *initial_turn)
-                            .await
+                        self.prepare_native_turn_control(
+                            preparation.clone(),
+                            *initial_turn,
+                            foreground_activation.clone(),
+                        )
+                        .await
                     }),
                     AgentDurableEvent::NativeTerminalEffectsPrepared { preparation } => Some(
                         match self
@@ -5929,11 +6013,16 @@ impl MessageProcessor {
             AgentDurableEvent::NativeCancellationContextPrepared {
                 preparation,
                 initial_turn,
-            } => message_future(async move {
-                self.prepare_native_turn_control(preparation, initial_turn)
-                    .await
-                    .is_ok()
-            }),
+            } => {
+                let foreground = self
+                    .foreground_starts
+                    .entry(&preparation.thread_id, &preparation.turn_id);
+                message_future(async move {
+                    self.prepare_native_turn_control(preparation, initial_turn, foreground)
+                        .await
+                        .is_ok()
+                })
+            }
             AgentDurableEvent::NativeTerminalEffectsPrepared { preparation } => {
                 message_future(async move {
                     let thread_id = preparation.thread_id.clone();

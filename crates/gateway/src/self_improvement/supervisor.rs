@@ -3059,6 +3059,7 @@ mod tests {
                     "/workspace",
                     (ENABLED_AT + 11) * 1000,
                 ),
+                None,
             )
             .await
             .expect("native Agent turn must start");

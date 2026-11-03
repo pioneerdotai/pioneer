@@ -682,6 +682,22 @@ async fn persist_admitted_turn_start(
         params.execution_backend.as_ref(),
         materialization,
     )?;
+    let original_execution = pioneer_crud::TurnExecutionRecord {
+        turn_id: execution.turn_id.clone(),
+        thread_id: execution.thread_id.clone(),
+        workspace_id: execution.workspace_id.clone(),
+        executor_kind: execution.executor_kind,
+        executor_key: execution.executor_key.clone(),
+        status: execution.status,
+        owner_id: execution.owner_id.clone(),
+        owner_generation: 1,
+        lease_until: execution.lease_until,
+        heartbeat_at: execution.created_at,
+        started_at: None,
+        completed_at: None,
+        created_at: execution.created_at,
+        updated_at: execution.created_at,
+    };
     // The admitted Turn and its execution graph form one durable transaction,
     // but the transaction does not need to inherit the RPC dispatch poll stack.
     // Own its inputs and poll the complete commit from a fresh runtime task.
@@ -689,7 +705,7 @@ async fn persist_admitted_turn_start(
     let materialization = materialization.clone();
     let reasoning_effort = reasoning_effort.map(str::to_owned);
     let execution_security_snapshot = execution_security_snapshot.clone();
-    message_fresh_task(async move {
+    let result = message_fresh_task(async move {
         crud_store
             .materialize_authorized_turn_start_with_reasoning_effort_and_permission_audit(
                 &materialization.thread,
@@ -712,7 +728,11 @@ async fn persist_admitted_turn_start(
             .await
     })
     .await
-    .map_err(|error| anyhow::anyhow!("admitted turn/start persistence task failed: {error}"))?
+    .map_err(|error| anyhow::anyhow!("admitted turn/start persistence task failed: {error}"))?;
+    if result.is_ok() {
+        foreground_start::note_committed_start(original_execution);
+    }
+    result
 }
 
 pub(super) fn new_turn_execution(
@@ -2981,7 +3001,6 @@ impl MessageProcessor {
                 )));
             }
         };
-        foreground_start::note_committed_start();
         if graph_result.as_ref().is_some_and(|result| result.queued) {
             return Err(TurnStartFailure::internal(
                 "root Agent execution was unexpectedly queued",
@@ -3001,7 +3020,7 @@ impl MessageProcessor {
                 .await
             {
                 let message = format!("failed to bind admitted root Agent execution: {error:#}");
-                self.mark_turn_blocked(
+                self.block_api_provider_preparation_failure(
                     outcome.materialization.thread.id.clone(),
                     outcome.materialization.turn.id.clone(),
                     message.clone(),
@@ -3019,7 +3038,7 @@ impl MessageProcessor {
             .await
         {
             let message = format!("failed to register execution lease: {error:#}");
-            self.mark_turn_blocked(
+            self.block_api_provider_preparation_failure(
                 outcome.started_notification.thread_id.clone(),
                 outcome.started_notification.turn.id.clone(),
                 message.clone(),
@@ -3037,7 +3056,7 @@ impl MessageProcessor {
             )
             .await
         {
-            self.mark_turn_blocked(
+            self.block_api_provider_preparation_failure(
                 outcome.started_notification.thread_id.clone(),
                 outcome.started_notification.turn.id.clone(),
                 format!("failed to prepare agent thread runtime: {error}"),
@@ -3048,12 +3067,20 @@ impl MessageProcessor {
             )));
         }
 
+        if let Some(generation) = self
+            .agent_manager
+            .thread_generation(&outcome.started_notification.thread_id)
+            .await
+        {
+            foreground_start::note_start_actor(generation);
+        }
+
         if let Err(error) = self
             .ensure_agent_listener_task(outcome.started_notification.thread_id.as_str())
             .await
         {
             let message = format!("failed to activate native durable listener: {error:#}");
-            self.mark_turn_blocked(
+            self.block_api_provider_preparation_failure(
                 outcome.started_notification.thread_id.clone(),
                 outcome.started_notification.turn.id.clone(),
                 message.clone(),
@@ -3078,7 +3105,7 @@ impl MessageProcessor {
             Err(_) => {
                 let message =
                     "Conversation history is unavailable; turn preparation paused".to_owned();
-                self.mark_turn_blocked(
+                self.block_api_provider_preparation_failure(
                     outcome.started_notification.thread_id.clone(),
                     outcome.started_notification.turn.id.clone(),
                     message.clone(),
@@ -3116,7 +3143,7 @@ impl MessageProcessor {
                 } else {
                     format!("failed to load workspace skill policies: {error:#}")
                 };
-                self.mark_turn_blocked(
+                self.block_api_provider_preparation_failure(
                     outcome.started_notification.thread_id.clone(),
                     outcome.started_notification.turn.id.clone(),
                     message.clone(),
@@ -3139,7 +3166,7 @@ impl MessageProcessor {
             {
                 Ok(resolved_artifacts) => resolved_artifacts,
                 Err(error) => {
-                    self.mark_turn_blocked(
+                    self.block_api_provider_preparation_failure(
                         outcome.started_notification.thread_id.clone(),
                         outcome.started_notification.turn.id.clone(),
                         format!("failed to resolve artifact input for provider: {error:#}"),
@@ -3168,7 +3195,7 @@ impl MessageProcessor {
                     runtime_environment.into_iter().collect::<HashMap<_, _>>()
                 }
                 Err(error) => {
-                    self.mark_turn_blocked(
+                    self.block_api_provider_preparation_failure(
                         outcome.started_notification.thread_id.clone(),
                         outcome.started_notification.turn.id.clone(),
                         format!("failed to prepare artifact output directory: {error:#}"),
@@ -3209,7 +3236,7 @@ impl MessageProcessor {
             )
             .await;
         if let Err(error) = snapshot_result {
-            self.mark_turn_blocked(
+            self.block_api_provider_preparation_failure(
                 outcome.started_notification.thread_id.clone(),
                 outcome.started_notification.turn.id.clone(),
                 format!("failed to persist turn runtime snapshot: {error:#}"),
@@ -3223,7 +3250,7 @@ impl MessageProcessor {
             match self.materialized_turn_permission_profile(&outcome.materialization.turn) {
                 Ok(permission_profile) => permission_profile,
                 Err(error) => {
-                    self.mark_turn_blocked(
+                    self.block_api_provider_preparation_failure(
                         outcome.started_notification.thread_id.clone(),
                         outcome.started_notification.turn.id.clone(),
                         format!("failed to resolve turn permission profile: {error:#}"),
@@ -3275,12 +3302,24 @@ impl MessageProcessor {
         prepared: &PreparedApiProviderTurnStart,
         reason: String,
     ) -> bool {
-        self.mark_turn_blocked(
+        self.block_api_provider_preparation_failure(
             prepared.outcome.started_notification.thread_id.clone(),
             prepared.outcome.started_notification.turn.id.clone(),
             reason,
         )
         .await
+    }
+
+    async fn block_api_provider_preparation_failure(
+        &self,
+        thread: String,
+        turn: String,
+        reason: String,
+    ) -> bool {
+        if foreground_start::preparing_foreground_start() {
+            return false;
+        }
+        self.mark_turn_blocked(thread, turn, reason).await
     }
 
     pub(super) async fn dispatch_prepared_api_provider_turn_start(
@@ -3295,8 +3334,9 @@ impl MessageProcessor {
     async fn dispatch_prepared_api_provider_turn_start_current(
         &self,
         prepared: PreparedApiProviderTurnStart,
-        expected: Option<&pioneer_crud::TurnExecutionRecord>,
+        source: Option<(&pioneer_crud::TurnExecutionRecord, u64)>,
     ) -> Result<Option<pioneer_agent::AgentStartReceipt>, ApiProviderTurnDispatchFailure> {
+        let expected = source.map(|(execution, _)| execution);
         if let Some(expected) = expected {
             // Stop/fast terminal may have won before the actor was activated.
             if self
@@ -3307,6 +3347,15 @@ impl MessageProcessor {
             {
                 return Ok(None);
             }
+        }
+        #[cfg(test)]
+        if expected.is_some() {
+            self.completed_history_preparation_barrier
+                .wait_if_armed(
+                    "__foreground_start_after_terminal_precheck__",
+                    &tokio_util::sync::CancellationToken::new(),
+                )
+                .await;
         }
         let outcome = prepared.outcome;
         let start_result = self
@@ -3328,6 +3377,7 @@ impl MessageProcessor {
                 prepared.effective_reasoning_effort.as_deref(),
                 prepared.permission_profile,
                 prepared.execution_security_snapshot,
+                source.map(|(_, generation)| generation),
             )
             .await;
         if let Err(error) = start_result {
@@ -3428,6 +3478,7 @@ impl MessageProcessor {
                         &outcome.started_notification.thread_id,
                         &receipt,
                         "initial startup ownership was not confirmed",
+                        Some((&expected.owner_id, expected.owner_generation)),
                     )
                     .await;
                 return Err(match ownership_started {

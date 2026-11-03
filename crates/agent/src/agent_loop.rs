@@ -1795,6 +1795,10 @@ fn spawn_turn_task(
                 }
             }
 
+            if turn_control.cancellation_token().is_cancelled() {
+                return Outcome::Cancelled;
+            }
+
             let NativeTurnRuntimeSnapshot {
                 context_controller,
                 generation: _,
