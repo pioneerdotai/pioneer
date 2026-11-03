@@ -88109,8 +88109,11 @@ async fn claude_service_optional_statistics_survive_normalization_and_journal_re
             assert_eq!(model["provider"], "anthropic");
             assert_eq!(model["costBasis"], "list");
         } else {
-            assert!(stats["ttft_ms"].is_null());
-            assert!(stats["model_usage"]["claude-sonnet"]["thinkingTokens"].is_null());
+            assert_eq!(stats["ttft_ms"], JsonValue::Null);
+            assert_eq!(
+                stats["model_usage"]["claude-sonnet"]["thinkingTokens"],
+                JsonValue::Null
+            );
         }
         assert!(!rows[0].usage_json.contains("SECRET"));
     }
@@ -89643,7 +89646,10 @@ async fn opencode_v2_summary_totals_and_native_categories_reach_completion_and_j
             raw["visible_output_tokens"]
         );
         if messages.as_array().unwrap().len() == 64 && input.is_none() {
-            assert!(statistics["native_tokens"]["cache"]["read"].is_null());
+            assert_eq!(
+                statistics["native_tokens"]["cache"]["read"],
+                JsonValue::Null
+            );
             assert_eq!(statistics["known_partial_tokens"]["cache_read"], 5040);
             assert_eq!(statistics["known_partial_tokens"]["input"], 640);
         }
