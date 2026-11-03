@@ -2845,7 +2845,13 @@ fn cli_parent_native_completion_continues_with_existing_attached_work() {
                 native_thread_id: Some(binding.native_thread_id.clone()),
                 native_turn_id: binding.native_turn_id.clone().unwrap(),
                 status: "completed".to_owned(),
-                native: None,
+                native: (kind == CLIAgentRuntimeKind::Codex).then(|| {
+                    pioneer_cli_agent_runtime::event::RuntimeNativeEvent {
+                        method: "turn/completed".into(),
+                        payload_redacted: Some(json!({"turn":{"completedAt":15,"durationMs":250}})),
+                        raw_redacted: None,
+                    }
+                }),
             });
             processor
                 .handle_cli_runtime_timeline_event(handle.instance(), terminal.clone())
@@ -2877,6 +2883,17 @@ fn cli_parent_native_completion_continues_with_existing_attached_work() {
                     .status,
                 TurnStatus::InProgress
             );
+            if kind == CLIAgentRuntimeKind::Codex {
+                let items = processor
+                    .crud_store
+                    .list_turn_items_by_type(&turn_id, "system_event")
+                    .await
+                    .unwrap();
+                assert_eq!(items.iter().filter(|item| matches!(item,
+                    TurnItem::SystemEvent { code:Some(code),details:Some(details),.. }
+                    if code == "cli_native_turn_timing" && details["native_turn_id"] == binding.native_turn_id.as_deref().unwrap()
+                        && details["native_timing"]["durationMs"] == 250)).count(), 1);
+            }
             let next = processor
                 .crud_store
                 .latest_cli_runtime_turn_attempt(&turn_id)
