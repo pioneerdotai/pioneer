@@ -4595,7 +4595,7 @@ async fn codex_usage_receipts_survive_database_replay_without_range_attribution(
                 turn_id: Some(BLOCKED_TURN.into()),
                 native_thread_id: Some(BLOCKED_NATIVE_THREAD.into()),
                 native_turn_id: Some(BLOCKED_TURN.into()),
-                native_method: notification.method,
+                native_method: notification.method.clone(),
                 payload_redacted_json: json!({"cliUsage":item.metadata}).to_string(),
                 sequence: now.timestamp_millis(),
                 created_at: now,
