@@ -17,9 +17,13 @@ pub(super) async fn enforce(request: Request<Body>, next: Next) -> Response {
     enforce_policy(request, next, false).await
 }
 
-/// Only the explicitly mounted webhook router permits request bodies. All
-/// established routes continue to reject non-empty bodies before route work.
+/// Explicitly mounted bounded-body ingress. Existing GET/WS/storage routes
+/// continue to reject non-empty bodies before route work.
 pub(super) async fn enforce_webhook(request: Request<Body>, next: Next) -> Response {
+    enforce_policy(request, next, true).await
+}
+
+pub(super) async fn enforce_owner_operation(request: Request<Body>, next: Next) -> Response {
     enforce_policy(request, next, true).await
 }
 

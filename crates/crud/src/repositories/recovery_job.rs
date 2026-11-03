@@ -122,14 +122,8 @@ pub async fn count_jobs_for_turn<C: ConnectionTrait>(db: &C, turn_id: &str) -> R
 }
 
 /// Advisory, payload-free discovery. The writer must revalidate every predicate.
-pub async fn list_due_job_ids<C: ConnectionTrait>(
-    db: &C,
-    now: DateTimeWithTimeZone,
-    limit: u64,
-) -> Result<Vec<String>> {
+pub(crate) fn due_jobs_query(now: DateTimeWithTimeZone) -> sea_orm::Select<recovery_job::Entity> {
     recovery_job::Entity::find()
-        .select_only()
-        .column(recovery_job::Column::Id)
         .filter(
             recovery_job::Column::Status.eq(recovery_job_status_to_db(RecoveryJobStatus::Pending)),
         )
@@ -139,6 +133,33 @@ pub async fn list_due_job_ids<C: ConnectionTrait>(
                 .add(recovery_job::Column::ClaimExpiresAt.is_null())
                 .add(recovery_job::Column::ClaimExpiresAt.lte(now)),
         )
+}
+
+/// Point advisory read of one raw candidate. Excluded rows never acquire the
+/// writer; the existing conditional UPDATE remains the only claim authority.
+pub(crate) async fn due_job_id<C: ConnectionTrait>(
+    db: &C,
+    now: DateTimeWithTimeZone,
+    id: &str,
+) -> Result<Vec<String>> {
+    due_jobs_query(now)
+        .filter(recovery_job::Column::Id.eq(id.to_owned()))
+        .select_only()
+        .column(recovery_job::Column::Id)
+        .into_tuple::<String>()
+        .all(db)
+        .await
+        .context("failed to observe recovery job candidate")
+}
+
+pub async fn list_due_job_ids<C: ConnectionTrait>(
+    db: &C,
+    now: DateTimeWithTimeZone,
+    limit: u64,
+) -> Result<Vec<String>> {
+    due_jobs_query(now)
+        .select_only()
+        .column(recovery_job::Column::Id)
         .order_by_asc(recovery_job::Column::NextRunAt)
         .order_by_asc(recovery_job::Column::Id)
         .limit(limit)
@@ -208,6 +229,30 @@ pub async fn claim_due_job_ids<C: ConnectionTrait>(
     Ok(claimed)
 }
 
+/// Pending terminal repair is parked while another Active job owns its Turn.
+/// The authoritative writer repeats this check. The relation is narrow and
+/// independent of scheduler fairness/claim ownership.
+pub(crate) fn terminal_repair_available() -> sea_orm::sea_query::SimpleExpr {
+    use sea_orm::sea_query::{Expr, Query};
+    // The unique partial (turn_id) WHERE status='active' index bounds this
+    // correlated probe to this Turn, rather than materializing every active ID.
+    Expr::exists(
+        Query::select()
+            .expr(Expr::val(1))
+            .from_as(recovery_job::Entity, "terminal_repair_active")
+            .and_where(
+                Expr::col(("terminal_repair_active", recovery_job::Column::Status))
+                    .eq(Expr::Constant("active".into())),
+            )
+            .and_where(
+                Expr::col(("terminal_repair_active", recovery_job::Column::TurnId))
+                    .equals((recovery_job::Entity, recovery_job::Column::TurnId)),
+            )
+            .to_owned(),
+    )
+    .not()
+}
+
 pub async fn list_due_pending_jobs_by_action<C: ConnectionTrait>(
     db: &C,
     action: RecoveryAction,
@@ -217,7 +262,11 @@ pub async fn list_due_pending_jobs_by_action<C: ConnectionTrait>(
     let pending = recovery_job_status_to_db(RecoveryJobStatus::Pending);
     let action_db = recovery_action_to_db(action);
 
-    recovery_job::Entity::find()
+    let mut query = recovery_job::Entity::find();
+    if action == RecoveryAction::MarkFailed {
+        query = query.filter(terminal_repair_available());
+    }
+    query
         .filter(recovery_job::Column::Status.eq(pending))
         .filter(recovery_job::Column::Action.eq(action_db))
         .filter(recovery_job::Column::NextRunAt.lte(now))

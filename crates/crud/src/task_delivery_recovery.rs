@@ -35,21 +35,30 @@ impl CrudStore {
         expected: &DeliveryRecoverySnapshot,
         clock: &(dyn Fn() -> i64 + Send + Sync),
     ) -> Result<bool> {
-        let token = pioneer_protocol::generate_id(21);
-        #[cfg(any(test, feature = "test-support"))]
-        self.pause_delivery_commit_for_test(crate::TaskDeliveryCommitTestKind::RecoveryRetry)
-            .await;
-        let tx = self.connection.begin().await?;
-        let result = recovery::defer(&tx, expected, clock(), &token).await;
-        match result {
-            Ok(changed) => {
-                tx.commit().await?;
-                Ok(changed)
-            }
-            Err(error) => {
-                let _ = tx.rollback().await;
-                Err(error)
-            }
-        }
+        self.background_change(
+            "tasks.lifecycle",
+            async {
+                let token = pioneer_protocol::generate_id(21);
+                #[cfg(any(test, feature = "test-support"))]
+                self.pause_delivery_commit_for_test(
+                    crate::TaskDeliveryCommitTestKind::RecoveryRetry,
+                )
+                .await;
+                let tx = self.connection.begin().await?;
+                let result = recovery::defer(&tx, expected, clock(), &token).await;
+                match result {
+                    Ok(changed) => {
+                        tx.commit().await?;
+                        Ok(changed)
+                    }
+                    Err(error) => {
+                        let _ = tx.rollback().await;
+                        Err(error)
+                    }
+                }
+            },
+            |changed| *changed,
+        )
+        .await
     }
 }

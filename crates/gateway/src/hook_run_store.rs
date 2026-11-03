@@ -74,11 +74,22 @@ fn sqlite_code_diagnostic(extended: i32) -> HookRunStoreDiagnostic {
 #[derive(Clone)]
 pub(crate) struct CrudHookRunStore {
     crud_store: Arc<CrudStore>,
+    recovery_candidate: Option<String>,
 }
 
 impl CrudHookRunStore {
     pub(crate) fn new(crud_store: Arc<CrudStore>) -> Self {
-        Self { crud_store }
+        Self {
+            crud_store,
+            recovery_candidate: None,
+        }
+    }
+
+    pub(crate) fn for_recovery_candidate(crud_store: Arc<CrudStore>, id: String) -> Self {
+        Self {
+            crud_store,
+            recovery_candidate: Some(id),
+        }
     }
 }
 
@@ -276,9 +287,11 @@ impl HookRunStore for CrudHookRunStore {
         &self,
         scan: HookRecoveryScan,
     ) -> HookRunStoreResult<Vec<HookRecoverableRunRecord>> {
-        self.crud_store
-            .list_recoverable_hook_runs(scan)
-            .await
+        let records = match self.recovery_candidate.as_deref() {
+            Some(id) => self.crud_store.recoverable_hook_run_by_id(scan, id).await,
+            None => self.crud_store.list_recoverable_hook_runs(scan).await,
+        };
+        records
             .map_err(|_| HookRunStoreError::internal("failed to list recoverable hook runs"))?
             .into_iter()
             .map(|record| {

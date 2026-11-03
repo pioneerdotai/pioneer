@@ -1,13 +1,200 @@
 use anyhow::{Context, Result, bail};
 use pioneer_entity::{task_result_candidate, task_result_review_event};
 use pioneer_protocol::{TaskError, TaskResult, TaskResultCandidate, TaskResultCandidateStatus};
-use sea_orm::sea_query::{Expr, OnConflict};
+use sea_orm::sea_query::{Alias, Expr, ExprTrait, OnConflict};
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set,
+    ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, QueryTrait,
+    Set,
 };
 
 use crate::convention::task_result_candidate_status_to_db;
 use crate::util::{optional_typed_json_to_db, typed_json_to_db, unix_to_datetime};
+
+/// The same active candidate used by the authoritative service: highest round
+/// among pending_review/extraction_failed, with a result, and both Task and Run
+/// still waiting for review. Unique (run_id, round) removes the tie case.
+fn review_timeout_query() -> sea_orm::Select<task_result_candidate::Entity> {
+    use pioneer_entity::{task, task_run};
+    // Literal AST nodes preserve the existing partial UNIQUE index predicate;
+    // bound status parameters do not establish its physical input bound.
+    let active = || {
+        [
+            Expr::Constant("pending_review".into()),
+            Expr::Constant("extraction_failed".into()),
+        ]
+    };
+    let newer = Alias::new("newer_review_candidate");
+    let mut later = task_result_candidate::Entity::find()
+        .select_only()
+        .column(task_result_candidate::Column::Id);
+    QueryTrait::query(&mut later)
+        .from_clear()
+        .from_as(task_result_candidate::Entity, newer.clone());
+    later = later
+        .filter(
+            Expr::col((newer.clone(), task_result_candidate::Column::RunId)).equals((
+                task_result_candidate::Entity,
+                task_result_candidate::Column::RunId,
+            )),
+        )
+        .filter(Expr::col((newer.clone(), task_result_candidate::Column::Status)).is_in(active()))
+        .filter(
+            Expr::col((newer, task_result_candidate::Column::Round)).gt(Expr::col((
+                task_result_candidate::Entity,
+                task_result_candidate::Column::Round,
+            ))),
+        );
+    task_result_candidate::Entity::find()
+        .filter(Expr::col(task_result_candidate::Column::Status).is_in(active()))
+        .filter(task_result_candidate::Column::Status.eq("pending_review"))
+        .filter(task_result_candidate::Column::ResultJson.is_not_null())
+        .filter(Expr::exists(later.into_query()).not())
+        .filter(Expr::exists(
+            task::Entity::find()
+                .select_only()
+                .column(task::Column::Id)
+                .filter(Expr::col((task::Entity, task::Column::Id)).equals((
+                    task_result_candidate::Entity,
+                    task_result_candidate::Column::TaskId,
+                )))
+                .filter(task::Column::Status.eq("waiting_review"))
+                .into_query(),
+        ))
+        .filter(Expr::exists(
+            task_run::Entity::find()
+                .select_only()
+                .column(task_run::Column::Id)
+                .filter(Expr::col((task_run::Entity, task_run::Column::Id)).equals((
+                    task_result_candidate::Entity,
+                    task_result_candidate::Column::RunId,
+                )))
+                .filter(task_run::Column::Status.eq("waiting_review"))
+                .into_query(),
+        ))
+}
+
+/// Compatibility full observation, with each database hold bounded. The
+/// owned worker calls review_runs_page once per quantum and retains its minimum.
+pub async fn next_review_timeout<C: ConnectionTrait>(db: &C, timeout: i64) -> Result<Option<i64>> {
+    let mut cursor: Option<(String, String)> = None;
+    let mut earliest = None;
+    loop {
+        let (_, next, nearest, failed) = review_runs_page(
+            db,
+            i64::MIN,
+            timeout,
+            64,
+            cursor.as_ref().map(|(a, _)| a.as_str()),
+            cursor.as_ref().map(|(_, u)| u.as_str()),
+        )
+        .await?;
+        anyhow::ensure!(!failed, "review deadline point observation failed");
+        earliest = earliest.into_iter().chain(nearest).min();
+        cursor = next;
+        if cursor.is_none() {
+            return Ok(earliest);
+        }
+    }
+}
+
+pub async fn due_review_runs<C: ConnectionTrait>(
+    db: &C,
+    now: i64,
+    timeout: i64,
+    limit: u64,
+    after: Option<&str>,
+    upper: Option<&str>,
+) -> Result<(
+    Vec<pioneer_entity::task_run::Model>,
+    Option<(String, String)>,
+)> {
+    let (rows, next, _, failed) = review_runs_page(db, now, timeout, limit, after, upper).await?;
+    anyhow::ensure!(!failed, "review point observation failed");
+    Ok((rows, next))
+}
+
+/// Immutable raw Run PKs, including ineligible/future/history inputs. Fixed
+/// upper and continuation advance through every raw key, never filtered matches.
+pub async fn review_runs_page<C: ConnectionTrait>(
+    db: &C,
+    now: i64,
+    timeout: i64,
+    limit: u64,
+    after: Option<&str>,
+    upper: Option<&str>,
+) -> Result<(
+    Vec<pioneer_entity::task_run::Model>,
+    Option<(String, String)>,
+    Option<i64>,
+    bool,
+)> {
+    use pioneer_entity::task_run;
+    let limit = limit.clamp(1, 64);
+    let upper = match upper {
+        Some(u) => Some(u.to_owned()),
+        None => {
+            task_run::Entity::find()
+                .select_only()
+                .column(task_run::Column::Id)
+                .order_by_desc(task_run::Column::Id)
+                .limit(1)
+                .into_tuple::<String>()
+                .one(db)
+                .await?
+        }
+    };
+    let Some(upper) = upper else {
+        return Ok((Vec::new(), None, None, false));
+    };
+    let mut query = task_run::Entity::find()
+        .select_only()
+        .column(task_run::Column::Id)
+        .filter(task_run::Column::Id.lte(upper.clone()));
+    if let Some(a) = after {
+        query = query.filter(task_run::Column::Id.gt(a));
+    }
+    let ids = query
+        .order_by_asc(task_run::Column::Id)
+        .limit(limit)
+        .into_tuple::<String>()
+        .all(db)
+        .await?;
+    let next = ids
+        .last()
+        .filter(|id| ids.len() == limit as usize && *id < &upper)
+        .map(|id| (id.clone(), upper));
+    let mut rows = Vec::new();
+    let mut earliest = None;
+    let mut failed = false;
+    for id in ids {
+        // Unique active-per-run index bounds active rows, including the newer
+        // round exclusion. Task and Run eligibility use correlated PK lookups.
+        let observation = review_timeout_query()
+            .select_only()
+            .column(task_result_candidate::Column::CreatedAt)
+            .filter(task_result_candidate::Column::RunId.eq(&id))
+            .into_tuple::<sea_orm::prelude::DateTimeWithTimeZone>()
+            .one(db)
+            .await;
+        match observation {
+            Ok(Some(created)) => {
+                let deadline = created.timestamp().saturating_add(timeout);
+                if deadline > now {
+                    earliest = earliest.into_iter().chain(Some(deadline)).min();
+                    continue;
+                }
+                match task_run::Entity::find_by_id(&id).one(db).await {
+                    Ok(Some(row)) => rows.push(row),
+                    Ok(None) => {}
+                    Err(_) => failed = true,
+                }
+            }
+            Ok(None) => {}
+            Err(_) => failed = true,
+        }
+    }
+    Ok((rows, next, earliest, failed))
+}
 
 #[derive(Clone, Debug)]
 pub struct NewTaskResultCandidate {

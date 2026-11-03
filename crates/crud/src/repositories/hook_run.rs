@@ -618,9 +618,155 @@ pub async fn list_hook_run_attempts<C: ConnectionTrait>(
         .collect()
 }
 
+/// A raw PK pass: filtering resumability and clocks happens AFTER64 keys.
+#[derive(Default)]
+pub struct HookClockPass {
+    /// Raw IDs from this quantum only; payload/eligibility is reloaded by PK.
+    pub candidates: Vec<String>,
+    /// Zero uses64 for clock-only callers; the hook owner applies its batch cap.
+    pub raw_limit: usize,
+    upper: Option<String>,
+    after: Option<String>,
+    done: bool,
+    pub next: Option<DateTimeWithTimeZone>,
+    failure: Option<anyhow::Error>,
+}
+pub(crate) async fn recovery_clock_quantum<C: ConnectionTrait>(
+    db: &C,
+    pass: &mut HookClockPass,
+    stale_ms: u64,
+) -> Result<bool> {
+    pass.candidates.clear();
+    if pass.done {
+        return Ok(true);
+    }
+    if pass.upper.is_none() {
+        pass.upper = hook_run::Entity::find()
+            .select_only()
+            .column(hook_run::Column::Id)
+            .order_by_desc(hook_run::Column::Id)
+            .limit(1)
+            .into_tuple::<String>()
+            .one(db)
+            .await?;
+    }
+    let Some(upper) = pass.upper.as_ref() else {
+        pass.done = true;
+        return Ok(true);
+    };
+    let raw_limit = if pass.raw_limit == 0 {
+        64
+    } else {
+        pass.raw_limit.min(64)
+    };
+    let ids = hook_run::Entity::find()
+        .select_only()
+        .column(hook_run::Column::Id)
+        .filter(hook_run::Column::Id.gt(pass.after.as_deref().unwrap_or("")))
+        .filter(hook_run::Column::Id.lte(upper.clone()))
+        .order_by_asc(hook_run::Column::Id)
+        .limit(raw_limit as u64)
+        .into_tuple::<String>()
+        .all(db)
+        .await?;
+    pass.done = ids.len() < raw_limit;
+    pass.candidates.clone_from(&ids);
+    for id in ids {
+        let row = hook_run::Entity::find_by_id(id.clone())
+            .select_only()
+            .columns([
+                hook_run::Column::Status,
+                hook_run::Column::QueuedAt,
+                hook_run::Column::StartedAt,
+                hook_run::Column::DeadlineAt,
+            ])
+            .expr_as(hook_run::Column::ResumeStateJson.is_not_null(), "resumable")
+            .into_tuple::<(
+                String,
+                Option<DateTimeWithTimeZone>,
+                Option<DateTimeWithTimeZone>,
+                Option<DateTimeWithTimeZone>,
+                bool,
+            )>()
+            .one(db)
+            .await;
+        match row {
+            Ok(Some((status, queued, started, deadline, true))) => {
+                let at = match status.as_str() {
+                    "queued" => Some(queued.unwrap_or_else(|| unix_ms_to_datetime(0))),
+                    "running" => deadline
+                        .into_iter()
+                        .chain(started.map(|at| {
+                            at.checked_add_signed(ChronoDuration::milliseconds(
+                                i64::try_from(stale_ms.max(1)).unwrap_or(i64::MAX),
+                            ))
+                            .unwrap_or(at)
+                        }))
+                        .min(),
+                    _ => None,
+                };
+                let at = at
+                    .map(|at| {
+                        let remainder = at.timestamp_subsec_nanos() % 1_000_000;
+                        if remainder == 0 {
+                            Ok(at)
+                        } else {
+                            at.checked_add_signed(ChronoDuration::nanoseconds(i64::from(
+                                1_000_000 - remainder,
+                            )))
+                            .context("hook recovery clock overflow")
+                        }
+                    })
+                    .transpose();
+                match at {
+                    Ok(at) => pass.next = pass.next.into_iter().chain(at).min(),
+                    Err(error) => {
+                        pass.failure.get_or_insert(error);
+                    }
+                }
+            }
+            Err(error) => {
+                pass.failure.get_or_insert(error.into());
+            }
+            _ => {}
+        }
+        pass.after = Some(id);
+    }
+    if pass.done {
+        if let Some(error) = pass.failure.take() {
+            return Err(error);
+        }
+    }
+    Ok(pass.done)
+}
+pub(crate) async fn next_recoverable_deadline<C: ConnectionTrait>(
+    db: &C,
+    stale_running_after_ms: u64,
+) -> Result<Option<DateTimeWithTimeZone>> {
+    let mut pass = HookClockPass::default();
+    while !recovery_clock_quantum(db, &mut pass, stale_running_after_ms).await? {}
+    Ok(pass.next)
+}
+
 pub async fn list_recoverable_hook_runs<C: ConnectionTrait>(
     db: &C,
     scan: HookRecoveryScan,
+) -> Result<Vec<RecoverableHookRunRecord>> {
+    list_recoverable_hook_runs_inner(db, scan, None).await
+}
+
+pub(crate) async fn recoverable_hook_run_by_id<C: ConnectionTrait>(
+    db: &C,
+    scan: HookRecoveryScan,
+    id: &str,
+) -> Result<Vec<RecoverableHookRunRecord>> {
+    list_recoverable_hook_runs_inner(db, scan, Some(id)).await
+}
+
+async fn list_recoverable_hook_runs_inner<C: ConnectionTrait>(
+    db: &C,
+    scan: HookRecoveryScan,
+    id: Option<&str>,
 ) -> Result<Vec<RecoverableHookRunRecord>> {
     let now = unix_ms_to_datetime(scan.now_unix_ms);
     let stale_started_before = now
@@ -659,7 +805,12 @@ pub async fn list_recoverable_hook_runs<C: ConnectionTrait>(
             .add(hook_run::Column::Phase.is_in(phase_values));
     }
     let limit = u64::try_from(scan.batch_size.max(1)).unwrap_or(u64::MAX);
+    // The owner supplies exactly one raw PK. Apply the SAME due/resumability/
+    // phase predicates to that identity; no population discovery in this lane.
     let rows = hook_run::Entity::find()
+        .filter(id.map_or_else(Condition::all, |id| {
+            Condition::all().add(hook_run::Column::Id.eq(id.to_owned()))
+        }))
         .filter(condition)
         .filter(hook_run::Column::ResumeStateJson.is_not_null())
         .order_by_asc(hook_run::Column::QueuedAt)

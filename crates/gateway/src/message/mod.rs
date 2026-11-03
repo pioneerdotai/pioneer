@@ -281,7 +281,7 @@ use tokio::sync::{Mutex, OwnedMutexGuard, RwLock, broadcast, oneshot};
 use tokio::task::JoinHandle;
 
 use pioneer_cli_agent_runtime::event::RuntimeEvent;
-use tokio::time::{Duration, MissedTickBehavior, interval, sleep};
+use tokio::time::{Duration, sleep};
 use tracing::{debug, error, info, warn};
 
 use crate::auth::GatewayAuthService;
@@ -450,7 +450,9 @@ where
         pioneer_observability::work::ExecutorRole::Gateway,
         future,
     );
-    AbortOnDropMessageTask::new(tokio::spawn(future))
+    AbortOnDropMessageTask::new(tokio::spawn(pioneer_sqlite::background::inherit_origin(
+        future,
+    )))
 }
 
 const RESILIENCE_WORKER_POLL_INTERVAL_SECONDS: u64 = 2;
@@ -459,15 +461,12 @@ const RESILIENCE_WORKER_TRANSIENT_STORAGE_BACKOFF_SECONDS: u64 = 60;
 const PROGRESS_DELTA_HEARTBEAT_INTERVAL_SECONDS: i64 = 5;
 const PROGRESS_ITEM_TYPE_MISS_RETRY_SECONDS: i64 = 1;
 const PROGRESS_ITEM_TYPE_MISS_CACHE_CAPACITY: usize = 1_024;
+#[cfg(test)]
 const CLI_RUNTIME_COMMAND_REHYDRATION_INTERVAL_SECONDS: i64 = 30;
-const AGENT_ACTION_LEDGER_COMPACTION_INTERVAL_SECONDS: i64 = 24 * 60 * 60;
 const AGENT_ACTION_LEDGER_COMPACTION_RETRY_SECONDS: i64 = 60 * 60;
-const AGENT_ACTION_LEDGER_COMPACTION_BATCH_SIZE: u64 = 256;
 const NATIVE_TERMINAL_EFFECT_RETENTION_SECONDS: i64 = 30 * 24 * 60 * 60;
-const NATIVE_TERMINAL_EFFECT_PURGE_INTERVAL_SECONDS: i64 = 24 * 60 * 60;
 const NATIVE_TERMINAL_EFFECT_PURGE_RETRY_SECONDS: i64 = 60 * 60;
 const NATIVE_TERMINAL_EFFECT_PURGE_BATCH_SIZE: u64 = 256;
-const NATIVE_TERMINAL_EFFECT_RECOVERY_INTERVAL_SECONDS: i64 = 10 * 60;
 const NATIVE_TERMINAL_EFFECT_RECOVERY_RETRY_SECONDS: i64 = 60;
 const NATIVE_TERMINAL_EFFECT_RECOVERY_BATCH_SIZE: u64 = 64;
 
@@ -548,18 +547,6 @@ fn record_resilience_worker_poll_error(
     }
 }
 
-async fn sleep_after_transient_storage_poll_failure(transient_storage_poll_failed: bool) -> bool {
-    if !transient_storage_poll_failed {
-        return false;
-    }
-
-    sleep(Duration::from_secs(
-        RESILIENCE_WORKER_TRANSIENT_STORAGE_BACKOFF_SECONDS,
-    ))
-    .await;
-    true
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ThreadTitleJobState {
     Pending,
@@ -621,6 +608,8 @@ pub struct MessageProcessor {
     #[cfg(test)]
     recovery_due_wait_barrier:
         Arc<compaction_background::CompletedHistoryPreparationBarrier>,
+    #[cfg(test)]
+    recovery_admission_failure: Arc<std::sync::Mutex<Option<anyhow::Error>>>,
     #[cfg(test)]
     task_history_preparation_failure: Arc<std::sync::Mutex<Option<anyhow::Error>>>,
     #[cfg(test)]
@@ -1057,6 +1046,7 @@ struct TaskEventFanoutSummary {
     emitted: usize,
     errors: usize,
     pending: Option<bool>,
+    deadline: Option<i64>,
 }
 
 impl MessageProcessor {
@@ -1272,7 +1262,8 @@ impl MessageProcessor {
             ),
             task_child_point_cursor: Arc::new(Mutex::new(Default::default())),
             task_child_scope_cursor: Arc::new(Mutex::new(Default::default())),
-            completed_history_checks: Arc::new(Mutex::new(HashMap::new())),
+            completed_history_checks: compaction_background::shared_history_jobs(&crud_store),
+            native_turn_event_delivery_workers: agent_runtime::shared_delivery_workers(&crud_store),
             compaction_lifecycle_not_before: Arc::new(StdRwLock::new(None)),
             #[cfg(test)]
             completed_history_preparation_barrier: Arc::new(Default::default()),
@@ -1280,6 +1271,8 @@ impl MessageProcessor {
             turn_execution_heartbeat_barrier: Arc::new(Default::default()),
             #[cfg(test)]
             recovery_due_wait_barrier: Arc::new(Default::default()),
+            #[cfg(test)]
+            recovery_admission_failure: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
             task_history_preparation_failure: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
@@ -1296,8 +1289,8 @@ impl MessageProcessor {
             task_output_capture_failures: Arc::new(std::sync::Mutex::new(HashMap::new())),
             context_compaction_config: resilience_config.context_compaction,
             compaction_clock: Arc::new(crate::compaction::SystemCompactionClock::default()),
-            compaction_coordinator: Arc::new(
-                crate::compaction::ContextCompactionCoordinator::default(),
+            compaction_coordinator: crate::compaction::ContextCompactionCoordinator::for_store(
+                &crud_store,
             ),
             cli_history_shutdown: tokio_util::sync::CancellationToken::new(),
             #[cfg(test)]
@@ -1377,7 +1370,6 @@ impl MessageProcessor {
             thread_title_publication_attempted: Arc::new(tokio::sync::Notify::new()),
             timeout_supervisor,
             recovery_coordinator,
-            native_turn_event_delivery_workers: Arc::new(Default::default()),
             native_terminal_effect_kick_running: Arc::new(AtomicBool::new(false)),
             native_terminal_effect_kick_pending: Arc::new(AtomicBool::new(false)),
             native_lifecycle_readiness: Arc::new(
@@ -1437,6 +1429,9 @@ impl MessageProcessor {
 
     pub async fn set_hook_recovery_config(&self, config: GatewayHookRecoveryConfig) {
         *self.hook_recovery_config.write().await = config;
+        self.crud_store
+            .background_work("hooks.recovery")
+            .invalidate();
     }
 
     pub(crate) fn with_remote_access_supervisor(
@@ -1928,6 +1923,9 @@ impl MessageProcessor {
                 Ok(builder) => {
                     let runtime = builder.build();
                     *self.hook_runtime.write().await = Some(runtime.clone());
+                    self.crud_store
+                        .background_work("hooks.recovery")
+                        .invalidate();
                     self.agent_manager.set_hook_runtime(Some(runtime)).await;
                 }
                 Err(error) => {
@@ -1944,6 +1942,9 @@ impl MessageProcessor {
             Ok(builder) => {
                 let runtime = builder.build();
                 *self.hook_runtime.write().await = Some(runtime.clone());
+                self.crud_store
+                    .background_work("hooks.recovery")
+                    .invalidate();
                 self.agent_manager.set_hook_runtime(Some(runtime)).await;
             }
             Err(error) => {
@@ -1989,6 +1990,7 @@ impl MessageProcessor {
                 crate::compaction::GatewayNativeContextController::new(Arc::downgrade(self)),
             )))
             .await;
+        self.crud_store.invalidate_compaction_history_dependencies();
     }
 
     /// Resolve the database-backed launch catalog on an isolated Tokio task.
@@ -2160,6 +2162,9 @@ impl MessageProcessor {
             Ok(builder) => {
                 let runtime = builder.build();
                 *self.hook_runtime.write().await = Some(runtime.clone());
+                self.crud_store
+                    .background_work("hooks.recovery")
+                    .invalidate();
                 self.agent_manager.set_hook_runtime(Some(runtime)).await;
             }
             Err(error) => {
@@ -2400,6 +2405,7 @@ impl MessageProcessor {
             .workspace_compaction_settings
             .write()
             .map_err(|_| anyhow::anyhow!("workspace compaction settings unavailable"))? = prepared;
+        self.crud_store.invalidate_compaction_history_dependencies();
         Ok(())
     }
 
@@ -2449,7 +2455,7 @@ impl MessageProcessor {
         Arc::new(self.scoped_with_database_class(class))
     }
 
-    fn for_background_reconciliation(self: &Arc<Self>) -> Arc<Self> {
+    pub(crate) fn for_background_reconciliation(self: &Arc<Self>) -> Arc<Self> {
         Arc::new(self.scoped_for_background_reconciliation())
     }
 
@@ -2530,235 +2536,558 @@ impl MessageProcessor {
     }
 
     async fn run_recovery_due_worker(processor: Weak<Self>) {
+        use pioneer_sqlite::background::{Plan, Ready};
+        let Some(initial) = processor.upgrade() else {
+            return;
+        };
+        let Some(mut owner) = initial.crud_store.background_work("recovery.due").acquire() else {
+            return;
+        };
+        let cancellation = initial.cli_history_shutdown.clone();
+        drop(initial);
+        let mut clocks = pioneer_crud::RecoveryClockPass::default();
+        let mut admission_error = None;
+        let mut clock_observation = None;
+        let mut clock_rescan = false;
         loop {
+            let ready = tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => return,
+                ready = owner.ready() => ready,
+            };
+            if ready == Ready::Closed {
+                return;
+            }
             let Some(original) = processor.upgrade() else {
-                break;
+                return;
             };
             let this = original.for_background_reconciliation();
             drop(original);
             #[cfg(test)]
             let wait_barrier = this.recovery_due_wait_barrier.clone();
-            let wake = this.recovery_coordinator.due_wake();
             let mut transient_storage_poll_failed = false;
-            let cycle = AssertUnwindSafe(async {
-                let now = now_timestamp_secs();
-                match crate::database::attribution::scope_database_workload_result(
-                    pioneer_observability::DatabaseWorkload::ExecutionSupervision,
-                    pioneer_observability::DatabaseOperationSite::RecoveryJobs,
-                    retry_transient_storage_access(|| {
-                        this.recovery_coordinator.run_due_jobs(now, 64)
-                    }),
-                )
-                .await
+            if ready == Ready::SettlementRequired {
+                clock_rescan = true;
+                let settle_observation = owner.observe();
+                if let Err(error) = this
+                    .crud_store
+                    .database_connection()
+                    .settle_background_change(&owner)
+                    .await
                 {
-                    Ok(events) => {
-                        for event in events {
-                            this.handle_recovery_event(event, now).await;
+                    record_resilience_worker_poll_error(
+                        "recovery due settlement",
+                        &error.into(),
+                        &mut transient_storage_poll_failed,
+                    );
+                    owner.retry_after(
+                        settle_observation,
+                        Duration::from_secs(if transient_storage_poll_failed {
+                            RESILIENCE_WORKER_TRANSIENT_STORAGE_BACKOFF_SECONDS
+                        } else {
+                            RESILIENCE_WORKER_POLL_INTERVAL_SECONDS
+                        }),
+                    );
+                }
+                continue;
+            }
+            let observation = owner.observe();
+            if clock_observation.is_some_and(|at| owner.producer_changed_since(at)) {
+                clock_rescan = true;
+            }
+            clock_observation = Some(observation);
+            let cycle = AssertUnwindSafe(owner.scope(async {
+                let now = chrono::DateTime::<chrono::Utc>::from(
+                    this.crud_store.background_work("recovery.due").wall_now(),
+                )
+                .timestamp();
+                // Reuse this quantum's unconditional PK frontier for execution
+                // AND clocks. No filtered population scan precedes this page.
+                let complete = match this
+                    .crud_store
+                    .recovery_clock_quantum(&mut clocks, false)
+                    .await
+                {
+                    Ok(complete) => complete,
+                    Err(error) => {
+                        admission_error.get_or_insert(error);
+                        true
+                    }
+                };
+                for id in &clocks.job_candidates {
+                    let result = crate::database::attribution::scope_database_workload_result(
+                        pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                        pioneer_observability::DatabaseOperationSite::RecoveryJobs,
+                        retry_transient_storage_access(|| {
+                            this.recovery_coordinator.run_due_job_candidate(now, id)
+                        }),
+                    )
+                    .await;
+                    match result {
+                        Ok(events) => {
+                            if !events.is_empty() {
+                                clock_rescan = true;
+                            }
+                            for event in events {
+                                this.handle_recovery_event(event, now).await;
+                            }
+                        }
+                        Err(error) => {
+                            admission_error.get_or_insert(error);
                         }
                     }
-                    Err(error) => record_resilience_worker_poll_error(
+                }
+                if !complete {
+                    return Ok(Plan::Runnable);
+                }
+                if let Some(error) = admission_error.take() {
+                    return Err(error);
+                }
+                let next = clocks.job_next;
+                clocks = Default::default();
+                if std::mem::take(&mut clock_rescan) {
+                    return Ok(Plan::Runnable);
+                }
+                Ok(next.map_or(Plan::Dormant, |at| Plan::WallDeadline(at.into())))
+            }))
+            .catch_unwind()
+            .await;
+            let mut _parked = false;
+            match cycle {
+                Ok(Ok(plan)) if !owner.requires_settlement() => {
+                    _parked = owner.publish(observation, plan) && !matches!(plan, Plan::Runnable);
+                }
+                Ok(Ok(_)) => {
+                    // A swallowed lower mutation failure still carries Unknown.
+                    owner.retry_after(
+                        observation,
+                        Duration::from_secs(RESILIENCE_WORKER_TRANSIENT_STORAGE_BACKOFF_SECONDS),
+                    );
+                }
+                Ok(Err(error)) => {
+                    admission_error = None;
+                    clocks = Default::default();
+                    clock_rescan = false;
+                    record_resilience_worker_poll_error(
                         "recovery due jobs",
                         &error,
                         &mut transient_storage_poll_failed,
-                    ),
+                    );
+                    owner.retry_after(
+                        observation,
+                        Duration::from_secs(if transient_storage_poll_failed {
+                            RESILIENCE_WORKER_TRANSIENT_STORAGE_BACKOFF_SECONDS
+                        } else {
+                            RESILIENCE_WORKER_POLL_INTERVAL_SECONDS
+                        }),
+                    );
                 }
-            })
-            .catch_unwind()
-            .await;
-            if cycle.is_err() {
-                error!("contained panic in recovery due worker");
+                Err(_) => {
+                    admission_error = None;
+                    clocks = Default::default();
+                    clock_rescan = false;
+                    error!("contained panic in recovery due worker");
+                    owner.retry_after(
+                        observation,
+                        Duration::from_secs(RESILIENCE_WORKER_POLL_INTERVAL_SECONDS),
+                    );
+                }
             }
-            // notify_one retains a permit across the drain/wait boundary. No
-            // processor or database resource is held during the fallback wait.
+            #[cfg(test)]
+            if _parked {
+                this.completed_history_preparation_barrier
+                    .wait_if_armed("__recovery_clock_settled__", &cancellation)
+                    .await;
+            }
             drop(this);
             #[cfg(test)]
             wait_barrier
-                .wait_if_armed(
-                    "__recovery_due_before_wait__",
-                    &tokio_util::sync::CancellationToken::new(),
-                )
+                .wait_if_armed("__recovery_due_before_wait__", &cancellation)
                 .await;
-            if sleep_after_transient_storage_poll_failure(transient_storage_poll_failed).await {
-                continue;
-            }
-            tokio::select! {
-                _ = wake.notified() => {},
-                _ = sleep(Duration::from_secs(RESILIENCE_WORKER_POLL_INTERVAL_SECONDS)) => {},
-            }
         }
     }
 
     async fn run_projection_delivery_resilience_worker(processor: Weak<Self>) {
-        let mut finalization_reporting = reconciliation_diagnostics::Reporter::new(
+        // Independent owner leases and phases. Delivery retains its existing
+        // bounded/causal drain; the adapter below only forwards coalesced input
+        // invalidations and never claims, discovers or dispatches business rows.
+        tokio::join!(
+            Self::run_native_projection_owner(processor.clone(), false),
+            Self::run_native_projection_owner(processor.clone(), true),
+            Self::run_native_delivery_inputs(
+                processor.clone(),
+                pioneer_crud::NATIVE_TURN_EVENT_LIVE_CONSUMER
+            ),
+            Self::run_native_delivery_inputs(
+                processor,
+                pioneer_crud::NATIVE_TURN_EVENT_EPISODIC_CONSUMER
+            ),
+        );
+    }
+
+    async fn run_native_delivery_inputs(processor: Weak<Self>, consumer: &'static str) {
+        use pioneer_sqlite::background::{Plan, Ready};
+        let Some(initial) = processor.upgrade() else {
+            return;
+        };
+        let name = if consumer == pioneer_crud::NATIVE_TURN_EVENT_LIVE_CONSUMER {
+            "turn.delivery.live"
+        } else {
+            "turn.delivery.episodic"
+        };
+        let work = initial.crud_store.background_work(name);
+        let cancel = initial.cli_history_shutdown.clone();
+        let Some(mut owner) = work.acquire() else {
+            return;
+        };
+        drop(initial);
+        loop {
+            let ready = tokio::select! {
+                _ = cancel.cancelled() => return,
+                ready = owner.ready() => ready,
+            };
+            if ready == Ready::Closed {
+                return;
+            }
+            let Some(this) = processor.upgrade() else {
+                return;
+            };
+            if ready == Ready::SettlementRequired {
+                let settle_observation = owner.observe();
+                if this
+                    .crud_store
+                    .database_connection()
+                    .settle_background_change(&owner)
+                    .await
+                    .is_err()
+                {
+                    owner.retry_after(settle_observation, Duration::from_secs(5));
+                }
+                continue;
+            }
+            let observed = owner.observe();
+            owner
+                .scope(async {
+                    if consumer == pioneer_crud::NATIVE_TURN_EVENT_LIVE_CONSUMER {
+                        this.kick_native_live_turn_event_deliveries();
+                    } else {
+                        this.kick_native_episodic_turn_event_deliveries();
+                    }
+                })
+                .await;
+            // The existing native owner owns discovery, deadlines and Empty.
+            // This memory-only input adapter settles just the forwarded hint.
+            owner.publish(observed, Plan::Dormant);
+        }
+    }
+
+    async fn run_native_projection_owner(processor: Weak<Self>, finalization: bool) {
+        use pioneer_sqlite::background::{Plan, Ready};
+        let Some(initial) = processor.upgrade() else {
+            return;
+        };
+        let work = initial.crud_store.background_work(if finalization {
+            "turn.finalization"
+        } else {
+            "turn.projection"
+        });
+        let cancellation = initial.cli_history_shutdown.clone();
+        let Some(mut owner) = work.acquire() else {
+            return;
+        };
+        drop(initial);
+        let mut reporting = reconciliation_diagnostics::Reporter::new(
             reconciliation_diagnostics::Operation::NativeFinalization,
         );
         loop {
-            let Some(this) = processor.upgrade() else {
-                break;
+            let ready = tokio::select! {
+                _ = cancellation.cancelled() => return,
+                ready = owner.ready() => ready,
             };
-            let this = this.for_background_reconciliation();
-            let cycle = AssertUnwindSafe(async {
-                let now = now_timestamp_secs();
-                match crate::database::attribution::scope_database_workload_result(
-                    pioneer_observability::DatabaseWorkload::ProjectionRecovery,
-                    pioneer_observability::DatabaseOperationSite::ProjectionReplay,
-                    retry_transient_storage_access(|| {
-                        this.crud_store.replay_due_turn_event_projections(now, 64)
-                    }),
-                )
-                .await
+            if ready == Ready::Closed {
+                return;
+            }
+            let Some(original) = processor.upgrade() else {
+                return;
+            };
+            let this = original.for_background_reconciliation();
+            drop(original);
+            if ready == Ready::SettlementRequired {
+                let settle_observation = owner.observe();
+                if this
+                    .crud_store
+                    .database_connection()
+                    .settle_background_change(&owner)
+                    .await
+                    .is_err()
                 {
-                    Ok(summary) if summary.quarantined > 0 || summary.missing_events > 0 => warn!(
-                        claimed = summary.claimed,
-                        projected = summary.projected,
-                        failed = summary.failed,
-                        quarantined = summary.quarantined,
-                        missing_events = summary.missing_events,
-                        "turn event projection replay found quarantined streams"
-                    ),
-                    Ok(summary) if summary.projected > 0 || summary.deferred > 0 => debug!(
-                        projected = summary.projected,
-                        deferred = summary.deferred,
-                        "turn event projection replay advanced"
-                    ),
-                    Ok(_) => {}
-                    Err(error) => error!(
-                        error = %format!("{error:#}"),
-                        "turn event projection replay failed"
-                    ),
+                    owner.retry_after(settle_observation, Duration::from_secs(2));
                 }
-
-                let result = crate::database::attribution::scope_database_workload_result(
-                    pioneer_observability::DatabaseWorkload::FinalizationRecovery,
-                    pioneer_observability::DatabaseOperationSite::PreparedFinalizationReconcile,
-                    retry_transient_storage_access(|| {
-                        this.reconcile_prepared_native_turn_finalizations(now, 64)
-                    }),
+                continue;
+            }
+            let observed = owner.observe();
+            let cycle = owner.scope(AssertUnwindSafe(async {
+                let now = now_timestamp_secs();
+                if finalization {
+                    let result = crate::database::attribution::scope_database_workload_result(
+                        pioneer_observability::DatabaseWorkload::FinalizationRecovery,
+                        pioneer_observability::DatabaseOperationSite::PreparedFinalizationReconcile,
+                        retry_transient_storage_access(|| this.reconcile_prepared_native_turn_finalizations(now, 64)),
+                    ).await;
+                    reporting.observe_finalizations(&result, Instant::now());
+                    let summary = result?;
+                    if summary.committed_count() > 0 {
+                        info!(scanned = summary.scanned, committed = summary.committed_count(), "reconciled prepared native Turn finalizations");
+                        this.kick_native_turn_event_deliveries();
+                    }
+                    // Finish the bounded pass before retrying poison, keeping
+                    // independent healthy intents reachable beyond its prefix.
+                    if !summary.pass_complete { return Ok(Plan::Runnable); }
+                    anyhow::ensure!(!summary.pass_failed, "native finalization pass has failures");
+                    Ok(Plan::Dormant)
+                } else {
+                    let summary = crate::database::attribution::scope_database_workload_result(
+                        pioneer_observability::DatabaseWorkload::ProjectionRecovery,
+                        pioneer_observability::DatabaseOperationSite::ProjectionReplay,
+                        retry_transient_storage_access(|| this.crud_store.replay_due_turn_event_projections(now, 64)),
+                    ).await?;
+                    if summary.quarantined > 0 || summary.missing_events > 0 {
+                        warn!(claimed = summary.claimed, projected = summary.projected, failed = summary.failed,
+                            quarantined = summary.quarantined, missing_events = summary.missing_events,
+                            "turn event projection replay found quarantined streams");
+                    }
+                    if summary.claimed >= 64 { return Ok(Plan::Runnable); }
+                    Ok(summary.next_eligible_at_unix.map_or(Plan::Dormant, |at| {
+                        Plan::WallDeadline(pioneer_crud::unix_to_datetime(at).into())
+                    }))
+                }
+            }).catch_unwind()).await;
+            match cycle {
+                Ok(Ok(plan)) if !owner.requires_settlement() => {
+                    owner.publish(observed, plan);
+                }
+                Ok(Err(error)) => {
+                    error!(finalization, error = %format!("{error:#}"), "native projection/finalization recovery deferred");
+                    owner.retry_after(observed, Duration::from_secs(2));
+                }
+                _ => {
+                    owner.retry_after(observed, Duration::from_secs(2));
+                }
+            }
+            #[cfg(test)]
+            this.completed_history_preparation_barrier
+                .wait_if_armed(
+                    if finalization {
+                        "__finalization_before_wait__"
+                    } else {
+                        "__event_delivery_recovery_before_kick__"
+                    },
+                    &cancellation,
                 )
                 .await;
-                finalization_reporting.observe_finalizations(&result, Instant::now());
-                match result {
-                    Ok(summary) => {
-                        let committed = summary.committed_count();
-                        if committed > 0 {
-                            info!(
-                                scanned = summary.scanned,
-                                committed,
-                                newly_committed = summary.newly_committed_count(),
-                                "reconciled prepared native Turn finalizations"
-                            );
-                            this.kick_native_turn_event_deliveries();
-                        }
-                        if summary.deferred_by_predecessor > 0
-                            || summary.superseded_by_terminal_status > 0
-                        {
-                            debug!(
-                                scanned = summary.scanned,
-                                deferred = summary.deferred_by_predecessor,
-                                superseded = summary.superseded_by_terminal_status,
-                                "prepared native Turn finalization reconciliation deferred work"
-                            );
-                        }
-                    }
-                    Err(_) => {}
-                }
-
-                #[cfg(test)]
-                this.completed_history_preparation_barrier
-                    .wait_if_armed(
-                        "__event_delivery_recovery_before_kick__",
-                        &this.cli_history_shutdown,
-                    )
-                    .await;
-                // Periodic recovery shares the same consumer owners as commit
-                // kicks; a slow episodic effect cannot hold the next LIVE batch.
-                this.kick_native_turn_event_deliveries();
-            })
-            .catch_unwind()
-            .await;
-            if cycle.is_err() {
-                error!("contained panic in projection/delivery resilience worker");
-            }
-            // Fixed fallback also discovers foreign writes and restored streams.
-            // No second deadline SELECT and no acceleration of shared callbacks.
-            sleep(Duration::from_secs(RESILIENCE_WORKER_POLL_INTERVAL_SECONDS)).await;
+            drop(this);
         }
     }
 
     async fn run_task_lifecycle_resilience_worker(processor: Weak<Self>) {
+        use pioneer_sqlite::background::{Plan, Ready};
         let mut occurrence_reporting = reconciliation_diagnostics::Reporter::new(
             reconciliation_diagnostics::Operation::TaskRunOccurrence,
         );
+        let Some(initial) = processor.upgrade() else {
+            return;
+        };
+        let work = initial.crud_store.background_work("tasks.lifecycle");
+        let cancellation = initial.cli_history_shutdown.clone();
+        let Some(mut owner) = work.acquire() else {
+            return;
+        };
+        drop(initial);
+        let mut delivery_cursor: Option<(String, String)> = None;
+        let mut delivery_pending = None;
+        let mut delivery_recovery = None;
+        let mut delivery_pass = None;
+        let mut delivery_rescan = false;
+        let mut delivery_failed = false;
         loop {
-            let Some(this) = processor.upgrade() else {
-                break;
+            let ready = tokio::select! {
+                _ = cancellation.cancelled() => return,
+                ready = owner.ready() => ready,
             };
-            let this = this.for_background_reconciliation();
-            let cycle = AssertUnwindSafe(async {
-                let now = now_timestamp_secs();
-                match crate::database::attribution::scope_database_workload_result(
-                    pioneer_observability::DatabaseWorkload::TaskReconcile,
-                    pioneer_observability::DatabaseOperationSite::TaskChildReconcile,
-                    this.reconcile_terminal_task_child_turns_with_retry(64),
-                )
-                .await
-                {
-                    Ok(reconciled) if reconciled > 0 => info!(
-                        reconciled,
-                        "reconciled terminal child Turns with their TaskRun aggregates"
-                    ),
-                    Ok(_) => {}
-                    Err(error) => tasks::report_task_child_reconciliation_error(error),
-                }
-
-                let result = crate::database::attribution::scope_database_workload_result(
-                    pioneer_observability::DatabaseWorkload::TaskReconcile,
-                    pioneer_observability::DatabaseOperationSite::TaskOccurrenceReconcile,
-                    this.reconcile_terminal_task_run_occurrence_turns(64),
-                )
-                .await;
-                occurrence_reporting.observe_occurrences(&result, Instant::now());
-                if let Ok(summary) = result
-                    && summary.selected > 0
-                {
-                    info!(
-                        selected = summary.selected,
-                        claimed = summary.claimed,
-                        reconciled = summary.changed,
-                        lost_claims = summary.lost_claims,
-                        stale = summary.stale,
-                        unresolved = summary.unresolved,
-                        no_change = summary.no_change,
-                        claim_errors = summary.claim_errors,
-                        claim_deferrals = summary.claim_deferrals,
-                        claim_deferral_conflicts = summary.claim_deferral_conflicts,
-                        claim_deferral_errors = summary.claim_deferral_errors,
-                        claim_without_snapshot = summary.claim_without_snapshot,
-                        claim_commit_unknown = summary.claim_commit_unknown,
-                        repair_errors = summary.repair_errors,
-                        storage_errors = summary.storage_errors,
-                        notification_errors = summary.notification_errors,
-                        queue_state_errors = summary.queue_state_errors,
-                        "TaskRun parent occurrence reconciliation pass"
-                    );
-                }
-
-                if let Err(error) = crate::database::attribution::scope_database_workload_result(
-                    pioneer_observability::DatabaseWorkload::TaskReconcile,
-                    pioneer_observability::DatabaseOperationSite::TaskDelivery,
-                    this.process_due_task_deliveries(now, 64),
-                )
-                .await
-                {
-                    error!(error = %format!("{error:#}"), "task delivery worker failed");
-                }
-            })
-            .catch_unwind()
-            .await;
-            if cycle.is_err() {
-                error!("contained panic in task lifecycle resilience worker");
+            if ready == Ready::Closed {
+                return;
             }
-            sleep(Duration::from_secs(RESILIENCE_WORKER_POLL_INTERVAL_SECONDS)).await;
+            let Some(original) = processor.upgrade() else {
+                return;
+            };
+            let this = original.for_background_reconciliation();
+            drop(original);
+            if ready == Ready::SettlementRequired {
+                delivery_cursor = None;
+                delivery_pass = None;
+                let settle_observation = owner.observe();
+                if this
+                    .crud_store
+                    .database_connection()
+                    .settle_background_change(&owner)
+                    .await
+                    .is_err()
+                {
+                    error!("Task lifecycle change settlement failed");
+                    owner.retry_after(settle_observation, Duration::from_secs(2));
+                }
+                continue;
+            }
+            let observed = owner.observe();
+            if delivery_cursor.is_none() {
+                delivery_pending = None;
+                delivery_recovery = None;
+                delivery_pass = Some(observed);
+                delivery_rescan = false;
+                delivery_failed = false;
+            }
+            delivery_rescan |= delivery_pass.is_some_and(|at| owner.producer_changed_since(at));
+            let cycle = owner.scope(AssertUnwindSafe(async {
+                let now = work.wall_now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs().min(i64::MAX as u64) as i64;
+                let mut failed = false;
+                {
+                    if let Err(error) = this.crud_store.seed_child_work_with_clock(&|| now).await {
+                        failed = true;
+                        error!(error = %format!("{error:#}"), "Task child seed quantum failed");
+                    }
+                    match crate::database::attribution::scope_database_workload_result(
+                        pioneer_observability::DatabaseWorkload::TaskReconcile,
+                        pioneer_observability::DatabaseOperationSite::TaskChildReconcile,
+                        this.reconcile_terminal_task_child_turns_with_retry(64),
+                    )
+                    .await
+                    {
+                        Ok(reconciled) if reconciled > 0 => info!(
+                            reconciled,
+                            "reconciled terminal child Turns with their TaskRun aggregates"
+                        ),
+                        Ok(_) => {}
+                        Err(error) => { failed = true; tasks::report_task_child_reconciliation_error(error); },
+                    }
+                }
+                {
+                    let result = crate::database::attribution::scope_database_workload_result(
+                        pioneer_observability::DatabaseWorkload::TaskReconcile,
+                        pioneer_observability::DatabaseOperationSite::TaskOccurrenceReconcile,
+                        this.reconcile_terminal_task_run_occurrence_turns(64),
+                    )
+                    .await;
+                    failed |= result.as_ref().map_or(true, |summary| summary.first_error.is_some()
+                        || summary.notification_errors > 0 || summary.pending.is_none());
+                    occurrence_reporting.observe_occurrences(&result, Instant::now());
+                    if let Ok(summary) = result
+                        && summary.selected > 0
+                    {
+                        info!(
+                            selected = summary.selected,
+                            claimed = summary.claimed,
+                            reconciled = summary.changed,
+                            lost_claims = summary.lost_claims,
+                            stale = summary.stale,
+                            unresolved = summary.unresolved,
+                            no_change = summary.no_change,
+                            claim_errors = summary.claim_errors,
+                            claim_deferrals = summary.claim_deferrals,
+                            claim_deferral_conflicts = summary.claim_deferral_conflicts,
+                            claim_deferral_errors = summary.claim_deferral_errors,
+                            claim_without_snapshot = summary.claim_without_snapshot,
+                            claim_commit_unknown = summary.claim_commit_unknown,
+                            repair_errors = summary.repair_errors,
+                            storage_errors = summary.storage_errors,
+                            notification_errors = summary.notification_errors,
+                            queue_state_errors = summary.queue_state_errors,
+                            "TaskRun parent occurrence reconciliation pass"
+                        );
+                    }
+                }
+                {
+                    if let Err(error) =
+                        crate::database::attribution::scope_database_workload_result(
+                            pioneer_observability::DatabaseWorkload::TaskReconcile,
+                            pioneer_observability::DatabaseOperationSite::TaskDelivery,
+                            this.process_due_task_deliveries(now, 64),
+                        )
+                        .await
+                    {
+                        failed = true;
+                        error!(error = %format!("{error:#}"), "task delivery worker failed");
+                    }
+                }
+                let now = work.wall_now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs().min(i64::MAX as u64) as i64;
+                let mut deadlines = this.crud_store.task_lifecycle_non_delivery_deadlines(now).await?;
+                let (pending, recovery, next, point_failed) = this.crud_store.task_delivery_deadline_page(
+                    now, delivery_cursor.as_ref().map(|(a, _)| a.as_str()),
+                    delivery_cursor.as_ref().map(|(_, u)| u.as_str()),
+                ).await?;
+                delivery_pending = delivery_pending.into_iter().chain(pending).min();
+                delivery_recovery = delivery_recovery.into_iter().chain(recovery).min();
+                delivery_cursor = next;
+                delivery_failed |= point_failed;
+                failed |= delivery_cursor.is_none() && delivery_failed;
+                deadlines.delivery_pending = delivery_pending;
+                deadlines.delivery_recovery = delivery_recovery;
+                let cooldown = this.task_runtime.background_control_service().delivery_recovery_retry_deadline();
+                let mut earliest = deadlines.child_point.into_iter()
+                    .chain(deadlines.child_scope).chain(deadlines.occurrence)
+                    .map(|at| std::time::UNIX_EPOCH + Duration::from_secs(at.max(0) as u64))
+                    .chain(deadlines.delivery_pending.map(|at| std::time::UNIX_EPOCH
+                        + Duration::from_secs(at.timestamp().saturating_add(i64::from(at.timestamp_subsec_nanos() > 0)).max(0) as u64)))
+                    .min();
+                // A cooling delivery source is the same lane as its retry:
+                // suppress that source, retain the retry, and independently
+                // retain every other lane's wall-clock obligation.
+                let recovery_cooldown = cooldown.filter(|until| *until > tokio::time::Instant::now());
+                if recovery_cooldown.is_none() {
+                    earliest = earliest.into_iter().chain(deadlines.delivery_recovery.map(|at|
+                        std::time::UNIX_EPOCH + Duration::from_secs(at.max(0) as u64))).min();
+                }
+                let plan = earliest.map_or(Plan::Dormant, |at| {
+                    if at <= work.wall_now() { Plan::Runnable }
+                    else { Plan::WallDeadline(at) }
+                });
+                let plan = if delivery_cursor.is_some() || delivery_rescan { Plan::Runnable } else { plan };
+                let plan = recovery_cooldown.map_or(plan, |until| plan.with_monotonic_deadline(until));
+                Ok::<_, anyhow::Error>((plan, failed))
+            }).catch_unwind()).await;
+            match cycle {
+                Ok(Ok((plan, false))) => {
+                    let settled = owner.publish(observed, plan);
+                    #[cfg(test)]
+                    if settled
+                        && delivery_cursor.is_none()
+                        && !delivery_rescan
+                        && !matches!(plan, Plan::Runnable)
+                    {
+                        this.completed_history_preparation_barrier
+                            .wait_if_armed("__task_lifecycle_delivery_settled__", &cancellation)
+                            .await;
+                    }
+                    let _ = settled;
+                }
+                Ok(Ok((_, true))) => {
+                    owner.retry_after(observed, Duration::from_secs(2));
+                }
+                Ok(Err(error)) => {
+                    error!(error = %format!("{error:#}"), "Task lifecycle deadline observation failed");
+                    owner.retry_after(observed, Duration::from_secs(2));
+                }
+                Err(_) => {
+                    error!("contained panic in task lifecycle resilience worker");
+                    owner.retry_after(observed, Duration::from_secs(2));
+                }
+            }
+            #[cfg(test)]
+            this.completed_history_preparation_barrier
+                .wait_if_armed("__task_lifecycle_before_wait__", &this.cli_history_shutdown)
+                .await;
+            // The weak processor and every database resource are released
+            // before common waiting. Dormant has neither a timer nor SQL.
+            drop(this);
         }
     }
 
@@ -2920,6 +3249,36 @@ impl MessageProcessor {
         Ok(())
     }
 
+    /// The queue phase of the control fallback. Admission is advisory; the
+    /// writer-owned scheduler rechecks capacity and keeps all fairness/claims.
+    async fn promote_admitted_agent_queue(
+        &self,
+        admission: Option<&pioneer_crud::RecoveryAdmission>,
+        clock: impl Fn() -> sea_orm::prelude::DateTimeWithTimeZone + Sync,
+    ) -> anyhow::Result<Vec<pioneer_crud::PromotedAgentExecution>> {
+        if admission
+            .is_some_and(|ready| !ready.queue || ready.queue_next.is_some_and(|at| at > clock()))
+        {
+            // The advisory F1 gate may admit <1s early. Its exact deadline
+            // avoids an empty writer/retry loop during that fractional gap.
+            return Ok(Vec::new());
+        }
+        let policy = crate::authorization::AgentWorkResourcePolicy::default();
+        crate::database::attribution::scope_database_workload_result(
+            pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+            pioneer_observability::DatabaseOperationSite::QueuedExecutionPromotion,
+            retry_transient_storage_access(|| {
+                self.crud_store.promote_queued_agent_executions(
+                    clock(),
+                    64,
+                    i64::try_from(policy.idle_timeout_secs).unwrap_or(i64::MAX),
+                    i64::try_from(policy.hard_timeout_secs).unwrap_or(i64::MAX),
+                )
+            }),
+        )
+        .await
+    }
+
     #[cfg(test)]
     pub async fn start_resilience_workers(self: &Arc<Self>) -> anyhow::Result<()> {
         let cancellation = tokio_util::sync::CancellationToken::new();
@@ -2999,6 +3358,7 @@ impl MessageProcessor {
 
         let processor = Arc::downgrade(self);
         let cancellation = cancellation.clone();
+        let worker_cancellation = cancellation.clone();
         let worker = async move {
             struct IsolatedWorkerGuard(Vec<JoinHandle<()>>);
 
@@ -3015,26 +3375,155 @@ impl MessageProcessor {
                     processor.clone(),
                 )),
                 tokio::spawn(Self::run_recovery_due_worker(processor.clone())),
+                tokio::spawn(Self::run_execution_timeout_worker(processor.clone())),
+                tokio::spawn(Self::run_native_terminal_effect_worker(processor.clone())),
+                tokio::spawn(Self::run_agent_action_ledger_worker(processor.clone())),
+                tokio::spawn(Self::run_skill_upload_cleanup_worker(processor.clone())),
+                tokio::spawn(Self::run_native_terminal_effect_archive_worker(
+                    processor.clone(),
+                    false,
+                )),
+                tokio::spawn(Self::run_native_terminal_effect_archive_worker(
+                    processor.clone(),
+                    true,
+                )),
+                tokio::spawn(Self::run_cli_command_heartbeat_worker(processor.clone())),
+                tokio::spawn(Self::run_cli_supervision_worker(processor.clone())),
                 tokio::spawn(Self::run_projection_delivery_resilience_worker(
                     processor.clone(),
                 )),
                 tokio::spawn(Self::run_task_lifecycle_resilience_worker(
                     processor.clone(),
                 )),
+                tokio::spawn(Self::run_compaction_lifecycle_worker(processor.clone())),
+                tokio::spawn(Self::run_compaction_history_worker(processor.clone())),
             ]);
-            let mut cli_runtime_stale_turn_scan = cli_runtime::CliRuntimeStaleTurnScan::default();
-            let mut next_skill_upload_cleanup = 0;
-            let mut next_agent_action_ledger_compaction = 0;
-            let mut next_native_terminal_effect_purge = 0;
-            let mut next_native_terminal_effect_recovery = 0;
-            loop {
-                let Some(this) = processor.upgrade() else {
-                    break;
-                };
-                let this = this.for_background_reconciliation();
-                let maintenance = this.with_database_class(SqliteWriteClass::Maintenance);
-                let now = now_timestamp_secs();
+            Self::run_recovery_control_worker(processor, worker_cancellation).await;
+        };
+        let handle = tokio::spawn(async move {
+            tokio::select! {
+                _ = cancellation.cancelled() => {},
+                _ = worker => {},
+            }
+        });
+
+        *guard = Some(handle);
+        Ok(())
+    }
+
+    /// One retained control owner, independent of the sibling owner tasks.
+    /// Startup owns its cancellation together with those siblings.
+    async fn run_recovery_control_worker(
+        processor: Weak<Self>,
+        worker_cancellation: tokio_util::sync::CancellationToken,
+    ) {
+        use pioneer_sqlite::background::{Plan, Ready};
+        let Some(initial) = processor.upgrade() else {
+            return;
+        };
+        let Some(mut owner) = initial
+            .crud_store
+            .background_work("recovery.control")
+            .acquire()
+        else {
+            return;
+        };
+        drop(initial);
+        let mut clocks = pioneer_crud::RecoveryClockPass::default();
+        let mut control_admission = pioneer_crud::ControlAdmissionPass::default();
+        let mut admission_complete = false;
+        let mut clock_observation = None;
+        let mut clock_rescan = false;
+        loop {
+            let ready = tokio::select! { biased; _ = worker_cancellation.cancelled() => return, ready = owner.ready() => ready };
+            if ready == Ready::Closed {
+                return;
+            }
+            let Some(this) = processor.upgrade() else {
+                break;
+            };
+            let this = this.for_background_reconciliation();
+            if ready == Ready::SettlementRequired {
+                clock_rescan = true;
+                let settle_observation = owner.observe();
+                if this
+                    .crud_store
+                    .database_connection()
+                    .settle_background_change(&owner)
+                    .await
+                    .is_err()
+                {
+                    owner.retry_after(settle_observation, Duration::from_secs(60));
+                }
+                continue;
+            }
+            let observed = owner.observe();
+            if clock_observation.is_some_and(|at| owner.producer_changed_since(at)) {
+                clock_rescan = true;
+            }
+            clock_observation = Some(observed);
+            let mut clock_complete = false;
+            let mut clock_observed = false;
+            let mut clock_failed = false;
+            let plan = owner.scope(async {
+                let now = this.crud_store.background_work("recovery.control").wall_now().duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default().as_secs().min(i64::MAX as u64) as i64;
                 let mut transient_storage_poll_failed = false;
+                let mut phase_failed = false;
+                let admission = match crate::database::attribution::scope_database_workload_result(
+                    pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                    pioneer_observability::DatabaseOperationSite::RecoveryJobs,
+                    async {
+                        #[cfg(test)]
+                        {
+                            let failure = this.recovery_admission_failure.lock().unwrap().take();
+                            if let Some(error) = failure {
+                                return Err(error);
+                            }
+                        }
+                        clock_observed = true;
+                        clock_complete = match this.crud_store.recovery_clock_quantum(&mut clocks, true).await {
+                            Ok(complete) => complete,
+                            Err(error) => { clock_failed=true; clock_rescan=true; return Err(error); }
+                        };
+                        admission_complete = match this.crud_store.control_admission_quantum(&mut control_admission).await {
+                            Ok(done) => done,
+                            Err(error) => {control_admission = Default::default(); return Err(error);}
+                        };
+                        #[cfg(test)]
+                        if !admission_complete {
+                            this.completed_history_preparation_barrier.wait_if_armed(
+                                "__control_admission_raw_page__", &worker_cancellation).await;
+                        }
+                        let mut admission = this.crud_store.recovery_admission_core(this.turn_execution_owner_id.as_ref(), now).await?;
+                        control_admission.apply_at(&mut admission, pioneer_crud::utc_now());
+                        admission.orphan = this.recovery_coordinator.orphan_supervision_more();
+                        admission.orphan_next = this.recovery_coordinator.orphan_supervision_deadline().map(pioneer_crud::unix_to_datetime);
+                        admission.terminal_audit = clocks.terminal_audit;
+                        admission.backfill = clocks.backfill;
+                        admission.terminal_repair = clocks.repair_next.is_some_and(|at| at <= pioneer_crud::unix_to_datetime(now));
+                        admission.terminal_delivery = clocks.terminal_next.is_some_and(|at| at <= pioneer_crud::unix_to_datetime(now));
+                        admission.terminal_repair_next = clocks.repair_next;
+                        admission.terminal_delivery_next = clocks.terminal_next;
+                        Ok(admission)
+                    },
+                )
+                .await
+                {
+                    Ok(admission) => Some(admission),
+                    Err(error) => {
+                        // Observation failure is advisory: preserve its diagnostic
+                        // without deferring healthy authoritative phases below.
+                        record_resilience_worker_error(
+                            "recovery admission",
+                            &error,
+                            ResilienceWorkerFailureImpact::Maintenance,
+                        );
+                        // Unknown is never Empty: allow every independent phase
+                        // to attempt its existing authoritative discovery.
+                        None
+                    }
+                };
                 #[cfg(test)]
                 this.completed_history_preparation_barrier
                     .wait_if_armed(
@@ -3042,63 +3531,30 @@ impl MessageProcessor {
                         &tokio_util::sync::CancellationToken::new(),
                     )
                     .await;
-                if maintenance.poll_completed_history_checks().await.is_err() {
-                    warn!("failed to poll completed history checks");
-                }
-                if now >= next_skill_upload_cleanup {
-                    crate::database::attribution::scope_database_workload(
-                        pioneer_observability::DatabaseWorkload::ExecutionSupervision,
-                        pioneer_observability::DatabaseOperationSite::StaleSkillUploadCleanup,
-                        maintenance.cleanup_stale_skill_uploads(now),
-                    )
-                    .await;
-                    next_skill_upload_cleanup = now.saturating_add(60);
-                }
-
-                // Confirm live native command activity before timeout polling.
-                // A command whose lease is near its boundary must get the
-                // authoritative liveness check before any destructive claim.
-                crate::database::attribution::scope_database_workload(
-                    pioneer_observability::DatabaseWorkload::ExecutionSupervision,
-                    pioneer_observability::DatabaseOperationSite::CliCommandHeartbeat,
-                    this.heartbeat_due_cli_runtime_command_items(now),
-                )
-                .await;
-
-                let agent_resource_policy =
-                    crate::authorization::AgentWorkResourcePolicy::default();
-                match crate::database::attribution::scope_database_workload_result(
-                    pioneer_observability::DatabaseWorkload::ExecutionSupervision,
-                    pioneer_observability::DatabaseOperationSite::QueuedExecutionPromotion,
-                    retry_transient_storage_access(|| {
-                        this.crud_store.promote_queued_agent_executions(
-                            pioneer_crud::utc_now(),
-                            64,
-                            i64::try_from(agent_resource_policy.idle_timeout_secs)
-                                .unwrap_or(i64::MAX),
-                            i64::try_from(agent_resource_policy.hard_timeout_secs)
-                                .unwrap_or(i64::MAX),
-                        )
-                    }),
-                )
-                .await
+                // Command heartbeats have their own retained deadline owner.
+                // Timeout authority still checks liveness before destructive CAS.
+                let mut action_outbox_changed = false;
+                let mut terminal_effects_changed = false;
+                match this
+                    .promote_admitted_agent_queue(admission.as_ref(), pioneer_crud::utc_now)
+                    .await
                 {
                     Ok(promoted) => {
-                        let database = this.crud_store.database_connection();
+                        action_outbox_changed = !promoted.is_empty();
                         for execution in &promoted {
                             if let Err(error) =
                                 crate::database::attribution::scope_database_workload_result(
                                     pioneer_observability::DatabaseWorkload::ExecutionSupervision,
                                     pioneer_observability::DatabaseOperationSite::AgentOutboxWake,
-                                    pioneer_crud::wake_agent_action_outbox_for_execution(
-                                        &database,
+                                    this.crud_store.wake_agent_action_outbox_for_execution(
                                         execution.execution_id.as_str(),
                                         pioneer_crud::utc_now(),
                                     ),
                                 )
                                 .await
                             {
-                                record_resilience_worker_poll_error(
+                                phase_failed = true;
+                    record_resilience_worker_poll_error(
                                     "agent domain promoted agent outbox wake",
                                     &error,
                                     &mut transient_storage_poll_failed,
@@ -3120,246 +3576,112 @@ impl MessageProcessor {
                         }
                     }
                     Err(error) => {
-                        record_resilience_worker_poll_error(
+                        phase_failed = true;
+                    record_resilience_worker_poll_error(
                             "agent domain durable agent queue",
                             &error,
                             &mut transient_storage_poll_failed,
                         );
                     }
                 }
-                if sleep_after_transient_storage_poll_failure(transient_storage_poll_failed).await {
-                    continue;
+                if transient_storage_poll_failed {
+                    return this.recovery_coordinator.supervision_retry_plan(tokio::time::Instant::now() + Duration::from_secs(RESILIENCE_WORKER_TRANSIENT_STORAGE_BACKOFF_SECONDS));
                 }
 
-                if now >= next_agent_action_ledger_compaction {
-                    next_agent_action_ledger_compaction =
-                        now.saturating_add(AGENT_ACTION_LEDGER_COMPACTION_INTERVAL_SECONDS);
+                if action_outbox_changed
+                    || admission.as_ref().is_none_or(|ready| ready.action_outbox)
+                {
                     match crate::database::attribution::scope_database_workload_result(
                         pioneer_observability::DatabaseWorkload::ExecutionSupervision,
-                        pioneer_observability::DatabaseOperationSite::TerminalExecutionCompaction,
-                        retry_transient_storage_access(|| {
-                            let database = maintenance.crud_store.database_connection();
-                            async move {
-                                pioneer_crud::compact_terminal_agent_action_ledger(
-                                    &database,
-                                    pioneer_crud::utc_now(),
-                                    AGENT_ACTION_LEDGER_COMPACTION_BATCH_SIZE,
-                                )
-                                .await
-                            }
-                        }),
+                        pioneer_observability::DatabaseOperationSite::AgentActionOutbox,
+                        // One input quantum. Report errors/back off only after all
+                        // independent known-committed rows have had their dispatch.
+                        agent_action_tools::process_due_agent_action_outbox(&this, 64),
                     )
                     .await
                     {
-                        Ok(summary) => {
-                            if summary.compacted_rows > 0 {
-                                info!(
-                                    compacted_rows = summary.compacted_rows,
-                                    payload_bytes_released = summary.payload_bytes_released,
-                                    "compacted terminal agent domain action ledger payloads"
+                        Ok(batch) => {
+                            terminal_effects_changed |=
+                                batch.delivered > 0 || !batch.errors.is_empty();
+                            if !batch.errors.is_empty() {
+                                tracing::warn!(
+                                    delivered = batch.delivered,
+                                    candidate_failures = batch.errors.len(),
+                                    "agent action outbox quantum made partial progress"
                                 );
-                            }
-                            if summary.candidate_rows >= AGENT_ACTION_LEDGER_COMPACTION_BATCH_SIZE {
-                                next_agent_action_ledger_compaction = now;
+                                transient_storage_poll_failed = true;
+                                for error in batch.errors {
+                                    phase_failed = true;
+                    record_resilience_worker_poll_error(
+                                        "agent domain agent action outbox",
+                                        &error,
+                                        &mut transient_storage_poll_failed,
+                                    );
+                                }
                             }
                         }
                         Err(error) => {
-                            next_agent_action_ledger_compaction =
-                                now.saturating_add(AGENT_ACTION_LEDGER_COMPACTION_RETRY_SECONDS);
-                            record_resilience_worker_poll_error(
-                                "agent domain action ledger compaction",
+                            transient_storage_poll_failed = true;
+                            phase_failed = true;
+                    record_resilience_worker_poll_error(
+                                "agent domain agent action outbox",
                                 &error,
                                 &mut transient_storage_poll_failed,
                             );
                         }
                     }
+                    if transient_storage_poll_failed {
+                    return this.recovery_coordinator.supervision_retry_plan(tokio::time::Instant::now() + Duration::from_secs(RESILIENCE_WORKER_TRANSIENT_STORAGE_BACKOFF_SECONDS));
                 }
-                if sleep_after_transient_storage_poll_failure(transient_storage_poll_failed).await {
-                    continue;
                 }
 
-                if now >= next_native_terminal_effect_recovery {
-                    next_native_terminal_effect_recovery =
-                        now.saturating_add(NATIVE_TERMINAL_EFFECT_RECOVERY_INTERVAL_SECONDS);
-                    match crate::database::attribution::scope_database_workload_result(
-                        pioneer_observability::DatabaseWorkload::ExecutionSupervision,
-                        pioneer_observability::DatabaseOperationSite::NativeTerminalEffectRequeue,
-                        retry_transient_storage_access(|| {
-                            maintenance
-                                .crud_store
-                                .requeue_retryable_unresolved_native_terminal_effects(
-                                    now,
-                                    NATIVE_TERMINAL_EFFECT_RECOVERY_BATCH_SIZE,
-                                )
-                        }),
-                    )
-                    .await
-                    {
-                        Ok(requeued) => {
-                            if requeued > 0 {
-                                info!(
-                                    requeued,
-                                    "requeued retryable unresolved native terminal effects"
-                                );
-                            }
-                            if requeued >= NATIVE_TERMINAL_EFFECT_RECOVERY_BATCH_SIZE {
-                                next_native_terminal_effect_recovery = now;
-                            }
-                        }
+                if terminal_effects_changed {
+                    this.crud_store.background_work("recovery.effects").dependency_released();
+                }
+
+                if admission.is_none() && !clock_observed {
+                    // A failure before clock discovery still permits this late
+                    // independent bounded phase (including F7's late commit).
+                    clock_rescan = true;
+                    match this.crud_store.recovery_clock_quantum(&mut clocks, true).await {
+                        Ok(done) => clock_complete = done,
                         Err(error) => {
-                            next_native_terminal_effect_recovery =
-                                now.saturating_add(NATIVE_TERMINAL_EFFECT_RECOVERY_RETRY_SECONDS);
-                            record_resilience_worker_error(
-                                "native terminal-effect retryable recovery",
-                                &error,
-                                ResilienceWorkerFailureImpact::Maintenance,
-                            );
+                            phase_failed = true;
+                            clock_failed = true;
+                            record_resilience_worker_poll_error("recovery terminalization observation", &error, &mut transient_storage_poll_failed);
                         }
                     }
                 }
-                if sleep_after_transient_storage_poll_failure(transient_storage_poll_failed).await {
-                    continue;
-                }
-
-                if now >= next_native_terminal_effect_purge {
-                    next_native_terminal_effect_purge =
-                        now.saturating_add(NATIVE_TERMINAL_EFFECT_PURGE_INTERVAL_SECONDS);
-                    match crate::database::attribution::scope_database_workload_result(
-                        pioneer_observability::DatabaseWorkload::ExecutionSupervision,
-                        pioneer_observability::DatabaseOperationSite::NativeTerminalEffectPurge,
-                        retry_transient_storage_access(|| {
-                            maintenance
-                                .crud_store
-                                .purge_resolved_native_terminal_effects_before(
-                                    now.saturating_sub(NATIVE_TERMINAL_EFFECT_RETENTION_SECONDS),
-                                    NATIVE_TERMINAL_EFFECT_PURGE_BATCH_SIZE,
-                                )
-                        }),
-                    )
-                    .await
-                    {
-                        Ok(purged) => {
-                            if purged > 0 {
-                                info!(purged, "purged retained native terminal effects");
-                            }
-                            if purged >= NATIVE_TERMINAL_EFFECT_PURGE_BATCH_SIZE {
-                                next_native_terminal_effect_purge = now;
-                            }
-                        }
-                        Err(error) => {
-                            next_native_terminal_effect_purge =
-                                now.saturating_add(NATIVE_TERMINAL_EFFECT_PURGE_RETRY_SECONDS);
-                            // Retention is maintenance, not recovery authority.
-                            // Its failure must not defer terminalization,
-                            // timeout supervision, or either durable outbox.
-                            record_resilience_worker_error(
-                                "native terminal-effect retention",
-                                &error,
-                                ResilienceWorkerFailureImpact::Maintenance,
-                            );
-                        }
-                    }
-                }
-                if sleep_after_transient_storage_poll_failure(transient_storage_poll_failed).await {
-                    continue;
-                }
-
-                match crate::database::attribution::scope_database_workload_result(
-                    pioneer_observability::DatabaseWorkload::ExecutionSupervision,
-                    pioneer_observability::DatabaseOperationSite::AgentActionOutbox,
-                    // One input quantum. Report errors/back off only after all
-                    // independent known-committed rows have had their dispatch.
-                    agent_action_tools::process_due_agent_action_outbox(&this, 64),
-                )
-                .await
+                if admission
+                    .as_ref()
+                    .is_none_or(|ready| ready.terminal_audit)
                 {
-                    Ok(batch) => {
-                        if !batch.errors.is_empty() {
-                            tracing::warn!(
-                                delivered = batch.delivered,
-                                candidate_failures = batch.errors.len(),
-                                "agent action outbox quantum made partial progress"
-                            );
-                            transient_storage_poll_failed = true;
-                            for error in batch.errors {
-                                record_resilience_worker_poll_error(
-                                    "agent domain agent action outbox",
-                                    &error,
-                                    &mut transient_storage_poll_failed,
-                                );
-                            }
-                        }
-                    }
-                    Err(error) => {
-                        transient_storage_poll_failed = true;
-                        record_resilience_worker_poll_error(
-                            "agent domain agent action outbox",
-                            &error,
-                            &mut transient_storage_poll_failed,
-                        );
-                    }
-                }
-                if sleep_after_transient_storage_poll_failure(transient_storage_poll_failed).await {
-                    continue;
-                }
-
-                // Hook/cleanup handlers have their own bounded deadlines and
-                // must never block lease heartbeats, timeout recovery, or the
-                // rest of this global resilience control loop.
-                this.kick_native_terminal_effects();
-
-                match crate::database::attribution::scope_database_workload_result(
-                    pioneer_observability::DatabaseWorkload::ExecutionSupervision,
-                    pioneer_observability::DatabaseOperationSite::ExecutionTimeoutPoll,
-                    retry_transient_storage_access(|| {
-                        this.poll_timeouts_respecting_human_wait(now, 64)
-                    }),
-                )
-                .await
-                {
-                    Ok(candidates) => {
-                        for candidate in candidates {
-                            crate::database::attribution::scope_database_workload(
-                                pioneer_observability::DatabaseWorkload::ExecutionSupervision,
-                                pioneer_observability::DatabaseOperationSite::ExecutionTimeoutApply,
-                                this.handle_timeout_candidate(candidate, now),
-                            )
-                            .await;
-                        }
-                    }
-                    Err(error) => {
-                        record_resilience_worker_poll_error(
-                            "timeout supervisor",
-                            &error,
-                            &mut transient_storage_poll_failed,
-                        );
-                    }
-                }
-                if sleep_after_transient_storage_poll_failure(transient_storage_poll_failed).await {
-                    continue;
-                }
-
-                if let Err(error) = crate::database::attribution::scope_database_workload_result(
+                    if let Err(error) = crate::database::attribution::scope_database_workload_result(
                     pioneer_observability::DatabaseWorkload::RecoveryTerminalizationAudit,
                     pioneer_observability::DatabaseOperationSite::RecoveryTerminalizationAudit,
                     retry_transient_storage_access(|| {
                         this.crud_store
-                            .enqueue_missing_recovery_terminalizations(64, now)
+                            .enqueue_missing_recovery_terminalization_candidates(&clocks.terminal_audit_candidates, now)
                     }),
                 )
                 .await
                 {
+                    phase_failed = true;
                     record_resilience_worker_poll_error(
                         "recovery terminalization auditor",
                         &error,
                         &mut transient_storage_poll_failed,
                     );
                 }
-                if sleep_after_transient_storage_poll_failure(transient_storage_poll_failed).await {
-                    continue;
+                    if transient_storage_poll_failed {
+                    return this.recovery_coordinator.supervision_retry_plan(tokio::time::Instant::now() + Duration::from_secs(RESILIENCE_WORKER_TRANSIENT_STORAGE_BACKOFF_SECONDS));
+                }
                 }
 
-                if let Err(error) = crate::database::attribution::scope_database_workload_result(
+                if admission.as_ref().is_none_or(|ready| {
+                    ready.terminal_delivery || ready.terminal_audit
+                }) {
+                    if let Err(error) = crate::database::attribution::scope_database_workload_result(
                     pioneer_observability::DatabaseWorkload::RecoveryTerminalizationApply,
                     pioneer_observability::DatabaseOperationSite::RecoveryTerminalizationApply,
                     retry_transient_storage_access(|| {
@@ -3368,26 +3690,39 @@ impl MessageProcessor {
                 )
                 .await
                 {
+                    phase_failed = true;
                     record_resilience_worker_poll_error(
                         "recovery terminalization outbox",
                         &error,
                         &mut transient_storage_poll_failed,
                     );
                 }
-                if sleep_after_transient_storage_poll_failure(transient_storage_poll_failed).await {
-                    continue;
+                    if transient_storage_poll_failed {
+                    return this.recovery_coordinator.supervision_retry_plan(tokio::time::Instant::now() + Duration::from_secs(RESILIENCE_WORKER_TRANSIENT_STORAGE_BACKOFF_SECONDS));
+                }
                 }
 
                 match crate::database::attribution::scope_database_workload_result(
                     pioneer_observability::DatabaseWorkload::ExecutionSupervision,
                     pioneer_observability::DatabaseOperationSite::RecoveryJobs,
-                    retry_transient_storage_access(|| {
-                        this.recovery_coordinator.run_supervision_audits(now, 64)
+                    retry_transient_storage_access(|| async {
+                        match admission.as_ref() {
+                            Some(ready) => {
+                                this.recovery_coordinator
+                                    .run_admitted_supervision_audits(now, 64, ready, Some(&clocks.backfill_candidates))
+                                    .await
+                            }
+                            None => {
+                                this.recovery_coordinator
+                                    .run_admitted_supervision_audits(now, 64, &pioneer_crud::RecoveryAdmission::unknown(), Some(&clocks.backfill_candidates))
+                                    .await
+                            }
+                        }
                     }),
                 )
                 .await
                 {
-                    Ok(events) => {
+                    Ok((events, backfill_error)) => {
                         for event in events {
                             crate::database::attribution::scope_database_workload(
                                 pioneer_observability::DatabaseWorkload::ExecutionSupervision,
@@ -3396,41 +3731,92 @@ impl MessageProcessor {
                             )
                             .await;
                         }
+                        if let Some(error) = backfill_error {
+                            phase_failed = true;
+                            record_resilience_worker_poll_error("recovery timeout backfill point", &error, &mut transient_storage_poll_failed);
+                        }
                     }
                     Err(error) => {
-                        record_resilience_worker_poll_error(
+                        phase_failed = true;
+                    record_resilience_worker_poll_error(
                             "recovery coordinator",
                             &error,
                             &mut transient_storage_poll_failed,
                         );
                     }
                 }
-                if sleep_after_transient_storage_poll_failure(transient_storage_poll_failed).await {
-                    continue;
+                if transient_storage_poll_failed {
+                    return this.recovery_coordinator.supervision_retry_plan(tokio::time::Instant::now() + Duration::from_secs(RESILIENCE_WORKER_TRANSIENT_STORAGE_BACKOFF_SECONDS));
                 }
 
-                crate::database::attribution::scope_database_workload(
-                    pioneer_observability::DatabaseWorkload::ExecutionSupervision,
-                    pioneer_observability::DatabaseOperationSite::StaleCliTurnFailure,
-                    this.fail_stale_cli_runtime_turns(
-                        now_timestamp_millis(),
-                        &mut cli_runtime_stale_turn_scan,
-                    ),
-                )
-                .await;
-
-                sleep(Duration::from_secs(RESILIENCE_WORKER_POLL_INTERVAL_SECONDS)).await;
+                // An observation error remains Unknown through ALL independent
+                // phases. Only an authoritative phase's own error selects the
+                // early60s backoff above (F7).
+                if phase_failed || admission.is_none() {
+                    // Keep a partial healthy tail on grouped-read errors; restart
+                    // completed/failed reconstruction after its point phase ran.
+                    if clock_complete || clock_failed { clocks=Default::default(); }
+                    return this.recovery_coordinator.supervision_retry_plan(tokio::time::Instant::now() + Duration::from_secs(RESILIENCE_WORKER_POLL_INTERVAL_SECONDS));
+                }
+                let ready = admission.unwrap();
+                let (more_active, active_next) = this.recovery_coordinator.active_supervision_schedule();
+                if more_active || this.recovery_coordinator.orphan_supervision_more() { return Plan::Runnable; }
+                // Supervision can finish an execution/release root capacity
+                // after the pre-queue snapshot. Own ACK suppression must not
+                // park newly enabled queue/outbox work in that same quantum.
+                let had_clock_work = ready.terminal_repair || ready.terminal_delivery;
+                let had_immediate = ready.control_runnable() || ready.orphan || ready.active;
+                if had_clock_work || ready.control_runnable() { clock_rescan=true; }
+                let mut ready = if had_immediate {
+                    match this.crud_store.recovery_admission_core(this.turn_execution_owner_id.as_ref(), now).await {
+                        Ok(mut ready) => {
+                            control_admission.apply_at(&mut ready, pioneer_crud::utc_now());
+                            ready.orphan = this.recovery_coordinator.orphan_supervision_more();
+                            ready.terminal_audit = clocks.terminal_audit;
+                            ready.backfill = clocks.backfill;
+                            ready
+                        },
+                        Err(error) => {
+                            record_resilience_worker_error("recovery admission", &error, ResilienceWorkerFailureImpact::Maintenance);
+                            return this.recovery_coordinator.supervision_retry_plan(tokio::time::Instant::now() + Duration::from_secs(2));
+                        }
+                    }
+                } else { ready };
+                // The finite orphan pass owns this clock and its error budget;
+                // grouped advisory clocks cannot bypass the same lane cooldown.
+                ready.orphan_next = this.recovery_coordinator.orphan_supervision_deadline()
+                    .map(pioneer_crud::unix_to_datetime);
+                if !clock_complete || !admission_complete { return Plan::Runnable; }
+                control_admission = Default::default();
+                admission_complete = false;
+                let clock_next = clocks.repair_next.into_iter().chain(clocks.terminal_next).min();
+                clocks=Default::default();
+                if std::mem::take(&mut clock_rescan) || ready.control_runnable() { return Plan::Runnable; }
+                let next = ready.control_deadline().into_iter().chain(clock_next).chain(active_next.map(pioneer_crud::unix_to_datetime))
+                    .chain(this.recovery_coordinator.orphan_supervision_deadline().map(pioneer_crud::unix_to_datetime)).min();
+                let plan = next.map_or(Plan::Dormant, |at| Plan::WallDeadline(at.into()));
+                this.recovery_coordinator.supervision_retry_deadline()
+                    .map_or(plan, |at| plan.with_monotonic_deadline(at))
+                }).await;
+            let settled = owner.publish(observed, plan);
+            if !settled && let Plan::MonotonicDeadline(at) = plan {
+                // Own ambiguous commit advances the generation; the common
+                // retry fence accepts it only without an intervening producer.
+                owner.retry_after(
+                    observed,
+                    at.saturating_duration_since(tokio::time::Instant::now()),
+                );
             }
-        };
-        let handle = tokio::spawn(async move {
-            tokio::select! {
-                _ = cancellation.cancelled() => {},
-                _ = worker => {},
+            #[cfg(test)]
+            if settled && !matches!(plan, Plan::Runnable) {
+                this.completed_history_preparation_barrier
+                    .wait_if_armed("__control_owner_settled__", &worker_cancellation)
+                    .await;
             }
-        });
-
-        *guard = Some(handle);
-        Ok(())
+            if matches!(plan, Plan::Runnable) {
+                tokio::select! { _ = worker_cancellation.cancelled() => return, _ = sleep(Duration::from_millis(10)) => {} }
+            }
+        }
     }
 
     pub(crate) async fn shutdown_resilience_workers(&self) {
@@ -3459,6 +3845,149 @@ impl MessageProcessor {
         self.task_runtime.shutdown().await;
     }
 
+    async fn run_cli_command_heartbeat_worker(processor: Weak<Self>) {
+        use pioneer_sqlite::background::{Plan, Ready};
+        let Some(initial) = processor.upgrade() else {
+            return;
+        };
+        let work = initial.crud_store.background_work("cli.commands");
+        let Some(mut owner) = work.acquire() else {
+            return;
+        };
+        let cancellation = initial.cli_history_shutdown.clone();
+        let tracker = initial.cli_runtime_command_heartbeats.clone();
+        drop(initial);
+        let mut previous = None;
+        let mut reconstruct = true;
+        let mut upper: Option<String> = None;
+        let mut after: Option<String> = None;
+        let mut seen = std::collections::HashSet::new();
+        let mut rescan = false;
+        let mut failed = false;
+        let mut retry_at: Option<tokio::time::Instant> = None;
+        loop {
+            let ready = tokio::select! {
+                biased; _ = cancellation.cancelled() => return,
+                ready = owner.ready() => ready,
+                _ = tracker.dependency_released() => Ready::Work,
+            };
+            if ready == Ready::Closed {
+                return;
+            }
+            let Some(this) = processor.upgrade() else {
+                return;
+            };
+            let this = this.for_background_reconciliation();
+            if ready == Ready::SettlementRequired {
+                let settle_observation = owner.observe();
+                reconstruct = true;
+                upper = None;
+                after = None;
+                seen.clear();
+                failed = false;
+                retry_at = None;
+                if this
+                    .crud_store
+                    .database_connection()
+                    .settle_background_change(&owner)
+                    .await
+                    .is_err()
+                {
+                    owner.retry_after(settle_observation, Duration::from_secs(60));
+                }
+                continue;
+            }
+            let observed = owner.observe();
+            if previous.is_some_and(|old| old != observed) {
+                if upper.is_some() {
+                    rescan = true;
+                } else {
+                    reconstruct = true;
+                    after = None;
+                    seen.clear();
+                    failed = false;
+                }
+                retry_at = None;
+            }
+            previous = Some(observed);
+            let now = now_timestamp_secs();
+            let (more, next) = tokio::select! { biased; _ = cancellation.cancelled() => return,
+                result = owner.scope(crate::database::attribution::scope_database_workload(
+                    pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                    pioneer_observability::DatabaseOperationSite::CliCommandHeartbeat,
+                    async {
+                        if reconstruct && retry_at.is_none_or(|at| at <= tokio::time::Instant::now()) {
+                            retry_at = None;
+                            let result = async {
+                                if upper.is_none() { upper = this.crud_store.command_supervision_upper().await?; after = None; seen.clear(); }
+                                let complete = if let Some(last) = upper.as_deref() {
+                                    let (next, rows) = this.crud_store.command_supervision_page(after.as_deref(), last).await?;
+                                    let complete = next.is_none() || next.as_deref() == Some(last);
+                                    after = next;
+                                    let mut attempts = Vec::with_capacity(rows.len());
+                                    for row in rows {
+                                        match row { Ok(row) => attempts.push(row), Err(error) => { failed = true; record_resilience_worker_error("CLI command source", &error, ResilienceWorkerFailureImpact::Maintenance); } }
+                                    }
+                                    match this.restore_cli_runtime_command_items(None, attempts).await {
+                                        Ok(keys) => seen.extend(keys),
+                                        Err(error) => { failed = true; record_resilience_worker_error("CLI command reconstruction", &error, ResilienceWorkerFailureImpact::Maintenance); }
+                                    }
+                                    complete
+                                } else { true };
+                                if complete {
+                                    upper = None; after = None;
+                                    if std::mem::take(&mut rescan) { seen.clear(); }
+                                    else if failed {
+                                        retry_at = Some(tokio::time::Instant::now() + Duration::from_secs(30));
+                                        failed = false; seen.clear();
+                                    } else {
+                                        // Fence the complete durable reconstruction before
+                                        // pruning old memory entries. A newer commit/unknown
+                                        // generation retains another pass, never false Empty.
+                                        if owner.publish(observed, Plan::Runnable) {
+                                            this.cli_runtime_command_heartbeats.retain_discovered_commands(&seen).await;
+                                            reconstruct = false;
+                                            retry_at = None; seen.clear();
+                                        }
+                                    }
+                                }
+                                Ok::<_,anyhow::Error>(())
+                            }.await;
+                            if let Err(error) = result {
+                                record_resilience_worker_error("CLI command discovery", &error, ResilienceWorkerFailureImpact::Maintenance);
+                                retry_at = Some(tokio::time::Instant::now() + Duration::from_secs(30));
+                                reconstruct = true;
+                            }
+                        }
+                        // Reconstruction failure cannot suppress the existing
+                        // bounded heartbeat quota of already known commands.
+                        this.heartbeat_registered_cli_runtime_command_items(now).await;
+                        let plan = this.cli_runtime_command_heartbeats.next_wait(now).await;
+                        let next = retry_at.map_or(plan, |at|plan.with_monotonic_deadline(at));
+                        (reconstruct && retry_at.is_none(), next)
+                    },
+                )) => result,
+            };
+            if owner.requires_settlement() {
+                continue;
+            }
+            let plan = if more { Plan::Runnable } else { next };
+            let settled = owner.publish(observed, plan);
+            #[cfg(test)]
+            if settled && !matches!(plan, Plan::Runnable) {
+                this.completed_history_preparation_barrier
+                    .wait_if_armed("__cli_commands_settled__", &cancellation)
+                    .await;
+            }
+            #[cfg(not(test))]
+            let _ = settled;
+            drop(this);
+            if more {
+                tokio::select! { _ = cancellation.cancelled() => return, _ = tokio::time::sleep(Duration::from_millis(10)) => {} }
+            }
+        }
+    }
+
     async fn update_cli_runtime_command_item_registry(
         &self,
         instance: &crate::cli_runtime::session_instance::CliSessionInstanceId,
@@ -3468,6 +3997,14 @@ impl MessageProcessor {
         self.cli_runtime_command_heartbeats
             .update_from_runtime_event(instance, turn_binding, event, now_timestamp_secs())
             .await;
+        if matches!(event, RuntimeEvent::ItemStarted(started) if crate::cli_runtime::command_heartbeat::is_command_execution_kind(&started.item_kind))
+            || matches!(event, RuntimeEvent::ItemCompleted(completed) if crate::cli_runtime::command_heartbeat::is_command_execution_kind(&completed.item_kind))
+            || event.turn_terminal_kind().is_some()
+        {
+            self.crud_store
+                .background_work("cli.commands")
+                .dependency_released();
+        }
     }
 
     async fn detach_cli_runtime_command_observer(
@@ -3477,6 +4014,7 @@ impl MessageProcessor {
         self.cli_runtime_command_heartbeats
             .detach_observer(instance)
             .await;
+        self.crud_store.background_work("cli.commands").invalidate();
     }
 
     async fn rehydrate_cli_runtime_command_items(
@@ -3498,7 +4036,33 @@ impl MessageProcessor {
                 return 0;
             }
         };
-        let mut restored = 0usize;
+        match self
+            .restore_cli_runtime_command_items(observer, attempts)
+            .await
+        {
+            Ok(keys) => {
+                if !keys.is_empty() {
+                    self.crud_store
+                        .background_work("cli.commands")
+                        .dependency_released();
+                }
+                keys.len()
+            }
+            Err(error) => {
+                warn!(error = %format!("{error:#}"), "CLI command reconstruction incomplete");
+                0
+            }
+        }
+    }
+
+    async fn restore_cli_runtime_command_items(
+        &self,
+        observer: Option<&crate::cli_runtime::session_instance::CliSessionInstanceId>,
+        attempts: Vec<pioneer_crud::RunningTurnItemAttempt>,
+    ) -> anyhow::Result<Vec<crate::cli_runtime::command_heartbeat::CliRuntimeCommandHeartbeatKey>>
+    {
+        let mut restored = Vec::new();
+        let mut failed = false;
         for attempt in attempts {
             let binding = match self
                 .crud_store
@@ -3508,6 +4072,7 @@ impl MessageProcessor {
                 Ok(Some(binding)) => binding,
                 Ok(None) => continue,
                 Err(error) => {
+                    failed = true;
                     warn!(
                         turn_id = attempt.turn_id.as_str(),
                         item_id = attempt.item_id.as_str(),
@@ -3539,6 +4104,7 @@ impl MessageProcessor {
                 Ok(Some(owner_attempt)) if owner_attempt.status.is_active() => owner_attempt,
                 Ok(_) => continue,
                 Err(error) => {
+                    failed = true;
                     warn!(
                         turn_id = binding.turn_id.as_str(),
                         item_id = attempt.item_id.as_str(),
@@ -3560,6 +4126,7 @@ impl MessageProcessor {
             {
                 Ok(segment) => segment,
                 Err(error) => {
+                    failed = true;
                     warn!(
                         turn_id = binding.turn_id.as_str(),
                         item_id = attempt.item_id.as_str(),
@@ -3587,6 +4154,7 @@ impl MessageProcessor {
                 Ok(Some(owner)) => owner,
                 Ok(None) => continue,
                 Err(error) => {
+                    failed = true;
                     warn!(
                         turn_id = binding.turn_id.as_str(),
                         item_id = attempt.item_id.as_str(),
@@ -3616,7 +4184,10 @@ impl MessageProcessor {
                     binding.continuation_thread_id.clone(),
                 ) {
                     Ok(key) => key,
-                    Err(_) => continue,
+                    Err(_) => {
+                        failed = true;
+                        continue;
+                    }
                 };
                 manager
                     .existing_session(&key)
@@ -3625,7 +4196,8 @@ impl MessageProcessor {
             } else {
                 None
             };
-            self.cli_runtime_command_heartbeats
+            let key = self
+                .cli_runtime_command_heartbeats
                 .restore_from_durable(
                     attached_observer.as_ref(),
                     &binding,
@@ -3633,11 +4205,16 @@ impl MessageProcessor {
                     native_turn_id,
                 )
                 .await;
-            restored = restored.saturating_add(1);
+            restored.push(key);
         }
-        restored
+        anyhow::ensure!(
+            !failed,
+            "CLI command reconstruction retained uncertain records"
+        );
+        Ok(restored)
     }
 
+    #[cfg(test)]
     async fn heartbeat_due_cli_runtime_command_items(&self, now_unix: i64) -> usize {
         if self
             .cli_runtime_command_heartbeats
@@ -3646,9 +4223,14 @@ impl MessageProcessor {
         {
             self.rehydrate_cli_runtime_command_items(None, 1_024).await;
         }
+        self.heartbeat_registered_cli_runtime_command_items(now_unix)
+            .await
+    }
+
+    async fn heartbeat_registered_cli_runtime_command_items(&self, now_unix: i64) -> usize {
         let due = self
             .cli_runtime_command_heartbeats
-            .due_items(now_unix)
+            .due_items_bounded(now_unix, 64)
             .await;
         let mut heartbeated = 0usize;
         for item in due {
@@ -3663,7 +4245,7 @@ impl MessageProcessor {
             {
                 Ok(Some(owner)) if item.matches_active_native_turn_owner(&owner) => owner,
                 Ok(_) => {
-                    self.cli_runtime_command_heartbeats.remove_key(&key).await;
+                    self.cli_runtime_command_heartbeats.remove_key(&item).await;
                     continue;
                 }
                 Err(error) => {
@@ -3677,7 +4259,7 @@ impl MessageProcessor {
                         "failed to validate CLI runtime command heartbeat binding"
                     );
                     self.cli_runtime_command_heartbeats
-                        .mark_attempt_failed(&key, now_unix)
+                        .mark_attempt_failed(&item, now_unix)
                         .await;
                     continue;
                 }
@@ -3700,13 +4282,13 @@ impl MessageProcessor {
                         "failed to validate durable CLI runtime open command item"
                     );
                     self.cli_runtime_command_heartbeats
-                        .mark_attempt_failed(&key, now_unix)
+                        .mark_attempt_failed(&item, now_unix)
                         .await;
                     continue;
                 }
             };
             if !open_command {
-                self.cli_runtime_command_heartbeats.remove_key(&key).await;
+                self.cli_runtime_command_heartbeats.remove_key(&item).await;
                 continue;
             }
 
@@ -3727,16 +4309,16 @@ impl MessageProcessor {
                         "failed to load Pioneer turn for CLI runtime command supervision"
                     );
                     self.cli_runtime_command_heartbeats
-                        .mark_attempt_failed(&key, now_unix)
+                        .mark_attempt_failed(&item, now_unix)
                         .await;
                     continue;
                 }
             }) else {
-                self.cli_runtime_command_heartbeats.remove_key(&key).await;
+                self.cli_runtime_command_heartbeats.remove_key(&item).await;
                 continue;
             };
             if turn.status != TurnStatus::InProgress {
-                self.cli_runtime_command_heartbeats.remove_key(&key).await;
+                self.cli_runtime_command_heartbeats.remove_key(&item).await;
                 continue;
             }
             match self
@@ -3749,16 +4331,36 @@ impl MessageProcessor {
             {
                 Ok(cli_runtime::CLIRuntimeAuthoritativeTurnState::Active(_)) => {}
                 Ok(cli_runtime::CLIRuntimeAuthoritativeTurnState::Terminal) => {
-                    self.cli_runtime_command_heartbeats.remove_key(&key).await;
+                    self.cli_runtime_command_heartbeats.remove_key(&item).await;
                     continue;
                 }
-                Ok(
-                    cli_runtime::CLIRuntimeAuthoritativeTurnState::Deferred
-                    | cli_runtime::CLIRuntimeAuthoritativeTurnState::Superseded,
-                ) => continue,
+                Ok(cli_runtime::CLIRuntimeAuthoritativeTurnState::Superseded) => {
+                    self.cli_runtime_command_heartbeats.remove_key(&item).await;
+                    continue;
+                }
+                Ok(cli_runtime::CLIRuntimeAuthoritativeTurnState::Deferred) => {
+                    let dependency = if let Ok(session_key) =
+                        crate::cli_runtime::manager::CLIAgentRuntimeSessionKey::new(
+                            owner.binding.workspace_id.clone(),
+                            owner.binding.runtime_id.clone(),
+                            owner.binding.continuation_thread_id.clone(),
+                        ) {
+                        let gate = self
+                            .cli_runtime_session_transition_mutex(&session_key)
+                            .await;
+                        let busy = gate.try_lock().is_err();
+                        busy.then_some(gate)
+                    } else {
+                        None
+                    };
+                    self.cli_runtime_command_heartbeats
+                        .mark_deferred(&item, now_unix, dependency)
+                        .await;
+                    continue;
+                }
                 Ok(cli_runtime::CLIRuntimeAuthoritativeTurnState::Unavailable) => {
                     self.cli_runtime_command_heartbeats
-                        .mark_attempt_failed(&key, now_unix)
+                        .mark_attempt_failed(&item, now_unix)
                         .await;
                     continue;
                 }
@@ -3773,22 +4375,21 @@ impl MessageProcessor {
                         "failed to confirm CLI runtime command activity"
                     );
                     self.cli_runtime_command_heartbeats
-                        .mark_attempt_failed(&key, now_unix)
+                        .mark_attempt_failed(&item, now_unix)
                         .await;
                     continue;
                 }
             }
 
-            if let Err(error) = self
+            let renewal = self
                 .timeout_supervisor
-                .heartbeat_item_attempt(
-                    key.turn_id.as_str(),
-                    key.item_id.as_str(),
-                    TurnItemType::CommandExecution,
-                    now_unix,
-                )
-                .await
-            {
+                .heartbeat_cli_command_item_attempt(&owner, &key.item_id, now_unix)
+                .await;
+            if matches!(renewal, Ok(false)) {
+                self.cli_runtime_command_heartbeats.remove_key(&item).await;
+                continue;
+            }
+            if let Err(error) = renewal {
                 warn!(
                     workspace_id = key.workspace_id.as_str(),
                     runtime_id = key.runtime_id.as_str(),
@@ -3799,12 +4400,12 @@ impl MessageProcessor {
                     "failed to heartbeat active CLI runtime command item"
                 );
                 self.cli_runtime_command_heartbeats
-                    .mark_attempt_failed(&key, now_unix)
+                    .mark_attempt_failed(&item, now_unix)
                     .await;
                 continue;
             }
             self.cli_runtime_command_heartbeats
-                .mark_heartbeat_succeeded(&key, now_unix)
+                .mark_heartbeat_succeeded(&item, now_unix)
                 .await;
             heartbeated = heartbeated.saturating_add(1);
         }
@@ -3825,43 +4426,181 @@ impl MessageProcessor {
             return;
         }
 
+        if self.cli_history_shutdown.is_cancelled() {
+            return;
+        }
+        let Some(mut owner) = self.crud_store.background_work("hooks.recovery").acquire() else {
+            return;
+        };
+        let cancellation = self.cli_history_shutdown.clone();
         let processor = Arc::downgrade(self);
         let handle = tokio::spawn(async move {
+            use pioneer_sqlite::background::{Plan, Ready};
             let mut first_pass = true;
+            let mut clocks = pioneer_crud::HookClockPass::default();
+            let mut admission_error = None;
+            let mut clock_observation = None;
+            let mut clock_rescan = false;
             loop {
+                let ready = tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => return,
+                    ready = owner.ready() => ready,
+                };
+                if ready == Ready::Closed {
+                    return;
+                }
                 let Some(this) = processor.upgrade() else {
-                    break;
+                    return;
                 };
                 let this = this.for_background_reconciliation();
+                let observation = owner.observe();
+                if clock_observation.is_some_and(|at| owner.producer_changed_since(at)) {
+                    clock_rescan = true;
+                }
+                clock_observation = Some(observation);
                 let config = this.hook_recovery_config.read().await.clone();
-                if config.enabled && (!first_pass || config.startup_scan) {
-                    crate::database::attribution::scope_database_workload(
-                        pioneer_observability::DatabaseWorkload::HookRecovery,
-                        pioneer_observability::DatabaseOperationSite::HookRecovery,
-                        this.run_hook_recovery_pass(config.clone()),
-                    )
-                    .await;
+                let retry = Duration::from_millis(config.poll_interval_ms.max(250));
+                if ready == Ready::SettlementRequired {
+                    clock_rescan = true;
+                    if let Err(error) = this
+                        .crud_store
+                        .database_connection()
+                        .settle_background_change(&owner)
+                        .await
+                    {
+                        error!(error = %error, "hook recovery change settlement failed");
+                        owner.retry_after(observation, retry);
+                    }
+                    continue;
+                }
+                if !config.enabled {
+                    owner.publish(observation, Plan::Dormant);
+                    continue;
+                }
+                if first_pass && !config.startup_scan {
+                    first_pass = false;
+                    owner.publish(
+                        observation,
+                        Plan::MonotonicDeadline(tokio::time::Instant::now() + retry),
+                    );
+                    continue;
                 }
                 first_pass = false;
-                sleep(Duration::from_millis(config.poll_interval_ms.max(250))).await;
+                let result = owner
+                    .scope(
+                        crate::database::attribution::scope_database_workload_result(
+                            pioneer_observability::DatabaseWorkload::HookRecovery,
+                            pioneer_observability::DatabaseOperationSite::HookRecovery,
+                            async {
+                                if this
+                                    .hook_runtime
+                                    .read()
+                                    .await
+                                    .as_ref()
+                                    .is_none_or(|runtime| !runtime.has_run_store())
+                                {
+                                    clocks = Default::default();
+                                    admission_error = None;
+                                    return Ok::<_, anyhow::Error>(Plan::Dormant);
+                                }
+                                clocks.raw_limit = config.batch_size.max(1).min(64);
+                                let complete = match this
+                                    .crud_store
+                                    .hook_recovery_clock_quantum(
+                                        &mut clocks,
+                                        config.stale_running_after_ms,
+                                    )
+                                    .await
+                                {
+                                    Ok(complete) => complete,
+                                    Err(error) => {
+                                        admission_error.get_or_insert(error);
+                                        true
+                                    }
+                                };
+                                let now = chrono::DateTime::<chrono::Utc>::from(
+                                    this.crud_store.background_work("hooks.recovery").wall_now(),
+                                )
+                                .timestamp_millis();
+                                // Singleton locator bounds discovery and isolates poison
+                                // hydration/handler errors while keeping the existing runner.
+                                for id in &clocks.candidates {
+                                    match this.run_hook_recovery_pass(config.clone(), now, id).await
+                                    {
+                                        Ok(Some(summary)) => {
+                                            if summary.scanned_count > 0 {
+                                                clock_rescan = true;
+                                            }
+                                        }
+                                        Ok(None) => return Ok::<_, anyhow::Error>(Plan::Dormant),
+                                        Err(error) => {
+                                            admission_error.get_or_insert(error);
+                                        }
+                                    }
+                                }
+                                if !complete {
+                                    return Ok(Plan::Runnable);
+                                }
+                                if let Some(error) = admission_error.take() {
+                                    return Err(error);
+                                }
+                                let next = clocks.next;
+                                clocks = Default::default();
+                                if std::mem::take(&mut clock_rescan) {
+                                    return Ok(Plan::Runnable);
+                                }
+                                Ok(next.map_or(Plan::Dormant, |at| Plan::WallDeadline(at.into())))
+                            },
+                        ),
+                    )
+                    .await;
+                match result {
+                    Ok(plan) if !owner.requires_settlement() => {
+                        let _published = owner.publish(observation, plan);
+                        #[cfg(test)]
+                        if _published && !matches!(plan, Plan::Runnable) {
+                            this.completed_history_preparation_barrier
+                                .wait_if_armed("__hook_clock_settled__", &cancellation)
+                                .await;
+                        }
+                    }
+                    Ok(_) => {
+                        owner.retry_after(observation, retry);
+                    }
+                    Err(error) => {
+                        admission_error = None;
+                        clocks = Default::default();
+                        clock_rescan = false;
+                        error!(error = %error, "hook recovery discovery failed");
+                        owner.retry_after(observation, retry);
+                    }
+                }
+                // DB scopes drop before waiting. Due backlog yields through the
+                // shared owner; dormant Empty has no domain-discovery timer.
             }
         });
 
         *guard = Some(handle);
     }
 
-    async fn run_hook_recovery_pass(&self, config: GatewayHookRecoveryConfig) {
+    async fn run_hook_recovery_pass(
+        &self,
+        config: GatewayHookRecoveryConfig,
+        now_unix_ms: i64,
+        candidate: &str,
+    ) -> anyhow::Result<Option<pioneer_hooks::HookRecoverySummary>> {
         let Some(runtime) = self.hook_runtime.read().await.clone() else {
-            return;
+            return Ok(None);
         };
         if !runtime.has_run_store() {
-            return;
+            return Ok(None);
         }
         let runtime = GatewayHookRuntimeBuilder::from_runtime(self.crud_store.clone(), &runtime)
-            .with_crud_run_store()
+            .with_recovery_candidate(candidate.to_owned())
             .build();
         let options = HookRecoveryOptions {
-            now_unix_ms: now_timestamp_millis(),
+            now_unix_ms,
             batch_size: config.batch_size,
             max_concurrent: config.max_concurrent,
             stale_running_after_ms: config.stale_running_after_ms,
@@ -3887,68 +4626,96 @@ impl MessageProcessor {
                 } else {
                     debug!("hook recovery pass completed with no recoverable runs");
                 }
+                Ok(Some(summary))
             }
             Err(error) => {
                 error!(error = %format!("{error:#}"), "hook recovery pass failed");
+                Err(anyhow::anyhow!("{error}"))
             }
         }
     }
 
     async fn start_task_event_listener(self: &Arc<Self>) {
+        use pioneer_sqlite::background::{Plan, Ready};
         let mut guard = self.task_event_listener_worker.lock().await;
-        if guard.is_some() {
+        if guard.is_some() || self.cli_history_shutdown.is_cancelled() {
             return;
         }
+        let wake = self.crud_store.background_work("tasks.fanout");
+        let Some(mut owner) = wake.acquire() else {
+            return;
+        };
         let processor = Arc::downgrade(self);
-        let mut subscription = self
-            .task_runtime
-            .event_bus()
-            .subscribe(pioneer_tasks::TaskEventFilter::default());
+        let shutdown = self.cli_history_shutdown.clone();
+        #[cfg(test)]
+        let wait_barrier = self.recovery_due_wait_barrier.clone();
         *guard = Some(tokio::spawn(async move {
-            let mut bus_open = true;
-            let mut periodic = interval(Duration::from_secs(5));
-            periodic.set_missed_tick_behavior(MissedTickBehavior::Delay);
             loop {
-                // The bus is only a wake. This owned dispatcher is the sole
-                // emitter, so even slow Tasks cannot acquire competing lanes.
-                tokio::select! {
-                    delivery=subscription.recv(),if bus_open=>match delivery {
-                        pioneer_tasks::TaskEventWakeDelivery::Wake(_)=>{},
-                        pioneer_tasks::TaskEventWakeDelivery::Lagged(count)=>warn!(missed_wakes=count,"task fanout wake bus lagged"),
-                        pioneer_tasks::TaskEventWakeDelivery::Closed=>bus_open=false,
-                    },
-                    _=periodic.tick()=>{},
+                let ready = tokio::select! {
+                    _ = shutdown.cancelled() => return,
+                    ready = owner.ready() => ready,
+                };
+                if ready == Ready::Closed {
+                    return;
                 }
                 let Some(this) = processor.upgrade() else {
-                    break;
+                    return;
                 };
-                let result = crate::database::attribution::scope_database_workload_result(
-                    pioneer_observability::DatabaseWorkload::TaskEventFanout,
-                    pioneer_observability::DatabaseOperationSite::TaskEventFanout,
-                    this.for_background_reconciliation()
-                        .task_event_fanout_quantum(),
-                )
-                .await;
+                let this = this.for_background_reconciliation();
+                if ready == Ready::SettlementRequired {
+                    let settle_observation = owner.observe();
+                    if this
+                        .crud_store
+                        .database_connection()
+                        .settle_background_change(&owner)
+                        .await
+                        .is_err()
+                    {
+                        warn!(
+                            failure_class = "task_fanout_settlement_failure",
+                            "task fanout change settlement deferred"
+                        );
+                        owner.retry_after(settle_observation, Duration::from_secs(5));
+                    }
+                    continue;
+                }
+                let observation = owner.observe();
+                let result = owner
+                    .scope(
+                        crate::database::attribution::scope_database_workload_result(
+                            pioneer_observability::DatabaseWorkload::TaskEventFanout,
+                            pioneer_observability::DatabaseOperationSite::TaskEventFanout,
+                            this.task_event_fanout_quantum(),
+                        ),
+                    )
+                    .await;
                 match result {
-                    Ok(summary) => {
+                    Ok(summary) if summary.errors == 0 && !owner.requires_settlement() => {
                         debug!(selected=summary.selected,event_inputs=summary.event_inputs,emitted=summary.emitted,errors=summary.errors,pending=?summary.pending,"task fanout quantum completed");
-                        if summary.errors > 0 {
-                            // Storage/claim failures cannot spin via a hot bus.
-                            // Sleep owns no DB resources; cancellation aborts it.
-                            tokio::time::sleep(Duration::from_secs(5)).await;
+                        let plan = match summary.deadline {
+                            Some(at) => std::time::UNIX_EPOCH
+                                .checked_add(Duration::from_secs(u64::try_from(at).unwrap_or(0)))
+                                .map(Plan::WallDeadline),
+                            None => Some(Plan::Dormant),
+                        };
+                        if let Some(plan) = plan {
+                            owner.publish(observation, plan);
+                            #[cfg(test)]
+                            if summary.deadline.is_none() {
+                                wait_barrier
+                                    .wait_if_armed("__task_fanout_before_wait__", &shutdown)
+                                    .await;
+                            }
+                        } else {
+                            owner.retry_after(observation, Duration::from_secs(5));
                         }
                     }
-                    Err(error) => {
+                    Ok(_) | Err(_) => {
                         warn!(
-                            failure_class =
-                                if reconciliation_diagnostics::is_storage_failure(&error) {
-                                    "storage"
-                                } else {
-                                    "candidate"
-                                },
-                            "task fanout discovery failed"
+                            failure_class = "task_fanout_pass_failed",
+                            "task fanout quantum deferred"
                         );
-                        tokio::time::sleep(Duration::from_secs(5)).await;
+                        owner.retry_after(observation, Duration::from_secs(5));
                     }
                 }
             }
@@ -4049,8 +4816,11 @@ impl MessageProcessor {
             }
         }
         summary.event_inputs = TASK_EVENT_FANOUT_EVENT_BUDGET - events_left;
-        summary.pending = match maintenance.has_pending_task_event_fanout().await {
-            Ok(pending) => Some(pending),
+        summary.pending = match maintenance.next_task_event_fanout_deadline().await {
+            Ok(deadline) => {
+                summary.deadline = deadline;
+                Some(deadline.is_some())
+            }
             Err(error) => {
                 summary.errors += 1;
                 warn!(
@@ -5051,7 +5821,8 @@ impl MessageProcessor {
             ),
             task_child_point_cursor: Arc::new(Mutex::new(Default::default())),
             task_child_scope_cursor: Arc::new(Mutex::new(Default::default())),
-            completed_history_checks: Arc::new(Mutex::new(HashMap::new())),
+            completed_history_checks: compaction_background::shared_history_jobs(&crud_store),
+            native_turn_event_delivery_workers: agent_runtime::shared_delivery_workers(&crud_store),
             compaction_lifecycle_not_before: Arc::new(StdRwLock::new(None)),
             #[cfg(test)]
             completed_history_preparation_barrier: Arc::new(Default::default()),
@@ -5059,6 +5830,8 @@ impl MessageProcessor {
             turn_execution_heartbeat_barrier: Arc::new(Default::default()),
             #[cfg(test)]
             recovery_due_wait_barrier: Arc::new(Default::default()),
+            #[cfg(test)]
+            recovery_admission_failure: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
             task_history_preparation_failure: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
@@ -5075,8 +5848,8 @@ impl MessageProcessor {
             task_output_capture_failures: Arc::new(std::sync::Mutex::new(HashMap::new())),
             context_compaction_config: GatewayContextCompactionConfig::default(),
             compaction_clock: Arc::new(crate::compaction::SystemCompactionClock::default()),
-            compaction_coordinator: Arc::new(
-                crate::compaction::ContextCompactionCoordinator::default(),
+            compaction_coordinator: crate::compaction::ContextCompactionCoordinator::for_store(
+                &crud_store,
             ),
             cli_history_shutdown: tokio_util::sync::CancellationToken::new(),
             #[cfg(test)]
@@ -5151,7 +5924,6 @@ impl MessageProcessor {
             thread_title_publication_attempted: Arc::new(tokio::sync::Notify::new()),
             timeout_supervisor,
             recovery_coordinator,
-            native_turn_event_delivery_workers: Arc::new(Default::default()),
             native_terminal_effect_kick_running: Arc::new(AtomicBool::new(false)),
             native_terminal_effect_kick_pending: Arc::new(AtomicBool::new(false)),
             native_lifecycle_readiness: Arc::new(

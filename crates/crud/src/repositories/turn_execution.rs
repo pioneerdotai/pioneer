@@ -369,6 +369,67 @@ pub async fn list_expired_foreign_active<C: ConnectionTrait>(
         .collect()
 }
 
+// The immutable PK defines physical discovery, before owner/status/lease
+// policy. Both orphan lanes retain independent cursors over this raw source.
+async fn raw_execution_upper<C: ConnectionTrait>(db: &C) -> Result<Option<String>> {
+    Ok(turn_execution::Entity::find()
+        .select_only()
+        .column(turn_execution::Column::TurnId)
+        .order_by_desc(turn_execution::Column::TurnId)
+        .limit(1)
+        .into_tuple::<String>()
+        .one(db)
+        .await?)
+}
+pub async fn expired_foreign_upper<C: ConnectionTrait>(
+    db: &C,
+    _owner: &str,
+    _now: DateTimeWithTimeZone,
+) -> Result<Option<String>> {
+    raw_execution_upper(db).await
+}
+pub async fn expired_foreign_page<C: ConnectionTrait>(
+    db: &C,
+    owner: &str,
+    _now: DateTimeWithTimeZone,
+    after: Option<&str>,
+    upper: &str,
+    limit: u64,
+) -> Result<(Option<String>, Vec<Result<TurnExecutionRecord>>)> {
+    let keys = turn_execution::Entity::find()
+        .select_only()
+        .column(turn_execution::Column::TurnId)
+        .filter(turn_execution::Column::TurnId.gt(after.unwrap_or("")))
+        .filter(turn_execution::Column::TurnId.lte(upper))
+        .order_by_asc(turn_execution::Column::TurnId)
+        .limit(limit.min(TURN_EXECUTION_BATCH_LIMIT as u64))
+        .into_tuple::<String>()
+        .all(db)
+        .await?;
+    let after = keys.last().cloned();
+    let mut rows = Vec::with_capacity(keys.len());
+    for key in keys {
+        match find(db, &key).await {
+            Ok(Some(row))
+                if row.owner_id != owner
+                    && matches!(
+                        row.status,
+                        TurnExecutionStatus::Queued
+                            | TurnExecutionStatus::Starting
+                            | TurnExecutionStatus::Running
+                            | TurnExecutionStatus::Recovering
+                    ) =>
+            {
+                rows.push(Ok(row))
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => {}
+            Err(error) => rows.push(Err(error)),
+        }
+    }
+    Ok((after, rows))
+}
+
 /// A rejected native pre-start admission remains owned, resumable recovery work.
 pub async fn mark_recovering_owned<C: ConnectionTrait>(
     db: &C,
@@ -416,6 +477,46 @@ pub async fn list_owned_recovering<C: ConnectionTrait>(
         .into_iter()
         .map(record_from_model)
         .collect()
+}
+
+pub async fn owned_recovering_upper<C: ConnectionTrait>(
+    db: &C,
+    _owner: &str,
+) -> Result<Option<String>> {
+    raw_execution_upper(db).await
+}
+pub async fn owned_recovering_page<C: ConnectionTrait>(
+    db: &C,
+    owner: &str,
+    after: Option<&str>,
+    upper: &str,
+    limit: u64,
+) -> Result<(Option<String>, Vec<Result<TurnExecutionRecord>>)> {
+    let keys = turn_execution::Entity::find()
+        .select_only()
+        .column(turn_execution::Column::TurnId)
+        .filter(turn_execution::Column::TurnId.gt(after.unwrap_or("")))
+        .filter(turn_execution::Column::TurnId.lte(upper))
+        .order_by_asc(turn_execution::Column::TurnId)
+        .limit(limit.min(TURN_EXECUTION_BATCH_LIMIT as u64))
+        .into_tuple::<String>()
+        .all(db)
+        .await?;
+    let after = keys.last().cloned();
+    let mut rows = Vec::with_capacity(keys.len());
+    for key in keys {
+        match find(db, &key).await {
+            Ok(Some(row))
+                if row.owner_id == owner && row.status == TurnExecutionStatus::Recovering =>
+            {
+                rows.push(Ok(row))
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => {}
+            Err(error) => rows.push(Err(error)),
+        }
+    }
+    Ok((after, rows))
 }
 
 pub async fn claim_expired<C: ConnectionTrait>(

@@ -454,13 +454,11 @@ fn clears_attempt_payload(status: TurnItemAttemptStatus) -> bool {
     )
 }
 
-pub async fn list_expired_running_attempts<C: ConnectionTrait>(
-    db: &C,
+pub(crate) fn expired_running_query(
     now: DateTimeWithTimeZone,
-    limit: u64,
-) -> Result<Vec<RunningAttemptSnapshot>> {
+) -> sea_orm::Select<turn_item_attempt::Entity> {
     let running = turn_item_attempt_status_to_db(TurnItemAttemptStatus::Running);
-    let rows = turn_item_attempt::Entity::find()
+    turn_item_attempt::Entity::find()
         .filter(turn_item_attempt::Column::Status.eq(running))
         // Legacy attempts remain non-destructive until the background data
         // migration has assigned their authoritative execution class.
@@ -471,6 +469,14 @@ pub async fn list_expired_running_attempts<C: ConnectionTrait>(
                 .or(Expr::col(turn_item_attempt::Column::IdleDeadlineAt).lte(now))
                 .or(Expr::col(turn_item_attempt::Column::LeaseExpiresAt).lte(now)),
         )
+}
+
+pub async fn list_expired_running_attempts<C: ConnectionTrait>(
+    db: &C,
+    now: DateTimeWithTimeZone,
+    limit: u64,
+) -> Result<Vec<RunningAttemptSnapshot>> {
+    let rows = expired_running_query(now)
         .order_by(turn_item_attempt::Column::StartedAt, Order::Asc)
         .limit(limit)
         .all(db)
@@ -1178,16 +1184,20 @@ pub async fn find_latest_running_attempt<C: ConnectionTrait>(
         .transpose()
 }
 
-pub async fn list_timed_out_without_recovery<C: ConnectionTrait>(
-    db: &C,
-    limit: u64,
-) -> Result<Vec<TimedOutAttemptSnapshot>> {
+pub(crate) fn unqueued_timeout_query() -> sea_orm::Select<turn_item_attempt::Entity> {
     let timed_out_status = turn_item_attempt_status_to_db(TurnItemAttemptStatus::TimedOut);
-    let rows = turn_item_attempt::Entity::find()
+    turn_item_attempt::Entity::find()
         .filter(turn_item_attempt::Column::Status.eq(timed_out_status))
         .filter(turn_item_attempt::Column::ExecutionClass.is_not_null())
         .filter(turn_item_attempt::Column::RecoveryAction.is_null())
         .filter(turn_item_attempt::Column::RecoverySuppressedReason.is_null())
+}
+
+pub async fn list_timed_out_without_recovery<C: ConnectionTrait>(
+    db: &C,
+    limit: u64,
+) -> Result<Vec<TimedOutAttemptSnapshot>> {
+    let rows = unqueued_timeout_query()
         .order_by_asc(turn_item_attempt::Column::UpdatedAt)
         .limit(limit)
         .all(db)
@@ -1195,34 +1205,48 @@ pub async fn list_timed_out_without_recovery<C: ConnectionTrait>(
         .context("failed to query timed_out attempts without recovery")?;
 
     rows.into_iter()
-        .map(|row| -> Result<TimedOutAttemptSnapshot> {
-            let execution_class = row
-                .execution_class
-                .as_deref()
-                .and_then(turn_item_execution_class_from_db)
-                .with_context(|| format!("attempt `{}` has an invalid execution class", row.id))?;
-            Ok(TimedOutAttemptSnapshot {
-                id: row.id,
-                turn_id: row.turn_id,
-                item_id: row.item_id,
-                item_type: turn_item_type_from_db(row.item_type.as_str())
-                    .unwrap_or(TurnItemType::DynamicToolCall),
-                execution_class,
-                attempt_number: row.attempt_number,
-                timeout_reason: row
-                    .timeout_reason
-                    .as_deref()
-                    .and_then(turn_item_timeout_reason_from_db)
-                    .unwrap_or(TurnItemTimeoutReason::HardDeadlineExceeded),
-                started_at: row.started_at,
-                started_event_sequence: row.started_event_sequence,
-                last_heartbeat_at: row.last_heartbeat_at,
-                lease_expires_at: row.lease_expires_at,
-                idle_deadline_at: row.idle_deadline_at,
-                hard_deadline_at: row.hard_deadline_at,
-            })
-        })
+        .map(timed_out_snapshot_from_model)
         .collect()
+}
+
+pub async fn find_unqueued_timeout_by_id<C: ConnectionTrait>(
+    db: &C,
+    id: &str,
+) -> Result<Option<TimedOutAttemptSnapshot>> {
+    unqueued_timeout_query()
+        .filter(turn_item_attempt::Column::Id.eq(id))
+        .one(db)
+        .await?
+        .map(timed_out_snapshot_from_model)
+        .transpose()
+}
+
+fn timed_out_snapshot_from_model(row: turn_item_attempt::Model) -> Result<TimedOutAttemptSnapshot> {
+    let execution_class = row
+        .execution_class
+        .as_deref()
+        .and_then(turn_item_execution_class_from_db)
+        .with_context(|| format!("attempt `{}` has an invalid execution class", row.id))?;
+    Ok(TimedOutAttemptSnapshot {
+        id: row.id,
+        turn_id: row.turn_id,
+        item_id: row.item_id,
+        item_type: turn_item_type_from_db(row.item_type.as_str())
+            .unwrap_or(TurnItemType::DynamicToolCall),
+        execution_class,
+        attempt_number: row.attempt_number,
+        timeout_reason: row
+            .timeout_reason
+            .as_deref()
+            .and_then(turn_item_timeout_reason_from_db)
+            .unwrap_or(TurnItemTimeoutReason::HardDeadlineExceeded),
+        started_at: row.started_at,
+        started_event_sequence: row.started_event_sequence,
+        last_heartbeat_at: row.last_heartbeat_at,
+        lease_expires_at: row.lease_expires_at,
+        idle_deadline_at: row.idle_deadline_at,
+        hard_deadline_at: row.hard_deadline_at,
+    })
 }
 
 fn running_snapshot_from_model(row: turn_item_attempt::Model) -> Result<RunningAttemptSnapshot> {

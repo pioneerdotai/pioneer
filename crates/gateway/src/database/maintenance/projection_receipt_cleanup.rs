@@ -1,4 +1,5 @@
 use pioneer_crud::{CrudStore, ProjectionReceiptCleanupOutcome};
+use pioneer_sqlite::background::{Plan, Ready};
 use std::{
     sync::Arc,
     time::{Duration, Instant},
@@ -15,7 +16,12 @@ enum QuantumError {
 
 pub(super) async fn run(crud_store: Arc<CrudStore>, cancellation: CancellationToken) {
     let store = crud_store.with_maintenance_access();
+    let work = store.background_work("storage.receipts");
+    let Some(mut owner) = work.acquire() else {
+        return;
+    };
     let mut after_turn_id = None::<String>;
+    let mut pass_changed = false;
     let mut scanned = 0_u64;
     let mut deleted = 0_u64;
     let mut deferred = 0_u64;
@@ -23,6 +29,29 @@ pub(super) async fn run(crud_store: Arc<CrudStore>, cancellation: CancellationTo
     let mut failed = 0_u64;
     let mut last_progress_log = Instant::now();
     loop {
+        let ready = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return,
+            ready = owner.ready() => ready,
+        };
+        if ready == Ready::Closed {
+            return;
+        }
+        if ready == Ready::SettlementRequired {
+            let settle_observation = owner.observe();
+            after_turn_id = None;
+            pass_changed = false;
+            if store
+                .database_connection()
+                .settle_background_change(&owner)
+                .await
+                .is_err()
+            {
+                owner.retry_after(settle_observation, IDLE_PAUSE);
+            }
+            continue;
+        }
+        let observed = owner.observe();
         let started = Instant::now();
         // Do not put a local timeout around dispatched SQLite work. Dropping
         // the SQLx future does not interrupt sqlite3_step on its worker thread,
@@ -31,7 +60,7 @@ pub(super) async fn run(crud_store: Arc<CrudStore>, cancellation: CancellationTo
         let result = tokio::select! {
             biased;
             _ = cancellation.cancelled() => return,
-            result = crate::database::attribution::scope_database_workload_result(
+            result = owner.scope(crate::database::attribution::scope_database_workload_result(
                 pioneer_observability::DatabaseWorkload::ProjectionReceiptCleanup, pioneer_observability::DatabaseOperationSite::ProjectionReceiptCleanupQuantum,
                 async {
                     match store.cleanup_projection_receipts_quantum(after_turn_id.as_deref()).await {
@@ -40,10 +69,10 @@ pub(super) async fn run(crud_store: Arc<CrudStore>, cancellation: CancellationTo
                         Err(_) => Err(QuantumError::Database),
                     }
                 },
-            ) => result,
+            )) => result,
         };
-        let pause = match result {
-            Ok(outcome) if !outcome.backfill_ready => IDLE_PAUSE,
+        let plan = match result {
+            Ok(outcome) if !outcome.backfill_ready => Plan::Dormant,
             Ok(outcome) | Err(QuantumError::StreamFailed(outcome)) => {
                 if let Some(turn_id) = outcome.last_turn_id {
                     after_turn_id = Some(turn_id);
@@ -63,7 +92,9 @@ pub(super) async fn run(crud_store: Arc<CrudStore>, cancellation: CancellationTo
                         );
                         last_progress_log = Instant::now();
                     }
-                    quantum_pause(started.elapsed())
+                    Plan::MonotonicDeadline(
+                        tokio::time::Instant::now() + quantum_pause(started.elapsed()),
+                    )
                 } else {
                     tracing::info!(
                         streams_scanned = scanned,
@@ -80,18 +111,24 @@ pub(super) async fn run(crud_store: Arc<CrudStore>, cancellation: CancellationTo
                         );
                     }
                     after_turn_id = None;
-                    let pause = if deleted > 0 {
-                        quantum_pause(started.elapsed())
+                    let plan = if failed > 0 || deferred > 0 {
+                        // Known failed/deferred prefixes are not settled Empty.
+                        Plan::MonotonicDeadline(tokio::time::Instant::now() + IDLE_PAUSE)
+                    } else if deleted > 0 || pass_changed {
+                        Plan::MonotonicDeadline(
+                            tokio::time::Instant::now() + quantum_pause(started.elapsed()),
+                        )
                     } else {
-                        IDLE_PAUSE
+                        Plan::Dormant
                     };
+                    pass_changed = false;
                     scanned = 0;
                     deleted = 0;
                     deferred = 0;
                     source_bytes = 0;
                     failed = 0;
                     last_progress_log = Instant::now();
-                    pause
+                    plan
                 }
             }
             Err(QuantumError::Database) => {
@@ -99,13 +136,19 @@ pub(super) async fn run(crud_store: Arc<CrudStore>, cancellation: CancellationTo
                     reason = "database_error",
                     "projection receipt cleanup quantum deferred"
                 );
-                IDLE_PAUSE
+                Plan::MonotonicDeadline(tokio::time::Instant::now() + IDLE_PAUSE)
             }
         };
-        tokio::select! {
-            biased;
-            _ = cancellation.cancelled() => return,
-            _ = tokio::time::sleep(pause) => {},
+        // Preserve a changed old key while finishing this finite immutable-ID
+        // pass. Never clear a producer that committed during discovery/apply.
+        if !owner.publish(observed, plan) {
+            pass_changed = true;
+            if let Plan::MonotonicDeadline(at) = plan {
+                owner.retry_after(
+                    observed,
+                    at.saturating_duration_since(tokio::time::Instant::now()),
+                );
+            }
         }
     }
 }

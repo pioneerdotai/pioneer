@@ -89,6 +89,8 @@ mod memory_post_turn_response;
 #[path = "tests/task_capsule.rs"]
 mod task_capsule;
 
+mod hook_recovery_workers;
+mod local_owner_operations;
 #[path = "tests/task_launch_continuity.rs"]
 pub(super) mod task_launch_continuity;
 #[path = "tests/task_webhooks.rs"]
@@ -57054,6 +57056,12 @@ async fn turn_permission_request_respond_allows_another_current_collaborator_use
     .await;
     let (respond_tx, respond_rx) = tokio::sync::oneshot::channel();
 
+    let timeout_wake = processor.crud_store.background_work("recovery.timeouts");
+    let mut timeout_owner = timeout_wake.acquire().unwrap();
+    assert!(timeout_owner.publish(
+        timeout_owner.observe(),
+        pioneer_sqlite::background::Plan::Dormant
+    ));
     processor
         .open_native_permission_request(crate::permissions::GatewayPermissionApprovalRequest {
             request_id: "perm-approval-request-1".to_owned(),
@@ -57109,6 +57117,13 @@ async fn turn_permission_request_respond_allows_another_current_collaborator_use
         foreign_opened_params["request"]["request_id"],
         serde_json::json!("perm-approval-request-1")
     );
+    assert_eq!(
+        timeout_owner.ready().await,
+        pioneer_sqlite::background::Ready::Work,
+        "native open registers human wait with the same physical timeout owner"
+    );
+    let before_response = timeout_owner.observe();
+    assert!(timeout_owner.publish(before_response, pioneer_sqlite::background::Plan::Dormant));
     let foreign_response_id = "permissionforeign0001";
     processor
         .process_request_for_connection(
@@ -57143,6 +57158,14 @@ async fn turn_permission_request_respond_allows_another_current_collaborator_use
     assert_eq!(
         resolved_params["resolution"],
         serde_json::json!("allow_once")
+    );
+    assert!(
+        !timeout_owner.publish(before_response, pioneer_sqlite::background::Plan::Dormant),
+        "accepted response/delivery changes cannot leave the old timeout snapshot parked"
+    );
+    assert_eq!(
+        timeout_owner.ready().await,
+        pioneer_sqlite::background::Ready::Work
     );
     let resolution = respond_rx
         .await
@@ -77256,6 +77279,18 @@ async fn setup_pooled_file_workspace_manager_with_observer(
     Arc<CrudStore>,
     String,
 ) {
+    setup_pooled_file_workspace_manager_with_observers(writer_observer, None).await
+}
+
+async fn setup_pooled_file_workspace_manager_with_observers(
+    writer_observer: Option<Arc<dyn pioneer_sqlite::SqliteWriteObserver>>,
+    read_observer: Option<Arc<dyn pioneer_sqlite::SqliteReadObserver>>,
+) -> (
+    tempfile::TempDir,
+    Arc<WorkspaceManager>,
+    Arc<CrudStore>,
+    String,
+) {
     use sea_orm::{ConnectOptions, ConnectionTrait};
 
     let directory = tempfile::tempdir().expect("isolated Gateway database directory");
@@ -77278,20 +77313,36 @@ async fn setup_pooled_file_workspace_manager_with_observer(
     let writer = Database::connect(writer_options)
         .await
         .expect("isolated Gateway writer");
-    let mut reader_options = ConnectOptions::new(url);
+    // Match Gateway FK/runtime settings before attaching the test observer;
+    // fixture initialization must not pollute assertions about owner admissions.
+    pioneer_sqlite::SqliteWriteExecutor::new(writer.clone())
+        .apply_pragmas(pioneer_sqlite::SqliteWriteClass::Maintenance)
+        .await
+        .expect("Gateway writer pragmas for isolated fixture");
+    let mut reader_options =
+        ConnectOptions::new(pioneer_sqlite::sqlite_read_only_connection_url(&path));
     reader_options
         .max_connections(4)
         .sqlx_logging(false)
-        .map_sqlx_sqlite_opts(|options| options.pragma("query_only", "ON"));
+        .map_sqlx_sqlite_opts(|options| {
+            options
+                .read_only(true)
+                .create_if_missing(false)
+                .pragma("query_only", "ON")
+        });
     let reader = Database::connect(reader_options)
         .await
         .expect("isolated Gateway read-only pool");
     drop(bootstrap_connection);
-    let database = match writer_observer {
-        Some(observer) => {
-            pioneer_sqlite::SqliteDatabase::new_with_observer(reader, writer, observer)
-        }
-        None => pioneer_sqlite::SqliteDatabase::new(reader, writer),
+    let writer = match writer_observer {
+        Some(observer) => pioneer_sqlite::SqliteWriteExecutor::with_observer(writer, observer),
+        None => pioneer_sqlite::SqliteWriteExecutor::new(writer),
+    };
+    let database = match read_observer {
+        Some(observer) => pioneer_sqlite::SqliteDatabase::from_executor_with_read_observer(
+            reader, writer, observer,
+        ),
+        None => pioneer_sqlite::SqliteDatabase::from_executor(reader, writer),
     };
     (
         directory,
@@ -89762,4 +89813,259 @@ async fn task_webhook_url_uses_actual_bind_and_rejects_persisted_disconnected_re
     let persisted = std::fs::read_to_string(&settings_path).unwrap();
     assert!(!persisted.contains("public_base_url"));
     assert!(!persisted.contains("obsolete.example"));
+}
+
+#[tokio::test]
+async fn skill_upload_owner_reopens_old_key_and_expires_without_client_or_empty_poll() {
+    let observer = Arc::new(NativeSchedulingObserver::default());
+    let (directory, manager, store, workspace) =
+        setup_pooled_file_workspace_manager_with_observers(
+            Some(observer.clone()),
+            Some(observer.clone()),
+        )
+        .await;
+    let system_root = directory.path().join("system");
+    let user_root = directory.path().join("{workspaceId}").join("user");
+    let workspace_root = directory.path().join("workspace");
+    let registry_root = directory.path().join("registry");
+    for root in [&system_root, &user_root, &workspace_root, &registry_root] {
+        std::fs::create_dir_all(root).unwrap();
+    }
+    // Actual active Workspace identities; roots are workspace-specific, so the
+    // last healthy root requires a second64-ID page. No PK rewrites.
+    let mut cleanup_workspaces = vec![workspace.clone()];
+    for index in 0..65 {
+        cleanup_workspaces.push(
+            manager
+                .create_workspace(&format!("cleanup-{index:03}"), None)
+                .await
+                .unwrap()
+                .id,
+        );
+    }
+    cleanup_workspaces.sort();
+    let config =
+        test_tool_loop_config_with_roots(&system_root, &user_root, &workspace_root, &registry_root);
+    let ttl = config.skills.security.upload_ttl_secs.max(60);
+    // Use the configured public path resolver, without exposing private
+    // SkillsRuntimeContext fields to this sibling test module.
+    let roots = |id: &str| {
+        let user = super::skills::resolve_root_path(&user_root.to_string_lossy(), id);
+        let runtime_root = user.parent().unwrap();
+        (
+            runtime_root.join("uploads"),
+            runtime_root.join(".materialized"),
+        )
+    };
+    let processor = Arc::new(MessageProcessor::new(
+        Arc::new(ThreadManager::new("test", "openai")),
+        test_provider(),
+        Arc::new(SessionManager::new()),
+        manager,
+        store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        config,
+    ));
+    let mut stale_directories = Vec::new();
+    for id in [&cleanup_workspaces[0], cleanup_workspaces.last().unwrap()] {
+        let (uploads, materialized) = roots(id);
+        let stale = std::time::SystemTime::now()
+            .checked_sub(Duration::from_secs(ttl + 60))
+            .unwrap();
+        for path in [
+            materialized.join("orphan-materialized"),
+            uploads.join("orphan-workspace").join("orphan-no-session"),
+        ] {
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(path.join("payload"), b"stale orphan").unwrap();
+            let mut options = std::fs::OpenOptions::new();
+            options.read(true);
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::OpenOptionsExt;
+                // FILE_WRITE_ATTRIBUTES + FILE_FLAG_BACKUP_SEMANTICS permit
+                // timestamp restoration on a directory without a new dependency.
+                options.access_mode(0x0100).custom_flags(0x02000000);
+            }
+            options.open(&path).unwrap().set_modified(stale).unwrap();
+            stale_directories.push(path);
+        }
+    }
+    assert_ne!(stale_directories[0], stale_directories[2]);
+    {
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+        pioneer_entity::workspace::Entity::update_many()
+            .filter(pioneer_entity::workspace::Column::Id.eq(&cleanup_workspaces[0]))
+            .col_expr(
+                pioneer_entity::workspace::Column::CreatedAt,
+                sea_orm::sea_query::Expr::value("malformed-date"),
+            )
+            .exec(&store.database_connection())
+            .await
+            .unwrap();
+    }
+    // Retained terminal receipts span several raw pages. Missing payload dirs
+    // are already settled and do not warrant a writer or recurring scan.
+    let now = now_timestamp_secs();
+    for index in 0..33 {
+        store
+            .insert_skill_upload_session(&pioneer_crud::SkillUploadSessionRecord {
+                upload_id: format!("z-terminal-{index:03}"),
+                workspace_id: workspace.clone(),
+                connection_id: 1,
+                status: "expired".into(),
+                file_name: "payload.tar.gz".into(),
+                archive_format: "tar_gz".into(),
+                compressed_size_bytes: 7,
+                received_bytes: 7,
+                sha256: "a".repeat(64),
+                payload_path: directory
+                    .path()
+                    .join(format!("absent-{index}/payload.tar.gz"))
+                    .display()
+                    .to_string(),
+                created_at_unix: now - 120,
+                expires_at_unix: now - 60,
+                finalized_at_unix: None,
+                consumed_at_unix: None,
+                aborted_at_unix: None,
+            })
+            .await
+            .unwrap();
+    }
+    let label = "__skill_upload_cleanup_settled__";
+    processor.arm_completed_history_preparation_barrier(label);
+    observer.writes.lock().unwrap().clear();
+    let worker = tokio::spawn(MessageProcessor::run_skill_upload_cleanup_worker(
+        Arc::downgrade(&processor),
+    ));
+    timeout(
+        Duration::from_secs(10),
+        processor.wait_for_completed_history_preparation_barrier(),
+    )
+    .await
+    .unwrap();
+    assert!(observer.writes.lock().unwrap().is_empty());
+    assert!(
+        stale_directories.iter().all(|path| !path.exists()),
+        "ID-only cleanup reaches poison and >64 healthy roots without repairing unrelated dates"
+    );
+    {
+        use sea_orm::{EntityTrait, QuerySelect};
+        let date = pioneer_entity::workspace::Entity::find_by_id(&cleanup_workspaces[0])
+            .select_only()
+            .column(pioneer_entity::workspace::Column::CreatedAt)
+            .into_tuple::<String>()
+            .one(&store.database_connection())
+            .await
+            .unwrap();
+        assert_eq!(date.as_deref(), Some("malformed-date"));
+    }
+
+    processor.release_completed_history_preparation_barrier();
+    tokio::task::yield_now().await;
+    observer.reads.lock().unwrap().clear();
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(300)).await;
+    tokio::task::yield_now().await;
+    assert!(
+        observer.reads.lock().unwrap().is_empty(),
+        "completed receipts do not reopen a sweep"
+    );
+    assert!(observer.writes.lock().unwrap().is_empty());
+    tokio::time::resume();
+    processor.arm_completed_history_preparation_barrier(label);
+    store.background_work("skills.uploads").invalidate();
+    timeout(
+        Duration::from_secs(10),
+        processor.wait_for_completed_history_preparation_barrier(),
+    )
+    .await
+    .unwrap();
+    let lower = CrudStore::new(store.database_connection());
+    let (uploads, _) = roots(&workspace);
+    let payload = uploads
+        .join("workspace-fixture")
+        .join("a-late")
+        .join("payload.tar.gz");
+    std::fs::create_dir_all(payload.parent().unwrap()).unwrap();
+    std::fs::write(&payload, b"payload").unwrap();
+    let now = now_timestamp_secs();
+    lower
+        .insert_skill_upload_session(&pioneer_crud::SkillUploadSessionRecord {
+            upload_id: "a-late".into(),
+            workspace_id: workspace.clone(),
+            connection_id: 1,
+            status: "finalized".into(),
+            file_name: "payload.tar.gz".into(),
+            archive_format: "tar_gz".into(),
+            compressed_size_bytes: 7,
+            received_bytes: 7,
+            sha256: "a".repeat(64),
+            payload_path: payload.display().to_string(),
+            created_at_unix: now,
+            expires_at_unix: now + 3,
+            finalized_at_unix: Some(now),
+            consumed_at_unix: None,
+            aborted_at_unix: None,
+        })
+        .await
+        .unwrap();
+    observer.reads.lock().unwrap().clear();
+    observer.writes.lock().unwrap().clear();
+    processor.arm_completed_history_preparation_barrier(label);
+    processor.release_completed_history_preparation_barrier();
+    timeout(
+        Duration::from_secs(10),
+        processor.wait_for_completed_history_preparation_barrier(),
+    )
+    .await
+    .unwrap();
+    assert!(payload.exists());
+    assert!(
+        observer.writes.lock().unwrap().is_empty(),
+        "future expiry cannot mutate early"
+    );
+    processor.arm_completed_history_preparation_barrier(label);
+    processor.release_completed_history_preparation_barrier();
+    timeout(
+        Duration::from_secs(7),
+        processor.wait_for_completed_history_preparation_barrier(),
+    )
+    .await
+    .unwrap();
+    assert!(observer.reads.lock().unwrap().iter().all(|event| !matches!(event,
+        pioneer_sqlite::SqliteReadEvent::AdmissionEnqueued {class,..} if *class!=pioneer_sqlite::SqliteReadClass::Maintenance)));
+    assert!(observer.writes.lock().unwrap().iter().any(|event| matches!(
+        event,
+        pioneer_sqlite::SqliteWriteEvent::Acquired {
+            class: pioneer_sqlite::SqliteWriteClass::Maintenance,
+            ..
+        }
+    )));
+    assert_eq!(
+        lower
+            .find_skill_upload_session("a-late")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "expired"
+    );
+    assert!(
+        !payload.exists(),
+        "real deadline deletes the guarded payload without another client commit"
+    );
+    processor.release_completed_history_preparation_barrier();
+    tokio::task::yield_now().await;
+    observer.reads.lock().unwrap().clear();
+    observer.writes.lock().unwrap().clear();
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(300)).await;
+    tokio::task::yield_now().await;
+    assert!(observer.reads.lock().unwrap().is_empty());
+    assert!(observer.writes.lock().unwrap().is_empty());
+    processor.cli_history_shutdown.cancel();
+    worker.await.unwrap();
 }

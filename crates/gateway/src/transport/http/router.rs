@@ -43,7 +43,23 @@ pub(crate) fn gateway_router(state: GatewayHttpState) -> Router {
                 )
                 .layer(middleware::from_fn(super::header_policy::enforce_webhook)),
         )
+        .merge(local_owner_routes())
         .with_state(state)
+}
+
+fn local_owner_routes() -> Router<GatewayHttpState> {
+    Router::new()
+        .route(
+            "/local/owner-operation",
+            post(super::local_operations::owner_operation),
+        )
+        .layer(middleware::from_fn(
+            super::header_policy::enforce_owner_operation,
+        ))
+}
+
+pub(crate) fn local_owner_router(state: GatewayHttpState) -> Router {
+    local_owner_routes().with_state(state)
 }
 
 fn operational_router<S>(

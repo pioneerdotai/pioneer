@@ -4810,6 +4810,18 @@ where
         bail!("Agent action compaction batch exceeds its bounded limit");
     }
     let cutoff = now - Duration::days(AGENT_ACTION_LEDGER_PAYLOAD_RETENTION_DAYS);
+    let candidates = terminal_ledger_query()
+        .filter(agent_action_outbox::Column::CreatedAt.lte(cutoff))
+        .order_by_asc(agent_action_outbox::Column::CreatedAt)
+        .order_by_asc(agent_action_outbox::Column::Id)
+        .limit(limit)
+        .all(db)
+        .await
+        .context("failed to select terminal agent action ledger rows")?;
+    compact_terminal_agent_action_candidates(db, now, candidates, false, &mut None).await
+}
+
+fn terminal_ledger_query() -> sea_orm::Select<agent_action_outbox::Entity> {
     let terminal = Condition::any()
         .add(
             Condition::all()
@@ -4856,16 +4868,106 @@ where
                 )
                 .add(agent_action_outbox::Column::NextAttemptAt.is_null()),
         );
-    let candidates = agent_action_outbox::Entity::find()
+    agent_action_outbox::Entity::find()
         .filter(terminal)
-        .filter(agent_action_outbox::Column::CreatedAt.lte(cutoff))
         .filter(agent_action_outbox::Column::PayloadJson.not_like("%\"_pioneer_compacted\"%"))
-        .order_by_asc(agent_action_outbox::Column::CreatedAt)
+}
+
+// Raw immutable PK order has an unconditional index. Retention is observed
+// after point hydration; partial dispatch tuple indexes do not cover history.
+pub type AgentActionLedgerKey = String;
+pub struct AgentActionLedgerPage {
+    pub after: Option<AgentActionLedgerKey>,
+    pub more: bool,
+    pub next_at: Option<DateTimeWithTimeZone>,
+    pub summary: AgentActionLedgerCompactionSummary,
+    pub errors: Vec<anyhow::Error>,
+}
+pub async fn terminal_agent_action_ledger_upper<C: ConnectionTrait>(
+    db: &C,
+) -> Result<Option<AgentActionLedgerKey>> {
+    Ok(agent_action_outbox::Entity::find()
+        .select_only()
+        .column(agent_action_outbox::Column::Id)
+        .order_by_desc(agent_action_outbox::Column::Id)
+        .limit(1)
+        .into_tuple::<String>()
+        .one(db)
+        .await?)
+}
+pub async fn compact_terminal_agent_action_ledger_page<C: ConnectionTrait + TransactionTrait>(
+    db: &C,
+    now: DateTimeWithTimeZone,
+    after: Option<&AgentActionLedgerKey>,
+    upper: &AgentActionLedgerKey,
+) -> Result<AgentActionLedgerPage> {
+    // Only PK range constraints precede LIMIT: every excluded or corrupt row
+    // still advances raw progress, without reading payload-bearing history.
+    let mut query = agent_action_outbox::Entity::find()
+        .filter(agent_action_outbox::Column::Id.lte(upper.clone()));
+    if let Some(after) = after {
+        query = query.filter(agent_action_outbox::Column::Id.gt(after.clone()));
+    }
+    let keys = query
+        .select_only()
+        .column(agent_action_outbox::Column::Id)
         .order_by_asc(agent_action_outbox::Column::Id)
-        .limit(limit)
+        .limit(64)
+        .into_tuple::<String>()
         .all(db)
-        .await
-        .context("failed to select terminal agent domain action ledger rows")?;
+        .await?;
+    let after = keys.last().cloned();
+    let more = keys.len() == 64 && after.as_ref() != Some(upper);
+    let mut next_at = None;
+    let mut summary = AgentActionLedgerCompactionSummary::default();
+    let mut errors = Vec::new();
+    for id in keys {
+        let result: Result<AgentActionLedgerCompactionSummary> = async {
+            // Eligibility and marker guards now see at most this one PK.
+            // The returned model releases reader resources before parsing or
+            // the existing conditional writer transaction begins.
+            let Some(row) = terminal_ledger_query()
+                .filter(agent_action_outbox::Column::Id.eq(id))
+                .one(db)
+                .await?
+            else {
+                return Ok(AgentActionLedgerCompactionSummary::default());
+            };
+            let at = row.created_at + Duration::days(AGENT_ACTION_LEDGER_PAYLOAD_RETENTION_DAYS);
+            if at > now {
+                next_at =
+                    Some(next_at.map_or(at, |old: DateTimeWithTimeZone| std::cmp::min(old, at)));
+                return Ok(AgentActionLedgerCompactionSummary::default());
+            }
+            compact_terminal_agent_action_candidates(db, now, vec![row], true, &mut next_at).await
+        }
+        .await;
+        match result {
+            Ok(one) => {
+                summary.candidate_rows += one.candidate_rows;
+                summary.compacted_rows += one.compacted_rows;
+                summary.payload_bytes_released += one.payload_bytes_released;
+            }
+            Err(error) => errors.push(error),
+        }
+    }
+    Ok(AgentActionLedgerPage {
+        after,
+        more,
+        next_at,
+        summary,
+        errors,
+    })
+}
+
+async fn compact_terminal_agent_action_candidates<C: ConnectionTrait + TransactionTrait>(
+    db: &C,
+    now: DateTimeWithTimeZone,
+    candidates: Vec<agent_action_outbox::Model>,
+    defer_future: bool,
+    next_at: &mut Option<DateTimeWithTimeZone>,
+) -> Result<AgentActionLedgerCompactionSummary> {
+    let cutoff = now - Duration::days(AGENT_ACTION_LEDGER_PAYLOAD_RETENTION_DAYS);
     let mut summary = AgentActionLedgerCompactionSummary {
         candidate_rows: u64::try_from(candidates.len()).unwrap_or(u64::MAX),
         ..Default::default()
@@ -4920,6 +5022,20 @@ where
             .await
             .context("failed to load compactable agent domain action receipt")?
             .context("compactable agent domain outbox has no receipt")?;
+        if defer_future {
+            let deadline = action
+                .committed_at
+                .into_iter()
+                .chain(Some(receipt.committed_at))
+                .chain(Some(candidate.created_at))
+                .max()
+                .unwrap()
+                + Duration::days(AGENT_ACTION_LEDGER_PAYLOAD_RETENTION_DAYS);
+            if deadline > now {
+                *next_at = Some(next_at.map_or(deadline, |old| std::cmp::min(old, deadline)));
+                continue;
+            }
+        }
         if action.status != "committed"
             || action
                 .committed_at
@@ -5225,6 +5341,96 @@ fn agent_action_outbox_timed_discovery_sql() -> String {
         ),
         exhausted,
     )
+}
+
+/// Same three candidate ranges as discovery. This is advisory only: the
+/// authoritative dispatcher still validates immutable action/payload identity,
+/// generation and permits after a transactional claim.
+#[cfg(test)]
+pub(crate) fn action_outbox_due_query(
+    now: DateTimeWithTimeZone,
+) -> sea_orm::Select<agent_action_outbox::Entity> {
+    action_outbox_candidate_query(Some(now))
+}
+
+pub(crate) fn action_outbox_candidate_query(
+    now: Option<DateTimeWithTimeZone>,
+) -> sea_orm::Select<agent_action_outbox::Entity> {
+    use agent_action_outbox::Column as O;
+    use sea_orm::QueryTrait;
+    use sea_orm::sea_query::{Alias, Expr, Func};
+    let eligible_status = Condition::any()
+        .add(O::Status.eq("pending"))
+        .add(O::Status.eq("failed"));
+    let not_detached = Condition::any()
+        .add(O::Status.ne("failed"))
+        .add(O::LastError.is_null())
+        .add(O::LastError.ne("outbox_detached_binding_rejected"));
+    let immediate = Condition::all()
+        .add(O::NextAttemptAt.is_null())
+        .add(eligible_status.clone())
+        .add(O::Attempts.lt(AGENT_ACTION_OUTBOX_MAX_ATTEMPTS))
+        .add(
+            Condition::any()
+                .add(O::Status.eq("pending"))
+                .add(O::LastError.is_null())
+                .add(
+                    O::LastError
+                        .is_not_in(AGENT_START_TERMINAL_FAILURE_CLASSES[1..].iter().copied()),
+                ),
+        )
+        .add(not_detached.clone());
+    let timed = Condition::all()
+        .add(O::NextAttemptAt.is_not_null())
+        .add(now.map_or_else(Condition::all, |now| {
+            Condition::all().add(O::NextAttemptAt.lte(now))
+        }))
+        .add(
+            Condition::any().add(O::Status.eq("pending")).add(
+                Condition::all()
+                    .add(O::Status.eq("failed"))
+                    .add(O::Attempts.lt(AGENT_ACTION_OUTBOX_MAX_ATTEMPTS)),
+            ),
+        );
+    let action = agent_action::Entity::find()
+        .select_only()
+        .column(agent_action::Column::Id)
+        .filter(agent_action::Column::ActionKind.eq("start_agent"))
+        .filter(
+            Expr::col((agent_action::Entity, agent_action::Column::Id))
+                .eq(Expr::col((agent_action_outbox::Entity, O::ActionId))),
+        );
+    // Installed SeaQuery has no backend-neutral guarded JSON extraction API.
+    // Compose the existing discovery's json_valid/json_extract scalar through
+    // Func/CASE inside the Entity path; no raw CRUD execution or new dialect.
+    let valid = Func::cust(Alias::new("json_valid")).arg(Expr::col(O::PayloadJson));
+    let kind = Func::cust(Alias::new("json_extract"))
+        .args([Expr::col(O::PayloadJson), Expr::value("$.kind")]);
+    let payload_kind =
+        Expr::case(Expr::expr(valid).eq(1), kind).finally(Expr::value(None::<String>));
+    let exhausted = Condition::all()
+        .add(eligible_status)
+        .add(O::Attempts.eq(AGENT_ACTION_OUTBOX_MAX_ATTEMPTS))
+        .add(
+            Condition::any()
+                .add(O::NextAttemptAt.is_not_null())
+                .add(not_detached),
+        )
+        .add(now.map_or_else(Condition::all, |now| {
+            Condition::any()
+                .add(O::NextAttemptAt.is_null())
+                .add(O::NextAttemptAt.lte(now))
+        }))
+        .add(Expr::exists(action.into_query()))
+        .add(
+            Expr::expr(Func::coalesce([
+                Expr::expr(payload_kind),
+                Expr::value("start_agent"),
+            ]))
+            .eq("start_agent"),
+        );
+    agent_action_outbox::Entity::find()
+        .filter(Condition::any().add(immediate).add(timed).add(exhausted))
 }
 
 async fn discover_agent_action_outbox<C: ConnectionTrait>(

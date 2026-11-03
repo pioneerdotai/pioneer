@@ -197,6 +197,8 @@ struct AdmissionInner {
     next_waiter_id: AtomicU64,
     policy: SqliteWritePolicy,
     observer: Arc<dyn SqliteWriteObserver>,
+    resources:
+        Mutex<std::collections::HashMap<std::any::TypeId, Arc<dyn std::any::Any + Send + Sync>>>,
 }
 
 struct Dispatch {
@@ -554,6 +556,18 @@ impl std::fmt::Debug for SqliteWriteExecutor {
 }
 
 impl SqliteWriteExecutor {
+    pub(crate) fn shared_resource<T: Default + Send + Sync + 'static>(&self) -> Arc<T> {
+        let mut resources = self.admission.resources.lock().unwrap();
+        let value = resources
+            .entry(std::any::TypeId::of::<T>())
+            .or_insert_with(|| Arc::new(T::default()))
+            .clone();
+        match value.downcast::<T>() {
+            Ok(value) => value,
+            Err(_) => unreachable!("runtime resource type matches its TypeId"),
+        }
+    }
+
     pub(crate) fn runtime_identity(&self) -> usize {
         Arc::as_ptr(&self.admission) as usize
     }
@@ -585,6 +599,7 @@ impl SqliteWriteExecutor {
                 next_waiter_id: AtomicU64::new(1),
                 policy,
                 observer,
+                resources: Mutex::new(std::collections::HashMap::new()),
             }),
         }
     }
@@ -603,8 +618,32 @@ impl SqliteWriteExecutor {
             .get_max_connections()
     }
 
+    pub fn with_ownership(self, ownership: crate::ownership::Ownership) -> Self {
+        let resource = self.shared_resource::<crate::ownership::RuntimeOwnership>();
+        let mut owner = resource.0.lock().unwrap();
+        assert!(owner.is_none(), "writer ownership already installed");
+        *owner = Some((
+            ownership,
+            self.connection.clone(),
+            tokio::runtime::Handle::try_current().ok(),
+        ));
+        drop(owner);
+        self
+    }
+
     pub async fn close(self) -> Result<(), DbErr> {
-        self.connection.close().await
+        let ownership = self.shared_resource::<crate::ownership::RuntimeOwnership>();
+        let owned = ownership.0.lock().unwrap().is_some();
+        if owned {
+            crate::ownership::close_owned_pool(self.connection.clone()).await;
+        } else {
+            self.connection.close_by_ref().await?;
+        }
+        let released = ownership.0.lock().unwrap().take();
+        if let Some((ownership, _connection, _runtime)) = released {
+            ownership.pool_closed();
+        }
+        Ok(())
     }
 
     /// Validates the physical writer connection under the same typed
@@ -1168,6 +1207,7 @@ mod tests {
     fn admission(policy: SqliteWritePolicy) -> Arc<AdmissionInner> {
         Arc::new(AdmissionInner {
             state: Mutex::new(AdmissionState::default()),
+            resources: Mutex::new(std::collections::HashMap::new()),
             next_waiter_id: AtomicU64::new(1),
             policy,
             observer: Arc::new(NoopSqliteWriteObserver),
@@ -1532,6 +1572,7 @@ mod tests {
         let observer = Arc::new(RecordingObserver::default());
         let inner = Arc::new(AdmissionInner {
             state: Mutex::new(AdmissionState::default()),
+            resources: Mutex::new(std::collections::HashMap::new()),
             next_waiter_id: AtomicU64::new(1),
             policy: SqliteWritePolicy::default(),
             observer: observer.clone(),

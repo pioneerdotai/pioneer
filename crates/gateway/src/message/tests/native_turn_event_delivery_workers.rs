@@ -785,7 +785,7 @@ async fn empty_delivery_owners_and_projection_cycles_do_not_repeat_deadline_quer
     let mut options = ConnectOptions::new(pioneer_sqlite::sqlite_connection_url(&path));
     options.max_connections(1).sqlx_logging(false);
     let writer = Database::connect(options).await.unwrap();
-    let (_, _, _) = setup_workspace_manager_with_connection(writer.clone()).await;
+    let (_, _, workspace) = setup_workspace_manager_with_connection(writer.clone()).await;
     writer
         .execute_unprepared("PRAGMA journal_mode=WAL")
         .await
@@ -808,6 +808,7 @@ async fn empty_delivery_owners_and_projection_cycles_do_not_repeat_deadline_quer
         Arc::new(WorkspaceManager::new(database.clone())),
         Arc::new(CrudStore::new(database)),
     ));
+    materialize_thread_episodic_ingest_turn(&processor.crud_store, &workspace, THREAD, TURN).await;
     let read_count = || {
         observer
             .reads
@@ -844,33 +845,68 @@ async fn empty_delivery_owners_and_projection_cycles_do_not_repeat_deadline_quer
     let worker = tokio::spawn(MessageProcessor::run_projection_delivery_resilience_worker(
         Arc::downgrade(&processor),
     ));
-    timeout(
-        Duration::from_secs(10),
-        processor.wait_for_completed_history_preparation_barrier(),
-    )
-    .await
-    .unwrap();
-    assert_eq!(
-        read_count(),
-        2,
-        "projection discovery + unchanged finalization upper read"
-    );
+    reached(&processor.completed_history_preparation_barrier).await;
     processor.release_completed_history_preparation_barrier();
-    processor.arm_completed_history_preparation_barrier("__event_delivery_recovery_before_kick__");
-    timeout(
-        Duration::from_secs(10),
-        processor.wait_for_completed_history_preparation_barrier(),
-    )
+    timeout(Duration::from_secs(10), async {
+        while read_count() < 4 {
+            tokio::task::yield_now().await;
+        }
+        idle(&processor).await;
+    })
     .await
     .unwrap();
-    // The next cycle is paused before its kicks. Wait only for the first pair.
-    idle(&processor).await;
     assert_eq!(
         read_count(),
-        6,
-        "two projection/finalization passes + two delivery discoveries; no deadline SQL"
+        4,
+        "one bootstrap discovery for each independent projection/finalization/delivery owner"
     );
     assert!(observer.writes.lock().unwrap().is_empty());
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(300)).await;
+    for _ in 0..64 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        read_count(),
+        4,
+        "successful Empty has no periodic domain discovery"
+    );
+    assert!(observer.writes.lock().unwrap().is_empty());
+    tokio::time::resume();
+
+    // A separate supported CrudStore commits without a MessageProcessor kick.
+    // Shared physical-runtime producer invalidation must reach both consumers,
+    // even after their completed Empty and without a fallback poll.
+    let ingestor = Arc::new(BlockingIngestor::default());
+    processor
+        .set_thread_episodic_ingestor_for_test(ingestor.clone())
+        .await;
+    let lower = CrudStore::new(processor.crud_store.database_connection());
+    commit(&lower, &workspace, "committed-after-empty").await;
+    timeout(Duration::from_secs(10), ingestor.entered.notified())
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(10), async {
+        loop {
+            let delivered = rows(&processor.crud_store, LIVE).await;
+            if delivered.len() == 1 && delivered[0].status == "delivered" {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("foreign work must reach LIVE while its episodic sibling is blocked");
+    assert_eq!(
+        rows(&processor.crud_store, EPISODIC).await[0].status,
+        "delivering"
+    );
+    ingestor.release.notify_one();
+    idle(&processor).await;
+    assert_eq!(
+        rows(&processor.crud_store, EPISODIC).await[0].status,
+        "delivered"
+    );
     worker.abort();
     let _ = worker.await;
     processor.shutdown_resilience_workers().await;

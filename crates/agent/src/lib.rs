@@ -2894,6 +2894,33 @@ impl AgentManager {
         turn_id: &str,
         payload: NativeTerminalEffectPayload,
     ) -> Result<(), AgentTerminalEffectExecutionError> {
+        self.execute_terminal_effect_with_run_store(
+            effect_id,
+            claim_token,
+            runtime_generation,
+            workspace_id,
+            thread_id,
+            turn_id,
+            payload,
+            None,
+        )
+        .await
+    }
+
+    /// The background owner supplies its scoped persistence adapter. The
+    /// retained generation's handlers/subscriptions/options remain unchanged;
+    /// only its existing durable run store acquires the caller's DB class.
+    pub async fn execute_terminal_effect_with_run_store(
+        &self,
+        effect_id: &str,
+        claim_token: &str,
+        runtime_generation: u64,
+        workspace_id: &str,
+        thread_id: &str,
+        turn_id: &str,
+        payload: NativeTerminalEffectPayload,
+        run_store: Option<Arc<dyn pioneer_hooks::HookRunStore>>,
+    ) -> Result<(), AgentTerminalEffectExecutionError> {
         let terminal_runtime = self
             .runtime_dependencies
             .terminal_runtime_snapshot_for(runtime_generation)
@@ -2931,6 +2958,14 @@ impl AgentManager {
                     .hook_runtime
                     .clone()
                     .ok_or(AgentTerminalEffectExecutionError::RuntimeUnavailable)?;
+                let runtime = match run_store {
+                    Some(store) => {
+                        pioneer_hooks::HookRuntimeBuilder::from_runtime(runtime.as_ref())
+                            .with_run_store(store)
+                            .build()
+                    }
+                    None => runtime,
+                };
                 let runtime_snapshot: DurablePostTurnHookRuntimeSnapshot =
                     serde_json::from_value(runtime_snapshot).map_err(|error| {
                         AgentTerminalEffectExecutionError::InvalidPayload(error.to_string())

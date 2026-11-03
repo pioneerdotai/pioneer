@@ -121,9 +121,52 @@ impl CrudStore {
         at: i64,
         action: Option<crate::AgentCommitInput>,
     ) -> Result<(bool, Vec<AppendedTaskEvent>)> {
-        self.run_serialized_write(|| {
-            self.request_task_finish_once(task_id, reason.clone(), at, action.clone())
-        })
+        let owners: &[&'static str] = if action.is_some() {
+            &["recovery.control", "recovery.ledger"]
+        } else {
+            &[]
+        };
+        self.background_changes(
+            owners,
+            async {
+                self.background_change(
+                    "tasks.fanout",
+                    async {
+                        self.background_change(
+                            "tasks.review",
+                            async {
+                                self.track_task_scheduler(
+                                    async {
+                                        self.run_serialized_write(|| {
+                                            self.request_task_finish_once(
+                                                task_id,
+                                                reason.clone(),
+                                                at,
+                                                action.clone(),
+                                            )
+                                        })
+                                        .await
+                                    },
+                                    |outcome, changes| changes.record_committed_events(&outcome.1),
+                                    |outcome, wait| wait.finish_events(&outcome.1),
+                                )
+                                .await
+                            },
+                            |outcome| crate::task_scheduler::task_review_changed(&outcome.1),
+                        )
+                        .await
+                    },
+                    |outcome| {
+                        outcome
+                            .1
+                            .iter()
+                            .any(|event| event.append_status.is_inserted())
+                    },
+                )
+                .await
+            },
+            |_| true,
+        )
         .await
     }
 
@@ -270,8 +313,11 @@ impl CrudStore {
         task_id: &str,
         at: i64,
     ) -> Result<Vec<AppendedTaskEvent>> {
-        self.run_serialized_write(|| self.discard_finished_task_queue_once(task_id, at))
-            .await
+        self.task_scheduler_event_change(None, async {
+            self.run_serialized_write(|| self.discard_finished_task_queue_once(task_id, at))
+                .await
+        })
+        .await
     }
 
     async fn discard_finished_task_queue_once(

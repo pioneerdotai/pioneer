@@ -52,6 +52,7 @@ pub(crate) async fn record_tool_output(
                 } else {
                     None
                 };
+                let change = store.background_work("storage.portable").changing();
                 let tx = store.connection.begin().await?;
                 ensure!(
                     thread::Entity::find_by_id(&n.thread_id)
@@ -75,7 +76,7 @@ pub(crate) async fn record_tool_output(
                         .is_some(),
                     "tool output turn mismatch"
                 );
-                if let Some(actual) = tool_output_chunk::Entity::find()
+                let inserted = if let Some(actual) = tool_output_chunk::Entity::find()
                     .select_only()
                     .columns([
                         tool_output_chunk::Column::Ordinal,
@@ -89,10 +90,13 @@ pub(crate) async fn record_tool_output(
                     if expected != Some(actual) {
                         return Err(portable_payload::PreflightRace.into());
                     }
+                    false
                 } else {
                     tool_output_chunk::Entity::insert(row).exec(&tx).await?;
-                }
+                    true
+                };
                 tx.commit().await?;
+                change.finish(inserted);
                 Ok(())
             }
         })

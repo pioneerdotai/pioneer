@@ -5,8 +5,10 @@ use std::path::{Component, Path};
 use std::pin::Pin;
 use std::time::Duration;
 
+pub mod background;
 mod blob_range;
 mod database;
+pub mod ownership;
 mod query_scope;
 mod reader;
 pub use query_scope::DiagnosticStream;

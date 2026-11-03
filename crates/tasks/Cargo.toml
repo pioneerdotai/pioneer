@@ -23,6 +23,7 @@ tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+pioneer-sqlite = { workspace = true, features = ["test-support"] }
 tokio = { workspace = true, features = ["test-util"] }
 pioneer-crud = { workspace = true, features = ["test-support"] }
 pioneer-migration.workspace = true

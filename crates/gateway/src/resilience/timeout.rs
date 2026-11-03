@@ -460,10 +460,51 @@ impl TimeoutSupervisor {
         now_unix: i64,
         activity_kind: &str,
     ) -> Result<()> {
+        self.heartbeat_item_attempt_for_owner(
+            turn_id,
+            item_id,
+            item_type,
+            now_unix,
+            activity_kind,
+            None,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    pub(crate) async fn heartbeat_cli_command_item_attempt(
+        &self,
+        expected: &pioneer_crud::CliRuntimeNativeTurnOwner,
+        item_id: &str,
+        now_unix: i64,
+    ) -> Result<bool> {
+        self.heartbeat_item_attempt_for_owner(
+            &expected.binding.turn_id,
+            item_id,
+            TurnItemType::CommandExecution,
+            now_unix,
+            "item/heartbeat",
+            Some(expected),
+        )
+        .await
+    }
+
+    async fn heartbeat_item_attempt_for_owner(
+        &self,
+        turn_id: &str,
+        item_id: &str,
+        item_type: TurnItemType,
+        now_unix: i64,
+        activity_kind: &str,
+        expected: Option<&pioneer_crud::CliRuntimeNativeTurnOwner>,
+    ) -> Result<bool> {
         let stored_attempt = self
             .crud_store
             .get_running_turn_item_attempt(turn_id, item_id)
             .await?;
+        if expected.is_some() && stored_attempt.is_none() {
+            return Ok(false);
+        }
         let (policy, execution_class, stored_item_type) = match stored_attempt {
             Some(attempt) => (
                 self.policy_registry
@@ -484,8 +525,21 @@ impl TimeoutSupervisor {
         ) && (execution_class != TurnItemExecutionClass::DurableWait
             || activity_kind == CONFIRMED_EXTERNAL_ACTIVITY_KIND);
         let next_hard_deadline_at = rolls_hard_deadline.then_some(hard_deadline_at);
-        let _ = self
-            .crud_store
+        if let Some(expected) = expected {
+            return self
+                .crud_store
+                .heartbeat_cli_runtime_command_attempt(
+                    expected,
+                    item_id,
+                    execution_class,
+                    now_unix,
+                    lease_expires_at,
+                    idle_deadline_at,
+                    next_hard_deadline_at,
+                )
+                .await;
+        }
+        self.crud_store
             .heartbeat_turn_item_attempt_with_activity_kind(
                 turn_id,
                 item_id,
@@ -496,10 +550,10 @@ impl TimeoutSupervisor {
                 next_hard_deadline_at,
                 activity_kind,
             )
-            .await?;
-        Ok(())
+            .await
     }
 
+    #[cfg(test)]
     pub async fn list_timeout_candidates(
         &self,
         now_unix: i64,

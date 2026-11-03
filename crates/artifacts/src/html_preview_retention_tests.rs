@@ -927,16 +927,31 @@ async fn html_preview_quiescent_pass_reaches_idle_and_discovers_later_preview() 
         .execute_unprepared("UPDATE turn SET status='completed' WHERE id='preview-turn'")
         .await
         .unwrap();
-    // Reuse the same worker state after idle. Later data is found on the next
-    // complete pass, and its newly orphaned bytes on the following one.
+    // IO-only continuation cannot reopen exhausted retention or GC, even
+    // after new durable input. Relevant source/dependency admission owns that.
+    for _ in 0..3 {
+        assert_eq!(
+            harness
+                .service
+                .continue_html_preview_maintenance(&mut progress)
+                .await
+                .unwrap(),
+            crate::HtmlPreviewMaintenanceOutcome::Idle,
+        );
+        assert!(path.exists());
+    }
+    // Reuse the same worker state after explicit discovery. Retirement may
+    // happen after GC EOF, so the orphan is collected on the following pass.
     for _ in 0..2 {
+        progress.rediscover();
         let mut idle = false;
         for _ in 0..64 {
-            if !harness
+            if harness
                 .service
-                .html_preview_maintenance_quantum(&mut progress)
+                .continue_html_preview_maintenance(&mut progress)
                 .await
                 .unwrap()
+                == crate::HtmlPreviewMaintenanceOutcome::Idle
             {
                 idle = true;
                 break;
@@ -1018,7 +1033,14 @@ async fn html_preview_retention_preserves_mixed_duplicate_and_oversized_groups()
 #[tokio::test]
 async fn preview_contention_defers_and_release_is_retained_after_unlock() {
     let harness = preview_fixture().await;
-    let activity = harness.service.html_preview_activity_signaled().await;
+    let sibling = ArtifactService::new(harness.store.clone(), harness.service.blob_store.clone());
+    drop(sibling.html_preview_activity_signaled().await);
+    tokio::select! {
+        biased;
+        _ = harness.service.html_preview_release_notified() => panic!("ordinary read release must not reopen EOF"),
+        _ = tokio::task::yield_now() => {},
+    }
+    let activity = sibling.html_preview_activity_signaled().await;
     let mut progress = crate::HtmlPreviewMaintenanceProgress::default();
     assert_eq!(
         harness

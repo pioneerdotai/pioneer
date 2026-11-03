@@ -90,11 +90,15 @@ pub(crate) async fn has_pending<C: ConnectionTrait>(db: &C) -> Result<bool> {
         .is_some())
 }
 
+pub(crate) fn due_condition(now: i64) -> SimpleExpr {
+    pending::Column::NextAttemptAt.lte(now)
+}
+
 pub(crate) fn due_query(now: i64, limit: u64) -> SelectStatement {
     Query::select()
         .columns([pending::Column::RunId, pending::Column::Generation])
         .from(pending::Entity)
-        .and_where(Expr::col(pending::Column::NextAttemptAt).lte(now))
+        .and_where(due_condition(now))
         .order_by(pending::Column::NextAttemptAt, Order::Asc)
         .order_by(pending::Column::Generation, Order::Asc)
         .order_by(pending::Column::RunId, Order::Asc)

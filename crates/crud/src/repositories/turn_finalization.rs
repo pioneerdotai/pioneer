@@ -122,20 +122,6 @@ pub async fn exists<C: ConnectionTrait>(db: &C, turn_id: &str) -> Result<bool> {
         != 0)
 }
 
-pub async fn list_prepared<C: ConnectionTrait>(
-    db: &C,
-    limit: u64,
-) -> Result<Vec<turn_finalization::Model>> {
-    turn_finalization::Entity::find()
-        .filter(turn_finalization::Column::Status.eq(STATUS_PREPARED))
-        .order_by_asc(turn_finalization::Column::PreparedAt)
-        .order_by_asc(turn_finalization::Column::TurnId)
-        .limit(limit)
-        .all(db)
-        .await
-        .context("failed to list prepared turn finalizations")
-}
-
 pub async fn list_prepared_ids<C: ConnectionTrait>(db: &C, limit: u64) -> Result<Vec<String>> {
     turn_finalization::Entity::find()
         .select_only()
@@ -160,9 +146,56 @@ pub(crate) struct PreparedCursor {
 
 #[derive(Debug, Default)]
 pub(crate) struct PreparedPass {
+    pub observation: Option<pioneer_sqlite::background::Observation>,
+    pub rescan: bool,
     pub after: Option<PreparedCursor>,
     pub upper: Option<PreparedCursor>,
     pub failed: bool,
+}
+
+// The cursor mutex protects only memory take/return. Domain serialization is
+// the shared owner's drain permit; it is never a state mutex held through DB
+// or event notification awaits. Cancellation reconstructs a finite pass.
+pub(crate) struct PreparedPassGuard {
+    slot: std::sync::Arc<std::sync::Mutex<PreparedPass>>,
+    pub pass: PreparedPass,
+    pub settled: bool,
+    work: std::sync::Arc<pioneer_sqlite::background::Wake>,
+}
+impl PreparedPassGuard {
+    pub fn take(
+        slot: std::sync::Arc<std::sync::Mutex<PreparedPass>>,
+        work: std::sync::Arc<pioneer_sqlite::background::Wake>,
+    ) -> Self {
+        let pass = std::mem::take(&mut *slot.lock().unwrap());
+        Self {
+            slot,
+            pass,
+            settled: false,
+            work,
+        }
+    }
+}
+impl std::ops::Deref for PreparedPassGuard {
+    type Target = PreparedPass;
+    fn deref(&self) -> &PreparedPass {
+        &self.pass
+    }
+}
+impl std::ops::DerefMut for PreparedPassGuard {
+    fn deref_mut(&mut self) -> &mut PreparedPass {
+        &mut self.pass
+    }
+}
+impl Drop for PreparedPassGuard {
+    fn drop(&mut self) {
+        *self.slot.lock().unwrap() = if self.settled {
+            std::mem::take(&mut self.pass)
+        } else {
+            PreparedPass::default()
+        };
+        self.work.invalidate();
+    }
 }
 
 pub(crate) async fn prepared_upper<C: ConnectionTrait>(db: &C) -> Result<Option<PreparedCursor>> {
@@ -187,6 +220,38 @@ pub(crate) async fn list_eligible_prepared<C: ConnectionTrait>(
     upper: &PreparedCursor,
     limit: u64,
 ) -> Result<Vec<PreparedCursor>> {
+    let mut query = eligible_prepared_query();
+    query = query.filter(
+        Condition::any()
+            .add(turn_finalization::Column::PreparedAt.lt(upper.prepared_at))
+            .add(
+                Condition::all()
+                    .add(turn_finalization::Column::PreparedAt.eq(upper.prepared_at))
+                    .add(turn_finalization::Column::TurnId.lte(upper.turn_id.clone())),
+            ),
+    );
+    if let Some(after) = after {
+        query = query.filter(
+            Condition::any()
+                .add(turn_finalization::Column::PreparedAt.gt(after.prepared_at))
+                .add(
+                    Condition::all()
+                        .add(turn_finalization::Column::PreparedAt.eq(after.prepared_at))
+                        .add(turn_finalization::Column::TurnId.gt(after.turn_id.clone())),
+                ),
+        );
+    }
+    query
+        .order_by_asc(turn_finalization::Column::PreparedAt)
+        .order_by_asc(turn_finalization::Column::TurnId)
+        .limit(limit)
+        .into_model::<PreparedCursor>()
+        .all(db)
+        .await
+        .context("failed to discover eligible prepared finalizations")
+}
+
+pub(crate) fn eligible_prepared_query() -> sea_orm::Select<turn_finalization::Entity> {
     let outer_id = || Expr::col((turn_finalization::Entity, turn_finalization::Column::TurnId));
     let active = Query::select()
         .expr(Expr::val(1))
@@ -221,7 +286,7 @@ pub(crate) async fn list_eligible_prepared<C: ConnectionTrait>(
         .and_where(Expr::col((stream::Entity, stream::Column::TurnId)).eq(outer_id()))
         .and_where(Expr::exists(newer).not())
         .to_owned();
-    let mut query = turn_finalization::Entity::find()
+    turn_finalization::Entity::find()
         .select_only()
         .column(turn_finalization::Column::TurnId)
         .column(turn_finalization::Column::PreparedAt)
@@ -232,35 +297,7 @@ pub(crate) async fn list_eligible_prepared<C: ConnectionTrait>(
                 .add(Expr::exists(events).not())
                 .add(Expr::exists(stream_exists).not())
                 .add(Expr::exists(ready_stream)),
-        );
-    query = query.filter(
-        Condition::any()
-            .add(turn_finalization::Column::PreparedAt.lt(upper.prepared_at))
-            .add(
-                Condition::all()
-                    .add(turn_finalization::Column::PreparedAt.eq(upper.prepared_at))
-                    .add(turn_finalization::Column::TurnId.lte(upper.turn_id.clone())),
-            ),
-    );
-    if let Some(after) = after {
-        query = query.filter(
-            Condition::any()
-                .add(turn_finalization::Column::PreparedAt.gt(after.prepared_at))
-                .add(
-                    Condition::all()
-                        .add(turn_finalization::Column::PreparedAt.eq(after.prepared_at))
-                        .add(turn_finalization::Column::TurnId.gt(after.turn_id.clone())),
-                ),
-        );
-    }
-    query
-        .order_by_asc(turn_finalization::Column::PreparedAt)
-        .order_by_asc(turn_finalization::Column::TurnId)
-        .limit(limit)
-        .into_model::<PreparedCursor>()
-        .all(db)
-        .await
-        .context("failed to discover eligible prepared finalizations")
+        )
 }
 
 pub async fn delete_prepared_by_turn_id<C: ConnectionTrait>(db: &C, turn_id: &str) -> Result<bool> {

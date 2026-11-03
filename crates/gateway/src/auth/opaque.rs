@@ -148,6 +148,43 @@ impl OpaqueCredentialFactory {
         credential
     }
 
+    /// Purpose-separated deterministic material for a local operation. The
+    /// operation id is not a credential; only the OS-protected key grants authority.
+    pub(crate) fn local_operation_material(
+        &self,
+        purpose: &[u8],
+        operation: &RequestId,
+    ) -> [u8; 32] {
+        let mut input = Vec::from(purpose);
+        input.push(0);
+        input.extend_from_slice(operation.as_str().as_bytes());
+        fingerprint(
+            &self.hmac_key,
+            b"pioneer.local-device.operation.v1\0",
+            &input,
+        )
+    }
+
+    pub(crate) fn local_operation_activation(
+        &self,
+        operation: &RequestId,
+        locator: Option<&str>,
+    ) -> OpaqueCredential {
+        let mut material = self.local_operation_material(b"activation", operation);
+        let mut entropy = [0u8; 5];
+        entropy.copy_from_slice(&material[..5]);
+        let mut value = encode_device_activation_entropy(entropy);
+        material.zeroize();
+        entropy.zeroize();
+        if let Some(locator) = locator {
+            value.replace_range(..1, locator);
+        }
+        OpaqueCredential {
+            kind: OpaqueCredentialKind::DeviceActivation,
+            value,
+        }
+    }
+
     pub(crate) fn generate_device_activation(&self) -> OpaqueCredential {
         let mut entropy = [0u8; 5];
         rand::fill(&mut entropy);

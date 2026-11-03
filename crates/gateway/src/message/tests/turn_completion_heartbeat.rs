@@ -479,3 +479,98 @@ async fn recovery_due_worker_releases_original_and_scoped_processor_before_wait(
     worker.abort();
     assert!(worker.await.unwrap_err().is_cancelled());
 }
+
+#[tokio::test]
+async fn recovery_due_dormant_reader_wakes_for_scoped_commit_and_reaches_terminal_outcome() {
+    use pioneer_sqlite::{SqliteReadClass, SqliteReadEvent};
+    let observer = Arc::new(NativeSchedulingObserver::default());
+    let (_directory, manager, store, workspace) =
+        setup_pooled_file_workspace_manager_with_observers(
+            Some(observer.clone()),
+            Some(observer.clone()),
+        )
+        .await;
+    let processor = Arc::new(MessageProcessor::new(
+        Arc::new(ThreadManager::new("test-model", "openai")),
+        test_provider(),
+        Arc::new(SessionManager::new()),
+        manager,
+        store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_tool_loop_config(),
+    ));
+    let barrier = processor.recovery_due_wait_barrier.clone();
+    barrier.arm("__recovery_due_before_wait__");
+    let worker = tokio::spawn(MessageProcessor::run_recovery_due_worker(Arc::downgrade(
+        &processor,
+    )));
+    timeout(Duration::from_secs(10), barrier.wait_until_reached())
+        .await
+        .unwrap();
+    observer.reads.lock().unwrap().clear();
+    observer.writes.lock().unwrap().clear();
+    barrier.release();
+    for _ in 0..32 {
+        tokio::task::yield_now().await;
+    }
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(300)).await;
+    for _ in 0..32 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        observer.reads.lock().unwrap().is_empty(),
+        "successful Empty has no periodic domain discovery"
+    );
+    assert!(observer.writes.lock().unwrap().is_empty());
+    tokio::time::resume();
+    let turn = "event-driven-due";
+    materialize_cli_runtime_turn_with_text(&store, &workspace, turn, turn, "due recovery fixture")
+        .await;
+    // Force the real producer/owner handoff rather than sending a Notify kick.
+    barrier.arm("__recovery_due_before_wait__");
+    let producer = CrudStore::new(store.database_connection().maintenance());
+    let job = producer
+        .enqueue_recovery_job(
+            turn.into(),
+            "reasoning".into(),
+            pioneer_protocol::TurnItemType::Reasoning,
+            None,
+            pioneer_protocol::RecoveryTrigger::ProviderError,
+            pioneer_protocol::RecoveryAction::MarkFailed,
+            None,
+            None,
+            None,
+            None,
+            0,
+            1,
+            serde_json::json!({}),
+            serde_json::json!({}),
+            now_timestamp_secs(),
+        )
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(10), barrier.wait_until_reached())
+        .await
+        .unwrap();
+    assert_eq!(
+        producer
+            .get_recovery_job(&job.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        pioneer_protocol::RecoveryJobStatus::Failed
+    );
+    assert!(observer.reads.lock().unwrap().iter().any(|event| matches!(
+        event,
+        SqliteReadEvent::OperationFinished {
+            class: SqliteReadClass::Maintenance,
+            ..
+        }
+    )));
+    barrier.release();
+    processor.cli_history_shutdown.cancel();
+    worker.await.unwrap();
+}

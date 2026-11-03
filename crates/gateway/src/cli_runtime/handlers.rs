@@ -23,6 +23,7 @@ use crate::cli_runtime::opencode_session::{
     probe_opencode_instance,
 };
 use crate::cli_runtime::session_instance::{CliSessionInstanceId, CliSessionInstanceOrigin};
+use crate::cli_runtime::turn_binding::cli_runtime_native_turn_id_for_event;
 use crate::thread::ThreadSubscriptionIdentity;
 use anyhow::Context as AnyhowContext;
 use futures_util::FutureExt;
@@ -74,6 +75,17 @@ const CLI_RUNTIME_PENDING_TURN_EVENT_MAX_PER_TURN: usize = 512;
 #[derive(Default)]
 pub(super) struct CliRuntimeStaleTurnScan {
     after: [Option<(chrono::DateTime<chrono::FixedOffset>, String)>; 2],
+    complete: [bool; 2],
+    nearest_ms: Option<i64>,
+    retry: Option<tokio::time::Instant>,
+    gates: Vec<Arc<tokio::sync::Mutex<()>>>,
+}
+
+enum CliSupervisionWait {
+    Settled,
+    Until(i64),
+    Dependency(Arc<tokio::sync::Mutex<()>>),
+    Uncertain,
 }
 
 #[derive(Debug, Default)]
@@ -7932,7 +7944,149 @@ impl MessageProcessor {
         }
     }
 
+    pub(super) async fn run_cli_supervision_worker(processor: Weak<Self>) {
+        use pioneer_sqlite::background::{Plan, Ready};
+        let Some(initial) = processor.upgrade() else {
+            return;
+        };
+        let cancellation = initial.cli_history_shutdown.clone();
+        let Some(mut owner) = initial
+            .crud_store
+            .background_work("cli.supervision")
+            .acquire()
+        else {
+            return;
+        };
+        drop(initial);
+        let mut scan = CliRuntimeStaleTurnScan::default();
+        let mut previous = None;
+        let mut rescan = false;
+        loop {
+            let gates = scan.gates.clone();
+            let ready = tokio::select! { biased;
+                _ = cancellation.cancelled() => return,
+                _ = pioneer_sqlite::background::wait_for_mutex_release(gates) => {
+                    scan = CliRuntimeStaleTurnScan::default();
+                    Ready::Work
+                },
+                ready = owner.ready() => ready,
+            };
+            if ready == Ready::Closed {
+                return;
+            }
+            let Some(this) = processor.upgrade() else {
+                return;
+            };
+            let this = this.for_background_reconciliation();
+            if ready == Ready::SettlementRequired {
+                let settle_observation = owner.observe();
+                scan = CliRuntimeStaleTurnScan::default();
+                rescan = false;
+                if this
+                    .crud_store
+                    .database_connection()
+                    .settle_background_change(&owner)
+                    .await
+                    .is_err()
+                {
+                    owner.retry_after(settle_observation, Duration::from_secs(60));
+                }
+                continue;
+            }
+            let observed = owner.observe();
+            if scan.complete.iter().all(|done| *done) {
+                scan = CliRuntimeStaleTurnScan::default();
+            } else if previous.is_some_and(|old| old != observed) {
+                rescan = true;
+            }
+            previous = Some(observed);
+            tokio::select! { biased;
+                _ = cancellation.cancelled() => return,
+                _ = owner.scope(crate::database::attribution::scope_database_workload(
+                    pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                    pioneer_observability::DatabaseOperationSite::StaleCliTurnFailure,
+                    this.cli_supervision_quantum(now_timestamp_millis(), &mut scan),
+                )) => {},
+            }
+            if owner.requires_settlement() {
+                continue;
+            }
+            let more = !scan.complete.iter().all(|done| *done);
+            let plan = if more || std::mem::take(&mut rescan) {
+                if !more {
+                    scan = CliRuntimeStaleTurnScan::default();
+                }
+                Plan::Runnable
+            } else {
+                let next = this
+                    .cli_pending_activity_deadline()
+                    .await
+                    .into_iter()
+                    .chain(scan.nearest_ms)
+                    .min();
+                let mut plan = next.map_or(Plan::Dormant, |ms| {
+                    chrono::DateTime::from_timestamp_millis(ms).map_or(
+                        Plan::MonotonicDeadline(
+                            tokio::time::Instant::now() + Duration::from_secs(2),
+                        ),
+                        |at| Plan::WallDeadline(at.into()),
+                    )
+                });
+                if let Some(at) = scan.retry {
+                    plan = plan.with_monotonic_deadline(at);
+                }
+                plan
+            };
+            let _settled = owner.publish(observed, plan);
+            #[cfg(test)]
+            if _settled && !matches!(plan, Plan::Runnable) {
+                this.completed_history_preparation_barrier
+                    .wait_if_armed("__cli_supervision_settled__", &cancellation)
+                    .await;
+            }
+            if matches!(plan, Plan::Runnable) {
+                tokio::select! { _ = cancellation.cancelled() => return, _ = sleep(Duration::from_millis(10)) => {} }
+            }
+        }
+    }
+
+    async fn cli_pending_activity_deadline(&self) -> Option<i64> {
+        // Buffers have fixed key/per-key bounds. No DB handle is held while
+        // their process-local TTL or a transition dependency is awaited.
+        let events = {
+            let buffer = self.cli_runtime_pending_turn_events.lock().await;
+            buffer
+                .values()
+                .filter_map(|items| items.iter().map(|item| item.received_at_unix_ms).max())
+                .min()
+        };
+        let requests = {
+            let buffer = self.cli_runtime_pending_turn_server_requests.lock().await;
+            buffer
+                .values()
+                .filter_map(|items| items.iter().map(|item| item.received_at_unix_ms).max())
+                .min()
+        };
+        events
+            .into_iter()
+            .chain(requests)
+            .min()
+            .map(|at| at.saturating_add(CLI_RUNTIME_PENDING_UNBOUND_EVENT_TTL_MS))
+    }
+
+    #[cfg(test)]
     pub(super) async fn fail_stale_cli_runtime_turns(
+        &self,
+        now_unix_ms: i64,
+        scan: &mut CliRuntimeStaleTurnScan,
+    ) -> CliRuntimeStaleTurnScanSummary {
+        if scan.complete.iter().all(|done| *done) {
+            *scan = CliRuntimeStaleTurnScan::default();
+        }
+        self.cli_supervision_quantum(now_unix_ms, scan).await
+    }
+
+    async fn cli_supervision_quantum(
         &self,
         now_unix_ms: i64,
         scan: &mut CliRuntimeStaleTurnScan,
@@ -7955,6 +8109,9 @@ impl MessageProcessor {
         let discovery = self.crud_store.with_maintenance_access();
         let mut summary = CliRuntimeStaleTurnScanSummary::default();
         for (slot, status) in [Starting, Running].into_iter().enumerate() {
+            if scan.complete[slot] {
+                continue;
+            }
             let bindings = match discovery
                 .list_active_cli_runtime_turn_binding_page(status, scan.after[slot].as_ref())
                 .await
@@ -7967,6 +8124,14 @@ impl MessageProcessor {
                         "failed to scan stale CLI runtime turn bindings"
                     );
                     failed = true;
+                    scan.complete[slot] = true;
+                    let delay = if is_anyhow_sqlite_transient_access(&error) {
+                        60
+                    } else {
+                        2
+                    };
+                    let at = tokio::time::Instant::now() + Duration::from_secs(delay);
+                    scan.retry = Some(scan.retry.map_or(at, |old| old.min(at)));
                     continue;
                 }
             };
@@ -7978,6 +8143,8 @@ impl MessageProcessor {
             // Advance on discovery, including healthy/error candidates and
             // cancellation during validation. A short/empty page wraps only on
             // the next quantum; never fetch a second page in this call.
+            scan.complete[slot] =
+                bindings.len() < pioneer_crud::CLI_RUNTIME_ACTIVE_TURN_BINDING_PAGE_MAX as usize;
             scan.after[slot] = if bindings.len()
                 == pioneer_crud::CLI_RUNTIME_ACTIVE_TURN_BINDING_PAGE_MAX as usize
             {
@@ -7992,7 +8159,20 @@ impl MessageProcessor {
                     .fail_stale_cli_runtime_turn_binding(binding, now_unix_ms)
                     .await
                 {
-                    Ok(()) => {
+                    Ok(wait) => {
+                        match wait {
+                            CliSupervisionWait::Until(at) => {
+                                scan.nearest_ms =
+                                    Some(scan.nearest_ms.map_or(at, |old| old.min(at)))
+                            }
+                            CliSupervisionWait::Dependency(gate) => {
+                                if !scan.gates.iter().any(|old| Arc::ptr_eq(old, &gate)) {
+                                    scan.gates.push(gate);
+                                }
+                            }
+                            CliSupervisionWait::Uncertain => failed = true,
+                            CliSupervisionWait::Settled => {}
+                        }
                         summary.processed += 1;
                         trace.record_items(
                             GatewayOperationItemKind::CliRuntimeStaleTurnProcessed,
@@ -8005,6 +8185,13 @@ impl MessageProcessor {
                             "failed to reconcile stale CLI runtime turn binding"
                         );
                         failed = true;
+                        let delay = if is_anyhow_sqlite_transient_access(&error) {
+                            60
+                        } else {
+                            2
+                        };
+                        let at = tokio::time::Instant::now() + Duration::from_secs(delay);
+                        scan.retry = Some(scan.retry.map_or(at, |old| old.min(at)));
                     }
                 }
             }
@@ -8019,6 +8206,11 @@ impl MessageProcessor {
         self.prune_stale_cli_runtime_pending_turn_server_requests(now_unix_ms)
             .await;
         if failed {
+            let at = tokio::time::Instant::now()
+                + Duration::from_secs(RESILIENCE_WORKER_POLL_INTERVAL_SECONDS);
+            if scan.retry.is_none() {
+                scan.retry = Some(at);
+            }
             trace.finish_failure();
         } else {
             trace.finish_success();
@@ -8295,23 +8487,23 @@ impl MessageProcessor {
         &self,
         binding: pioneer_crud::CliRuntimeTurnBindingRecord,
         now_unix_ms: i64,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<CliSupervisionWait> {
         let Some(expected) = self
             .crud_store
             .cli_runtime_turn_terminal_guard(&binding)
             .await?
         else {
-            return Ok(());
+            return Ok(CliSupervisionWait::Settled);
         };
         let Some((workspace_id, turn)) = self
             .crud_store
             .get_turn(binding.thread_id.as_str(), binding.turn_id.as_str())
             .await?
         else {
-            return Ok(());
+            return Ok(CliSupervisionWait::Settled);
         };
         if turn.status != expected.turn_status {
-            return Ok(());
+            return Ok(CliSupervisionWait::Settled);
         }
         if turn.status != TurnStatus::InProgress {
             let key = CLIAgentRuntimeSessionKey::new(
@@ -8328,11 +8520,11 @@ impl MessageProcessor {
                 .await;
             let transition = self.cli_runtime_session_transition_mutex(&key).await;
             let Ok(_transition) = transition.try_lock() else {
-                return Ok(());
+                return Ok(CliSupervisionWait::Dependency(transition.clone()));
             };
             self.cleanup_cli_runtime_terminal_turn_guard(&expected, "stale CLI runtime turn scan")
                 .await?;
-            return Ok(());
+            return Ok(CliSupervisionWait::Settled);
         }
 
         // Human-wait reconciliation can reach terminal cleanup too. Fence that
@@ -8343,8 +8535,8 @@ impl MessageProcessor {
             binding.continuation_thread_id.clone(),
         )?;
         let transition = self.cli_runtime_session_transition_mutex(&key).await;
-        let Ok(turn_transition) = transition.try_lock_owned() else {
-            return Ok(());
+        let Ok(turn_transition) = transition.clone().try_lock_owned() else {
+            return Ok(CliSupervisionWait::Dependency(transition));
         };
         let turn_transition = Arc::new(turn_transition);
         if self
@@ -8354,14 +8546,14 @@ impl MessageProcessor {
             .as_ref()
             != Some(&expected)
         {
-            return Ok(());
+            return Ok(CliSupervisionWait::Settled);
         }
 
         if self
             .replay_cli_runtime_terminal_event(&expected, &turn_transition)
             .await?
         {
-            return Ok(());
+            return Ok(CliSupervisionWait::Settled);
         }
 
         if self
@@ -8373,7 +8565,22 @@ impl MessageProcessor {
             )
             .await?
         {
-            return Ok(());
+            // Reconciliation may have expired the last request. In that case
+            // retain the existing short recovery turn before destructive work.
+            let (created, delivery) = self
+                .crud_store
+                .timeout_human_wait_deadlines(&binding.turn_id, NATIVE_HUMAN_INTERACTION_RUNTIME_ID)
+                .await?;
+            let deadline = created
+                .map(|at| {
+                    at.timestamp_millis()
+                        .saturating_add(CLI_RUNTIME_HUMAN_RESPONSE_TIMEOUT_MS)
+                })
+                .into_iter()
+                .chain(delivery.map(|at| at.timestamp_millis().saturating_add(30_000)))
+                .filter(|at| *at > now_unix_ms)
+                .min();
+            return Ok(deadline.map_or(CliSupervisionWait::Uncertain, CliSupervisionWait::Until));
         }
 
         let latest_native_event_ms = self
@@ -8396,7 +8603,9 @@ impl MessageProcessor {
             CLI_RUNTIME_SILENT_TURN_STALE_AFTER_MS
         };
         if now_unix_ms.saturating_sub(last_activity_ms) < stale_after_ms {
-            return Ok(());
+            return Ok(CliSupervisionWait::Until(
+                last_activity_ms.saturating_add(stale_after_ms),
+            ));
         }
 
         match self
@@ -8416,11 +8625,17 @@ impl MessageProcessor {
                         evidence.activity_kind(),
                     )
                     .await?;
-                return Ok(());
+                // Confirmed activity remains a real supervision obligation even
+                // when this turn has no command attempt whose heartbeat advances.
+                return Ok(CliSupervisionWait::Until(
+                    now_unix_ms.saturating_add(stale_after_ms),
+                ));
             }
             CLIRuntimeAuthoritativeTurnState::Terminal
-            | CLIRuntimeAuthoritativeTurnState::Superseded
-            | CLIRuntimeAuthoritativeTurnState::Deferred => return Ok(()),
+            | CLIRuntimeAuthoritativeTurnState::Superseded => {
+                return Ok(CliSupervisionWait::Settled);
+            }
+            CLIRuntimeAuthoritativeTurnState::Deferred => return Ok(CliSupervisionWait::Uncertain),
             CLIRuntimeAuthoritativeTurnState::Unavailable => {
                 let reason = format!(
                     "CLI runtime observation is unavailable for stale turn `{}`; authoritative state rehydration is required",
@@ -8434,7 +8649,7 @@ impl MessageProcessor {
                     None,
                 )
                 .await?;
-                return Ok(());
+                return Ok(CliSupervisionWait::Uncertain);
             }
         }
     }
@@ -9009,6 +9224,10 @@ impl MessageProcessor {
                 .cli_runtime_pending_turn_activity_sequence
                 .fetch_add(1, Ordering::Relaxed),
         });
+        drop(buffer);
+        self.crud_store
+            .background_work("cli.supervision")
+            .dependency_released();
     }
 
     async fn buffer_cli_runtime_codex_server_request_until_turn_binding(
@@ -9051,6 +9270,9 @@ impl MessageProcessor {
                 .fetch_add(1, Ordering::Relaxed),
         });
         drop(buffer);
+        self.crud_store
+            .background_work("cli.supervision")
+            .dependency_released();
         for request in evicted {
             self.fail_codex_machine_request(
                 &request.responder,
@@ -14289,34 +14511,6 @@ fn cli_runtime_event_log_label(event: &RuntimeEvent) -> String {
         RuntimeEvent::AppListUpdated(_) => "app_list_updated".to_owned(),
         RuntimeEvent::ReviewModeChanged(_) => "review_mode_changed".to_owned(),
         RuntimeEvent::Error(_) => "error".to_owned(),
-    }
-}
-
-fn cli_runtime_native_turn_id_for_event(event: &RuntimeEvent) -> Option<&str> {
-    match event {
-        RuntimeEvent::TurnStarted(event) => Some(event.native_turn_id.as_str()),
-        RuntimeEvent::ThreadGoalUpdated(event) => event.native_turn_id.as_deref(),
-        RuntimeEvent::TurnCompleted(event) => Some(event.native_turn_id.as_str()),
-        RuntimeEvent::TurnFailed(event) => event.native_turn_id.as_deref(),
-        RuntimeEvent::TurnInterrupted(event) => Some(event.native_turn_id.as_str()),
-        RuntimeEvent::TurnRetrying(event) => event.native_turn_id.as_deref(),
-        RuntimeEvent::ItemStarted(event) => Some(event.native_turn_id.as_str()),
-        RuntimeEvent::ItemDelta(event) => Some(event.native_turn_id.as_str()),
-        RuntimeEvent::ItemCompleted(event) => Some(event.native_turn_id.as_str()),
-        RuntimeEvent::ItemUpdated(event) => Some(event.native_turn_id.as_str()),
-        RuntimeEvent::PlanUpdated(event) => Some(event.native_turn_id.as_str()),
-        RuntimeEvent::DiffUpdated(event) => Some(event.native_turn_id.as_str()),
-        RuntimeEvent::ReviewModeChanged(event) => event.native_turn_id.as_deref(),
-        RuntimeEvent::Error(event) => event.native_turn_id.as_deref(),
-        RuntimeEvent::Raw(event) => event.native_turn_id.as_deref(),
-        RuntimeEvent::RequestOpened(event) => event.native_turn_id.as_deref(),
-        RuntimeEvent::SessionStateChanged(_)
-        | RuntimeEvent::ThreadNameUpdated(_)
-        | RuntimeEvent::ThreadStateChanged(_)
-        | RuntimeEvent::ThreadGoalCleared(_)
-        | RuntimeEvent::RequestResolved(_)
-        | RuntimeEvent::AccountUpdated(_)
-        | RuntimeEvent::AppListUpdated(_) => None,
     }
 }
 

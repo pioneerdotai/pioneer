@@ -512,6 +512,12 @@ pub struct SqliteDatabase {
 }
 
 impl SqliteDatabase {
+    /// Process-local state owned by the physical writer runtime, shared by all
+    /// scoped database handles and separately constructed domain stores.
+    pub fn shared_resource<T: Default + Send + Sync + 'static>(&self) -> Arc<T> {
+        self.writer.shared_resource::<T>()
+    }
+
     /// Stable across scheduling-class clones. Intended for process-local test
     /// instrumentation; it conveys no database authority or durable identity.
     #[doc(hidden)]
@@ -580,6 +586,34 @@ impl SqliteDatabase {
 
     pub const fn write_class(&self) -> SqliteWriteClass {
         self.write_class
+    }
+
+    /// Only the ambiguous-outcome path needs this fence. The one physical
+    /// writer connection processes its previously dispatched commit/rollback
+    /// commands before this control query; a reader snapshot cannot do that.
+    /// No transaction, reservation or stream survives this method's return.
+    pub async fn settle_background_change(
+        &self,
+        owner: &crate::background::Owner,
+    ) -> Result<bool, DbErr> {
+        if !owner.requires_settlement() {
+            return Ok(true);
+        }
+        if self.writer.max_connections() != 1 {
+            return Err(DbErr::Custom(
+                "ambiguous background settlement requires one writer connection".into(),
+            ));
+        }
+        let observation = owner.observe();
+        // Low-level connection-order barrier, not domain CRUD or an advisory
+        // query. It is deliberately absent from every healthy observation.
+        self.writer_connection()
+            .query_one_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT 1".to_owned(),
+            ))
+            .await?;
+        Ok(owner.settled(observation))
     }
 
     pub fn writer_max_connections(&self) -> u32 {

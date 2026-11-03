@@ -44,19 +44,31 @@ pub struct ArtifactService {
     pub(crate) blob_store: Arc<dyn ArtifactBlobStore>,
     quota_policy: ArtifactQuotaPolicy,
     gc_policy: ArtifactGcPolicy,
-    preview_activity: Arc<tokio::sync::RwLock<()>>,
-    preview_released: Arc<tokio::sync::Notify>,
+    preview_activity: Arc<HtmlPreviewActivity>,
 }
 
-/// Drop the actual activity fence before waking maintenance. No SQL in Drop.
+#[derive(Default)]
+struct HtmlPreviewActivity {
+    gate: Arc<tokio::sync::RwLock<()>>,
+    waiting: std::sync::atomic::AtomicBool,
+    released: tokio::sync::Notify,
+}
+/// Drop the actual activity fence before waking a refused cleanup. Ordinary
+/// activity completion does not reopen successful EOF; no SQL or DB handle.
 pub struct HtmlPreviewActivityGuard {
     guard: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
-    released: Arc<tokio::sync::Notify>,
+    activity: Arc<HtmlPreviewActivity>,
 }
 impl Drop for HtmlPreviewActivityGuard {
     fn drop(&mut self) {
         drop(self.guard.take());
-        self.released.notify_one();
+        if self
+            .activity
+            .waiting
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            self.activity.released.notify_one();
+        }
     }
 }
 
@@ -68,7 +80,7 @@ pub enum HtmlPreviewMaintenanceOutcome {
 }
 
 /// Cursors and EOF are one pass: a short traversal stays finished while the
-/// others catch up. The next quantum after idle starts a fresh bounded pass.
+/// others catch up. Owners explicitly reopen exhausted phases on discovery.
 #[derive(Default)]
 pub struct HtmlPreviewMaintenanceProgress {
     previews: pioneer_crud::HtmlPreviewRetentionProgress,
@@ -76,6 +88,39 @@ pub struct HtmlPreviewMaintenanceProgress {
     copies: String,
     finished: [bool; 3],
     io_seeded: bool,
+    blob_deadline_ms: Option<i64>,
+    // Failed side effects retain one finite lane rescan, after its healthy tail.
+    retry: [bool; 3],
+}
+
+impl HtmlPreviewMaintenanceProgress {
+    /// Reopen exhausted traversals after a relevant source change or dependency
+    /// release. In-progress cursors keep their bounded forward progress.
+    pub fn rediscover(&mut self) {
+        if self.finished[1] {
+            self.blob_deadline_ms = None;
+        }
+        self.finished = [false; 3];
+    }
+    pub fn next_deadline(&self) -> Option<i64> {
+        self.blob_deadline_ms
+    }
+    /// Only the timed grace lane reopens when its actual deadline arrives.
+    pub fn grace_elapsed(&mut self) {
+        if !self.finished[1] {
+            return;
+        }
+        self.finished[1] = false;
+        self.blobs.clear();
+        self.blob_deadline_ms = None;
+    }
+
+    /// Activity release can unblock retirement/copy cleanup. It does not
+    /// change the grace deadline of an exhausted physical blob traversal.
+    pub fn dependency_released(&mut self) {
+        self.finished[0] = false;
+        self.finished[2] = false;
+    }
 }
 
 /// Domain-owned bounded read used by the agent artifact tool.
@@ -221,13 +266,15 @@ struct ArtifactReadBlobDescriptor {
 
 impl ArtifactService {
     pub fn new(store: Arc<CrudStore>, blob_store: Arc<dyn ArtifactBlobStore>) -> Self {
+        let preview_activity = store
+            .database_connection()
+            .shared_resource::<HtmlPreviewActivity>();
         Self {
             store,
             blob_store,
             quota_policy: ArtifactQuotaPolicy::default(),
             gc_policy: ArtifactGcPolicy::default(),
-            preview_activity: Default::default(),
-            preview_released: Default::default(),
+            preview_activity,
         }
     }
 
@@ -236,13 +283,15 @@ impl ArtifactService {
         blob_store: Arc<dyn ArtifactBlobStore>,
         quota_policy: ArtifactQuotaPolicy,
     ) -> Self {
+        let preview_activity = store
+            .database_connection()
+            .shared_resource::<HtmlPreviewActivity>();
         Self {
             store,
             blob_store,
             quota_policy,
             gc_policy: ArtifactGcPolicy::default(),
-            preview_activity: Default::default(),
-            preview_released: Default::default(),
+            preview_activity,
         }
     }
 
@@ -252,32 +301,33 @@ impl ArtifactService {
         quota_policy: ArtifactQuotaPolicy,
         gc_policy: ArtifactGcPolicy,
     ) -> Self {
+        let preview_activity = store
+            .database_connection()
+            .shared_resource::<HtmlPreviewActivity>();
         Self {
             store,
             blob_store,
             quota_policy,
             gc_policy,
-            preview_activity: Default::default(),
-            preview_released: Default::default(),
+            preview_activity,
         }
     }
 
     /// In-process execution/delivery complements durable runtime/frozen owners.
     /// Shared by this service and its maintenance owner; never a DB permit.
-    pub async fn html_preview_activity(&self) -> tokio::sync::OwnedRwLockReadGuard<()> {
-        self.preview_activity.clone().read_owned().await
+    pub async fn html_preview_activity(&self) -> HtmlPreviewActivityGuard {
+        self.html_preview_activity_signaled().await
     }
 
     pub async fn html_preview_activity_signaled(&self) -> HtmlPreviewActivityGuard {
         HtmlPreviewActivityGuard {
-            guard: Some(self.preview_activity.clone().read_owned().await),
-            released: self.preview_released.clone(),
+            guard: Some(self.preview_activity.gate.clone().read_owned().await),
+            activity: self.preview_activity.clone(),
         }
     }
 
-    /// Retained local hint only; durable due discovery remains authoritative.
     pub async fn html_preview_release_notified(&self) {
-        self.preview_released.notified().await;
+        self.preview_activity.released.notified().await;
     }
 
     pub async fn ingest_bytes(
@@ -837,17 +887,49 @@ impl ArtifactService {
         &self,
         progress: &mut HtmlPreviewMaintenanceProgress,
     ) -> ArtifactResult<HtmlPreviewMaintenanceOutcome> {
-        let store = self.store.with_maintenance_access();
         if progress.finished.iter().all(|done| *done) {
-            progress.finished = [false; 3];
+            progress.rediscover();
+        }
+        self.continue_html_preview_maintenance(progress).await
+    }
+
+    /// Continue one explicitly admitted pass. IO queue wakes must not reopen
+    /// exhausted retention/GC traversals; source invalidation and concrete grace deadlines reopen them.
+    pub async fn continue_html_preview_maintenance(
+        &self,
+        progress: &mut HtmlPreviewMaintenanceProgress,
+    ) -> ArtifactResult<HtmlPreviewMaintenanceOutcome> {
+        let store = self.store.with_maintenance_access();
+        for lane in 0..3 {
+            if progress.finished[lane] && std::mem::take(&mut progress.retry[lane]) {
+                progress.finished[lane] = false;
+                match lane {
+                    1 => {
+                        progress.blobs.clear();
+                        progress.blob_deadline_ms = None;
+                    }
+                    2 => progress.copies.clear(),
+                    _ => {} // Preview EOF resets its own bounded cursors.
+                }
+            }
         }
         let mut deferred = false;
         let mut copies_deferred = false;
         let preview_result = if progress.finished[0] {
             Ok(false)
         } else {
-            match self.preview_activity.clone().try_write_owned() {
-                Ok(_activity) => progress.previews.quantum(&store).await,
+            // Register refusal before trying the gate: the last activity may
+            // release concurrently, but cannot leave cleanup asleep afterward.
+            self.preview_activity
+                .waiting
+                .store(true, std::sync::atomic::Ordering::Release);
+            match self.preview_activity.gate.clone().try_write_owned() {
+                Ok(_activity) => {
+                    self.preview_activity
+                        .waiting
+                        .store(false, std::sync::atomic::Ordering::Release);
+                    progress.previews.quantum(&store).await
+                }
                 Err(_) => {
                     deferred = true;
                     Ok(true)
@@ -856,19 +938,29 @@ impl ArtifactService {
         };
         if let Ok(more) = &preview_result {
             progress.finished[0] = !more;
+        } else {
+            progress.retry[0] = true;
         }
         let grace_ms =
             i64::try_from(self.gc_policy.grace_secs.saturating_mul(1000)).unwrap_or(i64::MAX);
-        let (next, candidates) = if progress.finished[1] {
-            (String::new(), Vec::new())
+        let (next, candidates, deadline) = if progress.finished[1] {
+            (String::new(), Vec::new(), None)
         } else {
             store
                 .html_preview_gc_blob_page(
                     &progress.blobs,
                     Utc::now().timestamp_millis().saturating_sub(grace_ms),
+                    grace_ms,
                 )
                 .await?
         };
+        if let Some(deadline) = deadline {
+            progress.blob_deadline_ms = Some(
+                progress
+                    .blob_deadline_ms
+                    .map_or(deadline, |old| old.min(deadline)),
+            );
+        }
         progress.finished[1] = next.is_empty();
         progress.blobs = next;
         let mut deletion_error = None;
@@ -893,10 +985,11 @@ impl ArtifactService {
             }
             .await;
             if let Err(error) = result {
+                progress.retry[1] = true;
                 deletion_error = Some(error);
             }
         }
-        if !progress.io_seeded {
+        if !progress.finished[2] && !progress.io_seeded {
             progress.io_seeded = store.html_preview_io_seed_complete().await?;
         }
         let (id, copy) = if progress.finished[2] || progress.io_seeded {
@@ -909,27 +1002,40 @@ impl ArtifactService {
         progress.finished[2] = id.is_empty();
         progress.copies = id.clone();
         if let Some((workspace, previous)) = copy {
-            match self
-                .prepare_html_preview_copy_cleanup(&workspace, &previous)
-                .await?
-            {
-                Some(prepared) => {
-                    store
-                        .finish_html_preview_copy_cleanup(&id, &previous, &prepared)
-                        .await?;
+            let result = async {
+                match self
+                    .prepare_html_preview_copy_cleanup(&workspace, &previous)
+                    .await?
+                {
+                    Some(prepared) => {
+                        store
+                            .finish_html_preview_copy_cleanup(&id, &previous, &prepared)
+                            .await?;
+                    }
+                    None => {
+                        copies_deferred = true;
+                        progress.copies.clear();
+                        progress.finished[2] = false;
+                    }
                 }
-                None => {
-                    copies_deferred = true;
-                    progress.copies.clear();
-                    progress.finished[2] = false;
-                }
+                Ok::<(), ArtifactError>(())
+            }
+            .await;
+            if let Err(error) = result {
+                progress.retry[2] = true;
+                deletion_error = Some(error);
             }
         }
         if let Some(error) = deletion_error {
             return Err(error);
         }
         preview_result?;
-        let runnable = (!progress.finished[0] && !deferred)
+        let runnable = progress
+            .retry
+            .iter()
+            .zip(progress.finished)
+            .any(|(retry, finished)| *retry && finished)
+            || (!progress.finished[0] && !deferred)
             || !progress.finished[1]
             || (!progress.finished[2] && !copies_deferred);
         Ok(if runnable {

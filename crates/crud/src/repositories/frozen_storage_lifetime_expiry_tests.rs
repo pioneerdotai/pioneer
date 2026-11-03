@@ -351,12 +351,8 @@ async fn positive_visit_keeps_cursor_accounting_and_periodic_revisit_after_root_
         .execute_unprepared("DELETE FROM turn_runtime_snapshot WHERE turn_id='turn'")
         .await
         .unwrap();
-    let now = Instant::now();
-    let interval = Duration::from_secs(60);
-    progress.revisit_completed_cleanup(now, interval);
-    progress.revisit_completed_cleanup(now + interval - Duration::from_secs(1), interval);
     assert!(progress.pass_done[2]);
-    progress.revisit_completed_cleanup(now + interval, interval);
+    progress.invalidate_completed_cleanup();
     assert!(!progress.pass_done[2]);
     progress.phase = 2;
     assert!(progress.quantum(&store).await.unwrap());

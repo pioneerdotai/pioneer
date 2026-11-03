@@ -14,6 +14,7 @@ pioneer-observability.workspace = true
 async-trait.workspace = true
 env_logger.workspace = true
 futures-util.workspace = true
+fs4.workspace = true
 lazy_static.workspace = true
 log.workspace = true
 lru_time_cache.workspace = true
@@ -32,3 +33,4 @@ zstd.workspace = true
 chrono.workspace = true
 names.workspace = true
 pretty_assertions.workspace = true
+tokio = { workspace = true, features = ["test-util"] }

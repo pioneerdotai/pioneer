@@ -98,6 +98,18 @@ pub async fn discover<C: ConnectionTrait>(
     consumer: &str,
     limit: u64,
 ) -> Result<Vec<(String, DateTimeWithTimeZone)>> {
+    discovery_query(consumer, limit)
+        .into_tuple::<(String, DateTimeWithTimeZone)>()
+        .all(db)
+        .await
+        .context("failed to discover eligible event work")
+}
+
+/// Shared advisory/claim discovery: retain causal head and projection guards.
+pub(crate) fn discovery_query(
+    consumer: &str,
+    limit: u64,
+) -> sea_orm::Select<turn_event_delivery::Entity> {
     turn_event_delivery::Entity::find()
         .select_only()
         .column(turn_event_delivery::Column::Id)
@@ -116,12 +128,9 @@ pub async fn discover<C: ConnectionTrait>(
         .order_by_asc(turn_event_delivery::Column::TurnId)
         .order_by_asc(turn_event_delivery::Column::Sequence)
         .limit(limit)
-        .into_tuple::<(String, DateTimeWithTimeZone)>()
-        .all(db)
-        .await
-        .context("failed to discover eligible event work")
 }
 
+#[cfg(test)]
 pub async fn claim_due<C: ConnectionTrait>(
     db: &C,
     consumer: &str,
@@ -234,6 +243,7 @@ fn projection_ready(consumer: &str) -> SimpleExpr {
     }
 }
 
+#[cfg(test)]
 pub async fn list_due<C: ConnectionTrait>(
     db: &C,
     consumer: &str,
@@ -301,7 +311,7 @@ pub async fn mark_delivered<C: ConnectionTrait>(
     id: &str,
     claim_token: &str,
     delivered_at: DateTimeWithTimeZone,
-) -> Result<bool> {
+) -> Result<Option<String>> {
     let affected = turn_event_delivery::Entity::update_many()
         .col_expr(
             turn_event_delivery::Column::Status,
@@ -330,11 +340,10 @@ pub async fn mark_delivered<C: ConnectionTrait>(
         .filter(turn_event_delivery::Column::Id.eq(id.to_owned()))
         .filter(turn_event_delivery::Column::Status.eq(DELIVERY_STATUS_DELIVERING))
         .filter(turn_event_delivery::Column::ClaimToken.eq(claim_token.to_owned()))
-        .exec(db)
+        .exec_with_returning(db)
         .await
-        .context("failed to mark turn event delivery delivered")?
-        .rows_affected;
-    Ok(affected == 1)
+        .context("failed to mark turn event delivery delivered")?;
+    Ok(affected.into_iter().next().map(|row| row.consumer))
 }
 
 pub async fn mark_failed<C: ConnectionTrait>(
@@ -345,7 +354,7 @@ pub async fn mark_failed<C: ConnectionTrait>(
     retry_at: DateTimeWithTimeZone,
     failed_at: DateTimeWithTimeZone,
     exhausted: bool,
-) -> Result<bool> {
+) -> Result<Option<String>> {
     let status = if exhausted {
         DELIVERY_STATUS_EXHAUSTED
     } else {
@@ -383,11 +392,10 @@ pub async fn mark_failed<C: ConnectionTrait>(
         .filter(turn_event_delivery::Column::Id.eq(id.to_owned()))
         .filter(turn_event_delivery::Column::Status.eq(DELIVERY_STATUS_DELIVERING))
         .filter(turn_event_delivery::Column::ClaimToken.eq(claim_token.to_owned()))
-        .exec(db)
+        .exec_with_returning(db)
         .await
-        .context("failed to mark turn event delivery failed")?
-        .rows_affected;
-    Ok(affected == 1)
+        .context("failed to mark turn event delivery failed")?;
+    Ok(affected.into_iter().next().map(|row| row.consumer))
 }
 
 async fn insert_pending<C: ConnectionTrait>(

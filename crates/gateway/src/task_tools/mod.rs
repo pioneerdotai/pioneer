@@ -121,6 +121,40 @@ pub(crate) struct GatewayTaskToolProvider {
 }
 
 impl GatewayTaskToolProvider {
+    async fn cleanup_attached_tasks_with_processor(
+        &self,
+        processor: Arc<MessageProcessor>,
+        context: TaskTurnContext,
+        reason: String,
+    ) -> Result<(), String> {
+        let tasks = attached_tasks_for_turn(&processor, &context)
+            .await
+            .map_err(|error| format!("{error:#}"))?;
+        for task in tasks {
+            if task.status.is_terminal() {
+                continue;
+            }
+            let service = if processor.crud_store.database_connection().read_class()
+                == pioneer_sqlite::SqliteReadClass::Maintenance
+            {
+                processor.task_runtime.background_control_service()
+            } else {
+                processor.task_runtime.service()
+            };
+            service
+                .cancel_task(
+                    pioneer_tasks::TaskMutationContext::default(),
+                    TaskCancelParams {
+                        task_id: task.id,
+                        reason: Some(reason.clone()),
+                        scope: pioneer_protocol::TaskCancelScope::AttachedSubtree,
+                    },
+                )
+                .await
+                .map_err(|error| format!("{error:#}"))?;
+        }
+        Ok(())
+    }
     pub(crate) fn new(processor: Weak<MessageProcessor>) -> Self {
         Self {
             processor,
@@ -686,29 +720,8 @@ impl TaskToolProvider for GatewayTaskToolProvider {
         context: TaskTurnContext,
         reason: String,
     ) -> Result<(), String> {
-        let processor = self.processor()?;
-        let tasks = attached_tasks_for_turn(&processor, &context)
+        self.cleanup_attached_tasks_with_processor(self.processor()?, context, reason)
             .await
-            .map_err(|error| format!("{error:#}"))?;
-        for task in tasks {
-            if task.status.is_terminal() {
-                continue;
-            }
-            processor
-                .task_runtime
-                .service()
-                .cancel_task(
-                    pioneer_tasks::TaskMutationContext::default(),
-                    TaskCancelParams {
-                        task_id: task.id,
-                        reason: Some(reason.clone()),
-                        scope: pioneer_protocol::TaskCancelScope::AttachedSubtree,
-                    },
-                )
-                .await
-                .map_err(|error| format!("{error:#}"))?;
-        }
-        Ok(())
     }
 
     async fn cleanup_attached_tasks_idempotent(
@@ -721,7 +734,12 @@ impl TaskToolProvider for GatewayTaskToolProvider {
         // attempt. Terminal children are skipped and cancel_task itself owns
         // the task revision fence, so replay after an unknown outbox ACK is a
         // logical no-op rather than a second cancellation transition.
-        self.cleanup_attached_tasks(context, reason).await
+        self.cleanup_attached_tasks_with_processor(
+            self.processor()?.for_background_reconciliation(),
+            context,
+            reason,
+        )
+        .await
     }
 }
 

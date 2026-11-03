@@ -211,6 +211,27 @@ pub async fn list_active_workspace_page<C: ConnectionTrait>(
         .context("failed to page active workspaces")
 }
 
+/// Cleanup only needs stable identity; unrelated Workspace timestamps are not
+/// inputs to filesystem retention and must not be hydrated here.
+pub async fn list_active_workspace_id_page<C: ConnectionTrait>(
+    db: &C,
+    after: Option<&str>,
+) -> Result<Vec<String>> {
+    let mut query = workspace::Entity::find().filter(workspace::Column::IsActive.eq(true));
+    if let Some(after) = after {
+        query = query.filter(workspace::Column::Id.gt(after.to_owned()));
+    }
+    query
+        .select_only()
+        .column(workspace::Column::Id)
+        .order_by_asc(workspace::Column::Id)
+        .limit(64)
+        .into_tuple::<String>()
+        .all(db)
+        .await
+        .context("failed to page active workspace IDs")
+}
+
 /// Returns only active workspaces granted to the exact ordinary principal.
 ///
 /// The membership predicate is part of the SQL query so callers never load an

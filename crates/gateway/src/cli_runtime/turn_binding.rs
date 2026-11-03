@@ -600,3 +600,34 @@ mod tests {
         );
     }
 }
+
+pub(crate) fn cli_runtime_native_turn_id_for_event(
+    event: &pioneer_cli_agent_runtime::event::RuntimeEvent,
+) -> Option<&str> {
+    use pioneer_cli_agent_runtime::event::RuntimeEvent;
+    match event {
+        RuntimeEvent::TurnStarted(event) => Some(event.native_turn_id.as_str()),
+        RuntimeEvent::ThreadGoalUpdated(event) => event.native_turn_id.as_deref(),
+        RuntimeEvent::TurnCompleted(event) => Some(event.native_turn_id.as_str()),
+        RuntimeEvent::TurnFailed(event) => event.native_turn_id.as_deref(),
+        RuntimeEvent::TurnInterrupted(event) => Some(event.native_turn_id.as_str()),
+        RuntimeEvent::TurnRetrying(event) => event.native_turn_id.as_deref(),
+        RuntimeEvent::ItemStarted(event) => Some(event.native_turn_id.as_str()),
+        RuntimeEvent::ItemDelta(event) => Some(event.native_turn_id.as_str()),
+        RuntimeEvent::ItemCompleted(event) => Some(event.native_turn_id.as_str()),
+        RuntimeEvent::ItemUpdated(event) => Some(event.native_turn_id.as_str()),
+        RuntimeEvent::PlanUpdated(event) => Some(event.native_turn_id.as_str()),
+        RuntimeEvent::DiffUpdated(event) => Some(event.native_turn_id.as_str()),
+        RuntimeEvent::ReviewModeChanged(event) => event.native_turn_id.as_deref(),
+        RuntimeEvent::Error(event) => event.native_turn_id.as_deref(),
+        RuntimeEvent::Raw(event) => event.native_turn_id.as_deref(),
+        RuntimeEvent::RequestOpened(event) => event.native_turn_id.as_deref(),
+        RuntimeEvent::SessionStateChanged(_)
+        | RuntimeEvent::ThreadNameUpdated(_)
+        | RuntimeEvent::ThreadStateChanged(_)
+        | RuntimeEvent::ThreadGoalCleared(_)
+        | RuntimeEvent::RequestResolved(_)
+        | RuntimeEvent::AccountUpdated(_)
+        | RuntimeEvent::AppListUpdated(_) => None,
+    }
+}

@@ -79,6 +79,16 @@ pub(crate) async fn has_pending<C: ConnectionTrait>(db: &C) -> Result<bool> {
         .await?
         .is_some())
 }
+pub(crate) async fn next_deadline<C: ConnectionTrait>(db: &C) -> Result<Option<i64>> {
+    Ok(pending::Entity::find()
+        .select_only()
+        .column(pending::Column::DueAt)
+        .order_by_asc(pending::Column::DueAt)
+        .limit(1)
+        .into_tuple::<i64>()
+        .one(db)
+        .await?)
+}
 /// Reserve before preparation. Failed reservation defers only the complete old
 /// snapshot; ambiguous commit never permits emission or another claim.
 pub(crate) async fn claim(

@@ -3150,14 +3150,28 @@ pub(crate) async fn process_due_agent_action_outbox(
         .crud_store
         .with_maintenance_access()
         .database_connection();
+    let control_change = processor
+        .crud_store
+        .background_work("recovery.control")
+        .changing();
+    let ledger_change = processor
+        .crud_store
+        .background_work("recovery.ledger")
+        .changing();
     let batch = pioneer_crud::claim_agent_action_outbox(&database, limit).await?;
-    Ok(
-        process_claimed_agent_action_outbox(&database, batch, |row| {
-            let processor = processor.clone();
-            async move { dispatch_agent_action_outbox_row(&processor, &row).await }
-        })
-        .await,
-    )
+    let changed = !batch.rows.is_empty();
+    let output = process_claimed_agent_action_outbox(&database, batch, |row| {
+        let processor = processor.clone();
+        async move { dispatch_agent_action_outbox_row(&processor, &row).await }
+    })
+    .await;
+    if output.errors.is_empty() {
+        control_change.finish(changed);
+        ledger_change.finish(changed);
+    }
+    // An ACK/deferral may have committed before an error. Unknown settlement
+    // stays with the addressed owners; a writer release alone is never success.
+    Ok(output)
 }
 
 #[derive(Debug, Default)]
@@ -6310,6 +6324,10 @@ impl AgentActionToolHandler {
     }
 
     async fn mark_outbox_delivered(processor: &MessageProcessor, outbox_id: &str) {
+        let changes: Vec<_> = ["recovery.control", "recovery.ledger"]
+            .into_iter()
+            .map(|owner| processor.crud_store.background_work(owner).changing())
+            .collect();
         match pioneer_crud::mark_agent_action_outbox_delivered(
             &processor.crud_store.database_connection(),
             outbox_id,
@@ -6318,9 +6336,13 @@ impl AgentActionToolHandler {
         )
         .await
         {
-            Ok(true) => {}
-            Ok(false) => {
-                tracing::warn!(outbox_id, "agent action outbox changed before finalization")
+            Ok(changed) => {
+                for change in changes {
+                    change.finish(changed);
+                }
+                if !changed {
+                    tracing::warn!(outbox_id, "agent action outbox changed before finalization");
+                }
             }
             Err(_error) => tracing::warn!(
                 outbox_id,

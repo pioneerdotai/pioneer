@@ -2288,6 +2288,21 @@ pub async fn expire_pending_request<C: ConnectionTrait>(
     .await
 }
 
+pub(crate) fn registers_native_cleanup(event: &NewCliRuntimeNativeEvent) -> bool {
+    event.turn_id.is_some()
+        && event.payload_redacted_json.len() <= 256 * 1024
+        && matches!(
+            event.native_method.as_str(),
+            "item/started"
+                | "item/completed"
+                | "item/agentMessage/delta"
+                | "item/commandExecution/outputDelta"
+                | "turn/diff/updated"
+                | "thread/tokenUsage/updated"
+                | "account/rateLimits/updated"
+        )
+}
+
 pub async fn append_native_event<C: ConnectionTrait>(
     db: &C,
     event: NewCliRuntimeNativeEvent,
@@ -2309,16 +2324,26 @@ pub async fn append_native_event_if_absent<C: ConnectionTrait>(
     db: &C,
     event: NewCliRuntimeNativeEvent,
 ) -> Result<CliRuntimeNativeEventRecord> {
+    Ok(append_native_event_if_absent_outcome(db, event).await?.0)
+}
+
+// The committed outcome belongs to the ingestion boundary; replaying a saved
+// business record is not a new cleanup obligation.
+pub(crate) async fn append_native_event_if_absent_outcome<C: ConnectionTrait>(
+    db: &C,
+    event: NewCliRuntimeNativeEvent,
+) -> Result<(CliRuntimeNativeEventRecord, bool)> {
     let id = event.id.clone();
-    cli_runtime_native_event::Entity::insert(active_native_event_from_new(event.clone()))
-        .on_conflict(
-            OnConflict::column(cli_runtime_native_event::Column::Id)
-                .do_nothing()
-                .to_owned(),
-        )
-        .exec_without_returning(db)
-        .await
-        .context("failed to persist idempotent CLI runtime native event")?;
+    let inserted =
+        cli_runtime_native_event::Entity::insert(active_native_event_from_new(event.clone()))
+            .on_conflict(
+                OnConflict::column(cli_runtime_native_event::Column::Id)
+                    .do_nothing()
+                    .to_owned(),
+            )
+            .exec_without_returning(db)
+            .await
+            .context("failed to persist idempotent CLI runtime native event")?;
     let existing = find_native_event(db, id.as_str())
         .await?
         .context("idempotent CLI runtime native event disappeared")?;
@@ -2334,7 +2359,7 @@ pub async fn append_native_event_if_absent<C: ConnectionTrait>(
             && existing.payload_redacted_json == event.payload_redacted_json,
         "idempotent CLI runtime native event conflicts with existing identity"
     );
-    Ok(existing)
+    Ok((existing, inserted > 0))
 }
 
 pub async fn find_native_event<C: ConnectionTrait>(
@@ -3278,4 +3303,112 @@ mod tests {
             CLI_RUNTIME_PENDING_REQUEST_PAGE_MAX
         );
     }
+}
+
+/// Metadata-only current-owner fence for a CLI command heartbeat. The caller
+/// holds the short writer transaction through the heartbeat; no runtime work
+/// or payload preparation happens inside this fence.
+pub(crate) async fn command_heartbeat_owner_is_current<C: ConnectionTrait>(
+    db: &C,
+    expected: &CliRuntimeNativeTurnOwner,
+) -> Result<bool> {
+    use pioneer_entity::{
+        turn, turn_cli_runtime_attempt as attempt, turn_cli_runtime_binding as binding,
+        turn_cli_runtime_execution_segment as segment,
+    };
+    let b = &expected.binding;
+    if binding::Entity::find_by_id(&b.turn_id)
+        .select_only()
+        .column(binding::Column::TurnId)
+        .filter(binding::Column::ThreadId.eq(&b.thread_id))
+        .filter(binding::Column::WorkspaceId.eq(&b.workspace_id))
+        .filter(binding::Column::ContinuationThreadId.eq(&b.continuation_thread_id))
+        .filter(binding::Column::RuntimeKind.eq(&b.runtime_kind))
+        .filter(binding::Column::RuntimeId.eq(&b.runtime_id))
+        .filter(binding::Column::NativeThreadId.eq(&b.native_thread_id))
+        .filter(match b.native_turn_id.as_deref() {
+            Some(id) => Condition::all().add(binding::Column::NativeTurnId.eq(id)),
+            None => Condition::all().add(binding::Column::NativeTurnId.is_null()),
+        })
+        .filter(binding::Column::Status.is_in(["starting", "running"]))
+        .into_tuple::<String>()
+        .one(db)
+        .await?
+        .is_none()
+    {
+        return Ok(false);
+    }
+    if turn::Entity::find_by_id(&b.turn_id)
+        .select_only()
+        .column(turn::Column::Id)
+        .filter(turn::Column::ThreadId.eq(&b.thread_id))
+        .filter(turn::Column::Status.eq("in_progress"))
+        .into_tuple::<String>()
+        .one(db)
+        .await?
+        .is_none()
+        || super::native_cancellation_context::has_accepted(db, &b.turn_id).await?
+    {
+        return Ok(false);
+    }
+    let latest = attempt::Entity::find()
+        .select_only()
+        .column(attempt::Column::Id)
+        .filter(attempt::Column::TurnId.eq(&b.turn_id))
+        .order_by_desc(attempt::Column::AttemptIndex)
+        .into_tuple::<String>()
+        .one(db)
+        .await?;
+    if latest.as_deref() != Some(expected.attempt.id.as_str()) {
+        return Ok(false);
+    }
+    let a = &expected.attempt;
+    if attempt::Entity::find_by_id(&a.id)
+        .select_only()
+        .column(attempt::Column::Id)
+        .filter(attempt::Column::TurnId.eq(&b.turn_id))
+        .filter(attempt::Column::RuntimeId.eq(&b.runtime_id))
+        .filter(attempt::Column::NativeThreadId.eq(&b.native_thread_id))
+        .filter(attempt::Column::Status.is_in(["starting", "running"]))
+        .filter(match a.native_turn_id.as_deref() {
+            Some(id) => Condition::all().add(attempt::Column::NativeTurnId.eq(id)),
+            None => Condition::all().add(attempt::Column::NativeTurnId.is_null()),
+        })
+        .into_tuple::<String>()
+        .one(db)
+        .await?
+        .is_none()
+    {
+        return Ok(false);
+    }
+    let latest = segment::Entity::find()
+        .select_only()
+        .column(segment::Column::Id)
+        .filter(segment::Column::AttemptId.eq(&a.id))
+        .order_by_desc(segment::Column::SegmentIndex)
+        .into_tuple::<String>()
+        .one(db)
+        .await?;
+    if latest.as_deref() != expected.segment.as_ref().map(|segment| segment.id.as_str()) {
+        return Ok(false);
+    }
+    if let Some(s) = expected.segment.as_ref() {
+        if segment::Entity::find_by_id(&s.id)
+            .select_only()
+            .column(segment::Column::Id)
+            .filter(segment::Column::AttemptId.eq(&a.id))
+            .filter(segment::Column::TurnId.eq(&b.turn_id))
+            .filter(segment::Column::RuntimeId.eq(&b.runtime_id))
+            .filter(segment::Column::NativeThreadId.eq(&b.native_thread_id))
+            .filter(segment::Column::NativeTurnId.eq(&s.native_turn_id))
+            .filter(segment::Column::Status.eq("running"))
+            .into_tuple::<String>()
+            .one(db)
+            .await?
+            .is_none()
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }

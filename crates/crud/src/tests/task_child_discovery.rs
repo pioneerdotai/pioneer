@@ -481,7 +481,23 @@ async fn queued_cleanup_revalidates_late_lineage_receipt_and_capsule_without_sel
         .all(&store.connection)
         .await
         .unwrap();
+    let dependents = [
+        "storage.frozen",
+        "storage.html.history",
+        "storage.html.retention",
+    ]
+    .map(|name| store.background_work(name).acquire().unwrap());
+    let observations = dependents.each_ref().map(|owner| owner.observe());
+    for (owner, observed) in dependents.iter().zip(observations) {
+        assert!(owner.publish(observed, pioneer_sqlite::background::Plan::Dormant));
+    }
     assert!(store.cleanup_claimed_child_capsule(&claim).await.unwrap());
+    for (owner, observed) in dependents.iter().zip(observations) {
+        assert!(
+            !owner.publish(observed, pioneer_sqlite::background::Plan::Dormant),
+            "committed capsule/root removal must invalidate its completed storage dependencies"
+        );
+    }
     assert!(
         store
             .list_turn_llm_context("gated_child")

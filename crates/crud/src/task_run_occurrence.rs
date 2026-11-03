@@ -107,34 +107,47 @@ impl CrudStore {
         candidate: &TaskRunOccurrenceReconcileCandidate,
         clock: &TaskRunOccurrenceClock<'_>,
     ) -> Result<Option<TaskRunOccurrenceReconcileClaim>> {
-        // Token generation precedes both the reader and the writer acquisition.
-        let token = generate_id(DB_ID_LEN);
-        let maintenance = self.with_maintenance_access();
-        // No operation-wide retry: an ambiguous commit must never cause a
-        // second reservation. The persisted due time handles later passes.
-        match queue::claim(&maintenance.connection, candidate, token, clock).await {
-            Ok(claim) => Ok(claim),
-            Err(failure) => {
-                let (deferral, deferral_error) = match failure.snapshot.as_ref() {
-                    Some(snapshot) => {
-                        match queue::defer_failed_claim(&maintenance.connection, snapshot, clock)
-                            .await
-                        {
-                            Ok(outcome) => (outcome, None),
-                            Err(error) => (TaskRunOccurrenceClaimDeferral::Failed, Some(error)),
+        self.background_change(
+            "tasks.lifecycle",
+            async {
+                // Token generation precedes both the reader and the writer acquisition.
+                let token = generate_id(DB_ID_LEN);
+                let maintenance = self.with_maintenance_access();
+                // No operation-wide retry: an ambiguous commit must never cause a
+                // second reservation. The persisted due time handles later passes.
+                match queue::claim(&maintenance.connection, candidate, token, clock).await {
+                    Ok(claim) => Ok(claim),
+                    Err(failure) => {
+                        let (deferral, deferral_error) = match failure.snapshot.as_ref() {
+                            Some(snapshot) => {
+                                match queue::defer_failed_claim(
+                                    &maintenance.connection,
+                                    snapshot,
+                                    clock,
+                                )
+                                .await
+                                {
+                                    Ok(outcome) => (outcome, None),
+                                    Err(error) => {
+                                        (TaskRunOccurrenceClaimDeferral::Failed, Some(error))
+                                    }
+                                }
+                            }
+                            None => (TaskRunOccurrenceClaimDeferral::NoSnapshot, None),
+                        };
+                        Err(TaskRunOccurrenceClaimFailure {
+                            phase: failure.phase,
+                            deferral,
+                            error: failure.error,
+                            deferral_error,
                         }
+                        .into())
                     }
-                    None => (TaskRunOccurrenceClaimDeferral::NoSnapshot, None),
-                };
-                Err(TaskRunOccurrenceClaimFailure {
-                    phase: failure.phase,
-                    deferral,
-                    error: failure.error,
-                    deferral_error,
                 }
-                .into())
-            }
-        }
+            },
+            |value| value.is_some(),
+        )
+        .await
     }
 
     /// A bounded service-table observation, including rows still in backoff.
@@ -149,73 +162,83 @@ impl CrudStore {
         claim: &TaskRunOccurrenceReconcileClaim,
         now: i64,
     ) -> Result<TaskRunOccurrenceTerminalizationOutcome> {
-        let repair = self.with_maintenance_reads_and_critical_writes();
-        if !queue::owns(&repair.connection, claim)
-            .await
-            .context(TaskRunOccurrenceRepairPhase::Ownership)?
-        {
-            return Ok(TaskRunOccurrenceTerminalizationOutcome::StaleClaim);
-        }
-        let prepared = match repair
-            .prepare_task_run_occurrence(claim.run_id.clone(), now, true)
-            .await
-        {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                // A concurrent source write may invalidate the claim even
-                // before decoding finishes. Supersession is a normal outcome,
-                // including when the new state is deliberately not repairable.
+        self.background_change(
+            "tasks.lifecycle",
+            async {
+                let repair = self.with_maintenance_reads_and_critical_writes();
                 if !queue::owns(&repair.connection, claim)
                     .await
                     .context(TaskRunOccurrenceRepairPhase::Ownership)?
                 {
                     return Ok(TaskRunOccurrenceTerminalizationOutcome::StaleClaim);
                 }
-                return Err(error.context(TaskRunOccurrenceRepairPhase::Preparation));
-            }
-        };
-        let outcome = match prepared {
-            Preparation::Ready(prepared) => {
-                // Retry only this single repair with the same preparation/token.
-                repair
-                    .run_serialized_write(|| {
-                        repair.commit_task_run_occurrence(*prepared.clone(), Some(claim.clone()))
-                    })
+                let prepared = match repair
+                    .prepare_task_run_occurrence(claim.run_id.clone(), now, true)
                     .await
-                    .context(TaskRunOccurrenceRepairPhase::Commit)?
-            }
-            Preparation::Unchanged(outcome) => outcome,
-        };
-        if matches!(
-            outcome,
-            TaskRunOccurrenceTerminalizationOutcome::Changed
-                | TaskRunOccurrenceTerminalizationOutcome::StaleClaim
-        ) {
-            return Ok(outcome);
-        }
-        // A no-op has no domain write-set; conditional cleanup is Maintenance.
-        let maintenance = self.with_maintenance_access();
-        let tx = maintenance
-            .connection
-            .begin()
-            .await
-            .context(TaskRunOccurrenceRepairPhase::QueueCleanup)?;
-        let current = queue::owns(&tx, claim)
-            .await
-            .context(TaskRunOccurrenceRepairPhase::QueueCleanup)?;
-        if current {
-            queue::remove_if_consistent(&tx, claim)
-                .await
-                .context(TaskRunOccurrenceRepairPhase::QueueCleanup)?;
-        }
-        tx.commit()
-            .await
-            .context(TaskRunOccurrenceRepairPhase::QueueCleanup)?;
-        Ok(if current {
-            outcome
-        } else {
-            TaskRunOccurrenceTerminalizationOutcome::StaleClaim
-        })
+                {
+                    Ok(prepared) => prepared,
+                    Err(error) => {
+                        // A concurrent source write may invalidate the claim even
+                        // before decoding finishes. Supersession is a normal outcome,
+                        // including when the new state is deliberately not repairable.
+                        if !queue::owns(&repair.connection, claim)
+                            .await
+                            .context(TaskRunOccurrenceRepairPhase::Ownership)?
+                        {
+                            return Ok(TaskRunOccurrenceTerminalizationOutcome::StaleClaim);
+                        }
+                        return Err(error.context(TaskRunOccurrenceRepairPhase::Preparation));
+                    }
+                };
+                let outcome = match prepared {
+                    Preparation::Ready(prepared) => {
+                        // Retry only this single repair with the same preparation/token.
+                        repair
+                            .run_serialized_write(|| {
+                                repair.commit_task_run_occurrence(
+                                    *prepared.clone(),
+                                    Some(claim.clone()),
+                                )
+                            })
+                            .await
+                            .context(TaskRunOccurrenceRepairPhase::Commit)?
+                    }
+                    Preparation::Unchanged(outcome) => outcome,
+                };
+                if matches!(
+                    outcome,
+                    TaskRunOccurrenceTerminalizationOutcome::Changed
+                        | TaskRunOccurrenceTerminalizationOutcome::StaleClaim
+                ) {
+                    return Ok(outcome);
+                }
+                // A no-op has no domain write-set; conditional cleanup is Maintenance.
+                let maintenance = self.with_maintenance_access();
+                let tx = maintenance
+                    .connection
+                    .begin()
+                    .await
+                    .context(TaskRunOccurrenceRepairPhase::QueueCleanup)?;
+                let current = queue::owns(&tx, claim)
+                    .await
+                    .context(TaskRunOccurrenceRepairPhase::QueueCleanup)?;
+                if current {
+                    queue::remove_if_consistent(&tx, claim)
+                        .await
+                        .context(TaskRunOccurrenceRepairPhase::QueueCleanup)?;
+                }
+                tx.commit()
+                    .await
+                    .context(TaskRunOccurrenceRepairPhase::QueueCleanup)?;
+                Ok(if current {
+                    outcome
+                } else {
+                    TaskRunOccurrenceTerminalizationOutcome::StaleClaim
+                })
+            },
+            |outcome| matches!(outcome, TaskRunOccurrenceTerminalizationOutcome::Changed),
+        )
+        .await
     }
 
     /// Task-event fanout and background repair use the same preparation/commit.
@@ -224,17 +247,28 @@ impl CrudStore {
         run_id: &str,
         fallback_completed_at: i64,
     ) -> Result<TaskRunOccurrenceTerminalizationOutcome> {
-        self.run_serialized_write(|| async {
-            match self
-                .prepare_task_run_occurrence(run_id.to_owned(), fallback_completed_at, false)
-                .await?
-            {
-                Preparation::Unchanged(outcome) => Ok(outcome),
-                Preparation::Ready(prepared) => {
-                    self.commit_task_run_occurrence(*prepared, None).await
-                }
-            }
-        })
+        self.background_change(
+            "tasks.lifecycle",
+            async {
+                self.run_serialized_write(|| async {
+                    match self
+                        .prepare_task_run_occurrence(
+                            run_id.to_owned(),
+                            fallback_completed_at,
+                            false,
+                        )
+                        .await?
+                    {
+                        Preparation::Unchanged(outcome) => Ok(outcome),
+                        Preparation::Ready(prepared) => {
+                            self.commit_task_run_occurrence(*prepared, None).await
+                        }
+                    }
+                })
+                .await
+            },
+            |outcome| matches!(outcome, TaskRunOccurrenceTerminalizationOutcome::Changed),
+        )
         .await
     }
 
@@ -384,108 +418,122 @@ impl CrudStore {
         prepared: PreparedOccurrence,
         claim: Option<TaskRunOccurrenceReconcileClaim>,
     ) -> Result<TaskRunOccurrenceTerminalizationOutcome> {
-        let PreparedOccurrence {
-            run_id,
-            prepared_run_model,
-            prepared_turn_model,
-            prepared_thread_model,
-            desired_status,
-            terminal_event,
-            created_at,
-            claim_expires_at,
-        } = prepared;
-        let transaction = self
-            .connection
-            .begin()
-            .await
-            .context("failed to begin TaskRun occurrence terminalization transaction")?;
+        self.background_changes(
+            &[
+                "recovery.effects",
+                "recovery.effects.retry",
+                "recovery.effects.retention",
+            ],
+            async {
+                let PreparedOccurrence {
+                    run_id,
+                    prepared_run_model,
+                    prepared_turn_model,
+                    prepared_thread_model,
+                    desired_status,
+                    terminal_event,
+                    created_at,
+                    claim_expires_at,
+                } = prepared;
+                let transaction =
+                    self.connection.begin().await.context(
+                        "failed to begin TaskRun occurrence terminalization transaction",
+                    )?;
 
-        let result = async {
-            if let Some(claim) = claim.as_ref()
-                && !queue::owns(&transaction, claim).await?
-            {
-                return Ok(TaskRunOccurrenceTerminalizationOutcome::StaleClaim);
-            }
-            let Some(run_model) = task_run::find_run_by_id(&transaction, run_id.as_str()).await?
-            else {
-                return Ok(TaskRunOccurrenceTerminalizationOutcome::NotFound);
-            };
-            // Complete set of Run facts used by this preparation: identity,
-            // terminal mapping, timestamp and serialized error. Heartbeat and
-            // updated_at do not fence these facts and need not invalidate them.
-            if run_model.id != prepared_run_model.id
-                || run_model.status != prepared_run_model.status
-                || run_model.completed_at != prepared_run_model.completed_at
-                || run_model.error_json != prepared_run_model.error_json
-            {
-                return Ok(TaskRunOccurrenceTerminalizationOutcome::StaleClaim);
-            }
+                let result = async {
+                    if let Some(claim) = claim.as_ref()
+                        && !queue::owns(&transaction, claim).await?
+                    {
+                        return Ok(TaskRunOccurrenceTerminalizationOutcome::StaleClaim);
+                    }
+                    let Some(run_model) =
+                        task_run::find_run_by_id(&transaction, run_id.as_str()).await?
+                    else {
+                        return Ok(TaskRunOccurrenceTerminalizationOutcome::NotFound);
+                    };
+                    // Complete set of Run facts used by this preparation: identity,
+                    // terminal mapping, timestamp and serialized error. Heartbeat and
+                    // updated_at do not fence these facts and need not invalidate them.
+                    if run_model.id != prepared_run_model.id
+                        || run_model.status != prepared_run_model.status
+                        || run_model.completed_at != prepared_run_model.completed_at
+                        || run_model.error_json != prepared_run_model.error_json
+                    {
+                        return Ok(TaskRunOccurrenceTerminalizationOutcome::StaleClaim);
+                    }
 
-            // The occurrence identity is canonical and does not depend on
-            // optional/legacy lineage rows: Turn.id is exactly TaskRun.id.
-            let Some(turn_model) = turn::find_turn_by_id(&transaction, run_id.as_str()).await?
-            else {
-                return Ok(TaskRunOccurrenceTerminalizationOutcome::NotFound);
-            };
-            if turn_kind_from_db(turn_model.turn_kind.as_str()) != Some(TurnKind::TaskRun) {
-                return Ok(TaskRunOccurrenceTerminalizationOutcome::InvalidBinding);
-            }
-            let current_status = turn_status_from_db(turn_model.status.as_str())
-                .with_context(|| format!("occurrence Turn `{run_id}` has an unknown status"))?;
-            if current_status == desired_status {
-                return Ok(TaskRunOccurrenceTerminalizationOutcome::AlreadyConsistent);
-            }
-            // The event contains the decoded Turn; compare the entire source
-            // model, including all serialized prompt/collaboration/security
-            // fields, without repeating deserialization under the writer.
-            if turn_model != prepared_turn_model {
-                return Ok(TaskRunOccurrenceTerminalizationOutcome::StaleClaim);
-            }
-            let thread_model =
-                thread::find_thread_by_id(&transaction, turn_model.thread_id.as_str()).await?;
-            let Some(thread_model) = thread_model else {
-                return Ok(TaskRunOccurrenceTerminalizationOutcome::NotFound);
-            };
-            if thread_model != prepared_thread_model {
-                return Ok(TaskRunOccurrenceTerminalizationOutcome::StaleClaim);
-            }
-            if !queue::workspace_exists(&transaction, &thread_model.workspace_id).await? {
-                return Ok(TaskRunOccurrenceTerminalizationOutcome::NotFound);
-            }
-            self.append_and_project_turn_event_in_transaction(
-                &transaction,
-                terminal_event,
-                created_at,
-                claim_expires_at,
-                false,
-            )
-            .await?;
+                    // The occurrence identity is canonical and does not depend on
+                    // optional/legacy lineage rows: Turn.id is exactly TaskRun.id.
+                    let Some(turn_model) =
+                        turn::find_turn_by_id(&transaction, run_id.as_str()).await?
+                    else {
+                        return Ok(TaskRunOccurrenceTerminalizationOutcome::NotFound);
+                    };
+                    if turn_kind_from_db(turn_model.turn_kind.as_str()) != Some(TurnKind::TaskRun) {
+                        return Ok(TaskRunOccurrenceTerminalizationOutcome::InvalidBinding);
+                    }
+                    let current_status = turn_status_from_db(turn_model.status.as_str())
+                        .with_context(|| {
+                            format!("occurrence Turn `{run_id}` has an unknown status")
+                        })?;
+                    if current_status == desired_status {
+                        return Ok(TaskRunOccurrenceTerminalizationOutcome::AlreadyConsistent);
+                    }
+                    // The event contains the decoded Turn; compare the entire source
+                    // model, including all serialized prompt/collaboration/security
+                    // fields, without repeating deserialization under the writer.
+                    if turn_model != prepared_turn_model {
+                        return Ok(TaskRunOccurrenceTerminalizationOutcome::StaleClaim);
+                    }
+                    let thread_model =
+                        thread::find_thread_by_id(&transaction, turn_model.thread_id.as_str())
+                            .await?;
+                    let Some(thread_model) = thread_model else {
+                        return Ok(TaskRunOccurrenceTerminalizationOutcome::NotFound);
+                    };
+                    if thread_model != prepared_thread_model {
+                        return Ok(TaskRunOccurrenceTerminalizationOutcome::StaleClaim);
+                    }
+                    if !queue::workspace_exists(&transaction, &thread_model.workspace_id).await? {
+                        return Ok(TaskRunOccurrenceTerminalizationOutcome::NotFound);
+                    }
+                    self.append_and_project_turn_event_in_transaction(
+                        &transaction,
+                        terminal_event,
+                        created_at,
+                        claim_expires_at,
+                        false,
+                    )
+                    .await?;
 
-            // Unknown legacy producers may not retire the queue row when the
-            // projection becomes consistent. ACK this exact claim in the same
-            // transaction; a superseding generation/token remains protected.
-            if let Some(claim) = claim.as_ref() {
-                queue::remove_if_consistent(&transaction, claim).await?;
-            }
-            Ok(TaskRunOccurrenceTerminalizationOutcome::Changed)
-        }
-        .await;
+                    // Unknown legacy producers may not retire the queue row when the
+                    // projection becomes consistent. ACK this exact claim in the same
+                    // transaction; a superseding generation/token remains protected.
+                    if let Some(claim) = claim.as_ref() {
+                        queue::remove_if_consistent(&transaction, claim).await?;
+                    }
+                    Ok(TaskRunOccurrenceTerminalizationOutcome::Changed)
+                }
+                .await;
 
-        match result {
-            Ok(outcome) => {
-                transaction
-                    .commit()
-                    .await
-                    .context("failed to commit TaskRun occurrence terminalization transaction")?;
-                Ok(outcome)
-            }
-            Err(error) => Err(
-                crate::repositories::portable_payload::rollback_with_hold_refusal(
-                    transaction,
-                    error,
-                )
-                .await,
-            ),
-        }
+                match result {
+                    Ok(outcome) => {
+                        transaction.commit().await.context(
+                            "failed to commit TaskRun occurrence terminalization transaction",
+                        )?;
+                        Ok(outcome)
+                    }
+                    Err(error) => Err(
+                        crate::repositories::portable_payload::rollback_with_hold_refusal(
+                            transaction,
+                            error,
+                        )
+                        .await,
+                    ),
+                }
+            },
+            |outcome| matches!(outcome, TaskRunOccurrenceTerminalizationOutcome::Changed),
+        )
+        .await
     }
 }

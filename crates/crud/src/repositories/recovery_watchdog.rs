@@ -162,7 +162,7 @@ pub(crate) async fn active_page<C: ConnectionTrait>(
     after: Option<&str>,
     upper: &str,
     limit: u64,
-) -> Result<Vec<recovery_job::Model>> {
+) -> Result<(Option<String>, Vec<Result<recovery_job::Model>>)> {
     use sea_orm::QueryOrder;
     let mut ids = recovery_job::Entity::find()
         .select_only()
@@ -178,13 +178,21 @@ pub(crate) async fn active_page<C: ConnectionTrait>(
         .into_tuple::<String>()
         .all(db)
         .await?;
-    if ids.is_empty() {
-        return Ok(Vec::new());
+    // Cursor ownership follows raw keys, even when a row disappears, changes
+    // status, or fails typed hydration. Each point read releases its reader
+    // before the caller prepares a watchdog decision.
+    let after = ids.last().cloned();
+    let mut rows = Vec::with_capacity(ids.len());
+    for id in ids {
+        match recovery_job::Entity::find_by_id(id)
+            .filter(recovery_job::Column::Status.eq("active"))
+            .one(db)
+            .await
+        {
+            Ok(Some(row)) => rows.push(Ok(row)),
+            Ok(None) => {}
+            Err(error) => rows.push(Err(error.into())),
+        }
     }
-    Ok(recovery_job::Entity::find()
-        .filter(recovery_job::Column::Status.eq("active"))
-        .filter(recovery_job::Column::Id.is_in(ids))
-        .order_by_asc(recovery_job::Column::Id)
-        .all(db)
-        .await?)
+    Ok((after, rows))
 }

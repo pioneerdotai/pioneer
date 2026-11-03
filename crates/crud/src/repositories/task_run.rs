@@ -369,6 +369,33 @@ pub async fn list_recovery_runs_through<C: ConnectionTrait>(
         .context("failed to audit task recovery runs")
 }
 
+/// Finite-reader locator: raw membership survives individual Model decode errors.
+pub async fn list_recovery_run_keys_through<C: ConnectionTrait>(
+    db: &C,
+    status: TaskRunStatus,
+    after_id: Option<&str>,
+    upper: Option<&str>,
+    limit: u64,
+) -> Result<Vec<(String, String)>> {
+    let mut query =
+        task_run::Entity::find().filter(task_run::Column::Status.eq(task_run_status_to_db(status)));
+    if let Some(after_id) = after_id {
+        query = query.filter(task_run::Column::Id.gt(after_id));
+    }
+    if let Some(id) = upper {
+        query = query.filter(task_run::Column::Id.lte(id));
+    }
+    query
+        .order_by_asc(task_run::Column::Id)
+        .limit(limit)
+        .select_only()
+        .columns([task_run::Column::Id, task_run::Column::TaskId])
+        .into_tuple::<(String, String)>()
+        .all(db)
+        .await
+        .context("failed to audit task recovery runs")
+}
+
 pub async fn list_recovery_runs_for_task<C: ConnectionTrait>(
     db: &C,
     task_id: &str,
@@ -397,6 +424,21 @@ pub async fn list_queued_schedule<C: ConnectionTrait>(
         .all(db)
         .await
         .context("failed to reconstruct queued task schedule")
+}
+
+pub(crate) async fn next_future_ready<C: ConnectionTrait>(
+    db: &C,
+    now: DateTimeWithTimeZone,
+) -> Result<Option<DateTimeWithTimeZone>> {
+    Ok(task_run::Entity::find()
+        .select_only()
+        .expr_as(task_run::Column::ReadyAt.min(), "ready_at")
+        .filter(task_run::Column::Status.eq("queued"))
+        .filter(task_run::Column::ReadyAt.gt(now))
+        .into_tuple::<Option<DateTimeWithTimeZone>>()
+        .one(db)
+        .await?
+        .flatten())
 }
 
 /// Rotating due fallback prevents a full page waiting for capacity from hiding
@@ -433,6 +475,38 @@ pub async fn list_scheduler_due_runs_through<C: ConnectionTrait>(
     query
         .order_by_asc(task_run::Column::Id)
         .limit(limit)
+        .all(db)
+        .await
+        .context("failed to discover task scheduler due runs")
+}
+
+/// Finite-reader locator: raw membership survives individual Model decode errors.
+pub async fn list_scheduler_due_run_keys_through<C: ConnectionTrait>(
+    db: &C,
+    now: DateTimeWithTimeZone,
+    after_id: Option<&str>,
+    upper: Option<&str>,
+    limit: u64,
+) -> Result<Vec<(String, String)>> {
+    let mut query = task_run::Entity::find()
+        .filter(task_run::Column::Status.eq("queued"))
+        .filter(
+            task_run::Column::ReadyAt
+                .is_null()
+                .or(task_run::Column::ReadyAt.lte(now)),
+        );
+    if let Some(after_id) = after_id {
+        query = query.filter(task_run::Column::Id.gt(after_id));
+    }
+    if let Some(id) = upper {
+        query = query.filter(task_run::Column::Id.lte(id));
+    }
+    query
+        .order_by_asc(task_run::Column::Id)
+        .limit(limit)
+        .select_only()
+        .columns([task_run::Column::Id, task_run::Column::TaskId])
+        .into_tuple::<(String, String)>()
         .all(db)
         .await
         .context("failed to discover task scheduler due runs")

@@ -31,6 +31,17 @@ impl GatewayHookRuntimeBuilder {
         }
     }
 
+    pub(crate) fn with_recovery_candidate(self, id: String) -> Self {
+        let Self { crud_store, inner } = self;
+        Self {
+            inner: inner.with_run_store(Arc::new(CrudHookRunStore::for_recovery_candidate(
+                crud_store.clone(),
+                id,
+            ))),
+            crud_store,
+        }
+    }
+
     pub(crate) fn install<P: HookPackage>(self, package: P) -> Result<Self, HookRegistryError> {
         let Self { crud_store, inner } = self;
         Ok(Self {

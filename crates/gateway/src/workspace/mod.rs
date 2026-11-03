@@ -78,9 +78,11 @@ impl WorkspaceChanges {
 
 impl WorkspaceManager {
     pub fn new(connection: impl Into<SqliteDatabase>) -> Self {
+        let connection = connection.into();
+        let changes = connection.shared_resource::<WorkspaceChanges>();
         Self {
-            connection: connection.into(),
-            changes: Arc::default(),
+            connection,
+            changes,
         }
     }
 
@@ -104,6 +106,18 @@ impl WorkspaceManager {
             .await
             .map_err(|error| {
                 WorkspaceError::Internal(format!("failed to page active workspaces: {error}"))
+            })
+    }
+
+    pub(crate) async fn active_id_page(
+        &self,
+        after: Option<&str>,
+    ) -> Result<Vec<String>, WorkspaceError> {
+        pioneer_crud::CrudStore::new(self.connection.clone())
+            .list_active_workspace_id_page(after)
+            .await
+            .map_err(|error| {
+                WorkspaceError::Internal(format!("failed to page active workspace IDs: {error}"))
             })
     }
 
@@ -164,86 +178,105 @@ impl WorkspaceManager {
         requested_workspace_id: &str,
         requested_name: Option<&str>,
     ) -> Result<Workspace, WorkspaceError> {
-        let workspace = self
-            .run_with_retry(|| async {
-                let requested_workspace_id = normalize_workspace_id(requested_workspace_id)?;
-                let explicit_name = normalize_workspace_name(requested_name)?;
+        let change = self
+            .connection
+            .shared_resource::<pioneer_sqlite::background::Registry>()
+            .owner("skills.uploads")
+            .changing();
+        let result = async {
+            let workspace = self
+                .run_with_retry(|| async {
+                    let requested_workspace_id = normalize_workspace_id(requested_workspace_id)?;
+                    let explicit_name = normalize_workspace_name(requested_name)?;
 
-                let existing_workspace =
-                    workspace::Entity::find_by_id(requested_workspace_id.clone())
-                        .one(&self.connection)
-                        .await
-                        .map_err(|error| {
-                            WorkspaceError::Internal(format!(
-                                "failed to query workspace `{requested_workspace_id}`: {error}"
-                            ))
-                        })?;
-
-                if let Some(existing_workspace) = existing_workspace {
-                    return Ok(model_to_workspace(existing_workspace));
-                }
-
-                let name = match explicit_name {
-                    Some(name) => name,
-                    None => {
-                        let workspace_count = workspace::Entity::find()
-                            .count(&self.connection)
+                    let existing_workspace =
+                        workspace::Entity::find_by_id(requested_workspace_id.clone())
+                            .one(&self.connection)
                             .await
                             .map_err(|error| {
                                 WorkspaceError::Internal(format!(
-                                    "failed to count workspaces: {error}"
+                                    "failed to query workspace `{requested_workspace_id}`: {error}"
                                 ))
                             })?;
-                        format!("Workspace {}", workspace_count + 1)
-                    }
-                };
 
-                let has_current_active_workspace = workspace::Entity::find()
-                    .filter(workspace::Column::IsCurrent.eq(true))
-                    .filter(workspace::Column::IsActive.eq(true))
-                    .count(&self.connection)
+                    if let Some(existing_workspace) = existing_workspace {
+                        return Ok(model_to_workspace(existing_workspace));
+                    }
+
+                    let name = match explicit_name {
+                        Some(name) => name,
+                        None => {
+                            let workspace_count = workspace::Entity::find()
+                                .count(&self.connection)
+                                .await
+                                .map_err(|error| {
+                                    WorkspaceError::Internal(format!(
+                                        "failed to count workspaces: {error}"
+                                    ))
+                                })?;
+                            format!("Workspace {}", workspace_count + 1)
+                        }
+                    };
+
+                    let has_current_active_workspace = workspace::Entity::find()
+                        .filter(workspace::Column::IsCurrent.eq(true))
+                        .filter(workspace::Column::IsActive.eq(true))
+                        .count(&self.connection)
+                        .await
+                        .map_err(|error| {
+                            WorkspaceError::Internal(format!(
+                                "failed to check current active workspace: {error}"
+                            ))
+                        })?
+                        > 0;
+
+                    let model = workspace::ActiveModel {
+                        id: Set(requested_workspace_id),
+                        name: Set(name),
+                        is_active: Set(true),
+                        is_current: Set(!has_current_active_workspace),
+                        ..Default::default()
+                    }
+                    .insert(&self.connection)
                     .await
                     .map_err(|error| {
-                        WorkspaceError::Internal(format!(
-                            "failed to check current active workspace: {error}"
-                        ))
-                    })?
-                    > 0;
+                        WorkspaceError::Internal(format!("failed to create workspace: {error}"))
+                    })?;
 
-                let model = workspace::ActiveModel {
-                    id: Set(requested_workspace_id),
-                    name: Set(name),
-                    is_active: Set(true),
-                    is_current: Set(!has_current_active_workspace),
-                    ..Default::default()
-                }
-                .insert(&self.connection)
-                .await
-                .map_err(|error| {
-                    WorkspaceError::Internal(format!("failed to create workspace: {error}"))
-                })?;
-
-                self.changes.committed();
-                Ok(model_to_workspace(model))
-            })
-            .await?;
-        pioneer_crud::ensure_pioneer_for_workspace(
-            &self.connection,
-            workspace.id.as_str(),
-            chrono::Utc::now().fixed_offset(),
-        )
-        .await
-        .map_err(|error| {
-            WorkspaceError::Internal(format!(
-                "failed to seed reserved Pioneer identity for workspace `{}`: {error:#}",
-                workspace.id
-            ))
-        })?;
-        Ok(workspace)
+                    self.changes.committed();
+                    Ok(model_to_workspace(model))
+                })
+                .await?;
+            pioneer_crud::ensure_pioneer_for_workspace(
+                &self.connection,
+                workspace.id.as_str(),
+                chrono::Utc::now().fixed_offset(),
+            )
+            .await
+            .map_err(|error| {
+                WorkspaceError::Internal(format!(
+                    "failed to seed reserved Pioneer identity for workspace `{}`: {error:#}",
+                    workspace.id
+                ))
+            })?;
+            Ok(workspace)
+        }
+        .await;
+        if result.is_ok() {
+            change.finish(true);
+        }
+        result
     }
 
     pub async fn ensure_default_workspace(&self) -> Result<Workspace, WorkspaceError> {
-        let workspace = self
+        let change = self
+            .connection
+            .shared_resource::<pioneer_sqlite::background::Registry>()
+            .owner("skills.uploads")
+            .changing();
+        let result =
+            async {
+                let workspace = self
             .run_with_retry(|| async {
                 let existing_workspaces = self.list_workspaces().await?;
                 if let Some(workspace) = select_default_workspace(existing_workspaces.as_slice()) {
@@ -304,19 +337,25 @@ impl WorkspaceManager {
                 }
             })
             .await?;
-        pioneer_crud::ensure_pioneer_for_workspace(
-            &self.connection,
-            workspace.id.as_str(),
-            chrono::Utc::now().fixed_offset(),
-        )
-        .await
-        .map_err(|error| {
-            WorkspaceError::Internal(format!(
-                "failed to seed reserved Pioneer identity for workspace `{}`: {error:#}",
-                workspace.id
-            ))
-        })?;
-        Ok(workspace)
+                pioneer_crud::ensure_pioneer_for_workspace(
+                    &self.connection,
+                    workspace.id.as_str(),
+                    chrono::Utc::now().fixed_offset(),
+                )
+                .await
+                .map_err(|error| {
+                    WorkspaceError::Internal(format!(
+                        "failed to seed reserved Pioneer identity for workspace `{}`: {error:#}",
+                        workspace.id
+                    ))
+                })?;
+                Ok(workspace)
+            }
+            .await;
+        if result.is_ok() {
+            change.finish(true);
+        }
+        result
     }
 
     pub(crate) async fn authorized_default_workspace(

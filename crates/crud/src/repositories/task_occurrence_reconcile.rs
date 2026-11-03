@@ -523,3 +523,33 @@ pub(crate) async fn seed_unfinished(
     tx.commit().await?;
     Ok(1 + ids.len() as u64)
 }
+
+/// Reconstruction is finite durable work; once seed/scope are consumed only a
+/// ticket's actual retry/claim timestamp keeps this owner timed.
+pub(crate) async fn next_work_at<C: ConnectionTrait>(db: &C, now: i64) -> Result<Option<i64>> {
+    let seed = seed::Entity::find_by_id(1)
+        .one(db)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("task occurrence seed missing"))?;
+    if seed.status_index < 5 {
+        return Ok(Some(now));
+    }
+    if scope::Entity::find()
+        .select_only()
+        .column(scope::Column::TaskId)
+        .limit(1)
+        .into_tuple::<String>()
+        .one(db)
+        .await?
+        .is_some()
+    {
+        return Ok(Some(now));
+    }
+    Ok(pending::Entity::find()
+        .select_only()
+        .expr_as(Expr::col(pending::Column::NextAttemptAt).min(), "deadline")
+        .into_tuple::<Option<i64>>()
+        .one(db)
+        .await?
+        .flatten())
+}

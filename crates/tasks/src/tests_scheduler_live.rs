@@ -113,7 +113,7 @@ async fn live_recovery_audits_dormant_triggers_without_reloading_future_triggers
         )
         .await
         .unwrap();
-    assert_eq!(reconciler.reconcile(10).await.unwrap().active_triggers, 1);
+    assert_eq!(reconciler.reconcile(10).await.unwrap().active_triggers, 0);
     let mut trigger = future.trigger;
     trigger.next_fire_at = None;
     runtime
@@ -162,7 +162,7 @@ async fn live_recovery_audits_dormant_triggers_without_reloading_future_triggers
 }
 
 #[tokio::test]
-async fn lag_rebuild_arms_a_foreign_replacement_schedule() {
+async fn lower_commit_arms_a_replacement_without_business_bus_delivery() {
     let runtime = runtime().await;
     let bus = runtime.event_bus();
     let executors = Arc::new(TaskExecutorRegistry::new());
@@ -188,10 +188,11 @@ async fn lag_rebuild_arms_a_foreign_replacement_schedule() {
         interval_anchor_at: Some(4_000_000_010),
         catch_up_policy: Some(TaskTriggerCatchUpPolicy::skip_missed()),
     };
-    // Simulate a foreign writer: commit a replacement without publishing a hint.
-    runtime
-        .service()
-        .append_event(
+    // A separate supported CRUD facade shares the DB registry. It commits the
+    // schedule without any TaskService callback or business-bus publication.
+    let lower = CrudStore::new(runtime.service().store().database_connection());
+    lower
+        .append_task_event(
             TaskEventPayload::TaskRescheduled {
                 task_id: task.task.id.clone(),
                 trigger: replacement,
@@ -202,38 +203,21 @@ async fn lag_rebuild_arms_a_foreign_replacement_schedule() {
         )
         .await
         .unwrap();
-    let other = runtime
-        .service()
-        .create_task(
-            TaskCreateContext::default(),
-            create_params(TaskTriggerSpec::Manual {
-                allowed_actor: None,
-            }),
-        )
-        .await
-        .unwrap();
-    for at in 12..1040 {
-        let event = runtime
-            .service()
-            .append_event(
-                TaskEventPayload::TaskRecovered {
-                    task_id: other.task.id.clone(),
-                    run_id: None,
-                    message: format!("wake {at}"),
-                    recovered_at: at,
-                },
-                at,
-            )
-            .await
-            .unwrap();
-        bus.publish(event).await;
-    }
     scheduler.process_due_once(1040).await.unwrap();
     assert_eq!(
         scheduler.process_due_once(4_000_000_010).await.unwrap(),
         1,
-        "lag must reconstruct and arm the replacement while still in the future"
+        "the committed exact replacement must remain armed until its real deadline"
     );
+    let durable = runtime
+        .service()
+        .store()
+        .get_task(&task.task.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(durable.runs.len(), 1);
+    assert_eq!(durable.runs[0].status, TaskRunStatus::Succeeded);
 }
 
 // Primary recovery regression: an early domain decode failure must not restart
@@ -313,11 +297,15 @@ async fn poisoned_recovery_preserves_discovery_and_reaches_unfinished_tail() {
         );
         let now = chrono::Utc::now().timestamp();
         assert!(reconciler.reconcile(now).await.is_err());
-        let live = reconciler.reconcile(now + 1).await.unwrap();
-        assert_eq!(
-            live.active_triggers, 0,
-            "future triggers must not be rediscovered after a row failure"
-        );
+        // Every quantum is now64 raw rows, at startup and while live. Finish
+        // this finite1025-run pass without advancing the poison retry clock.
+        for _ in 0..16 {
+            let live = reconciler.reconcile(now + 1).await.unwrap();
+            assert_eq!(
+                live.active_triggers, 0,
+                "future triggers do not belong to live recovery discovery"
+            );
+        }
         let events = runtime
             .service()
             .store()
@@ -764,11 +752,21 @@ async fn foreign_expired_cache_refresh_replaces_deadlines_without_rebuild() {
                 .unwrap();
         }
         scheduler.process_due_once(4_000_000_000).await.unwrap();
-        assert_eq!(
-            scheduler.next_sleep_duration(4_000_000_000).await,
-            crate::service::LIVE_RECONCILIATION_INTERVAL,
-            "{change}"
-        );
+        let plan = scheduler.next_work_plan(4_000_000_000).await.unwrap();
+        if change == "later" {
+            let pioneer_sqlite::background::Plan::WallDeadline(at) = plan else {
+                panic!("future schedule lost: {plan:?}");
+            };
+            assert_eq!(
+                at.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+                4_000_000_040
+            );
+        } else {
+            assert!(
+                matches!(plan, pioneer_sqlite::background::Plan::Dormant),
+                "{change}: {plan:?}"
+            );
+        }
         if change == "later" {
             assert_eq!(
                 scheduler.process_due_once(4_000_000_040).await.unwrap(),
@@ -832,10 +830,10 @@ async fn foreign_expired_cache_refresh_replaces_deadlines_without_rebuild() {
     // This scheduler has a separate bus: the durable completion cannot publish
     // a local hint, so only expired-cache addressed refresh can remove the entry.
     scheduler.process_due_once(4_000_000_000).await.unwrap();
-    assert_eq!(
-        scheduler.next_sleep_duration(4_000_000_000).await,
-        crate::service::LIVE_RECONCILIATION_INTERVAL
-    );
+    assert!(matches!(
+        scheduler.next_work_plan(4_000_000_000).await.unwrap(),
+        pioneer_sqlite::background::Plan::Dormant
+    ));
 }
 
 #[tokio::test]
@@ -1100,10 +1098,12 @@ async fn finite_due_trigger_pass_returns_behind_cursor_under_suffix_growth() {
         executors,
     );
     scheduler.process_due_once(now).await.unwrap();
-    assert_eq!(
-        scheduler.next_sleep_duration(now).await,
-        Duration::ZERO,
-        "an overdue cached backlog preserves base immediate scheduling between finite pages"
+    assert!(
+        matches!(
+            scheduler.next_work_plan(now).await.unwrap(),
+            pioneer_sqlite::background::Plan::Runnable
+        ),
+        "the captured finite page retains continuation without another commit"
     );
     let missed = runtime
         .service()
@@ -1460,14 +1460,7 @@ async fn fractional_foreign_due_deadlines_keep_exact_upper_and_page_progress() {
 }
 
 #[tokio::test]
-async fn empty_live_recovery_is_quiet_but_duplicate_event_mutations_still_wake() {
-    async fn has_wake(bus: &crate::event_bus::TaskEventBus) -> bool {
-        // Observe the actual retained Notify permit; no wall-clock SLA or
-        // source-grep seam. Timeout polls a ready permit before its deadline.
-        tokio::time::timeout(Duration::ZERO, bus.scheduler_notify().notified())
-            .await
-            .is_ok()
-    }
+async fn live_recovery_keeps_duplicate_events_idempotent_and_respects_future_queue() {
     let runtime = runtime().await;
     let store = runtime.service().store();
     let bus = Arc::new(crate::event_bus::TaskEventBus::new());
@@ -1477,15 +1470,14 @@ async fn empty_live_recovery_is_quiet_but_duplicate_event_mutations_still_wake()
     let reconciler =
         TaskStartupReconciler::new(store.clone(), bus.clone(), executors, scheduler.handle());
     let now = chrono::Utc::now().timestamp();
-    reconciler.reconcile(now).await.unwrap();
-    assert!(
-        !has_wake(&bus).await,
-        "empty reconstruction/queue bookkeeping is not a scheduling mutation"
-    );
-    reconciler.reconcile(now + 5).await.unwrap();
-    assert!(
-        !has_wake(&bus).await,
-        "empty live pass must not restart scheduler polling"
+    assert_eq!(reconciler.reconcile(now).await.unwrap().recovered_events, 0);
+    assert_eq!(
+        reconciler
+            .reconcile(now + 5)
+            .await
+            .unwrap()
+            .recovered_events,
+        0
     );
     let task = runtime
         .service()
@@ -1504,28 +1496,28 @@ async fn empty_live_recovery_is_quiet_but_duplicate_event_mutations_still_wake()
             .recovered_events
             > 0
     );
-    assert!(has_wake(&bus).await);
     let repeated = reconciler.reconcile(now + 15).await.unwrap();
     assert_eq!(
         repeated.recovered_events, 0,
         "the recovery message already exists"
-    );
-    assert!(
-        has_wake(&bus).await,
-        "possible occurrence synchronization still dirties/wakes its exact Task"
     );
     assert_eq!(scheduler.process_due_once(now + 15).await.unwrap(), 1);
     assert_eq!(
         store.get_task_run(&run.id).await.unwrap().unwrap().status,
         TaskRunStatus::Succeeded
     );
-    let _ = has_wake(&bus).await; // committed dispatch/terminal events are real wakes
-    reconciler.reconcile(now + 20).await.unwrap();
-    assert!(!has_wake(&bus).await);
+    assert_eq!(
+        reconciler
+            .reconcile(now + 20)
+            .await
+            .unwrap()
+            .recovered_events,
+        0
+    );
 
-    // An unpublished future queue row is not an addressed local dependency.
-    // Once a foreign writer moves ready_at earlier, indexed due discovery must
-    // recover it without waiting for the old deadline or a local hint.
+    // Restored/offline row fixture: explicit reconciliation must respect the
+    // durable eligibility boundary. Real online commit/deadline wiring is
+    // covered by the physical scheduler worker regression.
     let future = runtime
         .service()
         .create_task(
@@ -1551,10 +1543,6 @@ async fn empty_live_recovery_is_quiet_but_duplicate_event_mutations_still_wake()
         .await
         .unwrap();
     reconciler.reconcile(now + 25).await.unwrap();
-    assert!(
-        !has_wake(&bus).await,
-        "future-only live state does not mutate or wake"
-    );
     assert!(!store.get_task_events(&future.task_id, None).await.unwrap().events.iter().any(|event|
         matches!(&event.payload, TaskEventPayload::TaskRecovered { run_id: Some(id), .. } if id == &future.id)));
     pioneer_entity::task_run::Entity::update_many()
@@ -1571,13 +1559,12 @@ async fn empty_live_recovery_is_quiet_but_duplicate_event_mutations_still_wake()
         .await
         .unwrap();
     reconciler.reconcile(now + 30).await.unwrap();
-    assert!(has_wake(&bus).await);
     assert!(store.get_task_events(&future.task_id, None).await.unwrap().events.iter().any(|event|
         matches!(&event.payload, TaskEventPayload::TaskRecovered { run_id: Some(id), .. } if id == &future.id)));
 }
 
 #[tokio::test]
-async fn waiting_review_with_current_execution_lease_does_not_recover_or_wake() {
+async fn waiting_review_with_current_execution_lease_preserves_ownership_and_events() {
     let runtime = runtime().await;
     let store = runtime.service().store();
     let task = runtime
@@ -1616,7 +1603,6 @@ async fn waiting_review_with_current_execution_lease_does_not_recover_or_wake() 
         .unwrap()
         .unwrap();
     assert!(lease.worker_id.is_some() && lease.lease_until.is_some_and(|at| at > now + 12));
-    let _ = tokio::time::timeout(Duration::ZERO, bus.scheduler_notify().notified()).await;
     // Foreign/repair status changed before the old execution owner released its
     // lease. Review recovery cannot bypass that still-current ownership proof.
     pioneer_entity::task_run::Entity::update_many()
@@ -1628,13 +1614,25 @@ async fn waiting_review_with_current_execution_lease_does_not_recover_or_wake() 
         .exec(&store.database_connection())
         .await
         .unwrap();
+    let events = store
+        .get_task_events(&run.task_id, None)
+        .await
+        .unwrap()
+        .events;
     for at in [now + 6, now + 12] {
         reconciler.reconcile(at).await.unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 1);
-        assert!(
-            tokio::time::timeout(Duration::ZERO, bus.scheduler_notify().notified())
+        assert_eq!(
+            store.load_execution_for_run(&run.id).await.unwrap(),
+            Some(lease.clone())
+        );
+        assert_eq!(
+            store
+                .get_task_events(&run.task_id, None)
                 .await
-                .is_err()
+                .unwrap()
+                .events,
+            events
         );
     }
 }

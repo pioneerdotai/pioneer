@@ -25,7 +25,7 @@ use pioneer_provider::{ChatMessage, ModelInputItem, ProviderRegistry, Role};
 use pioneer_tools::{ExecutionWindowAdmissionDecision, decide_execution_window_admission};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use tokio::sync::{Notify, RwLock};
+use tokio::sync::RwLock;
 use tracing::warn;
 
 use super::timeout::{
@@ -494,6 +494,47 @@ pub struct RuntimeFailureCandidate {
     pub metadata: ToolMetadata,
 }
 
+#[derive(Default)]
+struct ActiveSupervisionPass {
+    after: Option<String>,
+    upper: Option<String>,
+    foreign_after: Option<String>,
+    foreign_upper: Option<String>,
+    foreign_complete: bool,
+    nearest: Option<i64>,
+    retry: Option<tokio::time::Instant>,
+    rescan: bool,
+    complete: bool,
+    generation: Option<pioneer_sqlite::background::Observation>,
+}
+impl ActiveSupervisionPass {
+    fn cooling(&self) -> bool {
+        self.retry
+            .is_some_and(|at| at > tokio::time::Instant::now())
+    }
+
+    fn wall_deadline(&self) -> Option<i64> {
+        // A failed finite observation owns one lane-local elapsed-time budget.
+        // Its old clock cannot reopen that same lane and defeat the cooldown.
+        // The independent supervision lane is combined by the coordinator.
+        if self.cooling() { None } else { self.nearest }
+    }
+}
+struct ActiveSupervisionGuard {
+    saved: Arc<std::sync::Mutex<ActiveSupervisionPass>>,
+    pass: ActiveSupervisionPass,
+    completed_quantum: bool,
+}
+impl Drop for ActiveSupervisionGuard {
+    fn drop(&mut self) {
+        // Selected-page cursors must not commit on cancellation between rows.
+        if !self.completed_quantum {
+            self.pass = ActiveSupervisionPass::default();
+        }
+        *self.saved.lock().unwrap() = std::mem::take(&mut self.pass);
+    }
+}
+
 #[derive(Clone)]
 pub struct RecoveryCoordinator {
     crud_store: Arc<CrudStore>,
@@ -504,8 +545,8 @@ pub struct RecoveryCoordinator {
     execution_leases: Arc<crate::authorization::ExecutionLeaseRegistry>,
     turn_execution_owner_id: Arc<str>,
     listener_starter: Arc<RwLock<Option<RecoveryListenerStarter>>>,
-    due_wake: Arc<Notify>,
-    active_scan: Arc<tokio::sync::Mutex<(Option<String>, Option<String>)>>,
+    active_scan: Arc<std::sync::Mutex<ActiveSupervisionPass>>,
+    orphan_scan: Arc<std::sync::Mutex<ActiveSupervisionPass>>,
 }
 
 #[derive(Debug, Clone)]
@@ -746,7 +787,6 @@ impl RecoveryCoordinator {
         let authorization_invalidation_hub = Arc::new(
             crate::authorization::AuthorizationInvalidationHub::durable(crud_store.clone()),
         );
-        let due_wake = crud_store.recovery_job_notification();
         Self {
             crud_store,
             agent_manager,
@@ -760,8 +800,8 @@ impl RecoveryCoordinator {
             )
             .into(),
             listener_starter: Arc::new(RwLock::new(None)),
-            due_wake,
             active_scan: Default::default(),
+            orphan_scan: Default::default(),
         }
     }
 
@@ -1678,6 +1718,7 @@ impl RecoveryCoordinator {
 
     /// Compatibility entry point for explicit reconstruction callers. Live
     /// workers select the independent audit and due phases below.
+    #[cfg(test)]
     pub async fn run_ready_jobs(
         &self,
         now_unix: i64,
@@ -1696,83 +1737,150 @@ impl RecoveryCoordinator {
         finish_recovery_phases(events, errors)
     }
 
+    #[cfg(test)]
     pub async fn run_supervision_audits(
         &self,
         now_unix: i64,
         limit: u64,
     ) -> Result<Vec<RecoveryCoordinatorEvent>> {
+        let admission = self
+            .crud_store
+            .recovery_admission(self.turn_execution_owner_id.as_ref(), now_unix)
+            .await.unwrap_or_else(|error| {
+                warn!(error = %format!("{error:#}"), "recovery admission failed; retaining all audits");
+                pioneer_crud::RecoveryAdmission::unknown()
+            });
+        let (events, backfill_error) = self
+            .run_admitted_supervision_audits(now_unix, limit, &admission, None)
+            .await?;
+        if events.is_empty()
+            && let Some(error) = backfill_error
+        {
+            return Err(error);
+        }
+        Ok(events)
+    }
+
+    pub(crate) async fn run_admitted_supervision_audits(
+        &self,
+        now_unix: i64,
+        limit: u64,
+        admission: &pioneer_crud::RecoveryAdmission,
+        backfill_ids: Option<&[String]>,
+    ) -> Result<(Vec<RecoveryCoordinatorEvent>, Option<anyhow::Error>)> {
         let mut events = Vec::new();
         let mut phase_errors = Vec::new();
+        let mut backfill_error = None;
 
-        match self.reconcile_orphan_turn_executions(now_unix, limit).await {
-            Ok(()) => {}
-            Err(error) => {
-                warn!(
-                    error = %format!("{error:#}"),
-                    "recovery coordinator orphan-turn-execution phase failed"
-                );
-                phase_errors.push(format!("orphan Turn executions: {error:#}"));
+        if admission.orphan || self.orphan_supervision_more() {
+            match self.reconcile_orphan_turn_executions(now_unix, limit).await {
+                Ok(()) => {}
+                Err(error) => {
+                    warn!(
+                        error = %format!("{error:#}"),
+                        "recovery coordinator orphan-turn-execution phase failed"
+                    );
+                    phase_errors.push(format!("orphan Turn executions: {error:#}"));
+                }
             }
         }
 
-        match self.backfill_timeout_jobs(now_unix, limit).await {
-            Ok(mut phase_events) => events.append(&mut phase_events),
-            Err(error) => {
-                warn!(
-                    error = %format!("{error:#}"),
-                    "recovery coordinator timeout backfill phase failed"
-                );
-                phase_errors.push(format!("timeout backfill: {error:#}"));
+        if admission.backfill {
+            let result = if let Some(ids) = backfill_ids {
+                let (mut found, failure) =
+                    self.backfill_timeout_candidates(now_unix, limit, ids).await;
+                events.append(&mut found);
+                backfill_error = failure;
+                Ok(Vec::new())
+            } else {
+                self.backfill_timeout_jobs(now_unix, limit).await
+            };
+            match result {
+                Ok(mut phase_events) => events.append(&mut phase_events),
+                Err(error) => {
+                    warn!(
+                        error = %format!("{error:#}"),
+                        "recovery coordinator timeout backfill phase failed"
+                    );
+                    phase_errors.push(format!("timeout backfill: {error:#}"));
+                }
             }
         }
 
-        match self.expire_active_recovery_jobs(now_unix, limit).await {
-            Ok(mut phase_events) => events.append(&mut phase_events),
-            Err(error) => {
-                warn!(
-                    error = %format!("{error:#}"),
-                    "recovery coordinator active expiration phase failed"
-                );
-                phase_errors.push(format!("active expiration: {error:#}"));
-            }
-        }
-
-        match self
-            .repair_due_terminal_recovery_jobs(now_unix, limit)
-            .await
+        if admission.active
+            || admission.orphan
+            || admission.backfill
+            || self.active_supervision_schedule().0
         {
-            Ok(mut phase_events) => events.append(&mut phase_events),
-            Err(error) => {
-                warn!(
-                    error = %format!("{error:#}"),
-                    "recovery coordinator terminal repair phase failed"
-                );
-                phase_errors.push(format!("terminal repair: {error:#}"));
+            match self.expire_active_recovery_jobs(now_unix, limit).await {
+                Ok(mut phase_events) => events.append(&mut phase_events),
+                Err(error) => {
+                    warn!(
+                        error = %format!("{error:#}"),
+                        "recovery coordinator active expiration phase failed"
+                    );
+                    phase_errors.push(format!("active expiration: {error:#}"));
+                }
             }
         }
 
-        finish_recovery_phases(events, phase_errors)
+        if admission.terminal_repair || admission.orphan || admission.backfill {
+            match self
+                .repair_due_terminal_recovery_jobs(now_unix, limit)
+                .await
+            {
+                Ok(mut phase_events) => events.append(&mut phase_events),
+                Err(error) => {
+                    warn!(
+                        error = %format!("{error:#}"),
+                        "recovery coordinator terminal repair phase failed"
+                    );
+                    phase_errors.push(format!("terminal repair: {error:#}"));
+                }
+            }
+        }
+
+        Ok((
+            finish_recovery_phases(events, phase_errors)?,
+            backfill_error,
+        ))
     }
 
-    pub(crate) fn due_wake(&self) -> Arc<Notify> {
-        self.due_wake.clone()
-    }
-
-    /// Due work never invokes discovery/backfill or active supervision. A
-    /// retained wake is advisory; the existing short point retry is retained
-    /// for foreign producers, due/retry deadlines and expired claims.
+    /// Due work never invokes discovery/backfill or active supervision. The
+    /// independent owner reconstructs retry/claim deadlines and uses addressed
+    /// committed changes; claims and execution remain authoritative here.
     pub async fn run_due_jobs(
         &self,
         now_unix: i64,
         limit: u64,
     ) -> Result<Vec<RecoveryCoordinatorEvent>> {
-        let mut events = Vec::new();
-        let mut phase_errors = Vec::new();
-        match self
+        let jobs = self
             .crud_store
             .claim_due_recovery_jobs(now_unix, RECOVERY_JOB_CLAIM_LEASE_SECS, limit)
-            .await
-        {
+            .await;
+        self.run_due_claim_result(now_unix, jobs).await
+    }
+
+    pub(crate) async fn run_due_job_candidate(
+        &self,
+        now_unix: i64,
+        id: &str,
+    ) -> Result<Vec<RecoveryCoordinatorEvent>> {
+        let jobs = self
+            .crud_store
+            .claim_due_recovery_job_candidate(now_unix, RECOVERY_JOB_CLAIM_LEASE_SECS, id)
+            .await;
+        self.run_due_claim_result(now_unix, jobs).await
+    }
+
+    async fn run_due_claim_result(
+        &self,
+        now_unix: i64,
+        jobs: Result<Vec<pioneer_crud::RecoveryJobRecord>>,
+    ) -> Result<Vec<RecoveryCoordinatorEvent>> {
+        let mut events = Vec::new();
+        let mut phase_errors = Vec::new();
+        match jobs {
             Ok(jobs) => {
                 for job in jobs {
                     match self.run_single_job(job, now_unix).await {
@@ -1804,43 +1912,157 @@ impl RecoveryCoordinator {
     /// same boundary as the Turn, so a missing provider binding is never used
     /// to guess whether work is native or CLI-backed.
     async fn reconcile_orphan_turn_executions(&self, now_unix: i64, limit: u64) -> Result<()> {
-        let expired = self
-            .crud_store
-            .list_expired_foreign_turn_executions(
-                self.turn_execution_owner_id.as_ref(),
-                now_unix,
-                limit,
-            )
-            .await?;
-        for execution in expired {
-            let Some(claimed) = self
-                .crud_store
-                .claim_expired_turn_execution(
-                    &execution,
-                    self.turn_execution_owner_id.as_ref(),
-                    now_unix,
-                    now_unix.saturating_add(RECOVERY_JOB_CLAIM_LEASE_SECS as i64),
-                )
-                .await?
-            else {
-                continue;
-            };
-            self.enqueue_claimed_turn_execution_recovery(&claimed, now_unix)
-                .await?;
+        if limit == 0 {
+            return Ok(());
         }
-
-        // A storage failure after the ownership CAS must remain retryable.
-        // Recovering rows owned by this process are therefore revisited until
-        // their idempotent recovery job exists or they become terminal.
-        for claimed in self
+        let wake = self.crud_store.background_work("recovery.control");
+        let Some(_drain) = self
             .crud_store
-            .list_owned_recovering_turn_executions(self.turn_execution_owner_id.as_ref(), limit)
-            .await?
+            .background_work("recovery.orphans.drain")
+            .drain()
+            .await
+        else {
+            return Ok(());
+        };
+        let generation = wake.observe();
+        let mut state = ActiveSupervisionGuard {
+            completed_quantum: false,
+            saved: self.orphan_scan.clone(),
+            pass: std::mem::take(&mut *self.orphan_scan.lock().unwrap()),
+        };
+        if state.pass.generation != Some(generation) {
+            if state.pass.generation.is_none()
+                || (state.pass.complete && state.pass.foreign_complete)
+            {
+                state.pass = ActiveSupervisionPass {
+                    generation: Some(generation),
+                    ..Default::default()
+                };
+            } else {
+                state.pass.generation = Some(generation);
+                state.pass.rescan = true;
+            }
+        }
+        if state.pass.complete
+            && state.pass.foreign_complete
+            && ((!state.pass.cooling() && state.pass.nearest.is_some_and(|at| at <= now_unix))
+                || state
+                    .pass
+                    .retry
+                    .is_some_and(|at| at <= tokio::time::Instant::now())
+                || (state.pass.rescan && state.pass.retry.is_none()))
         {
-            self.enqueue_claimed_turn_execution_recovery(&claimed, now_unix)
-                .await?;
+            state.pass = ActiveSupervisionPass {
+                generation: Some(generation),
+                ..Default::default()
+            };
+        }
+        let mut errors = Vec::new();
+        // Completed lanes remain latched until a real lease, monotonic retry,
+        // or external generation reopens the finite pass.
+        if !state.pass.foreign_complete {
+            if state.pass.foreign_upper.is_none() {
+                state.pass.foreign_upper = self
+                    .crud_store
+                    .expired_foreign_execution_upper(
+                        self.turn_execution_owner_id.as_ref(),
+                        now_unix,
+                    )
+                    .await?;
+            }
+            if let Some(upper) = state.pass.foreign_upper.as_deref() {
+                let (after, rows) = self
+                    .crud_store
+                    .expired_foreign_execution_page(
+                        self.turn_execution_owner_id.as_ref(),
+                        now_unix,
+                        state.pass.foreign_after.as_deref(),
+                        upper,
+                        limit,
+                    )
+                    .await?;
+                state.pass.foreign_complete = after.is_none() || after.as_deref() == Some(upper);
+                state.pass.foreign_after = after;
+                for row in rows {
+                    let result = async {
+                        let execution = row?;
+                        if execution.lease_until > pioneer_crud::unix_to_datetime(now_unix) {
+                            let at = execution.lease_until.timestamp().saturating_add(i64::from(
+                                execution.lease_until.timestamp_subsec_nanos() != 0,
+                            ));
+                            state.pass.nearest =
+                                Some(state.pass.nearest.map_or(at, |old| old.min(at)));
+                            return Ok::<_, anyhow::Error>(());
+                        }
+                        if let Some(claimed) = self
+                            .crud_store
+                            .claim_expired_turn_execution(
+                                &execution,
+                                self.turn_execution_owner_id.as_ref(),
+                                now_unix,
+                                now_unix.saturating_add(RECOVERY_JOB_CLAIM_LEASE_SECS as i64),
+                            )
+                            .await?
+                        {
+                            self.enqueue_claimed_turn_execution_recovery(&claimed, now_unix)
+                                .await?;
+                        }
+                        Ok::<_, anyhow::Error>(())
+                    }
+                    .await;
+                    if let Err(error) = result {
+                        errors.push(format!("foreign orphan: {error:#}"));
+                    }
+                }
+            } else {
+                state.pass.foreign_complete = true;
+            }
         }
 
+        // Visit each owned recovering key once per relevant generation. An
+        // accepted CLI outcome or existing recovery episode can park this row;
+        // its own future mutation wakes the same control owner. Never rescan a
+        // parked prefix every quantum merely because it remains Recovering.
+        if !state.pass.complete {
+            if state.pass.upper.is_none() {
+                state.pass.upper = self
+                    .crud_store
+                    .owned_recovering_execution_upper(self.turn_execution_owner_id.as_ref())
+                    .await?;
+            }
+            if let Some(upper) = state.pass.upper.as_deref() {
+                let (after, rows) = self
+                    .crud_store
+                    .owned_recovering_execution_page(
+                        self.turn_execution_owner_id.as_ref(),
+                        state.pass.after.as_deref(),
+                        upper,
+                        limit,
+                    )
+                    .await?;
+                state.pass.complete = after.is_none() || after.as_deref() == Some(upper);
+                state.pass.after = after;
+                for row in rows {
+                    let result = async {
+                        let row = row?;
+                        self.enqueue_claimed_turn_execution_recovery(&row, now_unix)
+                            .await
+                    }
+                    .await;
+                    if let Err(error) = result {
+                        errors.push(format!("orphan execution: {error:#}"));
+                    }
+                }
+            } else {
+                state.pass.complete = true;
+            }
+        }
+        state.completed_quantum = true;
+        if !errors.is_empty() {
+            let at = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+            state.pass.retry = Some(state.pass.retry.map_or(at, |old| old.min(at)));
+            anyhow::bail!(errors.join("; "));
+        }
         Ok(())
     }
 
@@ -2137,6 +2359,83 @@ impl RecoveryCoordinator {
         Ok(Vec::new())
     }
 
+    pub(crate) fn orphan_supervision_more(&self) -> bool {
+        let observed = self
+            .crud_store
+            .background_work("recovery.control")
+            .observe();
+        let pass = self.orphan_scan.lock().unwrap();
+        pass.generation != Some(observed)
+            || (!pass.complete
+                || !pass.foreign_complete
+                || (pass.rescan && pass.retry.is_none())
+                || pass
+                    .retry
+                    .is_some_and(|at| at <= tokio::time::Instant::now())
+                || pass
+                    .wall_deadline()
+                    .is_some_and(|at| at <= self.supervision_wall_seconds()))
+    }
+    pub(crate) fn orphan_supervision_deadline(&self) -> Option<i64> {
+        let pass = self.orphan_scan.lock().unwrap();
+        pass.wall_deadline()
+    }
+
+    pub(crate) fn active_supervision_schedule(&self) -> (bool, Option<i64>) {
+        let pass = self.active_scan.lock().unwrap();
+        (
+            pass.generation.is_some()
+                && (!pass.complete
+                    || (pass.rescan && pass.retry.is_none())
+                    || pass
+                        .retry
+                        .is_some_and(|at| at <= tokio::time::Instant::now())
+                    || pass
+                        .wall_deadline()
+                        .is_some_and(|at| at <= self.supervision_wall_seconds())),
+            pass.wall_deadline(),
+        )
+    }
+
+    fn supervision_wall_seconds(&self) -> i64 {
+        self.crud_store
+            .background_work("recovery.control")
+            .wall_now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            .min(i64::MAX as u64) as i64
+    }
+
+    pub(crate) fn supervision_retry_deadline(&self) -> Option<tokio::time::Instant> {
+        // Copy under independent short locks; no SQL/await/notification here.
+        let active = self.active_scan.lock().unwrap().retry;
+        let orphan = self.orphan_scan.lock().unwrap().retry;
+        active.into_iter().chain(orphan).min()
+    }
+
+    pub(crate) fn supervision_retry_plan(
+        &self,
+        at: tokio::time::Instant,
+    ) -> pioneer_sqlite::background::Plan {
+        use pioneer_sqlite::background::Plan;
+        // An early error return has not completed every authoritative phase.
+        // Retain independent FUTURE clocks, but do not turn an already overdue
+        // observation into immediate retries of this same failing quantum.
+        let now = self.supervision_wall_seconds();
+        let next = self
+            .active_supervision_schedule()
+            .1
+            .into_iter()
+            .chain(self.orphan_supervision_deadline())
+            .filter(|wall| *wall > now)
+            .min();
+        next.map_or(Plan::Dormant, |wall| {
+            Plan::WallDeadline(pioneer_crud::unix_to_datetime(wall).into())
+        })
+        .with_monotonic_deadline(at)
+    }
+
     async fn expire_active_recovery_jobs(
         &self,
         now_unix: i64,
@@ -2145,41 +2444,83 @@ impl RecoveryCoordinator {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let jobs = {
-            // Serialize only discovery cursor updates, never domain work.
-            let mut scan = self.active_scan.lock().await;
-            if scan.1.is_none() {
-                scan.1 = self.crud_store.active_recovery_job_upper_id().await?;
-            }
-            let Some(upper) = scan.1.as_deref() else {
-                return Ok(Vec::new());
-            };
-            let jobs = self
-                .crud_store
-                .list_active_recovery_job_page(scan.0.as_deref(), upper, limit)
-                .await?;
-            if let Some(last) = jobs.last() {
-                if scan.1.as_ref() == Some(&last.id) {
-                    *scan = (None, None);
-                } else {
-                    scan.0 = Some(last.id.clone());
-                }
-            } else {
-                *scan = (None, None);
-            }
-            jobs
+        let wake = self.crud_store.background_work("recovery.control");
+        let Some(_drain) = wake.drain().await else {
+            return Ok(Vec::new());
         };
+        let generation = wake.observe();
+        let mut state = ActiveSupervisionGuard {
+            completed_quantum: false,
+            saved: self.active_scan.clone(),
+            pass: std::mem::take(&mut *self.active_scan.lock().unwrap()),
+        };
+        if state.pass.generation != Some(generation) {
+            if state.pass.generation.is_none() || state.pass.complete {
+                state.pass = ActiveSupervisionPass {
+                    generation: Some(generation),
+                    ..Default::default()
+                };
+            } else {
+                state.pass.generation = Some(generation);
+                state.pass.rescan = true;
+            }
+        }
+        if state.pass.complete
+            && ((!state.pass.cooling() && state.pass.nearest.is_some_and(|at| at <= now_unix))
+                || state
+                    .pass
+                    .retry
+                    .is_some_and(|at| at <= tokio::time::Instant::now())
+                || (state.pass.rescan && state.pass.retry.is_none()))
+        {
+            state.pass = ActiveSupervisionPass {
+                generation: Some(generation),
+                ..Default::default()
+            };
+        }
+        if state.pass.complete {
+            state.completed_quantum = true;
+            return Ok(Vec::new());
+        }
+        if state.pass.upper.is_none() {
+            state.pass.upper = self.crud_store.active_recovery_job_upper_id().await?;
+        }
+        let Some(upper) = state.pass.upper.as_deref() else {
+            state.pass.complete = true;
+            state.completed_quantum = true;
+            return Ok(Vec::new());
+        };
+        let (after, jobs) = self
+            .crud_store
+            .list_active_recovery_job_page(state.pass.after.as_deref(), upper, limit)
+            .await?;
+        state.pass.complete = after.is_none() || after.as_ref() == state.pass.upper.as_ref();
+        state.pass.after = after;
         let mut events = Vec::new();
         let mut errors = Vec::new();
         for job in jobs {
-            match self.expire_active_recovery_job(job, now_unix).await {
-                Ok(mut found) => events.append(&mut found),
+            let outcome = match job {
+                Ok(job) => self.expire_active_recovery_job(job, now_unix).await,
+                Err(error) => Err(error),
+            };
+            match outcome {
+                Ok((mut found, deadline)) => {
+                    events.append(&mut found);
+                    if let Some(at) = deadline {
+                        state.pass.nearest = Some(state.pass.nearest.map_or(at, |old| old.min(at)));
+                    }
+                }
                 Err(error) => {
                     warn!(error = %format!("{error:#}"), "active recovery row deferred");
                     errors.push(format!("active recovery: {error:#}"));
+                    // A bounded error retry owns this unfinished obligation;
+                    // poison is not a successful settled Empty.
+                    let at = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+                    state.pass.retry = Some(state.pass.retry.map_or(at, |old| old.min(at)));
                 }
             }
         }
+        state.completed_quantum = true;
         finish_recovery_phases(events, errors)
     }
 
@@ -2187,12 +2528,12 @@ impl RecoveryCoordinator {
         &self,
         job: RecoveryJobRecord,
         now_unix: i64,
-    ) -> Result<Vec<RecoveryCoordinatorEvent>> {
+    ) -> Result<(Vec<RecoveryCoordinatorEvent>, Option<i64>)> {
         let mut events = Vec::new();
 
         let policy = self.policy_for_recovery_job(&job).await?;
         let Some(max_wall_clock_secs) = i64::try_from(policy.max_wall_clock_secs).ok() else {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), None));
         };
         let wall_clock_elapsed = now_unix.saturating_sub(job.scheduled_at_unix);
         let active_elapsed = job
@@ -2227,7 +2568,34 @@ impl RecoveryCoordinator {
         let attempt_budget_exceeded =
             active_elapsed > attempt_wall_clock_secs && !progress_since_attempt;
         if !job_budget_exceeded && !attempt_budget_exceeded {
-            return Ok(Vec::new());
+            // Exact integer-second predicates use strict >, hence +1. Fresh
+            // causal progress postpones the budget only until its real stale
+            // frontier; an owner heartbeat cannot postpone it.
+            let mut deadline = job
+                .scheduled_at_unix
+                .saturating_add(max_wall_clock_secs)
+                .saturating_add(1)
+                .min(
+                    job.active_attempt_started_at_unix
+                        .unwrap_or(job.updated_at_unix)
+                        .saturating_add(attempt_wall_clock_secs)
+                        .saturating_add(1),
+                );
+            if let Some(frontier) = progress_frontier.as_ref().filter(|frontier| {
+                is_causal_recovery_progress(&frontier.last_activity_kind)
+                    && frontier.last_activity_at_unix
+                        > job
+                            .active_attempt_started_at_unix
+                            .unwrap_or(job.updated_at_unix)
+            }) {
+                deadline = deadline.max(
+                    frontier
+                        .last_activity_at_unix
+                        .saturating_add(RECOVERY_PROGRESS_STALE_SECS)
+                        .saturating_add(1),
+                );
+            }
+            return Ok((Vec::new(), Some(deadline)));
         }
 
         let message = Some(if job_budget_exceeded {
@@ -2333,7 +2701,7 @@ impl RecoveryCoordinator {
                 ));
             }
         }
-        Ok(events)
+        Ok((events, None))
     }
 
     async fn run_single_job(
@@ -4259,49 +4627,88 @@ impl RecoveryCoordinator {
         let mut events = Vec::new();
 
         for candidate in candidates {
-            let liveness = self
-                .crud_store
-                .get_turn_liveness(candidate.turn_id.as_str())
-                .await?;
-            if let TimeoutRecoveryClassification::SuppressRecoveryBecauseTurnProgressed {
-                liveness,
-            } = classify_timeout_candidate_liveness(&candidate, liveness.as_ref())
-            {
-                let context = timeout_recovery_suppression_context(&candidate, &liveness);
-                let _ = self
-                    .crud_store
-                    .suppress_timeout_candidate_recovery(
-                        &candidate,
-                        TIMEOUT_RECOVERY_SUPPRESSED_TURN_PROGRESS,
-                        context,
-                        now_unix,
-                    )
-                    .await?;
-                continue;
-            }
+            events.extend(
+                self.backfill_timeout_candidate(&candidate, now_unix)
+                    .await?,
+            );
+        }
+        Ok(events)
+    }
 
-            if self
-                .suppress_timeout_recovery_if_turn_not_in_progress(&candidate, now_unix)
-                .await?
-            {
-                continue;
+    async fn backfill_timeout_candidates(
+        &self,
+        now_unix: i64,
+        limit: u64,
+        ids: &[String],
+    ) -> (Vec<RecoveryCoordinatorEvent>, Option<anyhow::Error>) {
+        let mut events = Vec::new();
+        let mut failure = None;
+        for id in ids.iter().take(limit.min(64) as usize) {
+            let result = async {
+                let Some(candidate) = self.crud_store.unqueued_timeout_candidate_by_id(id).await?
+                else {
+                    return Ok(Vec::new());
+                };
+                self.backfill_timeout_candidate(&candidate, now_unix).await
             }
-
-            if let Some((_job_id, active_events)) = self
-                .record_recovery_timeout_failure(&candidate, now_unix)
-                .await?
-            {
-                events.extend(active_events);
-            } else {
-                let outcome = self.enqueue_timeout_job(&candidate, now_unix).await?;
-                events.push(recovery_enqueue_event_from_outcome(
-                    &candidate,
-                    RecoveryTrigger::Timeout,
-                    outcome,
-                ));
+            .await;
+            match result {
+                Ok(mut found) => events.append(&mut found),
+                Err(error) => {
+                    warn!(error = %format!("{error:#}"), "timeout backfill point deferred");
+                    failure.get_or_insert(error);
+                }
             }
         }
+        (events, failure)
+    }
 
+    async fn backfill_timeout_candidate(
+        &self,
+        candidate: &TimeoutCandidate,
+        now_unix: i64,
+    ) -> Result<Vec<RecoveryCoordinatorEvent>> {
+        let mut events = Vec::new();
+        let liveness = self
+            .crud_store
+            .get_turn_liveness(candidate.turn_id.as_str())
+            .await?;
+        if let TimeoutRecoveryClassification::SuppressRecoveryBecauseTurnProgressed { liveness } =
+            classify_timeout_candidate_liveness(candidate, liveness.as_ref())
+        {
+            let context = timeout_recovery_suppression_context(candidate, &liveness);
+            let _ = self
+                .crud_store
+                .suppress_timeout_candidate_recovery(
+                    candidate,
+                    TIMEOUT_RECOVERY_SUPPRESSED_TURN_PROGRESS,
+                    context,
+                    now_unix,
+                )
+                .await?;
+            return Ok(events);
+        }
+
+        if self
+            .suppress_timeout_recovery_if_turn_not_in_progress(candidate, now_unix)
+            .await?
+        {
+            return Ok(events);
+        }
+
+        if let Some((_job_id, active_events)) = self
+            .record_recovery_timeout_failure(candidate, now_unix)
+            .await?
+        {
+            events.extend(active_events);
+        } else {
+            let outcome = self.enqueue_timeout_job(candidate, now_unix).await?;
+            events.push(recovery_enqueue_event_from_outcome(
+                candidate,
+                RecoveryTrigger::Timeout,
+                outcome,
+            ));
+        }
         Ok(events)
     }
 

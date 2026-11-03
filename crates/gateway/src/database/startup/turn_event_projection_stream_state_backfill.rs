@@ -2,7 +2,6 @@ use anyhow::{Context, Result};
 use pioneer_crud::{
     CrudStore, PROJECTION_META_STATUS_BACKFILLING, PROJECTION_META_STATUS_COMPLETE,
     PROJECTION_META_STATUS_FAILED, ProjectionMetaRecord, find_projection_meta,
-    upsert_projection_meta,
 };
 use sea_orm::ConnectionTrait;
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
@@ -64,9 +63,8 @@ pub(crate) async fn backfill_once(
     }
 
     let started_at = now_datetime();
-    upsert_projection_meta(
-        &db,
-        ProjectionMetaRecord {
+    crud_store
+        .upsert_projection_meta(ProjectionMetaRecord {
             projection_key: PROJECTION_STREAM_STATE_BACKFILL_KEY.to_owned(),
             projection_version: PROJECTION_STREAM_STATE_BACKFILL_VERSION,
             status: PROJECTION_META_STATUS_BACKFILLING.to_owned(),
@@ -79,19 +77,18 @@ pub(crate) async fn backfill_once(
             backfilled_at: None,
             created_at: started_at,
             updated_at: started_at,
-        },
-    )
-    .await?;
+        })
+        .await?;
 
     let result =
         backfill_all_batches(crud_store, PROJECTION_STREAM_STATE_BACKFILL_BATCH_SIZE).await;
     match result {
         Ok(summary) => {
-            mark_backfill_complete(&db, started_at, &summary).await?;
+            mark_backfill_complete(crud_store, started_at, &summary).await?;
             Ok(summary)
         }
         Err(error) => {
-            mark_backfill_failed(&db, started_at, &error).await?;
+            mark_backfill_failed(crud_store, started_at, &error).await?;
             Err(error)
         }
     }
@@ -156,15 +153,14 @@ async fn backfill_is_current<C: ConnectionTrait>(db: &C) -> Result<bool> {
     )
 }
 
-async fn mark_backfill_complete<C: ConnectionTrait>(
-    db: &C,
+async fn mark_backfill_complete(
+    store: &CrudStore,
     started_at: DateTimeWithTimeZone,
     summary: &ProjectionStreamStateBackfillSummary,
 ) -> Result<()> {
     let completed_at = now_datetime();
-    upsert_projection_meta(
-        db,
-        ProjectionMetaRecord {
+    store
+        .upsert_projection_meta(ProjectionMetaRecord {
             projection_key: PROJECTION_STREAM_STATE_BACKFILL_KEY.to_owned(),
             projection_version: PROJECTION_STREAM_STATE_BACKFILL_VERSION,
             status: PROJECTION_META_STATUS_COMPLETE.to_owned(),
@@ -177,20 +173,18 @@ async fn mark_backfill_complete<C: ConnectionTrait>(
             backfilled_at: Some(completed_at),
             created_at: started_at,
             updated_at: completed_at,
-        },
-    )
-    .await
+        })
+        .await
 }
 
-async fn mark_backfill_failed<C: ConnectionTrait>(
-    db: &C,
+async fn mark_backfill_failed(
+    store: &CrudStore,
     started_at: DateTimeWithTimeZone,
     error: &anyhow::Error,
 ) -> Result<()> {
     let failed_at = now_datetime();
-    upsert_projection_meta(
-        db,
-        ProjectionMetaRecord {
+    store
+        .upsert_projection_meta(ProjectionMetaRecord {
             projection_key: PROJECTION_STREAM_STATE_BACKFILL_KEY.to_owned(),
             projection_version: PROJECTION_STREAM_STATE_BACKFILL_VERSION,
             status: PROJECTION_META_STATUS_FAILED.to_owned(),
@@ -203,9 +197,8 @@ async fn mark_backfill_failed<C: ConnectionTrait>(
             backfilled_at: None,
             created_at: started_at,
             updated_at: failed_at,
-        },
-    )
-    .await
+        })
+        .await
 }
 
 fn now_datetime() -> DateTimeWithTimeZone {

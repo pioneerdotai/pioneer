@@ -738,6 +738,16 @@ pub async fn find_delivery_by_id<C: ConnectionTrait>(
         .context("failed to query task delivery by id")
 }
 
+pub(crate) fn due_condition(now: DateTimeWithTimeZone) -> sea_orm::Condition {
+    sea_orm::Condition::all()
+        .add(task_delivery::Column::Status.eq("pending"))
+        .add(
+            task_delivery::Column::NextAttemptAt
+                .is_null()
+                .or(task_delivery::Column::NextAttemptAt.lte(now)),
+        )
+}
+
 pub async fn list_due_deliveries<C: ConnectionTrait>(
     db: &C,
     now: DateTimeWithTimeZone,
@@ -747,12 +757,7 @@ pub async fn list_due_deliveries<C: ConnectionTrait>(
         bail!("due Task delivery batch exceeds its bounded limit");
     }
     task_delivery::Entity::find()
-        .filter(task_delivery::Column::Status.eq("pending"))
-        .filter(
-            task_delivery::Column::NextAttemptAt
-                .is_null()
-                .or(task_delivery::Column::NextAttemptAt.lte(now)),
-        )
+        .filter(due_condition(now))
         .order_by_asc(task_delivery::Column::NextAttemptAt)
         .order_by_asc(task_delivery::Column::CreatedAt)
         .limit(limit)

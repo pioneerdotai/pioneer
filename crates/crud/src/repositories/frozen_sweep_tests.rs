@@ -300,11 +300,7 @@ mod durable_sweep {
         )
         .await;
         let mut restart = FrozenStorageLifetimeProgress::default();
-        restart.revisit_completed_cleanup(Instant::now(), Duration::from_secs(60));
-        restart.revisit_completed_cleanup(
-            Instant::now() + Duration::from_secs(61),
-            Duration::from_secs(60),
-        );
+        restart.invalidate_completed_cleanup();
         for _ in 0..3 {
             assert!(!restart.sweep_quantum(&store).await.unwrap());
         }

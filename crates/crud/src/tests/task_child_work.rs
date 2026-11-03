@@ -706,3 +706,201 @@ async fn failed_seed_claim_retains_owned_deferred_work_until_post_deadline_eof()
         ChildSeedOutcome::CommittedDone
     );
 }
+
+// The primary lifecycle owner protects concrete nearest clocks; scheduler
+// fairness, claim ABA and business repair fixtures remain in their own suites.
+struct LifecycleDue {
+    child: bool,
+    occurrence: bool,
+    delivery: bool,
+}
+async fn lifecycle_due(store: &crate::CrudStore, now: i64) -> anyhow::Result<LifecycleDue> {
+    let clocks = store.task_lifecycle_deadlines(now).await?;
+    Ok(LifecycleDue {
+        child: clocks
+            .child_point
+            .into_iter()
+            .chain(clocks.child_scope)
+            .any(|at| at <= now),
+        occurrence: clocks.occurrence.is_some_and(|at| at <= now),
+        delivery: clocks
+            .delivery_pending
+            .is_some_and(|at| at <= crate::util::unix_to_datetime(now))
+            || clocks.delivery_recovery.is_some_and(|at| at <= now),
+    })
+}
+#[tokio::test]
+async fn lifecycle_admission_reconstructs_deadlines_parked_work_and_unknown_producers() {
+    use crate::repositories::task_child_work::{ChildScope, enqueue_point, enqueue_scope};
+    use pioneer_entity::{
+        task_child_reconcile_pending as point, task_run_occurrence_reconcile_pending as parent,
+    };
+    use sea_orm::sea_query::Expr;
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, Set, TransactionTrait};
+    let store = test_store_with_workspace("admission-queues")
+        .await
+        .with_maintenance_access();
+    let db = store.database_connection();
+    while store.expand_child_scope(100, true).await.unwrap() {}
+    for _ in 0..3 {
+        let empty = lifecycle_due(&store, 99).await.unwrap();
+        assert!(!empty.child && !empty.occurrence && !empty.delivery);
+    }
+    // Seed retries/claims retain their own clock; incomplete does not imply due.
+    pioneer_entity::task_child_reconcile_scope::Entity::update_many()
+        .col_expr(
+            pioneer_entity::task_child_reconcile_scope::Column::NextAttemptAt,
+            Expr::value(200_i64),
+        )
+        .exec(&db)
+        .await
+        .unwrap();
+    assert!(!lifecycle_due(&store, 199).await.unwrap().child);
+    assert!(lifecycle_due(&store, 200).await.unwrap().child);
+    pioneer_entity::task_child_reconcile_scope::Entity::update_many()
+        .col_expr(
+            pioneer_entity::task_child_reconcile_scope::Column::NextAttemptAt,
+            Expr::value(Option::<i64>::None),
+        )
+        .exec(&db)
+        .await
+        .unwrap();
+    let tx = db.begin().await.unwrap();
+    enqueue_point(&tx, "thread", "turn", 100).await.unwrap();
+    enqueue_scope(&tx, ChildScope::Task("task".into()), 200)
+        .await
+        .unwrap();
+    parent::Entity::insert(parent::ActiveModel {
+        run_id: Set("run".into()),
+        generation: Set(1),
+        next_attempt_at: Set(100),
+        attempt_count: Set(0),
+        claim_token: Set(None),
+    })
+    .exec_without_returning(&tx)
+    .await
+    .unwrap();
+    tx.commit().await.unwrap(); // No process-local wake: reconstruct committed work.
+    let clocks = store.task_lifecycle_deadlines(99).await.unwrap();
+    assert_eq!(clocks.child_point, Some(100));
+    assert_eq!(clocks.child_scope, Some(200));
+    assert_eq!(clocks.occurrence, Some(100));
+    let future = lifecycle_due(&store, 99).await.unwrap();
+    assert!(!future.child && !future.occurrence);
+    let due = lifecycle_due(&store, 100).await.unwrap();
+    assert!(due.child && due.occurrence && !due.delivery);
+    // Lease/defer clocks and parked NULL have the same semantics as discovery.
+    point::Entity::update_many()
+        .col_expr(
+            point::Column::NextAttemptAt,
+            Expr::value(Option::<i64>::None),
+        )
+        .filter(point::Column::TurnId.eq("turn"))
+        .exec(&db)
+        .await
+        .unwrap();
+    parent::Entity::delete_many().exec(&db).await.unwrap();
+    assert!(!lifecycle_due(&store, 199).await.unwrap().child);
+    assert!(lifecycle_due(&store, 200).await.unwrap().child);
+    enqueue_point(&db, "thread", "turn", 101).await.unwrap();
+    assert!(lifecycle_due(&store, 101).await.unwrap().child);
+    // Unknown foreign producer generation invalidates Empty on every read.
+    db.execute_unprepared("CREATE TRIGGER task_occurrence_reconcile_admission_unknown AFTER UPDATE ON task BEGIN SELECT 1; END").await.unwrap();
+    assert!(
+        store.task_lifecycle_deadlines(0).await.is_err(),
+        "an unknown producer catalog cannot publish Empty or a deadline"
+    );
+}
+
+#[tokio::test]
+async fn lifecycle_delivery_admission_respects_null_due_grace_retry_and_terminal_history() {
+    use pioneer_entity::{task_delivery as delivery, task_delivery_recovery_retry as retry};
+    use sea_orm::{EntityTrait, Set};
+    let store = test_store_with_workspace("admission-delivery")
+        .await
+        .with_maintenance_access();
+    let db = store.database_connection();
+    pioneer_sqlite::apply_sqlite_pragmas(&db).await.unwrap();
+    let mut row = delivery::ActiveModel {
+        id: Set("delivery".into()),
+        workspace_id: Set("admission-delivery".into()),
+        task_id: Set("task".into()),
+        run_id: Set("run".into()),
+        delivery_key: Set("key".into()),
+        mode: Set("user_notification".into()),
+        status: Set("pending".into()),
+        next_attempt_at: Set(None),
+        attempt_count: Set(1),
+        max_attempts: Set(3),
+        created_at: Set(crate::util::unix_to_datetime(100)),
+        updated_at: Set(crate::util::unix_to_datetime(100)),
+        ..Default::default()
+    };
+    delivery::Entity::insert(row.clone())
+        .exec_without_returning(&db)
+        .await
+        .unwrap();
+    assert!(lifecycle_due(&store, 100).await.unwrap().delivery);
+    row.next_attempt_at = Set(Some(crate::util::unix_to_datetime(500)));
+    delivery::Entity::update(row.clone())
+        .exec(&db)
+        .await
+        .unwrap();
+    assert!(!lifecycle_due(&store, 499).await.unwrap().delivery);
+    assert!(lifecycle_due(&store, 500).await.unwrap().delivery);
+    row.status = Set("delivering".into());
+    for (nanos, first_due) in [(0, 400), (1, 401), (500_000_000, 401), (999_999_999, 401)] {
+        row.updated_at =
+            Set(crate::util::unix_to_datetime(100) + chrono::Duration::nanoseconds(nanos));
+        delivery::Entity::update(row.clone())
+            .exec(&db)
+            .await
+            .unwrap();
+        assert!(!lifecycle_due(&store, first_due - 1).await.unwrap().delivery);
+        assert!(lifecycle_due(&store, first_due).await.unwrap().delivery);
+        // Compare the advisory deadline to the actual raw recovery source,
+        // including precision finer than SQLite's floating date functions.
+        assert!(
+            store
+                .task_delivery_recovery_page(first_due - 301, None, 1)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .task_delivery_recovery_page(first_due - 300, None, 1)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+    retry::Entity::insert(retry::ActiveModel {
+        delivery_id: Set("delivery".into()),
+        expected_attempt_id: Set(None),
+        expected_attempt_count: Set(1),
+        expected_updated_at: Set(crate::util::unix_to_datetime(100)),
+        retry_token: Set("retry".into()),
+        next_probe_at: Set(600),
+        attempts: Set(1),
+    })
+    .exec_without_returning(&db)
+    .await
+    .unwrap();
+    assert_eq!(
+        store
+            .task_lifecycle_deadlines(599)
+            .await
+            .unwrap()
+            .delivery_recovery,
+        Some(600)
+    );
+    assert!(!lifecycle_due(&store, 599).await.unwrap().delivery);
+    assert!(lifecycle_due(&store, 600).await.unwrap().delivery);
+    // Clock reversal does not retain a stale Ready cache.
+    assert!(!lifecycle_due(&store, 399).await.unwrap().delivery);
+    row.status = Set("delivered".into());
+    delivery::Entity::update(row).exec(&db).await.unwrap();
+    assert!(!lifecycle_due(&store, 1000).await.unwrap().delivery);
+}

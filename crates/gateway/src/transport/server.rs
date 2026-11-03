@@ -241,6 +241,25 @@ pub async fn spawn_server(
         .context("failed to read bound gateway server address")?;
 
     message_processor.set_gateway_listen_addr(local_addr);
+    let local_listener = if local_addr.ip().is_loopback() || local_addr.ip().is_unspecified() {
+        None
+    } else {
+        Some(
+            TcpListener::bind("127.0.0.1:0")
+                .await
+                .context("failed to bind local owner ingress")?,
+        )
+    };
+    let operation_addr = match local_listener.as_ref() {
+        Some(listener) => listener.local_addr()?,
+        None => local_addr,
+    };
+    crate::local_operations::publish(
+        &config,
+        message_processor.local_operation_home(),
+        message_processor.gateway_secrets(),
+        operation_addr,
+    )?;
     let state = GatewayHttpState::new(
         config,
         auth,
@@ -250,16 +269,45 @@ pub async fn spawn_server(
     )
     .map_err(|error| anyhow::anyhow!("invalid Gateway HTTP configuration: {error:?}"))?;
     let app = gateway_router(state.clone());
+    let local_app = super::http::local_owner_router(state.clone());
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let readiness = state.readiness();
+    let stop_on_error = shutdown_tx.clone();
     let join_handle = tokio::spawn(async move {
-        axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .with_graceful_shutdown(shutdown_signal(shutdown_rx, state))
-        .await
-        .context("Axum Gateway server failed")
+        let main_app = app.clone();
+        let main_state = state.clone();
+        let main_shutdown = shutdown_rx.clone();
+        let main_stop = stop_on_error.clone();
+        let main = async move {
+            let result = axum::serve(
+                listener,
+                main_app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(shutdown_signal(main_shutdown, main_state))
+            .await;
+            if result.is_err() {
+                let _ = main_stop.send(true);
+            }
+            result.context("Axum Gateway server failed")
+        };
+        let local = async move {
+            if let Some(listener) = local_listener {
+                let result = axum::serve(
+                    listener,
+                    local_app.into_make_service_with_connect_info::<SocketAddr>(),
+                )
+                .with_graceful_shutdown(shutdown_signal(shutdown_rx, state))
+                .await;
+                if result.is_err() {
+                    let _ = stop_on_error.send(true);
+                }
+                result.context("local owner ingress failed")?;
+            }
+            Ok::<(), anyhow::Error>(())
+        };
+        // Both listeners use one runtime/services and both drain before DB close.
+        let (main, local) = tokio::join!(main, local);
+        main.and(local)
     });
 
     Ok(GatewayServerHandle {

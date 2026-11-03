@@ -1,6 +1,6 @@
 use pioneer_crud::AppendedTaskEvent;
 use std::sync::Arc;
-use tokio::sync::{Notify, broadcast};
+use tokio::sync::broadcast;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskEventWake {
@@ -87,7 +87,13 @@ pub enum TaskEventWakeDelivery {
 #[derive(Clone)]
 pub struct TaskEventBus {
     sender: broadcast::Sender<TaskEventWake>,
-    scheduler_notify: Arc<Notify>,
+    scheduler_binding: Arc<
+        std::sync::OnceLock<(
+            Arc<pioneer_sqlite::background::Wake>,
+            Arc<crate::scheduler::SchedulerState>,
+            Arc<pioneer_crud::TaskSchedulerChanges>,
+        )>,
+    >,
 }
 
 impl Default for TaskEventBus {
@@ -101,12 +107,33 @@ impl TaskEventBus {
         let (sender, _) = broadcast::channel(1024);
         Self {
             sender,
-            scheduler_notify: Arc::new(Notify::new()),
+            scheduler_binding: Default::default(),
         }
     }
 
-    pub(crate) fn scheduler_notify(&self) -> Arc<Notify> {
-        self.scheduler_notify.clone()
+    pub(crate) fn bind_scheduler(
+        &self,
+        store: &pioneer_crud::CrudStore,
+    ) -> (
+        Arc<pioneer_sqlite::background::Wake>,
+        Arc<crate::scheduler::SchedulerState>,
+        Arc<pioneer_crud::TaskSchedulerChanges>,
+    ) {
+        let wake = store.background_work("tasks.scheduler");
+        let bound = self.scheduler_binding.get_or_init(|| {
+            (
+                wake.clone(),
+                store
+                    .database_connection()
+                    .shared_resource::<crate::scheduler::SchedulerState>(),
+                store.task_scheduler_changes(),
+            )
+        });
+        assert!(
+            Arc::ptr_eq(&bound.0, &wake),
+            "one Task event bus cannot span distinct database runtimes"
+        );
+        bound.clone()
     }
 
     pub fn subscribe(&self, filter: TaskEventFilter) -> TaskEventSubscription {
@@ -121,8 +148,9 @@ impl TaskEventBus {
             return;
         }
         let _ = self.sender.send(TaskEventWake::from_committed_event(event));
-        // A permit survives publication between processing and registering a wait.
-        self.scheduler_notify.notify_one();
+        // Durable lower mutation boundaries already publish addressed inputs.
+        // Re-publishing a saved business event must not masquerade as a commit
+        // or overwrite the scheduler's newer trigger observations.
     }
 
     pub async fn publish_many(&self, events: Vec<AppendedTaskEvent>) {
@@ -138,24 +166,6 @@ pub struct TaskEventSubscription {
 }
 
 impl TaskEventSubscription {
-    pub(crate) fn try_recv(&mut self) -> Option<TaskEventWakeDelivery> {
-        loop {
-            match self.receiver.try_recv() {
-                Ok(wake) if self.filter.matches(&wake) => {
-                    return Some(TaskEventWakeDelivery::Wake(wake));
-                }
-                Ok(_) => {}
-                Err(broadcast::error::TryRecvError::Empty) => return None,
-                Err(broadcast::error::TryRecvError::Lagged(count)) => {
-                    return Some(TaskEventWakeDelivery::Lagged(count));
-                }
-                Err(broadcast::error::TryRecvError::Closed) => {
-                    return Some(TaskEventWakeDelivery::Closed);
-                }
-            }
-        }
-    }
-
     pub async fn recv(&mut self) -> TaskEventWakeDelivery {
         loop {
             match self.receiver.recv().await {

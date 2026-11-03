@@ -380,23 +380,41 @@ async fn waits_for_backfill_and_requires_maintenance_reads_and_writes() {
     );
     assert_eq!(boundary(&store, "turn").await, 0);
     ready(&store).await;
-    for invalid_marker in [
-        "UPDATE thread_timeline_projection_meta SET projection_version = 2",
-        "UPDATE thread_timeline_projection_meta SET status = 'backfilling'",
-        "UPDATE thread_timeline_projection_meta SET last_error = 'injected failure'",
+    for (invalid_marker, failure) in [
+        (
+            "UPDATE thread_timeline_projection_meta SET projection_version = 2",
+            false,
+        ),
+        (
+            "UPDATE thread_timeline_projection_meta SET status = 'backfilling'",
+            false,
+        ),
+        (
+            "UPDATE thread_timeline_projection_meta SET last_error = 'injected failure'",
+            true,
+        ),
+        (
+            "UPDATE thread_timeline_projection_meta SET status = 'failed'",
+            true,
+        ),
     ] {
         store
             .database_connection()
             .execute_unprepared(invalid_marker)
             .await
             .unwrap();
-        let outcome = store
-            .cleanup_projection_receipts_quantum(None)
-            .await
-            .unwrap();
-        assert!(!outcome.backfill_ready);
-        assert!(outcome.last_turn_id.is_none());
-        assert_eq!(outcome.rows_deleted, 0);
+        let outcome = store.cleanup_projection_receipts_quantum(None).await;
+        if failure {
+            assert!(
+                outcome.is_err(),
+                "failed backfill must remain visible to error recovery"
+            );
+        } else {
+            let outcome = outcome.unwrap();
+            assert!(!outcome.backfill_ready);
+            assert!(outcome.last_turn_id.is_none());
+            assert_eq!(outcome.rows_deleted, 0);
+        }
         assert_eq!(boundary(&store, "turn").await, 0);
         assert_eq!(
             receipt::Entity::find()

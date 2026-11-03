@@ -622,3 +622,768 @@ async fn terminal_effect_single_kick_drains_more_than_one_full_quantum() {
         }
     }
 }
+
+#[tokio::test]
+async fn terminal_effect_owner_retains_lower_retry_deadline_and_coalesces_settled_kicks() {
+    let observer = Arc::new(NativeSchedulingObserver::default());
+    let (_directory, manager, store, workspace) =
+        setup_pooled_file_workspace_manager_with_observers(
+            Some(observer.clone()),
+            Some(observer.clone()),
+        )
+        .await;
+    let processor = Arc::new(MessageProcessor::new(
+        Arc::new(ThreadManager::new("test", "openai")),
+        test_provider(),
+        Arc::new(SessionManager::new()),
+        manager,
+        store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_tool_loop_config(),
+    ));
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    install_recoverable_test_hook_runtime(
+        &processor,
+        task_post_turn_recording_hook_runtime(calls.clone()),
+    )
+    .await;
+    let label = "__terminal_effect_owner_settled__";
+    processor.arm_completed_history_preparation_barrier(label);
+    let worker = tokio::spawn(MessageProcessor::run_native_terminal_effect_worker(
+        Arc::downgrade(&processor),
+    ));
+    timeout(
+        Duration::from_secs(5),
+        processor.wait_for_completed_history_preparation_barrier(),
+    )
+    .await
+    .unwrap();
+    processor.release_completed_history_preparation_barrier();
+    tokio::task::yield_now().await;
+    observer.reads.lock().unwrap().clear();
+    observer.writes.lock().unwrap().clear();
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(300)).await;
+    tokio::task::yield_now().await;
+    assert!(observer.reads.lock().unwrap().is_empty());
+    assert!(observer.writes.lock().unwrap().is_empty());
+    tokio::time::resume();
+    processor.arm_completed_history_preparation_barrier(label);
+    store.background_work("recovery.effects").invalidate();
+    timeout(
+        Duration::from_secs(5),
+        processor.wait_for_completed_history_preparation_barrier(),
+    )
+    .await
+    .unwrap();
+    let lower = CrudStore::new(store.database_connection());
+    seed_cli_runtime_turn_with_text(
+        &lower,
+        &workspace,
+        "codex",
+        "codex",
+        "effect-owner-thread",
+        "effect-owner-turn",
+        "native-effect-owner",
+        "input",
+    )
+    .await;
+    let binding = lower
+        .get_cli_runtime_turn_binding("effect-owner-turn")
+        .await
+        .unwrap()
+        .unwrap();
+    processor
+        .prepare_cli_post_turn_hook(&binding, 1, Some(&final_answer("done")))
+        .await
+        .unwrap();
+    commit_turn(&lower, &binding).await;
+    // A real prior claim/failure creates its durable retry. No kick or payload
+    // event replay is needed to discover this supported lower-store mutation.
+    let now = now_timestamp_secs();
+    let claimed = lower
+        .claim_due_native_terminal_effects(now, 90, 8)
+        .await
+        .unwrap();
+    assert_eq!(claimed.records.len(), 1);
+    let claimed = &claimed.records[0];
+    assert!(
+        lower
+            .fail_native_terminal_effect(
+                &claimed.effect_id,
+                &claimed.claim_token,
+                "effect_timeout",
+                "fixture transient",
+                true,
+                now + 3,
+                now
+            )
+            .await
+            .unwrap()
+    );
+    processor.arm_completed_history_preparation_barrier(label);
+    processor.release_completed_history_preparation_barrier();
+    timeout(
+        Duration::from_secs(5),
+        processor.wait_for_completed_history_preparation_barrier(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        calls.lock().unwrap().is_empty(),
+        "future retry cannot dispatch early"
+    );
+    observer.reads.lock().unwrap().clear();
+    observer.writes.lock().unwrap().clear();
+    processor.arm_completed_history_preparation_barrier(label);
+    processor.release_completed_history_preparation_barrier();
+    timeout(
+        Duration::from_secs(7),
+        processor.wait_for_completed_history_preparation_barrier(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(calls.lock().unwrap().len(), 1);
+    assert!(observer.reads.lock().unwrap().iter().all(|event| !matches!(event,
+        pioneer_sqlite::SqliteReadEvent::AdmissionEnqueued {class,..} if *class!=pioneer_sqlite::SqliteReadClass::Maintenance)));
+    assert_eq!(
+        lower
+            .native_terminal_effect_status("effect-owner-turn:terminal-effect:post-turn")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "succeeded"
+    );
+    observer.reads.lock().unwrap().clear();
+    observer.writes.lock().unwrap().clear();
+    for _ in 0..1000 {
+        processor.kick_native_terminal_effects();
+    }
+    processor.arm_completed_history_preparation_barrier(label);
+    processor.release_completed_history_preparation_barrier();
+    timeout(
+        Duration::from_secs(5),
+        processor.wait_for_completed_history_preparation_barrier(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        observer
+            .reads
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| matches!(
+                event,
+                pioneer_sqlite::SqliteReadEvent::OperationFinished {
+                    class: pioneer_sqlite::SqliteReadClass::Maintenance,
+                    ..
+                }
+            ))
+            .count(),
+        1,
+        "retained hints coalesce into one metadata observation, without an empty claim writer"
+    );
+    assert!(observer.writes.lock().unwrap().is_empty());
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        1,
+        "wake hints never replay business effects"
+    );
+    processor.release_completed_history_preparation_barrier();
+    tokio::task::yield_now().await;
+    observer.reads.lock().unwrap().clear();
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(300)).await;
+    tokio::task::yield_now().await;
+    assert!(observer.reads.lock().unwrap().is_empty());
+    assert!(observer.writes.lock().unwrap().is_empty());
+    processor.cli_history_shutdown.cancel();
+    worker.await.unwrap();
+}
+
+// Both matrices use the actual pooled file runtime and the existing owner
+// barriers. No recovery kick, synthetic receipt, or direct handler call rescues
+// the operation after the race has been released.
+async fn activation_owner_barrier(processor: &MessageProcessor) {
+    timeout(
+        Duration::from_secs(10),
+        processor.wait_for_completed_history_preparation_barrier(),
+    )
+    .await
+    .expect("owner must reach its armed publication boundary");
+}
+
+async fn prepare_frontier_intent(store: &CrudStore, workspace: &str, index: usize, at: i64) {
+    let mut answer = final_answer("accepted answer");
+    if let TurnItem::AgentMessage { id, .. } = &mut answer {
+        *id = format!("frontier-answer-{index:03}");
+    }
+    store
+        .prepare_turn_finalization(
+            &ItemCompletedNotification {
+                workspace_id: workspace.into(),
+                thread_id: format!("frontier-thread-{index:03}"),
+                turn_id: format!("frontier-turn-{index:03}"),
+                item: answer,
+            },
+            1,
+            None,
+            at,
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn finalization_owner_rescans_new_intent_after_owner_or_foreground_frontier() {
+    use pioneer_entity::turn_finalization as intent;
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+    for foreground in [false, true] {
+        let observer = Arc::new(NativeSchedulingObserver::default());
+        let (_directory, manager, store, workspace) =
+            setup_pooled_file_workspace_manager_with_observers(
+                Some(observer.clone()),
+                Some(observer.clone()),
+            )
+            .await;
+        let processor = Arc::new(MessageProcessor::new(
+            Arc::new(ThreadManager::new("test", "openai")),
+            test_provider(),
+            Arc::new(SessionManager::new()),
+            manager,
+            store.clone(),
+            test_gateway_secrets(),
+            test_summary_config(),
+            test_tool_loop_config(),
+        ));
+        let lower = CrudStore::new(store.database_connection());
+        let now = now_timestamp_secs();
+        // All 65 real Turns already exist; only the final supported PREPARE is
+        // withheld. Ascending prepared_at gives an unambiguous finite upper.
+        for index in 0..65 {
+            materialize_cli_runtime_turn_with_text(
+                &lower,
+                &workspace,
+                &format!("frontier-thread-{index:03}"),
+                &format!("frontier-turn-{index:03}"),
+                "question",
+            )
+            .await;
+        }
+        if !foreground {
+            for index in 0..64 {
+                prepare_frontier_intent(&lower, &workspace, index, now).await;
+            }
+        }
+        let label = "__finalization_before_wait__";
+        processor.arm_completed_history_preparation_barrier(label);
+        let worker = tokio::spawn(MessageProcessor::run_native_projection_owner(
+            Arc::downgrade(&processor),
+            true,
+        ));
+        activation_owner_barrier(&processor).await;
+        if foreground {
+            // Hold the owner's bootstrap EOF while the ordinary foreground
+            // entry point establishes and advances the SAME shared finite pass.
+            for index in 0..64 {
+                prepare_frontier_intent(&lower, &workspace, index, now).await;
+            }
+            let summary = lower
+                .reconcile_prepared_turn_finalizations(64, now)
+                .await
+                .unwrap();
+            assert_eq!(summary.committed_count(), 64);
+        }
+        let db = lower.database_connection();
+        assert_eq!(
+            intent::Entity::find()
+                .filter(intent::Column::Status.eq("committed"))
+                .all(&db)
+                .await
+                .unwrap()
+                .len(),
+            64
+        );
+        prepare_frontier_intent(&lower, &workspace, 64, now + 1).await;
+        // No further writes or kicks. The next quantum reaches EOF of OLD U;
+        // only retained rescan debt can make a fresh pass visit N > U.
+        processor.arm_completed_history_preparation_barrier(label);
+        processor.release_completed_history_preparation_barrier();
+        activation_owner_barrier(&processor).await;
+        processor.arm_completed_history_preparation_barrier(label);
+        processor.release_completed_history_preparation_barrier();
+        activation_owner_barrier(&processor).await;
+        let row = intent::Entity::find_by_id("frontier-turn-064")
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, "committed", "foreground={foreground}");
+        assert!(row.committed_at.is_some());
+        assert_eq!(
+            lower
+                .get_turn("frontier-thread-064", "frontier-turn-064")
+                .await
+                .unwrap()
+                .unwrap()
+                .1
+                .status,
+            TurnStatus::Completed
+        );
+        // This <64 fresh page includes N and establishes settled EOF. Release
+        // its barrier and wait for any already spawned optional deliveries.
+        processor.release_completed_history_preparation_barrier();
+        timeout(Duration::from_secs(10), async {
+            while processor
+                .native_turn_event_delivery_workers
+                .live
+                .running
+                .load(Ordering::Acquire)
+                || processor
+                    .native_turn_event_delivery_workers
+                    .episodic
+                    .running
+                    .load(Ordering::Acquire)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        observer.reads.lock().unwrap().clear();
+        observer.writes.lock().unwrap().clear();
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(300)).await;
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            observer.reads.lock().unwrap().is_empty(),
+            "foreground={foreground}"
+        );
+        assert!(observer.writes.lock().unwrap().is_empty());
+        tokio::time::resume();
+        worker.abort();
+        let _ = worker.await;
+    }
+}
+
+#[tokio::test]
+async fn dormant_effect_owner_is_woken_by_replay_and_recovered_finalization_activation() {
+    use pioneer_crud::CanonicalTurnEventPayload;
+    for finalization in [false, true] {
+        let observer = Arc::new(NativeSchedulingObserver::default());
+        let (_directory, manager, store, workspace) =
+            setup_pooled_file_workspace_manager_with_observers(
+                Some(observer.clone()),
+                Some(observer.clone()),
+            )
+            .await;
+        let processor = Arc::new(MessageProcessor::new(
+            Arc::new(ThreadManager::new("test", "openai")),
+            test_provider(),
+            Arc::new(SessionManager::new()),
+            manager,
+            store.clone(),
+            test_gateway_secrets(),
+            test_summary_config(),
+            test_tool_loop_config(),
+        ));
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        install_recoverable_test_hook_runtime(
+            &processor,
+            task_post_turn_recording_hook_runtime(calls.clone()),
+        )
+        .await;
+        let lower = CrudStore::new(store.database_connection());
+        let thread = "activation-thread";
+        let turn = "activation-turn";
+        seed_cli_runtime_turn_with_text(
+            &lower,
+            &workspace,
+            "codex",
+            "codex",
+            thread,
+            turn,
+            "native-activation-thread",
+            "question",
+        )
+        .await;
+        let binding = lower
+            .get_cli_runtime_turn_binding(turn)
+            .await
+            .unwrap()
+            .unwrap();
+        let answer = final_answer("accepted answer");
+        processor
+            .prepare_cli_post_turn_hook(&binding, 1, Some(&answer))
+            .await
+            .unwrap();
+        let effect_id = format!("{turn}:terminal-effect:post-turn");
+        assert_eq!(
+            lower
+                .native_terminal_effect_status(&effect_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "prepared"
+        );
+        let now = now_timestamp_secs();
+        // Real accepted predecessor, with its production claim already expired.
+        // No fabricated projection status or watermark is inserted.
+        let mut predecessor = final_answer("causal predecessor");
+        if let TurnItem::AgentMessage { id, .. } = &mut predecessor {
+            *id = "activation-predecessor".into();
+        }
+        lower
+            .accept_turn_event_before_projection_for_test(
+                CanonicalTurnEventPayload::ItemCompleted(ItemCompletedNotification {
+                    workspace_id: workspace.clone(),
+                    thread_id: thread.into(),
+                    turn_id: turn.into(),
+                    item: predecessor,
+                }),
+                now - 61,
+            )
+            .await
+            .unwrap();
+        let mut finalizer = None;
+        if finalization {
+            lower
+                .prepare_turn_finalization(
+                    &ItemCompletedNotification {
+                        workspace_id: workspace.clone(),
+                        thread_id: thread.into(),
+                        turn_id: turn.into(),
+                        item: answer,
+                    },
+                    1,
+                    None,
+                    now,
+                )
+                .await
+                .unwrap();
+            processor.arm_completed_history_preparation_barrier("__finalization_before_wait__");
+            finalizer = Some(tokio::spawn(MessageProcessor::run_native_projection_owner(
+                Arc::downgrade(&processor),
+                true,
+            )));
+            activation_owner_barrier(&processor).await;
+            processor.release_completed_history_preparation_barrier();
+        } else {
+            let (_, mut terminal) = lower.get_turn(thread, turn).await.unwrap().unwrap();
+            terminal.status = TurnStatus::Completed;
+            let error = lower
+                .materialize_turn_completed(
+                    TurnCompletedNotification {
+                        workspace_id: workspace.clone(),
+                        thread_id: thread.into(),
+                        turn: terminal,
+                    },
+                    now,
+                )
+                .await
+                .unwrap_err();
+            assert!(pioneer_crud::turn_event_was_appended_before_error(&error));
+        }
+        // The effect owner starts AFTER all early prepare/append wakes and
+        // legitimately settles PREPARED as Dormant before any activation.
+        processor.arm_completed_history_preparation_barrier("__terminal_effect_owner_settled__");
+        let effects = tokio::spawn(MessageProcessor::run_native_terminal_effect_worker(
+            Arc::downgrade(&processor),
+        ));
+        activation_owner_barrier(&processor).await;
+        assert!(calls.lock().unwrap().is_empty());
+        assert_eq!(
+            lower
+                .native_terminal_effect_status(&effect_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "prepared"
+        );
+        assert!(
+            lower
+                .native_terminal_effect_work_deadline()
+                .await
+                .unwrap()
+                .is_none()
+        );
+        processor.release_completed_history_preparation_barrier();
+        // This is the only subsequently started producer. Ordinary replay
+        // commits the predecessor, then either projects terminal itself or
+        // releases the already dormant finalization owner. No manual kick.
+        let replay = tokio::spawn(MessageProcessor::run_native_projection_owner(
+            Arc::downgrade(&processor),
+            false,
+        ));
+        timeout(Duration::from_secs(10), async {
+            loop {
+                let effect = lower
+                    .native_terminal_effect_status(&effect_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if effect.status == "succeeded" {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("late activation must wake the dormant effect owner");
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            1,
+            "finalization={finalization}"
+        );
+        assert_eq!(
+            lower
+                .get_turn(thread, turn)
+                .await
+                .unwrap()
+                .unwrap()
+                .1
+                .status,
+            TurnStatus::Completed
+        );
+        if finalization {
+            use sea_orm::EntityTrait;
+            let row = pioneer_entity::turn_finalization::Entity::find_by_id(turn)
+                .one(&lower.database_connection())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.status, "committed");
+        }
+        replay.abort();
+        let _ = replay.await;
+        if let Some(worker) = finalizer {
+            worker.abort();
+            let _ = worker.await;
+        }
+        effects.abort();
+        let _ = effects.await;
+    }
+}
+
+#[tokio::test]
+async fn retry_owner_crosses_excluded_raw_history_requeues_tail_and_parks() {
+    use pioneer_entity::native_terminal_effect_outbox as effect;
+    use sea_orm::{ActiveModelTrait, EntityTrait, Set};
+    let observer = Arc::new(NativeSchedulingObserver::default());
+    let (_directory, manager, store, workspace) =
+        setup_pooled_file_workspace_manager_with_observers(
+            Some(observer.clone()),
+            Some(observer.clone()),
+        )
+        .await;
+    let processor = Arc::new(MessageProcessor::new(
+        Arc::new(ThreadManager::new("test", "openai")),
+        test_provider(),
+        Arc::new(SessionManager::new()),
+        manager,
+        store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_tool_loop_config(),
+    ));
+    install_recoverable_test_hook_runtime(
+        &processor,
+        task_post_turn_recording_hook_runtime(Arc::new(std::sync::Mutex::new(Vec::new()))),
+    )
+    .await;
+    let now = now_timestamp_secs();
+    for i in 0..132 {
+        let turn = format!("f05-retry-{i:03}");
+        seed_cli_runtime_turn_with_text(
+            &store,
+            &workspace,
+            "codex",
+            "codex",
+            &format!("thread-{turn}"),
+            &turn,
+            &format!("native-{turn}"),
+            "input",
+        )
+        .await;
+        let binding = store
+            .get_cli_runtime_turn_binding(&turn)
+            .await
+            .unwrap()
+            .unwrap();
+        processor
+            .prepare_cli_post_turn_hook(&binding, 1, Some(&final_answer("done")))
+            .await
+            .unwrap();
+        commit_turn(&store, &binding).await;
+        let id = format!("{turn}:terminal-effect:post-turn");
+        // Restored unresolved history has real production preparation/identity.
+        let mut row: effect::ActiveModel = effect::Entity::find_by_id(&id)
+            .one(&store.database_connection())
+            .await
+            .unwrap()
+            .unwrap()
+            .into();
+        row.status = Set("unresolved".into());
+        row.next_run_at = Set(None);
+        row.completed_at = Set(Some(pioneer_crud::unix_to_datetime(now - 3601)));
+        row.last_error_code = Set(Some(
+            if i < 65 {
+                "memory.post_turn_extractor.provider_http_403"
+            } else {
+                "effect_timeout"
+            }
+            .into(),
+        ));
+        if (65..130).contains(&i) {
+            row.prepared_at = Set(pioneer_crud::unix_to_datetime(now - 90000));
+        }
+        if i == 131 {
+            row.completed_at = Set(Some(pioneer_crud::unix_to_datetime(now)));
+        }
+        row.update(&store.database_connection()).await.unwrap();
+    }
+    processor.arm_completed_history_preparation_barrier("__effect_retry_raw_page__");
+    let worker = tokio::spawn(MessageProcessor::run_native_terminal_effect_archive_worker(
+        Arc::downgrade(&processor),
+        false,
+    ));
+    timeout(
+        Duration::from_secs(10),
+        processor.wait_for_completed_history_preparation_barrier(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        store
+            .native_terminal_effect_status("f05-retry-130:terminal-effect:post-turn")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "unresolved",
+        "excluded first page cannot consume the healthy tail"
+    );
+    processor.arm_completed_history_preparation_barrier("__effect_retry_settled__");
+    processor.release_completed_history_preparation_barrier();
+    timeout(
+        Duration::from_secs(10),
+        processor.wait_for_completed_history_preparation_barrier(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        store
+            .native_terminal_effect_status("f05-retry-130:terminal-effect:post-turn")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "retry_wait"
+    );
+    assert_eq!(
+        store
+            .native_terminal_effect_status("f05-retry-000:terminal-effect:post-turn")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "unresolved"
+    );
+    observer.reads.lock().unwrap().clear();
+    observer.writes.lock().unwrap().clear();
+    processor.release_completed_history_preparation_barrier();
+    tokio::task::yield_now().await;
+    let ticker = tokio::spawn(async {
+        loop {
+            tokio::task::yield_now().await;
+        }
+    });
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(300)).await;
+    for _ in 0..32 {
+        tokio::task::yield_now().await;
+    }
+    ticker.abort();
+    assert!(observer.reads.lock().unwrap().is_empty());
+    assert!(observer.writes.lock().unwrap().is_empty());
+    tokio::time::resume();
+    // Old-key restored eligible transition uses the same explicit source guard;
+    // no owner kick or heartbeat repairs the completed frontier.
+    let change = store.background_work("recovery.effects.retry").changing();
+    let mut old: effect::ActiveModel =
+        effect::Entity::find_by_id("f05-retry-000:terminal-effect:post-turn")
+            .one(&store.database_connection())
+            .await
+            .unwrap()
+            .unwrap()
+            .into();
+    old.last_error_code = Set(Some("effect_timeout".into()));
+    processor.arm_completed_history_preparation_barrier("__effect_retry_settled__");
+    old.update(&store.database_connection()).await.unwrap();
+    change.finish(true);
+    timeout(
+        Duration::from_secs(10),
+        processor.wait_for_completed_history_preparation_barrier(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        store
+            .native_terminal_effect_status("f05-retry-000:terminal-effect:post-turn")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "retry_wait"
+    );
+    // All remaining unresolved inputs are excluded. EOF has no retry clock.
+    let change = store.background_work("recovery.effects.retry").changing();
+    let mut last: effect::ActiveModel =
+        effect::Entity::find_by_id("f05-retry-131:terminal-effect:post-turn")
+            .one(&store.database_connection())
+            .await
+            .unwrap()
+            .unwrap()
+            .into();
+    last.last_error_code = Set(Some("memory.post_turn_extractor.provider_http_403".into()));
+    last.update(&store.database_connection()).await.unwrap();
+    change.finish(true);
+    processor.arm_completed_history_preparation_barrier("__effect_retry_settled__");
+    processor.release_completed_history_preparation_barrier();
+    timeout(
+        Duration::from_secs(10),
+        processor.wait_for_completed_history_preparation_barrier(),
+    )
+    .await
+    .unwrap();
+    observer.reads.lock().unwrap().clear();
+    observer.writes.lock().unwrap().clear();
+    processor.release_completed_history_preparation_barrier();
+    tokio::task::yield_now().await;
+    let ticker = tokio::spawn(async {
+        loop {
+            tokio::task::yield_now().await;
+        }
+    });
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(300)).await;
+    for _ in 0..32 {
+        tokio::task::yield_now().await;
+    }
+    ticker.abort();
+    assert!(observer.reads.lock().unwrap().is_empty());
+    assert!(observer.writes.lock().unwrap().is_empty());
+    tokio::time::resume();
+    processor.cli_history_shutdown.cancel();
+    timeout(Duration::from_secs(10), worker)
+        .await
+        .unwrap()
+        .unwrap();
+}

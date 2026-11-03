@@ -371,7 +371,11 @@ async fn register_turn_context_page(
         .await
 }
 
-pub(crate) async fn quantum(store: &CrudStore, workspace: &str, thread_id: &str) -> Result<bool> {
+pub(crate) async fn quantum(
+    store: &CrudStore,
+    workspace: &str,
+    thread_id: &str,
+) -> Result<(bool, bool)> {
     let Some(p) = progress(&store.connection, workspace, thread_id).await? else {
         store
             .run_serialized_write(|| async {
@@ -406,10 +410,10 @@ pub(crate) async fn quantum(store: &CrudStore, workspace: &str, thread_id: &str)
                 Ok(())
             })
             .await?;
-        return Ok(false);
+        return Ok((false, true));
     };
     if p.ready == 1 {
-        return Ok(true);
+        return Ok((true, false));
     }
     let mut next = p.clone();
     let mut ids = Vec::new();
@@ -480,7 +484,7 @@ pub(crate) async fn quantum(store: &CrudStore, workspace: &str, thread_id: &str)
                 .ok_or_else(|| anyhow::anyhow!("history preparation thread disappeared"))?;
             if current.step != p.step || current.ready == 1 {
                 txn.rollback().await?;
-                return Ok(current.ready == 1);
+                return Ok((current.ready == 1, current.step != p.step));
             }
             let mut next = next.clone();
             if !ids.is_empty() {
@@ -550,7 +554,7 @@ pub(crate) async fn quantum(store: &CrudStore, workspace: &str, thread_id: &str)
             // Cursor was revalidated under the same serialized write transaction.
             next.into_active_model().reset_all().update(&txn).await?;
             txn.commit().await?;
-            Ok(finished)
+            Ok((finished, true))
         })
         .await
 }

@@ -1,19 +1,55 @@
 use pioneer_crud::{CrudStore, NativeEventCleanupMetrics};
+use pioneer_sqlite::background::{Plan, Ready};
 use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
 use tokio_util::sync::CancellationToken;
 
+#[cfg(test)]
+#[derive(Default)]
+pub(super) struct IdleBarrier {
+    pub(super) armed: std::sync::atomic::AtomicBool,
+    pub(super) entered: tokio::sync::Notify,
+    pub(super) release: tokio::sync::Notify,
+}
+
 /// Bootstrap and cleanup alternate bounded portions, so neither a large legacy
 /// table nor a continuous live backlog monopolizes this maintenance worker.
 pub(super) async fn run(store: Arc<CrudStore>, cancellation: CancellationToken) {
     let store = store.with_maintenance_access();
+    let work = store.background_work("storage.native_events");
+    let Some(mut owner) = work.acquire() else {
+        return;
+    };
     let mut bootstrap_pending = true;
     let mut bootstrap_next = true;
     let mut last_log = Instant::now();
     let mut progress = Progress::default();
     loop {
+        let ready = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return,
+            ready = owner.ready() => ready,
+        };
+        if ready == Ready::Closed {
+            return;
+        }
+        if ready == Ready::SettlementRequired {
+            let settle_observation = owner.observe();
+            // Bootstrap's durable completion marker remains authoritative;
+            // actual cleanup writes settle before a new queue observation.
+            if store
+                .database_connection()
+                .settle_background_change(&owner)
+                .await
+                .is_err()
+            {
+                owner.retry_after(settle_observation, Duration::from_secs(60));
+            }
+            continue;
+        }
+        let observed = owner.observe();
         let started = Instant::now();
         let bootstrap_phase = bootstrap_pending && bootstrap_next;
         bootstrap_next = !bootstrap_next;
@@ -22,7 +58,7 @@ pub(super) async fn run(store: Arc<CrudStore>, cancellation: CancellationToken) 
         let result: anyhow::Result<bool> = tokio::select! {
             biased;
             _ = cancellation.cancelled() => return,
-            result = crate::database::attribution::scope_database_workload_result(
+            result = owner.scope(crate::database::attribution::scope_database_workload_result(
                 pioneer_observability::DatabaseWorkload::NativeEventCleanup, pioneer_observability::DatabaseOperationSite::NativeEventCleanupQuantum,
                 async {
                     if bootstrap_phase {
@@ -41,15 +77,34 @@ pub(super) async fn run(store: Arc<CrudStore>, cancellation: CancellationToken) 
                         Ok(empty)
                     }
                 },
-            ) => result,
+            )) => result,
         };
         progress.quanta += 1;
-        let pause = match result {
-            Ok(empty) if empty && !bootstrap_pending => Duration::from_secs(60),
-            Ok(_) => started
-                .elapsed()
-                .saturating_mul(9)
-                .max(Duration::from_millis(25)),
+        let plan = match result {
+            Ok(empty) if empty && !bootstrap_pending => {
+                match store.next_native_event_cleanup_deadline().await {
+                    Ok(Some(at)) => Plan::WallDeadline(at.into()),
+                    Ok(None) => Plan::Dormant,
+                    Err(_) => {
+                        progress.failures += 1;
+                        tracing::warn!(
+                            reason = "database_error",
+                            phase = "deadline",
+                            "native event cleanup deferred"
+                        );
+                        Plan::MonotonicDeadline(
+                            tokio::time::Instant::now() + Duration::from_secs(60),
+                        )
+                    }
+                }
+            }
+            Ok(_) => Plan::MonotonicDeadline(
+                tokio::time::Instant::now()
+                    + started
+                        .elapsed()
+                        .saturating_mul(9)
+                        .max(Duration::from_millis(25)),
+            ),
             Err(_) => {
                 progress.failures += 1;
                 tracing::warn!(
@@ -61,10 +116,12 @@ pub(super) async fn run(store: Arc<CrudStore>, cancellation: CancellationToken) 
                     },
                     "native event cleanup deferred"
                 );
-                Duration::from_secs(60)
+                Plan::MonotonicDeadline(tokio::time::Instant::now() + Duration::from_secs(60))
             }
         };
-        if last_log.elapsed() >= Duration::from_secs(30) || pause == Duration::from_secs(60) {
+        if last_log.elapsed() >= Duration::from_secs(30)
+            || matches!(plan, Plan::Dormant | Plan::WallDeadline(_))
+        {
             tracing::info!(
                 bootstrap_complete = !bootstrap_pending,
                 bootstrap_rows = progress.bootstrap_rows,
@@ -92,10 +149,26 @@ pub(super) async fn run(store: Arc<CrudStore>, cancellation: CancellationToken) 
             progress = Progress::default();
             last_log = Instant::now();
         }
-        tokio::select! {
-            biased;
-            _ = cancellation.cancelled() => return,
-            _ = tokio::time::sleep(pause) => {},
+        let published = owner.publish(observed, plan);
+        if !published && let Plan::MonotonicDeadline(at) = plan {
+            owner.retry_after(
+                observed,
+                at.saturating_duration_since(tokio::time::Instant::now()),
+            );
+        }
+        #[cfg(test)]
+        if published && matches!(plan, Plan::Dormant) {
+            let barrier = store.database_connection().shared_resource::<IdleBarrier>();
+            if barrier
+                .armed
+                .swap(false, std::sync::atomic::Ordering::AcqRel)
+            {
+                barrier.entered.notify_one();
+                tokio::select! {
+                    _ = cancellation.cancelled() => return,
+                    _ = barrier.release.notified() => {},
+                }
+            }
         }
     }
 }

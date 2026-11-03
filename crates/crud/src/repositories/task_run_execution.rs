@@ -463,3 +463,72 @@ fn terminal_status_values() -> [&'static str; 5] {
         task_run_execution_status_to_db(TaskRunExecutionStatus::TimedOut),
     ]
 }
+
+/// Unfiltered immutable execution PKs: no policy predicate before LIMIT.
+pub(crate) async fn recovery_lease_keys<C: ConnectionTrait>(
+    db: &C,
+    after: Option<&str>,
+    upper: Option<&str>,
+    limit: u64,
+) -> Result<(Vec<String>, Option<String>)> {
+    let upper = match upper {
+        Some(id) => Some(id.to_owned()),
+        None => {
+            task_run_execution::Entity::find()
+                .select_only()
+                .column(task_run_execution::Column::Id)
+                .order_by_desc(task_run_execution::Column::Id)
+                .limit(1)
+                .into_tuple::<String>()
+                .one(db)
+                .await?
+        }
+    };
+    let Some(bound) = upper.as_ref() else {
+        return Ok((Vec::new(), None));
+    };
+    let mut query = task_run_execution::Entity::find()
+        .select_only()
+        .column(task_run_execution::Column::Id)
+        .filter(task_run_execution::Column::Id.lte(bound.clone()));
+    if let Some(after) = after {
+        query = query.filter(task_run_execution::Column::Id.gt(after));
+    }
+    let keys = query
+        .order_by_asc(task_run_execution::Column::Id)
+        .limit(limit)
+        .into_tuple::<String>()
+        .all(db)
+        .await?;
+    Ok((keys, upper))
+}
+
+/// Exact PK plus one Run PK lookup. Execution status is deliberately irrelevant:
+/// current live Run and worker/lease remain the original authority predicates.
+pub(crate) async fn recovery_lease_point<C: ConnectionTrait>(
+    db: &C,
+    id: &str,
+    cutoff: DateTimeWithTimeZone,
+) -> Result<Option<DateTimeWithTimeZone>> {
+    use pioneer_entity::task_run;
+    use sea_orm::{ExprTrait, QueryTrait};
+    let live_run = task_run::Entity::find()
+        .select_only()
+        .column(task_run::Column::Id)
+        .filter(Expr::col((task_run::Entity, task_run::Column::Id)).equals((
+            task_run_execution::Entity,
+            task_run_execution::Column::TaskRunId,
+        )))
+        .filter(task_run::Column::Status.is_in(["starting", "running", "waiting_review"]))
+        .into_query();
+    Ok(task_run_execution::Entity::find_by_id(id)
+        .select_only()
+        .column(task_run_execution::Column::LeaseUntil)
+        .filter(task_run_execution::Column::WorkerId.is_not_null())
+        .filter(task_run_execution::Column::LeaseUntil.gt(cutoff))
+        .filter(Expr::exists(live_run))
+        .into_tuple::<Option<DateTimeWithTimeZone>>()
+        .one(db)
+        .await?
+        .flatten())
+}

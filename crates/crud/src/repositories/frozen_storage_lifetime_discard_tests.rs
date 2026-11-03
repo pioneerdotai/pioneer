@@ -582,10 +582,7 @@ async fn physical_eof_and_periodic_revisit_find_new_eligibility_behind_cursor() 
     progress.phase = 4;
     assert!(progress.quantum(&store).await.unwrap());
     assert!(progress.pass_done[4] && progress.discard_after.is_empty());
-    let now = Instant::now();
-    let interval = Duration::from_secs(60);
-    progress.revisit_completed_cleanup(now, interval);
-    progress.revisit_completed_cleanup(now + interval, interval);
+    progress.invalidate_completed_cleanup();
     assert!(!progress.pass_done[4]);
     for _ in 0..64 {
         progress.phase = 4;

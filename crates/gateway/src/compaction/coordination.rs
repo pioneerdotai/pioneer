@@ -25,6 +25,10 @@ struct Owner {
 #[derive(Default)]
 pub(crate) struct ContextCompactionCoordinator {
     owners: Arc<Mutex<HashMap<(String, String), Weak<Owner>>>>,
+    release: std::sync::OnceLock<(
+        Arc<pioneer_crud::CompactionHistoryChanges>,
+        Arc<pioneer_sqlite::background::Wake>,
+    )>,
 }
 struct OwnerReference {
     owner: Arc<Owner>,
@@ -51,7 +55,11 @@ impl Drop for OwnerReference {
 pub(crate) struct ContextCompactionLease {
     reference: OwnerReference,
     cancellation: CancellationToken,
-    _guard: OwnedMutexGuard<()>,
+    _guard: Option<OwnedMutexGuard<()>>,
+    release: Option<(
+        Arc<pioneer_crud::CompactionHistoryChanges>,
+        Arc<pioneer_sqlite::background::Wake>,
+    )>,
 }
 impl ContextCompactionLease {
     pub(crate) fn cancellation(&self) -> CancellationToken {
@@ -62,9 +70,27 @@ impl Drop for ContextCompactionLease {
     fn drop(&mut self) {
         self.cancellation.cancel();
         self.reference.owner.active.send_replace(None);
+        drop(self._guard.take());
+        if let Some((changes, wake)) = &self.release {
+            changes.executor_released();
+            wake.dependency_released();
+        }
     }
 }
 impl ContextCompactionCoordinator {
+    pub(crate) fn for_store(store: &pioneer_crud::CrudStore) -> Arc<Self> {
+        let coordinator = store.database_connection().shared_resource::<Self>();
+        let wake = store.background_work("compaction.history");
+        let binding = coordinator
+            .release
+            .get_or_init(|| (store.compaction_history_changes(), wake.clone()));
+        assert!(
+            Arc::ptr_eq(&binding.1, &wake),
+            "context coordinator cannot span database runtimes"
+        );
+        coordinator
+    }
+
     pub(crate) async fn acquire(
         &self,
         workspace: &str,
@@ -131,7 +157,8 @@ impl ContextCompactionCoordinator {
         Ok(Some(ContextCompactionLease {
             reference,
             cancellation: child,
-            _guard: guard,
+            _guard: Some(guard),
+            release: self.release.get().cloned(),
         }))
     }
 }

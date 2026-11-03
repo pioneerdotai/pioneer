@@ -12,7 +12,11 @@ async fn outbox_fixture(
 ) {
     let observer = Arc::new(NativeSchedulingObserver::default());
     let (directory, workspace_manager, store, workspace) =
-        setup_pooled_file_workspace_manager_with_observer(Some(observer.clone())).await;
+        setup_pooled_file_workspace_manager_with_observers(
+            Some(observer.clone()),
+            Some(observer.clone()),
+        )
+        .await;
     let database = store.database_connection();
     let identity = agent_identity::Entity::find()
         .filter(agent_identity::Column::WorkspaceId.eq(&workspace))
@@ -22,7 +26,7 @@ async fn outbox_fixture(
         .unwrap();
     let now = pioneer_crud::utc_now();
     let execution = "E00000000000000000007";
-    // A valid FK-backed owner: no disabled integrity checks in this worker test.
+    // Persist a real owner tuple under the same FK-OFF runtime contract as Gateway.
     agent_execution::Entity::insert(agent_execution::ActiveModel {
         id: Set(execution.to_owned()),
         workspace_id: Set(workspace),
@@ -820,4 +824,648 @@ async fn exhausted_start_reconciliation_is_bounded_and_yields_to_an_ordinary_due
             .unwrap()
             .is_none()
     );
+}
+
+#[tokio::test]
+async fn ledger_owner_parks_terminal_prefix_and_compacts_after_real_ack_and_retention_deadline() {
+    use pioneer_entity::agent_action_receipt as receipt;
+    use sea_orm::sea_query::Expr;
+    let execution = "E00000000000000000007";
+    let mut rows = Vec::new();
+    for index in 0..65 {
+        let id = format!("parked-{index:03}");
+        rows.push((id.clone(), json!({"action_id":id,"execution_id":execution,"kind":"start_agent",
+            "spawned_execution_id":"absent-execution","dispatch":{"turn_id":"absent-turn","execution_generation":1}}).to_string(), 8));
+    }
+    for index in 0..65 {
+        let id = format!("aaa-compacted-{index:03}");
+        rows.push((id.clone(), json!({"action_id":id,"execution_id":execution,"kind":"send_message","bulky":"x".repeat(4096)}).to_string(),0));
+    }
+    for id in ["closed-old", "closed-future"] {
+        rows.push((id.into(), json!({"action_id":id,"execution_id":execution,"kind":"send_message","bulky":"x".repeat(4096)}).to_string(),0));
+    }
+    let refs = rows
+        .iter()
+        .map(|(id, payload, attempts)| (id.as_str(), payload.as_str(), *attempts))
+        .collect::<Vec<_>>();
+    let (_directory, processor, observer, _) = outbox_fixture(&refs).await;
+    let database = processor.crud_store.database_connection();
+    let old = pioneer_crud::utc_now() - chrono::Duration::days(31);
+    let parked = rows
+        .iter()
+        .filter(|(id, _, _)| id.starts_with("parked-"))
+        .map(|(id, _, _)| id.clone())
+        .collect::<Vec<_>>();
+    agent_action::Entity::update_many()
+        .col_expr(agent_action::Column::ActionKind, Expr::value("start_agent"))
+        .filter(agent_action::Column::Id.is_in(parked.clone()))
+        .exec(&database)
+        .await
+        .unwrap();
+    agent_action_outbox::Entity::update_many()
+        .col_expr(agent_action_outbox::Column::CreatedAt, Expr::value(old))
+        .col_expr(agent_action_outbox::Column::Status, Expr::value("failed"))
+        .col_expr(
+            agent_action_outbox::Column::LastError,
+            Expr::value("outbox_detached_binding_rejected"),
+        )
+        .filter(agent_action_outbox::Column::Id.is_in(parked.clone()))
+        .exec(&database)
+        .await
+        .unwrap();
+    let compacted_ids = rows
+        .iter()
+        .filter(|(id, _, _)| id.starts_with("aaa-compacted-"))
+        .map(|(id, _, _)| id.clone())
+        .collect::<Vec<_>>();
+    for id in &compacted_ids {
+        agent_action::Entity::update_many()
+            .col_expr(agent_action::Column::CreatedAt, Expr::value(old))
+            .col_expr(agent_action::Column::CommittedAt, Expr::value(Some(old)))
+            .filter(agent_action::Column::Id.eq(id.clone()))
+            .exec(&database)
+            .await
+            .unwrap();
+        agent_action_outbox::Entity::update_many()
+            .col_expr(agent_action_outbox::Column::CreatedAt, Expr::value(old))
+            .col_expr(
+                agent_action_outbox::Column::Status,
+                Expr::value("delivered"),
+            )
+            .col_expr(
+                agent_action_outbox::Column::DeliveredAt,
+                Expr::value(Some(old)),
+            )
+            .filter(agent_action_outbox::Column::Id.eq(id.clone()))
+            .exec(&database)
+            .await
+            .unwrap();
+        receipt::Entity::insert(receipt::ActiveModel {
+            id: Set(format!("receipt-{id}")),
+            action_id: Set(id.clone()),
+            actor_kind: Set("agent_execution".into()),
+            actor_id: Set(Some(execution.into())),
+            decision: Set("allowed".into()),
+            policy_fingerprint: Set("a".repeat(64)),
+            committed_at: Set(old),
+            response_json: Set(Some("large response".repeat(100))),
+            ..Default::default()
+        })
+        .exec(&database)
+        .await
+        .unwrap();
+    }
+    // Use the production compactor to obtain genuine markers, then restart
+    // reconstruction over more than one page of already compacted history.
+    let upper = processor
+        .crud_store
+        .terminal_agent_action_ledger_upper()
+        .await
+        .unwrap()
+        .unwrap();
+    let mut cursor = None;
+    loop {
+        let page = processor
+            .crud_store
+            .compact_terminal_agent_action_ledger_page(
+                pioneer_crud::utc_now(),
+                cursor.as_ref(),
+                &upper,
+            )
+            .await
+            .unwrap();
+        assert!(page.errors.is_empty());
+        cursor = page.after;
+        if !page.more {
+            break;
+        }
+    }
+    let prefix = processor
+        .crud_store
+        .compact_terminal_agent_action_ledger_page(pioneer_crud::utc_now(), None, &upper)
+        .await
+        .unwrap();
+    assert!(
+        prefix.more,
+        "excluded history consumes a raw page before the useful tail"
+    );
+    assert_eq!(prefix.after.as_deref(), Some("aaa-compacted-063"));
+    assert_eq!(prefix.summary.compacted_rows, 0);
+    assert!(prefix.errors.is_empty());
+    // The StartAgent tuple is genuinely parked on absent terminal provenance.
+    // Its unmodified payloads must not repeatedly reopen compaction at EOF.
+    let label = "__agent_ledger_settled__";
+    processor.arm_completed_history_preparation_barrier(label);
+    observer.writes.lock().unwrap().clear();
+    let worker = tokio::spawn(MessageProcessor::run_agent_action_ledger_worker(
+        Arc::downgrade(&processor),
+    ));
+    timeout(
+        Duration::from_secs(10),
+        processor.wait_for_completed_history_preparation_barrier(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        observer.writes.lock().unwrap().is_empty(),
+        "parked raw pages do not require a writer"
+    );
+    processor.release_completed_history_preparation_barrier();
+    tokio::task::yield_now().await;
+    observer.reads.lock().unwrap().clear();
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(300)).await;
+    tokio::task::yield_now().await;
+    assert!(observer.reads.lock().unwrap().is_empty());
+    assert!(observer.writes.lock().unwrap().is_empty());
+    tokio::time::resume();
+    // Establish a real Empty handoff before the supported action dispatcher
+    // publishes terminal ACKs. Test-only tuple dates retain exact retention.
+    processor.arm_completed_history_preparation_barrier(label);
+    processor
+        .crud_store
+        .background_work("recovery.ledger")
+        .invalidate();
+    timeout(
+        Duration::from_secs(10),
+        processor.wait_for_completed_history_preparation_barrier(),
+    )
+    .await
+    .unwrap();
+    let now = pioneer_crud::utc_now();
+    for (id, created) in [
+        ("closed-old", old),
+        (
+            "closed-future",
+            now - chrono::Duration::days(30) + chrono::Duration::seconds(3),
+        ),
+    ] {
+        agent_action::Entity::update_many()
+            .col_expr(agent_action::Column::CreatedAt, Expr::value(created))
+            .col_expr(
+                agent_action::Column::CommittedAt,
+                Expr::value(Some(created)),
+            )
+            .filter(agent_action::Column::Id.eq(id))
+            .exec(&database)
+            .await
+            .unwrap();
+        agent_action_outbox::Entity::update_many()
+            .col_expr(agent_action_outbox::Column::CreatedAt, Expr::value(created))
+            .filter(agent_action_outbox::Column::Id.eq(id))
+            .exec(&database)
+            .await
+            .unwrap();
+        receipt::Entity::insert(receipt::ActiveModel {
+            id: Set(format!("receipt-{id}")),
+            action_id: Set(id.into()),
+            actor_kind: Set("agent_execution".into()),
+            actor_id: Set(Some(execution.into())),
+            decision: Set("allowed".into()),
+            policy_fingerprint: Set("a".repeat(64)),
+            committed_at: Set(created),
+            response_json: Set(Some("large response".repeat(100))),
+            ..Default::default()
+        })
+        .exec(&database)
+        .await
+        .unwrap();
+    }
+    let batch = crate::message::agent_action_tools::process_due_agent_action_outbox(&processor, 64)
+        .await
+        .unwrap();
+    assert!(batch.errors.is_empty());
+    assert_eq!(batch.delivered, 2);
+    processor.arm_completed_history_preparation_barrier(label);
+    processor.release_completed_history_preparation_barrier();
+    timeout(
+        Duration::from_secs(10),
+        processor.wait_for_completed_history_preparation_barrier(),
+    )
+    .await
+    .unwrap();
+    let old_row = agent_action_outbox::Entity::find_by_id("closed-old")
+        .one(&database)
+        .await
+        .unwrap()
+        .unwrap();
+    let future_row = agent_action_outbox::Entity::find_by_id("closed-future")
+        .one(&database)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        serde_json::from_str::<JsonValue>(&old_row.payload_json)
+            .unwrap()
+            .get("_pioneer_compacted")
+            .is_some()
+    );
+    assert!(
+        serde_json::from_str::<JsonValue>(&future_row.payload_json)
+            .unwrap()
+            .get("_pioneer_compacted")
+            .is_none()
+    );
+    observer.reads.lock().unwrap().clear();
+    observer.writes.lock().unwrap().clear();
+    processor.arm_completed_history_preparation_barrier(label);
+    processor.release_completed_history_preparation_barrier();
+    timeout(
+        Duration::from_secs(7),
+        processor.wait_for_completed_history_preparation_barrier(),
+    )
+    .await
+    .unwrap();
+    assert!(observer.reads.lock().unwrap().iter().all(|event| !matches!(event,
+        pioneer_sqlite::SqliteReadEvent::AdmissionEnqueued {class,..} if *class!=pioneer_sqlite::SqliteReadClass::Maintenance)));
+    assert!(observer.writes.lock().unwrap().iter().any(|event| matches!(
+        event,
+        pioneer_sqlite::SqliteWriteEvent::Acquired {
+            class: pioneer_sqlite::SqliteWriteClass::Maintenance,
+            ..
+        }
+    )));
+    let future_row = agent_action_outbox::Entity::find_by_id("closed-future")
+        .one(&database)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        serde_json::from_str::<JsonValue>(&future_row.payload_json)
+            .unwrap()
+            .get("_pioneer_compacted")
+            .is_some(),
+        "actual retention deadline compacts without another commit/client"
+    );
+    let retained = agent_action_outbox::Entity::find()
+        .filter(agent_action_outbox::Column::Id.is_in(parked))
+        .all(&database)
+        .await
+        .unwrap();
+    assert_eq!(retained.len(), 65);
+    assert!(retained.iter().all(|row| {
+        serde_json::from_str::<JsonValue>(&row.payload_json)
+            .unwrap()
+            .get("_pioneer_compacted")
+            .is_none()
+    }));
+    // Remove fixture-only parked/tail tuples after their assertions, leaving
+    // more than one raw page of exclusively production-compacted history.
+    agent_action_outbox::Entity::delete_many()
+        .filter(agent_action_outbox::Column::Id.is_not_in(compacted_ids.clone()))
+        .exec(&database)
+        .await
+        .unwrap();
+    processor
+        .crud_store
+        .background_work("recovery.ledger")
+        .invalidate();
+    processor.arm_completed_history_preparation_barrier(label);
+    processor.release_completed_history_preparation_barrier();
+    timeout(
+        Duration::from_secs(10),
+        processor.wait_for_completed_history_preparation_barrier(),
+    )
+    .await
+    .unwrap();
+    let all_upper = processor
+        .crud_store
+        .terminal_agent_action_ledger_upper()
+        .await
+        .unwrap()
+        .unwrap();
+    let page = processor
+        .crud_store
+        .compact_terminal_agent_action_ledger_page(pioneer_crud::utc_now(), None, &all_upper)
+        .await
+        .unwrap();
+    assert!(page.more);
+    assert!(page.errors.is_empty());
+    assert_eq!(page.summary.compacted_rows, 0);
+    assert!(page.next_at.is_none());
+    processor.release_completed_history_preparation_barrier();
+    tokio::task::yield_now().await;
+    observer.reads.lock().unwrap().clear();
+    observer.writes.lock().unwrap().clear();
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(300)).await;
+    tokio::task::yield_now().await;
+    assert!(observer.reads.lock().unwrap().is_empty());
+    assert!(observer.writes.lock().unwrap().is_empty());
+    processor.cli_history_shutdown.cancel();
+    worker.await.unwrap();
+}
+
+#[tokio::test]
+async fn ledger_raw_page_keeps_tuple_progress_through_datetime_decode_poison() {
+    use pioneer_entity::agent_action_receipt as receipt;
+    use sea_orm::sea_query::Expr;
+    for poison_due in [false, true] {
+        let execution = "E00000000000000000007";
+        let rows = (0..66).map(|i| {
+            let id = format!("ledger-{i:03}");
+            (id.clone(), json!({"action_id":id,"execution_id":execution,"kind":"send_message","bulky":"x".repeat(4096)}).to_string(), 0)
+        }).collect::<Vec<_>>();
+        let refs = rows
+            .iter()
+            .map(|(id, p, n)| (id.as_str(), p.as_str(), *n))
+            .collect::<Vec<_>>();
+        let (_directory, processor, _observer, _) = outbox_fixture(&refs).await;
+        let store = processor.crud_store.with_maintenance_access();
+        let db = store.database_connection();
+        let now = pioneer_crud::utc_now();
+        let old = now - chrono::Duration::days(31);
+        let later = if poison_due {
+            old
+        } else {
+            now - chrono::Duration::days(30) + chrono::Duration::seconds(3)
+        };
+        for (index, (id, _, _)) in rows.iter().enumerate() {
+            let created = if index < 63 { old } else { later };
+            agent_action::Entity::update_many()
+                .col_expr(agent_action::Column::CreatedAt, Expr::value(created))
+                .col_expr(
+                    agent_action::Column::CommittedAt,
+                    Expr::value(Some(created)),
+                )
+                .filter(agent_action::Column::Id.eq(id))
+                .exec(&db)
+                .await
+                .unwrap();
+            agent_action_outbox::Entity::update_many()
+                .col_expr(agent_action_outbox::Column::CreatedAt, Expr::value(created))
+                .col_expr(
+                    agent_action_outbox::Column::Status,
+                    Expr::value("delivered"),
+                )
+                .col_expr(
+                    agent_action_outbox::Column::DeliveredAt,
+                    Expr::value(Some(created)),
+                )
+                .filter(agent_action_outbox::Column::Id.eq(id))
+                .exec(&db)
+                .await
+                .unwrap();
+            receipt::Entity::insert(receipt::ActiveModel {
+                id: Set(format!("receipt-{id}")),
+                action_id: Set(id.clone()),
+                actor_kind: Set("agent_execution".into()),
+                actor_id: Set(Some(execution.into())),
+                decision: Set("allowed".into()),
+                policy_fingerprint: Set("a".repeat(64)),
+                committed_at: Set(created),
+                response_json: Set(Some("large response".repeat(100))),
+                ..Default::default()
+            })
+            .exec(&db)
+            .await
+            .unwrap();
+        }
+        // Valid tuple keys and payload JSON, malformed non-key timestamp. This
+        // exercises ORM decoding, rather than the older JSON poison matrix.
+        agent_action_outbox::Entity::update_many()
+            .col_expr(
+                agent_action_outbox::Column::DeliveredAt,
+                Expr::value("not-a-date"),
+            )
+            .filter(agent_action_outbox::Column::Id.eq("ledger-063"))
+            .exec(&db)
+            .await
+            .unwrap();
+        let upper = store
+            .terminal_agent_action_ledger_upper()
+            .await
+            .unwrap()
+            .unwrap();
+        let first = store
+            .compact_terminal_agent_action_ledger_page(now, None, &upper)
+            .await
+            .unwrap();
+        assert!(first.more);
+        assert_eq!(first.after.as_ref().unwrap(), "ledger-063");
+        assert_eq!(first.summary.compacted_rows, 63);
+        assert_eq!(first.errors.len(), 1, "future poison is visible too");
+        let tail = store
+            .compact_terminal_agent_action_ledger_page(
+                now + chrono::Duration::seconds(4),
+                first.after.as_ref(),
+                &upper,
+            )
+            .await
+            .unwrap();
+        assert!(!tail.more);
+        assert_eq!(
+            tail.summary.compacted_rows, 2,
+            "healthy tail beyond raw64 is serviced"
+        );
+        assert!(tail.errors.is_empty());
+        assert!(
+            agent_action_outbox::Entity::find_by_id("ledger-063")
+                .one(&db)
+                .await
+                .is_err(),
+            "poison is preserved, never ACKed"
+        );
+        // A subsequent finite error-retry pass observes the same poison, with
+        // no healthy-row replay or loss. The existing real-owner test covers
+        // retained error/deadline waiting; this is its raw adapter boundary.
+        let retry = store
+            .compact_terminal_agent_action_ledger_page(
+                now + chrono::Duration::hours(1),
+                None,
+                &upper,
+            )
+            .await
+            .unwrap();
+        assert_eq!(retry.summary.compacted_rows, 0);
+        assert_eq!(retry.errors.len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn control_action_raw_pages_keep_future_and_excluded_history_then_old_key_release() {
+    let owned = (0..131)
+        .map(|i| {
+            (
+                format!("f05-action-{i:03}"),
+                r#"{"kind":"send_message","original":true}"#,
+                0,
+            )
+        })
+        .collect::<Vec<_>>();
+    let inputs = owned
+        .iter()
+        .map(|(id, p, a)| (id.as_str(), *p, *a))
+        .collect::<Vec<_>>();
+    let (_directory, processor, observer, now) = outbox_fixture(&inputs).await;
+    let db = processor.crud_store.database_connection();
+    let future = now + chrono::Duration::hours(1) + chrono::Duration::nanoseconds(1);
+    for i in 0..130 {
+        let id = format!("f05-action-{i:03}");
+        let mut row: agent_action_outbox::ActiveModel =
+            agent_action_outbox::Entity::find_by_id(&id)
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap()
+                .into();
+        if i < 65 {
+            row.next_attempt_at = Set(Some(future));
+        } else {
+            row.status = Set("failed".into());
+            row.attempts = Set(8);
+            row.last_error = Set(Some("outbox_detached_binding_rejected".into()));
+        }
+        sea_orm::ActiveModelTrait::update(row, &db).await.unwrap();
+    }
+    processor.arm_completed_history_preparation_barrier("__control_admission_raw_page__");
+    let stop = tokio_util::sync::CancellationToken::new();
+    let worker = tokio::spawn(MessageProcessor::run_recovery_control_worker(
+        Arc::downgrade(&processor),
+        stop.clone(),
+    ));
+    timeout(
+        Duration::from_secs(10),
+        processor.wait_for_completed_history_preparation_barrier(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        agent_action_outbox::Entity::find_by_id("f05-action-130")
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "pending",
+        "raw frontier has not reached useful tail"
+    );
+    processor.arm_completed_history_preparation_barrier("__control_owner_settled__");
+    processor.release_completed_history_preparation_barrier();
+    timeout(
+        Duration::from_secs(10),
+        processor.wait_for_completed_history_preparation_barrier(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        agent_action_outbox::Entity::find_by_id("f05-action-130")
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "delivered"
+    );
+    let mut pass = pioneer_crud::ControlAdmissionPass::default();
+    timeout(Duration::from_secs(10), async {
+        while !processor
+            .crud_store
+            .control_admission_quantum(&mut pass)
+            .await
+            .unwrap()
+        {}
+    })
+    .await
+    .unwrap();
+    let mut admission = pioneer_crud::RecoveryAdmission::unknown();
+    pass.apply(&mut admission, now.timestamp());
+    assert_eq!(admission.action_next, Some(future));
+    assert!(!admission.action_outbox);
+    observer.reads.lock().unwrap().clear();
+    observer.writes.lock().unwrap().clear();
+    processor.release_completed_history_preparation_barrier();
+    tokio::task::yield_now().await;
+    let ticker = tokio::spawn(async {
+        loop {
+            tokio::task::yield_now().await;
+        }
+    });
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(300)).await;
+    for _ in 0..32 {
+        tokio::task::yield_now().await;
+    }
+    ticker.abort();
+    assert!(observer.reads.lock().unwrap().is_empty());
+    assert!(observer.writes.lock().unwrap().is_empty());
+    tokio::time::resume();
+    // Restored retry-date transition at a key behind the completed cursor.
+    let change = processor
+        .crud_store
+        .background_work("recovery.control")
+        .changing();
+    let mut row: agent_action_outbox::ActiveModel =
+        agent_action_outbox::Entity::find_by_id("f05-action-000")
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap()
+            .into();
+    row.next_attempt_at = Set(None);
+    processor.arm_completed_history_preparation_barrier("__control_owner_settled__");
+    sea_orm::ActiveModelTrait::update(row, &db).await.unwrap();
+    change.finish(true);
+    timeout(
+        Duration::from_secs(10),
+        processor.wait_for_completed_history_preparation_barrier(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        agent_action_outbox::Entity::find_by_id("f05-action-000")
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "delivered"
+    );
+    // All-excluded history: remove only genuine timed obligations, then prove
+    // settled Empty has no recurring physical discovery.
+    let change = processor
+        .crud_store
+        .background_work("recovery.control")
+        .changing();
+    agent_action_outbox::Entity::update_many()
+        .col_expr(
+            agent_action_outbox::Column::Status,
+            sea_orm::sea_query::Expr::value("delivered"),
+        )
+        .filter(agent_action_outbox::Column::NextAttemptAt.is_not_null())
+        .exec(&db)
+        .await
+        .unwrap();
+    change.finish(true);
+    processor.arm_completed_history_preparation_barrier("__control_owner_settled__");
+    processor.release_completed_history_preparation_barrier();
+    timeout(
+        Duration::from_secs(10),
+        processor.wait_for_completed_history_preparation_barrier(),
+    )
+    .await
+    .unwrap();
+    observer.reads.lock().unwrap().clear();
+    observer.writes.lock().unwrap().clear();
+    processor.release_completed_history_preparation_barrier();
+    tokio::task::yield_now().await;
+    let ticker = tokio::spawn(async {
+        loop {
+            tokio::task::yield_now().await;
+        }
+    });
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(300)).await;
+    for _ in 0..32 {
+        tokio::task::yield_now().await;
+    }
+    ticker.abort();
+    assert!(observer.reads.lock().unwrap().is_empty());
+    assert!(observer.writes.lock().unwrap().is_empty());
+    tokio::time::resume();
+    stop.cancel();
+    timeout(Duration::from_secs(10), worker)
+        .await
+        .unwrap()
+        .unwrap();
 }

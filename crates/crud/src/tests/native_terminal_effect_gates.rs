@@ -1921,3 +1921,75 @@ async fn failed_claim_discovery_page_keeps_its_input_quota_and_other_statuses_pr
             .all(|record| !record.effect_id.contains("ready"))
     );
 }
+
+#[tokio::test]
+async fn grouped_admission_tracks_gate_due_retry_and_expired_claim_without_history_false_positives()
+{
+    let f = Fixture::open().await;
+    let id = f
+        .effect(
+            "admission",
+            pioneer_protocol::NativeTerminalEffectGate::AcceptedTaskResult,
+            true,
+        )
+        .await;
+    let scoped = f.store.with_maintenance_access();
+    for (status, due, lease, gate, expected) in [
+        ("prepared", Some(NOW), None, NOW, false),
+        ("waiting_acceptance", None, None, NOW + 1, false),
+        ("waiting_acceptance", None, None, NOW, true),
+        ("ready", Some(NOW + 1), None, NOW, false),
+        ("ready", None, None, NOW, false),
+        ("ready", Some(NOW), None, NOW, true),
+        ("retry_wait", Some(NOW + 1), None, NOW, false),
+        ("retry_wait", Some(NOW), None, NOW, true),
+        ("running", Some(NOW - 100), Some(NOW + 1), NOW, false),
+        ("running", Some(NOW - 100), None, NOW, false),
+        ("running", Some(NOW + 100), Some(NOW), NOW, true),
+        ("succeeded", Some(NOW), Some(NOW), NOW, false),
+        ("unresolved", Some(NOW), Some(NOW), NOW, false),
+    ] {
+        let mut row: effect::ActiveModel = f.row(&id).await.into_active_model();
+        row.status = Set(status.to_owned());
+        row.next_run_at = Set(due.map(unix_to_datetime));
+        row.claim_expires_at = Set(lease.map(unix_to_datetime));
+        row.gate_probe_at = Set(gate);
+        row.update(&f.store.connection).await.unwrap(); // setup bypasses hints; this test observes the durable clock directly
+        let before = f.routes.reads.load(Ordering::SeqCst);
+        assert_eq!(
+            scoped
+                .native_terminal_effect_work_deadline()
+                .await
+                .unwrap()
+                .is_some_and(|at| at <= unix_to_datetime(NOW)),
+            expected,
+            "status={status}, due={due:?}, lease={lease:?}, gate={gate}"
+        );
+        assert_eq!(f.routes.reads.load(Ordering::SeqCst) - before, 1);
+    }
+    let mut row: effect::ActiveModel = f.row(&id).await.into_active_model();
+    row.status = Set("waiting_acceptance".into());
+    row.gate_probe_at = Set(NOW + 1);
+    row.update(&f.store.connection).await.unwrap();
+    assert!(
+        !scoped
+            .native_terminal_effect_work_deadline()
+            .await
+            .unwrap()
+            .is_some_and(|at| at <= unix_to_datetime(NOW))
+    );
+    assert!(
+        scoped
+            .native_terminal_effect_work_deadline()
+            .await
+            .unwrap()
+            .is_some_and(|at| at <= unix_to_datetime(NOW + 1))
+    );
+    assert!(
+        !scoped
+            .native_terminal_effect_work_deadline()
+            .await
+            .unwrap()
+            .is_some_and(|at| at <= unix_to_datetime(NOW - 1))
+    );
+}

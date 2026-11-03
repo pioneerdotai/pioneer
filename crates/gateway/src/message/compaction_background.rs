@@ -7,6 +7,7 @@ use pioneer_crud::compaction::{HistoryCheckDiagnostic, HistoryCheckOutcome};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::sync::atomic::AtomicBool;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Serialize, Deserialize)]
@@ -20,11 +21,48 @@ struct CapturedCheck {
     #[serde(default)]
     fixed_input_tokens: u64,
 }
+type HistoryJobs = tokio::sync::Mutex<HashMap<(String, String), OwnedHistoryCheck>>;
+#[derive(Default)]
+struct SharedHistoryJobs(std::sync::Mutex<Weak<HistoryJobs>>);
+pub(super) fn shared_history_jobs(store: &CrudStore) -> Arc<HistoryJobs> {
+    let shared = store
+        .database_connection()
+        .shared_resource::<SharedHistoryJobs>();
+    let mut current = shared.0.lock().unwrap();
+    current.upgrade().unwrap_or_else(|| {
+        let jobs = Arc::new(HistoryJobs::default());
+        *current = Arc::downgrade(&jobs);
+        jobs
+    })
+}
+
 pub(super) struct OwnedHistoryCheck {
     turn: String,
     cancel: CancellationToken,
     suspending: Arc<AtomicBool>,
     pub(super) handle: Option<JoinHandle<()>>,
+    finished: Arc<AtomicBool>,
+}
+struct HistoryCapacityRelease {
+    finished: Arc<AtomicBool>,
+    wake: Arc<pioneer_sqlite::background::Wake>,
+    inputs: Arc<pioneer_crud::CompactionHistoryChanges>,
+    observed: [u64; 4],
+    waiting: u8,
+    settled: bool,
+}
+impl Drop for HistoryCapacityRelease {
+    fn drop(&mut self) {
+        // Publish before notification: JoinHandle::is_finished can still be
+        // false during this last destructor. Collection may join after removing
+        // the completed entry, without a DB resource or state lock.
+        self.finished.store(true, Ordering::Release);
+        self.inputs.retain_changed(self.observed, self.waiting);
+        if !self.settled {
+            self.inputs.defer_error();
+        }
+        self.wake.dependency_released();
+    }
 }
 
 #[cfg(test)]
@@ -33,10 +71,14 @@ pub(crate) struct CompletedHistoryPreparationBarrier {
     turn: std::sync::Mutex<Option<String>>,
     reached: tokio::sync::Notify,
     release: tokio::sync::Notify,
+    history_idle: tokio::sync::Notify,
 }
 
 #[cfg(test)]
 impl CompletedHistoryPreparationBarrier {
+    pub(super) async fn wait_for_history_idle(&self) {
+        self.history_idle.notified().await;
+    }
     pub(super) fn arm(&self, turn: &str) {
         *self.turn.lock().expect("preparation barrier lock") = Some(turn.to_owned());
     }
@@ -206,22 +248,42 @@ impl MessageProcessor {
             .await
     }
 
-    /// Existing resilience owner polls only durable completion intents, not all
-    /// histories. Service work runs separately and never stalls its poll loop.
+    #[cfg(test)]
     pub(crate) async fn poll_completed_history_checks(&self) -> anyhow::Result<()> {
+        let lifecycle = self.reconcile_compaction_lifecycle().await;
+        let history = self.poll_completed_history_checks_only().await;
+        history?;
+        lifecycle
+    }
+
+    // History remains independently service-owned; lifecycle errors cannot
+    // suppress its discovery quota or cancellation of completed service jobs.
+    #[cfg(test)]
+    pub(crate) async fn poll_completed_history_checks_only(&self) -> anyhow::Result<()> {
         if !self.agent_manager.has_context_controller().await {
             return Ok(());
         }
-        let lifecycle_result = self.reconcile_compaction_lifecycle().await;
-        if lifecycle_result.is_err() {
-            warn!("compaction lifecycle maintenance deferred after storage failure");
-        }
-        let store = self.crud_store.with_maintenance_access();
+        self.collect_completed_history_checks().await;
+        let rows = self
+            .crud_store
+            .with_maintenance_access()
+            .compaction_due_history_checks(
+                self.compaction_clock.now_ms().min(i64::MAX as u64) as i64
+            )
+            .await?;
+        self.spawn_completed_history_rows(rows.into_iter().map(|row| (row, false)).collect())
+            .await
+    }
+
+    async fn collect_completed_history_checks(&self) {
         let finished = {
             let mut jobs = self.completed_history_checks.lock().await;
             let keys: Vec<_> = jobs
                 .iter()
-                .filter(|(_, job)| job.handle.as_ref().is_none_or(JoinHandle::is_finished))
+                .filter(|(_, job)| {
+                    job.finished.load(Ordering::Acquire)
+                        || job.handle.as_ref().is_none_or(JoinHandle::is_finished)
+                })
                 .map(|(key, _)| key.clone())
                 .collect();
             keys.into_iter()
@@ -233,12 +295,13 @@ impl MessageProcessor {
                 let _ = handle.await;
             }
         }
-        for mut row in store
-            .compaction_due_history_checks(
-                self.compaction_clock.now_ms().min(i64::MAX as u64) as i64
-            )
-            .await?
-        {
+    }
+
+    async fn spawn_completed_history_rows(
+        &self,
+        rows: Vec<(pioneer_crud::compaction::CompletedHistoryCheck, bool)>,
+    ) -> anyhow::Result<()> {
+        for (mut row, dependency) in rows {
             let key = (row.workspace_id.clone(), row.thread_id.clone());
             let mut jobs = self.completed_history_checks.lock().await;
             if jobs.contains_key(&key) {
@@ -255,17 +318,39 @@ impl MessageProcessor {
             let task_cancel = cancel.clone();
             let task_suspending = suspending.clone();
             let turn = row.turn_id.clone();
-            let handle = tokio::spawn(async move {
+            let finished = Arc::new(AtomicBool::new(false));
+            let completion = HistoryCapacityRelease {
+                finished: finished.clone(),
+                wake: self.crud_store.background_work("compaction.history"),
+                inputs: self.crud_store.compaction_history_changes(),
+                observed: self.crud_store.compaction_history_changes().versions(),
+                waiting: 0,
+                settled: false,
+            };
+            let history_changes = self.crud_store.compaction_history_changes();
+            let future = async move {
+                let mut completion = completion;
                 let now = processor.compaction_clock.now_ms();
                 let claimed = tokio::select! { biased;
                     _ = task_cancel.cancelled() => return,
-                    result = processor.crud_store.compaction_claim_history_check(&row.turn_id, row.revision, now.min(i64::MAX as u64) as i64) => result,
+                    result = async {
+                        if dependency {
+                            processor.crud_store.compaction_claim_history_dependency(&row, now.min(i64::MAX as u64) as i64).await
+                        } else {
+                            processor.crud_store.compaction_claim_history_check(&row.turn_id, row.revision, now.min(i64::MAX as u64) as i64).await
+                        }
+                    } => result,
                 };
                 let claimed = match claimed {
                     Ok(Some(value)) => value,
-                    Ok(None) => return,
+                    Ok(None) => {
+                        completion.settled = true;
+                        return;
+                    }
                     Err(_) => {
                         warn!("failed to claim history check");
+                        history_changes.defer_error();
+                        completion.settled = true;
                         return;
                     }
                 };
@@ -339,7 +424,7 @@ impl MessageProcessor {
                             .push_str("; automatic preparation retry limit reached");
                     }
                     diagnostic.observed_ms = processor.compaction_clock.now_ms();
-                    if processor
+                    let recorded = processor
                         .crud_store
                         .compaction_record_history_result(
                             &row.turn_id,
@@ -349,13 +434,27 @@ impl MessageProcessor {
                             &diagnostic,
                             diagnostic.observed_ms.min(i64::MAX as u64) as i64,
                         )
-                        .await
-                        .is_err()
-                    {
-                        warn!("failed to persist history check result");
+                        .await;
+                    match recorded {
+                        Ok(true) => {
+                            completion.waiting = match outcome {
+                                HistoryCheckOutcome::WaitingCatalog => 1,
+                                HistoryCheckOutcome::WaitingSettings => 2,
+                                HistoryCheckOutcome::WaitingExecutor => 4,
+                                HistoryCheckOutcome::Preparing => 8,
+                                _ => 0,
+                            }
+                        }
+                        Ok(false) => {}
+                        Err(_) => {
+                            warn!("failed to persist history check result");
+                            history_changes.defer_error();
+                        }
                     }
                 }
-            });
+                completion.settled = true;
+            };
+            let handle = tokio::spawn(pioneer_sqlite::background::inherit_origin(future));
             jobs.insert(
                 key,
                 OwnedHistoryCheck {
@@ -363,11 +462,375 @@ impl MessageProcessor {
                     cancel,
                     suspending,
                     handle: Some(handle),
+                    finished,
                 },
             );
         }
-        lifecycle_result
+        Ok(())
     }
+
+    pub(super) async fn run_compaction_history_worker(processor: Weak<Self>) {
+        use pioneer_sqlite::background::{Plan, Ready};
+        let Some(initial) = processor.upgrade() else {
+            return;
+        };
+        let work = initial.crud_store.background_work("compaction.history");
+        let inputs = initial.crud_store.compaction_history_changes();
+        let cancel = initial.cli_history_shutdown.clone();
+        // Subscribe before reconstruction: catalog completion during an Empty
+        // read is retained independently of every other catalog consumer.
+        let mut catalog = pioneer_provider::catalog::subscribe_model_catalog_changes();
+        let mut provider_secrets = initial.gateway_secrets.subscribe_provider_changes();
+        let Some(mut owner) = work.acquire() else {
+            return;
+        };
+        drop(initial);
+        let mut dependency_pass = true;
+        let mut dependency_kinds = 15u8;
+        let mut dependency_after = None::<String>;
+        let mut dependency_upper = None::<String>;
+        let mut dependency_rescan = 0u8;
+        let mut earliest_future = None::<i64>;
+        let mut prior_observation = None;
+        let mut rescan = false;
+        let mut due_turn = false;
+        loop {
+            let ready = tokio::select! {
+                _ = cancel.cancelled() => return,
+                changed = catalog.changed() => {
+                    if changed.is_err() { return; }
+                    inputs.catalog_changed();
+                    work.dependency_released();
+                    continue;
+                },
+                changed = provider_secrets.changed() => {
+                    if changed.is_err() { return; }
+                    inputs.configuration_changed();
+                    work.dependency_released();
+                    continue;
+                },
+                ready = owner.ready() => ready,
+            };
+            if ready == Ready::Closed {
+                return;
+            }
+            let Some(original) = processor.upgrade() else {
+                return;
+            };
+            let this = original.with_database_class(SqliteWriteClass::Maintenance);
+            drop(original);
+            if ready == Ready::SettlementRequired {
+                let settle_observation = owner.observe();
+                dependency_pass = true;
+                dependency_after = None;
+                dependency_upper = None;
+                dependency_rescan = 0;
+                dependency_kinds = 15;
+                earliest_future = None;
+                rescan = false;
+                if this
+                    .crud_store
+                    .database_connection()
+                    .settle_background_change(&owner)
+                    .await
+                    .is_err()
+                {
+                    warn!("compaction history settlement deferred");
+                    owner.retry_after(settle_observation, Duration::from_secs(2));
+                }
+                continue;
+            }
+            let observed = owner.observe();
+            if prior_observation.is_some_and(|prior| owner.producer_changed_since(prior)) {
+                rescan |= dependency_pass;
+                if !dependency_pass {
+                    earliest_future = None;
+                    dependency_kinds = 0;
+                    dependency_pass = true;
+                }
+            }
+            prior_observation = Some(observed);
+            if !dependency_pass {
+                // Woken by a concrete deadline: reconstruct it in bounded pages.
+                dependency_pass = true;
+                earliest_future = None;
+                dependency_kinds = 0;
+            }
+            if let Some(at) = inputs.retry_at().filter(|at| *at > Instant::now()) {
+                owner.publish(observed, Plan::MonotonicDeadline(at));
+                continue;
+            }
+            let changed = inputs.take_dependencies();
+            if changed != 0 {
+                if dependency_after.is_none() && dependency_upper.is_none() {
+                    dependency_kinds |= changed;
+                } else if dependency_pass {
+                    dependency_rescan |= changed;
+                } else {
+                    dependency_pass = true;
+                    dependency_after = None;
+                    dependency_upper = None;
+                    dependency_kinds = changed;
+                }
+            }
+            let cycle = owner
+                .scope(
+                    AssertUnwindSafe(async {
+                        this.collect_completed_history_checks().await;
+                        if !this.agent_manager.has_context_controller().await {
+                            return Ok(Plan::Dormant);
+                        }
+                        let active = {
+                            let jobs = this.completed_history_checks.lock().await;
+                            jobs.values()
+                                .map(|job| job.turn.clone())
+                                .collect::<Vec<_>>()
+                        };
+                        let slots = 16usize.saturating_sub(active.len());
+                        if slots == 0 {
+                            return Ok(Plan::Dormant);
+                        }
+                        let mut rows = Vec::new();
+                        let mut read_error = None;
+                        due_turn = !due_turn;
+                        let due_quota = if slots == 1 {
+                            usize::from(due_turn)
+                        } else {
+                            slots / 2
+                        };
+                        let raw_quota = slots - due_quota;
+                        match this
+                            .crud_store
+                            .compaction_due_history_page(
+                                this.compaction_clock.now_ms().min(i64::MAX as u64) as i64,
+                                &active,
+                                due_quota as u64,
+                                this.context_compaction_config
+                                    .hot_conversation_window_secs
+                                    .saturating_mul(1000)
+                                    .min(i64::MAX as u64) as i64,
+                            )
+                            .await
+                        {
+                            Ok(due) => rows.extend(due.into_iter().map(|row| {
+                                let dependency = matches!(
+                                    row.outcome.as_deref(),
+                                    Some(
+                                        "waiting_catalog"
+                                            | "waiting_settings"
+                                            | "waiting_executor"
+                                            | "preparing"
+                                    )
+                                );
+                                (row, dependency)
+                            })),
+                            Err(error) => {
+                                read_error = Some(error);
+                            }
+                        }
+                        if raw_quota > 0 {
+                            match this
+                                .crud_store
+                                .compaction_history_obligation_page(
+                                    dependency_after.as_deref(),
+                                    dependency_upper.as_deref(),
+                                    &active,
+                                    raw_quota as u64,
+                                    dependency_kinds,
+                                    this.compaction_clock.now_ms().min(i64::MAX as u64) as i64,
+                                    this.context_compaction_config
+                                        .hot_conversation_window_secs
+                                        .saturating_mul(1000)
+                                        .min(i64::MAX as u64)
+                                        as i64,
+                                )
+                                .await
+                            {
+                                Ok((page, after, upper, error, next)) => {
+                                    dependency_pass = after.is_some();
+                                    dependency_after = after;
+                                    dependency_upper = upper;
+                                    earliest_future = earliest_future.into_iter().chain(next).min();
+                                    if let Some(error) = error {
+                                        read_error.get_or_insert(error);
+                                    }
+                                    rows.extend(page);
+                                }
+                                Err(error) => {
+                                    read_error = Some(error);
+                                }
+                            }
+                        }
+                        let mut seen = std::collections::HashSet::new();
+                        rows.retain(|(row, _)| seen.insert(row.turn_id.clone()));
+                        // Both independent read quotas have run before returning an
+                        // observation error; any healthy selected work still starts.
+                        this.spawn_completed_history_rows(rows).await?;
+                        if let Some(error) = read_error {
+                            rescan = true;
+                            return Err(error);
+                        }
+                        if !dependency_pass && (dependency_rescan != 0 || rescan) {
+                            rescan = false;
+                            earliest_future = None;
+                            dependency_kinds = std::mem::take(&mut dependency_rescan);
+                            dependency_pass = true;
+                        }
+                        let active = {
+                            let jobs = this.completed_history_checks.lock().await;
+                            jobs.values()
+                                .map(|job| job.turn.clone())
+                                .collect::<Vec<_>>()
+                        };
+                        if active.len() == 16 {
+                            return Ok(Plan::Dormant);
+                        }
+                        if dependency_pass || inputs.dependencies_pending() {
+                            return Ok(Plan::Runnable);
+                        }
+                        let next = earliest_future;
+                        Ok(next.map_or(Plan::Dormant, |at| {
+                            let delay = at.saturating_sub(
+                                this.compaction_clock.now_ms().min(i64::MAX as u64) as i64,
+                            );
+                            if delay <= 0 {
+                                Plan::Runnable
+                            } else {
+                                Plan::MonotonicDeadline(
+                                    Instant::now() + Duration::from_millis(delay as u64),
+                                )
+                            }
+                        }))
+                    })
+                    .catch_unwind(),
+                )
+                .await;
+            match cycle {
+                Ok(Ok(plan)) => {
+                    #[cfg(test)]
+                    let published = owner.publish(observed, plan);
+                    #[cfg(not(test))]
+                    owner.publish(observed, plan);
+                    #[cfg(test)]
+                    let no_jobs = this.completed_history_checks.lock().await.is_empty();
+                    #[cfg(test)]
+                    if published
+                        && !dependency_pass
+                        && matches!(plan, Plan::Dormant | Plan::MonotonicDeadline(_))
+                        && no_jobs
+                        && work.observe() == observed
+                        && !owner.requires_settlement()
+                    {
+                        // Notification only: no input mutation, plan override,
+                        // extra SQL, or production path. EOF + actual empty job
+                        // set + successful generation-fenced wait publication.
+                        this.completed_history_preparation_barrier
+                            .history_idle
+                            .notify_one();
+                    }
+                }
+                _ => {
+                    rescan = true;
+                    warn!("compaction history discovery deferred after failure");
+                    inputs.defer_error();
+                    owner.retry_after(observed, Duration::from_secs(2));
+                }
+            }
+            #[cfg(test)]
+            this.completed_history_preparation_barrier
+                .wait_if_armed("__compaction_history_before_wait__", &cancel)
+                .await;
+            drop(this);
+        }
+    }
+
+    pub(super) async fn run_compaction_lifecycle_worker(processor: Weak<Self>) {
+        use pioneer_sqlite::background::{Plan, Ready};
+        let Some(initial) = processor.upgrade() else {
+            return;
+        };
+        let work = initial.crud_store.background_work("compaction.lifecycle");
+        let cancel = initial.cli_history_shutdown.clone();
+        let Some(mut owner) = work.acquire() else {
+            return;
+        };
+        drop(initial);
+        loop {
+            let ready =
+                tokio::select! { _ = cancel.cancelled() => return, ready = owner.ready() => ready };
+            if ready == Ready::Closed {
+                return;
+            }
+            let Some(original) = processor.upgrade() else {
+                return;
+            };
+            let this = original.for_background_reconciliation();
+            drop(original);
+            if ready == Ready::SettlementRequired {
+                let settle_observation = owner.observe();
+                if this
+                    .crud_store
+                    .database_connection()
+                    .settle_background_change(&owner)
+                    .await
+                    .is_err()
+                {
+                    warn!("compaction lifecycle settlement deferred");
+                    owner.retry_after(settle_observation, Duration::from_secs(5));
+                }
+                continue;
+            }
+            let observed = owner.observe();
+            let cooldown = *this
+                .compaction_lifecycle_not_before
+                .read()
+                .expect("lifecycle schedule lock");
+            if let Some(until) = cooldown.filter(|until| *until > Instant::now()) {
+                owner.publish(observed, Plan::MonotonicDeadline(until));
+                continue;
+            }
+            let cycle = owner
+                .scope(
+                    AssertUnwindSafe(async {
+                        this.reconcile_compaction_lifecycle().await?;
+                        this.crud_store.compaction_lifecycle_deadlines().await
+                    })
+                    .catch_unwind(),
+                )
+                .await;
+            match cycle {
+                Ok(Ok((pending, scope))) => {
+                    let next = pending.into_iter().chain(scope).min();
+                    // Compaction's clock is epoch+monotonic, not UTC wall time.
+                    // Preserve its clock domain; never cast ms to Unix seconds.
+                    let plan = next.map_or(Plan::Dormant, |at| {
+                        let delay = at.saturating_sub(
+                            this.compaction_clock.now_ms().min(i64::MAX as u64) as i64,
+                        );
+                        if delay <= 0 {
+                            Plan::Runnable
+                        } else {
+                            Plan::MonotonicDeadline(
+                                Instant::now() + Duration::from_millis(delay as u64),
+                            )
+                        }
+                    });
+                    owner.publish(observed, plan);
+                }
+                _ => {
+                    warn!("compaction lifecycle quantum deferred after failure");
+                    this.defer_compaction_lifecycle();
+                    owner.retry_after(observed, Duration::from_secs(5));
+                }
+            }
+            #[cfg(test)]
+            this.completed_history_preparation_barrier
+                .wait_if_armed("__compaction_lifecycle_before_wait__", &cancel)
+                .await;
+            drop(this);
+        }
+    }
+
     fn defer_compaction_lifecycle(&self) {
         // Local scheduling only: when storage cannot persist a deferral, durable
         // backoff is unproven. Preserve the debt and let the common poll proceed.
@@ -392,9 +855,23 @@ impl MessageProcessor {
         let processor = Arc::new(self.scoped_with_database_class(SqliteWriteClass::Maintenance));
         let store = &processor.crud_store;
         let clock = || i64::try_from(self.compaction_clock.now_ms()).unwrap_or(i64::MAX);
+        let (pending_ready, scope_ready) = match store.compaction_lifecycle_deadlines().await {
+            Ok((pending, scope)) => (
+                pending.is_some_and(|at| at <= clock()),
+                scope.is_some_and(|at| at <= clock()),
+            ),
+            Err(error) => {
+                // Unknown admits the independent bounded owners in this quantum.
+                // Preserve the error and cooldown even when pending repair succeeds.
+                warn!("compaction lifecycle readiness unavailable");
+                self.defer_compaction_lifecycle();
+                storage_error = Some(error.context("compaction lifecycle readiness unavailable"));
+                (true, true)
+            }
+        };
         // One shared input budget: 4 seed + 4 scope + 8 pending. Neither an
         // outer lock-race retry nor per-row repair can rediscover this batch.
-        for seed in [true, false] {
+        for seed in [true, false].into_iter().filter(|_| scope_ready) {
             let result =
                 std::panic::AssertUnwindSafe(store.compaction_expand_lifecycle_scope(seed, &clock))
                     .catch_unwind()
@@ -410,10 +887,25 @@ impl MessageProcessor {
                     self.defer_compaction_lifecycle();
                     storage_error.get_or_insert(error);
                 }
-                _ => warn!("failed to expand compaction lifecycle scope"),
+                Ok(Err(error)) => {
+                    warn!("failed to expand compaction lifecycle scope");
+                    self.defer_compaction_lifecycle();
+                    storage_error.get_or_insert(error);
+                }
+                Err(_) => {
+                    self.defer_compaction_lifecycle();
+                    storage_error.get_or_insert_with(|| {
+                        anyhow::anyhow!("compaction lifecycle scope panicked")
+                    });
+                }
             }
         }
-        let rows = match store.compaction_due_lifecycle(clock()).await {
+        // Expansion can create pending rows even if the initial observation was empty.
+        let rows = match if pending_ready || scope_ready {
+            store.compaction_due_lifecycle(clock()).await
+        } else {
+            Ok(Vec::new())
+        } {
             Ok(rows) => rows,
             Err(error) => {
                 warn!("compaction lifecycle discovery unavailable");
@@ -516,7 +1008,17 @@ impl MessageProcessor {
                     self.defer_compaction_lifecycle();
                     storage_error.get_or_insert(error);
                 }
-                _ => warn!("failed to reconcile compaction lifecycle record"),
+                Ok(Err(error)) => {
+                    warn!("failed to reconcile compaction lifecycle record");
+                    self.defer_compaction_lifecycle();
+                    storage_error.get_or_insert(error);
+                }
+                Err(_) => {
+                    self.defer_compaction_lifecycle();
+                    storage_error.get_or_insert_with(|| {
+                        anyhow::anyhow!("compaction lifecycle record panicked")
+                    });
+                }
             }
         }
         storage_error.map_or(Ok(()), Err)

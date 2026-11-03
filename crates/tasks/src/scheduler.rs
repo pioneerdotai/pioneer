@@ -1,12 +1,10 @@
 use crate::TaskRuntimeResult;
 use crate::actor_contract::build_occurrence_contract;
-use crate::event_bus::{TaskEventBus, TaskEventSubscription, TaskEventWakeDelivery};
+use crate::event_bus::TaskEventBus;
 use crate::executor::{
     TaskExecutionContext, TaskExecutionHandle, TaskExecutorRegistry, TaskExecutorStartOutcome,
 };
-use crate::service::{
-    LIVE_RECONCILIATION_INTERVAL, is_terminal_task, now_timestamp_secs, task_error,
-};
+use crate::service::{is_terminal_task, now_timestamp_secs, task_error};
 use crate::trigger::{TaskTriggerCalculator, TaskTriggerCatchUpPlan};
 use anyhow::Context;
 use pioneer_crud::CrudStore;
@@ -18,16 +16,16 @@ use pioneer_sqlite::{
     DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS,
     is_anyhow_sqlite_transient_access, retry_with_backoff,
 };
-use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::sync::{Mutex, Notify};
-use tokio::time::{Duration, sleep};
+use tokio::sync::Mutex;
+#[cfg(test)]
+use tokio::sync::Notify;
+use tokio::time::Duration;
 use tracing::{debug, error, warn};
 
 const ID_LEN: usize = 21;
 pub const TASK_EXECUTION_LEASE_SECONDS: i64 = 300;
-const TASK_SCHEDULER_MAX_SLEEP_SECONDS: u64 = 60;
+const TASK_SCHEDULER_STORAGE_BACKOFF_SECONDS: u64 = 60;
 const TASK_FINISH_QUEUE_TASK_LIMIT: u64 = 64;
 
 /// Only schedule calculation failures can quarantine a Task. Storage and
@@ -55,14 +53,13 @@ impl std::error::Error for TriggerScheduleError {}
 
 #[derive(Clone)]
 pub struct TaskSchedulerHandle {
-    notify: Arc<Notify>,
-    dirty_tasks: Arc<Mutex<HashMap<String, u64>>>,
-    needs_rebuild: Arc<AtomicBool>,
+    changes: Arc<pioneer_crud::TaskSchedulerChanges>,
+    work: Arc<pioneer_sqlite::background::Wake>,
 }
 
 impl TaskSchedulerHandle {
     pub fn wake(&self) {
-        self.notify.notify_one();
+        self.work.invalidate();
     }
 
     /// Mark the exact inputs before polling a fresh mutation future. Wake only
@@ -73,67 +70,98 @@ impl TaskSchedulerHandle {
         task_id: &str,
         operation: impl std::future::Future<Output = TaskRuntimeResult<T>>,
     ) -> TaskRuntimeResult<T> {
-        {
-            let mut dirty = self.dirty_tasks.lock().await;
-            let revision = dirty.entry(task_id.to_owned()).or_default();
-            *revision = revision.wrapping_add(1);
-        }
+        let change = self.work.changing();
+        self.changes.record(task_id);
         let mut pass = SchedulerPass {
-            needs_rebuild: &self.needs_rebuild,
+            changes: &self.changes,
+            due_runs: None,
             complete: false,
         };
         let outcome = operation.await;
         // A concurrent refresh may have consumed the pre-write revision. Keep
         // a fresh addressed observation even when no new event was appended.
-        {
-            let mut dirty = self.dirty_tasks.lock().await;
-            let revision = dirty.entry(task_id.to_owned()).or_default();
-            *revision = revision.wrapping_add(1);
-        }
+        self.changes.record(task_id);
         pass.complete = outcome.is_ok();
         drop(pass);
-        self.notify.notify_one();
+        if outcome.is_ok() {
+            change.finish(true);
+        }
+        // Error/cancellation drops the guard as Unknown, including outcomes
+        // whose COMMIT may still be settling on the serialized connection.
         outcome
     }
+}
+
+#[derive(Default)]
+pub(crate) struct SchedulerState {
+    #[cfg(test)]
+    before_plan: std::sync::Mutex<Option<Arc<tokio::sync::Barrier>>>,
+    #[cfg(test)]
+    local_rebuild: std::sync::Mutex<Option<Arc<tokio::sync::Barrier>>>,
+    rebuild: Mutex<Option<TriggerRebuild>>,
+    continuation: std::sync::atomic::AtomicBool,
+    due_runs: std::sync::Mutex<DueRunPass>,
+    // Earliest clock used by this complete Runs + Triggers traversal. A
+    // deadline crossing does not advance producer generation.
+    due_cutoff: std::sync::Mutex<Option<i64>>,
+    due_trigger_upper: Mutex<Option<(chrono::DateTime<chrono::FixedOffset>, String)>>,
+    due_trigger_cursor: Mutex<Option<(chrono::DateTime<chrono::FixedOffset>, String)>>,
+}
+
+// The drain serializes foreground and owner quanta. Keep the input fence with
+// the retained frontier, rather than with the long-lived owner's stack.
+#[derive(Default)]
+struct DueRunPass {
+    after: Option<String>,
+    upper: Option<String>,
+    observation: Option<pioneer_sqlite::background::Observation>,
+    rescan_requested: bool,
+}
+
+struct TriggerRebuild {
+    after: Option<String>,
+    upper: Option<String>,
+    generation: u64,
+    observed_at: i64,
+    seen: std::collections::HashSet<String>,
 }
 
 pub struct TaskScheduler {
     store: Arc<CrudStore>,
     event_bus: Arc<TaskEventBus>,
     executors: Arc<TaskExecutorRegistry>,
-    notify: Arc<Notify>,
-    due_queue: Mutex<Vec<TaskTriggerQueueItem>>,
-    process_lock: Mutex<()>,
-    events: Mutex<TaskEventSubscription>,
-    needs_rebuild: Arc<AtomicBool>,
-    dirty_tasks: Arc<Mutex<HashMap<String, u64>>>,
-    due_run_cursor: Mutex<Option<String>>,
-    due_run_upper: Mutex<Option<String>>,
-    due_trigger_upper: Mutex<Option<(chrono::DateTime<chrono::FixedOffset>, String)>>,
-    expired_task_cursor: Mutex<Option<(String, String)>>,
-    due_trigger_cursor: Mutex<Option<(chrono::DateTime<chrono::FixedOffset>, String)>>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-struct TaskTriggerQueueItem {
-    task_id: String,
-    wake_id: String,
-    next_fire_at: i64,
-    // Only a future observation arms an occurrence. Keep the schedule snapshot
-    // so a replacement spec at the same timestamp cannot inherit it.
-    armed_trigger: Option<TaskTrigger>,
+    work: Arc<pioneer_sqlite::background::Wake>,
+    state: Arc<SchedulerState>,
+    changes: Arc<pioneer_crud::TaskSchedulerChanges>,
+    #[cfg(test)]
+    pub(super) parked: Notify,
+    #[cfg(test)]
+    pub(super) future_observed: Notify,
 }
 
 /// Cancellation or an error after possible mutation makes the next pass
 /// reconstruct durable state; only a completed pass may disarm this guard.
+// A foreground quantum may leave a quiet finite reconstruction tail. Return
+// that obligation only after its admission and state restoration unwind.
+struct ForegroundSchedulerHandoff<'a>(&'a pioneer_sqlite::background::Wake);
+impl Drop for ForegroundSchedulerHandoff<'_> {
+    fn drop(&mut self) {
+        self.0.invalidate();
+    }
+}
+
 struct SchedulerPass<'a> {
-    needs_rebuild: &'a AtomicBool,
+    changes: &'a pioneer_crud::TaskSchedulerChanges,
+    due_runs: Option<&'a std::sync::Mutex<DueRunPass>>,
     complete: bool,
 }
 impl Drop for SchedulerPass<'_> {
     fn drop(&mut self) {
         if !self.complete {
-            self.needs_rebuild.store(true, Ordering::Release);
+            if let Some(runs) = self.due_runs {
+                runs.lock().unwrap().rescan_requested = true;
+            }
+            self.changes.reconstruct();
         }
     }
 }
@@ -144,68 +172,180 @@ impl TaskScheduler {
         event_bus: Arc<TaskEventBus>,
         executors: Arc<TaskExecutorRegistry>,
     ) -> Self {
-        let events = event_bus.subscribe(Default::default());
-        let notify = event_bus.scheduler_notify();
+        let (work, state, changes) = event_bus.bind_scheduler(&store);
+        changes.reconstruct();
+        work.invalidate();
         Self {
             store: Arc::new(store.with_maintenance_access()),
             event_bus,
             executors,
-            notify,
-            due_queue: Mutex::new(Vec::new()),
-            process_lock: Mutex::new(()),
-            events: Mutex::new(events),
-            needs_rebuild: Arc::new(AtomicBool::new(true)),
-            dirty_tasks: Arc::new(Mutex::new(HashMap::new())),
-            due_run_cursor: Mutex::new(None),
-            due_run_upper: Mutex::new(None),
-            due_trigger_upper: Mutex::new(None),
-            expired_task_cursor: Mutex::new(None),
-            due_trigger_cursor: Mutex::new(None),
+            work,
+            state,
+            changes,
+            #[cfg(test)]
+            parked: Default::default(),
+            #[cfg(test)]
+            future_observed: Default::default(),
         }
     }
 
     pub fn handle(&self) -> TaskSchedulerHandle {
         TaskSchedulerHandle {
-            notify: self.notify.clone(),
-            dirty_tasks: self.dirty_tasks.clone(),
-            needs_rebuild: self.needs_rebuild.clone(),
+            changes: self.changes.clone(),
+            work: self.work.clone(),
         }
     }
 
     pub fn wake(&self) {
-        self.notify.notify_one();
+        self.work.invalidate();
     }
 
     pub async fn run(self: Arc<Self>) {
+        use pioneer_sqlite::background::{Plan, Ready};
+        let Some(mut owner) = self.work.acquire() else {
+            return;
+        };
+        let mut after_sweep = None;
         loop {
-            let now = now_timestamp_secs();
-            let processing = self
-                .process_due_once_with_transient_storage_retry(now)
+            let ready = owner.ready().await;
+            if ready == Ready::Closed {
+                return;
+            }
+            let observation = owner.observe();
+            let Some(_drain) = self.work.drain().await else {
+                return;
+            };
+            if ready == Ready::SettlementRequired {
+                let settle_observation = owner.observe();
+                after_sweep = None;
+                self.changes.reconstruct();
+                if self
+                    .store
+                    .database_connection()
+                    .settle_background_change(&owner)
+                    .await
+                    .is_err()
+                {
+                    warn!(
+                        failure_class = "task_scheduler_settlement_failure",
+                        "task scheduler change settlement deferred"
+                    );
+                    owner.retry_after(
+                        settle_observation,
+                        Duration::from_secs(TASK_SCHEDULER_STORAGE_BACKOFF_SECONDS),
+                    );
+                }
+                continue;
+            }
+            if let Some((observed, plan)) = after_sweep {
+                let deadline_reached =
+                    matches!(plan, Plan::WallDeadline(at) if at <= self.work.wall_now());
+                if owner.observe() == observed && !self.changes.pending() && !deadline_reached {
+                    self.changes.sweep_trigger_observations();
+                    if !self.changes.sweeping() {
+                        after_sweep = None;
+                        let settled = owner.publish(observed, plan);
+                        #[cfg(test)]
+                        if settled {
+                            match plan {
+                                Plan::Dormant => self.parked.notify_one(),
+                                Plan::WallDeadline(_) => self.future_observed.notify_one(),
+                                _ => {}
+                            }
+                        }
+                        let _ = settled;
+                    }
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+                after_sweep = None;
+            }
+            let now = self
+                .work
+                .wall_now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+                .min(i64::MAX as u64) as i64;
+            let processing = owner
+                .scope(self.process_due_once_with_transient_storage_retry(now))
                 .await;
-            let sleep_duration = match processing {
-                Ok(_) => self.next_sleep_duration(now).await,
+            #[cfg(test)]
+            {
+                let barrier = self.state.before_plan.lock().unwrap().take();
+                if let Some(barrier) = barrier {
+                    barrier.wait().await;
+                    barrier.wait().await;
+                }
+            }
+            match processing {
+                Ok(_) if !owner.requires_settlement() => match self.next_work_plan(now).await {
+                    Ok(plan) => {
+                        // Cleanup of old arming observations is bounded memory
+                        // work. Reuse this observed wait plan while sweeping;
+                        // do not repeat domain SQL for each memory page. A new
+                        // generation or a reached deadline interrupts the sweep.
+                        let sweeping = self.changes.sweeping() && !matches!(plan, Plan::Runnable);
+                        let settled = owner
+                            .publish(observation, if sweeping { Plan::Runnable } else { plan });
+                        if settled && sweeping {
+                            after_sweep = Some((observation, plan));
+                        }
+                        #[cfg(test)]
+                        if settled && !sweeping {
+                            match plan {
+                                Plan::Dormant => self.parked.notify_one(),
+                                Plan::WallDeadline(_) => self.future_observed.notify_one(),
+                                _ => {}
+                            }
+                        }
+                        let _ = settled;
+                    }
+                    Err(error) => {
+                        warn!(
+                            failure_class = "task_scheduler_deadline_failed",
+                            "task scheduler deadline observation deferred"
+                        );
+                        owner.retry_after(
+                            observation,
+                            if is_transient_scheduler_storage_error(&error) {
+                                Duration::from_secs(TASK_SCHEDULER_STORAGE_BACKOFF_SECONDS)
+                            } else {
+                                Duration::from_secs(5)
+                            },
+                        );
+                    }
+                },
+                Ok(_) => {
+                    owner.retry_after(
+                        observation,
+                        Duration::from_secs(TASK_SCHEDULER_STORAGE_BACKOFF_SECONDS),
+                    );
+                }
                 Err(error) => {
-                    // SchedulerPass already records unknown outcomes. Partial row
-                    // errors preserve discovery progress and addressed retries.
-                    let is_transient_storage = is_transient_scheduler_storage_error(&error);
-                    if is_transient_storage {
+                    let delay = if is_transient_scheduler_storage_error(&error) {
                         warn!(
                             failure_class = "task_scheduler_transient_storage_failure",
                             "task scheduler due processing deferred by transient storage access failure"
                         );
-                        Duration::from_secs(TASK_SCHEDULER_MAX_SLEEP_SECONDS)
+                        Duration::from_secs(TASK_SCHEDULER_STORAGE_BACKOFF_SECONDS)
                     } else {
                         error!(
                             failure_class = "task_scheduler_due_processing_failed",
                             "task scheduler due processing failed"
                         );
-                        self.next_sleep_duration(now).await
-                    }
+                        // A malformed due row can retain a past cache clock.
+                        // That is retry debt, not a zero-duration continuation.
+                        match self.store.next_task_scheduler_deadline(now).await {
+                            Ok(Some(at)) => std::time::SystemTime::from(at)
+                                .duration_since(std::time::SystemTime::now())
+                                .unwrap_or(Duration::from_secs(5))
+                                .min(Duration::from_secs(5)),
+                            _ => Duration::from_secs(5),
+                        }
+                    };
+                    owner.retry_after(observation, delay);
                 }
-            };
-            tokio::select! {
-                _ = self.notify.notified() => {}
-                _ = sleep(sleep_duration) => {}
             }
         }
     }
@@ -215,7 +355,7 @@ impl TaskScheduler {
         now: i64,
     ) -> TaskRuntimeResult<usize> {
         retry_with_backoff(
-            || self.process_due_once(now),
+            || self.process_due_admitted(now),
             is_transient_scheduler_storage_error,
             DEFAULT_LOCK_RETRY_ATTEMPTS,
             Duration::from_millis(DEFAULT_LOCK_RETRY_BASE_DELAY_MS),
@@ -224,29 +364,74 @@ impl TaskScheduler {
     }
 
     pub async fn process_due_once(&self, now: i64) -> TaskRuntimeResult<usize> {
-        let _guard = self.process_lock.lock().await;
+        let _handoff = ForegroundSchedulerHandoff(&self.work);
+        let Some(_drain) = self.work.drain().await else {
+            return Ok(0);
+        };
+        self.process_due_admitted(now).await
+    }
+
+    // Owner retains admission through next_work_plan/publication; foreground
+    // retains it through restoration and then hands work back without SQL.
+    async fn process_due_admitted(&self, now: i64) -> TaskRuntimeResult<usize> {
+        // Capture before consuming semantic hints/release bits or doing any
+        // awaited work. Refreshing triggers does not revalidate queued runs.
+        let observed = self.work.observe();
+        {
+            let mut cutoff = self.state.due_cutoff.lock().unwrap();
+            // A rollback can exclude an obligation from a later page too.
+            // Keep the earliest comparison boundary across both finite lanes.
+            *cutoff = Some(cutoff.map_or(now, |old| old.min(now)));
+        }
+        let released = self.changes.take_releases();
+        {
+            let mut runs = self.state.due_runs.lock().unwrap();
+            if runs.after.is_some()
+                && (released
+                    || runs
+                        .observation
+                        .is_some_and(|prior| self.work.producer_changed_since(prior)))
+            {
+                runs.rescan_requested = true;
+            }
+            runs.observation = Some(observed);
+        }
+        self.state
+            .continuation
+            .store(false, std::sync::atomic::Ordering::Release);
         let mut pass = SchedulerPass {
-            needs_rebuild: &self.needs_rebuild,
+            changes: &self.changes,
+            due_runs: Some(&self.state.due_runs),
             complete: false,
         };
         // Recover a stop committed before queue disposal, without waiting for
         // a retry's old ready_at. One bounded disposal quantum per Task keeps
         // transactions small; any remaining queue is rediscovered next pass.
-        for task_id in self
+        let finish = self
             .store
             .list_task_finish_queue_candidates(TASK_FINISH_QUEUE_TASK_LIMIT)
-            .await?
-        {
+            .await?;
+        if finish.len() == TASK_FINISH_QUEUE_TASK_LIMIT as usize {
+            self.state
+                .continuation
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        for task_id in finish {
             self.mark_task_dirty(&task_id).await;
             let events = self
                 .store
                 .discard_finished_task_queue(&task_id, now)
                 .await?;
+            if events.len() >= 16 {
+                self.state
+                    .continuation
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
             self.event_bus.publish_many(events).await;
         }
         let mut row_failures = self.refresh_inputs(now).await?;
-        let after = self.due_trigger_cursor.lock().await.clone();
-        let upper = self.due_trigger_upper.lock().await.clone();
+        let after = self.state.due_trigger_cursor.lock().await.clone();
+        let upper = self.state.due_trigger_upper.lock().await.clone();
         let (due, upper) = self
             .store
             .list_due_active_task_triggers_page_finite(
@@ -264,8 +449,8 @@ impl TaskScheduler {
         // Acquire both advisory guards before publishing the pair: cancellation
         // cannot leave an advanced cursor with an uncaptured/replaced upper.
         {
-            let mut cursor = self.due_trigger_cursor.lock().await;
-            let mut upper_state = self.due_trigger_upper.lock().await;
+            let mut cursor = self.state.due_trigger_cursor.lock().await;
+            let mut upper_state = self.state.due_trigger_upper.lock().await;
             *cursor = if more { due.last.clone() } else { None };
             *upper_state = if more { upper } else { None };
         }
@@ -273,22 +458,12 @@ impl TaskScheduler {
             self.mark_task_dirty(&failure.task_id).await;
         }
         row_failures.extend(due.failures);
-        let armed = self
-            .due_queue
-            .lock()
-            .await
-            .iter()
-            .filter_map(|item| item.armed_trigger.as_ref())
-            .map(|trigger| (trigger.id.clone(), trigger.clone()))
-            .collect::<HashMap<_, _>>();
         let mut created = 0usize;
         let mut failure = None;
         for trigger in due.records {
             // Mark before attempting a write: a failed/unknown commit is not empty.
             self.mark_task_dirty(&trigger.task_id).await;
-            let is_armed = armed
-                .get(&trigger.id)
-                .is_some_and(|previous| same_scheduled_occurrence(previous, &trigger));
+            let is_armed = self.changes.armed(&trigger);
             match self.process_trigger(trigger.clone(), now, is_armed).await {
                 Ok(count) => created = created.saturating_add(count),
                 Err(error) if error.downcast_ref::<TriggerScheduleError>().is_some() => {
@@ -309,27 +484,31 @@ impl TaskScheduler {
                 }
             }
         }
-        let after_id = self.due_run_cursor.lock().await.clone();
-        let upper = self.due_run_upper.lock().await.clone();
+        let (after_id, upper) = {
+            let runs = self.state.due_runs.lock().unwrap();
+            (runs.after.clone(), runs.upper.clone())
+        };
         let (runs, upper) = self
             .store
             .list_scheduler_due_task_runs_finite(now, after_id.as_deref(), upper.as_deref(), 1024)
             .await?;
         let more = runs.scanned == 1024 && runs.last.as_ref() != upper.as_ref();
-        // Acquire both advisory guards before publishing the pair: cancellation
-        // cannot leave an advanced cursor with an uncaptured/replaced upper.
+        // Publish the captured pair together before row processing, preserving
+        // healthy-tail progress when a point fails or this quantum is dropped.
         {
-            let mut cursor = self.due_run_cursor.lock().await;
-            let mut upper_state = self.due_run_upper.lock().await;
-            *cursor = if more { runs.last.clone() } else { None };
-            *upper_state = if more { upper } else { None };
+            let mut pass = self.state.due_runs.lock().unwrap();
+            pass.after = if more { runs.last.clone() } else { None };
+            pass.upper = if more { upper } else { None };
         }
         for failure in &runs.failures {
             self.mark_task_dirty(&failure.task_id).await;
         }
         row_failures.extend(runs.failures);
         for run in runs.records {
-            self.mark_task_dirty(&run.task_id).await;
+            // Visiting an unchanged blocked run is not a committed input.
+            // Lower mutation guards retain revisions/Unknown; SchedulerPass
+            // reconstructs on error or cancellation. Do not replenish the
+            // semantic locator set merely because this due row was observed.
             let outcome = if run.retry_of_run_id.is_some() {
                 self.process_retry_run(run, now).await
             } else {
@@ -344,17 +523,27 @@ impl TaskScheduler {
             }
         }
         row_failures.extend(self.refresh_inputs(now).await?);
+        let released = self.changes.take_releases();
+        {
+            let mut pass = self.state.due_runs.lock().unwrap();
+            // A producer may arrive during this page, including the final
+            // refresh which ACKs its task locator. Keep that debt across EOF.
+            // A committed own completion can release a previously visited run
+            // without advancing the external generation. Consume the semantic
+            // release into this same debt; blocked/no-op visits set neither.
+            pass.rescan_requested |= released || self.work.producer_changed_since(observed);
+            if !more && std::mem::take(&mut pass.rescan_requested) {
+                self.state
+                    .continuation
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
         if let Some(error) = failure {
             return Err(error.context(format!("discovery row failures: {:?}", row_failures)));
         }
-        if self.needs_rebuild.load(Ordering::Acquire) {
-            return Err(anyhow::anyhow!(
-                "unknown addressed scheduler discovery: {:?}",
-                row_failures
-            ));
-        }
         pass.complete = true;
         if !row_failures.is_empty() {
+            self.state.due_runs.lock().unwrap().rescan_requested = true;
             return Err(PartialDiscoveryError(row_failures).into());
         }
         Ok(created)
@@ -371,15 +560,16 @@ impl TaskScheduler {
         // concurrent scheduler wake is safe: claim_task_run_for_dispatch is
         // the per-run CAS and exactly one contender can own the dispatch.
         let mut pass = SchedulerPass {
-            needs_rebuild: &self.needs_rebuild,
+            changes: &self.changes,
+            due_runs: None,
             complete: false,
         };
         let task_id = run.task_id.clone();
         self.mark_task_dirty(&task_id).await;
-        self.notify.notify_one();
+        self.wake();
         let outcome = self.process_queued_run(store, run).await?;
         self.mark_task_dirty(&task_id).await;
-        self.notify.notify_one();
+        self.wake();
         pass.complete = true;
         Ok(outcome)
     }
@@ -513,86 +703,38 @@ impl TaskScheduler {
     }
 
     async fn mark_task_dirty(&self, task_id: &str) {
-        let mut dirty = self.dirty_tasks.lock().await;
-        let revision = dirty.entry(task_id.to_owned()).or_default();
-        *revision = revision.wrapping_add(1);
+        self.changes.record(task_id);
     }
 
-    /// The subscription is created with the scheduler, before startup work. A
-    /// bounded broadcast retains exact task hints; overflow requests durable
-    /// reconstruction. Notifications only wake the loop and never imply empty.
+    /// Committed producers retain a bounded coalesced set before publication.
+    /// Overflow requests durable reconstruction; business event subscriptions
+    /// remain independent of this readiness path.
     async fn refresh_inputs(
         &self,
         now: i64,
     ) -> TaskRuntimeResult<Vec<pioneer_crud::TaskSchedulerRowFailure>> {
         let mut failures = Vec::new();
-        {
-            let mut events = self.events.lock().await;
-            let mut dirty = self.dirty_tasks.lock().await;
-            // One channel quantum. A saturated channel reports lag on the next
-            // pass rather than keeping the scheduler in an unbounded drain.
-            for _ in 0..1024 {
-                match events.try_recv() {
-                    Some(TaskEventWakeDelivery::Wake(wake)) => {
-                        let version = dirty.entry(wake.task_id).or_default();
-                        *version = version.wrapping_add(1);
-                    }
-                    Some(TaskEventWakeDelivery::Lagged(_)) => {
-                        self.needs_rebuild.store(true, Ordering::Release);
-                    }
-                    Some(TaskEventWakeDelivery::Closed) | None => break,
-                }
-            }
+        self.changes.sweep_trigger_observations();
+        // Publication coalesces task locators before reaching this owner; the
+        // business broadcast is independent and is not replayed for readiness.
+        // Consume the reconstruction flag BEFORE await: a concurrent producer
+        // can set it again and cannot be erased by this older rebuild.
+        let reconstruct = self.changes.take_reconstruction();
+        let rebuilding = self.state.rebuild.lock().await.is_some();
+        if reconstruct {
+            *self.state.rebuild.lock().await = None;
         }
-        if self.needs_rebuild.load(Ordering::Acquire) {
-            failures.extend(self.rebuild_due_queue(now).await?);
-            self.needs_rebuild.store(false, Ordering::Release);
-        }
-        // Positive due SQL cannot observe foreign pause/delete/move-later. Rotate
-        // addressed expired cache tasks, bounded independently of dirty hints.
-        let mut expired = self
-            .due_queue
-            .lock()
-            .await
-            .iter()
-            .filter(|item| item.next_fire_at <= now)
-            .map(|item| item.task_id.clone())
-            .collect::<Vec<_>>();
-        expired.sort();
-        expired.dedup();
-        let mut cursor = self.expired_task_cursor.lock().await;
-        // Capture a finite cache pass; newly appended suffix tasks cannot defer
-        // revisiting an older expired locator indefinitely.
-        let upper = cursor
-            .as_ref()
-            .map(|(_, upper)| upper.clone())
-            .or_else(|| expired.last().cloned());
-        let selected = expired
-            .iter()
-            .filter(|id| {
-                cursor.as_ref().is_none_or(|(after, _)| *id > after)
-                    && upper.as_ref().is_some_and(|upper| *id <= upper)
-            })
-            .take(64)
-            .cloned()
-            .collect::<Vec<_>>();
-        *cursor = match (selected.last(), upper) {
-            (Some(last), Some(upper)) if selected.len() == 64 && last < &upper => {
-                Some((last.clone(), upper))
-            }
-            _ => None,
-        };
-        drop(cursor);
-        for id in selected {
-            self.mark_task_dirty(&id).await;
+        if reconstruct || rebuilding {
+            failures.extend(self.rebuild_trigger_observations(now).await?);
         }
         // Keep each locator until its reload succeeds, including cancellation.
-        let tasks = self.dirty_tasks.lock().await.clone();
+        let tasks = self.changes.page();
         for (task_id, revision) in tasks {
-            let (triggers, runs) = match self.store.task_scheduler_inputs_partial(&task_id).await {
+            let snapshot = self.changes.generation();
+            let triggers = match self.store.task_scheduler_triggers_for_task(&task_id).await {
                 Ok(inputs) => inputs,
                 Err(error) => {
-                    self.needs_rebuild.store(true, Ordering::Release);
+                    self.changes.reconstruct();
                     failures.push(pioneer_crud::TaskSchedulerRowFailure {
                         id: task_id.clone(),
                         task_id: task_id.clone(),
@@ -601,159 +743,118 @@ impl TaskScheduler {
                     continue;
                 }
             };
-            let incomplete = !triggers.failures.is_empty() || !runs.failures.is_empty();
+            let incomplete = !triggers.failures.is_empty();
+            let complete_page = triggers.scanned < 64;
             let bad_ids = triggers
                 .failures
                 .iter()
-                .chain(&runs.failures)
                 .map(|row| row.id.clone())
                 .collect::<std::collections::HashSet<_>>();
             failures.extend(triggers.failures);
-            failures.extend(runs.failures);
-            let mut queue = self.due_queue.lock().await;
-            let armed = queue
-                .iter()
-                .filter_map(|item| item.armed_trigger.clone())
-                .map(|trigger| (trigger.id.clone(), trigger))
-                .collect::<HashMap<_, _>>();
-            queue.retain(|item| item.task_id != task_id || bad_ids.contains(&item.wake_id));
-            {
-                for trigger in triggers.records {
-                    if trigger.status == TaskTriggerStatus::Active {
-                        if let Some(next_fire_at) = trigger.next_fire_at {
-                            let is_armed = next_fire_at > now
-                                || armed
-                                    .get(&trigger.id)
-                                    .is_some_and(|old| same_scheduled_occurrence(old, &trigger));
-                            queue.push(TaskTriggerQueueItem {
-                                task_id: task_id.clone(),
-                                wake_id: trigger.id.clone(),
-                                next_fire_at,
-                                armed_trigger: is_armed.then_some(trigger),
-                            });
-                        }
-                    }
-                }
-                for run in runs.records {
-                    if run.status == TaskRunStatus::Queued {
-                        queue.push(TaskTriggerQueueItem {
-                            task_id: task_id.clone(),
-                            wake_id: run.id,
-                            next_fire_at: run.ready_at.unwrap_or(now),
-                            armed_trigger: None,
-                        });
-                    }
-                }
+            let mut seen = bad_ids;
+            for trigger in triggers.records {
+                seen.insert(trigger.id.clone());
+                self.changes.observe_trigger(&trigger, snapshot, now);
             }
-            queue.sort_by_key(|item| {
-                (
-                    item.next_fire_at,
-                    item.task_id.clone(),
-                    item.wake_id.clone(),
-                )
-            });
-            drop(queue);
-            let mut dirty = self.dirty_tasks.lock().await;
-            if !incomplete && dirty.get(&task_id) == Some(&revision) {
-                dirty.remove(&task_id);
+            if complete_page {
+                self.changes
+                    .finish_task_trigger_observation(&task_id, &seen, snapshot);
+            }
+            if !incomplete {
+                self.changes.acknowledge(&task_id, revision);
             }
         }
         Ok(failures)
     }
 
-    async fn rebuild_due_queue(
+    async fn rebuild_trigger_observations(
         &self,
         now: i64,
     ) -> TaskRuntimeResult<Vec<pioneer_crud::TaskSchedulerRowFailure>> {
-        let triggers = self.store.list_active_task_triggers_partial().await?;
-        let runs = self.store.list_queued_task_schedule_partial(1024).await?;
-        let mut failures = triggers.failures;
-        failures.extend(runs.failures);
-        for row in &failures {
+        let mut scan = self
+            .state
+            .rebuild
+            .lock()
+            .await
+            .take()
+            .unwrap_or_else(|| TriggerRebuild {
+                after: None,
+                upper: None,
+                generation: self.changes.begin_trigger_reconstruction(now),
+                observed_at: now,
+                seen: Default::default(),
+            });
+        #[cfg(test)]
+        {
+            let barrier = self.state.local_rebuild.lock().unwrap().take();
+            if let Some(barrier) = barrier {
+                barrier.wait().await;
+                barrier.wait().await;
+            }
+        }
+        let (page, upper) = self
+            .store
+            .task_scheduler_trigger_page(scan.after.as_deref(), scan.upper.as_deref(), 64)
+            .await?;
+        let more = page.scanned == 64 && page.last.as_ref() != upper.as_ref();
+        scan.seen
+            .extend(page.records.iter().map(|trigger| trigger.id.clone()));
+        scan.seen
+            .extend(page.failures.iter().map(|row| row.id.clone()));
+        for row in &page.failures {
             self.mark_task_dirty(&row.task_id).await;
         }
-        let armed = self
-            .due_queue
-            .lock()
-            .await
-            .iter()
-            .filter_map(|item| item.armed_trigger.as_ref())
-            .map(|trigger| (trigger.id.clone(), trigger.clone()))
-            .collect::<HashMap<_, _>>();
-        let mut items = triggers
-            .records
-            .into_iter()
-            .filter_map(|trigger| {
-                let next_fire_at = trigger.next_fire_at?;
-                let is_armed = next_fire_at > now
-                    || armed
-                        .get(&trigger.id)
-                        .is_some_and(|previous| same_scheduled_occurrence(previous, &trigger));
-                Some(TaskTriggerQueueItem {
-                    task_id: trigger.task_id.clone(),
-                    wake_id: trigger.id.clone(),
-                    next_fire_at,
-                    armed_trigger: is_armed.then_some(trigger),
-                })
-            })
-            .collect::<Vec<_>>();
-        items.extend(runs.records.into_iter().filter_map(|run| {
-            let ready_at = run.ready_at.unwrap_or(now);
-            Some(TaskTriggerQueueItem {
-                task_id: run.task_id,
-                wake_id: run.id,
-                next_fire_at: ready_at,
-                armed_trigger: None,
-            })
-        }));
-        items.sort_by(|left, right| {
-            left.next_fire_at
-                .cmp(&right.next_fire_at)
-                .then_with(|| left.task_id.cmp(&right.task_id))
-                .then_with(|| left.wake_id.cmp(&right.wake_id))
-        });
-        let bad_ids = failures
-            .iter()
-            .map(|row| row.id.as_str())
-            .collect::<std::collections::HashSet<_>>();
-        let mut queue = self.due_queue.lock().await;
-        items.extend(
-            queue
-                .iter()
-                .filter(|item| bad_ids.contains(item.wake_id.as_str()))
-                .cloned(),
-        );
-        items.sort_by_key(|item| {
-            (
-                item.next_fire_at,
-                item.task_id.clone(),
-                item.wake_id.clone(),
-            )
-        });
-        *queue = items;
-        Ok(failures)
+        for trigger in page.records {
+            self.changes
+                .observe_trigger(&trigger, scan.generation, scan.observed_at);
+        }
+        if more {
+            scan.after = page.last;
+            scan.upper = upper;
+            *self.state.rebuild.lock().await = Some(scan);
+        } else {
+            self.changes
+                .finish_trigger_reconstruction(scan.seen, scan.generation);
+        }
+        Ok(page.failures)
     }
 
-    pub(crate) async fn next_sleep_duration(&self, now: i64) -> Duration {
-        self.due_queue
+    pub(crate) async fn next_work_plan(
+        &self,
+        now: i64,
+    ) -> TaskRuntimeResult<pioneer_sqlite::background::Plan> {
+        use pioneer_sqlite::background::Plan;
+        let rebuilding = self.state.rebuild.lock().await.is_some();
+        let runs = {
+            let pass = self.state.due_runs.lock().unwrap();
+            pass.after.is_some() || pass.rescan_requested
+        };
+        let triggers = self.state.due_trigger_cursor.lock().await.is_some();
+        if self
+            .state
+            .continuation
+            .load(std::sync::atomic::Ordering::Acquire)
+            || self.changes.pending()
+            || rebuilding
+            || runs
+            || triggers
+        {
+            return Ok(Plan::Runnable);
+        }
+        let cutoff = self
+            .state
+            .due_cutoff
             .lock()
-            .await
-            .first()
-            .map(|item| {
-                if item.next_fire_at <= now {
-                    Duration::ZERO
-                } else {
-                    Duration::from_secs(
-                        u64::try_from(item.next_fire_at.saturating_sub(now)).unwrap_or(u64::MAX),
-                    )
-                }
-            })
-            .map(|duration| duration.min(Duration::from_secs(TASK_SCHEDULER_MAX_SLEEP_SECONDS)))
-            .unwrap_or_else(|| Duration::from_secs(TASK_SCHEDULER_MAX_SLEEP_SECONDS))
-            // The former unconditional live-reconcile pulse supplied this
-            // foreign-writer discovery ceiling. Keep it without empty wakes.
-            // Transient storage backoff in run() retains its separate 60s path.
-            .min(LIVE_RECONCILIATION_INTERVAL)
+            .unwrap()
+            .unwrap_or(now)
+            .min(now);
+        let next = self.store.next_task_scheduler_deadline(cutoff).await?;
+        // Only a complete successful observation consumes the captured clock.
+        // A deadline that crossed behind either frontier remains a wall wait
+        // (already due => one fresh finite pass), whose next cutoff is current.
+        // Errors/cancellation above retain it; shared drain covers publication.
+        *self.state.due_cutoff.lock().unwrap() = None;
+        Ok(next.map_or(Plan::Dormant, |at| Plan::WallDeadline(at.into())))
     }
 
     async fn process_trigger(
@@ -1421,25 +1522,13 @@ fn is_recurring(trigger: &TaskTrigger) -> bool {
     )
 }
 
-fn same_scheduled_occurrence(left: &TaskTrigger, right: &TaskTrigger) -> bool {
-    // RunTerminalStatusRefresh changes updated_at without changing the schedule.
-    // It must not turn an armed deadline into recovery when a sibling finishes.
-    left.id == right.id
-        && left.task_id == right.task_id
-        && left.status == right.status
-        && left.spec == right.spec
-        && left.next_fire_at == right.next_fire_at
-        && left.last_fire_at == right.last_fire_at
-        && left.created_at == right.created_at
-}
-
 fn is_transient_scheduler_storage_error(error: &anyhow::Error) -> bool {
     is_anyhow_sqlite_transient_access(error)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::is_transient_scheduler_storage_error;
+    use super::*;
     use anyhow::anyhow;
 
     #[test]
@@ -1451,17 +1540,1459 @@ mod tests {
 
         assert!(is_transient_scheduler_storage_error(&error));
     }
-    #[tokio::test]
-    async fn scheduler_wake_survives_before_wait_registration() {
-        let notify = std::sync::Arc::new(tokio::sync::Notify::new());
-        let handle = super::TaskSchedulerHandle {
-            notify: notify.clone(),
-            dirty_tasks: Default::default(),
-            needs_rebuild: Default::default(),
-        };
-        handle.wake();
-        tokio::time::timeout(std::time::Duration::from_millis(100), notify.notified())
+    async fn scheduler_fixture() -> (
+        tempfile::TempDir,
+        Arc<CrudStore>,
+        crate::TaskRuntime,
+        Arc<crate::tests::DispatchDatabaseObserver>,
+    ) {
+        use crate::tests::{DispatchDatabaseObserver, seed_task_test_workspace};
+        use pioneer_sqlite::{SqliteDatabase, SqliteWriteClass, SqliteWriteExecutor};
+        use sea_orm::{ConnectOptions, Database};
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("scheduler.sqlite");
+        let mut options = ConnectOptions::new(pioneer_sqlite::sqlite_connection_url(&path));
+        options.max_connections(1);
+        let writer = Database::connect(options).await.unwrap();
+        let bootstrap = SqliteWriteExecutor::new(writer.clone());
+        bootstrap
+            .apply_pragmas(SqliteWriteClass::Maintenance)
             .await
-            .expect("post-commit wake must retain a permit before a wait exists");
+            .unwrap();
+        bootstrap
+            .run_migrations::<migration::Migrator>(SqliteWriteClass::Maintenance, None)
+            .await
+            .unwrap();
+        seed_task_test_workspace(&writer).await;
+        drop(bootstrap);
+        let mut options =
+            ConnectOptions::new(pioneer_sqlite::sqlite_read_only_connection_url(&path));
+        options.map_sqlx_sqlite_opts(|options| options.read_only(true).pragma("query_only", "ON"));
+        let reader = Database::connect(options).await.unwrap();
+        let observer = Arc::new(DispatchDatabaseObserver::default());
+        let database = SqliteDatabase::from_executor_with_read_observer(
+            reader,
+            SqliteWriteExecutor::with_observer(writer, observer.clone()),
+            observer.clone(),
+        );
+        let store = Arc::new(CrudStore::new(database.maintenance()));
+        let runtime = crate::TaskRuntime::new(store.clone());
+        (directory, store, runtime, observer)
+    }
+    #[tokio::test]
+    async fn real_scheduler_parks_and_processes_a_registered_deadline_without_periodic_discovery() {
+        use super::*;
+        use crate::tests::{CompletingSystemExecutor, create_params};
+        use pioneer_sqlite::SqliteReadClass;
+        let (_directory, store, runtime, observer) = scheduler_fixture().await;
+        let executors = Arc::new(TaskExecutorRegistry::new());
+        executors.register(Arc::new(CompletingSystemExecutor)).await;
+        let scheduler = Arc::new(TaskScheduler::new(
+            store.clone(),
+            runtime.event_bus(),
+            executors,
+        ));
+        let worker = tokio::spawn(scheduler.clone().run());
+        tokio::time::timeout(Duration::from_secs(10), scheduler.parked.notified())
+            .await
+            .unwrap();
+        observer.reads.lock().unwrap().clear();
+        observer.writes.lock().unwrap().clear();
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(300)).await;
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+        assert!(observer.reads.lock().unwrap().is_empty());
+        assert!(observer.writes.lock().unwrap().is_empty());
+        tokio::time::resume();
+        let task =
+            runtime
+                .service()
+                .create_task(
+                    crate::TaskCreateContext::default(),
+                    create_params(pioneer_protocol::TaskTriggerSpec::ScheduledAt {
+                        scheduled_at: now_timestamp_secs() + 3,
+                        timezone: None,
+                        catch_up_policy: Some(
+                            pioneer_protocol::TaskTriggerCatchUpPolicy::skip_missed(),
+                        ),
+                    }),
+                )
+                .await
+                .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            scheduler.future_observed.notified(),
+        )
+        .await
+        .unwrap();
+        // No client, bus replay, manual process_due_once or fallback tick.
+        tokio::time::timeout(Duration::from_secs(10), scheduler.parked.notified())
+            .await
+            .unwrap();
+        let result = store.get_task(&task.task.id).await.unwrap().unwrap();
+        assert_eq!(result.runs.len(), 1);
+        assert_eq!(result.runs[0].status, TaskRunStatus::Succeeded);
+        assert!(
+            observer
+                .reads
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|class| *class == SqliteReadClass::Maintenance)
+        );
+        // Replaying an already committed business event still delivers it to
+        // business subscribers; it is not another lower durable mutation.
+        let event = store
+            .get_task_events(&task.task.id, None)
+            .await
+            .unwrap()
+            .events
+            .into_iter()
+            .next()
+            .unwrap();
+        let replay = pioneer_crud::AppendedTaskEvent {
+            id: event.id.clone(),
+            task_id: event.task_id,
+            run_id: event.run_id,
+            thread_id: event.thread_id,
+            turn_id: event.turn_id,
+            sequence: event.sequence,
+            event_type: event.event_type,
+            idempotency_key: event.idempotency_key,
+            payload: event.payload,
+            workspace_id: None,
+            root_task_id: None,
+            parent_task_id: None,
+            created_at: chrono::DateTime::from_timestamp(event.created_at, 0)
+                .unwrap()
+                .fixed_offset(),
+            append_status: pioneer_crud::TaskEventAppendStatus::Inserted,
+        };
+        let bus = runtime.event_bus();
+        let mut subscriber = bus.subscribe(Default::default());
+        observer.reads.lock().unwrap().clear();
+        observer.writes.lock().unwrap().clear();
+        for _ in 0..1000 {
+            bus.publish(replay.clone()).await;
+        }
+        for _ in 0..1000 {
+            let crate::event_bus::TaskEventWakeDelivery::Wake(wake) = subscriber.recv().await
+            else {
+                panic!("a replay remains a business notification");
+            };
+            assert_eq!(wake.event_id, event.id);
+        }
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            observer.reads.lock().unwrap().is_empty(),
+            "bus replay is not a new durable scheduler input"
+        );
+        assert!(observer.writes.lock().unwrap().is_empty());
+        for _ in 0..1000 {
+            scheduler.wake();
+        }
+        tokio::time::timeout(Duration::from_secs(10), scheduler.parked.notified())
+            .await
+            .unwrap();
+        assert!(
+            observer.writes.lock().unwrap().is_empty(),
+            "coalesced hints do not manufacture claims"
+        );
+        observer.reads.lock().unwrap().clear();
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(300)).await;
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            observer.reads.lock().unwrap().is_empty(),
+            "completed history stays dormant"
+        );
+        assert!(observer.writes.lock().unwrap().is_empty());
+        worker.abort();
+        let _ = worker.await;
+    }
+    #[tokio::test]
+    async fn raw_trigger_history_advances_empty_match_pages_and_old_key_schedule_fires() {
+        use crate::tests::{CompletingSystemExecutor, create_params};
+        use pioneer_protocol::{TaskTriggerCatchUpPolicy, TaskTriggerSpec, TaskTriggerStatus};
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+        for all_excluded in [false, true] {
+            let (_directory, store, runtime, observer) = scheduler_fixture().await;
+            let now = now_timestamp_secs();
+            let mut tasks = Vec::new();
+            for _ in 0..129 {
+                tasks.push(
+                    runtime
+                        .service()
+                        .create_task(
+                            crate::TaskCreateContext::default(),
+                            create_params(TaskTriggerSpec::ScheduledAt {
+                                scheduled_at: now + 7200,
+                                timezone: None,
+                                catch_up_policy: Some(TaskTriggerCatchUpPolicy::skip_missed()),
+                            }),
+                        )
+                        .await
+                        .unwrap(),
+                );
+            }
+            tasks.sort_by(|a, b| a.trigger.id.cmp(&b.trigger.id));
+            // Restored history fixture, before worker admission. Its first two
+            // raw pages have zero active matches, followed by a future tail.
+            let db = store.database_connection();
+            for (index, task) in tasks.iter().enumerate() {
+                if index < 128 || all_excluded {
+                    pioneer_entity::task_trigger::Entity::update_many()
+                        .filter(
+                            pioneer_entity::task_trigger::Column::Id.eq(task.trigger.id.clone()),
+                        )
+                        .col_expr(
+                            pioneer_entity::task_trigger::Column::Status,
+                            sea_orm::sea_query::Expr::value(if index % 2 == 0 {
+                                "exhausted"
+                            } else {
+                                "paused"
+                            }),
+                        )
+                        .col_expr(
+                            pioneer_entity::task_trigger::Column::NextFireAt,
+                            sea_orm::sea_query::Expr::value(
+                                None::<chrono::DateTime<chrono::FixedOffset>>,
+                            ),
+                        )
+                        .exec(&db)
+                        .await
+                        .unwrap();
+                }
+            }
+            let (first, upper) = store
+                .task_scheduler_trigger_page(None, None, 64)
+                .await
+                .unwrap();
+            assert_eq!(first.scanned, 64);
+            assert!(first.records.is_empty() && first.failures.is_empty());
+            assert_eq!(first.last.as_deref(), Some(tasks[63].trigger.id.as_str()));
+            let (second, _) = store
+                .task_scheduler_trigger_page(first.last.as_deref(), upper.as_deref(), 64)
+                .await
+                .unwrap();
+            assert_eq!(second.scanned, 64);
+            assert!(second.records.is_empty());
+            let (tail, _) = store
+                .task_scheduler_trigger_page(second.last.as_deref(), upper.as_deref(), 64)
+                .await
+                .unwrap();
+            assert_eq!(tail.scanned, 1);
+            assert_eq!(tail.records.len(), usize::from(!all_excluded));
+            assert_eq!(tail.last, upper);
+            let executors = Arc::new(TaskExecutorRegistry::new());
+            executors.register(Arc::new(CompletingSystemExecutor)).await;
+            let scheduler = Arc::new(TaskScheduler::new(
+                store.clone(),
+                runtime.event_bus(),
+                executors,
+            ));
+            scheduler
+                .work
+                .set_wall_clock_for_test(std::time::UNIX_EPOCH + Duration::from_secs(now as u64));
+            let worker = tokio::spawn(scheduler.clone().run());
+            if all_excluded {
+                tokio::time::timeout(Duration::from_secs(10), scheduler.parked.notified())
+                    .await
+                    .unwrap();
+            } else {
+                tokio::time::timeout(
+                    Duration::from_secs(10),
+                    scheduler.future_observed.notified(),
+                )
+                .await
+                .unwrap();
+            }
+            observer.reads.lock().unwrap().clear();
+            observer.writes.lock().unwrap().clear();
+            tokio::time::pause();
+            let hold = tokio::spawn(async {
+                loop {
+                    tokio::task::yield_now().await;
+                }
+            });
+            tokio::time::advance(Duration::from_secs(300)).await;
+            for _ in 0..32 {
+                tokio::task::yield_now().await;
+            }
+            assert!(observer.reads.lock().unwrap().is_empty());
+            assert!(observer.writes.lock().unwrap().is_empty());
+            // A supported old-key reschedule must replace the retained EOF and
+            // preserve its committed arming marker, without a manual owner kick.
+            let mut trigger = tasks[0].trigger.clone();
+            trigger.status = TaskTriggerStatus::Active;
+            trigger.next_fire_at = Some(now + 30);
+            trigger.spec = TaskTriggerSpec::ScheduledAt {
+                scheduled_at: now + 30,
+                timezone: None,
+                catch_up_policy: Some(TaskTriggerCatchUpPolicy::skip_missed()),
+            };
+            runtime
+                .service()
+                .append_event(
+                    TaskEventPayload::TaskRescheduled {
+                        task_id: tasks[0].task.id.clone(),
+                        trigger,
+                        rescheduled_at: now,
+                        reason: TaskRescheduleReason::UserRequested,
+                    },
+                    now,
+                )
+                .await
+                .unwrap();
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                scheduler.future_observed.notified(),
+            )
+            .await
+            .unwrap();
+            scheduler.work.set_wall_clock_for_test(
+                std::time::UNIX_EPOCH + Duration::from_secs((now + 31) as u64),
+            );
+            tokio::time::advance(Duration::from_secs(30)).await;
+            for _ in 0..512 {
+                if store
+                    .get_task(&tasks[0].task.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .runs
+                    .iter()
+                    .any(|run| run.status == TaskRunStatus::Succeeded)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            assert!(
+                store
+                    .get_task(&tasks[0].task.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .runs
+                    .iter()
+                    .any(|run| run.status == TaskRunStatus::Succeeded)
+            );
+            worker.abort();
+            let _ = worker.await;
+            hold.abort();
+            tokio::time::resume();
+        }
+    }
+    #[tokio::test]
+    async fn foreground_reconstruction_handoff_finishes_unseen_future_trigger_pages() {
+        use super::*;
+        use crate::tests::{CompletingSystemExecutor, create_params, runtime};
+        use pioneer_protocol::{TaskTriggerCatchUpPolicy, TaskTriggerSpec};
+        for cancel_foreground in [false, true] {
+            let runtime = runtime().await;
+            let store = runtime.service().store().clone();
+            let now = now_timestamp_secs();
+            let due = now + 3600;
+            let mut tasks = Vec::new();
+            for _ in 0..257 {
+                tasks.push(
+                    runtime
+                        .service()
+                        .create_task(
+                            crate::TaskCreateContext::default(),
+                            create_params(TaskTriggerSpec::ScheduledAt {
+                                scheduled_at: due + 3600,
+                                timezone: None,
+                                catch_up_policy: Some(TaskTriggerCatchUpPolicy::skip_missed()),
+                            }),
+                        )
+                        .await
+                        .unwrap(),
+                );
+            }
+            tasks.sort_by(|a, b| a.trigger.id.cmp(&b.trigger.id));
+            let mut target = tasks.pop().unwrap();
+            target.trigger.spec = TaskTriggerSpec::ScheduledAt {
+                scheduled_at: due,
+                timezone: None,
+                catch_up_policy: Some(TaskTriggerCatchUpPolicy::skip_missed()),
+            };
+            target.trigger.next_fire_at = Some(due);
+            runtime
+                .service()
+                .append_event(
+                    TaskEventPayload::TaskRescheduled {
+                        task_id: target.task.id.clone(),
+                        trigger: target.trigger,
+                        rescheduled_at: now,
+                        reason: TaskRescheduleReason::UserRequested,
+                    },
+                    now,
+                )
+                .await
+                .unwrap();
+            let executors = Arc::new(TaskExecutorRegistry::new());
+            executors.register(Arc::new(CompletingSystemExecutor)).await;
+            let scheduler = Arc::new(TaskScheduler::new(
+                store.clone(),
+                runtime.event_bus(),
+                executors,
+            ));
+            // Model restored durable inputs without process-local producer locators.
+            // These ACKs grant no database claim/dispatch authority.
+            loop {
+                let page = scheduler.changes.page();
+                if page.is_empty() {
+                    break;
+                }
+                for (task, revision) in page {
+                    scheduler.changes.acknowledge(&task, revision);
+                }
+            }
+            let generation = scheduler.changes.begin_trigger_reconstruction(now);
+            scheduler
+                .changes
+                .finish_trigger_reconstruction(Default::default(), generation);
+            while scheduler.changes.sweeping() {
+                scheduler.changes.sweep_trigger_observations();
+            }
+            let durable = store.get_task(&target.task.id).await.unwrap().unwrap();
+            assert!(
+                !scheduler.changes.armed(&durable.triggers[0]),
+                "restored input has no process-local arming"
+            );
+            scheduler
+                .work
+                .set_wall_clock_for_test(std::time::UNIX_EPOCH + Duration::from_secs(now as u64));
+            let page = Arc::new(tokio::sync::Barrier::new(2));
+            *scheduler.state.before_plan.lock().unwrap() = Some(page.clone());
+            let worker = tokio::spawn(scheduler.clone().run());
+            page.wait().await;
+            let local = Arc::new(tokio::sync::Barrier::new(2));
+            *scheduler.state.local_rebuild.lock().unwrap() = Some(local.clone());
+            let foreground_scheduler = scheduler.clone();
+            let mut foreground =
+                Box::pin(async move { foreground_scheduler.process_due_once(now).await });
+            std::future::poll_fn(|cx| {
+                assert!(std::future::Future::poll(foreground.as_mut(), cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            assert!(
+                scheduler.state.rebuild.lock().await.is_some(),
+                "foreground queues before owner plan"
+            );
+            page.wait().await;
+            let foreground = tokio::spawn(foreground);
+            local.wait().await;
+            assert!(
+                scheduler.state.rebuild.lock().await.is_none(),
+                "real scan temporarily local"
+            );
+            if cancel_foreground {
+                foreground.abort();
+                let _ = foreground.await;
+            } else {
+                local.wait().await;
+                foreground.await.unwrap().unwrap();
+            }
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                scheduler.future_observed.notified(),
+            )
+            .await
+            .unwrap();
+            assert!(
+                scheduler.state.rebuild.lock().await.is_none(),
+                "all finite pages reconstructed before wait"
+            );
+            tokio::time::pause();
+            let hold = tokio::spawn(async {
+                loop {
+                    tokio::task::yield_now().await;
+                }
+            });
+            // A normal late wake must retain initial arming, not skip the unseen fire.
+            scheduler.work.set_wall_clock_for_test(
+                std::time::UNIX_EPOCH + Duration::from_secs((due + 1) as u64),
+            );
+            tokio::time::advance(Duration::from_secs(30)).await;
+            for _ in 0..256 {
+                if !store
+                    .get_task(&target.task.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .runs
+                    .is_empty()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            let result = store.get_task(&target.task.id).await.unwrap().unwrap();
+            assert_eq!(result.runs.len(), 1);
+            // Complete the actual dispatch before observing outcome.
+            for _ in 0..256 {
+                if store.get_task(&target.task.id).await.unwrap().unwrap().runs[0].status
+                    == TaskRunStatus::Succeeded
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(
+                store.get_task(&target.task.id).await.unwrap().unwrap().runs[0].status,
+                TaskRunStatus::Succeeded
+            );
+            worker.abort();
+            let _ = worker.await;
+            hold.abort();
+            tokio::time::resume();
+        }
+    }
+    // Extend the real scheduler owner matrix at the ORM (rather than JSON)
+    // boundary, with healthy witnesses in and beyond the same1024-key page.
+    #[tokio::test]
+    async fn typed_finite_pages_preserve_dispatch_tail_and_retry_without_producer() {
+        use crate::tests::{CompletingSystemExecutor, create_params};
+        use pioneer_entity::{task_run as run_row, task_trigger as trigger_row};
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, sea_query::Expr};
+        for trigger_fault in [false, true] {
+            let (_directory, store, runtime, observer) = scheduler_fixture().await;
+            let at = now_timestamp_secs() + 3600;
+            let mut inputs = Vec::new();
+            for _ in 0..1025 {
+                let spec = if trigger_fault {
+                    pioneer_protocol::TaskTriggerSpec::ScheduledAt {
+                        scheduled_at: at,
+                        timezone: None,
+                        catch_up_policy: None,
+                    }
+                } else {
+                    pioneer_protocol::TaskTriggerSpec::Immediate
+                };
+                let response = runtime
+                    .service()
+                    .create_task(crate::TaskCreateContext::default(), create_params(spec))
+                    .await
+                    .unwrap();
+                let key = if trigger_fault {
+                    response.trigger.id
+                } else {
+                    response.run.unwrap().id
+                };
+                inputs.push((response.task.id, key));
+            }
+            inputs.sort_by(|a, b| a.1.cmp(&b.1));
+            let db = store.database_connection();
+            let original = if trigger_fault {
+                let row = trigger_row::Entity::find_by_id(&inputs[0].1)
+                    .one(&db)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                trigger_row::Entity::update_many()
+                    .filter(trigger_row::Column::Id.eq(&row.id))
+                    .col_expr(
+                        trigger_row::Column::UpdatedAt,
+                        Expr::value("malformed-date"),
+                    )
+                    .exec(&db)
+                    .await
+                    .unwrap();
+                row.updated_at
+            } else {
+                let row = run_row::Entity::find_by_id(&inputs[0].1)
+                    .one(&db)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                run_row::Entity::update_many()
+                    .filter(run_row::Column::Id.eq(&row.id))
+                    .col_expr(run_row::Column::UpdatedAt, Expr::value("malformed-date"))
+                    .exec(&db)
+                    .await
+                    .unwrap();
+                row.updated_at
+            };
+            runtime
+                .register_executor(Arc::new(CompletingSystemExecutor))
+                .await;
+            let scheduler = runtime.scheduler_for_test();
+            scheduler
+                .work
+                .set_wall_clock_for_test(std::time::UNIX_EPOCH + Duration::from_secs(at as u64));
+            let barrier = Arc::new(tokio::sync::Barrier::new(2));
+            *scheduler.state.before_plan.lock().unwrap() = Some(barrier.clone());
+            let worker = tokio::spawn(scheduler.clone().run());
+            let ticker = tokio::spawn(async {
+                loop {
+                    tokio::task::yield_now().await;
+                }
+            });
+            let mut reached = false;
+            for _ in 0..40 {
+                tokio::time::timeout(Duration::from_secs(60), barrier.wait())
+                    .await
+                    .unwrap();
+                let tail = store
+                    .get_task(&inputs.last().unwrap().0)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if tail
+                    .runs
+                    .iter()
+                    .any(|r| r.status == TaskRunStatus::Succeeded)
+                {
+                    reached = true;
+                    break;
+                }
+                *scheduler.state.before_plan.lock().unwrap() = Some(barrier.clone());
+                barrier.wait().await;
+                {
+                    let admission = scheduler.work.drain().await.unwrap();
+                    drop(admission);
+                }
+                tokio::time::pause();
+                tokio::time::advance(Duration::from_secs(60)).await;
+                tokio::time::resume();
+            }
+            assert!(
+                reached,
+                "healthy tail beyond1024 reaches dispatch before poison repair"
+            );
+            assert!(
+                store
+                    .get_task(&inputs[1].0)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .runs
+                    .iter()
+                    .any(|r| r.status == TaskRunStatus::Succeeded),
+                "same-page healthy dispatch"
+            );
+            assert!(
+                scheduler.state.due_runs.lock().unwrap().rescan_requested
+                    || scheduler
+                        .state
+                        .continuation
+                        .load(std::sync::atomic::Ordering::Acquire),
+                "failed row retains rescan/retry debt at EOF"
+            );
+            let bad = if trigger_fault {
+                store
+                    .task_scheduler_trigger_partial(&inputs[0].1)
+                    .await
+                    .map(|_| ())
+            } else {
+                store
+                    .task_scheduler_run_partial(&inputs[0].1)
+                    .await
+                    .map(|_| ())
+            };
+            assert!(
+                bad.is_err(),
+                "typed ORM failure remains, not a JSON conversion"
+            );
+            // A further real quantum with unchanged inputs proves the retained
+            // timed retry before repairing anything. No producer supplies it.
+            *scheduler.state.before_plan.lock().unwrap() = Some(barrier.clone());
+            barrier.wait().await;
+            {
+                let admission = scheduler.work.drain().await.unwrap();
+                drop(admission);
+            }
+            tokio::time::pause();
+            tokio::time::advance(Duration::from_secs(60)).await;
+            tokio::time::resume();
+            tokio::time::timeout(Duration::from_secs(60), barrier.wait())
+                .await
+                .unwrap();
+            let before = scheduler.work.observe();
+            if trigger_fault {
+                trigger_row::Entity::update_many()
+                    .filter(trigger_row::Column::Id.eq(&inputs[0].1))
+                    .col_expr(trigger_row::Column::UpdatedAt, Expr::value(original))
+                    .exec(&db)
+                    .await
+                    .unwrap();
+            } else {
+                run_row::Entity::update_many()
+                    .filter(run_row::Column::Id.eq(&inputs[0].1))
+                    .col_expr(run_row::Column::UpdatedAt, Expr::value(original))
+                    .exec(&db)
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(
+                scheduler.work.observe(),
+                before,
+                "repair emits no producer hint"
+            );
+            barrier.wait().await;
+            {
+                let admission = scheduler.work.drain().await.unwrap();
+                drop(admission);
+            }
+            tokio::time::pause();
+            tokio::time::advance(Duration::from_secs(60)).await;
+            tokio::time::resume();
+            tokio::time::timeout(Duration::from_secs(60), scheduler.parked.notified())
+                .await
+                .unwrap();
+            assert!(
+                store
+                    .get_task(&inputs[0].0)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .runs
+                    .iter()
+                    .any(|r| r.status == TaskRunStatus::Succeeded),
+                "repaired input reaches durable dispatch without wake"
+            );
+            observer.reads.lock().unwrap().clear();
+            observer.writes.lock().unwrap().clear();
+            tokio::time::pause();
+            tokio::time::advance(Duration::from_secs(300)).await;
+            for _ in 0..64 {
+                tokio::task::yield_now().await;
+            }
+            assert!(observer.reads.lock().unwrap().is_empty());
+            assert!(observer.writes.lock().unwrap().is_empty());
+            tokio::time::resume();
+            ticker.abort();
+            worker.abort();
+            let _ = worker.await;
+            runtime.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn due_blocked_population_settles_then_registration_drains_all_tasks() {
+        use crate::tests::{CompletingSystemExecutor, create_params};
+        // A clock crossing behind a retained PK frontier is an obligation
+        // even when no producer commits and no sibling live owner exists.
+        for jump_seconds in [1_i64, 3600] {
+            use pioneer_entity::task_run as run_row;
+            use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, sea_query::Expr};
+            let (_directory, store, runtime, observer) = scheduler_fixture().await;
+            // Dispatch's writer-owned UTC revalidation stays authoritative.
+            // Both test clock samples are historical to real UTC, while A is
+            // genuinely future to the scheduler's first sample.
+            let now = now_timestamp_secs() - 7200;
+            let due = now + 1;
+            let mut tail = Vec::new();
+            for _ in 0..1025 {
+                let mut params = create_params(pioneer_protocol::TaskTriggerSpec::Immediate);
+                params.executor_kind = TaskExecutorKind::Tool;
+                let task = runtime
+                    .service()
+                    .create_task(crate::TaskCreateContext::default(), params)
+                    .await
+                    .unwrap();
+                tail.push(task.run.unwrap().id);
+            }
+            tail.sort();
+            let mut selected = None;
+            for _ in 0..128 {
+                let task = runtime
+                    .service()
+                    .create_task(
+                        crate::TaskCreateContext::default(),
+                        create_params(pioneer_protocol::TaskTriggerSpec::Immediate),
+                    )
+                    .await
+                    .unwrap();
+                if task.run.as_ref().unwrap().id < tail[1023] {
+                    selected = Some(task);
+                    break;
+                }
+                runtime
+                    .service()
+                    .cancel_task(
+                        crate::TaskMutationContext::default(),
+                        pioneer_protocol::TaskCancelParams {
+                            task_id: task.task.id,
+                            reason: Some("select generated early clock fixture".into()),
+                            scope: pioneer_protocol::TaskCancelScope::TaskOnly,
+                        },
+                    )
+                    .await
+                    .unwrap();
+            }
+            let target = selected.expect("generated early clock fixture within 128 tries");
+            let a = target.run.unwrap().id;
+            assert!(
+                store
+                    .get_task_occurrence_contract_by_run(&a)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            let db = store.database_connection();
+            // Restore eligibility clocks only, before any worker acquisition.
+            // No IDs, event/contract identities, or occurrence generations change.
+            run_row::Entity::update_many()
+                .filter(run_row::Column::Id.is_in(tail.clone()))
+                .col_expr(
+                    run_row::Column::ReadyAt,
+                    Expr::value(Some(pioneer_crud::unix_to_datetime(now))),
+                )
+                .exec(&db)
+                .await
+                .unwrap();
+            run_row::Entity::update_many()
+                .filter(run_row::Column::Id.eq(&a))
+                .col_expr(
+                    run_row::Column::ReadyAt,
+                    Expr::value(Some(pioneer_crud::unix_to_datetime(due))),
+                )
+                .exec(&db)
+                .await
+                .unwrap();
+            runtime
+                .register_executor(Arc::new(CompletingSystemExecutor))
+                .await;
+            let scheduler = runtime.scheduler_for_test();
+            scheduler.work.set_wall_clock_for_test(
+                std::time::UNIX_EPOCH + Duration::from_secs((now - 60) as u64),
+            );
+            // Settle the REAL owner before either existing clock is due. A
+            // foreground warmup handoff would itself invalidate generation.
+            let worker = tokio::spawn(scheduler.clone().run());
+            tokio::time::timeout(
+                Duration::from_secs(60),
+                scheduler.future_observed.notified(),
+            )
+            .await
+            .unwrap();
+            assert!(!scheduler.changes.pending());
+            let (first, upper) = store
+                .list_scheduler_due_task_runs_finite(now, None, None, 1024)
+                .await
+                .unwrap();
+            assert_eq!(first.scanned, 1024);
+            assert!(first.failures.is_empty());
+            assert!(!first.records.iter().any(|run| run.id == a));
+            assert!(first.last.as_ref().unwrap() > &a);
+            assert_ne!(first.last, upper);
+            let barrier = Arc::new(tokio::sync::Barrier::new(2));
+            *scheduler.state.before_plan.lock().unwrap() = Some(barrier.clone());
+            // Only the already retained Tool ReadyAt opens this pass. Give
+            // the SQL-free wall sampler one interval; no setup kick/producer.
+            let before_start = scheduler.work.observe();
+            let sampler_ticker = tokio::spawn(async {
+                loop {
+                    tokio::task::yield_now().await;
+                }
+            });
+            tokio::time::pause();
+            for _ in 0..32 {
+                tokio::task::yield_now().await;
+            }
+            scheduler
+                .work
+                .set_wall_clock_for_test(std::time::UNIX_EPOCH + Duration::from_secs(now as u64));
+            tokio::time::advance(Duration::from_secs(30)).await;
+            tokio::time::resume();
+            sampler_ticker.abort();
+            assert_eq!(scheduler.work.observe(), before_start);
+            tokio::time::timeout(Duration::from_secs(60), barrier.wait())
+                .await
+                .unwrap();
+            {
+                let pass = scheduler.state.due_runs.lock().unwrap();
+                assert!(pass.after.as_ref().is_some_and(|after| after > &a));
+                assert!(
+                    pass.upper.is_some(),
+                    "real retained frontier, not an EOF test"
+                );
+            }
+            assert_eq!(
+                store.get_task_run(&a).await.unwrap().unwrap().status,
+                TaskRunStatus::Queued
+            );
+            let observed = scheduler.work.observe();
+            scheduler.work.set_wall_clock_for_test(
+                std::time::UNIX_EPOCH + Duration::from_secs((now + jump_seconds) as u64),
+            );
+            assert_eq!(
+                scheduler.work.observe(),
+                observed,
+                "clock movement is no producer"
+            );
+            barrier.wait().await;
+            // Only the existing captured tail and clock obligation may proceed.
+            // No kick, write, executor registration, foreground or live recovery.
+            tokio::time::timeout(Duration::from_secs(60), scheduler.parked.notified())
+                .await
+                .unwrap();
+            assert_eq!(
+                store.get_task_run(&a).await.unwrap().unwrap().status,
+                TaskRunStatus::Succeeded,
+                "clock jump {jump_seconds}"
+            );
+            for id in &tail {
+                assert_eq!(
+                    store.get_task_run(id).await.unwrap().unwrap().status,
+                    TaskRunStatus::Queued
+                );
+            }
+            observer.reads.lock().unwrap().clear();
+            observer.writes.lock().unwrap().clear();
+            let ticker = tokio::spawn(async {
+                loop {
+                    tokio::task::yield_now().await;
+                }
+            });
+            tokio::time::pause();
+            tokio::time::advance(Duration::from_secs(300)).await;
+            for _ in 0..64 {
+                tokio::task::yield_now().await;
+            }
+            assert!(
+                observer.reads.lock().unwrap().is_empty(),
+                "unchanged blocked tail parks"
+            );
+            assert!(observer.writes.lock().unwrap().is_empty());
+            tokio::time::resume();
+            ticker.abort();
+            worker.abort();
+            let _ = worker.await;
+            runtime.shutdown().await;
+        }
+        // Own-origin release: A(run2) is visited before B(run1), which the
+        // same scheduler quantum completes. No sibling live owner can rescue A.
+        {
+            use pioneer_entity::task_run as run_row;
+            use pioneer_protocol::{
+                TaskConcurrencyConflictPolicy, TaskConcurrencyPolicy, TaskUpdateParams,
+            };
+            use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, sea_query::Expr};
+            let (_directory, store, runtime, observer) = scheduler_fixture().await;
+            let now = now_timestamp_secs();
+            let mut tail = Vec::new();
+            for _ in 0..1025 {
+                let mut params = create_params(pioneer_protocol::TaskTriggerSpec::Immediate);
+                params.executor_kind = TaskExecutorKind::Tool;
+                let task = runtime
+                    .service()
+                    .create_task(crate::TaskCreateContext::default(), params)
+                    .await
+                    .unwrap();
+                tail.push(task.run.unwrap().id);
+            }
+            tail.sort();
+            let anchor = now + 3600;
+            let mut selected = None;
+            for _ in 0..128 {
+                let mut params = create_params(pioneer_protocol::TaskTriggerSpec::Interval {
+                    interval_seconds: 10,
+                    interval_anchor_at: Some(anchor),
+                    catch_up_policy: None,
+                });
+                // Two genuine ordinary scheduled occurrences, without an
+                // executor. Saturated max1 would deliberately deduplicate run2.
+                params.concurrency_policy = Some(TaskConcurrencyPolicy {
+                    key: None,
+                    max_parallel_runs: 2,
+                    on_conflict: TaskConcurrencyConflictPolicy::Queue,
+                });
+                let task = runtime
+                    .service()
+                    .create_task(crate::TaskCreateContext::default(), params)
+                    .await
+                    .unwrap();
+                runtime.process_due_once(anchor).await.unwrap();
+                runtime.process_due_once(anchor + 10).await.unwrap();
+                let response = store.get_task(&task.task.id).await.unwrap().unwrap();
+                assert_eq!(response.runs.len(), 2);
+                let b = response
+                    .runs
+                    .iter()
+                    .find(|run| run.run_number == 1)
+                    .unwrap()
+                    .clone();
+                let a = response
+                    .runs
+                    .iter()
+                    .find(|run| run.run_number == 2)
+                    .unwrap()
+                    .clone();
+                assert_eq!(a.status, TaskRunStatus::Queued);
+                assert_eq!(b.status, TaskRunStatus::Queued);
+                assert!(
+                    store
+                        .get_task_occurrence_contract_by_run(&a.id)
+                        .await
+                        .unwrap()
+                        .is_some()
+                );
+                assert!(
+                    store
+                        .get_task_occurrence_contract_by_run(&b.id)
+                        .await
+                        .unwrap()
+                        .is_some()
+                );
+                if a.id < b.id && b.id < tail[1022] {
+                    runtime
+                        .service()
+                        .update_task(
+                            crate::TaskMutationContext::default(),
+                            TaskUpdateParams {
+                                task_id: task.task.id.clone(),
+                                concurrency_policy: Some(TaskConcurrencyPolicy {
+                                    key: None,
+                                    max_parallel_runs: 1,
+                                    on_conflict: TaskConcurrencyConflictPolicy::Queue,
+                                }),
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .unwrap();
+                    // Only restored eligibility clocks change; service-created
+                    // IDs, events, occurrence contracts and generations stay real.
+                    run_row::Entity::update_many()
+                        .filter(run_row::Column::Id.is_in([a.id.clone(), b.id.clone()]))
+                        .col_expr(
+                            run_row::Column::ReadyAt,
+                            Expr::value(Some(pioneer_crud::unix_to_datetime(now - 1))),
+                        )
+                        .exec(&store.database_connection())
+                        .await
+                        .unwrap();
+                    selected = Some((task.task.id, a.id, b.id));
+                    break;
+                }
+                runtime
+                    .service()
+                    .cancel_task(
+                        crate::TaskMutationContext::default(),
+                        pioneer_protocol::TaskCancelParams {
+                            task_id: task.task.id,
+                            reason: Some("select generated serial fixture keys".into()),
+                            scope: pioneer_protocol::TaskCancelScope::TaskOnly,
+                        },
+                    )
+                    .await
+                    .unwrap();
+            }
+            let (task_id, a, b) = selected.expect("generated A<B in first1024 page");
+            let scheduler = runtime.scheduler_for_test();
+            let worker = tokio::spawn(scheduler.clone().run());
+            tokio::time::timeout(
+                Duration::from_secs(60),
+                scheduler.future_observed.notified(),
+            )
+            .await
+            .unwrap();
+            // Settle all setup generation/hints before registering the executor.
+            // There is no scheduler due prefix yet on which setup could leave debt.
+            let (first, upper) = store
+                .list_scheduler_due_task_runs_finite(now_timestamp_secs(), None, None, 1024)
+                .await
+                .unwrap();
+            assert_eq!(first.scanned, 1024);
+            assert!(first.records.iter().any(|run| run.id == a));
+            assert!(first.records.iter().any(|run| run.id == b));
+            assert_ne!(first.last, upper);
+            assert!(a < b);
+            let barrier = Arc::new(tokio::sync::Barrier::new(2));
+            *scheduler.state.before_plan.lock().unwrap() = Some(barrier.clone());
+            runtime
+                .register_executor(Arc::new(CompletingSystemExecutor))
+                .await;
+            let registered = scheduler.work.observe();
+            tokio::time::timeout(Duration::from_secs(60), barrier.wait())
+                .await
+                .unwrap();
+            assert_eq!(
+                store.get_task_run(&b).await.unwrap().unwrap().status,
+                TaskRunStatus::Succeeded
+            );
+            assert_eq!(
+                store.get_task_run(&a).await.unwrap().unwrap().status,
+                TaskRunStatus::Queued
+            );
+            assert!(
+                !scheduler.work.producer_changed_since(registered),
+                "B completion is own-origin, not another external rescue"
+            );
+            barrier.wait().await;
+            // Only the captured tail, own release debt and real dispatch now run.
+            // No clock movement, foreground processing, sibling live or new input.
+            tokio::time::timeout(
+                Duration::from_secs(60),
+                scheduler.future_observed.notified(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                store.get_task_run(&a).await.unwrap().unwrap().status,
+                TaskRunStatus::Succeeded
+            );
+            let task = store.get_task(&task_id).await.unwrap().unwrap();
+            assert_eq!(
+                task.runs.len(),
+                2,
+                "the distant interval has not fired again"
+            );
+            assert!(task.triggers.iter().any(|trigger| {
+                trigger
+                    .next_fire_at
+                    .is_some_and(|at| at > now_timestamp_secs() + 300)
+            }));
+            for id in tail {
+                assert_eq!(
+                    store.get_task_run(&id).await.unwrap().unwrap().status,
+                    TaskRunStatus::Queued
+                );
+            }
+            observer.reads.lock().unwrap().clear();
+            observer.writes.lock().unwrap().clear();
+            let ticker = tokio::spawn(async {
+                loop {
+                    tokio::task::yield_now().await;
+                }
+            });
+            tokio::time::pause();
+            tokio::time::advance(Duration::from_secs(300)).await;
+            for _ in 0..64 {
+                tokio::task::yield_now().await;
+            }
+            assert!(
+                observer.reads.lock().unwrap().is_empty(),
+                "own release verification settles before the distant trigger"
+            );
+            assert!(observer.writes.lock().unwrap().is_empty());
+            tokio::time::resume();
+            ticker.abort();
+            worker.abort();
+            let _ = worker.await;
+            runtime.shutdown().await;
+        }
+        // Own scheduler boundary: the sibling live owner is never started.
+        // Settle trigger reconstruction/hints BEFORE opening a new due pass;
+        // otherwise that unrelated continuation could accidentally rescue A.
+        {
+            let (_directory, store, runtime, observer) = scheduler_fixture().await;
+            let mut tail = Vec::new();
+            let mut tail_run_ids = Vec::new();
+            for _ in 0..1025 {
+                let mut params = create_params(pioneer_protocol::TaskTriggerSpec::Immediate);
+                params.executor_kind = TaskExecutorKind::Tool;
+                let task = runtime
+                    .service()
+                    .create_task(crate::TaskCreateContext::default(), params)
+                    .await
+                    .unwrap();
+                let run = task.run.unwrap();
+                assert_eq!(run.status, TaskRunStatus::Queued);
+                tail_run_ids.push(run.id);
+                tail.push(task.task.id);
+            }
+            tail_run_ids.sort();
+            // IDs remain generated by the real service. Choose a System A in
+            // the first page without rewriting PK/occurrence/event authority.
+            // Discard rejected setup candidates through the real cancel API.
+            let mut target = None;
+            for _ in 0..128 {
+                let task = runtime
+                    .service()
+                    .create_task(
+                        crate::TaskCreateContext::default(),
+                        create_params(pioneer_protocol::TaskTriggerSpec::Immediate),
+                    )
+                    .await
+                    .unwrap();
+                if task.run.as_ref().unwrap().id < tail_run_ids[1023] {
+                    target = Some(task);
+                    break;
+                }
+                runtime
+                    .service()
+                    .cancel_task(
+                        crate::TaskMutationContext::default(),
+                        pioneer_protocol::TaskCancelParams {
+                            task_id: task.task.id,
+                            reason: Some("choose an early generated fixture key".into()),
+                            scope: pioneer_protocol::TaskCancelScope::TaskOnly,
+                        },
+                    )
+                    .await
+                    .unwrap();
+            }
+            let target = target.expect("generated early System run for first page");
+            let target_run = target.run.as_ref().unwrap().id.clone();
+            let scheduler = runtime.scheduler_for_test();
+            let worker = tokio::spawn(scheduler.clone().run());
+            tokio::time::timeout(Duration::from_secs(30), scheduler.parked.notified())
+                .await
+                .unwrap();
+            assert_eq!(
+                store
+                    .get_task_run(&target_run)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                TaskRunStatus::Queued
+            );
+            observer.reads.lock().unwrap().clear();
+            observer.writes.lock().unwrap().clear();
+            let ticker = tokio::spawn(async {
+                loop {
+                    tokio::task::yield_now().await;
+                }
+            });
+            tokio::time::pause();
+            tokio::time::advance(Duration::from_secs(300)).await;
+            for _ in 0..64 {
+                tokio::task::yield_now().await;
+            }
+            assert!(
+                observer.reads.lock().unwrap().is_empty(),
+                "unchanged >1024 blocked runs park"
+            );
+            assert!(observer.writes.lock().unwrap().is_empty());
+            tokio::time::resume();
+            ticker.abort();
+
+            let barrier = Arc::new(tokio::sync::Barrier::new(2));
+            *scheduler.state.before_plan.lock().unwrap() = Some(barrier.clone());
+            // Setup wake only: the tested registration below is the final input.
+            scheduler.wake();
+            tokio::time::timeout(Duration::from_secs(30), barrier.wait())
+                .await
+                .unwrap();
+            // The first page visited A while blocked; the captured Tool tail
+            // still has no executor, mutations or future deadline.
+            let (page, upper) = store
+                .list_scheduler_due_task_runs_finite(now_timestamp_secs(), None, None, 1024)
+                .await
+                .unwrap();
+            assert_eq!(page.scanned, 1024);
+            assert!(page.records.iter().any(|run| run.id == target_run));
+            assert_ne!(page.last, upper, "a captured healthy tail remains");
+            assert_eq!(
+                store
+                    .get_task_run(&target_run)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                TaskRunStatus::Queued
+            );
+            runtime
+                .register_executor(Arc::new(CompletingSystemExecutor))
+                .await;
+            barrier.wait().await;
+            // No later kick/producer/clock, and no live reconciliation task.
+            tokio::time::timeout(Duration::from_secs(30), scheduler.parked.notified())
+                .await
+                .unwrap();
+            assert_eq!(
+                store
+                    .get_task_run(&target_run)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                TaskRunStatus::Succeeded
+            );
+            for id in tail {
+                let task = store.get_task(&id).await.unwrap().unwrap();
+                assert_eq!(task.runs.len(), 1);
+                assert_eq!(task.runs[0].status, TaskRunStatus::Queued);
+            }
+            observer.reads.lock().unwrap().clear();
+            observer.writes.lock().unwrap().clear();
+            let ticker = tokio::spawn(async {
+                loop {
+                    tokio::task::yield_now().await;
+                }
+            });
+            tokio::time::pause();
+            tokio::time::advance(Duration::from_secs(300)).await;
+            for _ in 0..64 {
+                tokio::task::yield_now().await;
+            }
+            assert!(
+                observer.reads.lock().unwrap().is_empty(),
+                "verified tail parks after useful rescan"
+            );
+            assert!(observer.writes.lock().unwrap().is_empty());
+            tokio::time::resume();
+            ticker.abort();
+            worker.abort();
+            let _ = worker.await;
+            runtime.shutdown().await;
+        }
+        for saturated in [false, true] {
+            let (_directory, store, runtime, observer) = scheduler_fixture().await;
+            // Separate capacity no-op branch, using real saturated scheduling to
+            // create the second occurrence before starting the worker.
+            let capacity = if saturated {
+                let capacity = runtime
+                    .service()
+                    .create_task(
+                        crate::TaskCreateContext::default(),
+                        create_params(pioneer_protocol::TaskTriggerSpec::Interval {
+                            interval_seconds: 10,
+                            interval_anchor_at: Some(4_000_000_000),
+                            catch_up_policy: None,
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                runtime.process_due_once(4_000_000_000).await.unwrap();
+                let first = store
+                    .get_task(&capacity.task.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .runs[0]
+                    .clone();
+                let capacity_handle = crate::TaskExecutionHandle::new(
+                    store.clone(),
+                    runtime.event_bus(),
+                    capacity.task.id.clone(),
+                    first.id.clone(),
+                );
+                capacity_handle.mark_started(4_000_000_000).await.unwrap();
+                runtime.process_due_once(4_000_000_010).await.unwrap();
+                let blocked = store.get_task(&capacity.task.id).await.unwrap().unwrap();
+                assert_eq!(blocked.runs.len(), 2);
+                assert_eq!(blocked.runs[1].status, TaskRunStatus::Queued);
+                // Setup scheduling above creates genuine occurrence authority at
+                // a synthetic future clock. Move only its queued eligibility
+                // clock into the past BEFORE owner acquisition so this branch
+                // actually exercises a due capacity no-op on production UTC.
+                use pioneer_entity::task_run as run;
+                use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, sea_query::Expr};
+                run::Entity::update_many()
+                    .col_expr(
+                        run::Column::ReadyAt,
+                        Expr::value(Some(pioneer_crud::unix_to_datetime(
+                            now_timestamp_secs() - 1,
+                        ))),
+                    )
+                    .filter(run::Column::Id.eq(blocked.runs[1].id.clone()))
+                    .exec(&store.database_connection())
+                    .await
+                    .unwrap();
+                let due = store
+                    .get_task_run(&blocked.runs[1].id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(due.ready_at.is_some_and(|at| at <= now_timestamp_secs()));
+                Some((capacity.task.id, capacity_handle))
+            } else {
+                None
+            };
+            let mut ids = Vec::new();
+            for _ in 0..129 {
+                let task = runtime
+                    .service()
+                    .create_task(
+                        crate::TaskCreateContext::default(),
+                        create_params(pioneer_protocol::TaskTriggerSpec::Immediate),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(task.run.as_ref().unwrap().status, TaskRunStatus::Queued);
+                ids.push(task.task.id);
+            }
+            let scheduler = runtime.scheduler_for_test();
+            let worker = tokio::spawn(scheduler.clone().run());
+            tokio::time::timeout(Duration::from_secs(10), async {
+                if saturated {
+                    scheduler.future_observed.notified().await;
+                } else {
+                    scheduler.parked.notified().await;
+                }
+            })
+            .await
+            .unwrap();
+            observer.reads.lock().unwrap().clear();
+            observer.writes.lock().unwrap().clear();
+            tokio::time::pause();
+            let hold = tokio::spawn(async {
+                loop {
+                    tokio::task::yield_now().await;
+                }
+            });
+            tokio::time::advance(Duration::from_secs(300)).await;
+            for _ in 0..64 {
+                tokio::task::yield_now().await;
+            }
+            assert!(
+                observer.reads.lock().unwrap().is_empty(),
+                "blocked due rows do not replenish semantic debt"
+            );
+            assert!(observer.writes.lock().unwrap().is_empty());
+            hold.abort();
+            tokio::time::resume();
+            // Only the supported producer registration; no manual processing/kick.
+            runtime
+                .register_executor(Arc::new(CompletingSystemExecutor))
+                .await;
+            tokio::time::timeout(Duration::from_secs(20), async {
+                loop {
+                    let mut complete = true;
+                    for id in &ids {
+                        let response = store.get_task(id).await.unwrap().unwrap();
+                        complete &= response.runs.len() == 1
+                            && response.runs[0].status == TaskRunStatus::Succeeded;
+                    }
+                    if complete {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            // Capacity release is its own lower committed producer, independent
+            // of registration. The queued second occurrence must now complete.
+            if let Some((capacity_id, capacity_handle)) = capacity {
+                capacity_handle
+                    .complete_run(None, 4_000_000_011)
+                    .await
+                    .unwrap();
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    loop {
+                        let task = store.get_task(&capacity_id).await.unwrap().unwrap();
+                        if task
+                            .runs
+                            .iter()
+                            .all(|run| run.status == TaskRunStatus::Succeeded)
+                        {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+            }
+            worker.abort();
+            let _ = worker.await;
+            runtime.shutdown().await;
+        }
     }
 }

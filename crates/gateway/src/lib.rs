@@ -31,6 +31,7 @@ mod human_interaction;
 mod identity;
 mod invitation;
 mod keep_awake;
+mod local_operations;
 mod mcp_oauth;
 mod mcp_secrets;
 mod mcp_service;
@@ -109,7 +110,6 @@ use crate::identity::bootstrap_identity;
 use crate::mcp_secrets::garbage_collection_orphan_mcp_secrets;
 use crate::memory_runtime::GatewayMemoryRuntime;
 use crate::message::SummaryConfig;
-use crate::message::now_timestamp_secs;
 use crate::message::{MessageProcessor, MessageProcessorResilienceConfig};
 use crate::secrets::GatewaySecrets;
 use crate::self_improvement::supervisor::SelfImprovementSupervisor;
@@ -846,9 +846,6 @@ async fn run_gateway_until_shutdown_inner(
         .await;
     message_processor.bind_agent_tool_bridges().await;
     message_processor.bind_memory_bridge_if_enabled().await;
-    message_processor
-        .cleanup_stale_skill_uploads(now_timestamp_secs())
-        .await;
     let startup_thread_episodic_vector_search_config =
         config.gateway.thread_episodic.vector_search.clone();
     let startup_thread_episodic_indexing_enabled =
@@ -1210,10 +1207,85 @@ pub async fn create_device(
     config: &AppConfig,
     runtime_home: &Path,
 ) -> Result<AuthDeviceCreateResponse> {
+    prepare_device_creation(config, runtime_home, false)
+        .await?
+        .confirm()
+}
+
+/// Explicit local intent to supersede the retained activation operation.
+pub async fn create_device_new_operation(
+    config: &AppConfig,
+    runtime_home: &Path,
+) -> Result<AuthDeviceCreateResponse> {
+    prepare_device_creation(config, runtime_home, true)
+        .await?
+        .confirm()
+}
+
+/// A durable device result awaiting caller delivery. Dropping it before confirm
+/// preserves replay identity, including cancellation or CLI stdout failure.
+pub struct PendingDeviceCreation {
+    response: AuthDeviceCreateResponse,
+    operation: local_operations::DeviceOperation,
+}
+impl PendingDeviceCreation {
+    pub fn response(&self) -> &AuthDeviceCreateResponse {
+        &self.response
+    }
+    /// Deliver outside DB capacity; a failed write/flush leaves durable replay
+    /// pending. The synchronous acknowledgement follows successful delivery.
+    pub fn deliver(
+        self,
+        output: impl FnOnce(&AuthDeviceCreateResponse) -> Result<()>,
+    ) -> Result<AuthDeviceCreateResponse> {
+        output(&self.response)?;
+        self.confirm()
+    }
+
+    /// Call only after the result was accepted (CLI: successful write + flush).
+    pub fn confirm(self) -> Result<AuthDeviceCreateResponse> {
+        self.operation.confirm()?;
+        Ok(self.response)
+    }
+}
+
+/// CLI output has a later acknowledgement boundary than library return. Keep
+/// the operation guard until that boundary rather than acknowledging the RPC.
+pub async fn prepare_device_creation(
+    config: &AppConfig,
+    runtime_home: &Path,
+    start_new: bool,
+) -> Result<PendingDeviceCreation> {
+    let operation = if start_new {
+        local_operations::DeviceOperation::start_new(config, runtime_home)?
+    } else {
+        local_operations::DeviceOperation::open(config, runtime_home)?
+    };
+    match local_operations::try_online(
+        config,
+        runtime_home,
+        operation.id.clone(),
+        local_operations::Action::CreateDevice,
+    )
+    .await
+    {
+        Ok(Some(response)) => {
+            return Ok(PendingDeviceCreation {
+                response,
+                operation,
+            });
+        }
+        Ok(None) => {}
+        Err(error) => {
+            return Err(error);
+        }
+    }
     let gateway_secrets = GatewaySecrets::open(runtime_home)?;
     let database = database::initialize_existing_for_operations(runtime_home, config)
         .await?
         .context("Gateway database must exist before creating a device")?;
+    let closing = operations::OperationDatabase::new(database.clone());
+    let result: Result<AuthDeviceCreateResponse> = async {
     let identity = Arc::new(
         bootstrap_identity(&database)
             .await
@@ -1234,14 +1306,23 @@ pub async fn create_device(
         );
     }
     let service = GatewayAuthService::new(
-        database,
+        database.clone(),
         config.gateway.auth.clone(),
         identity,
         &access_key,
         &credential_hmac_key,
     )
     .context("failed to initialize Gateway auth service")?;
-    service.create_local_device().await.map_err(Into::into)
+    service.create_local_device_for_operation(&operation.id).await.map_err(Into::into)
+    }.await;
+    closing
+        .close()
+        .await
+        .context("failed to close offline device database")?;
+    result.map(|response| PendingDeviceCreation {
+        response,
+        operation,
+    })
 }
 
 fn load_gateway_settings(runtime_home: &Path, config: &AppConfig) -> Result<GatewaySettings> {

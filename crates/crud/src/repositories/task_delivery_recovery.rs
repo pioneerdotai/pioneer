@@ -90,7 +90,7 @@ pub struct DeliveryRecoverySnapshot {
 impl DeliveryRecoverySnapshot {
     pub fn eligible(&self, now: i64) -> bool {
         self.delivery.status == "delivering"
-            && self.delivery.updated_at.timestamp() <= now.saturating_sub(300)
+            && self.delivery.updated_at <= crate::util::unix_to_datetime(now.saturating_sub(300))
             && self.retry.as_ref().is_none_or(|r| r.next_probe_at <= now)
     }
 

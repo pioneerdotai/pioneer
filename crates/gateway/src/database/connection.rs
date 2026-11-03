@@ -293,17 +293,25 @@ async fn initialize_inner(
         .context("failed to register sqlite-zstd gateway database extension")?;
 
     let database_path = runtime_home.join(config.file_name.as_str());
-    let writer_url = sqlite_connection_url(database_path.as_path());
+    let ownership = pioneer_sqlite::ownership::Opening::acquire(&database_path)?;
+    let writer_url = sqlite_connection_url(ownership.path());
     let query_fingerprints = Arc::new(QueryFingerprintLimiter::default());
 
-    let mut writer = Database::connect(connect_options(
+    let mut writer_options = connect_options(
         writer_url.clone(),
         WRITER_MAX_CONNECTIONS,
         &config,
         "pioneer-sqlite-writer-",
-    ))
-    .await
-    .with_context(|| format!("failed to connect to gateway writer `{writer_url}`"))?;
+    );
+    ownership.configure_with(&mut writer_options, |options| {
+        options
+            .busy_timeout(Duration::from_millis(DEFAULT_SQLITE_BUSY_TIMEOUT_MS))
+            .thread_name(|id| format!("pioneer-sqlite-writer-{id}"))
+    });
+    let mut writer = Database::connect(writer_options)
+        .await
+        .with_context(|| format!("failed to connect to gateway writer `{writer_url}`"))?;
+    let ownership = ownership.connected();
     if let Some(stage) = database_open_stage {
         stage.succeed();
     }
@@ -317,7 +325,8 @@ async fn initialize_inner(
         query_fingerprints.clone(),
     );
 
-    let writer = SqliteWriteExecutor::with_observer(writer, super::write_observer());
+    let writer = SqliteWriteExecutor::with_observer(writer, super::write_observer())
+        .with_ownership(ownership);
     writer
         .ping(SqliteWriteClass::Maintenance)
         .await
@@ -670,6 +679,40 @@ pub(crate) fn gateway_database_path(
 ) -> Result<PathBuf> {
     let config = GatewayDatabaseRuntimeConfig::from_app_config(app_config)?;
     Ok(runtime_home.join(config.file_name.as_str()))
+}
+
+/// Real inspections never acquire writable ownership, run migrations or repair.
+/// Both contours are physically read-only; accidental mutation fails closed.
+pub(crate) async fn initialize_existing_for_inspection(
+    runtime_home: &Path,
+    app_config: &AppConfig,
+) -> Result<Option<SqliteDatabase>> {
+    let path = gateway_database_path(runtime_home, app_config)?;
+    match std::fs::metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("cannot inspect database path"),
+        Ok(metadata) => anyhow::ensure!(metadata.is_file(), "database must be a regular file"),
+    }
+    pioneer_sqlite::zstd::register_auto_extension_once()?;
+    let config = GatewayDatabaseRuntimeConfig::from_app_config(app_config)?;
+    let mut options = connect_options(
+        sqlite_read_only_connection_url(&path),
+        1,
+        &config,
+        "pioneer-sqlite-inspection-",
+    );
+    options.map_sqlx_sqlite_opts(|options| {
+        options
+            .read_only(true)
+            .create_if_missing(false)
+            .pragma("query_only", "ON")
+    });
+    let reader = Database::connect(options)
+        .await
+        .context("cannot open read-only inspection")?;
+    let database = SqliteDatabase::from_single_connection(reader).maintenance();
+    database.validate_reader().await?;
+    Ok(Some(database))
 }
 
 pub(crate) async fn initialize_existing_for_operations(

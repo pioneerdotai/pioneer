@@ -10,6 +10,13 @@ use sea_orm::{
     TransactionTrait,
 };
 
+pub(crate) fn point_due(now: i64) -> sea_orm::sea_query::SimpleExpr {
+    point::Column::NextAttemptAt.lte(now)
+}
+pub(crate) fn scope_due(now: i64) -> sea_orm::sea_query::SimpleExpr {
+    scope::Column::NextAttemptAt.lte(now)
+}
+
 const PAGE: u64 = 32;
 const LEASE: i64 = 60;
 fn token() -> String {
@@ -32,6 +39,7 @@ pub enum ChildScope {
     CreatorThread(String),
     AcceptedSource(String),
     ParentThread(String),
+    #[cfg(test)]
     HistoricalSeed,
 }
 impl ChildScope {
@@ -54,6 +62,7 @@ impl ChildScope {
             Self::CreatorThread(k) => ("creator-thread", k.clone()),
             Self::AcceptedSource(k) => ("accepted-source", k.clone()),
             Self::ParentThread(k) => ("parent-thread", k.clone()),
+            #[cfg(test)]
             Self::HistoricalSeed => ("historical-seed", "v1".into()),
         }
     }
@@ -225,7 +234,7 @@ impl CrudStore {
             return Ok(Vec::new());
         }
         let query = point::Entity::find()
-            .filter(point::Column::NextAttemptAt.lte(now))
+            .filter(point_due(now))
             .order_by_asc(point::Column::NextAttemptAt)
             .order_by_asc(point::Column::TurnId)
             .limit(limit.min(PAGE));
@@ -254,7 +263,7 @@ impl CrudStore {
         Ok(point::Entity::find()
             .select_only()
             .columns([point::Column::NextAttemptAt, point::Column::TurnId])
-            .filter(point::Column::NextAttemptAt.lte(now))
+            .filter(point_due(now))
             .order_by_desc(point::Column::NextAttemptAt)
             .order_by_desc(point::Column::TurnId)
             .into_tuple::<(i64, String)>()
@@ -269,17 +278,15 @@ impl CrudStore {
         after: Option<&(i64, String)>,
         upper: &(i64, String),
     ) -> Result<Vec<point::Model>> {
-        let mut query = point::Entity::find()
-            .filter(point::Column::NextAttemptAt.lte(now))
-            .filter(
-                sea_orm::Condition::any()
-                    .add(point::Column::NextAttemptAt.lt(upper.0))
-                    .add(
-                        sea_orm::Condition::all()
-                            .add(point::Column::NextAttemptAt.eq(upper.0))
-                            .add(point::Column::TurnId.lte(&upper.1)),
-                    ),
-            );
+        let mut query = point::Entity::find().filter(point_due(now)).filter(
+            sea_orm::Condition::any()
+                .add(point::Column::NextAttemptAt.lt(upper.0))
+                .add(
+                    sea_orm::Condition::all()
+                        .add(point::Column::NextAttemptAt.eq(upper.0))
+                        .add(point::Column::TurnId.lte(&upper.1)),
+                ),
+        );
         if let Some((due, id)) = after {
             query = query.filter(
                 sea_orm::Condition::any()
@@ -306,22 +313,29 @@ impl CrudStore {
         snapshot: &point::Model,
         clock: &F,
     ) -> Result<bool> {
-        self.run_serialized_write(|| async {
-            let tx = self.connection.begin().await?;
-            let due = clock().saturating_add(2);
-            let changed = point::Entity::update_many()
-                .filter(point_fence(snapshot))
-                .col_expr(point::Column::NextAttemptAt, Expr::value(due))
-                .col_expr(
-                    point::Column::ClaimToken,
-                    Expr::value(Option::<String>::None),
-                )
-                .exec(&tx)
-                .await?
-                .rows_affected;
-            tx.commit().await?;
-            Ok(changed == 1)
-        })
+        self.background_change(
+            "tasks.lifecycle",
+            async {
+                self.run_serialized_write(|| async {
+                    let tx = self.connection.begin().await?;
+                    let due = clock().saturating_add(2);
+                    let changed = point::Entity::update_many()
+                        .filter(point_fence(snapshot))
+                        .col_expr(point::Column::NextAttemptAt, Expr::value(due))
+                        .col_expr(
+                            point::Column::ClaimToken,
+                            Expr::value(Option::<String>::None),
+                        )
+                        .exec(&tx)
+                        .await?
+                        .rows_affected;
+                    tx.commit().await?;
+                    Ok(changed == 1)
+                })
+                .await
+            },
+            |value| *value,
+        )
         .await
     }
     pub async fn claim_child_point(
@@ -336,35 +350,42 @@ impl CrudStore {
         candidate: &point::Model,
         clock: &F,
     ) -> Result<Option<point::Model>> {
-        if candidate.next_attempt_at.is_none_or(|due| due > clock()) {
-            return Ok(None);
-        }
-        self.run_serialized_write(|| async {
-            let claim = token();
-            let tx = self.connection.begin().await?;
-            let reserved_at = clock();
-            let until = reserved_at.saturating_add(LEASE);
-            let affected = point::Entity::update_many()
-                .filter(point_fence(candidate))
-                .filter(point::Column::NextAttemptAt.lte(reserved_at))
-                .col_expr(point::Column::ClaimToken, Expr::value(&claim))
-                .col_expr(point::Column::NextAttemptAt, Expr::value(until))
-                .col_expr(
-                    point::Column::AttemptCount,
-                    Expr::value(candidate.attempt_count.saturating_add(1)),
-                )
-                .exec(&tx)
-                .await?
-                .rows_affected;
-            tx.commit().await?;
-            Ok((affected == 1).then(|| {
-                let mut row = candidate.clone();
-                row.claim_token = Some(claim);
-                row.next_attempt_at = Some(until);
-                row.attempt_count = row.attempt_count.saturating_add(1);
-                row
-            }))
-        })
+        self.background_change(
+            "tasks.lifecycle",
+            async {
+                if candidate.next_attempt_at.is_none_or(|due| due > clock()) {
+                    return Ok(None);
+                }
+                self.run_serialized_write(|| async {
+                    let claim = token();
+                    let tx = self.connection.begin().await?;
+                    let reserved_at = clock();
+                    let until = reserved_at.saturating_add(LEASE);
+                    let affected = point::Entity::update_many()
+                        .filter(point_fence(candidate))
+                        .filter(point_due(reserved_at))
+                        .col_expr(point::Column::ClaimToken, Expr::value(&claim))
+                        .col_expr(point::Column::NextAttemptAt, Expr::value(until))
+                        .col_expr(
+                            point::Column::AttemptCount,
+                            Expr::value(candidate.attempt_count.saturating_add(1)),
+                        )
+                        .exec(&tx)
+                        .await?
+                        .rows_affected;
+                    tx.commit().await?;
+                    Ok((affected == 1).then(|| {
+                        let mut row = candidate.clone();
+                        row.claim_token = Some(claim);
+                        row.next_attempt_at = Some(until);
+                        row.attempt_count = row.attempt_count.saturating_add(1);
+                        row
+                    }))
+                })
+                .await
+            },
+            |value| value.is_some(),
+        )
         .await
     }
     /// None parks a proven durable dependency. Runtime-local waits use a timed
@@ -375,28 +396,35 @@ impl CrudStore {
         retry_at: Option<i64>,
         done: bool,
     ) -> Result<bool> {
-        ensure!(claim.claim_token.is_some(), "unclaimed child ACK");
-        self.run_serialized_write(|| async {
-            let rows = if done {
-                point::Entity::delete_many()
-                    .filter(point_fence(claim))
-                    .exec(&self.connection)
-                    .await?
-                    .rows_affected
-            } else {
-                point::Entity::update_many()
-                    .filter(point_fence(claim))
-                    .col_expr(
-                        point::Column::ClaimToken,
-                        Expr::value(Option::<String>::None),
-                    )
-                    .col_expr(point::Column::NextAttemptAt, Expr::value(retry_at))
-                    .exec(&self.connection)
-                    .await?
-                    .rows_affected
-            };
-            Ok(rows == 1)
-        })
+        self.background_change(
+            "tasks.lifecycle",
+            async {
+                ensure!(claim.claim_token.is_some(), "unclaimed child ACK");
+                self.run_serialized_write(|| async {
+                    let rows = if done {
+                        point::Entity::delete_many()
+                            .filter(point_fence(claim))
+                            .exec(&self.connection)
+                            .await?
+                            .rows_affected
+                    } else {
+                        point::Entity::update_many()
+                            .filter(point_fence(claim))
+                            .col_expr(
+                                point::Column::ClaimToken,
+                                Expr::value(Option::<String>::None),
+                            )
+                            .col_expr(point::Column::NextAttemptAt, Expr::value(retry_at))
+                            .exec(&self.connection)
+                            .await?
+                            .rows_affected
+                    };
+                    Ok(rows == 1)
+                })
+                .await
+            },
+            |value| *value,
+        )
         .await
     }
 }
@@ -685,7 +713,7 @@ impl CrudStore {
         after: Option<&(i64, String, String)>,
     ) -> Result<Option<scope::Model>> {
         let base = scope::Entity::find()
-            .filter(scope::Column::NextAttemptAt.lte(now))
+            .filter(scope_due(now))
             .filter(if seed {
                 scope::Column::ScopeKind.eq("historical-seed")
             } else {
@@ -728,7 +756,7 @@ impl CrudStore {
                 scope::Column::ScopeKind,
                 scope::Column::ScopeKey,
             ])
-            .filter(scope::Column::NextAttemptAt.lte(now))
+            .filter(scope_due(now))
             .filter(scope::Column::ScopeKind.ne("historical-seed"))
             .order_by_desc(scope::Column::NextAttemptAt)
             .order_by_desc(scope::Column::ScopeKind)
@@ -744,7 +772,7 @@ impl CrudStore {
         upper: &(i64, String, String),
     ) -> Result<Option<scope::Model>> {
         let mut query = scope::Entity::find()
-            .filter(scope::Column::NextAttemptAt.lte(now))
+            .filter(scope_due(now))
             .filter(scope::Column::ScopeKind.ne("historical-seed"))
             .filter(
                 sea_orm::Condition::any()
@@ -791,80 +819,136 @@ impl CrudStore {
         clock: &F,
         seed: bool,
     ) -> Result<bool> {
-        let outcome = self
-            .run_serialized_write(|| async {
-                let claim = token();
-                let tx = self.connection.begin().await?;
-                let now = clock();
-                if scope::Entity::update_many()
-                    .filter(scope_fence(&candidate))
-                    .filter(scope::Column::NextAttemptAt.lte(now))
-                    .col_expr(
-                        scope::Column::AttemptCount,
-                        Expr::value(candidate.attempt_count.saturating_add(1)),
-                    )
-                    .col_expr(scope::Column::ClaimToken, Expr::value(&claim))
-                    .col_expr(
-                        scope::Column::NextAttemptAt,
-                        Expr::value(now.saturating_add(LEASE)),
-                    )
-                    .exec(&tx)
-                    .await?
-                    .rows_affected
-                    != 1
-                {
-                    tx.rollback().await?;
-                    return Ok(true);
-                }
-                let mut current = scope::Entity::find_by_id((
-                    candidate.scope_kind.clone(),
-                    candidate.scope_key.clone(),
-                ))
-                .one(&tx)
-                .await?
-                .expect("claimed scope exists");
-                let claimed = current.clone();
-                if current.pass_revision.is_none() {
-                    current.pass_revision = Some(current.requested_revision.clone());
-                    current.cursor = None;
-                    current.upper_watermark = page(&tx, &current, true)
+        self.background_change(
+            "tasks.lifecycle",
+            async {
+                let outcome = self
+                    .run_serialized_write(|| async {
+                        let claim = token();
+                        let tx = self.connection.begin().await?;
+                        let now = clock();
+                        if scope::Entity::update_many()
+                            .filter(scope_fence(&candidate))
+                            .filter(scope_due(now))
+                            .col_expr(
+                                scope::Column::AttemptCount,
+                                Expr::value(candidate.attempt_count.saturating_add(1)),
+                            )
+                            .col_expr(scope::Column::ClaimToken, Expr::value(&claim))
+                            .col_expr(
+                                scope::Column::NextAttemptAt,
+                                Expr::value(now.saturating_add(LEASE)),
+                            )
+                            .exec(&tx)
+                            .await?
+                            .rows_affected
+                            != 1
+                        {
+                            tx.rollback().await?;
+                            return Ok(true);
+                        }
+                        let mut current = scope::Entity::find_by_id((
+                            candidate.scope_kind.clone(),
+                            candidate.scope_key.clone(),
+                        ))
+                        .one(&tx)
                         .await?
-                        .first()
-                        .map(|item| item.cursor.clone());
-                }
-                let items = if current.upper_watermark.is_some() {
-                    page(&tx, &current, false).await?
-                } else {
-                    Vec::new()
-                };
-                let last = items.last().map(|item| item.cursor.clone());
-                let eof = items.len() < PAGE as usize;
-                for item in items {
-                    match item.output {
-                        Output::Scope(input) => enqueue_scope(&tx, input, now).await?,
-                        Output::Point(thread, id) => {
-                            if seed {
-                                ensure_discovered_point(&tx, &thread, &id, now, false).await?;
-                            } else {
-                                enqueue_point(&tx, &thread, &id, now).await?;
+                        .expect("claimed scope exists");
+                        let claimed = current.clone();
+                        if current.pass_revision.is_none() {
+                            current.pass_revision = Some(current.requested_revision.clone());
+                            current.cursor = None;
+                            current.upper_watermark = page(&tx, &current, true)
+                                .await?
+                                .first()
+                                .map(|item| item.cursor.clone());
+                        }
+                        let items = if current.upper_watermark.is_some() {
+                            page(&tx, &current, false).await?
+                        } else {
+                            Vec::new()
+                        };
+                        let last = items.last().map(|item| item.cursor.clone());
+                        let eof = items.len() < PAGE as usize;
+                        for item in items {
+                            match item.output {
+                                Output::Scope(input) => enqueue_scope(&tx, input, now).await?,
+                                Output::Point(thread, id) => {
+                                    if seed {
+                                        ensure_discovered_point(&tx, &thread, &id, now, false)
+                                            .await?;
+                                    } else {
+                                        enqueue_point(&tx, &thread, &id, now).await?;
+                                    }
+                                }
                             }
                         }
-                    }
-                }
-                // Lock-free CAS still fences ABA and prior holders. Producer writes
-                // serialize on this row; a changed request is never acknowledged.
-                let mut update = scope::Entity::update_many().filter(scope_pass_fence(&claimed));
-                if eof && current.pass_revision.as_ref() == Some(&current.requested_revision) {
-                    if seed {
-                        update = update.col_expr(
-                            scope::Column::NextAttemptAt,
-                            Expr::value(Option::<i64>::None),
-                        );
-                    } else {
-                        if !(scope::Entity::delete_many()
-                            .filter(scope_pass_fence(&claimed))
+                        // Lock-free CAS still fences ABA and prior holders. Producer writes
+                        // serialize on this row; a changed request is never acknowledged.
+                        let mut update =
+                            scope::Entity::update_many().filter(scope_pass_fence(&claimed));
+                        if eof
+                            && current.pass_revision.as_ref() == Some(&current.requested_revision)
+                        {
+                            if seed {
+                                update = update.col_expr(
+                                    scope::Column::NextAttemptAt,
+                                    Expr::value(Option::<i64>::None),
+                                );
+                            } else {
+                                if !(scope::Entity::delete_many()
+                                    .filter(scope_pass_fence(&claimed))
+                                    .filter(
+                                        scope::Column::RequestedRevision
+                                            .eq(&current.requested_revision),
+                                    )
+                                    .exec(&tx)
+                                    .await?
+                                    .rows_affected
+                                    == 1)
+                                {
+                                    return Err(super::portable_payload::PreflightRace.into());
+                                }
+                                tx.commit().await?;
+                                return Ok(true);
+                            }
+                        } else {
+                            update =
+                                update.col_expr(scope::Column::NextAttemptAt, Expr::value(now));
+                        }
+                        if eof {
+                            update = update
+                                .col_expr(
+                                    scope::Column::PassRevision,
+                                    Expr::value(Option::<String>::None),
+                                )
+                                .col_expr(
+                                    scope::Column::Cursor,
+                                    Expr::value(Option::<String>::None),
+                                )
+                                .col_expr(
+                                    scope::Column::UpperWatermark,
+                                    Expr::value(Option::<String>::None),
+                                );
+                        } else {
+                            update = update
+                                .col_expr(
+                                    scope::Column::PassRevision,
+                                    Expr::value(current.pass_revision.clone()),
+                                )
+                                .col_expr(scope::Column::Cursor, Expr::value(last))
+                                .col_expr(
+                                    scope::Column::UpperWatermark,
+                                    Expr::value(current.upper_watermark.clone()),
+                                );
+                        }
+                        if !(update
                             .filter(
                                 scope::Column::RequestedRevision.eq(&current.requested_revision),
+                            )
+                            .col_expr(
+                                scope::Column::ClaimToken,
+                                Expr::value(Option::<String>::None),
                             )
                             .exec(&tx)
                             .await?
@@ -874,80 +958,45 @@ impl CrudStore {
                             return Err(super::portable_payload::PreflightRace.into());
                         }
                         tx.commit().await?;
-                        return Ok(true);
+                        Ok(true)
+                    })
+                    .await;
+                if outcome.is_err() {
+                    // A poisoned locator must not monopolize the sorted due head.
+                    // The prior transaction has dropped; unknown commits are fenced
+                    // against the advisory snapshot before this independent deferral.
+                    let deferred = self
+                        .run_serialized_write(|| async {
+                            scope::Entity::update_many()
+                                .filter(scope_fence(&candidate))
+                                .filter(
+                                    scope::Column::RequestedRevision
+                                        .eq(&candidate.requested_revision),
+                                )
+                                .col_expr(
+                                    scope::Column::NextAttemptAt,
+                                    Expr::value(clock().saturating_add(2)),
+                                )
+                                .col_expr(
+                                    scope::Column::ClaimToken,
+                                    Expr::value(Option::<String>::None),
+                                )
+                                .exec(&self.connection)
+                                .await?;
+                            Ok(())
+                        })
+                        .await;
+                    if let Err(deferral) = deferred {
+                        return Err(outcome.unwrap_err().context(format!(
+                            "child scope independent deferral also failed: {deferral:#}"
+                        )));
                     }
-                } else {
-                    update = update.col_expr(scope::Column::NextAttemptAt, Expr::value(now));
                 }
-                if eof {
-                    update = update
-                        .col_expr(
-                            scope::Column::PassRevision,
-                            Expr::value(Option::<String>::None),
-                        )
-                        .col_expr(scope::Column::Cursor, Expr::value(Option::<String>::None))
-                        .col_expr(
-                            scope::Column::UpperWatermark,
-                            Expr::value(Option::<String>::None),
-                        );
-                } else {
-                    update = update
-                        .col_expr(
-                            scope::Column::PassRevision,
-                            Expr::value(current.pass_revision.clone()),
-                        )
-                        .col_expr(scope::Column::Cursor, Expr::value(last))
-                        .col_expr(
-                            scope::Column::UpperWatermark,
-                            Expr::value(current.upper_watermark.clone()),
-                        );
-                }
-                if !(update
-                    .filter(scope::Column::RequestedRevision.eq(&current.requested_revision))
-                    .col_expr(
-                        scope::Column::ClaimToken,
-                        Expr::value(Option::<String>::None),
-                    )
-                    .exec(&tx)
-                    .await?
-                    .rows_affected
-                    == 1)
-                {
-                    return Err(super::portable_payload::PreflightRace.into());
-                }
-                tx.commit().await?;
-                Ok(true)
-            })
-            .await;
-        if outcome.is_err() {
-            // A poisoned locator must not monopolize the sorted due head.
-            // The prior transaction has dropped; unknown commits are fenced
-            // against the advisory snapshot before this independent deferral.
-            let deferred = self
-                .run_serialized_write(|| async {
-                    scope::Entity::update_many()
-                        .filter(scope_fence(&candidate))
-                        .filter(scope::Column::RequestedRevision.eq(&candidate.requested_revision))
-                        .col_expr(
-                            scope::Column::NextAttemptAt,
-                            Expr::value(clock().saturating_add(2)),
-                        )
-                        .col_expr(
-                            scope::Column::ClaimToken,
-                            Expr::value(Option::<String>::None),
-                        )
-                        .exec(&self.connection)
-                        .await?;
-                    Ok(())
-                })
-                .await;
-            if let Err(deferral) = deferred {
-                return Err(outcome.unwrap_err().context(format!(
-                    "child scope independent deferral also failed: {deferral:#}"
-                )));
-            }
-        }
-        outcome
+                outcome
+            },
+            |value| *value,
+        )
+        .await
     }
 }
 
@@ -1117,119 +1166,158 @@ impl CrudStore {
     /// Queue fence plus current domain proof, capsule deletion and ACK in one
     /// writer transaction. A queue token alone never authorizes deletion.
     pub async fn cleanup_claimed_child_capsule(&self, claim: &point::Model) -> Result<bool> {
-        use pioneer_entity::{task, task_run, task_run_turn as link, thread, turn};
-        self.run_serialized_write(|| async {
-            let tx = super::task_child_cleanup::begin_authoritative(&self.connection).await?;
-            super::task_child_cleanup::lock_authority(&tx, &claim.thread_id, &claim.turn_id)
-                .await?;
-            if point::Entity::find()
-                .filter(point_fence(claim))
-                .one(&tx)
-                .await?
-                .is_none()
-            {
-                tx.rollback().await?;
-                return Ok(false);
-            }
-            match super::task_child_cleanup::ready(&tx, &claim.thread_id, &claim.turn_id).await? {
-                Some(false) => {
-                    tx.rollback().await?;
-                    return Ok(false);
-                }
-                Some(true) => {}
-                None => {
-                    let Some(child) = link::Entity::find()
-                        .filter(link::Column::TurnId.eq(&claim.turn_id))
-                        .filter(link::Column::ThreadId.eq(&claim.thread_id))
-                        .one(&tx)
-                        .await?
-                    else {
-                        tx.rollback().await?;
-                        return Ok(false);
-                    };
-                    if matches!(child.status.as_str(), "in_progress" | "blocked") {
-                        tx.rollback().await?;
-                        return Ok(false);
-                    }
-                    let Some(_run) = task_run::Entity::find_by_id(&child.run_id)
-                        .filter(task_run::Column::TaskId.eq(&child.task_id))
-                        .filter(task_run::Column::Status.is_in([
-                            "queued",
-                            "starting",
-                            "running",
-                            "waiting",
-                            "waiting_review",
-                        ]))
-                        .select_only()
-                        .column(task_run::Column::Id)
-                        .into_tuple::<String>()
-                        .one(&tx)
-                        .await?
-                    else {
-                        tx.rollback().await?;
-                        return Ok(false);
-                    };
-                    let Some(workspace) = task::Entity::find_by_id(&child.task_id)
-                        .filter(task::Column::Status.is_in([
-                            "draft",
-                            "scheduled",
-                            "queued",
-                            "running",
-                            "waiting",
-                            "waiting_review",
-                        ]))
-                        .select_only()
-                        .column(task::Column::WorkspaceId)
-                        .into_tuple::<String>()
-                        .one(&tx)
-                        .await?
-                    else {
-                        tx.rollback().await?;
-                        return Ok(false);
-                    };
-                    if thread::Entity::find_by_id(&claim.thread_id)
-                        .filter(thread::Column::WorkspaceId.eq(workspace))
-                        .select_only()
-                        .column(thread::Column::Id)
-                        .into_tuple::<String>()
-                        .one(&tx)
-                        .await?
-                        .is_none()
-                        || turn::Entity::find_by_id(&claim.turn_id)
-                            .filter(turn::Column::ThreadId.eq(&claim.thread_id))
-                            .filter(turn::Column::TurnKind.eq("conversation"))
-                            .filter(turn::Column::Status.is_in([
-                                "completed",
-                                "failed",
-                                "interrupted",
-                            ]))
-                            .select_only()
-                            .column(turn::Column::Id)
-                            .into_tuple::<String>()
+        let releases = [
+            "storage.frozen",
+            "storage.html.history",
+            "storage.html.retention",
+        ]
+        .map(|name| self.background_work(name).changing());
+        let (applied, released) = self
+            .background_change(
+                "tasks.lifecycle",
+                async {
+                    use pioneer_entity::{task, task_run, task_run_turn as link, thread, turn};
+                    self.run_serialized_write(|| async {
+                        let tx = super::task_child_cleanup::begin_authoritative(&self.connection)
+                            .await?;
+                        super::task_child_cleanup::lock_authority(
+                            &tx,
+                            &claim.thread_id,
+                            &claim.turn_id,
+                        )
+                        .await?;
+                        if point::Entity::find()
+                            .filter(point_fence(claim))
                             .one(&tx)
                             .await?
                             .is_none()
-                    {
-                        tx.rollback().await?;
-                        return Ok(false);
-                    }
-                }
-            }
-            super::turn_llm_context::delete_turn_llm_context_for_turn(&tx, &claim.turn_id).await?;
-            super::turn_runtime_snapshot::delete_turn_runtime_snapshot(&tx, &claim.turn_id).await?;
-            if !(point::Entity::delete_many()
-                .filter(point_fence(claim))
-                .exec(&tx)
-                .await?
-                .rows_affected
-                == 1)
-            {
-                return Err(super::portable_payload::PreflightRace.into());
-            }
-            tx.commit().await?;
-            Ok(true)
-        })
-        .await
+                        {
+                            tx.rollback().await?;
+                            return Ok((false, false));
+                        }
+                        match super::task_child_cleanup::ready(
+                            &tx,
+                            &claim.thread_id,
+                            &claim.turn_id,
+                        )
+                        .await?
+                        {
+                            Some(false) => {
+                                tx.rollback().await?;
+                                return Ok((false, false));
+                            }
+                            Some(true) => {}
+                            None => {
+                                let Some(child) = link::Entity::find()
+                                    .filter(link::Column::TurnId.eq(&claim.turn_id))
+                                    .filter(link::Column::ThreadId.eq(&claim.thread_id))
+                                    .one(&tx)
+                                    .await?
+                                else {
+                                    tx.rollback().await?;
+                                    return Ok((false, false));
+                                };
+                                if matches!(child.status.as_str(), "in_progress" | "blocked") {
+                                    tx.rollback().await?;
+                                    return Ok((false, false));
+                                }
+                                let Some(_run) = task_run::Entity::find_by_id(&child.run_id)
+                                    .filter(task_run::Column::TaskId.eq(&child.task_id))
+                                    .filter(task_run::Column::Status.is_in([
+                                        "queued",
+                                        "starting",
+                                        "running",
+                                        "waiting",
+                                        "waiting_review",
+                                    ]))
+                                    .select_only()
+                                    .column(task_run::Column::Id)
+                                    .into_tuple::<String>()
+                                    .one(&tx)
+                                    .await?
+                                else {
+                                    tx.rollback().await?;
+                                    return Ok((false, false));
+                                };
+                                let Some(workspace) = task::Entity::find_by_id(&child.task_id)
+                                    .filter(task::Column::Status.is_in([
+                                        "draft",
+                                        "scheduled",
+                                        "queued",
+                                        "running",
+                                        "waiting",
+                                        "waiting_review",
+                                    ]))
+                                    .select_only()
+                                    .column(task::Column::WorkspaceId)
+                                    .into_tuple::<String>()
+                                    .one(&tx)
+                                    .await?
+                                else {
+                                    tx.rollback().await?;
+                                    return Ok((false, false));
+                                };
+                                if thread::Entity::find_by_id(&claim.thread_id)
+                                    .filter(thread::Column::WorkspaceId.eq(workspace))
+                                    .select_only()
+                                    .column(thread::Column::Id)
+                                    .into_tuple::<String>()
+                                    .one(&tx)
+                                    .await?
+                                    .is_none()
+                                    || turn::Entity::find_by_id(&claim.turn_id)
+                                        .filter(turn::Column::ThreadId.eq(&claim.thread_id))
+                                        .filter(turn::Column::TurnKind.eq("conversation"))
+                                        .filter(turn::Column::Status.is_in([
+                                            "completed",
+                                            "failed",
+                                            "interrupted",
+                                        ]))
+                                        .select_only()
+                                        .column(turn::Column::Id)
+                                        .into_tuple::<String>()
+                                        .one(&tx)
+                                        .await?
+                                        .is_none()
+                                {
+                                    tx.rollback().await?;
+                                    return Ok((false, false));
+                                }
+                            }
+                        }
+                        let context_deleted =
+                            super::turn_llm_context::delete_turn_llm_context_for_turn(
+                                &tx,
+                                &claim.turn_id,
+                            )
+                            .await?;
+                        let snapshot_deleted =
+                            super::turn_runtime_snapshot::delete_turn_runtime_snapshot(
+                                &tx,
+                                &claim.turn_id,
+                            )
+                            .await?;
+                        if !(point::Entity::delete_many()
+                            .filter(point_fence(claim))
+                            .exec(&tx)
+                            .await?
+                            .rows_affected
+                            == 1)
+                        {
+                            return Err(super::portable_payload::PreflightRace.into());
+                        }
+                        tx.commit().await?;
+                        Ok((true, context_deleted > 0 || snapshot_deleted > 0))
+                    })
+                    .await
+                },
+                |value| value.0,
+            )
+            .await?;
+        for change in releases {
+            change.finish(released);
+        }
+        Ok(applied)
     }
 }
 
@@ -1402,5 +1490,200 @@ impl CrudStore {
                 }
             }
         }
+    }
+}
+
+/// Concrete durable clocks for the independent Task lifecycle quotas. NULL
+/// child clocks are parked dependencies; they are reopened by their producers.
+#[derive(Debug, sea_orm::FromQueryResult)]
+pub struct TaskLifecycleDeadlines {
+    pub child_point: Option<i64>,
+    pub child_scope: Option<i64>,
+    pub occurrence: Option<i64>,
+    pub delivery_pending: Option<sea_orm::prelude::DateTimeWithTimeZone>,
+    pub delivery_recovery: Option<i64>,
+}
+impl CrudStore {
+    pub async fn task_lifecycle_deadlines(&self, now: i64) -> Result<TaskLifecycleDeadlines> {
+        let mut result = self.task_lifecycle_non_delivery_deadlines(now).await?;
+        let mut cursor = None;
+        loop {
+            let (pending, recovery, next, failed) = self
+                .task_delivery_deadline_page(
+                    now,
+                    cursor.as_ref().map(|(a, _): &(String, String)| a.as_str()),
+                    cursor.as_ref().map(|(_, u)| u.as_str()),
+                )
+                .await?;
+            anyhow::ensure!(!failed, "delivery deadline point observation failed");
+            result.delivery_pending = result.delivery_pending.into_iter().chain(pending).min();
+            result.delivery_recovery = result.delivery_recovery.into_iter().chain(recovery).min();
+            cursor = next;
+            if cursor.is_none() {
+                return Ok(result);
+            }
+        }
+    }
+
+    /// Raw immutable PK range BEFORE status/clock/retry evaluation. No residual
+    /// predicate can turn an Empty page into a walk through excluded history.
+    pub async fn task_delivery_deadline_page(
+        &self,
+        now: i64,
+        after: Option<&str>,
+        upper: Option<&str>,
+    ) -> Result<(
+        Option<sea_orm::prelude::DateTimeWithTimeZone>,
+        Option<i64>,
+        Option<(String, String)>,
+        bool,
+    )> {
+        use pioneer_entity::{task_delivery as delivery, task_delivery_recovery_retry as retry};
+        let upper = match upper {
+            Some(u) => Some(u.to_owned()),
+            None => {
+                delivery::Entity::find()
+                    .select_only()
+                    .column(delivery::Column::Id)
+                    .order_by_desc(delivery::Column::Id)
+                    .limit(1)
+                    .into_tuple::<String>()
+                    .one(&self.connection)
+                    .await?
+            }
+        };
+        let Some(upper) = upper else {
+            return Ok((None, None, None, false));
+        };
+        let mut query = delivery::Entity::find()
+            .select_only()
+            .column(delivery::Column::Id)
+            .filter(delivery::Column::Id.lte(upper.clone()));
+        if let Some(after) = after {
+            query = query.filter(delivery::Column::Id.gt(after));
+        }
+        let ids = query
+            .order_by_asc(delivery::Column::Id)
+            .limit(32)
+            .into_tuple::<String>()
+            .all(&self.connection)
+            .await?;
+        let next = ids
+            .last()
+            .filter(|id| ids.len() == 32 && *id < &upper)
+            .map(|id| (id.clone(), upper));
+        let mut pending = None;
+        let mut recovery = None;
+        let mut failed = false;
+        for id in ids {
+            // Fetch scalar clocks only; no payload hydration/parse or open stream.
+            let row = delivery::Entity::find_by_id(&id)
+                .select_only()
+                .column(delivery::Column::Status)
+                .column(delivery::Column::UpdatedAt)
+                .column(delivery::Column::NextAttemptAt)
+                .into_tuple::<(
+                    String,
+                    sea_orm::prelude::DateTimeWithTimeZone,
+                    Option<sea_orm::prelude::DateTimeWithTimeZone>,
+                )>()
+                .one(&self.connection)
+                .await;
+            let row = match row {
+                Ok(row) => row,
+                Err(_) => {
+                    failed = true;
+                    continue;
+                }
+            };
+            let Some((status, updated, next_attempt)) = row else {
+                continue;
+            };
+            if status == "pending" {
+                pending = pending
+                    .into_iter()
+                    .chain(Some(
+                        next_attempt.unwrap_or_else(|| crate::util::unix_to_datetime(now)),
+                    ))
+                    .min();
+            } else if status == "delivering" {
+                let retry_at = retry::Entity::find_by_id(&id)
+                    .select_only()
+                    .column(retry::Column::NextProbeAt)
+                    .into_tuple::<i64>()
+                    .one(&self.connection)
+                    .await;
+                let retry_at = match retry_at {
+                    Ok(at) => at,
+                    Err(_) => {
+                        failed = true;
+                        continue;
+                    }
+                };
+                let grace = updated
+                    .timestamp()
+                    .saturating_add(i64::from(updated.timestamp_subsec_nanos() > 0))
+                    .saturating_add(300);
+                recovery = recovery
+                    .into_iter()
+                    .chain(Some(grace.max(retry_at.unwrap_or(i64::MIN))))
+                    .min();
+            }
+        }
+        Ok((pending, recovery, next, failed))
+    }
+
+    pub async fn task_lifecycle_non_delivery_deadlines(
+        &self,
+        now: i64,
+    ) -> Result<TaskLifecycleDeadlines> {
+        use pioneer_entity::task_run_occurrence_reconcile_pending as occurrence;
+
+        use sea_orm::{ExprTrait, QueryTrait};
+        let scalar = |query: sea_orm::sea_query::SelectStatement| {
+            Expr::SubQuery(None, Box::new(query.into()))
+        };
+        let point = point::Entity::find()
+            .select_only()
+            .expr_as(Expr::col(point::Column::NextAttemptAt).min(), "deadline")
+            .into_query();
+        let scopes = scope::Entity::find()
+            .select_only()
+            .expr_as(Expr::col(scope::Column::NextAttemptAt).min(), "deadline")
+            .into_query();
+        let occurrence = occurrence::Entity::find()
+            .select_only()
+            .expr_as(
+                Expr::col(occurrence::Column::NextAttemptAt).min(),
+                "deadline",
+            )
+            .into_query();
+        let mut query = scope::Entity::find()
+            .select_only()
+            .expr_as(scalar(point), "child_point")
+            .expr_as(scalar(scopes), "child_scope")
+            .expr_as(scalar(occurrence), "occurrence")
+            .expr_as(
+                Expr::val(Option::<sea_orm::prelude::DateTimeWithTimeZone>::None),
+                "delivery_pending",
+            )
+            .expr_as(Expr::val(Option::<i64>::None), "delivery_recovery");
+        QueryTrait::query(&mut query).from_clear();
+        let deadlines = query
+            .into_model::<TaskLifecycleDeadlines>()
+            .one(&self.connection)
+            .await?
+            .context("Task lifecycle deadline observation missing")?;
+        // These are compatibility/ownership facts, not Empty. Unsupported
+        // producer catalogs or a missing/corrupt seed remain visible errors.
+        ensure!(
+            super::task_occurrence_producers::typed(&self.connection).await?,
+            "Task lifecycle producer contract is not established"
+        );
+        ensure!(
+            self.child_seed_outcome(now).await? != ChildSeedOutcome::Missing,
+            "Task child seed marker missing"
+        );
+        Ok(deadlines)
     }
 }

@@ -54,7 +54,7 @@ const TEST_REVIEWER_THREAD_ID: &str = "H22345678901234567890";
 const TEST_PRESENTATION_SNAPSHOT_ID: &str = "S12345678901234567890";
 
 #[derive(Default)]
-struct CompletingSystemExecutor;
+pub(super) struct CompletingSystemExecutor;
 
 #[async_trait]
 impl TaskExecutor for CompletingSystemExecutor {
@@ -352,7 +352,7 @@ impl TaskExecutor for CancellationFailingSystemExecutor {
     }
 }
 
-async fn runtime() -> TaskRuntime {
+pub(super) async fn runtime() -> TaskRuntime {
     let connection = Database::connect("sqlite::memory:")
         .await
         .expect("sqlite memory database should connect");
@@ -405,7 +405,7 @@ async fn runtime_with_review_config() -> TaskRuntime {
     )
 }
 
-async fn seed_task_test_workspace(connection: &sea_orm::DatabaseConnection) {
+pub(super) async fn seed_task_test_workspace(connection: &sea_orm::DatabaseConnection) {
     let now = pioneer_crud::utc_now();
     pioneer_entity::workspace::Entity::insert(pioneer_entity::workspace::ActiveModel {
         id: Set(TEST_WORKSPACE_ID.to_owned()),
@@ -500,7 +500,7 @@ fn idempotency_test_run(status: TaskRunStatus, run_number: i64) -> TaskRun {
     }
 }
 
-fn create_params(spec: TaskTriggerSpec) -> TaskCreateParams {
+pub(super) fn create_params(spec: TaskTriggerSpec) -> TaskCreateParams {
     TaskCreateParams {
         workspace_id: TEST_WORKSPACE_ID.to_owned(),
         owner_kind: TaskOwnerKind::Workspace,
@@ -1080,7 +1080,7 @@ fn agent_spec(max_depth: i64) -> TaskAgentSpecInput {
     }
 }
 
-async fn create_waiting_review_agent_task(
+pub(super) async fn create_waiting_review_agent_task(
     runtime: &TaskRuntime,
     max_revision_rounds: u32,
     candidate_round: u32,
@@ -2677,6 +2677,16 @@ async fn auto_accept_expired_review_candidates_accepts_pending_candidate_after_t
         .expect("candidate lookup should succeed")
         .expect("candidate should exist");
 
+    assert_eq!(
+        runtime
+            .service()
+            .store()
+            .next_task_review_timeout(300)
+            .await
+            .unwrap(),
+        Some(candidate.created_at.saturating_add(300))
+    );
+
     let before_timeout = runtime
         .service()
         .auto_accept_expired_review_candidates(candidate.created_at.saturating_add(299), 1024)
@@ -2691,6 +2701,15 @@ async fn auto_accept_expired_review_candidates_accepts_pending_candidate_after_t
         .expect("timeout scan should accept candidate");
     assert_eq!(accepted, 1);
 
+    assert_eq!(
+        runtime
+            .service()
+            .store()
+            .next_task_review_timeout(300)
+            .await
+            .unwrap(),
+        None
+    );
     let response = runtime
         .service()
         .store()
@@ -2762,6 +2781,15 @@ async fn auto_accept_expired_review_candidates_skips_extraction_failed_candidate
         .expect("candidate lookup should succeed")
         .expect("candidate should exist");
 
+    assert_eq!(
+        runtime
+            .service()
+            .store()
+            .next_task_review_timeout(300)
+            .await
+            .unwrap(),
+        None
+    );
     let accepted = runtime
         .service()
         .auto_accept_expired_review_candidates(candidate.created_at.saturating_add(300), 1024)
@@ -7013,7 +7041,7 @@ async fn detach_task_updates_attachment_without_cancelling() {
 }
 
 #[tokio::test]
-async fn wait_wakes_from_event_bus_on_terminal_event() {
+async fn wait_wakes_from_committed_terminal_event() {
     let runtime = runtime().await;
     let response = runtime
         .service()
@@ -7067,7 +7095,7 @@ async fn wait_wakes_from_event_bus_on_terminal_event() {
 }
 
 #[tokio::test]
-async fn wait_detects_terminal_state_without_in_memory_wake_delivery() {
+async fn wait_detects_terminal_state_through_lower_commit_without_bus_delivery() {
     let runtime = runtime().await;
     let response = runtime
         .service()
@@ -7103,7 +7131,8 @@ async fn wait_detects_terminal_state_without_in_memory_wake_delivery() {
 
     runtime
         .service()
-        .append_event(
+        .store
+        .append_task_event(
             TaskEventPayload::RunCompleted {
                 task_id,
                 run_id,
@@ -8014,6 +8043,72 @@ async fn runtime_start_processes_overdue_scheduled_triggers_before_returning() {
 }
 
 #[tokio::test]
+async fn same_database_runtime_reuses_executor_registration_and_closed_runtime_cannot_restart() {
+    let original = runtime().await;
+    original
+        .register_executor(Arc::new(CompletingSystemExecutor))
+        .await;
+    let same_database = TaskRuntime::new(Arc::new(CrudStore::new(
+        original.service().store().database_connection(),
+    )));
+    // The second runtime's scheduler must use the DB owner's registered
+    // executor even though no executor was registered through this facade.
+    let task = same_database
+        .service()
+        .create_task(
+            TaskCreateContext::default(),
+            create_params(TaskTriggerSpec::Immediate),
+        )
+        .await
+        .unwrap();
+    let run = task.run.unwrap();
+    same_database
+        .process_due_once(run.created_at)
+        .await
+        .unwrap();
+    assert_eq!(
+        same_database
+            .service()
+            .store()
+            .get_task_run(&run.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        TaskRunStatus::Succeeded
+    );
+    same_database.shutdown().await;
+    assert!(
+        same_database.start().await.is_err(),
+        "closed runtime cannot create late owners"
+    );
+    // Closing this facade does not close the physical shared registry/services.
+    let next = original
+        .service()
+        .create_task(
+            TaskCreateContext::default(),
+            create_params(TaskTriggerSpec::Immediate),
+        )
+        .await
+        .unwrap()
+        .run
+        .unwrap();
+    original.process_due_once(next.created_at).await.unwrap();
+    assert_eq!(
+        original
+            .service()
+            .store()
+            .get_task_run(&next.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        TaskRunStatus::Succeeded
+    );
+    original.shutdown().await;
+}
+
+#[tokio::test]
 async fn startup_reconciliation_is_idempotent() {
     let runtime = runtime().await;
     let response = runtime
@@ -8146,9 +8241,9 @@ async fn role_owned_task_observation_budget_clamps_list_and_event_pages() {
 }
 
 #[derive(Default)]
-struct DispatchDatabaseObserver {
-    reads: std::sync::Mutex<Vec<pioneer_sqlite::SqliteReadClass>>,
-    writes: std::sync::Mutex<Vec<pioneer_sqlite::SqliteWriteClass>>,
+pub(super) struct DispatchDatabaseObserver {
+    pub(super) reads: std::sync::Mutex<Vec<pioneer_sqlite::SqliteReadClass>>,
+    pub(super) writes: std::sync::Mutex<Vec<pioneer_sqlite::SqliteWriteClass>>,
 }
 
 impl pioneer_sqlite::SqliteReadObserver for DispatchDatabaseObserver {

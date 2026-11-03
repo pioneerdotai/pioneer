@@ -1,7 +1,7 @@
 use crate::TaskRuntimeResult;
 use crate::actor_contract::{build_occurrence_contract, build_task_actor_contract};
 use crate::admission::TaskAdmissionNormalizer;
-use crate::event_bus::{TaskEventBus, TaskEventFilter, TaskEventWakeDelivery};
+use crate::event_bus::TaskEventBus;
 use crate::executor::{
     TaskExecutionContext, TaskExecutionHandle, TaskExecutor, TaskExecutorRegistry,
 };
@@ -56,17 +56,14 @@ use std::future::Future;
 use std::path::{Component, Path};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, RwLock, Semaphore};
 use tokio::task::JoinHandle;
-use tokio::time::{Duration, Instant, MissedTickBehavior, interval, timeout};
+use tokio::time::{Duration, Instant, timeout};
 use tracing::warn;
 
 const ID_LEN: usize = 21;
 const DEFAULT_MAX_TASK_DEPTH: i64 = 3;
 const MAX_ROOT_TASK_DEPTH_LIMIT: i64 = 10;
-const WAIT_RESCAN_INTERVAL: Duration = Duration::from_millis(250);
-const WAIT_LIVENESS_SCAN_INTERVAL: Duration = Duration::from_secs(5);
-pub(crate) const LIVE_RECONCILIATION_INTERVAL: Duration = Duration::from_secs(5);
 const REVIEW_AUTO_ACCEPT_SCAN_INTERVAL: Duration = Duration::from_secs(30);
 const REVIEW_AUTO_ACCEPT_SCAN_LIMIT: u64 = 1024;
 const DELIVERY_RECOVERY_BATCH_LIMIT: u64 = pioneer_crud::DELIVERY_RECOVERY_BUDGET;
@@ -125,6 +122,20 @@ impl PreparedComposerTask {
     }
 }
 
+// A weak runtime attachment shares executor registration without creating a
+// database-resource -> executor -> CrudStore/database ownership cycle.
+#[derive(Default)]
+struct SharedTaskExecutors(StdMutex<Weak<TaskExecutorRegistry>>);
+
+// Background start is exclusive for the physical DB, even though unstarted
+// facades may share executors and use foreground operations independently.
+struct TaskBackgroundAdmission(Arc<Semaphore>);
+impl Default for TaskBackgroundAdmission {
+    fn default() -> Self {
+        Self(Arc::new(Semaphore::new(1)))
+    }
+}
+
 pub struct TaskRuntime {
     service: Arc<TaskService>,
     critical_service: Arc<TaskService>,
@@ -137,45 +148,75 @@ pub struct TaskRuntime {
     scheduler_task: Mutex<Option<JoinHandle<()>>>,
     live_reconciliation_task: Mutex<Option<JoinHandle<()>>>,
     review_timeout_task: Mutex<Option<JoinHandle<()>>>,
+    background_admission: Arc<TaskBackgroundAdmission>,
+    worker_admission: StdMutex<Weak<OwnedSemaphorePermit>>,
+    start_gate: Semaphore,
+    #[cfg(test)]
+    startup_barrier: StdMutex<Option<Arc<tokio::sync::Barrier>>>,
+    closed: std::sync::atomic::AtomicBool,
+    closing: tokio::sync::watch::Sender<bool>,
 }
 
 impl Drop for TaskRuntime {
     fn drop(&mut self) {
+        self.closing.send_replace(true);
         // Worker tasks own Arcs of the scheduler/reconciler/service rather than
         // the runtime itself, so dropping the runtime does not cancel them by
         // reference-counting alone.  Abort every task synchronously to keep
         // short-lived processors (tests, reloads, and restart probes) from
         // accumulating unbounded scheduler/reconciliation loops.
-        if let Ok(mut guard) = self.scheduler_task.try_lock() {
-            if let Some(handle) = guard.take() {
+        for worker in [
+            &mut self.scheduler_task,
+            &mut self.live_reconciliation_task,
+            &mut self.review_timeout_task,
+        ] {
+            if let Some(handle) = worker.get_mut().take() {
                 handle.abort();
             }
         }
-        if let Ok(mut guard) = self.live_reconciliation_task.try_lock() {
-            if let Some(handle) = guard.take() {
-                handle.abort();
-            }
-        }
-        if let Ok(mut guard) = self.review_timeout_task.try_lock() {
-            if let Some(handle) = guard.take() {
-                handle.abort();
-            }
-        }
+        // Each spawned future keeps its own clone until it is actually dropped;
+        // abort() alone is not proof that an owner has released its Wake.
     }
 }
 
 impl TaskRuntime {
     pub async fn shutdown(&self) {
+        {
+            let _admission = self.worker_admission.lock().unwrap();
+            self.closed
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        self.closing.send_replace(true);
+        // Closing cancels startup before waiting for its per-facade phase gate.
+        // Concurrent shutdowns also join the same retained handles in order.
+        let _phase = self
+            .start_gate
+            .acquire()
+            .await
+            .expect("phase gate stays open");
         for worker in [
             &self.scheduler_task,
             &self.live_reconciliation_task,
             &self.review_timeout_task,
         ] {
-            if let Some(handle) = worker.lock().await.take() {
+            if let Some(handle) = worker.lock().await.as_ref() {
                 handle.abort();
-                let _ = handle.await;
             }
         }
+        for worker in [
+            &self.scheduler_task,
+            &self.live_reconciliation_task,
+            &self.review_timeout_task,
+        ] {
+            let mut handle = worker.lock().await;
+            if let Some(handle) = handle.as_mut() {
+                let _ = handle.await;
+            }
+            // Retain the JoinHandle across await: a cancelled shutdown must not
+            // detach an unjoined worker from a later shutdown/Drop.
+            *handle = None;
+        }
+        *self.worker_admission.lock().unwrap() = Weak::new();
     }
 }
 
@@ -219,35 +260,63 @@ impl TaskRuntime {
     }
 
     pub fn new_with_config(store: Arc<CrudStore>, config: TaskRuntimeConfig) -> Self {
-        let event_bus = Arc::new(TaskEventBus::new());
-        let executors = Arc::new(TaskExecutorRegistry::new());
+        let background_admission = store
+            .database_connection()
+            .shared_resource::<TaskBackgroundAdmission>();
+        let event_bus = store
+            .database_connection()
+            .shared_resource::<TaskEventBus>();
+        let registration = store
+            .database_connection()
+            .shared_resource::<SharedTaskExecutors>();
+        let executors = {
+            let mut current = registration.0.lock().unwrap();
+            current.upgrade().unwrap_or_else(|| {
+                let registry = Arc::new(TaskExecutorRegistry::new());
+                *current = Arc::downgrade(&registry);
+                registry
+            })
+        };
+        let closing = tokio::sync::watch::channel(false).0;
         let critical_store = Arc::new(store.with_critical_writes());
         let maintenance_store = Arc::new(store.with_maintenance_access());
         let background_control_store = Arc::new(store.with_maintenance_reads_and_critical_writes());
-        let service = Arc::new(TaskService::new_with_config(
-            store.clone(),
-            event_bus.clone(),
-            executors.clone(),
-            config.clone(),
-        ));
-        let critical_service = Arc::new(TaskService::new_with_config(
-            critical_store,
-            event_bus.clone(),
-            executors.clone(),
-            config.clone(),
-        ));
-        let maintenance_service = Arc::new(TaskService::new_with_config(
-            maintenance_store.clone(),
-            event_bus.clone(),
-            executors.clone(),
-            config.clone(),
-        ));
-        let background_control_service = Arc::new(TaskService::new_with_config(
-            background_control_store,
-            event_bus.clone(),
-            executors.clone(),
-            config,
-        ));
+        let service = Arc::new(
+            TaskService::new_with_config(
+                store.clone(),
+                event_bus.clone(),
+                executors.clone(),
+                config.clone(),
+            )
+            .with_lifecycle_receiver(closing.subscribe()),
+        );
+        let critical_service = Arc::new(
+            TaskService::new_with_config(
+                critical_store,
+                event_bus.clone(),
+                executors.clone(),
+                config.clone(),
+            )
+            .with_lifecycle_receiver(closing.subscribe()),
+        );
+        let maintenance_service = Arc::new(
+            TaskService::new_with_config(
+                maintenance_store.clone(),
+                event_bus.clone(),
+                executors.clone(),
+                config.clone(),
+            )
+            .with_lifecycle_receiver(closing.subscribe()),
+        );
+        let background_control_service = Arc::new(
+            TaskService::new_with_config(
+                background_control_store,
+                event_bus.clone(),
+                executors.clone(),
+                config,
+            )
+            .with_lifecycle_receiver(closing.subscribe()),
+        );
         let scheduler = Arc::new(TaskScheduler::new(
             maintenance_store.clone(),
             event_bus.clone(),
@@ -275,6 +344,13 @@ impl TaskRuntime {
             scheduler_task: Mutex::new(None),
             live_reconciliation_task: Mutex::new(None),
             review_timeout_task: Mutex::new(None),
+            background_admission,
+            worker_admission: StdMutex::new(Weak::new()),
+            start_gate: Semaphore::new(1),
+            #[cfg(test)]
+            startup_barrier: StdMutex::new(None),
+            closed: std::sync::atomic::AtomicBool::new(false),
+            closing,
         }
     }
 
@@ -301,11 +377,73 @@ impl TaskRuntime {
         self.event_bus.clone()
     }
 
-    pub async fn register_executor(&self, executor: Arc<dyn TaskExecutor>) {
-        self.executors.register(executor).await;
+    #[cfg(test)]
+    pub(super) fn live_owner_for_test(&self) -> Arc<TaskStartupReconciler> {
+        self.reconciler.clone()
     }
 
+    #[cfg(test)]
+    pub(super) fn scheduler_for_test(&self) -> Arc<TaskScheduler> {
+        self.scheduler.clone()
+    }
+
+    pub async fn register_executor(&self, executor: Arc<dyn TaskExecutor>) {
+        self.executors.register(executor).await;
+        self.scheduler.wake();
+        self.maintenance_service
+            .store
+            .background_work("tasks.live")
+            .invalidate();
+    }
+
+    /// Starts one background runtime per physical database. Another facade's
+    /// start fails explicitly; unstarted foreground facades remain usable.
     pub async fn start(&self) -> TaskRuntimeResult<()> {
+        // Subscribe before polling reconstruction. Shutdown cancels an in-flight
+        // startup as well as tracked workers; lower guards retain ambiguous debt.
+        let mut closing = self.closing.subscribe();
+        if *closing.borrow() {
+            bail!("Task runtime is shut down");
+        }
+        tokio::select! {
+            biased;
+            _ = closing.wait_for(|closed| *closed) => Err(anyhow!("Task runtime is shut down")),
+            result = async {
+                let _phase = self.start_gate.acquire().await.expect("phase gate stays open");
+                self.start_inner().await
+            } => result,
+        }
+    }
+
+    async fn start_inner(&self) -> TaskRuntimeResult<()> {
+        if self.closed.load(std::sync::atomic::Ordering::Acquire) {
+            bail!("Task runtime is shut down");
+        }
+        let admission = {
+            let retained = self.worker_admission.lock().unwrap();
+            match retained.upgrade() {
+                Some(admission) => admission,
+                None => Arc::new(
+                    self.background_admission
+                        .0
+                        .clone()
+                        .try_acquire_owned()
+                        .map_err(|_| {
+                            anyhow!("Task background runtime is already started for this database")
+                        })?,
+                ),
+            }
+        };
+        // Until all handles can be installed without another await, admission
+        // is local: cancellation/fatal startup error releases it automatically.
+        #[cfg(test)]
+        {
+            let barrier = self.startup_barrier.lock().unwrap().take();
+            if let Some(barrier) = barrier {
+                barrier.wait().await;
+                barrier.wait().await;
+            }
+        }
         let now = now_timestamp_secs();
         let mut partial_failures = Vec::new();
         match self.reconciler.reconcile(now).await {
@@ -348,31 +486,30 @@ impl TaskRuntime {
             Err(error) => return Err(error),
         }
         let mut guard = self.scheduler_task.lock().await;
+        let mut reconciliation_guard = self.live_reconciliation_task.lock().await;
+        let mut review_timeout_guard = self.review_timeout_task.lock().await;
+        let mut retained = self.worker_admission.lock().unwrap();
+        if self.closed.load(std::sync::atomic::Ordering::Acquire) {
+            bail!("Task runtime is shut down");
+        }
+        // No await from the closed check through installation. Shutdown uses
+        // this same short per-facade fence before closing admission.
         if guard.is_none() {
             let scheduler = self.scheduler.clone();
+            let admission = admission.clone();
             *guard = Some(tokio::spawn(async move {
+                let _admission = admission;
                 scheduler.run().await;
             }));
         }
-        let mut reconciliation_guard = self.live_reconciliation_task.lock().await;
         if reconciliation_guard.is_none() {
             let reconciler = self.reconciler.clone();
+            let admission = admission.clone();
             *reconciliation_guard = Some(tokio::spawn(async move {
-                let mut ticks = interval(LIVE_RECONCILIATION_INTERVAL);
-                ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
-                ticks.tick().await;
-                loop {
-                    ticks.tick().await;
-                    if let Err(_error) = reconciler.reconcile(now_timestamp_secs()).await {
-                        warn!(
-                            failure_class = "task_live_reconciliation_failed",
-                            "live task terminal reconciliation pass failed"
-                        );
-                    }
-                }
+                let _admission = admission;
+                reconciler.run().await;
             }));
         }
-        let mut review_timeout_guard = self.review_timeout_task.lock().await;
         if review_timeout_guard.is_none()
             && self
                 .maintenance_service
@@ -380,25 +517,19 @@ impl TaskRuntime {
                 .is_some()
         {
             let service = self.maintenance_service.clone();
+            let admission = admission.clone();
             *review_timeout_guard = Some(tokio::spawn(async move {
-                let mut interval = interval(REVIEW_AUTO_ACCEPT_SCAN_INTERVAL);
-                interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
-                interval.tick().await;
-                loop {
-                    interval.tick().await;
-                    let now = now_timestamp_secs();
-                    if let Err(_error) = service
-                        .auto_accept_expired_review_candidates(now, REVIEW_AUTO_ACCEPT_SCAN_LIMIT)
-                        .await
-                    {
-                        warn!(
-                            failure_class = "task_review_auto_accept_scan_failed",
-                            "task review timeout auto-accept scan failed"
-                        );
-                    }
-                }
+                let _admission = admission;
+                service.run_review_worker().await;
             }));
         }
+        // Bookkeeping is weak: cancelling shutdown after abort must not retain
+        // admission once the last actual worker future has stopped.
+        *retained = Arc::downgrade(&admission);
+        drop(retained);
+        drop(guard);
+        drop(reconciliation_guard);
+        drop(review_timeout_guard);
         if !partial_failures.is_empty() {
             return Err(crate::PartialTaskStartup(partial_failures).into());
         }
@@ -442,6 +573,20 @@ impl DeliveryRecoveryState {
     }
 }
 
+struct DeliveryRecoveryPass<'a> {
+    shared: &'a StdMutex<DeliveryRecoveryState>,
+    state: DeliveryRecoveryState,
+}
+impl Drop for DeliveryRecoveryPass<'_> {
+    fn drop(&mut self) {
+        let old = std::mem::replace(
+            &mut *self.shared.lock().unwrap(),
+            std::mem::take(&mut self.state),
+        );
+        drop(old);
+    }
+}
+
 pub struct TaskService {
     store: Arc<CrudStore>,
     projector: TaskProjector,
@@ -449,10 +594,25 @@ pub struct TaskService {
     executors: Arc<TaskExecutorRegistry>,
     scheduler: RwLock<Option<Weak<TaskScheduler>>>,
     config: TaskRuntimeConfig,
-    delivery_recovery: Mutex<DeliveryRecoveryState>,
+    delivery_recovery: Arc<StdMutex<DeliveryRecoveryState>>,
+    closing: Option<tokio::sync::watch::Receiver<bool>>,
+    #[cfg(test)]
+    wait_settled: tokio::sync::Notify,
+    #[cfg(test)]
+    review_accepted_and_settled: tokio::sync::Notify,
+    #[cfg(test)]
+    review_deadline_observed: tokio::sync::Notify,
+    #[cfg(test)]
+    review_page_barrier: StdMutex<Option<Arc<tokio::sync::Barrier>>>,
+    #[cfg(test)]
+    review_settled_barrier: StdMutex<Option<Arc<tokio::sync::Barrier>>>,
 }
 
 impl TaskService {
+    fn with_lifecycle_receiver(mut self, receiver: tokio::sync::watch::Receiver<bool>) -> Self {
+        self.closing = Some(receiver);
+        self
+    }
     pub fn new(
         store: Arc<CrudStore>,
         event_bus: Arc<TaskEventBus>,
@@ -468,6 +628,9 @@ impl TaskService {
         config: TaskRuntimeConfig,
     ) -> Self {
         let projector = TaskProjector::new(store.clone());
+        let delivery_recovery = store
+            .database_connection()
+            .shared_resource::<StdMutex<DeliveryRecoveryState>>();
         Self {
             store,
             projector,
@@ -475,7 +638,18 @@ impl TaskService {
             executors,
             scheduler: RwLock::new(None),
             config,
-            delivery_recovery: Mutex::new(DeliveryRecoveryState::default()),
+            delivery_recovery,
+            closing: None,
+            #[cfg(test)]
+            wait_settled: Default::default(),
+            #[cfg(test)]
+            review_accepted_and_settled: Default::default(),
+            #[cfg(test)]
+            review_deadline_observed: Default::default(),
+            #[cfg(test)]
+            review_page_barrier: Default::default(),
+            #[cfg(test)]
+            review_settled_barrier: Default::default(),
         }
     }
 
@@ -706,21 +880,177 @@ impl TaskService {
         self.record_task_result_review_event(record).await
     }
 
+    async fn run_review_worker(self: Arc<Self>) {
+        use pioneer_sqlite::background::{Plan, Ready};
+        let wake = self.store.background_work("tasks.review");
+        let Some(mut owner) = wake.acquire() else {
+            return;
+        };
+        if self.review_auto_accept_timeout_seconds().is_none() {
+            return;
+        }
+        let mut cursor: Option<(String, String)> = None;
+        let mut earliest: Option<i64> = None;
+        let mut pass_observation = None;
+        let mut rescan = false;
+        let mut pass_failed = false;
+        let mut accepted_in_pass = 0usize;
+        loop {
+            match owner.ready().await {
+                Ready::Closed => return,
+                Ready::SettlementRequired => {
+                    let settle_observation = owner.observe();
+                    cursor = None;
+                    pass_observation = None;
+                    if self
+                        .store
+                        .database_connection()
+                        .settle_background_change(&owner)
+                        .await
+                        .is_err()
+                    {
+                        warn!(
+                            failure_class = "task_review_settlement_failed",
+                            "task review change settlement deferred"
+                        );
+                        owner.retry_after(settle_observation, REVIEW_AUTO_ACCEPT_SCAN_INTERVAL);
+                    }
+                    continue;
+                }
+                Ready::Work => {}
+            }
+            let observation = owner.observe();
+            if cursor.is_none() {
+                earliest = None;
+                pass_failed = false;
+                accepted_in_pass = 0;
+                rescan = false;
+                pass_observation = Some(observation);
+            }
+            rescan |= pass_observation.is_some_and(|at| owner.producer_changed_since(at));
+            let result: TaskRuntimeResult<(usize, bool, Plan)> = owner
+                .scope(async {
+                    let (accepted, failed, continuation, nearest) = self
+                        .auto_accept_review_quantum_page(
+                            wake.wall_now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs()
+                                .min(i64::MAX as u64) as i64,
+                            REVIEW_AUTO_ACCEPT_SCAN_LIMIT,
+                            cursor.as_ref().map(|(after, _)| after.as_str()),
+                            cursor.as_ref().map(|(_, upper)| upper.as_str()),
+                        )
+                        .await?;
+                    accepted_in_pass += accepted;
+                    cursor = continuation;
+                    earliest = earliest.into_iter().chain(nearest).min();
+                    pass_failed |= failed;
+                    let deadline = earliest;
+                    let plan = if cursor.is_some() || rescan {
+                        Plan::Runnable
+                    } else {
+                        match deadline {
+                            Some(at) => Plan::WallDeadline(
+                                std::time::UNIX_EPOCH
+                                    .checked_add(Duration::from_secs(
+                                        u64::try_from(at).unwrap_or(0),
+                                    ))
+                                    .ok_or_else(|| {
+                                        anyhow!("review deadline is outside wall-clock range")
+                                    })?,
+                            ),
+                            None => Plan::Dormant,
+                        }
+                    };
+                    Ok((accepted, cursor.is_none() && pass_failed, plan))
+                })
+                .await;
+            // Test rendezvous occurs only after the bounded database quantum
+            // released all resources. It cannot manufacture a producer wake.
+            #[cfg(test)]
+            if cursor.is_some() {
+                let barrier = self.review_page_barrier.lock().unwrap().take();
+                if let Some(barrier) = barrier {
+                    barrier.wait().await;
+                    barrier.wait().await;
+                }
+            }
+            match result {
+                Ok((accepted, false, plan)) if !owner.requires_settlement() => {
+                    let settled = owner.publish(observation, plan);
+                    #[cfg(test)]
+                    if settled && accepted_in_pass > 0 && matches!(plan, Plan::Dormant) {
+                        self.review_accepted_and_settled.notify_one();
+                    }
+                    #[cfg(test)]
+                    if settled && matches!(plan, Plan::WallDeadline(_)) {
+                        self.review_deadline_observed.notify_one();
+                    }
+                    #[cfg(test)]
+                    if settled && !matches!(plan, Plan::Runnable) {
+                        let barrier = self.review_settled_barrier.lock().unwrap().take();
+                        if let Some(barrier) = barrier {
+                            barrier.wait().await;
+                            barrier.wait().await;
+                        }
+                    }
+                    let _ = (settled, accepted);
+                }
+                Ok(_) | Err(_) => {
+                    warn!(
+                        failure_class = "task_review_auto_accept_scan_failed",
+                        "task review timeout pass deferred"
+                    );
+                    owner.retry_after(observation, REVIEW_AUTO_ACCEPT_SCAN_INTERVAL);
+                }
+            }
+        }
+    }
+
     pub async fn auto_accept_expired_review_candidates(
         &self,
         now: i64,
         limit: u64,
     ) -> TaskRuntimeResult<usize> {
+        Ok(self.auto_accept_review_quantum(now, limit).await?.0)
+    }
+
+    async fn auto_accept_review_quantum(
+        &self,
+        now: i64,
+        limit: u64,
+    ) -> TaskRuntimeResult<(usize, bool)> {
+        let (accepted, failed, _, _) = self
+            .auto_accept_review_quantum_page(now, limit, None, None)
+            .await?;
+        Ok((accepted, failed))
+    }
+
+    async fn auto_accept_review_quantum_page(
+        &self,
+        now: i64,
+        limit: u64,
+        after: Option<&str>,
+        upper: Option<&str>,
+    ) -> TaskRuntimeResult<(usize, bool, Option<(String, String)>, Option<i64>)> {
         let Some(timeout_seconds) = self.review_auto_accept_timeout_seconds() else {
-            return Ok(0);
+            return Ok((0, false, None, None));
         };
         let timeout_seconds = i64::try_from(timeout_seconds).unwrap_or(i64::MAX);
-        let runs = self
+        let (runs, continuation, nearest, observation_failed) = self
             .store
-            .list_task_runs_by_status(TaskRunStatus::WaitingReview, limit)
+            .task_review_observation_page(now, timeout_seconds, limit, after, upper)
             .await?;
         let mut accepted = 0;
-        for run in runs {
+        let mut failed = observation_failed || !runs.failures.is_empty();
+        for _ in &runs.failures {
+            warn!(
+                failure_class = "task_review_row_decode_failed",
+                "task review candidate run could not be decoded"
+            );
+        }
+        for run in runs.records {
             let run_id = run.id.clone();
             match self
                 .auto_accept_expired_review_candidate_for_run(run, now, timeout_seconds)
@@ -729,6 +1059,7 @@ impl TaskService {
                 Ok(true) => accepted += 1,
                 Ok(false) => {}
                 Err(_error) => {
+                    failed = true;
                     warn!(
                         run_id = %run_id,
                         failure_class = "task_review_auto_accept_failed",
@@ -737,7 +1068,7 @@ impl TaskService {
                 }
             }
         }
-        Ok(accepted)
+        Ok((accepted, failed, continuation, nearest))
     }
 
     async fn auto_accept_expired_review_candidate_for_run(
@@ -2545,8 +2876,36 @@ impl TaskService {
     pub async fn wait_tasks(
         &self,
         context: TaskWaitContext,
+        params: TaskWaitParams,
+    ) -> TaskRuntimeResult<TaskWaitResponse> {
+        // Cover admission, initial reads and the timeout's final snapshot too.
+        // Shutdown cancels their queued DB work rather than waiting for a later
+        // transition into the dormant observation loop.
+        let mut closing = self.closing.clone();
+        let closed = async {
+            let Some(closing) = closing.as_mut() else {
+                return std::future::pending::<()>().await;
+            };
+            let _ = closing.wait_for(|closed| *closed).await;
+        };
+        tokio::select! { biased;
+            _ = closed => bail!("Task runtime is shut down"),
+            result = self.wait_tasks_open(context, params) => result,
+        }
+    }
+
+    async fn wait_tasks_open(
+        &self,
+        context: TaskWaitContext,
         mut params: TaskWaitParams,
     ) -> TaskRuntimeResult<TaskWaitResponse> {
+        if self
+            .closing
+            .as_ref()
+            .is_some_and(|closing| *closing.borrow())
+        {
+            bail!("Task runtime is shut down");
+        }
         let budget = context.task_resource_budget.unwrap_or_default();
         if params.task_ids.is_empty() && params.run_ids.is_empty() {
             bail!("`task_ids` or `run_ids` is required");
@@ -2575,22 +2934,20 @@ impl TaskService {
             .map_err(|_| anyhow!("task wait concurrency budget is exhausted"))?
             .map_err(|_| anyhow!("task wait governor is closed"))?;
         let plan = self.build_wait_target_plan(&params).await?;
+        // Register before the first state read. Lower CRUD producers share this
+        // physical-runtime subscription, including pre-registration in-flight
+        // operations and cancellation/unknown commit settlement.
+        let signal = self
+            .store
+            .subscribe_task_wait(&plan.signal_task_ids, &plan.wait_params.run_ids);
+        let mut owner = signal
+            .acquire()
+            .context("Task wait already has an active observer")?;
+        let initial_observed = owner.observe();
+        let initial_committed_event = signal.take_committed_event();
         let initial = self.collect_wait_state_for_plan(&plan).await?;
-        if wait_condition_satisfied(&initial) {
+        if wait_condition_satisfied(&initial) || !has_wait_targets(&plan.wait_params) {
             return Ok(initial);
-        }
-        if !has_wait_targets(&plan.wait_params) {
-            return Ok(initial);
-        }
-
-        let mut subscription = self.event_bus.subscribe(TaskEventFilter {
-            task_ids: plan.wait_params.task_ids.clone(),
-            run_ids: plan.wait_params.run_ids.clone(),
-            ..Default::default()
-        });
-        let after_subscribe = self.collect_wait_state_for_plan(&plan).await?;
-        if wait_condition_satisfied(&after_subscribe) {
-            return Ok(after_subscribe);
         }
 
         let confirmed_activity = context.confirmed_activity.clone();
@@ -2599,54 +2956,62 @@ impl TaskService {
         } else {
             BTreeMap::new()
         };
-        if !initial_frontier.is_empty()
+        if (initial_committed_event || !initial_frontier.is_empty())
             && let Some(observer) = confirmed_activity.as_ref()
         {
             observer();
         }
 
+        let settled = owner.publish(initial_observed, pioneer_sqlite::background::Plan::Dormant);
+        #[cfg(test)]
+        if settled {
+            self.wait_settled.notify_one();
+        }
+        #[cfg(not(test))]
+        let _ = settled;
         let wait_future = async {
-            let mut bus_closed = false;
-            let mut rescan = interval(WAIT_RESCAN_INTERVAL);
-            rescan.set_missed_tick_behavior(MissedTickBehavior::Delay);
-            rescan.tick().await;
+            use pioneer_sqlite::background::{Plan, Ready};
+            let _subscription = &signal;
             let mut activity_frontier = initial_frontier;
-            let mut next_liveness_scan = Instant::now() + WAIT_LIVENESS_SCAN_INTERVAL;
             loop {
-                let mut durable_target_event = false;
-                if bus_closed {
-                    rescan.tick().await;
-                } else {
-                    tokio::select! {
-                        delivery = subscription.recv() => {
-                            match delivery {
-                                TaskEventWakeDelivery::Wake(_) => durable_target_event = true,
-                                TaskEventWakeDelivery::Lagged(_) => {}
-                                TaskEventWakeDelivery::Closed => bus_closed = true,
-                            }
+                let ready = owner.ready().await;
+                match ready {
+                    Ready::Closed => bail!("Task wait runtime closed"),
+                    Ready::SettlementRequired => {
+                        let settle_observation = owner.observe();
+                        if !self.store.settle_task_wait_changes(&owner).await? {
+                            owner.retry_after(settle_observation, Duration::from_secs(2));
                         }
-                        _ = rescan.tick() => {}
-                    };
+                        continue;
+                    }
+                    Ready::Work => {}
                 }
-
+                // Capture the generation BEFORE consuming the coalesced event
+                // flag. Otherwise a commit between swap and observation could
+                // be included in the published snapshot but lose its activity.
+                let observed = owner.observe();
+                let committed_event = signal.take_committed_event();
                 let response = self.collect_wait_state_for_plan(&plan).await?;
-                if durable_target_event && let Some(observer) = confirmed_activity.as_ref() {
-                    observer();
-                }
-                if confirmed_activity.is_some() && Instant::now() >= next_liveness_scan {
-                    let next_frontier =
-                        self.collect_confirmed_wait_activity_frontier(&plan).await?;
-                    if wait_activity_frontier_advanced(&activity_frontier, &next_frontier)
-                        && let Some(observer) = confirmed_activity.as_ref()
+                if let Some(observer) = confirmed_activity.as_ref() {
+                    let next = self.collect_confirmed_wait_activity_frontier(&plan).await?;
+                    if committed_event || wait_activity_frontier_advanced(&activity_frontier, &next)
                     {
                         observer();
                     }
-                    activity_frontier = next_frontier;
-                    next_liveness_scan = Instant::now() + WAIT_LIVENESS_SCAN_INTERVAL;
+                    activity_frontier = next;
                 }
                 if wait_condition_satisfied(&response) {
                     return Ok(response);
                 }
+                // A matching commit or unknown outcome cannot be erased by the
+                // earlier read. A stable pending result has no periodic SQL.
+                let settled = owner.publish(observed, Plan::Dormant);
+                #[cfg(test)]
+                if settled {
+                    self.wait_settled.notify_one();
+                }
+                #[cfg(not(test))]
+                let _ = settled;
             }
         };
 
@@ -4101,6 +4466,13 @@ impl TaskService {
         Ok(())
     }
 
+    /// Local error cooldown is separate from durable retry clocks. The real
+    /// lifecycle owner uses it to avoid an overdue-source busy loop when storage
+    /// could not persist a deferral. This reads no database.
+    pub fn delivery_recovery_retry_deadline(&self) -> Option<Instant> {
+        self.delivery_recovery.lock().unwrap().retry_at
+    }
+
     pub async fn recover_stuck_deliveries(
         &self,
         now: i64,
@@ -4112,7 +4484,16 @@ impl TaskService {
         let limit = limit.min(pioneer_crud::DELIVERY_RECOVERY_BUDGET);
         // Serializes only this service's quanta; no DB resource is held here.
         // The cursor is fairness for current work, never a domain ACK.
-        let mut state = self.delivery_recovery.lock().await;
+        let work = self.store.background_work("tasks.delivery.recovery");
+        let Some(_drain) = work.drain().await else {
+            return Ok(TaskDeliveryRecoveryResult::default());
+        };
+        let state = std::mem::take(&mut *self.delivery_recovery.lock().unwrap());
+        let mut pass = DeliveryRecoveryPass {
+            shared: &self.delivery_recovery,
+            state,
+        };
+        let state = &mut pass.state;
         if state.retry_at.is_some_and(|at| Instant::now() < at) {
             return Ok(TaskDeliveryRecoveryResult {
                 cooling_down: true,
@@ -4718,7 +5099,6 @@ impl TaskService {
 
     pub(crate) async fn publish_and_wake(&self, events: Vec<AppendedTaskEvent>) {
         self.event_bus.publish_many(events).await;
-        self.wake_scheduler().await;
     }
 
     async fn process_due_once(&self, now: i64) -> TaskRuntimeResult<usize> {
@@ -4736,12 +5116,6 @@ impl TaskService {
             scheduler.process_queued_run_once(&self.store, run).await
         } else {
             Ok(false)
-        }
-    }
-
-    async fn wake_scheduler(&self) {
-        if let Some(scheduler) = self.scheduler.read().await.as_ref().and_then(Weak::upgrade) {
-            scheduler.wake();
         }
     }
 
@@ -4986,9 +5360,21 @@ impl TaskService {
         }
 
         wait_params.task_ids = wait_task_ids;
+        // Task-wide transitions also affect run-only waits. Resolve immutable
+        // Run parents before subscription so a Task-level event does not wake
+        // unrelated run subscribers. The first authoritative read follows it.
+        let mut signal_task_ids = wait_params.task_ids.clone();
+        for run_id in &wait_params.run_ids {
+            if let Some(run) = self.store.get_task_run(run_id).await? {
+                signal_task_ids.push(run.task_id);
+            }
+        }
+        signal_task_ids.sort();
+        signal_task_ids.dedup();
 
         Ok(WaitTargetPlan {
             wait_params,
+            signal_task_ids,
             non_waitable,
         })
     }
@@ -6462,6 +6848,7 @@ fn select_wait_run(runs: &[TaskRun], run_ids: &[String]) -> Option<TaskRun> {
 #[derive(Debug, Clone)]
 struct WaitTargetPlan {
     wait_params: TaskWaitParams,
+    signal_task_ids: Vec<String>,
     non_waitable: Vec<TaskWaitNonWaitableItem>,
 }
 
@@ -6697,6 +7084,735 @@ mod resource_policy_tests {
     use sea_orm::Database;
     use std::sync::Arc;
 
+    #[tokio::test]
+    async fn wait_uses_lower_commits_without_empty_sql_preserves_events_and_closes_on_shutdown() {
+        use super::{TaskCreateContext, TaskEventPayload, TaskWaitContext, TaskWaitParams};
+        use pioneer_protocol::TaskTriggerSpec;
+        use sea_orm::{ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::time::{Duration, timeout};
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("wait.sqlite");
+        let mut options =
+            sea_orm::ConnectOptions::new(pioneer_sqlite::sqlite_connection_url(&path));
+        options.max_connections(1);
+        let writer = Database::connect(options).await.unwrap();
+        let executor = pioneer_sqlite::SqliteWriteExecutor::new(writer.clone());
+        executor
+            .apply_pragmas(SqliteWriteClass::Maintenance)
+            .await
+            .unwrap();
+        executor
+            .run_migrations::<migration::Migrator>(SqliteWriteClass::Maintenance, None)
+            .await
+            .unwrap();
+        crate::tests::seed_task_test_workspace(&writer).await;
+        drop(executor);
+        let mut options =
+            sea_orm::ConnectOptions::new(pioneer_sqlite::sqlite_read_only_connection_url(&path));
+        options
+            .max_connections(2)
+            .map_sqlx_sqlite_opts(|options| options.read_only(true).pragma("query_only", "ON"));
+        let reader = Database::connect(options).await.unwrap();
+        let observer = Arc::new(crate::tests::DispatchDatabaseObserver::default());
+        let database = SqliteDatabase::from_executor_with_read_observer(
+            reader,
+            pioneer_sqlite::SqliteWriteExecutor::with_observer(writer, observer.clone()),
+            observer.clone(),
+        );
+        let runtime = TaskRuntime::new(Arc::new(CrudStore::new(database.clone())));
+        let a = runtime
+            .service()
+            .create_task(
+                TaskCreateContext::default(),
+                crate::tests::create_params(TaskTriggerSpec::Immediate),
+            )
+            .await
+            .unwrap();
+        let run_id = a.run.unwrap().id;
+        let a = a.task.id;
+        let b = runtime
+            .service()
+            .create_task(
+                TaskCreateContext::default(),
+                crate::tests::create_params(TaskTriggerSpec::Manual {
+                    allowed_actor: None,
+                }),
+            )
+            .await
+            .unwrap()
+            .task
+            .id;
+        let service = runtime.maintenance_service();
+        let sibling = runtime.service();
+        let confirmed = Arc::new(AtomicUsize::new(0));
+        let waiter = tokio::spawn({
+            let service = service.clone();
+            let run_id = run_id.clone();
+            let confirmed = confirmed.clone();
+            async move {
+                service
+                    .wait_tasks(
+                        TaskWaitContext {
+                            confirmed_activity: Some(Arc::new(move || {
+                                confirmed.fetch_add(1, Ordering::SeqCst);
+                            })),
+                            ..Default::default()
+                        },
+                        TaskWaitParams {
+                            run_ids: vec![run_id],
+                            timeout_ms: None,
+                            return_completed: true,
+                            return_pending: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+            }
+        });
+        let sibling_waiter = tokio::spawn({
+            let service = sibling.clone();
+            let id = b.clone();
+            async move {
+                service
+                    .wait_tasks(
+                        TaskWaitContext::default(),
+                        TaskWaitParams {
+                            task_ids: vec![id],
+                            timeout_ms: None,
+                            return_completed: true,
+                            return_pending: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+            }
+        });
+        timeout(Duration::from_secs(5), service.wait_settled.notified())
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(5), sibling.wait_settled.notified())
+            .await
+            .unwrap();
+        observer.reads.lock().unwrap().clear();
+        observer.writes.lock().unwrap().clear();
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(300)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            observer.reads.lock().unwrap().is_empty(),
+            "pending waits have no250ms/5s discovery loop"
+        );
+        assert!(observer.writes.lock().unwrap().is_empty());
+        tokio::time::resume();
+        // Hold the one Maintenance reader while committing a burst through a
+        // separately constructed lower store. No business-bus publication is
+        // performed; the durable log remains complete and wake state coalesces.
+        let initial_event_count = pioneer_entity::task_event::Entity::find()
+            .filter(pioneer_entity::task_event::Column::TaskId.eq(&a))
+            .count(&database)
+            .await
+            .unwrap();
+        let held = database.maintenance().begin_read().await.unwrap();
+        let lower = CrudStore::new(database.clone());
+        for n in 0..1000 {
+            lower
+                .append_task_event(
+                    TaskEventPayload::Progress {
+                        task_id: a.clone(),
+                        run_id: Some(run_id.clone()),
+                        message: format!("event{n}"),
+                        details: None,
+                    },
+                    super::now_timestamp_secs(),
+                )
+                .await
+                .unwrap();
+        }
+        observer.reads.lock().unwrap().clear();
+        observer.writes.lock().unwrap().clear();
+        drop(held);
+        timeout(Duration::from_secs(5), service.wait_settled.notified())
+            .await
+            .unwrap();
+        assert!(
+            confirmed.load(Ordering::SeqCst) > 0,
+            "real committed progress remains confirmed activity"
+        );
+        let reads = observer.reads.lock().unwrap().clone();
+        assert!(
+            !reads.is_empty() && reads.len() < 100,
+            "bounded state reads do not consume1000 event payloads: {reads:?}"
+        );
+        assert!(
+            reads
+                .iter()
+                .all(|class| *class == SqliteReadClass::Maintenance),
+            "the unrelated Interactive sibling stays parked"
+        );
+        assert!(observer.writes.lock().unwrap().is_empty());
+        assert!(!sibling_waiter.is_finished());
+        let count = pioneer_entity::task_event::Entity::find()
+            .filter(pioneer_entity::task_event::Column::TaskId.eq(&a))
+            .count(&database)
+            .await
+            .unwrap();
+        assert_eq!(
+            count,
+            initial_event_count + 1000,
+            "the creation records and all1000 Progress records survive coalescing"
+        );
+        lower
+            .append_task_event(
+                TaskEventPayload::TaskCancelled {
+                    task_id: a.clone(),
+                    reason: Some("done".into()),
+                    completed_at: super::now_timestamp_secs(),
+                },
+                super::now_timestamp_secs(),
+            )
+            .await
+            .unwrap();
+        let result = timeout(Duration::from_secs(5), waiter)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.cancelled.len(), 1);
+        assert!(!result.timed_out);
+        observer.reads.lock().unwrap().clear();
+        observer.writes.lock().unwrap().clear();
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(300)).await;
+        tokio::task::yield_now().await;
+        assert!(observer.reads.lock().unwrap().is_empty());
+        assert!(observer.writes.lock().unwrap().is_empty());
+        tokio::time::resume();
+        runtime.shutdown().await;
+        assert!(
+            timeout(Duration::from_secs(5), sibling_waiter)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap_err()
+                .to_string()
+                .contains("shut down")
+        );
+        observer.reads.lock().unwrap().clear();
+        assert!(
+            sibling
+                .wait_tasks(
+                    TaskWaitContext::default(),
+                    TaskWaitParams {
+                        task_ids: vec![b],
+                        timeout_ms: None,
+                        ..Default::default()
+                    }
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            observer.reads.lock().unwrap().is_empty(),
+            "closed runtime rejects a late wait before SQL"
+        );
+    }
+
+    #[tokio::test]
+    async fn review_owner_reconstructs_future_raw_pages_and_old_key_without_a_client() {
+        use super::{TaskReviewRuntimeConfig, TaskRuntimeConfig};
+        use migration::Migrator;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+        #[derive(Default)]
+        struct Observer {
+            reads: AtomicUsize,
+            writes: AtomicUsize,
+        }
+        impl pioneer_sqlite::SqliteReadObserver for Observer {
+            fn observe(&self, event: pioneer_sqlite::SqliteReadEvent) {
+                if let pioneer_sqlite::SqliteReadEvent::OperationFinished { class, .. } = event {
+                    assert_eq!(class, SqliteReadClass::Maintenance);
+                    self.reads.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        }
+        impl pioneer_sqlite::SqliteWriteObserver for Observer {
+            fn observe(&self, event: pioneer_sqlite::SqliteWriteEvent) {
+                if let pioneer_sqlite::SqliteWriteEvent::Acquired { .. } = event {
+                    self.writes.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("review.sqlite");
+        let mut options =
+            sea_orm::ConnectOptions::new(pioneer_sqlite::sqlite_connection_url(&path));
+        options.max_connections(1);
+        let writer = Database::connect(options).await.unwrap();
+        let executor = pioneer_sqlite::SqliteWriteExecutor::new(writer.clone());
+        executor
+            .apply_pragmas(SqliteWriteClass::Maintenance)
+            .await
+            .unwrap();
+        executor
+            .run_migrations::<Migrator>(SqliteWriteClass::Maintenance, None)
+            .await
+            .unwrap();
+        crate::tests::seed_task_test_workspace(&writer).await;
+        drop(executor);
+        let mut options =
+            sea_orm::ConnectOptions::new(pioneer_sqlite::sqlite_read_only_connection_url(&path));
+        options.map_sqlx_sqlite_opts(|options| options.read_only(true).pragma("query_only", "ON"));
+        let reader = Database::connect(options).await.unwrap();
+        let observer = Arc::new(Observer::default());
+        let database = SqliteDatabase::from_executor_with_read_observer(
+            reader,
+            pioneer_sqlite::SqliteWriteExecutor::with_observer(writer, observer.clone()),
+            observer.clone(),
+        );
+        let runtime = TaskRuntime::new_with_config(
+            Arc::new(CrudStore::new(database.maintenance())),
+            TaskRuntimeConfig {
+                review: TaskReviewRuntimeConfig {
+                    enabled: true,
+                    allow_task_create_review_policy: true,
+                    default_parent_review_for_immediate_attached_agent_tasks: false,
+                    default_max_revision_rounds: 2,
+                    auto_accept_after_seconds: 3,
+                },
+            },
+        );
+        let service = runtime.maintenance_service();
+        let wake = service.store.background_work("tasks.review");
+        let now = now_timestamp_secs();
+        wake.set_wall_clock_for_test(std::time::UNIX_EPOCH + Duration::from_secs(now as u64));
+        // Every fixture uses the actual execution/turn/candidate admission path.
+        let mut inputs = Vec::new();
+        for _ in 0..65 {
+            inputs.push(
+                crate::tests::create_waiting_review_agent_task(
+                    &runtime,
+                    2,
+                    0,
+                    pioneer_protocol::TaskResultCandidateStatus::PendingReview,
+                )
+                .await,
+            );
+        }
+        inputs.sort_by(|a, b| a.1.cmp(&b.1));
+        for (index, (_, _, id)) in inputs.iter().enumerate() {
+            // Historical CreatedAt is immutable producer identity. Establish
+            // fixture bytes before owner acquisition; do not replay an upsert
+            // with a different identity or fabricate a committed receipt.
+            use pioneer_entity::task_result_candidate as candidate;
+            use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, sea_query::Expr};
+            let at = if index == 64 || index == 1 {
+                now - 3
+            } else {
+                now + 100 + index as i64
+            };
+            candidate::Entity::update_many()
+                .col_expr(
+                    candidate::Column::CreatedAt,
+                    Expr::val(pioneer_crud::unix_to_datetime(at)),
+                )
+                .filter(candidate::Column::Id.eq(id))
+                .exec(&service.store.database_connection())
+                .await
+                .unwrap();
+        }
+        // A real active failed extraction suppresses an older clock.
+        service
+            .store
+            .update_task_result_candidate_resolution(
+                &inputs[1].2,
+                pioneer_protocol::TaskResultCandidateStatus::ExtractionFailed,
+                None,
+                None,
+                now,
+            )
+            .await
+            .unwrap();
+        let page_barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let settled = Arc::new(tokio::sync::Barrier::new(2));
+        *service.review_page_barrier.lock().unwrap() = Some(page_barrier.clone());
+        *service.review_settled_barrier.lock().unwrap() = Some(settled.clone());
+        let worker = tokio::spawn(service.clone().run_review_worker());
+        tokio::time::timeout(Duration::from_secs(10), page_barrier.wait())
+            .await
+            .unwrap();
+        // First raw64 have been consumed. The healthy due tail has not.
+        assert_eq!(
+            service
+                .store
+                .get_task_run(&inputs[64].1)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            pioneer_protocol::TaskRunStatus::WaitingReview
+        );
+        assert_eq!(
+            service
+                .store
+                .get_task_result_candidate(&inputs[1].2)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            pioneer_protocol::TaskResultCandidateStatus::ExtractionFailed
+        );
+        // Both changes are behind the retained Run cursor, inside the same
+        // finite pass. Lower committed APIs publish the invalidation themselves.
+        for index in [0usize, 1] {
+            service
+                .store
+                .update_task_result_candidate_resolution(
+                    &inputs[index].2,
+                    pioneer_protocol::TaskResultCandidateStatus::Cancelled,
+                    None,
+                    Some(now),
+                    now,
+                )
+                .await
+                .unwrap();
+        }
+        let mut replacement = service
+            .store
+            .get_task_result_candidate(&inputs[1].2)
+            .await
+            .unwrap()
+            .unwrap();
+        let result = service
+            .store
+            .get_task_result_candidate(&inputs[64].2)
+            .await
+            .unwrap()
+            .unwrap()
+            .result;
+        let mut turn = service
+            .store
+            .list_task_run_turns(&inputs[1].1)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|turn| turn.id == replacement.task_run_turn_id)
+            .unwrap();
+        turn.id = format!("replacement_turn_{}", inputs[1].1);
+        turn.turn_id = format!("replacement_child_{}", inputs[1].1);
+        turn.kind = pioneer_protocol::TaskRunTurnKind::Revision;
+        turn.round = 1;
+        turn.sequence = 1;
+        turn.status = pioneer_protocol::TaskRunTurnStatus::InProgress;
+        turn.requested_by_candidate_id = Some(replacement.id.clone());
+        turn.created_at = now - 4;
+        turn.started_at = Some(now - 4);
+        turn.completed_at = None;
+        let event = service
+            .append_event(
+                pioneer_protocol::TaskEventPayload::TaskRunTurnStarted {
+                    task_run_turn: turn.clone(),
+                },
+                now - 4,
+            )
+            .await
+            .unwrap();
+        service.publish_and_wake(vec![event]).await;
+        replacement.id = format!("replacement_candidate_{}", inputs[1].1);
+        replacement.task_run_turn_id = turn.id.clone();
+        replacement.turn_id = turn.turn_id.clone();
+        replacement.round = 1;
+        replacement.status = pioneer_protocol::TaskResultCandidateStatus::PendingReview;
+        replacement.result = result.map(|mut result| {
+            result.completed_by_run_id = Some(inputs[1].1.clone());
+            result
+        });
+        replacement.extraction_error = None;
+        replacement.created_at = now - 3;
+        replacement.updated_at = now;
+        replacement.resolved_at = None;
+        replacement.final_review_event_id = None;
+        turn.status = pioneer_protocol::TaskRunTurnStatus::CandidateCreated;
+        turn.completed_at = Some(now - 3);
+        let handle = crate::TaskExecutionHandle::new(
+            service.store.clone(),
+            runtime.event_bus(),
+            inputs[1].0.clone(),
+            inputs[1].1.clone(),
+        );
+        handle
+            .record_pending_review_result_candidate(turn, replacement.clone(), now)
+            .await
+            .unwrap();
+        // No kick or foreground auto-accept after changing the old keys.
+        page_barrier.wait().await;
+        tokio::time::timeout(Duration::from_secs(10), settled.wait())
+            .await
+            .unwrap();
+        assert_eq!(
+            service
+                .store
+                .get_task_run(&inputs[64].1)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            pioneer_protocol::TaskRunStatus::Succeeded,
+            "healthy old tail finishes"
+        );
+        assert_eq!(
+            service
+                .store
+                .get_task_run(&inputs[1].1)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            pioneer_protocol::TaskRunStatus::Succeeded,
+            "new round behind cursor is rescanned"
+        );
+        assert_eq!(
+            service
+                .store
+                .get_task_result_candidate(&replacement.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            pioneer_protocol::TaskResultCandidateStatus::Accepted
+        );
+        for index in [0usize, 1] {
+            assert_eq!(
+                service
+                    .store
+                    .get_task_result_candidate(&inputs[index].2)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                pioneer_protocol::TaskResultCandidateStatus::Cancelled
+            );
+        }
+        assert_eq!(
+            service.store.next_task_review_timeout(3).await.unwrap(),
+            Some(now + 105)
+        );
+        // Each phase gets its own rendezvous; an old Notify permit cannot
+        // stand in for completion of a later reconstruction.
+        let final_settled = Arc::new(tokio::sync::Barrier::new(2));
+        *service.review_settled_barrier.lock().unwrap() = Some(final_settled.clone());
+        let reads = observer.reads.load(Ordering::SeqCst);
+        let writes = observer.writes.load(Ordering::SeqCst);
+        tokio::time::pause();
+        let hold = tokio::spawn(async {
+            loop {
+                tokio::task::yield_now().await;
+            }
+        });
+        settled.wait().await;
+        tokio::time::advance(Duration::from_secs(60)).await;
+        for _ in 0..128 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(observer.reads.load(Ordering::SeqCst), reads);
+        assert_eq!(observer.writes.load(Ordering::SeqCst), writes);
+        // Genuine expiry through the same clock as both eligibility and wait.
+        wake.set_wall_clock_for_test(
+            std::time::UNIX_EPOCH + Duration::from_secs((now + 200) as u64),
+        );
+        tokio::time::advance(Duration::from_secs(200)).await;
+        tokio::time::timeout(Duration::from_secs(10), final_settled.wait())
+            .await
+            .unwrap();
+        for (_, run, candidate) in inputs.iter().skip(2) {
+            assert_eq!(
+                service
+                    .store
+                    .get_task_run(run)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                pioneer_protocol::TaskRunStatus::Succeeded
+            );
+            assert_eq!(
+                service
+                    .store
+                    .get_task_result_candidate(candidate)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                pioneer_protocol::TaskResultCandidateStatus::Accepted
+            );
+        }
+        final_settled.wait().await;
+        let reads = observer.reads.load(Ordering::SeqCst);
+        let writes = observer.writes.load(Ordering::SeqCst);
+        tokio::time::advance(Duration::from_secs(300)).await;
+        for _ in 0..128 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            observer.reads.load(Ordering::SeqCst),
+            reads,
+            "all settled reviews park quietly"
+        );
+        assert_eq!(observer.writes.load(Ordering::SeqCst), writes);
+        hold.abort();
+        worker.abort();
+        let _ = worker.await;
+    }
+
+    #[tokio::test]
+    async fn review_owner_has_no_empty_poll_and_accepts_its_real_deadline_without_a_client() {
+        use super::{TaskReviewRuntimeConfig, TaskRuntimeConfig};
+        use migration::Migrator;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+        #[derive(Default)]
+        struct Observer {
+            reads: AtomicUsize,
+            writes: AtomicUsize,
+        }
+        impl pioneer_sqlite::SqliteReadObserver for Observer {
+            fn observe(&self, event: pioneer_sqlite::SqliteReadEvent) {
+                if let pioneer_sqlite::SqliteReadEvent::OperationFinished { class, .. } = event {
+                    assert_eq!(class, SqliteReadClass::Maintenance);
+                    self.reads.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        }
+        impl pioneer_sqlite::SqliteWriteObserver for Observer {
+            fn observe(&self, event: pioneer_sqlite::SqliteWriteEvent) {
+                if let pioneer_sqlite::SqliteWriteEvent::Acquired { .. } = event {
+                    self.writes.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("review.sqlite");
+        let mut options =
+            sea_orm::ConnectOptions::new(pioneer_sqlite::sqlite_connection_url(&path));
+        options.max_connections(1);
+        let writer = Database::connect(options).await.unwrap();
+        let executor = pioneer_sqlite::SqliteWriteExecutor::new(writer.clone());
+        executor
+            .apply_pragmas(SqliteWriteClass::Maintenance)
+            .await
+            .unwrap();
+        executor
+            .run_migrations::<Migrator>(SqliteWriteClass::Maintenance, None)
+            .await
+            .unwrap();
+        crate::tests::seed_task_test_workspace(&writer).await;
+        drop(executor);
+        let mut options =
+            sea_orm::ConnectOptions::new(pioneer_sqlite::sqlite_read_only_connection_url(&path));
+        options.map_sqlx_sqlite_opts(|options| options.read_only(true).pragma("query_only", "ON"));
+        let reader = Database::connect(options).await.unwrap();
+        let observer = Arc::new(Observer::default());
+        let database = SqliteDatabase::from_executor_with_read_observer(
+            reader,
+            pioneer_sqlite::SqliteWriteExecutor::with_observer(writer, observer.clone()),
+            observer.clone(),
+        );
+        let runtime = TaskRuntime::new_with_config(
+            Arc::new(CrudStore::new(database.clone())),
+            TaskRuntimeConfig {
+                review: TaskReviewRuntimeConfig {
+                    enabled: true,
+                    allow_task_create_review_policy: true,
+                    default_parent_review_for_immediate_attached_agent_tasks: false,
+                    default_max_revision_rounds: 2,
+                    auto_accept_after_seconds: 3,
+                },
+            },
+        );
+        let service = runtime.maintenance_service();
+        let bootstrap = Arc::new(tokio::sync::Barrier::new(2));
+        *service.review_settled_barrier.lock().unwrap() = Some(bootstrap.clone());
+        let worker = tokio::spawn(service.clone().run_review_worker());
+        tokio::time::timeout(Duration::from_secs(10), bootstrap.wait())
+            .await
+            .unwrap();
+        assert_eq!(
+            observer.reads.load(Ordering::SeqCst),
+            1,
+            "empty raw Run upper is the sole query before settled Dormant"
+        );
+        bootstrap.wait().await;
+        tokio::time::pause();
+        let empty_reads = observer.reads.load(Ordering::SeqCst);
+        tokio::time::advance(Duration::from_secs(300)).await;
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(observer.reads.load(Ordering::SeqCst), empty_reads);
+        assert_eq!(observer.writes.load(Ordering::SeqCst), 0);
+        tokio::time::resume();
+        // Use maintenance for fixture requests too so every observed read has
+        // the production background class. No TaskRuntime.start/fallback runs.
+        let runtime = TaskRuntime::new_with_config(
+            Arc::new(CrudStore::new(database.maintenance())),
+            service.config.clone(),
+        );
+        let (_, run_id, candidate_id) = crate::tests::create_waiting_review_agent_task(
+            &runtime,
+            2,
+            0,
+            pioneer_protocol::TaskResultCandidateStatus::PendingReview,
+        )
+        .await;
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            service.review_deadline_observed.notified(),
+        )
+        .await
+        .unwrap();
+        // This follows an observed future-deadline publication, not a manual
+        // maintenance pass, client kick or fallback tick. The short real wall
+        // deadline keeps the test independent of frozen Tokio vs UTC clocks.
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            service.review_accepted_and_settled.notified(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            service
+                .store
+                .get_task_result_candidate(&candidate_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            pioneer_protocol::TaskResultCandidateStatus::Accepted
+        );
+        assert_eq!(
+            service
+                .store
+                .get_task_run(&run_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            pioneer_protocol::TaskRunStatus::Succeeded
+        );
+        let settled_reads = observer.reads.load(Ordering::SeqCst);
+        let settled_writes = observer.writes.load(Ordering::SeqCst);
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(300)).await;
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(observer.reads.load(Ordering::SeqCst), settled_reads);
+        assert_eq!(observer.writes.load(Ordering::SeqCst), settled_writes);
+        worker.abort();
+        let _ = worker.await;
+    }
+
     #[test]
     fn page_size_target_never_hides_a_single_logical_record() {
         let response = serde_json::json!({ "items": [{ "payload": "x".repeat(4096) }] });
@@ -6742,6 +7858,504 @@ mod resource_policy_tests {
             let database = service.store().database_connection();
             assert_eq!(database.read_class(), expected_read);
             assert_eq!(database.write_class(), expected_write);
+        }
+    }
+}
+
+#[cfg(test)]
+mod background_lifecycle_tests {
+    use super::*;
+    use crate::tests::{CompletingSystemExecutor, DispatchDatabaseObserver, create_params};
+    use pioneer_protocol::{TaskResultCandidateStatus, TaskTriggerSpec};
+    use pioneer_sqlite::{SqliteDatabase, SqliteReadClass, SqliteWriteClass};
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, sea_query::Expr};
+    use tokio::sync::Barrier;
+
+    async fn pooled_database() -> (
+        tempfile::TempDir,
+        SqliteDatabase,
+        Arc<DispatchDatabaseObserver>,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("background-lifecycle.sqlite");
+        let mut options =
+            sea_orm::ConnectOptions::new(pioneer_sqlite::sqlite_connection_url(&path));
+        options.max_connections(1);
+        let writer = sea_orm::Database::connect(options).await.unwrap();
+        let executor = pioneer_sqlite::SqliteWriteExecutor::new(writer.clone());
+        executor
+            .apply_pragmas(SqliteWriteClass::Maintenance)
+            .await
+            .unwrap();
+        executor
+            .run_migrations::<migration::Migrator>(SqliteWriteClass::Maintenance, None)
+            .await
+            .unwrap();
+        crate::tests::seed_task_test_workspace(&writer).await;
+        drop(executor);
+        let mut options =
+            sea_orm::ConnectOptions::new(pioneer_sqlite::sqlite_read_only_connection_url(&path));
+        options
+            .max_connections(2)
+            .map_sqlx_sqlite_opts(|options| options.read_only(true).pragma("query_only", "ON"));
+        let reader = sea_orm::Database::connect(options).await.unwrap();
+        let observer = Arc::new(DispatchDatabaseObserver::default());
+        let database = SqliteDatabase::from_executor_with_read_observer(
+            reader,
+            pioneer_sqlite::SqliteWriteExecutor::with_observer(writer, observer.clone()),
+            observer.clone(),
+        );
+        (directory, database, observer)
+    }
+
+    fn facade(database: &SqliteDatabase) -> TaskRuntime {
+        TaskRuntime::new_with_config(
+            Arc::new(CrudStore::new(database.maintenance())),
+            TaskRuntimeConfig {
+                review: TaskReviewRuntimeConfig {
+                    enabled: true,
+                    allow_task_create_review_policy: true,
+                    auto_accept_after_seconds: 3600,
+                    ..Default::default()
+                },
+            },
+        )
+    }
+
+    fn sql_count(observer: &DispatchDatabaseObserver) -> (usize, usize) {
+        (
+            observer.reads.lock().unwrap().len(),
+            observer.writes.lock().unwrap().len(),
+        )
+    }
+
+    fn clock(store: &CrudStore, now: i64) {
+        for name in ["tasks.scheduler", "tasks.live", "tasks.review"] {
+            store.background_work(name).set_wall_clock_for_test(
+                std::time::UNIX_EPOCH + Duration::from_secs(now.try_into().unwrap()),
+            );
+        }
+    }
+
+    async fn succeeded(store: &CrudStore, task: &str) {
+        timeout(Duration::from_secs(10), async {
+            loop {
+                let row = store.get_task(task).await.unwrap().unwrap();
+                if !row.runs.is_empty()
+                    && row
+                        .runs
+                        .iter()
+                        .all(|run| run.status == TaskRunStatus::Succeeded)
+                {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn physical_runtime_refuses_competing_start_and_releases_for_real_future_work() {
+        // One primary lifecycle matrix; no second writable executor, sibling
+        // rescue, manual dispatch after the deadline, or fake acceptance result.
+        for ending in [
+            "shutdown",
+            "drop",
+            "cancel_start",
+            "shutdown_start",
+            "cancel_shutdown",
+            "fatal_start",
+            "partial_start",
+        ] {
+            let (_directory, database, observer) = pooled_database().await;
+            let a = Arc::new(facade(&database));
+            a.register_executor(Arc::new(CompletingSystemExecutor))
+                .await;
+            a.maintenance_service()
+                .create_task(
+                    TaskCreateContext::default(),
+                    create_params(TaskTriggerSpec::Manual {
+                        allowed_actor: None,
+                    }),
+                )
+                .await
+                .unwrap();
+            let store = a.maintenance_service().store();
+            let db = store.database_connection();
+            let mut repair_trigger = None;
+            let mut repair_run = None;
+            if ending == "partial_start" {
+                let task = a
+                    .maintenance_service()
+                    .create_task(
+                        TaskCreateContext::default(),
+                        create_params(TaskTriggerSpec::ScheduledAt {
+                            scheduled_at: now_timestamp_secs() + 86_400,
+                            timezone: None,
+                            catch_up_policy: None,
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                let row = pioneer_entity::task_trigger::Entity::find_by_id(&task.trigger.id)
+                    .one(&db)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                pioneer_entity::task_trigger::Entity::update_many()
+                    .filter(pioneer_entity::task_trigger::Column::Id.eq(&row.id))
+                    .col_expr(
+                        pioneer_entity::task_trigger::Column::SpecJson,
+                        Expr::val("{"),
+                    )
+                    .exec(&db)
+                    .await
+                    .unwrap();
+                repair_trigger = Some(row);
+            }
+            if ending == "fatal_start" {
+                let task = a
+                    .maintenance_service()
+                    .create_task(
+                        TaskCreateContext::default(),
+                        create_params(TaskTriggerSpec::Immediate),
+                    )
+                    .await
+                    .unwrap();
+                a.process_due_once(now_timestamp_secs()).await.unwrap();
+                let run = store
+                    .get_task_run(&task.run.unwrap().id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(run.status, TaskRunStatus::Succeeded);
+                // The startup compatibility terminal scan fails decoding this
+                // real terminal row, after independent reconciliation ran.
+                pioneer_entity::task_run::Entity::update_many()
+                    .filter(pioneer_entity::task_run::Column::Id.eq(&run.id))
+                    .col_expr(
+                        pioneer_entity::task_run::Column::UpdatedAt,
+                        Expr::val("malformed-date"),
+                    )
+                    .exec(&db)
+                    .await
+                    .unwrap();
+                repair_run = Some(run);
+            }
+            let admission = Arc::new(Barrier::new(2));
+            *a.startup_barrier.lock().unwrap() = Some(admission.clone());
+            let stopping_owner = Arc::new(Barrier::new(2));
+            if ending == "cancel_shutdown" {
+                *a.maintenance_service.review_settled_barrier.lock().unwrap() =
+                    Some(stopping_owner.clone());
+            }
+            let rebuilding = Arc::new(Barrier::new(2));
+            if matches!(ending, "cancel_start" | "shutdown_start") {
+                a.reconciler.pause_pass_for_test(rebuilding.clone());
+            }
+            let starting = tokio::spawn({
+                let a = a.clone();
+                async move { a.start().await }
+            });
+            timeout(Duration::from_secs(10), admission.wait())
+                .await
+                .unwrap();
+            let b = facade(&database);
+            let before = sql_count(&observer);
+            let error = b.start().await.unwrap_err();
+            assert!(
+                error.to_string().contains("already started"),
+                "{ending}: {error:#}"
+            );
+            assert_eq!(
+                sql_count(&observer),
+                before,
+                "refusal precedes any reconstruction/SQL"
+            );
+            b.shutdown().await;
+            assert!(
+                b.start().await.is_err(),
+                "closed rejected facade cannot start late"
+            );
+            admission.wait().await;
+            let mut retained_runtime = None;
+            if matches!(ending, "cancel_start" | "shutdown_start") {
+                timeout(Duration::from_secs(10), rebuilding.wait())
+                    .await
+                    .unwrap();
+                // Cancellation is inside the real retained RecoveryPass,
+                // after its bounded DB work, not just before the first read.
+                if ending == "cancel_start" {
+                    starting.abort();
+                    assert!(starting.await.unwrap_err().is_cancelled());
+                    // Keep the failed starter alive and open. Cleanup must not
+                    // mask admission retained by a cancelled reconstruction.
+                    retained_runtime = Some(a);
+                } else {
+                    a.shutdown().await;
+                    assert!(starting.await.unwrap().is_err());
+                    assert!(a.start().await.is_err());
+                    drop(a);
+                }
+            } else {
+                let outcome = starting.await.unwrap();
+                if ending == "fatal_start" {
+                    let error = outcome.unwrap_err();
+                    assert!(error.downcast_ref::<crate::PartialTaskStartup>().is_none());
+                } else if ending == "partial_start" {
+                    assert!(
+                        outcome
+                            .unwrap_err()
+                            .downcast_ref::<crate::PartialTaskStartup>()
+                            .is_some()
+                    );
+                    let rejected = facade(&database);
+                    assert!(
+                        rejected
+                            .start()
+                            .await
+                            .unwrap_err()
+                            .to_string()
+                            .contains("already started")
+                    );
+                    rejected.shutdown().await;
+                } else {
+                    outcome.unwrap();
+                    if ending == "cancel_shutdown" {
+                        timeout(Duration::from_secs(10), stopping_owner.wait())
+                            .await
+                            .unwrap();
+                    }
+                    a.start().await.unwrap(); // same open facade remains idempotent
+                    let task = a
+                        .maintenance_service()
+                        .create_task(
+                            TaskCreateContext::default(),
+                            create_params(TaskTriggerSpec::Immediate),
+                        )
+                        .await
+                        .unwrap();
+                    succeeded(&store, &task.task.id).await;
+                }
+                if let Some(row) = repair_trigger {
+                    pioneer_entity::task_trigger::Entity::update_many()
+                        .filter(pioneer_entity::task_trigger::Column::Id.eq(&row.id))
+                        .col_expr(
+                            pioneer_entity::task_trigger::Column::SpecJson,
+                            Expr::val(row.spec_json),
+                        )
+                        // Remove this fixture's unrelated next-day obligation.
+                        .col_expr(
+                            pioneer_entity::task_trigger::Column::Status,
+                            Expr::val("paused"),
+                        )
+                        .exec(&db)
+                        .await
+                        .unwrap();
+                }
+                if let Some(run) = repair_run {
+                    pioneer_entity::task_run::Entity::update_many()
+                        .filter(pioneer_entity::task_run::Column::Id.eq(&run.id))
+                        .col_expr(
+                            pioneer_entity::task_run::Column::UpdatedAt,
+                            Expr::val(pioneer_crud::unix_to_datetime(run.updated_at)),
+                        )
+                        .exec(&db)
+                        .await
+                        .unwrap();
+                }
+                if ending == "fatal_start" {
+                    // A fatal startup must release admission before any
+                    // shutdown/Drop of the unsuccessful, still-open facade.
+                    retained_runtime = Some(a);
+                } else if ending == "cancel_shutdown" {
+                    // Poll through abort requests to the first unjoined task.
+                    // Dropping shutdown must retain handles for later joining,
+                    // but the closed facade must not retain a strong lease.
+                    let mut stopping = Box::pin(tokio::task::unconstrained(a.shutdown()));
+                    std::future::poll_fn(|cx| {
+                        assert!(std::future::Future::poll(stopping.as_mut(), cx).is_pending());
+                        std::task::Poll::Ready(())
+                    })
+                    .await;
+                    drop(stopping);
+                    assert!(a.start().await.is_err());
+                    retained_runtime = Some(a);
+                } else if ending == "drop" {
+                    // This current-thread test polls the contender before the
+                    // aborted owner futures can unwind. Arc-held admission
+                    // must outlive Drop's abort requests and Wake ownership.
+                    drop(a);
+                    let c = facade(&database);
+                    assert!(
+                        tokio::task::unconstrained(c.start())
+                            .await
+                            .unwrap_err()
+                            .to_string()
+                            .contains("already started")
+                    );
+                    c.shutdown().await;
+                } else {
+                    a.shutdown().await;
+                    assert!(a.start().await.is_err());
+                    drop(a);
+                }
+            }
+            // Wait for physical worker release after Drop using the actual
+            // Wake leases (no SQL and no repeated foreground startup attempts).
+            timeout(Duration::from_secs(10), async {
+                while ["tasks.scheduler", "tasks.live", "tasks.review"]
+                    .iter()
+                    .any(|name| store.background_work(name).has_owner())
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let c = facade(&database);
+            let (_, review_run, candidate) = crate::tests::create_waiting_review_agent_task(
+                &c,
+                2,
+                0,
+                TaskResultCandidateStatus::PendingReview,
+            )
+            .await;
+            let at = now_timestamp_secs();
+            let scheduled = c
+                .maintenance_service()
+                .create_task(
+                    TaskCreateContext::default(),
+                    create_params(TaskTriggerSpec::ScheduledAt {
+                        scheduled_at: at + 3600,
+                        timezone: Some("UTC".into()),
+                        catch_up_policy: None,
+                    }),
+                )
+                .await
+                .unwrap();
+            clock(&store, at);
+            c.start().await.unwrap();
+            timeout(
+                Duration::from_secs(10),
+                c.scheduler.future_observed.notified(),
+            )
+            .await
+            .unwrap();
+            timeout(
+                Duration::from_secs(10),
+                c.maintenance_service.review_deadline_observed.notified(),
+            )
+            .await
+            .unwrap();
+            if let Some(retained) = retained_runtime.take() {
+                // C is already started and owns future obligations. Closing
+                // the failed/cancelled A must not stop C or close shared Wake.
+                retained.shutdown().await;
+                assert!(retained.start().await.is_err());
+            }
+            for name in ["tasks.scheduler", "tasks.live", "tasks.review"] {
+                assert!(store.background_work(name).has_owner());
+                assert!(
+                    store.background_work(name).acquire().is_none(),
+                    "single {name} owner"
+                );
+            }
+            let expiry = store
+                .get_task_result_candidate(&candidate)
+                .await
+                .unwrap()
+                .unwrap()
+                .created_at
+                + 3600;
+            tokio::time::pause();
+            let hold_clock = tokio::spawn(async {
+                loop {
+                    tokio::task::yield_now().await;
+                }
+            });
+            clock(&store, expiry.max(at + 3600) + 1);
+            tokio::time::advance(Duration::from_secs(30)).await;
+            tokio::time::resume();
+            hold_clock.abort();
+            let _ = hold_clock.await;
+            succeeded(&store, &scheduled.task.id).await;
+            timeout(
+                Duration::from_secs(10),
+                c.maintenance_service.review_accepted_and_settled.notified(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                store
+                    .get_task_result_candidate(&candidate)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                TaskResultCandidateStatus::Accepted
+            );
+            assert_eq!(
+                store
+                    .get_task_run(&review_run)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                TaskRunStatus::Succeeded
+            );
+            timeout(Duration::from_secs(10), c.scheduler.parked.notified())
+                .await
+                .unwrap();
+            timeout(
+                Duration::from_secs(10),
+                c.reconciler.parked_for_test().notified(),
+            )
+            .await
+            .unwrap();
+            // Let final coalesced invalidations settle, then observe two full
+            // virtual quiet windows through the real reader/writer observers.
+            tokio::time::pause();
+            let hold_clock = tokio::spawn(async {
+                loop {
+                    tokio::task::yield_now().await;
+                }
+            });
+            let mut quiet = 0;
+            for _ in 0..16 {
+                let before = sql_count(&observer);
+                tokio::time::advance(Duration::from_secs(300)).await;
+                for _ in 0..128 {
+                    tokio::task::yield_now().await;
+                }
+                if sql_count(&observer) == before {
+                    quiet += 1;
+                } else {
+                    quiet = 0;
+                }
+                if quiet == 2 {
+                    break;
+                }
+            }
+            assert_eq!(quiet, 2, "{ending}: settled workers must not poll Empty");
+            assert!(
+                observer
+                    .reads
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|class| *class == SqliteReadClass::Maintenance)
+            );
+            c.shutdown().await;
+            assert!(c.start().await.is_err());
+            for name in ["tasks.scheduler", "tasks.live", "tasks.review"] {
+                assert!(!store.background_work(name).has_owner());
+            }
+            hold_clock.abort();
+            let _ = hold_clock.await;
+            tokio::time::resume();
         }
     }
 }

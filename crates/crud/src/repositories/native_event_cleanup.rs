@@ -111,6 +111,10 @@ pub(crate) async fn run(db: &SqliteDatabase, now: i64) -> Result<NativeEventClea
         metrics.prepare_elapsed_us = elapsed_us(started);
         return Ok(metrics);
     };
+    let change = db
+        .shared_resource::<pioneer_sqlite::background::Registry>()
+        .owner("storage.native_events")
+        .changing();
     metrics.jobs_examined = 1;
     metrics.prepare_reads += 1;
     let rows = match candidates(db, &job.turn_id, None).await {
@@ -120,6 +124,7 @@ pub(crate) async fn run(db: &SqliteDatabase, now: i64) -> Result<NativeEventClea
             let started = Instant::now();
             defer(db, &job.turn_id, now, "prepare_failed", &mut metrics).await?;
             metrics.apply_elapsed_us = elapsed_us(started);
+            change.finish(metrics.queue_rows_changed > 0);
             return Ok(metrics);
         }
     };
@@ -144,6 +149,7 @@ pub(crate) async fn run(db: &SqliteDatabase, now: i64) -> Result<NativeEventClea
         defer(db, &prepared.job.turn_id, now, "apply_failed", &mut metrics).await?;
     }
     metrics.apply_elapsed_us = elapsed_us(started);
+    change.finish(metrics.queue_rows_changed > 0);
     Ok(metrics)
 }
 async fn defer(
@@ -253,6 +259,52 @@ struct BootstrapRow {
     turn_id: Option<String>,
     eligible: bool,
 }
+/// Unix MICROSECONDS, matching the queue's authoritative retry/due lanes.
+/// Waiting jobs need a dependency release and are excluded from this clock.
+pub(crate) async fn next_deadline<C: ConnectionTrait>(db: &C) -> Result<Option<i64>> {
+    // Literal lane predicates match the existing partial indexes. Each head
+    // visits an index prefix, never the waiting dependency population.
+    let queued = || Expr::col(job::Column::State).eq(Expr::Constant("queued".into()));
+    let zero = || Expr::col(job::Column::AvailableAt).eq(Expr::Constant(0_i64.into()));
+    let mut nearest = None;
+    for served in [false, true] {
+        let lane = if served {
+            Expr::col(job::Column::LastServedAt).gt(Expr::Constant(0_i64.into()))
+        } else {
+            Expr::col(job::Column::LastServedAt).eq(Expr::Constant(0_i64.into()))
+        };
+        let query = job::Entity::find()
+            .select_only()
+            .column(job::Column::AvailableAt)
+            .filter(queued())
+            .filter(zero())
+            .filter(lane);
+        let query = if served {
+            query
+                .order_by_asc(job::Column::LastServedAt)
+                .order_by_asc(job::Column::TurnId)
+        } else {
+            query.order_by_asc(job::Column::TurnId)
+        };
+        nearest = nearest
+            .into_iter()
+            .chain(query.limit(1).into_tuple::<i64>().one(db).await?)
+            .min();
+    }
+    let retry = job::Entity::find()
+        .select_only()
+        .column(job::Column::AvailableAt)
+        .filter(queued())
+        .filter(Expr::col(job::Column::AvailableAt).gt(Expr::Constant(0_i64.into())))
+        .order_by_asc(job::Column::AvailableAt)
+        .order_by_asc(job::Column::TurnId)
+        .limit(1)
+        .into_tuple::<i64>()
+        .one(db)
+        .await?;
+    Ok(nearest.into_iter().chain(retry).min())
+}
+
 pub(crate) async fn bootstrap(db: &SqliteDatabase) -> Result<NativeEventCleanupBootstrap> {
     let state = bootstrap_state::Entity::find_by_id(1_i64)
         .one(db)
@@ -284,6 +336,10 @@ pub(crate) async fn bootstrap(db: &SqliteDatabase) -> Result<NativeEventCleanupB
         complete: rows.is_empty(),
         ..Default::default()
     };
+    let change = db
+        .shared_resource::<pioneer_sqlite::background::Registry>()
+        .owner("storage.native_events")
+        .changing();
     let tx = db.begin().await?;
     // CAS prevents an overlapping bootstrap caller from moving the cursor back.
     let cursor = match state.cursor_id.as_deref() {
@@ -307,6 +363,7 @@ pub(crate) async fn bootstrap(db: &SqliteDatabase) -> Result<NativeEventCleanupB
         .rows_affected;
     if updated == 0 {
         tx.rollback().await?;
+        change.finish(false);
         return Ok(NativeEventCleanupBootstrap::default());
     }
     for turn in turns {
@@ -324,6 +381,7 @@ pub(crate) async fn bootstrap(db: &SqliteDatabase) -> Result<NativeEventCleanupB
         .await?;
     }
     tx.commit().await?;
+    change.finish(true);
     Ok(result)
 }
 #[cfg(test)]

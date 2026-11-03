@@ -14,11 +14,13 @@ use pioneer_keystore::{
     DbKeyStoreConfig, SecretEntryMeta, SecretKind, inspect_keystore_sqlite_files,
     inspect_private_runtime_dir,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 pub use pioneer_keystore::{SecretPermissionHealthReport, SecretPermissionHealthStatus};
 
-use crate::database::{gateway_database_path, initialize_existing_for_operations};
+use crate::database::{
+    gateway_database_path, initialize_existing_for_inspection, initialize_existing_for_operations,
+};
 use crate::mcp_secrets::garbage_collection_orphan_mcp_secrets;
 use crate::secrets::GatewaySecrets;
 
@@ -66,7 +68,7 @@ pub struct McpSecretOrphanStatusReport {
     pub unavailable_reason: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct McpSecretGarbageCollectionReport {
     pub oauth_stored: usize,
     pub oauth_orphans: usize,
@@ -79,10 +81,53 @@ pub struct McpSecretGarbageCollectionReport {
     pub failed_deletes: Vec<McpSecretGarbageCollectionFailure>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct McpSecretGarbageCollectionFailure {
     pub ref_id: String,
     pub error: String,
+}
+
+/// Offline scopes explicitly close pools on success/error. Cancellation hands
+/// only pool shutdown to a cleanup task; it cannot perform new business writes.
+/// The native ownership lease remains attached until rollback/close completes.
+pub(crate) struct OperationDatabase(
+    Option<pioneer_sqlite::SqliteDatabase>,
+    Option<tokio::runtime::Handle>,
+);
+impl OperationDatabase {
+    pub(crate) fn new(database: pioneer_sqlite::SqliteDatabase) -> Self {
+        Self(Some(database), tokio::runtime::Handle::try_current().ok())
+    }
+    pub(crate) async fn close(mut self) -> Result<()> {
+        // Keep our copy until close finishes: cancellation must still schedule
+        // closure, even after the first close future was dropped.
+        self.0.as_ref().unwrap().clone().close().await?;
+        self.0.take();
+        Ok(())
+    }
+}
+impl Drop for OperationDatabase {
+    fn drop(&mut self) {
+        if let Some(database) = self.0.take() {
+            if let Some(runtime) = self
+                .1
+                .take()
+                .or_else(|| tokio::runtime::Handle::try_current().ok())
+            {
+                runtime.spawn(async move {
+                    if database.close().await.is_err() {
+                        tracing::warn!(
+                            reason = "database_close_error",
+                            "offline operation database close failed"
+                        );
+                    }
+                });
+            }
+            // If the runtime has already gone, dropping the final executor
+            // still closes admission synchronously and its native references
+            // retain the lease. Never panic or force-unlock from Drop.
+        }
+    }
 }
 
 pub async fn secrets_status(
@@ -99,12 +144,14 @@ pub async fn secrets_status(
     permissions.push(inspect_private_runtime_dir(runtime_home));
     permissions.extend(inspect_keystore_sqlite_files(storage_path.as_path()));
 
-    let mcp_orphans = match initialize_existing_for_operations(runtime_home, config).await? {
+    let mcp_orphans = match initialize_existing_for_inspection(runtime_home, config).await? {
         Some(database) => {
+            let closing = OperationDatabase::new(database.clone());
             let crud_store = CrudStore::new(database);
-            let report = garbage_collection_orphan_mcp_secrets(&crud_store, &gateway_secrets, true)
-                .await
-                .context("failed to compute MCP orphan secret status")?;
+            let report =
+                garbage_collection_orphan_mcp_secrets(&crud_store, &gateway_secrets, true).await;
+            closing.close().await?;
+            let report = report.context("failed to compute MCP orphan secret status")?;
 
             McpSecretOrphanStatusReport {
                 available: true,
@@ -143,17 +190,50 @@ pub async fn secrets_garbage_collection(
     runtime_home: &Path,
     dry_run: bool,
 ) -> Result<McpSecretGarbageCollectionReport> {
+    if !dry_run {
+        let id = pioneer_protocol::RequestId::new(pioneer_protocol::generate_id(
+            pioneer_protocol::REQUEST_ID_LEN,
+        ))?;
+        if let Some(report) = crate::local_operations::try_online(
+            config,
+            runtime_home,
+            id,
+            crate::local_operations::Action::SecretsGc,
+        )
+        .await?
+        {
+            return Ok(report);
+        }
+    }
     let gateway_db_path = gateway_database_path(runtime_home, config)?;
-    let Some(database) = initialize_existing_for_operations(runtime_home, config).await? else {
+    let database = if dry_run {
+        initialize_existing_for_inspection(runtime_home, config).await?
+    } else {
+        initialize_existing_for_operations(runtime_home, config).await?
+    };
+    let Some(database) = database else {
         bail!(
             "gateway database `{}` is missing; refusing to garbage collect MCP secrets",
             gateway_db_path.display()
         );
     };
 
-    let gateway_secrets = GatewaySecrets::open(runtime_home)?;
-    let crud_store = CrudStore::new(database);
-    let report = garbage_collection_orphan_mcp_secrets(&crud_store, &gateway_secrets, dry_run)
+    let closing = OperationDatabase::new(database.clone());
+    let result = async {
+        let gateway_secrets = GatewaySecrets::open(runtime_home)?;
+        secrets_gc_owned(&CrudStore::new(database), &gateway_secrets, dry_run).await
+    }
+    .await;
+    closing.close().await?;
+    result
+}
+
+pub(crate) async fn secrets_gc_owned(
+    crud_store: &CrudStore,
+    gateway_secrets: &GatewaySecrets,
+    dry_run: bool,
+) -> Result<McpSecretGarbageCollectionReport> {
+    let report = garbage_collection_orphan_mcp_secrets(crud_store, gateway_secrets, dry_run)
         .await
         .context("failed to garbage collect orphan MCP secrets")?;
 
@@ -182,11 +262,11 @@ pub async fn artifact_storage_usage(
     runtime_home: &Path,
     workspace_id: &str,
 ) -> Result<ArtifactWorkspaceUsage> {
-    let service = open_artifact_service_for_operations(config, runtime_home).await?;
-    service
-        .workspace_usage(workspace_id)
-        .await
-        .with_context(|| format!("failed to compute artifact storage usage for `{workspace_id}`"))
+    let (service, closing) =
+        open_artifact_service_for_operations(config, runtime_home, false).await?;
+    let result = service.workspace_usage(workspace_id).await;
+    closing.close().await?;
+    result.with_context(|| format!("failed to compute artifact storage usage for `{workspace_id}`"))
 }
 
 pub async fn artifact_gc_dry_run(
@@ -195,11 +275,11 @@ pub async fn artifact_gc_dry_run(
     workspace_id: &str,
     now_unix_ms: i64,
 ) -> Result<ArtifactGcPlan> {
-    let service = open_artifact_service_for_operations(config, runtime_home).await?;
-    service
-        .gc_dry_run(workspace_id, now_unix_ms)
-        .await
-        .with_context(|| format!("failed to plan artifact GC for `{workspace_id}`"))
+    let (service, closing) =
+        open_artifact_service_for_operations(config, runtime_home, false).await?;
+    let result = service.gc_dry_run(workspace_id, now_unix_ms).await;
+    closing.close().await?;
+    result.with_context(|| format!("failed to plan artifact GC for `{workspace_id}`"))
 }
 
 pub async fn artifact_gc_execute(
@@ -212,38 +292,64 @@ pub async fn artifact_gc_execute(
     if !execute {
         bail!("artifact GC execute requires execute=true; call dry-run first for visibility");
     }
-    let service = open_artifact_service_for_operations(config, runtime_home).await?;
-    service
-        .gc_execute(workspace_id, now_unix_ms)
-        .await
-        .with_context(|| format!("failed to execute artifact GC for `{workspace_id}`"))
+    let id = pioneer_protocol::RequestId::new(pioneer_protocol::generate_id(
+        pioneer_protocol::REQUEST_ID_LEN,
+    ))?;
+    if let Some(report) = crate::local_operations::try_online(
+        config,
+        runtime_home,
+        id,
+        crate::local_operations::Action::ArtifactGc {
+            workspace_id: workspace_id.to_owned(),
+            now_unix_ms,
+        },
+    )
+    .await?
+    {
+        return Ok(report);
+    }
+    let (service, closing) =
+        open_artifact_service_for_operations(config, runtime_home, true).await?;
+    let result = service.gc_execute(workspace_id, now_unix_ms).await;
+    closing.close().await?;
+    result.with_context(|| format!("failed to execute artifact GC for `{workspace_id}`"))
 }
 
 async fn open_artifact_service_for_operations(
     config: &AppConfig,
     runtime_home: &Path,
-) -> Result<ArtifactService> {
+    writable: bool,
+) -> Result<(ArtifactService, OperationDatabase)> {
     let gateway_db_path = gateway_database_path(runtime_home, config)?;
-    let Some(database) = initialize_existing_for_operations(runtime_home, config).await? else {
+    let database = if writable {
+        initialize_existing_for_operations(runtime_home, config).await?
+    } else {
+        initialize_existing_for_inspection(runtime_home, config).await?
+    };
+    let Some(database) = database else {
         bail!(
             "gateway database `{}` is missing; refusing artifact operations",
             gateway_db_path.display()
         );
     };
-    Ok(ArtifactService::new_with_policies(
-        Arc::new(CrudStore::new(database.maintenance())),
-        Arc::new(LocalArtifactBlobStore::new(runtime_home.to_path_buf())),
-        ArtifactQuotaPolicy {
-            max_file_bytes: config.gateway.artifacts.max_file_bytes,
-            max_workspace_bytes: config.gateway.artifacts.max_workspace_bytes,
-            max_files_per_workspace: config.gateway.artifacts.max_files_per_workspace,
-            warn_at_percent: config.gateway.artifacts.quota_warn_at_percent,
-        },
-        pioneer_artifacts::ArtifactGcPolicy {
-            grace_secs: config.gateway.artifacts.gc_grace_secs,
-            output_dir_ttl_secs: config.gateway.artifacts.output_dir_ttl_secs,
-            readable_copy_ttl_secs: config.gateway.artifacts.readable_copy_ttl_secs,
-        },
+    let closing = OperationDatabase::new(database.clone());
+    Ok((
+        ArtifactService::new_with_policies(
+            Arc::new(CrudStore::new(database.maintenance())),
+            Arc::new(LocalArtifactBlobStore::new(runtime_home.to_path_buf())),
+            ArtifactQuotaPolicy {
+                max_file_bytes: config.gateway.artifacts.max_file_bytes,
+                max_workspace_bytes: config.gateway.artifacts.max_workspace_bytes,
+                max_files_per_workspace: config.gateway.artifacts.max_files_per_workspace,
+                warn_at_percent: config.gateway.artifacts.quota_warn_at_percent,
+            },
+            pioneer_artifacts::ArtifactGcPolicy {
+                grace_secs: config.gateway.artifacts.gc_grace_secs,
+                output_dir_ttl_secs: config.gateway.artifacts.output_dir_ttl_secs,
+                readable_copy_ttl_secs: config.gateway.artifacts.readable_copy_ttl_secs,
+            },
+        ),
+        closing,
     ))
 }
 
@@ -491,15 +597,24 @@ mod tests {
                 .expect_err("execute flag should be required");
         assert!(format!("{explicit_error:#}").contains("execute=true"));
 
+        database
+            .close()
+            .await
+            .expect("close offline fixture writer before mutation");
         let report = artifact_gc_execute(&config, &runtime_home, "ws_ops", 200_000_000, true)
             .await
             .expect("execute artifact gc");
         assert_eq!(report.deleted_blobs, 1);
         assert_eq!(
-            crud_store
-                .count_artifact_blobs_by_workspace("ws_ops")
-                .await
-                .expect("query blobs"),
+            CrudStore::new(
+                initialize_existing_for_inspection(&runtime_home, &config)
+                    .await
+                    .unwrap()
+                    .unwrap()
+            )
+            .count_artifact_blobs_by_workspace("ws_ops")
+            .await
+            .expect("query blobs"),
             0
         );
     }
@@ -545,7 +660,7 @@ mod tests {
         let database = initialize_database(runtime_home, config)
             .await
             .expect("initialize gateway db");
-        let crud_store = CrudStore::new(database);
+        let crud_store = CrudStore::new(database.clone());
         let record = McpServerInstallationRecord {
             id: None,
             scope_kind: "workspace".to_owned(),
@@ -586,6 +701,7 @@ mod tests {
             .upsert_mcp_server_installation_with_audit(&record, &audit, 1_700_000_000)
             .await
             .expect("persist active MCP installation");
+        database.close().await.expect("close seeding writer");
     }
 
     fn test_app_config() -> AppConfig {

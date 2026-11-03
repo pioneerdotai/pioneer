@@ -1,10 +1,10 @@
 use anyhow::{Context, Result};
 use pioneer_entity::skill_upload_session;
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
-use sea_orm::sea_query::Expr;
+use sea_orm::sea_query::{Expr, Func};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, EntityTrait, IntoActiveModel,
-    QueryFilter, QueryOrder, Set,
+    QueryFilter, QueryOrder, QuerySelect, Set,
 };
 
 pub async fn insert_skill_upload_session<C: ConnectionTrait>(
@@ -88,6 +88,44 @@ pub async fn list_stale_skill_upload_sessions<C: ConnectionTrait>(
         .all(db)
         .await
         .context("failed to query stale skill upload sessions")
+}
+
+/// Raw PK traversal bounds work before status filtering, including retained
+/// terminal receipts. A decode failure retains the raw cursor and healthy tail.
+pub async fn cleanup_upper<C: ConnectionTrait>(db: &C) -> Result<Option<String>> {
+    Ok(skill_upload_session::Entity::find()
+        .select_only()
+        .expr(Func::max(Expr::col(skill_upload_session::Column::UploadId)))
+        .into_tuple::<Option<String>>()
+        .one(db)
+        .await?
+        .flatten())
+}
+pub async fn cleanup_page<C: ConnectionTrait>(
+    db: &C,
+    after: Option<&str>,
+    upper: &str,
+) -> Result<(Option<String>, Vec<Result<skill_upload_session::Model>>)> {
+    let keys = skill_upload_session::Entity::find()
+        .select_only()
+        .column(skill_upload_session::Column::UploadId)
+        .filter(skill_upload_session::Column::UploadId.gt(after.unwrap_or("")))
+        .filter(skill_upload_session::Column::UploadId.lte(upper))
+        .order_by_asc(skill_upload_session::Column::UploadId)
+        .limit(16)
+        .into_tuple::<String>()
+        .all(db)
+        .await?;
+    let after = keys.last().cloned();
+    let mut rows = Vec::with_capacity(keys.len());
+    for key in keys {
+        match find_skill_upload_session(db, &key).await {
+            Ok(Some(row)) => rows.push(Ok(row)),
+            Ok(None) => {}
+            Err(error) => rows.push(Err(error)),
+        }
+    }
+    Ok((after, rows))
 }
 
 pub async fn update_skill_upload_received_bytes<C: ConnectionTrait>(

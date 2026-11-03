@@ -1,4 +1,4 @@
-//! Review regressions. Compile only until orchestrator acceptance.
+//! Review regressions. Written only; execution requires separate acceptance and permission.
 use super::*;
 use crate::message::TaskEventFanoutSummary;
 use pioneer_crud::{TASK_EVENT_FANOUT_BYTE_BUDGET as BYTES, TaskEventFanoutOutcome};
@@ -870,4 +870,108 @@ async fn cutover_quantum_never_reads_history_and_only_delivers_post_install_even
     let progress = recv_notification_by_method(&mut rx, events::TASK_PROGRESS).await;
     assert_eq!(progress.params.unwrap()["context"]["sequence"], 2);
     assert!(rx.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn real_fanout_owner_parks_with_history_and_drains_coalesced_commits_without_bus_payload_replay()
+ {
+    let observer = Arc::new(NativeSchedulingObserver::default());
+    let (_directory, manager, store, workspace) =
+        setup_pooled_file_workspace_manager_with_observers(
+            Some(observer.clone()),
+            Some(observer.clone()),
+        )
+        .await;
+    let processor = processor_with_store(manager, store.clone());
+    let barrier = processor.recovery_due_wait_barrier.clone();
+    barrier.arm("__task_fanout_before_wait__");
+    processor.start_task_event_listener().await;
+    timeout(Duration::from_secs(10), barrier.wait_until_reached())
+        .await
+        .unwrap();
+    observer.reads.lock().unwrap().clear();
+    observer.writes.lock().unwrap().clear();
+    barrier.release();
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(300)).await;
+    for _ in 0..32 {
+        tokio::task::yield_now().await;
+    }
+    assert!(observer.reads.lock().unwrap().is_empty());
+    assert!(observer.writes.lock().unwrap().is_empty());
+    tokio::time::resume();
+
+    // No Task bus publication or MessageProcessor kick: a separately scoped
+    // CRUD producer and the existing durable fanout trigger carry the change.
+    let producer = CrudStore::new(store.database_connection().maintenance());
+    barrier.arm("__task_fanout_before_wait__");
+    producer
+        .append_task_event(
+            TaskEventPayload::TaskCreated {
+                task: fanout_test_task("coalesced-fanout", &workspace),
+            },
+            now_timestamp_secs(),
+        )
+        .await
+        .unwrap();
+    // Hold this owner's final Empty handoff; every committed business event
+    // remains durable while wake state is bounded and coalesced.
+    timeout(Duration::from_secs(10), barrier.wait_until_reached())
+        .await
+        .unwrap();
+    for n in 0..1000 {
+        producer
+            .append_task_event(
+                TaskEventPayload::Progress {
+                    task_id: "coalesced-fanout".into(),
+                    run_id: None,
+                    message: format!("event {n}"),
+                    details: None,
+                },
+                now_timestamp_secs(),
+            )
+            .await
+            .unwrap();
+    }
+    barrier.arm("__task_fanout_before_wait__");
+    barrier.release();
+    timeout(Duration::from_secs(30), barrier.wait_until_reached())
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .get_task_event_fanout_cursor("coalesced-fanout")
+            .await
+            .unwrap(),
+        Some(1001)
+    );
+    assert_eq!(
+        store
+            .get_task_events_page("coalesced-fanout", None, 1024)
+            .await
+            .unwrap()
+            .events
+            .len(),
+        1001
+    );
+    observer.reads.lock().unwrap().clear();
+    observer.writes.lock().unwrap().clear();
+    barrier.release();
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(300)).await;
+    for _ in 0..32 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        observer.reads.lock().unwrap().is_empty(),
+        "completed history does not reopen discovery"
+    );
+    assert!(
+        observer.writes.lock().unwrap().is_empty(),
+        "no self-invalidating ACK chain"
+    );
+    tokio::time::resume();
+    processor.shutdown_resilience_workers().await;
+    processor.start_task_event_listener().await;
+    assert!(store.background_work("tasks.fanout").acquire().is_some());
 }

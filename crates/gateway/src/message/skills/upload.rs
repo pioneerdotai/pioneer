@@ -54,6 +54,66 @@ fn normalize_materialized_skill_frontmatter(source_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+#[derive(Default)]
+struct SkillCleanupProgress {
+    upload_upper: Option<String>,
+    upload_after: Option<String>,
+    uploads_complete: bool,
+    workspace_after: Option<String>,
+    workspaces_complete: bool,
+    directories: Vec<SkillCleanupDirectory>,
+    roots: HashSet<PathBuf>,
+    nearest: Option<i64>,
+    retry: Option<tokio::time::Instant>,
+}
+struct SkillCleanupDirectory {
+    entries: fs::ReadDir,
+    workspace_level: bool,
+    uploads: bool,
+}
+impl SkillCleanupProgress {
+    fn deadline(&mut self, at: i64) {
+        self.nearest = Some(self.nearest.map_or(at, |old| old.min(at)));
+    }
+    fn failed(&mut self, error: anyhow::Error) {
+        warn!(error = %format!("{error:#}"), "skill cleanup quantum retained an unfinished obligation");
+        self.retry = Some(tokio::time::Instant::now() + Duration::from_secs(60));
+    }
+    fn complete(&self) -> bool {
+        self.uploads_complete && self.workspaces_complete && self.directories.is_empty()
+    }
+    fn plan(&self) -> pioneer_sqlite::background::Plan {
+        use pioneer_sqlite::background::Plan;
+        let mut plan = self.nearest.map_or(Plan::Dormant, |at| {
+            Plan::WallDeadline(pioneer_crud::unix_to_datetime(at).into())
+        });
+        if let Some(at) = self.retry {
+            plan = plan.with_monotonic_deadline(at);
+        }
+        plan
+    }
+    fn open(&mut self, path: &Path, workspace_level: bool, uploads: bool) {
+        match fs::read_dir(path) {
+            Ok(entries) => self.directories.push(SkillCleanupDirectory {
+                entries,
+                workspace_level,
+                uploads,
+            }),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => self.failed(error.into()),
+        }
+    }
+}
+/// These filesystem operations are synchronous: Drop occurs after the file
+/// operation/handle scope finishes, including cancellation between awaits.
+/// No SQL transaction/commit is inferred from this process-local source hint.
+struct SkillFilesystemChange(Arc<pioneer_sqlite::background::Wake>);
+impl Drop for SkillFilesystemChange {
+    fn drop(&mut self) {
+        self.0.dependency_released();
+    }
+}
+
 impl MessageProcessor {
     pub(crate) async fn skills_upload_start(
         &self,
@@ -96,7 +156,6 @@ impl MessageProcessor {
                 return;
             }
         };
-        self.cleanup_stale_skill_uploads(now_timestamp_secs()).await;
 
         if !matches!(params.archive_format, SkillArchiveFormat::TarGz) {
             self.send_error(
@@ -179,6 +238,8 @@ impl MessageProcessor {
         let upload_dir = workspace_upload_dir.join(upload_id.as_str());
         let payload_path = upload_dir.join("payload.tar.gz");
 
+        let _filesystem_change =
+            SkillFilesystemChange(self.crud_store.background_work("skills.uploads"));
         if let Err(error) = fs::create_dir_all(workspace_upload_dir.as_path())
             .and_then(|()| fs::create_dir(upload_dir.as_path()))
         {
@@ -844,6 +905,8 @@ impl MessageProcessor {
             ));
         }
 
+        let _filesystem_change =
+            SkillFilesystemChange(self.crud_store.background_work("skills.uploads"));
         let cleanup_root = context.materialized_root.join(request_id.as_str());
         let _ = fs::remove_dir_all(cleanup_root.as_path());
         fs::create_dir_all(cleanup_root.as_path()).map_err(|error| {
@@ -1028,207 +1091,283 @@ impl MessageProcessor {
         }
     }
 
-    pub(crate) async fn cleanup_stale_skill_uploads(&self, now: i64) {
-        let maintenance = self.scoped_with_database_class(SqliteWriteClass::Maintenance);
-        maintenance.cleanup_stale_skill_uploads_scoped(now).await;
-    }
-
-    async fn cleanup_stale_skill_uploads_scoped(&self, now: i64) {
-        let uploads = match self.crud_store.list_stale_skill_upload_sessions(now).await {
-            Ok(uploads) => uploads,
-            Err(error) => {
-                warn!(
-                    error = %format!("{error:#}"),
-                    "failed to query stale skill upload sessions"
-                );
+    pub(in crate::message) async fn run_skill_upload_cleanup_worker(
+        processor: std::sync::Weak<Self>,
+    ) {
+        use pioneer_sqlite::background::{Plan, Ready};
+        let Some(initial) = processor.upgrade() else {
+            return;
+        };
+        let Some(mut owner) = initial
+            .crud_store
+            .background_work("skills.uploads")
+            .acquire()
+        else {
+            return;
+        };
+        let cancellation = initial.cli_history_shutdown.clone();
+        drop(initial);
+        let mut progress = SkillCleanupProgress::default();
+        let mut previous = None;
+        let mut rescan = false;
+        loop {
+            let ready = tokio::select! { biased; _ = cancellation.cancelled() => return, ready = owner.ready() => ready };
+            if ready == Ready::Closed {
                 return;
             }
-        };
-
-        for upload in uploads {
-            let _guard = self
-                .acquire_skill_upload_lock(upload.upload_id.as_str())
-                .await;
-            let current = match self
-                .crud_store
-                .find_skill_upload_session(upload.upload_id.as_str())
-                .await
-            {
-                Ok(Some(current)) => current,
-                Ok(None) => continue,
-                Err(error) => {
-                    warn!(
-                        upload_id = upload.upload_id.as_str(),
-                        error = %format!("{error:#}"),
-                        "failed to re-read stale skill upload"
-                    );
-                    continue;
-                }
+            let Some(this) = processor.upgrade() else {
+                return;
             };
-            if current.expires_at_unix <= now
-                && matches!(
-                    current.status.as_str(),
-                    UPLOAD_STATUS_RECEIVING | UPLOAD_STATUS_FINALIZED
-                )
-            {
-                match self
+            let this = this.scoped_with_database_class(SqliteWriteClass::Maintenance);
+            if ready == Ready::SettlementRequired {
+                let settle_observation = owner.observe();
+                rescan = true;
+                match this
                     .crud_store
-                    .transition_skill_upload_status(
-                        current.upload_id.as_str(),
-                        &[UPLOAD_STATUS_RECEIVING, UPLOAD_STATUS_FINALIZED],
-                        UPLOAD_STATUS_EXPIRED,
-                        None,
-                        None,
-                        None,
-                        now,
-                    )
+                    .database_connection()
+                    .settle_background_change(&owner)
                     .await
                 {
-                    Ok(Some(_)) => {
-                        let _ = remove_upload_payload(&current);
-                        self.skill_upload_owners
-                            .lock()
-                            .await
-                            .remove(current.upload_id.as_str());
+                    Ok(true) => {
+                        let external = previous.is_none_or(|old| owner.producer_changed_since(old));
+                        previous = Some(settle_observation);
+                        if progress.complete() && (progress.retry.is_none() || external) {
+                            progress = SkillCleanupProgress::default();
+                            rescan = false;
+                            owner.publish(settle_observation, Plan::Runnable);
+                        } else if progress.complete() {
+                            owner.publish(settle_observation, progress.plan());
+                        }
                     }
-                    Ok(None) => {}
+                    Ok(false) => {}
                     Err(error) => {
-                        warn!(
-                            upload_id = current.upload_id.as_str(),
-                            error = %format!("{error:#}"),
-                            "failed to mark skill upload expired"
-                        );
+                        progress.failed(error.into());
+                        owner.retry_after(settle_observation, Duration::from_secs(60));
                     }
                 }
-            } else if matches!(
-                current.status.as_str(),
-                UPLOAD_STATUS_ABORTED | UPLOAD_STATUS_CONSUMED | UPLOAD_STATUS_EXPIRED
-            ) {
-                let _ = remove_upload_payload(&current);
-                self.skill_upload_owners
-                    .lock()
-                    .await
-                    .remove(current.upload_id.as_str());
-            }
-        }
-
-        self.cleanup_orphaned_upload_dirs(now).await;
-        self.cleanup_orphaned_materialized_dirs(now).await;
-    }
-
-    async fn cleanup_orphaned_upload_dirs(&self, now: i64) {
-        let contexts = self.active_skill_runtime_contexts().await;
-        let stale_before = skill_upload_stale_before(&self.tool_loop_config, now);
-        let mut roots = HashSet::new();
-        for context in contexts {
-            roots.insert(context.upload_root);
-        }
-
-        for upload_root in roots {
-            let Ok(workspace_dirs) = fs::read_dir(upload_root.as_path()) else {
                 continue;
-            };
-            for workspace_dir in workspace_dirs.flatten() {
-                let workspace_path = workspace_dir.path();
-                if !workspace_path.is_dir() {
-                    continue;
-                }
-                let Ok(upload_dirs) = fs::read_dir(workspace_path.as_path()) else {
-                    continue;
-                };
-                for upload_dir in upload_dirs.flatten() {
-                    let upload_path = upload_dir.path();
-                    if !upload_path.is_dir() {
-                        continue;
-                    }
-                    let Some(upload_id) = upload_path.file_name().and_then(|value| value.to_str())
-                    else {
-                        continue;
-                    };
-                    let should_remove =
-                        match self.crud_store.find_skill_upload_session(upload_id).await {
-                            Ok(Some(upload)) => {
-                                upload.expires_at_unix <= now
-                                    || matches!(
-                                        upload.status.as_str(),
-                                        UPLOAD_STATUS_ABORTED
-                                            | UPLOAD_STATUS_CONSUMED
-                                            | UPLOAD_STATUS_EXPIRED
-                                    )
-                            }
-                            Ok(None) => {
-                                directory_modified_at_or_before(upload_path.as_path(), stale_before)
-                            }
-                            Err(error) => {
-                                warn!(
-                                    upload_id,
-                                    error = %format!("{error:#}"),
-                                    "failed to inspect skill upload session during orphan cleanup"
-                                );
-                                false
-                            }
-                        };
-                    if should_remove {
-                        let _ = fs::remove_dir_all(upload_path);
-                    }
-                }
             }
-        }
-    }
-
-    async fn cleanup_orphaned_materialized_dirs(&self, now: i64) {
-        let contexts = self.active_skill_runtime_contexts().await;
-        let mut roots = HashSet::new();
-        for context in contexts {
-            roots.insert(context.materialized_root);
-        }
-
-        let stale_before = skill_upload_stale_before(&self.tool_loop_config, now);
-        for root in roots {
-            let Ok(entries) = fs::read_dir(root.as_path()) else {
+            let observed = owner.observe();
+            if progress.complete() {
+                progress = SkillCleanupProgress::default();
+                rescan = false;
+            } else if previous.is_some_and(|old| old != observed) {
+                rescan = true;
+            }
+            previous = Some(observed);
+            tokio::select! { biased; _ = cancellation.cancelled() => return,
+                _ = owner.scope(this.skill_cleanup_quantum(now_timestamp_secs(), &mut progress)) => {},
+            }
+            if owner.requires_settlement() {
                 continue;
+            }
+            let plan = if !progress.complete() {
+                Plan::Runnable
+            } else if progress.retry.is_none() && std::mem::take(&mut rescan) {
+                progress = SkillCleanupProgress::default();
+                Plan::Runnable
+            } else {
+                progress.plan()
             };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if !path.is_dir() {
-                    continue;
-                }
-                if directory_modified_at_or_before(path.as_path(), stale_before) {
-                    let _ = fs::remove_dir_all(path);
-                }
+            let _settled = owner.publish(observed, plan);
+            #[cfg(test)]
+            if _settled && !matches!(plan, Plan::Runnable) {
+                this.completed_history_preparation_barrier
+                    .wait_if_armed("__skill_upload_cleanup_settled__", &cancellation)
+                    .await;
+            }
+            if matches!(plan, Plan::Runnable) {
+                tokio::select! { _ = cancellation.cancelled() => return, _ = tokio::time::sleep(Duration::from_millis(10)) => {} }
             }
         }
     }
 
-    async fn active_skill_runtime_contexts(&self) -> Vec<SkillsRuntimeContext> {
-        let workspaces = match self.workspace_manager.list_workspaces().await {
-            Ok(workspaces) => workspaces,
-            Err(error) => {
-                warn!(
-                    error = %error,
-                    "failed to list workspaces for skill upload cleanup"
-                );
-                return Vec::new();
+    #[cfg(test)]
+    pub(crate) async fn cleanup_stale_skill_uploads(&self, now: i64) {
+        let maintenance = self.scoped_with_database_class(SqliteWriteClass::Maintenance);
+        let mut progress = SkillCleanupProgress::default();
+        loop {
+            maintenance.skill_cleanup_quantum(now, &mut progress).await;
+            if progress.complete() {
+                break;
             }
+            tokio::task::yield_now().await;
+        }
+    }
+
+    async fn cleanup_skill_upload_row(&self, upload_id: &str, now: i64) -> Result<Option<i64>> {
+        let _guard = self.acquire_skill_upload_lock(upload_id).await;
+        let Some(mut current) = self.crud_store.find_skill_upload_session(upload_id).await? else {
+            return Ok(None);
         };
+        if matches!(
+            current.status.as_str(),
+            UPLOAD_STATUS_RECEIVING | UPLOAD_STATUS_FINALIZED
+        ) {
+            if current.expires_at_unix > now {
+                return Ok(Some(current.expires_at_unix));
+            }
+            let Some(expired) = self
+                .crud_store
+                .transition_skill_upload_status(
+                    upload_id,
+                    &[UPLOAD_STATUS_RECEIVING, UPLOAD_STATUS_FINALIZED],
+                    UPLOAD_STATUS_EXPIRED,
+                    None,
+                    None,
+                    None,
+                    now,
+                )
+                .await?
+            else {
+                // A concurrent semantic source transition owns the next wake.
+                return Ok(None);
+            };
+            current = expired;
+        }
+        if matches!(
+            current.status.as_str(),
+            UPLOAD_STATUS_ABORTED | UPLOAD_STATUS_CONSUMED | UPLOAD_STATUS_EXPIRED
+        ) {
+            remove_upload_payload(&current)?;
+            self.skill_upload_owners.lock().await.remove(upload_id);
+        }
+        Ok(None)
+    }
 
-        workspaces
-            .into_iter()
-            .filter(|workspace| workspace.is_active)
-            .filter_map(
-                |workspace| match self.skills_runtime_context(workspace.id.as_str()) {
-                    Ok(context) => Some(context),
-                    Err(error) => {
-                        warn!(
-                            workspace_id = workspace.id.as_str(),
-                            error = %format!("{error:#}"),
-                            "failed to resolve skill upload cleanup context"
-                        );
-                        None
+    async fn skill_cleanup_quantum(&self, now: i64, progress: &mut SkillCleanupProgress) {
+        if !progress.uploads_complete {
+            let page = async {
+                if progress.upload_upper.is_none() {
+                    progress.upload_upper = self.crud_store.skill_upload_cleanup_upper().await?;
+                }
+                let Some(upper) = progress.upload_upper.as_deref() else {
+                    progress.uploads_complete = true;
+                    return Ok(());
+                };
+                let (after, rows) = self
+                    .crud_store
+                    .skill_upload_cleanup_page(progress.upload_after.as_deref(), upper)
+                    .await?;
+                progress.uploads_complete = after.is_none() || after.as_deref() == Some(upper);
+                progress.upload_after = after;
+                for row in rows {
+                    let result = async {
+                        let row = row?;
+                        self.cleanup_skill_upload_row(&row.upload_id, now).await
                     }
-                },
-            )
-            .collect()
+                    .await;
+                    match result {
+                        Ok(Some(at)) => progress.deadline(at),
+                        Ok(None) => {}
+                        Err(error) => progress.failed(error),
+                    }
+                }
+                Ok::<_, anyhow::Error>(())
+            }
+            .await;
+            if let Err(error) = page {
+                progress.uploads_complete = true;
+                progress.failed(error);
+            }
+        }
+        // Workspace discovery is a raw64 key page, then at most16 filesystem
+        // entries in this quantum. No reader is retained during file work.
+        if progress.directories.is_empty() && !progress.workspaces_complete {
+            match self
+                .workspace_manager
+                .active_id_page(progress.workspace_after.as_deref())
+                .await
+            {
+                Ok(rows) => {
+                    progress.workspaces_complete = rows.len() < 64;
+                    progress.workspace_after = rows.last().cloned();
+                    for workspace_id in rows {
+                        match self.skills_runtime_context(&workspace_id) {
+                            Ok(context) => {
+                                if progress.roots.insert(context.upload_root.clone()) {
+                                    progress.open(&context.upload_root, true, true);
+                                }
+                                if progress.roots.insert(context.materialized_root.clone()) {
+                                    progress.open(&context.materialized_root, false, false);
+                                }
+                            }
+                            Err(error) => progress.failed(error.into()),
+                        }
+                    }
+                }
+                Err(error) => {
+                    progress.workspaces_complete = true;
+                    progress.failed(anyhow!("{error}"));
+                }
+            }
+        }
+        for _ in 0..16 {
+            let Some(directory) = progress.directories.last_mut() else {
+                break;
+            };
+            let workspace_level = directory.workspace_level;
+            let uploads = directory.uploads;
+            let Some(entry) = directory.entries.next() else {
+                progress.directories.pop();
+                continue;
+            };
+            let path = match entry {
+                Ok(entry) => entry.path(),
+                Err(error) => {
+                    progress.failed(error.into());
+                    continue;
+                }
+            };
+            let metadata = match fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    progress.failed(error.into());
+                    continue;
+                }
+            };
+            if !metadata.is_dir() {
+                continue;
+            }
+            if workspace_level {
+                progress.open(&path, false, true);
+                continue;
+            }
+            let result = async {
+                if uploads {
+                    let Some(id) = path.file_name().and_then(|name| name.to_str()) else {
+                        return Ok(None);
+                    };
+                    if self
+                        .crud_store
+                        .find_skill_upload_session(id)
+                        .await?
+                        .is_some()
+                    {
+                        return self.cleanup_skill_upload_row(id, now).await;
+                    }
+                }
+                let modified = metadata.modified()?.duration_since(UNIX_EPOCH)?;
+                let at = i64::try_from(modified.as_secs())
+                    .unwrap_or(i64::MAX)
+                    .saturating_add(
+                        now.saturating_sub(skill_upload_stale_before(&self.tool_loop_config, now)),
+                    );
+                if at <= now {
+                    fs::remove_dir_all(&path)?;
+                    Ok(None)
+                } else {
+                    Ok(Some(at))
+                }
+            }
+            .await;
+            match result {
+                Ok(Some(at)) => progress.deadline(at),
+                Ok(None) => {}
+                Err(error) => progress.failed(error),
+            }
+        }
     }
 
     async fn find_upload_for_connection(
@@ -1508,19 +1647,6 @@ fn skill_upload_stale_before(tool_loop_config: &ToolLoopConfig, now: i64) -> i64
     let ttl_secs =
         i64::try_from(tool_loop_config.skills.security.upload_ttl_secs.max(60)).unwrap_or(3600);
     now.saturating_sub(ttl_secs)
-}
-
-fn directory_modified_at_or_before(path: &std::path::Path, stale_before: i64) -> bool {
-    let Ok(metadata) = fs::metadata(path) else {
-        return false;
-    };
-    let Ok(modified) = metadata.modified() else {
-        return false;
-    };
-    let Ok(age) = modified.duration_since(UNIX_EPOCH) else {
-        return false;
-    };
-    i64::try_from(age.as_secs()).unwrap_or(i64::MAX) <= stale_before
 }
 
 pub(super) fn extract_archive_secure(

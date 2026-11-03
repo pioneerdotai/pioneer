@@ -670,6 +670,7 @@ impl ThreadTimelineController {
             .is_none_or(|failure| failure.attempts < MAX_ATTEMPTS && now_ms >= failure.retry_at_ms)
     }
 
+    #[cfg(test)]
     pub(crate) fn finish(
         &mut self,
         key: &PageKey,

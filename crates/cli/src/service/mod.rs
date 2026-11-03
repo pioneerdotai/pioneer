@@ -250,10 +250,14 @@ pub fn stop_gateway_service() -> Result<()> {
     platform::stop_gateway_service(&settings)
 }
 
-pub fn create_device() -> Result<pioneer_protocol::AuthDeviceCreateResponse> {
+pub fn create_device(start_new: bool) -> Result<pioneer_gateway::PendingDeviceCreation> {
     let (config, runtime_home) = load_config_and_runtime_home()?;
-    block_on_gateway_operation(pioneer_gateway::create_device(&config, &runtime_home))
-        .context("failed to create pending device session")
+    block_on_gateway_operation(pioneer_gateway::prepare_device_creation(
+        &config,
+        &runtime_home,
+        start_new,
+    ))
+    .context("failed to create pending device session")
 }
 
 pub fn secrets_status() -> Result<pioneer_gateway::SecretsStatusReport> {

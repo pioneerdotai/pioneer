@@ -23,10 +23,7 @@ use sea_orm::{
     ColumnTrait, Condition, ConnectionTrait, DbBackend, EntityTrait, QueryFilter, QueryOrder,
     QuerySelect, QueryTrait, Statement, TransactionTrait,
 };
-use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
-    time::{Duration, Instant},
-};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 const FRAGMENT_BYTES: i64 = 64 * 1024;
 const META_ROWS: u64 = 64;
@@ -44,9 +41,6 @@ pub struct FrozenStorageLifetimeProgress {
     pass_done: [bool; 6],
     // Reconciliation/sealing can release holds discovered earlier this pass.
     pass_changed: bool,
-    // Periodic admission for already completed cleanup, independent of active
-    // continuations and of the worker's separate conversion discovery EOF.
-    cleanup_revisit_at: Option<Instant>,
     locator_done: [bool; 4],
     scope: ScopeDiscovery,
     locators: [String; 4],
@@ -822,203 +816,265 @@ fn healthy(alias: &str) -> String {
 }
 async fn expire(store: &CrudStore, header: &history::Model) -> Result<bool> {
     store
-        .run_serialized_write(|| async {
-            let tx = store.connection.begin().await?;
-            let h = history::Entity::find_by_id(&header.id)
-                .one(&tx)
-                .await?
-                .ok_or_else(|| anyhow::anyhow!("expiry header missing"))?;
-            crate::frozen_lifetime::logical_bounds(&h)?;
-            ensure!(h.ready == 1 && h == *header, "expiry header changed");
-            if store
-                .frozen_readers
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .contains_key(&h.id)
-            {
-                tx.commit().await?;
-                return Ok(false);
-            }
-            let guard = tx
-                .query_one(
-                    &Query::select()
-                        .expr(Expr::val(1))
-                        .from_as(history::Entity, Alias::new("h"))
-                        .and_where(Expr::col((Alias::new("h"), history::Column::Id)).eq(&h.id))
-                        .and_where(Expr::cust(root_predicate("h")))
-                        .limit(1)
-                        .to_owned(),
-                )
-                .await?;
-            if guard.is_some() {
-                tx.commit().await?;
-                return Ok(false);
-            }
-            // Saved runners retain the derived generation guard. Absent-runner
-            // failures instead recheck their current durable facts in this writer.
-            // Activation requires running; state insertion invalidates the marker.
-            let active = tx
-                .query_one(
-                    &Query::select()
-                        .expr(Expr::val(1))
-                        .from(projection::Entity)
-                        .join(
-                            JoinType::LeftJoin,
-                            operation::Entity,
-                            Expr::col((operation::Entity, operation::Column::Id)).eq(Expr::col((
-                                projection::Entity,
-                                projection::Column::OperationId,
-                            ))),
-                        )
-                        .join(
-                            JoinType::LeftJoin,
-                            runner::Entity,
-                            Expr::col((runner::Entity, runner::Column::OperationId))
-                                .eq(Expr::col((operation::Entity, operation::Column::Id))),
-                        )
-                        .join(
-                            JoinType::LeftJoin,
-                            context::Entity,
-                            Expr::col((context::Entity, context::Column::Owner))
-                                .eq(Expr::col((operation::Entity, operation::Column::Owner))),
-                        )
-                        .and_where(
-                            Expr::col((projection::Entity, projection::Column::ManifestId))
-                                .eq(&h.id),
-                        )
-                        .cond_where(
-                            Condition::any()
-                                .add(
-                                    Expr::col((operation::Entity, operation::Column::Id)).is_null(),
-                                )
-                                .add(
-                                    Expr::col((operation::Entity, operation::Column::Status))
-                                        .is_not_in(["completed", "failed", "cancelled", "stale"]),
-                                )
-                                .add(
-                                    Expr::col((runner::Entity, runner::Column::OperationId))
-                                        .is_null(),
-                                )
-                                .add(
-                                    Expr::col((
-                                        projection::Entity,
-                                        projection::Column::TerminalGeneration,
-                                    ))
-                                    .is_null(),
-                                )
-                                .add(
-                                    Expr::col((
-                                        projection::Entity,
-                                        projection::Column::TerminalGeneration,
-                                    ))
-                                    .ne(Expr::col((runner::Entity, runner::Column::Generation))),
-                                )
-                                .add(
-                                    Expr::col((context::Entity, context::Column::WorkspaceId))
-                                        .is_null(),
-                                )
-                                .add(
-                                    Expr::col((context::Entity, context::Column::WorkspaceId))
-                                        .ne(&h.workspace_id),
-                                ),
-                        )
-                        .and_where(pre_runner_failure(&h).eq(false))
-                        .limit(1)
-                        .to_owned(),
-                )
-                .await?;
-            if active.is_some() {
-                tx.commit().await?;
-                return Ok(false);
-            }
-            let unsealed_public = tx
-                .query_one(
-                    &Query::select()
-                        .expr(Expr::val(1))
-                        .from(projection::Entity)
-                        .join(
-                            JoinType::InnerJoin,
-                            checkpoint::Entity,
-                            Expr::col((checkpoint::Entity, checkpoint::Column::OperationId)).eq(
-                                Expr::col((projection::Entity, projection::Column::OperationId)),
-                            ),
-                        )
-                        .join(
-                            JoinType::InnerJoin,
-                            operation::Entity,
-                            Expr::col((operation::Entity, operation::Column::Id)).eq(Expr::col((
-                                projection::Entity,
-                                projection::Column::OperationId,
-                            ))),
-                        )
-                        .and_where(
-                            Expr::col((projection::Entity, projection::Column::ManifestId))
-                                .eq(&h.id),
-                        )
-                        .and_where(
-                            Expr::col((checkpoint::Entity, checkpoint::Column::ProofVersion)).ne(1),
-                        )
-                        .and_where(
-                            Expr::col((checkpoint::Entity, checkpoint::Column::Status))
-                                .eq("applied")
-                                .or(Expr::col((checkpoint::Entity, checkpoint::Column::Status))
-                                    .eq("retained")
-                                    .and(
-                                        Expr::col((operation::Entity, operation::Column::Status))
-                                            .eq("completed"),
-                                    )),
-                        )
-                        .limit(1)
-                        .to_owned(),
-                )
-                .await?;
-            if unsealed_public.is_some() {
-                tx.commit().await?;
-                return Ok(false);
-            }
-            let transitions = layout::Entity::find()
-                .select_only()
-                .column(layout::Column::ManifestId)
-                .filter(
-                    Condition::any()
-                        .add(layout::Column::ManifestId.eq(&h.id))
-                        .add(layout::Column::Candidate.eq(&h.id)),
-                )
-                .filter(
-                    Condition::any()
-                        .add(layout::Column::Active.ne(1))
-                        .add(layout::Column::Pending.ne(0))
-                        .add(layout::Column::Failed.ne(0))
-                        .add(Expr::col(layout::Column::CopyNext).lt(Func::coalesce([
-                            Expr::col(layout::Column::CopyTo),
-                            Expr::val(0),
-                        ]))),
-                )
-                .into_tuple::<String>()
-                .one(&tx)
-                .await?;
-            if transitions.is_some() {
-                tx.commit().await?;
-                return Ok(false);
-            }
-            let expired = history::Entity::update_many()
-                .col_expr(history::Column::Expired, Expr::val(1))
-                .filter(history::Column::Id.eq(&h.id))
-                .filter(history::Column::Expired.eq(0))
-                .filter(history::Column::Ready.eq(1))
-                .filter(
-                    Expr::col(history::Column::NextOrdinal)
-                        .eq(Expr::col(history::Column::MessageCount)),
-                )
-                .filter(
-                    Expr::col(history::Column::NextImport)
-                        .eq(Expr::col(history::Column::ImportCount)),
-                )
-                .exec(&tx)
-                .await?;
-            tx.commit().await?;
-            Ok(expired.rows_affected > 0)
-        })
+        .background_changes(
+            &["storage.html.retention", "storage.html.history"],
+            async {
+                store
+                    .run_serialized_write(|| async {
+                        let tx = store.connection.begin().await?;
+                        let h = history::Entity::find_by_id(&header.id)
+                            .one(&tx)
+                            .await?
+                            .ok_or_else(|| anyhow::anyhow!("expiry header missing"))?;
+                        crate::frozen_lifetime::logical_bounds(&h)?;
+                        ensure!(h.ready == 1 && h == *header, "expiry header changed");
+                        if crate::frozen_lifetime::held_for_cleanup(&store.frozen_readers, &h.id, 1)
+                        {
+                            tx.commit().await?;
+                            return Ok(false);
+                        }
+                        let guard = tx
+                            .query_one(
+                                &Query::select()
+                                    .expr(Expr::val(1))
+                                    .from_as(history::Entity, Alias::new("h"))
+                                    .and_where(
+                                        Expr::col((Alias::new("h"), history::Column::Id)).eq(&h.id),
+                                    )
+                                    .and_where(Expr::cust(root_predicate("h")))
+                                    .limit(1)
+                                    .to_owned(),
+                            )
+                            .await?;
+                        if guard.is_some() {
+                            tx.commit().await?;
+                            return Ok(false);
+                        }
+                        // Saved runners retain the derived generation guard. Absent-runner
+                        // failures instead recheck their current durable facts in this writer.
+                        // Activation requires running; state insertion invalidates the marker.
+                        let active = tx
+                            .query_one(
+                                &Query::select()
+                                    .expr(Expr::val(1))
+                                    .from(projection::Entity)
+                                    .join(
+                                        JoinType::LeftJoin,
+                                        operation::Entity,
+                                        Expr::col((operation::Entity, operation::Column::Id)).eq(
+                                            Expr::col((
+                                                projection::Entity,
+                                                projection::Column::OperationId,
+                                            )),
+                                        ),
+                                    )
+                                    .join(
+                                        JoinType::LeftJoin,
+                                        runner::Entity,
+                                        Expr::col((runner::Entity, runner::Column::OperationId))
+                                            .eq(Expr::col((
+                                                operation::Entity,
+                                                operation::Column::Id,
+                                            ))),
+                                    )
+                                    .join(
+                                        JoinType::LeftJoin,
+                                        context::Entity,
+                                        Expr::col((context::Entity, context::Column::Owner)).eq(
+                                            Expr::col((
+                                                operation::Entity,
+                                                operation::Column::Owner,
+                                            )),
+                                        ),
+                                    )
+                                    .and_where(
+                                        Expr::col((
+                                            projection::Entity,
+                                            projection::Column::ManifestId,
+                                        ))
+                                        .eq(&h.id),
+                                    )
+                                    .cond_where(
+                                        Condition::any()
+                                            .add(
+                                                Expr::col((
+                                                    operation::Entity,
+                                                    operation::Column::Id,
+                                                ))
+                                                .is_null(),
+                                            )
+                                            .add(
+                                                Expr::col((
+                                                    operation::Entity,
+                                                    operation::Column::Status,
+                                                ))
+                                                .is_not_in([
+                                                    "completed",
+                                                    "failed",
+                                                    "cancelled",
+                                                    "stale",
+                                                ]),
+                                            )
+                                            .add(
+                                                Expr::col((
+                                                    runner::Entity,
+                                                    runner::Column::OperationId,
+                                                ))
+                                                .is_null(),
+                                            )
+                                            .add(
+                                                Expr::col((
+                                                    projection::Entity,
+                                                    projection::Column::TerminalGeneration,
+                                                ))
+                                                .is_null(),
+                                            )
+                                            .add(
+                                                Expr::col((
+                                                    projection::Entity,
+                                                    projection::Column::TerminalGeneration,
+                                                ))
+                                                .ne(Expr::col((
+                                                    runner::Entity,
+                                                    runner::Column::Generation,
+                                                ))),
+                                            )
+                                            .add(
+                                                Expr::col((
+                                                    context::Entity,
+                                                    context::Column::WorkspaceId,
+                                                ))
+                                                .is_null(),
+                                            )
+                                            .add(
+                                                Expr::col((
+                                                    context::Entity,
+                                                    context::Column::WorkspaceId,
+                                                ))
+                                                .ne(&h.workspace_id),
+                                            ),
+                                    )
+                                    .and_where(pre_runner_failure(&h).eq(false))
+                                    .limit(1)
+                                    .to_owned(),
+                            )
+                            .await?;
+                        if active.is_some() {
+                            tx.commit().await?;
+                            return Ok(false);
+                        }
+                        let unsealed_public = tx
+                            .query_one(
+                                &Query::select()
+                                    .expr(Expr::val(1))
+                                    .from(projection::Entity)
+                                    .join(
+                                        JoinType::InnerJoin,
+                                        checkpoint::Entity,
+                                        Expr::col((
+                                            checkpoint::Entity,
+                                            checkpoint::Column::OperationId,
+                                        ))
+                                        .eq(Expr::col((
+                                            projection::Entity,
+                                            projection::Column::OperationId,
+                                        ))),
+                                    )
+                                    .join(
+                                        JoinType::InnerJoin,
+                                        operation::Entity,
+                                        Expr::col((operation::Entity, operation::Column::Id)).eq(
+                                            Expr::col((
+                                                projection::Entity,
+                                                projection::Column::OperationId,
+                                            )),
+                                        ),
+                                    )
+                                    .and_where(
+                                        Expr::col((
+                                            projection::Entity,
+                                            projection::Column::ManifestId,
+                                        ))
+                                        .eq(&h.id),
+                                    )
+                                    .and_where(
+                                        Expr::col((
+                                            checkpoint::Entity,
+                                            checkpoint::Column::ProofVersion,
+                                        ))
+                                        .ne(1),
+                                    )
+                                    .and_where(
+                                        Expr::col((checkpoint::Entity, checkpoint::Column::Status))
+                                            .eq("applied")
+                                            .or(Expr::col((
+                                                checkpoint::Entity,
+                                                checkpoint::Column::Status,
+                                            ))
+                                            .eq("retained")
+                                            .and(
+                                                Expr::col((
+                                                    operation::Entity,
+                                                    operation::Column::Status,
+                                                ))
+                                                .eq("completed"),
+                                            )),
+                                    )
+                                    .limit(1)
+                                    .to_owned(),
+                            )
+                            .await?;
+                        if unsealed_public.is_some() {
+                            tx.commit().await?;
+                            return Ok(false);
+                        }
+                        let transitions = layout::Entity::find()
+                            .select_only()
+                            .column(layout::Column::ManifestId)
+                            .filter(
+                                Condition::any()
+                                    .add(layout::Column::ManifestId.eq(&h.id))
+                                    .add(layout::Column::Candidate.eq(&h.id)),
+                            )
+                            .filter(
+                                Condition::any()
+                                    .add(layout::Column::Active.ne(1))
+                                    .add(layout::Column::Pending.ne(0))
+                                    .add(layout::Column::Failed.ne(0))
+                                    .add(Expr::col(layout::Column::CopyNext).lt(Func::coalesce([
+                                        Expr::col(layout::Column::CopyTo),
+                                        Expr::val(0),
+                                    ]))),
+                            )
+                            .into_tuple::<String>()
+                            .one(&tx)
+                            .await?;
+                        if transitions.is_some() {
+                            tx.commit().await?;
+                            return Ok(false);
+                        }
+                        let expired = history::Entity::update_many()
+                            .col_expr(history::Column::Expired, Expr::val(1))
+                            .filter(history::Column::Id.eq(&h.id))
+                            .filter(history::Column::Expired.eq(0))
+                            .filter(history::Column::Ready.eq(1))
+                            .filter(
+                                Expr::col(history::Column::NextOrdinal)
+                                    .eq(Expr::col(history::Column::MessageCount)),
+                            )
+                            .filter(
+                                Expr::col(history::Column::NextImport)
+                                    .eq(Expr::col(history::Column::ImportCount)),
+                            )
+                            .exec(&tx)
+                            .await?;
+                        tx.commit().await?;
+                        Ok(expired.rows_affected > 0)
+                    })
+                    .await
+            },
+            |changed| *changed,
+        )
         .await
 }
 
@@ -1728,6 +1784,12 @@ impl FrozenStorageLifetimeProgress {
     /// completed this pass, not that one phase happened to be empty. Rotating
     /// keysets revisit previously held rows on the next pass.
     pub async fn quantum(&mut self, store: &CrudStore) -> Result<bool> {
+        let change = store.background_work("storage.frozen").changing();
+        let more = self.quantum_inner(store).await?;
+        change.finish(more);
+        Ok(more)
+    }
+    async fn quantum_inner(&mut self, store: &CrudStore) -> Result<bool> {
         let store = store.with_maintenance_access();
         let mut selected = None;
         for _ in 0..self.pass_done.len() {
@@ -1825,19 +1887,10 @@ impl FrozenStorageLifetimeProgress {
         }
         Ok(true)
     }
-    /// Start another discovery epoch for completed cleanup families between
-    /// worker batches, admitted by the worker's periodic idle interval. An
-    /// unfinished proof graph alone is not a reason to reopen discovery.
-    /// Active container continuations and paged preparations are preserved.
-    /// The worker supplies its existing idle interval and monotonic batch time.
-    pub fn revisit_completed_cleanup(&mut self, now: Instant, interval: Duration) {
-        let due = self.cleanup_revisit_at.is_some_and(|at| now >= at);
-        if self.cleanup_revisit_at.is_none() || due {
-            self.cleanup_revisit_at = Some(now + interval);
-        }
-        if !due {
-            return;
-        }
+    /// A committed source/dependency change reopens completed cleanup only.
+    /// Unfinished preparations retain their frontiers; startup scope remains
+    /// checked because supported writers preserve its authority invariant.
+    pub fn invalidate_completed_cleanup(&mut self) {
         // Once proof discovery reaches EOF, let every family finish together
         // so a quiet database still reaches the existing idle/backoff state.
         if self.pass_done[1] {
@@ -2553,12 +2606,11 @@ impl DiscardPreparation {
         store
             .run_serialized_write(|| async {
                 let tx = store.connection.begin().await?;
-                if store
-                    .frozen_readers
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .contains_key(&self.manifest)
-                {
+                if crate::frozen_lifetime::held_for_cleanup(
+                    &store.frozen_readers,
+                    &self.manifest,
+                    1,
+                ) {
                     tx.commit().await?;
                     return Ok(());
                 }
@@ -2981,6 +3033,7 @@ pub(super) fn frozen_scope_query(id: &str) -> sea_orm::sea_query::SelectStatemen
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
     include!("frozen_sweep_tests.rs");
     mod expiry_preflight {
         include!("frozen_storage_lifetime_expiry_tests.rs");
@@ -6666,7 +6719,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn periodic_cleanup_revisit_sees_released_reader_before_proof_eof() {
+    async fn dependency_invalidation_sees_released_reader_before_proof_eof() {
         let (store, descriptor) = fixture(false).await;
         checkpoint_proofs::prepare_graph(&store, "cp-1")
             .await
@@ -6681,9 +6734,6 @@ mod tests {
         progress.proof = Some(checkpoint_proofs::GraphPreparation::new("cp-1"));
         progress.expiry = Some(prepared_expiry(&store).await);
         progress.expiry_after = "origin".into();
-        let now = Instant::now();
-        let interval = Duration::from_secs(60);
-        progress.revisit_completed_cleanup(now, interval);
         progress.phase = 2;
         assert!(progress.quantum(&store).await.unwrap());
         assert!(progress.expiry.is_none());
@@ -6701,15 +6751,14 @@ mod tests {
         );
 
         drop(hold);
-        progress.revisit_completed_cleanup(now + interval - Duration::from_secs(1), interval);
         assert!(progress.pass_done[2]);
-        progress.revisit_completed_cleanup(now + interval, interval);
+        progress.invalidate_completed_cleanup();
         assert!(!progress.pass_done[2] && !progress.pass_done[1]);
         progress.phase = 2;
         assert!(progress.quantum(&store).await.unwrap());
         assert!(
             progress.expiry.is_some(),
-            "periodic revisit rediscovers released origin"
+            "real dependency invalidation rediscovers released origin"
         );
         for _ in 0..500 {
             if progress.expiry.is_none() {
@@ -6743,15 +6792,10 @@ mod tests {
         progress
             .sweep_pending
             .push_back(SweepPreparation::new("queued".into(), 1, 24));
-        let now = Instant::now();
-        let interval = Duration::from_secs(60);
-        // Repeated unchanged worker batches do not reopen completed families,
-        // even while a real proof preparation and queue remain unfinished.
-        for seconds in 0..60 {
-            progress.revisit_completed_cleanup(now + Duration::from_secs(seconds), interval);
-            assert_eq!(progress.pass_done, [true, false, true, false, true, true]);
-        }
-        progress.revisit_completed_cleanup(now + interval, interval);
+        // Unchanged quanta do not reopen anything. Only a relevant source
+        // invalidation can revisit an already completed cleanup lane.
+        assert_eq!(progress.pass_done, [true, false, true, false, true, true]);
+        progress.invalidate_completed_cleanup();
         assert_eq!(progress.pass_done, [true, false, false, false, false, true]);
         assert!(progress.proof.is_some());
         assert_eq!(progress.proof_after, "proof-frontier");
@@ -6759,19 +6803,19 @@ mod tests {
         assert_eq!(progress.sweep.as_ref().unwrap().until, 42);
         assert_eq!(progress.sweep_pending.front().unwrap().manifest, "queued");
 
-        // Periodic admission reopens durable pending discovery only. No RAM
+        // Dependency invalidation reopens durable pending discovery only. No RAM
         // inventory frontier exists to reset, and active visits survive above.
         progress.sweep = None;
         progress.sweep_pending.clear();
         progress.pass_done[3] = true;
-        progress.revisit_completed_cleanup(now + interval * 2, interval);
+        progress.invalidate_completed_cleanup();
         assert!(!progress.pass_done[3]);
 
         progress.proof = None;
         progress.proof_pending.clear();
         progress.pass_done = [true, true, true, true, true, false];
         progress.pass_changed = true;
-        progress.revisit_completed_cleanup(now + interval * 3, interval);
+        progress.invalidate_completed_cleanup();
         assert_eq!(progress.pass_done, [true, true, true, true, true, false]);
         assert!(
             progress.quantum(&store).await.unwrap(),
@@ -6821,6 +6865,7 @@ mod tests {
                     hold = Some(crate::FrozenReadHold::register(
                         &store.frozen_readers,
                         "origin",
+                        store.frozen_release_wakes(),
                     ));
                 }
                 "generation" => {

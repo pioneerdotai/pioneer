@@ -137,6 +137,20 @@ pub(crate) fn usage_error(message: impl Into<String>) -> anyhow::Error {
     .into()
 }
 
+fn write_device_result(
+    device: &pioneer_protocol::AuthDeviceCreateResponse,
+    json_output: bool,
+    output: &mut impl io::Write,
+) -> Result<()> {
+    if json_output {
+        writeln!(output, "{}", serde_json::to_string_pretty(device)?)?;
+    } else {
+        writeln!(output, "{}", device.activation_code.expose_secret())?;
+    }
+    output.flush()?;
+    Ok(())
+}
+
 fn is_usage_error(error: &anyhow::Error) -> bool {
     error.downcast_ref::<CliUsageError>().is_some()
 }
@@ -165,13 +179,23 @@ fn run_with_args(mut args: impl Iterator<Item = String>) -> Result<()> {
         }
         Some("device") => match args.next().as_deref() {
             Some("create") => {
-                let json_output = parse_optional_json_flag(args)?;
-                let device = service::create_device()?;
-                if json_output {
-                    println!("{}", serde_json::to_string_pretty(&device)?);
-                } else {
-                    println!("{}", device.activation_code.expose_secret());
+                let mut json_output = false;
+                let mut start_new = false;
+                for argument in args {
+                    match argument.as_str() {
+                        "--json" if !json_output => json_output = true,
+                        "--new-operation" if !start_new => start_new = true,
+                        _ => {
+                            return Err(usage_error(format!(
+                                "unexpected device create argument: {argument}"
+                            )));
+                        }
+                    }
                 }
+                let pending = service::create_device(start_new)?;
+                pending.deliver(|device| {
+                    write_device_result(device, json_output, &mut io::stdout().lock())
+                })?;
                 Ok(())
             }
             Some(command) => Err(usage_error(format!(
@@ -660,7 +684,7 @@ fn help_text() -> String {
   {command} self-update (alias of `update`)
   {command} start [--json]      Install and start the persistent gateway service
   {command} status [--json]     Show gateway service status
-  {command} device create [--json]  Create a pending device session and one-time activation code
+  {command} device create [--json] [--new-operation]  Create a pending device; resume an unconfirmed result (--new-operation abandons it)
   {command} task-invariants --db <path> [--json] [--stale-turn-after-seconds <seconds>]
                                 Scan task/subagent runtime invariants in a SQLite gateway DB
   {command} secrets status [--json]  Show keystore status without secret values
@@ -693,6 +717,57 @@ mod tests {
 
     fn args<'a>(values: &'a [&'a str]) -> impl Iterator<Item = String> + 'a {
         values.iter().map(|value| (*value).to_owned())
+    }
+
+    #[test]
+    fn device_output_errors_prevent_delivery_acknowledgement() {
+        struct Output {
+            fail_write: bool,
+            fail_flush: bool,
+            flushed: bool,
+        }
+        impl io::Write for Output {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if self.fail_write {
+                    Err(io::ErrorKind::BrokenPipe.into())
+                } else {
+                    Ok(bytes.len())
+                }
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                self.flushed = true;
+                if self.fail_flush {
+                    Err(io::ErrorKind::BrokenPipe.into())
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        let response = pioneer_protocol::AuthDeviceCreateResponse {
+            device_id: pioneer_protocol::DeviceId::new("D00000000000000000001").unwrap(),
+            session_id: pioneer_protocol::AuthSessionId::new("S00000000000000000001").unwrap(),
+            activation_code: pioneer_protocol::AuthSecretString::new("synthetic activation"),
+            expires_at_unix: 1,
+            gateway_id: pioneer_protocol::GatewayId::new("G00000000000000000001").unwrap(),
+        };
+        for json in [false, true] {
+            for (fail_write, fail_flush, success) in [
+                (true, false, false),
+                (false, true, false),
+                (false, false, true),
+            ] {
+                let mut output = Output {
+                    fail_write,
+                    fail_flush,
+                    flushed: false,
+                };
+                assert_eq!(
+                    write_device_result(&response, json, &mut output).is_ok(),
+                    success
+                );
+                assert_eq!(output.flushed, !fail_write);
+            }
+        }
     }
 
     #[test]

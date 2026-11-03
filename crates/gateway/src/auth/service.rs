@@ -1444,16 +1444,51 @@ impl GatewayAuthService {
             Some(current),
             None,
             PendingSessionIds::random()?,
+            None,
         )
         .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn create_local_device(&self) -> Result<AuthDeviceCreateResponse, AuthError> {
         self.create_pending_device_session(
             PendingSessionIssuer::LocalCli,
             None,
             None,
             PendingSessionIds::random()?,
+            None,
+        )
+        .await
+    }
+
+    /// Stable business identities make a lost response replayable across restart.
+    /// The session row is the receipt, including terminal/revoked outcomes.
+    pub(crate) async fn create_local_device_for_operation(
+        &self,
+        operation: &RequestId,
+    ) -> Result<AuthDeviceCreateResponse, AuthError> {
+        let id = |purpose: &[u8]| {
+            self.opaque_credentials
+                .local_operation_material(purpose, operation)[..AUTH_DOMAIN_ID_LEN]
+                .iter()
+                .map(|byte| {
+                    char::from(
+                        b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+                            [usize::from(*byte) % 62],
+                    )
+                })
+                .collect::<String>()
+        };
+        self.create_pending_device_session(
+            PendingSessionIssuer::LocalCli,
+            None,
+            None,
+            PendingSessionIds {
+                device_id: typed_id(id(b"device"), DeviceId::new)?,
+                session_id: typed_id(id(b"session"), AuthSessionId::new)?,
+                token_family_id: typed_id(id(b"family"), TokenFamilyId::new)?,
+            },
+            Some(operation),
         )
         .await
     }
@@ -1485,6 +1520,7 @@ impl GatewayAuthService {
                 Some(current),
                 Some(target_principal_id),
                 PendingSessionIds::random()?,
+                None,
             )
             .await;
         record_outcome(
@@ -1505,6 +1541,7 @@ impl GatewayAuthService {
         authenticated_actor: Option<&AuthenticatedSessionPrincipal>,
         administrative_target: Option<&pioneer_protocol::PrincipalId>,
         ids: PendingSessionIds,
+        operation: Option<&RequestId>,
     ) -> Result<AuthDeviceCreateResponse, AuthError> {
         let now_unix =
             unix_timestamp_secs().map_err(|_| AuthError::new(AuthErrorCode::InvalidCredential))?;
@@ -1531,6 +1568,47 @@ impl GatewayAuthService {
                 || gateway.auth_ready_at.is_none()
             {
                 return Err(AuthError::new(AuthErrorCode::AuthNotReady));
+            }
+            if let Some(operation) = operation {
+                if let Some(previous) = load_session(&transaction, &ids.session_id)
+                    .await
+                    .map_err(storage_error)?
+                {
+                    // Do not supersede or create another device on replay, even
+                    // when activation/revocation happened after the lost reply.
+                    if previous.gateway_id != self.identity.gateway.id.as_str()
+                        || previous.principal_id != self.identity.superuser.id.as_str()
+                        || previous.device_id != ids.device_id.as_str()
+                        || previous.created_by_session_id.is_some()
+                    {
+                        return Err(AuthError::new(AuthErrorCode::InvalidCredential));
+                    }
+                    if previous.status != "pending" || previous.activation_expires_at <= now {
+                        return Err(AuthError::new(AuthErrorCode::CredentialExpired));
+                    }
+                    for locator in DEVICE_ACTIVATION_ALPHABET {
+                        let locator = char::from(*locator).to_string();
+                        let activation = self
+                            .opaque_credentials
+                            .local_operation_activation(operation, Some(&locator));
+                        if bool::from(
+                            self.opaque_credentials
+                                .fingerprint(&activation)
+                                .as_slice()
+                                .ct_eq(previous.activation_token_hash.as_slice()),
+                        ) {
+                            return Ok((
+                                activation,
+                                self.identity.superuser.id.clone(),
+                                u64::try_from(previous.activation_expires_at.timestamp()).map_err(
+                                    |_| AuthError::new(AuthErrorCode::InvalidCredential),
+                                )?,
+                                true,
+                            ));
+                        }
+                    }
+                    return Err(AuthError::new(AuthErrorCode::InvalidCredential));
+                }
             }
             let principal_id = match (authenticated_actor, administrative_target) {
                 (Some(current), Some(target_principal_id)) => {
@@ -1658,7 +1736,13 @@ impl GatewayAuthService {
             if used_locator_hashes.len() >= DEVICE_ACTIVATION_ALPHABET.len() {
                 return Err(AuthError::new(AuthErrorCode::InvalidCredential));
             }
-            let mut activation = self.opaque_credentials.generate_device_activation();
+            let mut activation = operation.map_or_else(
+                || self.opaque_credentials.generate_device_activation(),
+                |operation| {
+                    self.opaque_credentials
+                        .local_operation_activation(operation, None)
+                },
+            );
             let initial_locator = self
                 .opaque_credentials
                 .device_activation_locator(&activation)?;
@@ -1684,9 +1768,14 @@ impl GatewayAuthService {
                             .is_ok_and(|hash| !used_locator_hashes.contains(hash.as_slice()))
                     })
                     .ok_or_else(|| AuthError::new(AuthErrorCode::InvalidCredential))?;
-                activation = self
-                    .opaque_credentials
-                    .generate_device_activation_for_locator(free_locator.as_str())?;
+                activation = match operation {
+                    Some(operation) => self
+                        .opaque_credentials
+                        .local_operation_activation(operation, Some(&free_locator)),
+                    None => self
+                        .opaque_credentials
+                        .generate_device_activation_for_locator(&free_locator)?,
+                };
             }
             let activation_hash = self.opaque_credentials.fingerprint(&activation);
             let activation_locator_hash = self
@@ -1724,10 +1813,10 @@ impl GatewayAuthService {
                     .await
                     .map_err(storage_error)?;
             }
-            Ok((activation, principal_id))
+            Ok((activation, principal_id, expires_at_unix, false))
         }
         .await;
-        let (activation, principal_id) = match result {
+        let (activation, principal_id, expires_at_unix, replayed) = match result {
             Ok(result) => {
                 transaction
                     .commit()
@@ -1740,20 +1829,22 @@ impl GatewayAuthService {
                 return Err(error);
             }
         };
-        tracing::info!(
-            event = "auth_pending_device_session_created",
-            device_id = %ids.device_id,
-            auth_session_id = %ids.session_id,
-            principal_id = %principal_id,
-            issuer = if administrative_target.is_some() {
-                "administrative_recovery"
-            } else if authenticated_actor.is_some() {
-                "authenticated_session"
-            } else {
-                "local_cli"
-            },
-            outcome = "created",
-        );
+        if !replayed {
+            tracing::info!(
+                event = "auth_pending_device_session_created",
+                device_id = %ids.device_id,
+                auth_session_id = %ids.session_id,
+                principal_id = %principal_id,
+                issuer = if administrative_target.is_some() {
+                    "administrative_recovery"
+                } else if authenticated_actor.is_some() {
+                    "authenticated_session"
+                } else {
+                    "local_cli"
+                },
+                outcome = "created",
+            );
+        }
         Ok(AuthDeviceCreateResponse {
             device_id: ids.device_id,
             session_id: ids.session_id,
@@ -2294,6 +2385,7 @@ impl GatewayAuthService {
                     session_id: ids.session_id,
                     token_family_id: ids.token_family_id,
                 },
+                None,
             )
             .await?;
         let credential =
@@ -3669,6 +3761,76 @@ mod tests {
         assert_eq!(
             recovered.refresh_token.expose_secret(),
             first.refresh_token.expose_secret()
+        );
+        assert_eq!(
+            scalar_text(
+                &restarted.database,
+                "SELECT status AS value FROM auth_session"
+            )
+            .await,
+            "active"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_device_operation_replays_durable_result_after_restart_without_superseding() {
+        let (service, identity) = fixture().await;
+        let operation = RequestId::new("L00000000000000000001").unwrap();
+        let first = service
+            .create_local_device_for_operation(&operation)
+            .await
+            .unwrap();
+        let database = service.database.clone();
+        drop(service);
+        let restarted = GatewayAuthService::new(
+            database,
+            GatewayAuthConfig::default(),
+            identity.clone(),
+            &AuthKeyMaterial::from_test_bytes(vec![8; 64]),
+            &AuthKeyMaterial::from_test_bytes(vec![9; 64]),
+        )
+        .unwrap();
+        let replay = restarted
+            .create_local_device_for_operation(&operation)
+            .await
+            .unwrap();
+        assert_eq!(first, replay);
+        assert_eq!(
+            scalar_i64(&restarted.database, "SELECT COUNT(*) AS value FROM device").await,
+            1
+        );
+        assert_eq!(
+            scalar_i64(
+                &restarted.database,
+                "SELECT COUNT(*) AS value FROM auth_session"
+            )
+            .await,
+            1
+        );
+        let session = load_session(&restarted.database, &first.session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(session.created_by_session_id.is_none());
+        assert_eq!(session.principal_id, identity.superuser.id.as_str());
+        let raw = first.activation_code.expose_secret().to_owned();
+        restarted
+            .activate_device_with_ids(
+                device_activation_admission(&restarted, &raw),
+                params("local-operation-installation", ClientKind::Desktop),
+                issued_ids(1),
+            )
+            .await
+            .unwrap();
+        assert!(
+            restarted
+                .create_local_device_for_operation(&operation)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            scalar_i64(&restarted.database, "SELECT COUNT(*) AS value FROM device").await,
+            1
         );
         assert_eq!(
             scalar_text(

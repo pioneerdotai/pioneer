@@ -59,6 +59,13 @@ impl PreparedCleanup {
 pub(crate) async fn backfill_ready<C: ConnectionTrait>(db: &C) -> Result<bool> {
     let meta =
         crate::find_projection_meta(db, "turn_event_projection_stream_state_backfill").await?;
+    ensure!(
+        !meta
+            .as_ref()
+            .is_some_and(|meta| meta.status == crate::PROJECTION_META_STATUS_FAILED
+                || meta.last_error.is_some()),
+        "projection receipt cleanup waits for failed backfill recovery"
+    );
     Ok(meta.is_some_and(|meta| {
         meta.projection_version >= 3
             && meta.status == crate::PROJECTION_META_STATUS_COMPLETE

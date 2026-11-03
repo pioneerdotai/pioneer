@@ -65,6 +65,35 @@ pub(crate) async fn owns<C: ConnectionTrait>(
         .await?
         .is_some())
 }
+/// One aggregate row for both durable lifecycle owners. NULL is empty;
+/// pending due_at already incorporates lease/retry/eligibility fences. Scope
+/// eligibility matches expand, including the singleton legacy seed locator.
+pub(crate) async fn deadlines<C: ConnectionTrait>(db: &C) -> Result<(Option<i64>, Option<i64>)> {
+    use sea_orm::{QueryTrait, sea_query::Func};
+    let scope_deadline = scope::Entity::find()
+        .select_only()
+        .expr_as(Func::min(Expr::col(scope::Column::DueAt)), "deadline")
+        .filter(
+            sea_orm::Condition::any()
+                .add(scope::Column::Kind.ne("seed"))
+                .add(
+                    sea_orm::Condition::all()
+                        .add(scope::Column::Kind.eq("seed"))
+                        .add(scope::Column::Owner.eq(""))
+                        .add(scope::Column::TurnId.eq("")),
+                ),
+        )
+        .into_query();
+    let (pending_at, scope_at) = pending::Entity::find()
+        .select_only()
+        .expr_as(Func::min(Expr::col(pending::Column::DueAt)), "pending_at")
+        .expr_as(Expr::from(scope_deadline), "scope_at")
+        .into_tuple::<(Option<i64>, Option<i64>)>()
+        .one(db)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("lifecycle aggregate returned no observation"))?;
+    Ok((pending_at, scope_at))
+}
 pub(crate) async fn due<C: ConnectionTrait>(db: &C, now: i64) -> Result<Vec<pending::Model>> {
     Ok(pending::Entity::find()
         .filter(pending::Column::DueAt.lte(now))

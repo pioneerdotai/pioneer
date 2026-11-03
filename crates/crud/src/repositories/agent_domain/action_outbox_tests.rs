@@ -1352,3 +1352,137 @@ async fn action_outbox_concurrent_range_move_does_not_duplicate_an_input() {
     );
     assert_eq!(load(&db, "moving").await.next_attempt_at, Some(now));
 }
+
+#[tokio::test]
+async fn action_admission_preserves_all_ranges_and_excludes_retained_closed_history() {
+    let db = database().await;
+    let now = utc_now();
+    // Each case lives alone: a single retained poison record must not force an
+    // empty outbox chain forever, and no supported input range may be hidden.
+    for (status, attempts, due, error, kind, payload, expected) in [
+        (
+            "pending",
+            0,
+            None,
+            None,
+            "send_message",
+            r#"{"kind":"send_message"}"#,
+            true,
+        ),
+        (
+            "failed",
+            1,
+            None,
+            Some("outbox_start_integrity_rejected"),
+            "start_agent",
+            r#"{"kind":"start_agent"}"#,
+            false,
+        ),
+        (
+            "failed",
+            1,
+            None,
+            Some("outbox_detached_binding_rejected"),
+            "start_agent",
+            r#"{"kind":"start_agent"}"#,
+            false,
+        ),
+        (
+            "failed",
+            1,
+            Some(now),
+            Some("outbox_start_integrity_rejected"),
+            "start_agent",
+            r#"{"kind":"start_agent"}"#,
+            true,
+        ),
+        (
+            "pending",
+            8,
+            Some(now + Duration::seconds(1)),
+            None,
+            "start_agent",
+            r#"{"kind":"start_agent"}"#,
+            false,
+        ),
+        (
+            "failed",
+            8,
+            None,
+            None,
+            "start_agent",
+            "legacy invalid json",
+            true,
+        ),
+        (
+            "failed",
+            8,
+            None,
+            None,
+            "start_agent",
+            r#"{"kind":"send_message"}"#,
+            false,
+        ),
+        (
+            "failed",
+            8,
+            None,
+            Some("outbox_detached_binding_rejected"),
+            "start_agent",
+            r#"{"kind":"start_agent"}"#,
+            false,
+        ),
+        (
+            "failed",
+            8,
+            Some(now),
+            None,
+            "start_agent",
+            r#"{"kind":"start_agent"}"#,
+            true,
+        ),
+        (
+            "failed",
+            8,
+            None,
+            None,
+            "send_message",
+            r#"{"kind":"start_agent"}"#,
+            false,
+        ),
+        (
+            "delivered",
+            1,
+            Some(now),
+            None,
+            "start_agent",
+            r#"{"kind":"start_agent"}"#,
+            false,
+        ),
+    ] {
+        agent_action_outbox::Entity::delete_many()
+            .exec(&db)
+            .await
+            .unwrap();
+        agent_action::Entity::delete_many().exec(&db).await.unwrap();
+        seed(&db, "admission", status, attempts, now, due).await;
+        seed_action_for_discovery(&db, "admission", kind, now).await;
+        let mut row: agent_action_outbox::ActiveModel = load(&db, "admission").await.into();
+        row.last_error = Set(error.map(str::to_owned));
+        row.payload_json = Set(payload.to_owned());
+        row.update(&db).await.unwrap();
+        let admitted = action_outbox_due_query(now)
+            .select_only()
+            .column(agent_action_outbox::Column::Id)
+            .into_tuple::<String>()
+            .one(&db)
+            .await
+            .unwrap()
+            .is_some();
+        assert_eq!(
+            admitted, expected,
+            "{status}, {attempts}, {due:?}, {error:?}, {kind}, {payload}"
+        );
+        assert_eq!(!ids(&db, now).await.is_empty(), expected);
+    }
+}

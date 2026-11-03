@@ -10,6 +10,10 @@ impl MessageProcessor {
         self.gateway_secrets.as_ref()
     }
 
+    pub(crate) fn local_operation_home(&self) -> &std::path::Path {
+        &self.artifact_runtime_home
+    }
+
     pub(crate) fn set_gateway_listen_addr(&self, address: std::net::SocketAddr) {
         *self
             .gateway_listen_addr

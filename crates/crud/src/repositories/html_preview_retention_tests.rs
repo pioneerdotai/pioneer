@@ -2840,3 +2840,117 @@ async fn io_business_retry_preserves_cas_class_through_artifact_error_boundary()
         tx.rollback().await.unwrap();
     }
 }
+
+#[tokio::test]
+async fn maintenance_lifecycle_admission_observes_foreign_deadlines_without_writer() {
+    async fn due(store: &crate::CrudStore, now: i64) -> (bool, bool) {
+        let (pending, scope) = store.compaction_lifecycle_deadlines().await.unwrap();
+        (
+            pending.is_some_and(|at| at <= now),
+            scope.is_some_and(|at| at <= now),
+        )
+    }
+    let f = fixture().await;
+    // The startup seed is itself an obligation, independent of pending rows.
+    assert_eq!(due(&f.store, 0).await, (false, true));
+    f.sql("DELETE FROM compaction_lifecycle_scope").await;
+    for _ in 0..3 {
+        f.routes.reset();
+        assert_eq!(due(&f.store, 0).await, (false, false));
+        assert_eq!(f.routes.counts(), (1, 0));
+    }
+    f.sql("INSERT INTO compaction_lifecycle_scope(kind,owner,turn_id,generation,due_at) VALUES('turn','owner','parent-turn',1,500)").await;
+    f.sql("INSERT INTO compaction_context(owner,workspace_id,thread_id,format_version) VALUES('admission-owner','ws','parent',1)").await;
+    f.sql("INSERT INTO compaction_operation(id,owner,fingerprint,status,snapshot,deadline_ms) VALUES('legacy','admission-owner','admission','completed','{}',1)").await;
+    f.sql("INSERT INTO compaction_lifecycle_pending(operation_id,generation,eligible_at,retry_not_before,due_at) VALUES('legacy',1,700,900,900)").await;
+    // Offline/restored state reconstructs both concrete future deadlines. Retry/lease due_at, not eligible_at alone, admits pending.
+    assert_eq!(
+        f.store.compaction_lifecycle_deadlines().await.unwrap(),
+        (Some(900), Some(500))
+    );
+    for (now, expected) in [
+        (499, (false, false)),
+        (500, (false, true)),
+        (899, (false, true)),
+        (900, (true, true)),
+        (400, (false, false)),
+    ] {
+        f.routes.reset();
+        assert_eq!(due(&f.store, now).await, expected);
+        assert_eq!(f.routes.counts(), (1, 0));
+    }
+    // Earlier rescheduling and reconstruction do not reuse a cached Empty.
+    f.sql("UPDATE compaction_lifecycle_pending SET retry_not_before=0,due_at=eligible_at")
+        .await;
+    assert_eq!(due(&f.store, 700).await, (true, true));
+}
+
+#[tokio::test]
+async fn blocked_recovery_advances_raw_budget_without_mutating_terminal_prefix() {
+    use pioneer_entity::html_preview_io_work as work;
+    let f = fixture().await;
+    f.sql("DELETE FROM html_preview_io_work").await;
+    // Fixed-width queue keys in primary-key order; a prefix longer than a page.
+    for index in 0..35 {
+        let state = if index == 34 {
+            "blocked"
+        } else if index % 2 == 0 {
+            "done"
+        } else {
+            "quarantine"
+        };
+        work::Entity::insert(work::ActiveModel {
+            family: Set("copies".into()),
+            object_id: Set(format!("{index:064}")),
+            ordinal: Set(0),
+            workspace_id: Set("ws".into()),
+            incarnation: Set(format!("incarnation-{index}")),
+            requested_revision: Set("retained".into()),
+            pass_revision: Set("retained".into()),
+            state: Set(state.into()),
+            due_at: Set(None),
+            seed_version: Set(0),
+            ..Default::default()
+        })
+        .exec_without_returning(&f.store.connection)
+        .await
+        .unwrap();
+    }
+    let before = work::Entity::find()
+        .order_by_asc(work::Column::ObjectId)
+        .all(&f.store.connection)
+        .await
+        .unwrap();
+    let mut after = Default::default();
+    for last in [15, 31, 34] {
+        f.routes.reset();
+        after = f
+            .store
+            .recover_html_preview_io_blocked(&after)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after, ("copies".into(), format!("{last:064}"), 0));
+        let (reads, writes) = f.routes.counts();
+        assert_eq!(reads, 1);
+        assert_eq!(writes, usize::from(last == 34));
+    }
+    f.routes.reset();
+    assert!(
+        f.store
+            .recover_html_preview_io_blocked(&after)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(f.routes.counts(), (1, 0));
+    let after_rows = work::Entity::find()
+        .order_by_asc(work::Column::ObjectId)
+        .all(&f.store.connection)
+        .await
+        .unwrap();
+    assert_eq!(&after_rows[..34], &before[..34]);
+    assert_eq!(after_rows[34].state, "ready");
+    assert!(after_rows[34].due_at.is_some());
+    assert_eq!(after_rows[34].incarnation, before[34].incarnation);
+}

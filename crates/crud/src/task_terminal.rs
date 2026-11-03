@@ -432,9 +432,45 @@ impl CrudStore {
         &self,
         prepared: PreparedTaskTerminalTransition,
     ) -> Result<TaskTerminalCommitOutcome> {
-        // Finish reconciliation includes both commit and fresh preparation;
-        // heap-allocate that state machine on ordinary Gateway worker stacks.
-        Box::pin(self.commit_task_terminal_transition_inner(prepared)).await
+        self.background_change(
+            "tasks.fanout",
+            async {
+                self.background_changes(
+                    &[
+                        "tasks.review",
+                        "recovery.control",
+                        "recovery.ledger",
+                        "recovery.effects",
+                        "recovery.effects.retry",
+                        "recovery.effects.retention",
+                    ],
+                    async {
+                        self.track_task_scheduler(
+                            async {
+                                // Finish reconciliation includes both commit and fresh preparation;
+                                // heap-allocate that state machine on ordinary Gateway worker stacks.
+                                Box::pin(self.commit_task_terminal_transition_inner(prepared)).await
+                            },
+                            |outcome, changes| {
+                                changes.record_committed_events(&outcome.events)
+                                    || outcome.status == TaskTerminalCommitStatus::Applied
+                            },
+                            |outcome, wait| wait.finish_events(&outcome.events),
+                        )
+                        .await
+                    },
+                    |outcome| crate::task_scheduler::task_review_changed(&outcome.events),
+                )
+                .await
+            },
+            |outcome| {
+                outcome
+                    .events
+                    .iter()
+                    .any(|event| event.append_status.is_inserted())
+            },
+        )
+        .await
     }
 
     async fn commit_task_terminal_transition_inner(

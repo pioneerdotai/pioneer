@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::fs;
 
 use crate::error::{ArtifactError, ArtifactResult};
@@ -65,7 +65,7 @@ fn output_dir_is_active(path: &Path) -> bool {
         .unwrap_or(true)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArtifactOutputDirGcCandidate {
     pub thread_id: String,
     pub turn_id: String,

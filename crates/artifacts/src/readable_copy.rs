@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::fs;
 
 use crate::error::{ArtifactError, ArtifactResult};
@@ -9,7 +9,7 @@ use crate::ids::{path_segment, workspace_segment};
 
 pub const ARTIFACT_READABLE_COPY_DIR_NAME: &str = "materialized";
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArtifactReadableCopyGcCandidate {
     pub copy_id: String,
     pub relative_path: String,

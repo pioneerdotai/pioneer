@@ -490,6 +490,33 @@ async fn production_api_empty_queue_uses_one_maintenance_read_without_writer() -
     assert_eq!(m.jobs_examined, 0);
     assert_eq!(f.observer.reads.load(Ordering::SeqCst) - reads, 1);
     assert_eq!(f.observer.writes.load(Ordering::SeqCst), writes);
+    let due = 1_900_000_000_123_456_i64;
+    job::Entity::insert(job::ActiveModel {
+        turn_id: Set("real-microsecond-clock".into()),
+        state: Set("queued".into()),
+        available_at: Set(due),
+        ..Default::default()
+    })
+    .exec(&f.db)
+    .await?;
+    let at = f.store.next_native_event_cleanup_deadline().await?.unwrap();
+    assert_eq!(
+        at.timestamp_micros(),
+        due,
+        "queue clock is neither seconds nor milliseconds"
+    );
+    job::Entity::update_many()
+        .col_expr(job::Column::State, Expr::val("waiting"))
+        .filter(job::Column::TurnId.eq("real-microsecond-clock"))
+        .exec(&f.db)
+        .await?;
+    assert!(
+        f.store
+            .next_native_event_cleanup_deadline()
+            .await?
+            .is_none(),
+        "blocked dependency is not an overdue timer"
+    );
     Ok(())
 }
 #[tokio::test]

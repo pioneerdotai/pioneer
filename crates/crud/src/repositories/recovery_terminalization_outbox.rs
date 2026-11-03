@@ -81,6 +81,35 @@ pub async fn enqueue_for_terminal_job<C: ConnectionTrait>(
     Ok(())
 }
 
+/// Exact selected job only; caller owns the serialized short transaction.
+/// Revalidate the auditor's terminal/unresolved/missing predicates at commit.
+pub async fn enqueue_missing_for_job<C: ConnectionTrait>(
+    db: &C,
+    id: &str,
+    now: DateTimeWithTimeZone,
+) -> Result<bool> {
+    let Some(job) = recovery_job::Entity::find_by_id(id)
+        .filter(recovery_job::Column::Status.is_in(["failed", "exhausted", "blocked"]))
+        .filter(recovery_job::Column::ResolutionPending.eq(true))
+        .one(db)
+        .await?
+    else {
+        return Ok(false);
+    };
+    if recovery_terminalization_outbox::Entity::find_by_id(id)
+        .select_only()
+        .column(recovery_terminalization_outbox::Column::RecoveryJobId)
+        .into_tuple::<String>()
+        .one(db)
+        .await?
+        .is_some()
+    {
+        return Ok(false);
+    }
+    enqueue_for_terminal_job(db, &job, now).await?;
+    Ok(true)
+}
+
 pub async fn claim_due<C: ConnectionTrait>(
     db: &C,
     now: DateTimeWithTimeZone,

@@ -36,13 +36,13 @@ pub enum OriginKind {
     Fallback,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct LimitOrigin {
     pub kind: OriginKind,
     pub expression: String,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct CatalogModel {
     pub id: String,
@@ -61,7 +61,7 @@ pub struct CatalogModel {
     pub metadata: BTreeMap<String, Value>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 struct ModelOrigins {
     context_window: LimitOrigin,
@@ -74,7 +74,7 @@ struct ModelOrigins {
     tool_calling: Option<bool>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 struct InputLimit {
     value: u64,
@@ -582,8 +582,15 @@ impl std::fmt::Display for ModelCatalogUnavailable {
 }
 impl std::error::Error for ModelCatalogUnavailable {}
 
-#[derive(Default)]
-struct CatalogStore(RwLock<Option<Arc<ModelCatalog>>>);
+struct CatalogStore(
+    RwLock<Option<Arc<ModelCatalog>>>,
+    tokio::sync::watch::Sender<u64>,
+);
+impl Default for CatalogStore {
+    fn default() -> Self {
+        Self(RwLock::new(None), tokio::sync::watch::channel(0).0)
+    }
+}
 impl CatalogStore {
     fn snapshot(&self) -> anyhow::Result<Arc<ModelCatalog>> {
         self.0
@@ -593,12 +600,49 @@ impl CatalogStore {
             .ok_or_else(|| ModelCatalogUnavailable.into())
     }
     fn publish(&self, catalog: ModelCatalog) {
-        *self.0.write().expect("model catalog lock") = Some(Arc::new(catalog));
+        let next = Arc::new(catalog);
+        loop {
+            let old = self.0.read().expect("model catalog lock").clone();
+            // Full semantic comparison happens outside the publication lock.
+            // snapshot_id intentionally retains its existing models-only meaning.
+            let changed = old.as_ref().is_none_or(|old| {
+                old.models != next.models
+                    || old.origins != next.origins
+                    || old.tool_capabilities != next.tool_capabilities
+            });
+            {
+                let mut current = self.0.write().expect("model catalog lock");
+                let same = match (&*current, &old) {
+                    (Some(current), Some(old)) => Arc::ptr_eq(current, old),
+                    (None, None) => true,
+                    _ => false,
+                };
+                if !same {
+                    continue;
+                }
+                *current = Some(next.clone());
+            }
+            if changed {
+                self.1.send_modify(|generation| {
+                    *generation = generation
+                        .checked_add(1)
+                        .expect("catalog publication generation exhausted")
+                });
+            }
+            break;
+        }
     }
 }
 fn catalog_store() -> &'static CatalogStore {
     static STORE: OnceLock<CatalogStore> = OnceLock::new();
     STORE.get_or_init(CatalogStore::default)
+}
+
+/// Payload-free retained publication hints for background dependents. Each
+/// subscriber has an independent cursor; callers reload the validated snapshot.
+/// Identical semantic publications do not reopen a settled dependency.
+pub fn subscribe_model_catalog_changes() -> tokio::sync::watch::Receiver<u64> {
+    catalog_store().1.subscribe()
 }
 
 /// A validated, downloaded catalog is required; absence never supplies synthetic limits.
@@ -806,6 +850,54 @@ mod tests {
                 .limits("custom", "unknown")
                 .context_window,
             128_000
+        );
+    }
+
+    #[test]
+    fn dependency_subscription_retains_only_semantic_catalog_changes() {
+        let store = CatalogStore::default();
+        let mut changes = store.1.subscribe();
+        let catalog = reasoning_catalog(serde_json::json!({"off":"none"}));
+        let snapshot = catalog.snapshot_id().to_owned();
+        store.publish(reasoning_catalog(serde_json::json!({"off":"none"})));
+        assert!(
+            changes.has_changed().unwrap(),
+            "unavailable to available is a dependency release"
+        );
+        changes.borrow_and_update();
+        store.publish(reasoning_catalog(serde_json::json!({"off":"none"})));
+        assert!(
+            !changes.has_changed().unwrap(),
+            "identical refresh must leave waiting owners parked"
+        );
+        let mut changed = catalog;
+        changed
+            .origins
+            .get_mut("openai")
+            .unwrap()
+            .get_mut("aurora-unlisted-927")
+            .unwrap()
+            .input_limit
+            .as_mut()
+            .unwrap()
+            .value = 23000;
+        assert_eq!(
+            changed.snapshot_id(),
+            snapshot,
+            "existing models-only identity is unchanged"
+        );
+        store.publish(changed);
+        assert!(
+            changes.has_changed().unwrap(),
+            "provenance/input limits affect history admission too"
+        );
+        assert_eq!(
+            store
+                .snapshot()
+                .unwrap()
+                .limits("openai", "aurora-unlisted-927")
+                .max_input,
+            Some(23000)
         );
     }
 

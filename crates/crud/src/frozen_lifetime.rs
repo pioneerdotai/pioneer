@@ -12,36 +12,93 @@ use std::{
 mod stream;
 pub(crate) use stream::FrozenRootStream;
 
-pub(crate) type ReaderCounts = Arc<Mutex<BTreeMap<String, usize>>>;
+#[derive(Default)]
+pub(crate) struct ReaderState {
+    pub count: usize,
+    waiting: u8,
+}
+pub(crate) type ReaderCounts = Arc<Mutex<BTreeMap<String, ReaderState>>>;
 
-#[derive(Debug)]
+/// Record a real refused cleanup while holding the same short count mutex as
+/// acquisition/release. Ordinary read completion does not invalidate domains.
+pub(crate) fn held_for_cleanup(readers: &ReaderCounts, manifest: &str, lane: u8) -> bool {
+    let mut readers = readers
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(state) = readers.get_mut(manifest) {
+        state.waiting |= lane;
+        true
+    } else {
+        false
+    }
+}
+pub(crate) fn retention_held_keys(readers: &ReaderCounts) -> Vec<String> {
+    let mut readers = readers
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    readers
+        .iter_mut()
+        .take(65)
+        .map(|(key, state)| {
+            state.waiting |= 2;
+            key.clone()
+        })
+        .collect()
+}
+
 pub struct FrozenReadHold {
     readers: ReaderCounts,
     manifest: String,
+    released: [Arc<pioneer_sqlite::background::Wake>; 2],
+}
+impl std::fmt::Debug for FrozenReadHold {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FrozenReadHold").finish_non_exhaustive()
+    }
 }
 impl FrozenReadHold {
-    pub(crate) fn register(readers: &ReaderCounts, manifest: &str) -> Self {
-        *readers
+    pub(crate) fn register(
+        readers: &ReaderCounts,
+        manifest: &str,
+        released: [Arc<pioneer_sqlite::background::Wake>; 2],
+    ) -> Self {
+        readers
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .entry(manifest.to_owned())
-            .or_default() += 1;
+            .or_default()
+            .count += 1;
         Self {
             readers: readers.clone(),
             manifest: manifest.to_owned(),
+            released,
         }
     }
 }
 impl Drop for FrozenReadHold {
     fn drop(&mut self) {
-        let mut readers = self
-            .readers
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(count) = readers.get_mut(&self.manifest) {
-            *count -= 1;
-            if *count == 0 {
-                readers.remove(&self.manifest);
+        let last = {
+            let mut readers = self
+                .readers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(count) = readers.get_mut(&self.manifest) {
+                count.count -= 1;
+                if count.count == 0 {
+                    readers
+                        .remove(&self.manifest)
+                        .map_or(0, |state| state.waiting)
+                } else {
+                    0
+                }
+            } else {
+                0
+            }
+        };
+        // Release the count mutex before publishing; never query in Drop.
+        for (lane, wake) in self.released.iter().enumerate() {
+            if last & (1 << lane) != 0 {
+                wake.dependency_released();
             }
         }
     }
@@ -317,6 +374,12 @@ pub(crate) async fn exact_header<C: ConnectionTrait>(
 }
 
 impl crate::CrudStore {
+    pub(crate) fn frozen_release_wakes(&self) -> [Arc<pioneer_sqlite::background::Wake>; 2] {
+        [
+            self.background_work("storage.frozen"),
+            self.background_work("storage.html.retention"),
+        ]
+    }
     pub(crate) async fn acquire_frozen_header(
         &self,
         workspace: &str,
@@ -325,7 +388,11 @@ impl crate::CrudStore {
         self.run_serialized_write(|| async {
             let tx = self.connection.begin().await?;
             let header = exact_header(&tx, workspace, descriptor).await?;
-            let hold = FrozenReadHold::register(&self.frozen_readers, &descriptor.manifest_id);
+            let hold = FrozenReadHold::register(
+                &self.frozen_readers,
+                &descriptor.manifest_id,
+                self.frozen_release_wakes(),
+            );
             tx.commit().await?;
             Ok((header, hold))
         })
@@ -457,13 +524,41 @@ mod tests {
     fn reader_drop_releases_same_clone_family_without_database_cleanup() {
         let readers: ReaderCounts = Default::default();
         let scoped = readers.clone();
-        let first = FrozenReadHold::register(&readers, "m");
-        let second = FrozenReadHold::register(&scoped, "m");
-        assert_eq!(readers.lock().unwrap().get("m"), Some(&2));
+        let released = [
+            Arc::new(pioneer_sqlite::background::Wake::default()),
+            Arc::new(pioneer_sqlite::background::Wake::default()),
+        ];
+        let owner = released[0].acquire().unwrap();
+        let observed = owner.observe();
+        assert!(owner.publish(observed, pioneer_sqlite::background::Plan::Dormant));
+        let ordinary = FrozenReadHold::register(&readers, "read-only", released.clone());
+        drop(ordinary);
+        assert!(
+            owner.publish(observed, pioneer_sqlite::background::Plan::Dormant),
+            "ordinary reads with no refused cleanup must not manufacture new work"
+        );
+        let first = FrozenReadHold::register(&readers, "m", released.clone());
+        let second = FrozenReadHold::register(&scoped, "m", released);
+        assert_eq!(
+            readers.lock().unwrap().get("m").map(|state| state.count),
+            Some(2)
+        );
         drop(first);
-        assert_eq!(scoped.lock().unwrap().get("m"), Some(&1));
+        assert_eq!(
+            scoped.lock().unwrap().get("m").map(|state| state.count),
+            Some(1)
+        );
+        assert!(
+            owner.publish(observed, pioneer_sqlite::background::Plan::Dormant),
+            "partial release is not final dependency release"
+        );
+        assert!(held_for_cleanup(&readers, "m", 1));
         drop(second);
         assert!(readers.lock().unwrap().is_empty());
+        assert!(
+            !owner.publish(observed, pioneer_sqlite::background::Plan::Dormant),
+            "last release invalidates the old cleanup observation"
+        );
     }
     #[test]
     fn root_shapes_distinguish_no_basis_from_malformed_new_basis() {

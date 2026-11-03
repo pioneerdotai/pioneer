@@ -12,6 +12,6 @@ pub(crate) use admission::{read_observer, write_observer};
 #[cfg(test)]
 pub(crate) use connection::initialize;
 pub(crate) use connection::{
-    gateway_database_path, initialize_existing_for_operations, initialize_with_startup,
-    inspect_applied_migration_names,
+    gateway_database_path, initialize_existing_for_inspection, initialize_existing_for_operations,
+    initialize_with_startup, inspect_applied_migration_names,
 };

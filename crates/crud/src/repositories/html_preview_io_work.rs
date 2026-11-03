@@ -398,6 +398,17 @@ impl CrudStore {
         now_ms: i64,
         lease_ms: i64,
     ) -> Result<Option<HtmlPreviewIoClaim>> {
+        self.claim_html_preview_io_work_with_deadline(now_ms, lease_ms)
+            .await
+            .map(|(claim, _)| claim)
+    }
+    /// One indexed candidate discovery includes a future retry/claim clock.
+    /// Terminal/blocked rows have NULL due_at and require a source transition.
+    pub async fn claim_html_preview_io_work_with_deadline(
+        &self,
+        now_ms: i64,
+        lease_ms: i64,
+    ) -> Result<(Option<HtmlPreviewIoClaim>, Option<i64>)> {
         self.claim_html_preview_io_work_kind(now_ms, lease_ms, false)
             .await
     }
@@ -406,10 +417,10 @@ impl CrudStore {
         now_ms: i64,
         lease_ms: i64,
         seed_only: bool,
-    ) -> Result<Option<HtmlPreviewIoClaim>> {
+    ) -> Result<(Option<HtmlPreviewIoClaim>, Option<i64>)> {
         ensure!(lease_ms > 0, "invalid HTML IO lease");
         let Some(candidate) = work::Entity::find()
-            .filter(work::Column::DueAt.lte(now_ms))
+            .filter(work::Column::DueAt.is_not_null())
             .filter(work::Column::State.is_in(["ready", "timed", "running"]))
             .filter(if seed_only {
                 Condition::any()
@@ -425,49 +436,61 @@ impl CrudStore {
             .one(&self.connection)
             .await?
         else {
-            return Ok(None);
+            return Ok((None, None));
         };
         HtmlPreviewIoState::try_from(candidate.state.as_str())?;
-        self.run_serialized_write(|| async {
-            let tx = self.connection.begin().await?;
-            let mut update = work::Entity::update_many()
-                .filter(key(&candidate))
-                .filter(work::Column::Incarnation.eq(&candidate.incarnation))
-                .filter(work::Column::RequestedRevision.eq(&candidate.requested_revision))
-                .filter(work::Column::State.eq(&candidate.state))
-                .filter(work::Column::DueAt.lte(now_ms))
-                .col_expr(
-                    work::Column::State,
-                    Expr::val(HtmlPreviewIoState::Running.as_str()),
-                )
-                .col_expr(work::Column::ClaimToken, Expr::val(token()))
-                .col_expr(
-                    work::Column::DueAt,
-                    Expr::val(now_ms.saturating_add(lease_ms)),
-                );
-            // A reclaimed in-progress pass preserves its immutable frontier.
-            if !candidate.family.starts_with("seed_") {
-                update = update.col_expr(
-                    work::Column::PassRevision,
-                    Expr::val(candidate.requested_revision.clone()),
-                );
-            }
-            if update.exec(&tx).await?.rows_affected != 1 {
-                tx.rollback().await?;
-                anyhow::bail!("HTML IO claim contention requires fresh discovery");
-            }
-            let row = work::Entity::find_by_id((
-                candidate.family.clone(),
-                candidate.object_id.clone(),
-                candidate.ordinal,
-            ))
-            .one(&tx)
-            .await?
-            .expect("claimed row");
-            tx.commit().await?;
-            Ok(Some(HtmlPreviewIoClaim { row }))
-        })
-        .await
+        let due = candidate
+            .due_at
+            .ok_or_else(|| anyhow::anyhow!("runnable HTML IO without deadline"))?;
+        if due > now_ms {
+            return Ok((None, Some(due)));
+        }
+        let change = self.background_work("storage.html.io").changing();
+        let result = self
+            .run_serialized_write(|| async {
+                let tx = self.connection.begin().await?;
+                let mut update = work::Entity::update_many()
+                    .filter(key(&candidate))
+                    .filter(work::Column::Incarnation.eq(&candidate.incarnation))
+                    .filter(work::Column::RequestedRevision.eq(&candidate.requested_revision))
+                    .filter(work::Column::State.eq(&candidate.state))
+                    .filter(work::Column::DueAt.lte(now_ms))
+                    .col_expr(
+                        work::Column::State,
+                        Expr::val(HtmlPreviewIoState::Running.as_str()),
+                    )
+                    .col_expr(work::Column::ClaimToken, Expr::val(token()))
+                    .col_expr(
+                        work::Column::DueAt,
+                        Expr::val(now_ms.saturating_add(lease_ms)),
+                    );
+                // A reclaimed in-progress pass preserves its immutable frontier.
+                if !candidate.family.starts_with("seed_") {
+                    update = update.col_expr(
+                        work::Column::PassRevision,
+                        Expr::val(candidate.requested_revision.clone()),
+                    );
+                }
+                if update.exec(&tx).await?.rows_affected != 1 {
+                    tx.rollback().await?;
+                    anyhow::bail!("HTML IO claim contention requires fresh discovery");
+                }
+                let row = work::Entity::find_by_id((
+                    candidate.family.clone(),
+                    candidate.object_id.clone(),
+                    candidate.ordinal,
+                ))
+                .one(&tx)
+                .await?
+                .expect("claimed row");
+                tx.commit().await?;
+                Ok(Some(HtmlPreviewIoClaim { row }))
+            })
+            .await;
+        if let Ok(claim) = &result {
+            change.finish(claim.is_some());
+        }
+        result.map(|claim| (claim, None))
     }
     pub async fn html_preview_io_seed_startup_quantum(&self) -> Result<bool> {
         if self.html_preview_io_seed_complete().await? {
@@ -476,6 +499,7 @@ impl CrudStore {
         if let Some(claim) = self
             .claim_html_preview_io_work_kind(chrono::Utc::now().timestamp_millis(), 300_000, true)
             .await?
+            .0
         {
             return self.html_preview_io_seed_quantum(&claim).await;
         }
@@ -487,73 +511,80 @@ impl CrudStore {
         outcome: HtmlPreviewIoOutcome,
         now_ms: i64,
     ) -> Result<bool> {
-        let obsolete = if matches!(outcome, HtmlPreviewIoOutcome::Done) {
-            Some(self.prepare_html_preview_io_obsolete(claim).await?)
-        } else {
-            None
-        };
-        self.run_serialized_write(|| async {
-            let tx = self.connection.begin().await?;
-            if matches!(outcome, HtmlPreviewIoOutcome::Done) {
-                if !obsolete
-                    .as_ref()
-                    .expect("prepared proof")
-                    .revalidate(&tx)
-                    .await?
-                {
-                    tx.rollback().await?;
-                    return Ok(false);
-                }
-                let changed = ack(&tx, claim).await?;
-                tx.commit().await?;
-                return Ok(changed);
-            }
-            let (state, due, error) = match outcome {
-                HtmlPreviewIoOutcome::Retry => (
-                    HtmlPreviewIoState::Timed.as_str(),
-                    Some(now_ms.saturating_add(60_000)),
-                    Some(HtmlPreviewIoErrorClass::Transient.as_str()),
-                ),
-                HtmlPreviewIoOutcome::Blocked => (
-                    HtmlPreviewIoState::Blocked.as_str(),
-                    None,
-                    Some(HtmlPreviewIoErrorClass::LocalHold.as_str()),
-                ),
-                HtmlPreviewIoOutcome::Quarantine => (
-                    HtmlPreviewIoState::Quarantine.as_str(),
-                    None,
-                    Some(HtmlPreviewIoErrorClass::InvalidAuthority.as_str()),
-                ),
-                HtmlPreviewIoOutcome::Done => unreachable!(),
-            };
-            let changed = work::Entity::update_many()
-                .filter(fence(&claim.row))
-                .filter(work::Column::RequestedRevision.eq(&claim.row.requested_revision))
-                .col_expr(work::Column::State, Expr::val(state))
-                .col_expr(work::Column::DueAt, Expr::val(due))
-                .col_expr(work::Column::ErrorClass, Expr::val(error))
-                .exec(&tx)
-                .await?
-                .rows_affected
-                == 1;
-            // A producer racing a failed preparation must remain immediately due.
-            if !changed {
-                work::Entity::update_many()
-                    .filter(fence(&claim.row))
-                    .col_expr(
-                        work::Column::State,
-                        Expr::val(HtmlPreviewIoState::Ready.as_str()),
-                    )
-                    .col_expr(
-                        work::Column::DueAt,
-                        Expr::val(chrono::Utc::now().timestamp_millis()),
-                    )
-                    .exec(&tx)
-                    .await?;
-            }
-            tx.commit().await?;
-            Ok(changed)
-        })
+        self.background_changes(
+            &["storage.html.io"],
+            async {
+                let obsolete = if matches!(outcome, HtmlPreviewIoOutcome::Done) {
+                    Some(self.prepare_html_preview_io_obsolete(claim).await?)
+                } else {
+                    None
+                };
+                self.run_serialized_write(|| async {
+                    let tx = self.connection.begin().await?;
+                    if matches!(outcome, HtmlPreviewIoOutcome::Done) {
+                        if !obsolete
+                            .as_ref()
+                            .expect("prepared proof")
+                            .revalidate(&tx)
+                            .await?
+                        {
+                            tx.rollback().await?;
+                            return Ok(false);
+                        }
+                        let changed = ack(&tx, claim).await?;
+                        tx.commit().await?;
+                        return Ok(changed);
+                    }
+                    let (state, due, error) = match outcome {
+                        HtmlPreviewIoOutcome::Retry => (
+                            HtmlPreviewIoState::Timed.as_str(),
+                            Some(now_ms.saturating_add(60_000)),
+                            Some(HtmlPreviewIoErrorClass::Transient.as_str()),
+                        ),
+                        HtmlPreviewIoOutcome::Blocked => (
+                            HtmlPreviewIoState::Blocked.as_str(),
+                            None,
+                            Some(HtmlPreviewIoErrorClass::LocalHold.as_str()),
+                        ),
+                        HtmlPreviewIoOutcome::Quarantine => (
+                            HtmlPreviewIoState::Quarantine.as_str(),
+                            None,
+                            Some(HtmlPreviewIoErrorClass::InvalidAuthority.as_str()),
+                        ),
+                        HtmlPreviewIoOutcome::Done => unreachable!(),
+                    };
+                    let changed = work::Entity::update_many()
+                        .filter(fence(&claim.row))
+                        .filter(work::Column::RequestedRevision.eq(&claim.row.requested_revision))
+                        .col_expr(work::Column::State, Expr::val(state))
+                        .col_expr(work::Column::DueAt, Expr::val(due))
+                        .col_expr(work::Column::ErrorClass, Expr::val(error))
+                        .exec(&tx)
+                        .await?
+                        .rows_affected
+                        == 1;
+                    // A producer racing a failed preparation must remain immediately due.
+                    if !changed {
+                        work::Entity::update_many()
+                            .filter(fence(&claim.row))
+                            .col_expr(
+                                work::Column::State,
+                                Expr::val(HtmlPreviewIoState::Ready.as_str()),
+                            )
+                            .col_expr(
+                                work::Column::DueAt,
+                                Expr::val(chrono::Utc::now().timestamp_millis()),
+                            )
+                            .exec(&tx)
+                            .await?;
+                    }
+                    tx.commit().await?;
+                    Ok(changed)
+                })
+                .await
+            },
+            |changed| *changed,
+        )
         .await
     }
     /// Typed repair request belongs in the repair's transaction, before commit.
@@ -589,8 +620,8 @@ impl CrudStore {
         }
         Ok(true)
     }
-    /// Bounded traversal of the queue, including quarantined/terminal records,
-    /// avoids an unindexed search through an arbitrarily large parked set.
+    /// Bounded raw-key traversal of parked obligations. Terminal keys advance
+    /// this admitted pass without writer work; EOF stays closed until rediscovery.
     pub async fn recover_html_preview_io_blocked(
         &self,
         after: &(String, String, i64),
@@ -604,6 +635,8 @@ impl CrudStore {
             .column(work::Column::Ordinal)
             .column(work::Column::State)
             .column(work::Column::Incarnation)
+            // No state locator exists: filter states AFTER the raw-key LIMIT,
+            // so terminal history cannot turn one reader hold into a full sweep.
             .filter(after_key(after))
             .order_by_asc(work::Column::Family)
             .order_by_asc(work::Column::ObjectId)
@@ -619,7 +652,8 @@ impl CrudStore {
             if state != "blocked" {
                 continue;
             }
-            work::Entity::update_many()
+            let change = self.background_work("storage.html.io").changing();
+            let changed = work::Entity::update_many()
                 .filter(work::Column::Family.eq(family))
                 .filter(work::Column::ObjectId.eq(id))
                 .filter(work::Column::Ordinal.eq(ordinal))
@@ -634,7 +668,10 @@ impl CrudStore {
                     Expr::val(chrono::Utc::now().timestamp_millis()),
                 )
                 .exec(&self.connection)
-                .await?;
+                .await?
+                .rows_affected
+                > 0;
+            change.finish(changed);
         }
         Ok(next)
     }
@@ -659,307 +696,323 @@ impl CrudStore {
     /// A long TEXT key is handled alone; no byte filter skips source IDs.
     /// Metadata preparation happens on the reader before the fenced writer.
     pub async fn html_preview_io_seed_quantum(&self, claim: &HtmlPreviewIoClaim) -> Result<bool> {
-        let witness = claim.row.family == "seed_witness";
-        ensure!(witness || claim.row.family == "seed_copies", "not a seed");
-        let mut row = claim.row.clone();
-        if row.upper_id.is_none() {
-            let initialized = self
-                .run_serialized_write(|| async {
-                    let tx = self.connection.begin().await?;
-                    let Some(current) = work::Entity::find()
-                        .filter(fence(&row))
-                        .filter(work::Column::UpperId.is_null())
-                        .lock_exclusive()
-                        .one(&tx)
-                        .await?
-                    else {
-                        tx.rollback().await?;
-                        return Ok(None);
-                    };
-                    let upper = if witness {
-                        result_row::Entity::find()
-                            .select_only()
-                            .column(result_row::Column::ManifestId)
-                            .column(result_row::Column::Ordinal)
-                            .order_by_desc(result_row::Column::ManifestId)
-                            .order_by_desc(result_row::Column::Ordinal)
-                            .into_tuple::<(String, i64)>()
-                            .one(&tx)
-                            .await?
-                            .unwrap_or_default()
-                    } else {
-                        (
-                            artifact::Entity::find()
-                                .select_only()
-                                .column(artifact::Column::Id)
-                                .order_by_desc(artifact::Column::Id)
-                                .into_tuple::<String>()
-                                .one(&tx)
-                                .await?
-                                .unwrap_or_default(),
-                            0,
-                        )
-                    };
-                    if work::Entity::update_many()
-                        .filter(fence(&row))
-                        .filter(work::Column::UpperId.is_null())
-                        .filter(work::Column::RequestedRevision.eq(&current.requested_revision))
-                        .col_expr(
-                            work::Column::PassRevision,
-                            Expr::val(current.requested_revision.clone()),
-                        )
-                        .col_expr(work::Column::UpperId, Expr::val(upper.0.clone()))
-                        .col_expr(work::Column::UpperOrdinal, Expr::val(upper.1))
-                        .exec(&tx)
-                        .await?
-                        .rows_affected
-                        != 1
-                    {
-                        tx.rollback().await?;
-                        return Ok(None);
-                    }
-                    tx.commit().await?;
-                    Ok(Some((upper, current.requested_revision)))
-                })
-                .await?;
-            let Some(((id, ordinal), revision)) = initialized else {
-                return Ok(false);
-            };
-            row.pass_revision = revision.clone();
-            row.requested_revision = revision;
-            row.upper_id = Some(id);
-            row.upper_ordinal = Some(ordinal);
-        }
-        let after = row.cursor_id.clone().unwrap_or_default();
-        let ordinal = row.cursor_ordinal.unwrap_or(-1);
-        let upper = row.upper_id.as_deref().expect("frontier");
-        let mut source = None;
-        if witness {
-            let key = result_row::Entity::find()
-                .select_only()
-                .column(result_row::Column::ManifestId)
-                .column(result_row::Column::Ordinal)
-                .filter(
-                    Condition::any()
-                        .add(result_row::Column::ManifestId.gt(&after))
-                        .add(
-                            Condition::all()
-                                .add(result_row::Column::ManifestId.eq(&after))
-                                .add(result_row::Column::Ordinal.gt(ordinal)),
-                        ),
-                )
-                .filter(
-                    Condition::any()
-                        .add(result_row::Column::ManifestId.lt(upper))
-                        .add(
-                            Condition::all()
-                                .add(result_row::Column::ManifestId.eq(upper))
-                                .add(
-                                    result_row::Column::Ordinal.lte(row.upper_ordinal.unwrap_or(0)),
-                                ),
-                        ),
-                )
-                .order_by_asc(result_row::Column::ManifestId)
-                .order_by_asc(result_row::Column::Ordinal)
-                .limit(1)
-                .into_tuple::<(String, i64)>()
-                .one(&self.connection)
-                .await?;
-            if let Some((id, n)) = key {
-                let header = history::Entity::find_by_id(&id)
-                    .select_only()
-                    .column(history::Column::WorkspaceId)
-                    .column(history::Column::Expired)
-                    .into_tuple::<(String, i64)>()
-                    .one(&self.connection)
-                    .await?;
-                let digest = result_row::Entity::find_by_id((id.clone(), n))
-                    .select_only()
-                    .column(result_row::Column::ArchiveWireSha256)
-                    .into_tuple::<Option<String>>()
-                    .one(&self.connection)
-                    .await?;
-                let pending = digest.is_some_and(|hash| hash.is_none())
-                    && header.as_ref().is_none_or(|(_, expired)| *expired == 0);
-                source = Some(SeedSource {
-                    id,
-                    ordinal: n,
-                    workspace: header.map(|(ws, _)| ws).unwrap_or_default(),
-                    metadata: None,
-                    obligation: pending,
-                });
-            }
-        } else {
-            // Traverse PKs without a workspace/metadata search hidden before LIMIT.
-            let id = artifact::Entity::find()
-                .select_only()
-                .column(artifact::Column::Id)
-                .filter(artifact::Column::Id.gt(&after))
-                .filter(artifact::Column::Id.lte(upper))
-                .order_by_asc(artifact::Column::Id)
-                .limit(1)
-                .into_tuple::<String>()
-                .one(&self.connection)
-                .await?;
-            if let Some(id) = id {
-                let prepared = artifact::Entity::find_by_id(&id)
-                    .select_only()
-                    .column(artifact::Column::WorkspaceId)
-                    .column(artifact::Column::MetadataJson)
-                    .filter(artifact::Column::CreatedByKind.eq("tool"))
-                    .filter(artifact::Column::CreatedByActorId.eq("html_preview"))
-                    .filter(artifact::Column::CurrentVersionId.is_null())
-                    .filter(
-                        io_bytes(
-                            self.connection.get_database_backend(),
-                            Expr::col(artifact::Column::MetadataJson),
-                        )
-                        .lte(1048576),
-                    )
-                    .into_tuple::<(String, String)>()
-                    .one(&self.connection)
-                    .await?;
-                let (workspace, metadata, obligation) = if let Some((ws, metadata)) = prepared {
-                    let obligation = serde_json::from_str::<serde_json::Value>(&metadata)
-                        .ok()
-                        .is_some_and(|m| {
-                            m["htmlTool"]["retention"] == "released"
-                                && m["htmlTool"]["releasedCopies"]
-                                    .as_array()
-                                    .is_some_and(|a| !a.is_empty())
-                        });
-                    (ws, Some(metadata), obligation)
-                } else {
-                    (String::new(), None, false)
-                };
-                source = Some(SeedSource {
-                    id,
-                    ordinal: 0,
-                    workspace,
-                    metadata,
-                    obligation,
-                });
-            }
-        }
-        let locator = source.as_ref().map(|s| HtmlPreviewIoLocator::new(&s.id));
-        self.run_serialized_write(|| async {
-            let tx = self.connection.begin().await?;
-            let mut cursor_fence = fence(&row);
-            cursor_fence = cursor_fence.add(if let Some(id) = &row.cursor_id {
-                work::Column::CursorId.eq(id)
-            } else {
-                work::Column::CursorId.is_null()
-            });
-            cursor_fence = cursor_fence.add(work::Column::UpperId.eq(upper));
-            cursor_fence = cursor_fence.add(if let Some(ordinal) = row.cursor_ordinal {
-                work::Column::CursorOrdinal.eq(ordinal)
-            } else {
-                work::Column::CursorOrdinal.is_null()
-            });
-            cursor_fence = cursor_fence.add(work::Column::UpperOrdinal.eq(row.upper_ordinal));
-
-            ensure!(
-                work::Entity::find()
-                    .filter(cursor_fence.clone())
-                    .lock_exclusive()
-                    .one(&tx)
-                    .await?
-                    .is_some(),
-                "seed cursor fence lost"
-            );
-            if let Some(source) = &source {
-                if source.obligation
-                    && (row.workspace_id.is_empty() || row.workspace_id == source.workspace)
-                {
-                    if let Some(metadata) = &source.metadata {
-                        ensure!(
-                            artifact::Entity::find_by_id(&source.id)
-                                .select_only()
-                                .column(artifact::Column::Id)
-                                .filter(artifact::Column::WorkspaceId.eq(&source.workspace))
-                                .filter(artifact::Column::MetadataJson.eq(metadata))
-                                .filter(artifact::Column::CurrentVersionId.is_null())
+        self.background_changes(
+            &["storage.html.io"],
+            async {
+                let witness = claim.row.family == "seed_witness";
+                ensure!(witness || claim.row.family == "seed_copies", "not a seed");
+                let mut row = claim.row.clone();
+                if row.upper_id.is_none() {
+                    let initialized = self
+                        .run_serialized_write(|| async {
+                            let tx = self.connection.begin().await?;
+                            let Some(current) = work::Entity::find()
+                                .filter(fence(&row))
+                                .filter(work::Column::UpperId.is_null())
                                 .lock_exclusive()
-                                .into_tuple::<String>()
                                 .one(&tx)
                                 .await?
-                                .is_some(),
-                            "seed source changed; retry preparation"
-                        );
-                    } else {
-                        let current = history::Entity::find_by_id(&source.id)
+                            else {
+                                tx.rollback().await?;
+                                return Ok(None);
+                            };
+                            let upper = if witness {
+                                result_row::Entity::find()
+                                    .select_only()
+                                    .column(result_row::Column::ManifestId)
+                                    .column(result_row::Column::Ordinal)
+                                    .order_by_desc(result_row::Column::ManifestId)
+                                    .order_by_desc(result_row::Column::Ordinal)
+                                    .into_tuple::<(String, i64)>()
+                                    .one(&tx)
+                                    .await?
+                                    .unwrap_or_default()
+                            } else {
+                                (
+                                    artifact::Entity::find()
+                                        .select_only()
+                                        .column(artifact::Column::Id)
+                                        .order_by_desc(artifact::Column::Id)
+                                        .into_tuple::<String>()
+                                        .one(&tx)
+                                        .await?
+                                        .unwrap_or_default(),
+                                    0,
+                                )
+                            };
+                            if work::Entity::update_many()
+                                .filter(fence(&row))
+                                .filter(work::Column::UpperId.is_null())
+                                .filter(
+                                    work::Column::RequestedRevision.eq(&current.requested_revision),
+                                )
+                                .col_expr(
+                                    work::Column::PassRevision,
+                                    Expr::val(current.requested_revision.clone()),
+                                )
+                                .col_expr(work::Column::UpperId, Expr::val(upper.0.clone()))
+                                .col_expr(work::Column::UpperOrdinal, Expr::val(upper.1))
+                                .exec(&tx)
+                                .await?
+                                .rows_affected
+                                != 1
+                            {
+                                tx.rollback().await?;
+                                return Ok(None);
+                            }
+                            tx.commit().await?;
+                            Ok(Some((upper, current.requested_revision)))
+                        })
+                        .await?;
+                    let Some(((id, ordinal), revision)) = initialized else {
+                        return Ok(false);
+                    };
+                    row.pass_revision = revision.clone();
+                    row.requested_revision = revision;
+                    row.upper_id = Some(id);
+                    row.upper_ordinal = Some(ordinal);
+                }
+                let after = row.cursor_id.clone().unwrap_or_default();
+                let ordinal = row.cursor_ordinal.unwrap_or(-1);
+                let upper = row.upper_id.as_deref().expect("frontier");
+                let mut source = None;
+                if witness {
+                    let key = result_row::Entity::find()
+                        .select_only()
+                        .column(result_row::Column::ManifestId)
+                        .column(result_row::Column::Ordinal)
+                        .filter(
+                            Condition::any()
+                                .add(result_row::Column::ManifestId.gt(&after))
+                                .add(
+                                    Condition::all()
+                                        .add(result_row::Column::ManifestId.eq(&after))
+                                        .add(result_row::Column::Ordinal.gt(ordinal)),
+                                ),
+                        )
+                        .filter(
+                            Condition::any()
+                                .add(result_row::Column::ManifestId.lt(upper))
+                                .add(
+                                    Condition::all()
+                                        .add(result_row::Column::ManifestId.eq(upper))
+                                        .add(
+                                            result_row::Column::Ordinal
+                                                .lte(row.upper_ordinal.unwrap_or(0)),
+                                        ),
+                                ),
+                        )
+                        .order_by_asc(result_row::Column::ManifestId)
+                        .order_by_asc(result_row::Column::Ordinal)
+                        .limit(1)
+                        .into_tuple::<(String, i64)>()
+                        .one(&self.connection)
+                        .await?;
+                    if let Some((id, n)) = key {
+                        let header = history::Entity::find_by_id(&id)
                             .select_only()
                             .column(history::Column::WorkspaceId)
-                            .lock_exclusive()
-                            .into_tuple::<String>()
-                            .one(&tx)
-                            .await?
-                            .unwrap_or_default();
-                        ensure!(current == source.workspace, "seed witness identity changed");
-                    }
-                    let still_pending = if witness {
-                        result_row::Entity::find_by_id((source.id.clone(), source.ordinal))
+                            .column(history::Column::Expired)
+                            .into_tuple::<(String, i64)>()
+                            .one(&self.connection)
+                            .await?;
+                        let digest = result_row::Entity::find_by_id((id.clone(), n))
                             .select_only()
-                            .column(result_row::Column::ManifestId)
-                            .filter(result_row::Column::ArchiveWireSha256.is_null())
-                            .lock_exclusive()
-                            .into_tuple::<String>()
-                            .one(&tx)
-                            .await?
-                            .is_some()
-                            && history::Entity::find_by_id(&source.id)
-                                .select_only()
-                                .column(history::Column::Expired)
-                                .into_tuple::<i64>()
-                                .one(&tx)
-                                .await?
-                                .is_none_or(|expired| expired == 0)
-                    } else {
-                        true
-                    };
-                    if still_pending {
-                        request_prepared(
-                            &tx,
-                            if witness {
-                                HtmlPreviewIoFamily::Witness
-                            } else {
-                                HtmlPreviewIoFamily::Copies
-                            },
-                            locator.as_ref().expect("prepared locator"),
-                            source.ordinal,
-                            &source.workspace,
-                        )
+                            .column(result_row::Column::ArchiveWireSha256)
+                            .into_tuple::<Option<String>>()
+                            .one(&self.connection)
+                            .await?;
+                        let pending = digest.is_some_and(|hash| hash.is_none())
+                            && header.as_ref().is_none_or(|(_, expired)| *expired == 0);
+                        source = Some(SeedSource {
+                            id,
+                            ordinal: n,
+                            workspace: header.map(|(ws, _)| ws).unwrap_or_default(),
+                            metadata: None,
+                            obligation: pending,
+                        });
+                    }
+                } else {
+                    // Traverse PKs without a workspace/metadata search hidden before LIMIT.
+                    let id = artifact::Entity::find()
+                        .select_only()
+                        .column(artifact::Column::Id)
+                        .filter(artifact::Column::Id.gt(&after))
+                        .filter(artifact::Column::Id.lte(upper))
+                        .order_by_asc(artifact::Column::Id)
+                        .limit(1)
+                        .into_tuple::<String>()
+                        .one(&self.connection)
                         .await?;
+                    if let Some(id) = id {
+                        let prepared = artifact::Entity::find_by_id(&id)
+                            .select_only()
+                            .column(artifact::Column::WorkspaceId)
+                            .column(artifact::Column::MetadataJson)
+                            .filter(artifact::Column::CreatedByKind.eq("tool"))
+                            .filter(artifact::Column::CreatedByActorId.eq("html_preview"))
+                            .filter(artifact::Column::CurrentVersionId.is_null())
+                            .filter(
+                                io_bytes(
+                                    self.connection.get_database_backend(),
+                                    Expr::col(artifact::Column::MetadataJson),
+                                )
+                                .lte(1048576),
+                            )
+                            .into_tuple::<(String, String)>()
+                            .one(&self.connection)
+                            .await?;
+                        let (workspace, metadata, obligation) = if let Some((ws, metadata)) =
+                            prepared
+                        {
+                            let obligation = serde_json::from_str::<serde_json::Value>(&metadata)
+                                .ok()
+                                .is_some_and(|m| {
+                                    m["htmlTool"]["retention"] == "released"
+                                        && m["htmlTool"]["releasedCopies"]
+                                            .as_array()
+                                            .is_some_and(|a| !a.is_empty())
+                                });
+                            (ws, Some(metadata), obligation)
+                        } else {
+                            (String::new(), None, false)
+                        };
+                        source = Some(SeedSource {
+                            id,
+                            ordinal: 0,
+                            workspace,
+                            metadata,
+                            obligation,
+                        });
                     }
                 }
-                ensure!(
-                    work::Entity::update_many()
-                        .filter(cursor_fence)
-                        .col_expr(work::Column::CursorId, Expr::val(source.id.clone()))
-                        .col_expr(work::Column::CursorOrdinal, Expr::val(source.ordinal))
-                        .col_expr(
-                            work::Column::State,
-                            Expr::val(HtmlPreviewIoState::Ready.as_str())
-                        )
-                        .col_expr(
-                            work::Column::DueAt,
-                            Expr::val(chrono::Utc::now().timestamp_millis())
-                        )
-                        .exec(&tx)
-                        .await?
-                        .rows_affected
-                        == 1,
-                    "seed cursor CAS lost"
-                );
-            } else {
-                ensure!(
-                    ack(&tx, &HtmlPreviewIoClaim { row: row.clone() }).await?,
-                    "seed EOF fence lost"
-                );
-            }
-            tx.commit().await?;
-            Ok(true)
-        })
+                let locator = source.as_ref().map(|s| HtmlPreviewIoLocator::new(&s.id));
+                self.run_serialized_write(|| async {
+                    let tx = self.connection.begin().await?;
+                    let mut cursor_fence = fence(&row);
+                    cursor_fence = cursor_fence.add(if let Some(id) = &row.cursor_id {
+                        work::Column::CursorId.eq(id)
+                    } else {
+                        work::Column::CursorId.is_null()
+                    });
+                    cursor_fence = cursor_fence.add(work::Column::UpperId.eq(upper));
+                    cursor_fence = cursor_fence.add(if let Some(ordinal) = row.cursor_ordinal {
+                        work::Column::CursorOrdinal.eq(ordinal)
+                    } else {
+                        work::Column::CursorOrdinal.is_null()
+                    });
+                    cursor_fence =
+                        cursor_fence.add(work::Column::UpperOrdinal.eq(row.upper_ordinal));
+
+                    ensure!(
+                        work::Entity::find()
+                            .filter(cursor_fence.clone())
+                            .lock_exclusive()
+                            .one(&tx)
+                            .await?
+                            .is_some(),
+                        "seed cursor fence lost"
+                    );
+                    if let Some(source) = &source {
+                        if source.obligation
+                            && (row.workspace_id.is_empty() || row.workspace_id == source.workspace)
+                        {
+                            if let Some(metadata) = &source.metadata {
+                                ensure!(
+                                    artifact::Entity::find_by_id(&source.id)
+                                        .select_only()
+                                        .column(artifact::Column::Id)
+                                        .filter(artifact::Column::WorkspaceId.eq(&source.workspace))
+                                        .filter(artifact::Column::MetadataJson.eq(metadata))
+                                        .filter(artifact::Column::CurrentVersionId.is_null())
+                                        .lock_exclusive()
+                                        .into_tuple::<String>()
+                                        .one(&tx)
+                                        .await?
+                                        .is_some(),
+                                    "seed source changed; retry preparation"
+                                );
+                            } else {
+                                let current = history::Entity::find_by_id(&source.id)
+                                    .select_only()
+                                    .column(history::Column::WorkspaceId)
+                                    .lock_exclusive()
+                                    .into_tuple::<String>()
+                                    .one(&tx)
+                                    .await?
+                                    .unwrap_or_default();
+                                ensure!(
+                                    current == source.workspace,
+                                    "seed witness identity changed"
+                                );
+                            }
+                            let still_pending = if witness {
+                                result_row::Entity::find_by_id((source.id.clone(), source.ordinal))
+                                    .select_only()
+                                    .column(result_row::Column::ManifestId)
+                                    .filter(result_row::Column::ArchiveWireSha256.is_null())
+                                    .lock_exclusive()
+                                    .into_tuple::<String>()
+                                    .one(&tx)
+                                    .await?
+                                    .is_some()
+                                    && history::Entity::find_by_id(&source.id)
+                                        .select_only()
+                                        .column(history::Column::Expired)
+                                        .into_tuple::<i64>()
+                                        .one(&tx)
+                                        .await?
+                                        .is_none_or(|expired| expired == 0)
+                            } else {
+                                true
+                            };
+                            if still_pending {
+                                request_prepared(
+                                    &tx,
+                                    if witness {
+                                        HtmlPreviewIoFamily::Witness
+                                    } else {
+                                        HtmlPreviewIoFamily::Copies
+                                    },
+                                    locator.as_ref().expect("prepared locator"),
+                                    source.ordinal,
+                                    &source.workspace,
+                                )
+                                .await?;
+                            }
+                        }
+                        ensure!(
+                            work::Entity::update_many()
+                                .filter(cursor_fence)
+                                .col_expr(work::Column::CursorId, Expr::val(source.id.clone()))
+                                .col_expr(work::Column::CursorOrdinal, Expr::val(source.ordinal))
+                                .col_expr(
+                                    work::Column::State,
+                                    Expr::val(HtmlPreviewIoState::Ready.as_str())
+                                )
+                                .col_expr(
+                                    work::Column::DueAt,
+                                    Expr::val(chrono::Utc::now().timestamp_millis())
+                                )
+                                .exec(&tx)
+                                .await?
+                                .rows_affected
+                                == 1,
+                            "seed cursor CAS lost"
+                        );
+                    } else {
+                        ensure!(
+                            ack(&tx, &HtmlPreviewIoClaim { row: row.clone() }).await?,
+                            "seed EOF fence lost"
+                        );
+                    }
+                    tx.commit().await?;
+                    Ok(true)
+                })
+                .await
+            },
+            |changed| *changed,
+        )
         .await
     }
 }
@@ -1136,11 +1189,8 @@ pub(super) fn io_bytes(backend: sea_orm::DbBackend, value: Expr) -> Expr {
 impl CrudStore {
     /// Retained coalesced hint; callers of transactional repair helpers invoke
     /// notify only after their business transaction has committed and dropped.
-    pub fn html_preview_io_work_notification(&self) -> std::sync::Arc<tokio::sync::Notify> {
-        self.html_preview_io_work.clone()
-    }
     pub fn notify_html_preview_io_work(&self) {
-        self.html_preview_io_work.notify_one();
+        self.background_work("storage.html.io").invalidate();
     }
 }
 

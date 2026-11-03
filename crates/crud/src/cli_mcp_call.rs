@@ -62,202 +62,223 @@ impl CrudStore {
         identity: CliMcpCallIdentity,
         event_timestamp_secs: i64,
     ) -> Result<()> {
-        anyhow::ensure!(
-            notification.item.item_id() == identity.native_item_id,
-            "CLI MCP completion item identity mismatch"
-        );
-        let created_at = unix_to_datetime(event_timestamp_secs);
-        let claim_expires_at =
-            unix_to_datetime(event_timestamp_secs.saturating_add(TURN_EVENT_PROJECTION_LEASE_SECS));
-        // No response serialization or policy preparation holds the writer.
-        let prepared = prepare_projected_turn_event_for_permanent_storage(
-            &self.connection,
-            TurnEventPayload::ItemCompleted(notification.clone()),
-            created_at,
-        )
-        .await?;
-        // A durable tool receipt can replay after the facade ledger is lost.
-        // Its response/duration may differ, while the original canonical
-        // execution fact must remain unchanged. Decode outside the writer and
-        // carry the immutable event bytes back as a commit-time fence.
-        let accepted = turn_event::find_accepted_item_completion(
-            &self.connection,
-            &notification.turn_id,
-            &identity.native_item_id,
-        )
-        .await?;
-        let confirmed_replay = if let Some(event) = accepted {
-            let payload: TurnEventPayload = serde_json::from_str(&event.payload)?;
-            match payload {
-                TurnEventPayload::ItemCompleted(saved)
-                    if saved.workspace_id == notification.workspace_id
-                        && saved.thread_id == notification.thread_id
-                        && saved.turn_id == notification.turn_id
-                        && saved.item.item_id() == notification.item.item_id()
-                        && is_managed_cli_mcp_item(&saved.item) =>
-                {
-                    let saved_metadata = cli_mcp_item_metadata(&saved.item)
-                        .expect("managed MCP completion metadata");
-                    let incoming_metadata = cli_mcp_item_metadata(&notification.item)
-                        .context("CLI MCP completion metadata is missing")?;
-                    [
-                        "canonicalCallableName",
-                        "providerCallId",
-                        "sessionGeneration",
-                        "manifestHash",
-                        "invocationCorrelationId",
-                        "responseDelivery",
-                        "serverInstallationId",
-                        "canonicalSchemaFingerprint",
-                        "providerSchemaFingerprint",
-                        "arguments",
-                    ]
-                    .iter()
-                    .all(|key| {
-                        saved_metadata
-                            .get(key)
-                            .is_some_and(|value| Some(value) == incoming_metadata.get(key))
-                    })
-                    .then_some(event)
-                }
-                _ => None,
-            }
-        } else {
-            None
-        };
-        self.run_serialized_write(|| async {
-            let prepared = prepared.clone();
-            let transaction = self.connection.begin().await?;
-            let binding =
-                cli_runtime_binding::find_turn_binding(&transaction, &notification.turn_id)
-                    .await?
-                    .context("CLI MCP turn binding is missing")?;
-            anyhow::ensure!(
-                binding.workspace_id == notification.workspace_id
-                    && binding.thread_id == notification.thread_id
-                    && binding.runtime_id == identity.runtime_id
-                    && binding.native_thread_id == identity.native_thread_id
-                    && binding
-                        .mcp
-                        .as_ref()
-                        .is_some_and(|mcp| mcp.session_generation == identity.session_generation
-                            && mcp.manifest_hash == identity.manifest_hash
-                            && mcp.projection_activation_generation
-                                == identity.projection_activation_generation),
-                "CLI MCP completion binding or generation changed"
-            );
-            let owner = cli_runtime_binding::resolve_native_turn_owner(
-                &transaction,
-                &identity.runtime_id,
-                &identity.native_turn_id,
-            )
-            .await?
-            .context("CLI MCP native execution is missing")?;
-            anyhow::ensure!(
-                owner.binding.turn_id == notification.turn_id
-                    && owner.attempt.native_thread_id == identity.native_thread_id,
-                "CLI MCP completion native execution mismatch"
-            );
-            // Exact durable replay uses the existing event idempotency key;
-            // it never executes the operation again or repairs another attempt.
-            let replay =
-                turn_event::prepared_event_already_exists(&transaction, &prepared.event).await?;
-            if !replay {
-                let execution = turn_execution::find(&transaction, &notification.turn_id).await?;
+        self.background_changes(
+            &[
+                "tasks.lifecycle",
+                "turn.projection",
+                "turn.finalization",
+                "turn.delivery.live",
+                "turn.delivery.episodic",
+                "storage.receipts",
+                "storage.native_events",
+            ],
+            async {
                 anyhow::ensure!(
-                    execution
-                        .as_ref()
-                        .map(|execution| (execution.owner_id.clone(), execution.owner_generation))
-                        == identity.execution_owner,
-                    "CLI MCP execution lease owner changed"
+                    notification.item.item_id() == identity.native_item_id,
+                    "CLI MCP completion item identity mismatch"
                 );
-                let latest =
-                    cli_runtime_binding::latest_turn_attempt(&transaction, &notification.turn_id)
-                        .await?
-                        .context("CLI MCP current native attempt is missing")?;
-                let turn = turn::find_turn_by_thread_and_id(
-                    &transaction,
-                    &notification.thread_id,
-                    &notification.turn_id,
+                let created_at = unix_to_datetime(event_timestamp_secs);
+                let claim_expires_at = unix_to_datetime(
+                    event_timestamp_secs.saturating_add(TURN_EVENT_PROJECTION_LEASE_SECS),
+                );
+                // No response serialization or policy preparation holds the writer.
+                let prepared = prepare_projected_turn_event_for_permanent_storage(
+                    &self.connection,
+                    TurnEventPayload::ItemCompleted(notification.clone()),
+                    created_at,
                 )
-                .await?
-                .context("CLI MCP turn is missing")?;
-                anyhow::ensure!(
-                    latest.id == owner.attempt.id && turn.thread_id == notification.thread_id,
-                    "CLI MCP completion execution is no longer current"
-                );
-                if let Some(confirmed) = &confirmed_replay {
-                    let current = turn_event::find_accepted_item_completion(
-                        &transaction,
-                        &notification.turn_id,
-                        &identity.native_item_id,
-                    )
-                    .await?;
-                    anyhow::ensure!(
-                        current
-                            .is_some_and(|event| event.id == confirmed.id
-                                && event.payload == confirmed.payload),
-                        "CLI MCP canonical completion changed during replay"
-                    );
-                    transaction.rollback().await?;
-                    return Ok(());
-                }
-                if let Some(item) = turn::find_turn_item(
-                    &transaction,
+                .await?;
+                // A durable tool receipt can replay after the facade ledger is lost.
+                // Its response/duration may differ, while the original canonical
+                // execution fact must remain unchanged. Decode outside the writer and
+                // carry the immutable event bytes back as a commit-time fence.
+                let accepted = turn_event::find_accepted_item_completion(
+                    &self.connection,
                     &notification.turn_id,
                     &identity.native_item_id,
                 )
-                .await?
-                {
-                    if item.active_attempt_status.as_deref() == Some("interrupted") {
-                        // Turn closure may have won the writer race. It recorded
-                        // an unknown outcome, not an execution fact. Correct only
-                        // that exact original attempt; never retry the operation.
+                .await?;
+                let confirmed_replay = if let Some(event) = accepted {
+                    let payload: TurnEventPayload = serde_json::from_str(&event.payload)?;
+                    match payload {
+                        TurnEventPayload::ItemCompleted(saved)
+                            if saved.workspace_id == notification.workspace_id
+                                && saved.thread_id == notification.thread_id
+                                && saved.turn_id == notification.turn_id
+                                && saved.item.item_id() == notification.item.item_id()
+                                && is_managed_cli_mcp_item(&saved.item) =>
+                        {
+                            let saved_metadata = cli_mcp_item_metadata(&saved.item)
+                                .expect("managed MCP completion metadata");
+                            let incoming_metadata = cli_mcp_item_metadata(&notification.item)
+                                .context("CLI MCP completion metadata is missing")?;
+                            [
+                                "canonicalCallableName",
+                                "providerCallId",
+                                "sessionGeneration",
+                                "manifestHash",
+                                "invocationCorrelationId",
+                                "responseDelivery",
+                                "serverInstallationId",
+                                "canonicalSchemaFingerprint",
+                                "providerSchemaFingerprint",
+                                "arguments",
+                            ]
+                            .iter()
+                            .all(|key| {
+                                saved_metadata
+                                    .get(key)
+                                    .is_some_and(|value| Some(value) == incoming_metadata.get(key))
+                            })
+                            .then_some(event)
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                self.run_serialized_write(|| async {
+                    let prepared = prepared.clone();
+                    let transaction = self.connection.begin().await?;
+                    let binding =
+                        cli_runtime_binding::find_turn_binding(&transaction, &notification.turn_id)
+                            .await?
+                            .context("CLI MCP turn binding is missing")?;
+                    anyhow::ensure!(
+                        binding.workspace_id == notification.workspace_id
+                            && binding.thread_id == notification.thread_id
+                            && binding.runtime_id == identity.runtime_id
+                            && binding.native_thread_id == identity.native_thread_id
+                            && binding
+                                .mcp
+                                .as_ref()
+                                .is_some_and(|mcp| mcp.session_generation
+                                    == identity.session_generation
+                                    && mcp.manifest_hash == identity.manifest_hash
+                                    && mcp.projection_activation_generation
+                                        == identity.projection_activation_generation),
+                        "CLI MCP completion binding or generation changed"
+                    );
+                    let owner = cli_runtime_binding::resolve_native_turn_owner(
+                        &transaction,
+                        &identity.runtime_id,
+                        &identity.native_turn_id,
+                    )
+                    .await?
+                    .context("CLI MCP native execution is missing")?;
+                    anyhow::ensure!(
+                        owner.binding.turn_id == notification.turn_id
+                            && owner.attempt.native_thread_id == identity.native_thread_id,
+                        "CLI MCP completion native execution mismatch"
+                    );
+                    // Exact durable replay uses the existing event idempotency key;
+                    // it never executes the operation again or repairs another attempt.
+                    let replay =
+                        turn_event::prepared_event_already_exists(&transaction, &prepared.event)
+                            .await?;
+                    if !replay {
+                        let execution =
+                            turn_execution::find(&transaction, &notification.turn_id).await?;
                         anyhow::ensure!(
-                            turn_item_attempt::is_unconfirmed_cli_mcp_attempt(
+                            execution.as_ref().map(|execution| (
+                                execution.owner_id.clone(),
+                                execution.owner_generation
+                            )) == identity.execution_owner,
+                            "CLI MCP execution lease owner changed"
+                        );
+                        let latest = cli_runtime_binding::latest_turn_attempt(
+                            &transaction,
+                            &notification.turn_id,
+                        )
+                        .await?
+                        .context("CLI MCP current native attempt is missing")?;
+                        let turn = turn::find_turn_by_thread_and_id(
+                            &transaction,
+                            &notification.thread_id,
+                            &notification.turn_id,
+                        )
+                        .await?
+                        .context("CLI MCP turn is missing")?;
+                        anyhow::ensure!(
+                            latest.id == owner.attempt.id
+                                && turn.thread_id == notification.thread_id,
+                            "CLI MCP completion execution is no longer current"
+                        );
+                        if let Some(confirmed) = &confirmed_replay {
+                            let current = turn_event::find_accepted_item_completion(
                                 &transaction,
                                 &notification.turn_id,
                                 &identity.native_item_id,
-                                item.active_attempt_id
-                                    .as_deref()
-                                    .context("CLI MCP attempt is missing")?,
                             )
-                            .await?,
-                            "CLI MCP item attempt is already terminal"
-                        );
-                    } else {
-                        anyhow::ensure!(
-                            item.status.as_deref() == Some("in_progress")
-                                && item.active_attempt_status.as_deref() == Some("running"),
-                            "CLI MCP item attempt is already terminal"
-                        );
-                        let attempt = turn_item_attempt::find_latest_running_attempt(
+                            .await?;
+                            anyhow::ensure!(
+                                current.is_some_and(|event| event.id == confirmed.id
+                                    && event.payload == confirmed.payload),
+                                "CLI MCP canonical completion changed during replay"
+                            );
+                            transaction.rollback().await?;
+                            return Ok(());
+                        }
+                        if let Some(item) = turn::find_turn_item(
                             &transaction,
                             &notification.turn_id,
                             &identity.native_item_id,
                         )
                         .await?
-                        .context("CLI MCP running attempt is missing")?;
-                        anyhow::ensure!(
-                            item.active_attempt_id.as_deref() == Some(attempt.id.as_str()),
-                            "CLI MCP completion does not own the original item attempt"
-                        );
+                        {
+                            if item.active_attempt_status.as_deref() == Some("interrupted") {
+                                // Turn closure may have won the writer race. It recorded
+                                // an unknown outcome, not an execution fact. Correct only
+                                // that exact original attempt; never retry the operation.
+                                anyhow::ensure!(
+                                    turn_item_attempt::is_unconfirmed_cli_mcp_attempt(
+                                        &transaction,
+                                        &notification.turn_id,
+                                        &identity.native_item_id,
+                                        item.active_attempt_id
+                                            .as_deref()
+                                            .context("CLI MCP attempt is missing")?,
+                                    )
+                                    .await?,
+                                    "CLI MCP item attempt is already terminal"
+                                );
+                            } else {
+                                anyhow::ensure!(
+                                    item.status.as_deref() == Some("in_progress")
+                                        && item.active_attempt_status.as_deref() == Some("running"),
+                                    "CLI MCP item attempt is already terminal"
+                                );
+                                let attempt = turn_item_attempt::find_latest_running_attempt(
+                                    &transaction,
+                                    &notification.turn_id,
+                                    &identity.native_item_id,
+                                )
+                                .await?
+                                .context("CLI MCP running attempt is missing")?;
+                                anyhow::ensure!(
+                                    item.active_attempt_id.as_deref() == Some(attempt.id.as_str()),
+                                    "CLI MCP completion does not own the original item attempt"
+                                );
+                            }
+                        }
                     }
-                }
-            }
-            self.append_and_project_turn_event_with_replay_in_transaction(
-                &transaction,
-                prepared,
-                created_at,
-                claim_expires_at,
-                true,
-                false,
-                true,
-            )
-            .await?;
-            transaction.commit().await?;
-            Ok(())
-        })
+                    self.append_and_project_turn_event_with_replay_in_transaction(
+                        &transaction,
+                        prepared,
+                        created_at,
+                        claim_expires_at,
+                        true,
+                        false,
+                        true,
+                    )
+                    .await?;
+                    transaction.commit().await?;
+                    Ok(())
+                })
+                .await
+            },
+            |_| true,
+        )
         .await
     }
 }

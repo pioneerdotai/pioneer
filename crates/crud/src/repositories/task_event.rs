@@ -810,7 +810,8 @@ pub(crate) async fn hydrate_rows(
                 .payload_json_payload_id
                 .as_deref()
                 .map(|id| {
-                    super::portable_payload::PayloadReadHold::capture(
+                    super::portable_payload::PayloadReadHold::capture_in(
+                        db,
                         id,
                         super::portable_payload::Family::TaskEvent,
                     )

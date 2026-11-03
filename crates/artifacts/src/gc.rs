@@ -1,5 +1,5 @@
 use pioneer_crud::CrudStore;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::blob_store::ArtifactBlobStore;
 use crate::error::ArtifactResult;
@@ -29,7 +29,7 @@ impl Default for ArtifactGcPolicy {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ArtifactGcPlan {
     pub workspace_id: String,
     pub temp_uploads: u64,
@@ -42,14 +42,14 @@ pub struct ArtifactGcPlan {
     pub estimated_bytes_reclaimable: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArtifactGcBlobCandidate {
     pub blob_id: String,
     pub storage_key: String,
     pub size_bytes: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArtifactGcReport {
     pub plan: ArtifactGcPlan,
     pub deleted_blobs: u64,

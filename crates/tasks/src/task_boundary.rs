@@ -51,7 +51,7 @@ where
         pioneer_observability::work::Boundary::TaskFreshTask,
         pioneer_observability::work::WorkKind::Task,
         pioneer_observability::work::ExecutorRole::Task,
-        future,
+        pioneer_sqlite::background::inherit_origin(future),
     );
     AbortOnDropTask::new(tokio::spawn(future))
         .join()

@@ -23,6 +23,20 @@ const RETIRED_SUPERUSER_JWT_TOKEN_SERVICE: &str = "pioneer.gateway.superuser_jwt
 pub(crate) struct GatewaySecrets {
     store: Arc<dyn SecretStore>,
     auth_key_initialization_lock_path: Option<PathBuf>,
+    provider_changes: tokio::sync::watch::Sender<u64>,
+}
+// A synchronous keystore operation can partially succeed before an error. The
+// dependency hint is published after its stack/resources unwind, also in that
+// case. No credentials are copied into the signal and no database is retained.
+struct ProviderSecretChange<'a>(&'a tokio::sync::watch::Sender<u64>);
+impl Drop for ProviderSecretChange<'_> {
+    fn drop(&mut self) {
+        self.0.send_modify(|generation| {
+            *generation = generation
+                .checked_add(1)
+                .expect("provider secret generation exhausted");
+        });
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,6 +104,7 @@ impl GatewaySecrets {
             .context("failed to open gateway keystore")?;
         Ok(Self {
             store: Arc::new(store),
+            provider_changes: tokio::sync::watch::channel(0).0,
             auth_key_initialization_lock_path: Some(
                 runtime_home.join(AUTH_KEY_INITIALIZATION_LOCK_FILE_NAME),
             ),
@@ -100,8 +115,13 @@ impl GatewaySecrets {
     pub(crate) fn new(store: Arc<dyn SecretStore>) -> Self {
         Self {
             store,
+            provider_changes: tokio::sync::watch::channel(0).0,
             auth_key_initialization_lock_path: None,
         }
+    }
+
+    pub(crate) fn subscribe_provider_changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.provider_changes.subscribe()
     }
 
     pub(crate) fn normalize_provider_name(&self, provider: &str) -> Result<String> {
@@ -250,6 +270,7 @@ impl GatewaySecrets {
             .and_then(|entry| entry.created_at_unix)
             .unwrap_or(now);
 
+        let _change = ProviderSecretChange(&self.provider_changes);
         self.store
             .put_string(
                 &id,
@@ -289,6 +310,7 @@ impl GatewaySecrets {
             .and_then(|entry| entry.created_at_unix)
             .unwrap_or(now);
 
+        let _change = ProviderSecretChange(&self.provider_changes);
         self.store
             .put_string(
                 &id,
@@ -328,6 +350,7 @@ impl GatewaySecrets {
             .and_then(|entry| entry.created_at_unix)
             .unwrap_or(now);
 
+        let _change = ProviderSecretChange(&self.provider_changes);
         self.store
             .put_string(
                 &id,
@@ -367,6 +390,7 @@ impl GatewaySecrets {
             .and_then(|entry| entry.created_at_unix)
             .unwrap_or(now);
 
+        let _change = ProviderSecretChange(&self.provider_changes);
         self.store
             .put_string(
                 &id,
@@ -403,6 +427,7 @@ impl GatewaySecrets {
             .and_then(|entry| entry.created_at_unix)
             .unwrap_or(now);
 
+        let _change = ProviderSecretChange(&self.provider_changes);
         self.store
             .put_string(
                 &id,
@@ -423,6 +448,7 @@ impl GatewaySecrets {
     pub(crate) fn delete_provider_api_key(&self, provider: &str) -> Result<(String, bool)> {
         let id = SecretId::provider_api_key(provider).context("invalid provider name")?;
         let normalized_provider = id.user().to_owned();
+        let _change = ProviderSecretChange(&self.provider_changes);
         let deleted = self
             .store
             .delete(&id)
@@ -442,6 +468,7 @@ impl GatewaySecrets {
         .context("invalid workspace provider api key id")?;
         let normalized_provider = Self::provider_name_from_workspace_provider_id(&id)
             .unwrap_or_else(|| provider.trim().to_ascii_lowercase());
+        let _change = ProviderSecretChange(&self.provider_changes);
         let deleted = self
             .delete_workspace_provider_secret_and_aliases(
                 workspace_id,
@@ -465,6 +492,7 @@ impl GatewaySecrets {
         .context("invalid workspace provider proxy id")?;
         let normalized_provider = Self::provider_name_from_workspace_provider_id(&id)
             .unwrap_or_else(|| provider.trim().to_ascii_lowercase());
+        let _change = ProviderSecretChange(&self.provider_changes);
         let deleted = self
             .delete_workspace_provider_secret_and_aliases(
                 workspace_id,
@@ -488,6 +516,7 @@ impl GatewaySecrets {
         .context("invalid workspace provider base url id")?;
         let normalized_provider = Self::provider_name_from_workspace_provider_id(&id)
             .unwrap_or_else(|| provider.trim().to_ascii_lowercase());
+        let _change = ProviderSecretChange(&self.provider_changes);
         let deleted = self
             .delete_workspace_provider_secret_and_aliases(
                 workspace_id,
@@ -508,6 +537,7 @@ impl GatewaySecrets {
             .context("invalid workspace CLI runtime proxy id")?;
         let normalized_runtime = Self::runtime_id_from_workspace_cli_runtime_proxy_id(&id)
             .unwrap_or_else(|| runtime_id.trim().to_owned());
+        let _change = ProviderSecretChange(&self.provider_changes);
         let deleted = self
             .store
             .delete(&id)

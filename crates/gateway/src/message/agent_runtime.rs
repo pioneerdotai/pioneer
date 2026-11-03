@@ -45,6 +45,45 @@ pub(super) struct NativeTurnEventDeliveryWorkers {
     pub(super) admission: std::sync::Mutex<()>,
 }
 
+#[derive(Default)]
+struct SharedDeliveryWorkers(std::sync::Mutex<Weak<NativeTurnEventDeliveryWorkers>>);
+pub(super) fn shared_delivery_workers(store: &CrudStore) -> Arc<NativeTurnEventDeliveryWorkers> {
+    let shared = store
+        .database_connection()
+        .shared_resource::<SharedDeliveryWorkers>();
+    let mut current = shared.0.lock().unwrap();
+    current.upgrade().unwrap_or_else(|| {
+        let workers = Arc::new(NativeTurnEventDeliveryWorkers::default());
+        *current = Arc::downgrade(&workers);
+        workers
+    })
+}
+
+struct NativeTerminalEffectKickGuard {
+    running: Arc<AtomicBool>,
+    owned: bool,
+}
+impl NativeTerminalEffectKickGuard {
+    fn release(&mut self) {
+        if self.owned {
+            self.owned = false;
+            self.running.store(false, Ordering::Release);
+        }
+    }
+    fn reacquire(&mut self) -> bool {
+        if self.running.swap(true, Ordering::AcqRel) {
+            return false;
+        }
+        self.owned = true;
+        true
+    }
+}
+impl Drop for NativeTerminalEffectKickGuard {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
 struct NativeTurnEventDeliveryGuard {
     wake: Arc<NativeTurnEventDeliveryWake>,
     owned: bool,
@@ -3159,13 +3198,21 @@ impl MessageProcessor {
         Ok((processed, batch.next_eligible_at_unix))
     }
 
-    /// Wake both existing consumers after commit, or from periodic recovery.
+    /// Wake both existing consumers after commit.
     /// Each consumer owns a separate bounded drain; neither waits for the other.
     pub(super) fn kick_native_turn_event_deliveries(&self) {
+        self.kick_native_live_turn_event_deliveries();
+        self.kick_native_episodic_turn_event_deliveries();
+    }
+
+    pub(super) fn kick_native_live_turn_event_deliveries(&self) {
         self.kick_native_turn_event_delivery_consumer(
             pioneer_crud::NATIVE_TURN_EVENT_LIVE_CONSUMER,
             self.native_turn_event_delivery_workers.live.clone(),
         );
+    }
+
+    pub(super) fn kick_native_episodic_turn_event_deliveries(&self) {
         self.kick_native_turn_event_delivery_consumer(
             pioneer_crud::NATIVE_TURN_EVENT_EPISODIC_CONSUMER,
             self.native_turn_event_delivery_workers.episodic.clone(),
@@ -3198,7 +3245,19 @@ impl MessageProcessor {
             tokio::select! {
                 biased;
                 _ = shutdown.cancelled() => {}
-                _ = this.drain_native_turn_event_delivery_consumer(consumer, wake, guard) => {}
+                result = AssertUnwindSafe(this.drain_native_turn_event_delivery_consumer(consumer, wake, guard)).catch_unwind() => {
+                    if result.is_err() {
+                        error!(consumer, "contained panic in native event delivery owner");
+                        tokio::select! {
+                            _ = shutdown.cancelled() => {},
+                            _ = tokio::time::sleep(Duration::from_secs(5)) => {
+                                this.crud_store.background_work(if consumer == pioneer_crud::NATIVE_TURN_EVENT_LIVE_CONSUMER {
+                                    "turn.delivery.live"
+                                } else { "turn.delivery.episodic" }).dependency_released();
+                            }
+                        }
+                    }
+                }
             }
         };
         #[cfg(test)]
@@ -3210,7 +3269,9 @@ impl MessageProcessor {
                 .with_subscriber(dispatch)
                 .bind_hub(sentry::Hub::current())
         };
-        workers.tasks.spawn(future);
+        workers
+            .tasks
+            .spawn(pioneer_sqlite::background::inherit_origin(future));
     }
 
     async fn drain_native_turn_event_delivery_consumer(
@@ -3252,17 +3313,20 @@ impl MessageProcessor {
                         if let Some(deadline) =
                             next_eligible_at_unix.filter(|at| *at > now_timestamp_secs())
                         {
-                            let delay = Duration::from_secs(
-                                deadline.saturating_sub(now_timestamp_secs()).max(0) as u64,
-                            );
+                            let wall_deadline = pioneer_crud::unix_to_datetime(deadline).into();
                             #[cfg(test)]
                             wake.claim_barrier.wait_if_armed("timer", shutdown).await;
                             if !wake.pending.load(Ordering::SeqCst) {
                                 tokio::select! {
                                     _ = wake.deadline_wake.notified() => {}
-                                    _ = tokio::time::sleep(delay) => {}
+                                    _ = pioneer_sqlite::background::wait_until_wall(wall_deadline) => {}
                                 }
                             }
+                            wake.pending.store(true, Ordering::SeqCst);
+                        }
+                        if next_eligible_at_unix.is_some_and(|at| at <= now_timestamp_secs()) {
+                            // Discovery raced an authoritative claim/dependency
+                            // change. Reobserve within the bounded next quantum.
                             wake.pending.store(true, Ordering::SeqCst);
                         }
                         break;
@@ -3278,6 +3342,9 @@ impl MessageProcessor {
                         // Claim/ACK/deferral errors cannot turn coalesced
                         // wakes into a hot loop. No DB capacity is held.
                         tokio::time::sleep(Duration::from_secs(5)).await;
+                        // The old control fallback no longer supplies retries.
+                        // An actual storage error remains owned after cooldown.
+                        wake.pending.store(true, Ordering::SeqCst);
                         break;
                     }
                 }
@@ -3302,9 +3369,371 @@ impl MessageProcessor {
         }
     }
 
+    pub(super) async fn run_native_terminal_effect_worker(processor: Weak<Self>) {
+        use pioneer_sqlite::background::{Plan, Ready};
+        let Some(initial) = processor.upgrade() else {
+            return;
+        };
+        let work = initial.crud_store.background_work("recovery.effects");
+        let Some(mut owner) = work.acquire() else {
+            return;
+        };
+        let cancellation = initial.cli_history_shutdown.clone();
+        drop(initial);
+        loop {
+            let ready = tokio::select! { biased; _ = cancellation.cancelled() => return, ready = owner.ready() => ready };
+            if ready == Ready::Closed {
+                return;
+            }
+            let Some(this) = processor.upgrade() else {
+                return;
+            };
+            let this = this.for_background_reconciliation();
+            if ready == Ready::SettlementRequired {
+                let settle_observation = owner.observe();
+                if this
+                    .crud_store
+                    .database_connection()
+                    .settle_background_change(&owner)
+                    .await
+                    .is_err()
+                {
+                    owner.retry_after(settle_observation, Duration::from_secs(5));
+                }
+                continue;
+            }
+            let observed = owner.observe();
+            let result = tokio::select! { biased; _ = cancellation.cancelled() => return,
+                result = owner.scope(async {
+                    let Some(_drain) = work.drain().await else { return Ok(Plan::Dormant); };
+                    let now = now_timestamp_secs();
+                    let at = this.crud_store.native_terminal_effect_work_deadline().await?;
+                    if at.is_none_or(|at| at.timestamp() > now) {
+                        return Ok(at.map_or(Plan::Dormant, |at| Plan::WallDeadline(at.into())));
+                    }
+                    let outcome = this.process_due_native_terminal_effects(now, 8).await?;
+                    anyhow::ensure!(!outcome.storage_failed, "terminal-effect quantum retained storage uncertainty");
+                    if outcome.count > 0 { return Ok(Plan::Runnable); }
+                    let next = this.crud_store.native_terminal_effect_work_deadline().await?;
+                    Ok::<_, anyhow::Error>(next.map_or(Plan::Dormant, |at| Plan::WallDeadline(at.into())))
+                }) => result,
+            };
+            match result {
+                Ok(plan) => {
+                    let _settled = owner.publish(observed, plan);
+                    #[cfg(test)]
+                    if _settled && !matches!(plan, Plan::Runnable) {
+                        this.completed_history_preparation_barrier
+                            .wait_if_armed("__terminal_effect_owner_settled__", &cancellation)
+                            .await;
+                    }
+                    if matches!(plan, Plan::Runnable) {
+                        tokio::select! { _ = cancellation.cancelled() => return, _ = sleep(Duration::from_millis(10)) => {} }
+                    }
+                }
+                Err(error) => {
+                    record_resilience_worker_error(
+                        "native terminal effects",
+                        &error,
+                        ResilienceWorkerFailureImpact::Maintenance,
+                    );
+                    owner.retry_after(observed, Duration::from_secs(5));
+                }
+            }
+        }
+    }
+
+    pub(super) async fn run_native_terminal_effect_archive_worker(
+        processor: Weak<Self>,
+        retention: bool,
+    ) {
+        use pioneer_sqlite::background::{Plan, Ready};
+        let Some(initial) = processor.upgrade() else {
+            return;
+        };
+        let key = if retention {
+            "recovery.effects.retention"
+        } else {
+            "recovery.effects.retry"
+        };
+        let Some(mut owner) = initial.crud_store.background_work(key).acquire() else {
+            return;
+        };
+        let cancellation = initial.cli_history_shutdown.clone();
+        let delay = if retention {
+            NATIVE_TERMINAL_EFFECT_RETENTION_SECONDS
+        } else {
+            3_600
+        };
+        let error_delay = Duration::from_secs(if retention {
+            NATIVE_TERMINAL_EFFECT_PURGE_RETRY_SECONDS as u64
+        } else {
+            NATIVE_TERMINAL_EFFECT_RECOVERY_RETRY_SECONDS as u64
+        });
+        let mut retry_pass = pioneer_crud::EffectRetryPass::default();
+        let mut retry_complete = false;
+        let mut retry_rescan = false;
+        let mut retry_previous = None;
+        drop(initial);
+        loop {
+            let ready = tokio::select! { biased; _ = cancellation.cancelled() => return, ready = owner.ready() => ready };
+            if ready == Ready::Closed {
+                return;
+            }
+            let Some(this) = processor.upgrade() else {
+                return;
+            };
+            let this = this.scoped_with_database_class(SqliteWriteClass::Maintenance);
+            if ready == Ready::SettlementRequired {
+                retry_rescan = true;
+                let settle_observation = owner.observe();
+                if let Err(error) = this
+                    .crud_store
+                    .database_connection()
+                    .settle_background_change(&owner)
+                    .await
+                {
+                    record_resilience_worker_error(
+                        key,
+                        &anyhow::Error::new(error),
+                        ResilienceWorkerFailureImpact::Maintenance,
+                    );
+                    owner.retry_after(settle_observation, error_delay);
+                }
+                continue;
+            }
+            let observed = owner.observe();
+            if !retention {
+                let external = retry_previous.is_some_and(|old| owner.producer_changed_since(old));
+                if retry_complete {
+                    retry_pass = Default::default();
+                    retry_complete = false;
+                    retry_rescan = false;
+                } else if external {
+                    retry_rescan = true;
+                }
+            }
+            retry_previous = Some(observed);
+            let result = tokio::select! { biased; _ = cancellation.cancelled() => return,
+                result = owner.scope(async {
+                    let now = now_timestamp_secs();
+                    if !retention {
+                        let (done, _) = this.crud_store.native_terminal_effect_retry_quantum(
+                            &mut retry_pass, now, NATIVE_TERMINAL_EFFECT_RECOVERY_BATCH_SIZE).await?;
+                        retry_complete = done;
+                        if !done {
+                            #[cfg(test)]
+                            this.completed_history_preparation_barrier.wait_if_armed(
+                                "__effect_retry_raw_page__", &cancellation).await;
+                            return Ok(Plan::Runnable);
+                        }
+                        if std::mem::take(&mut retry_rescan) {
+                            retry_pass = Default::default();
+                            retry_complete = false;
+                            return Ok(Plan::Runnable);
+                        }
+                        return Ok(retry_pass.next.map_or(Plan::Dormant,|at|Plan::WallDeadline(at.into())));
+                    }
+                    let next = this.crud_store.native_terminal_effect_archive_deadline(now, retention).await?;
+                    let next = next.map(|at|at.timestamp().saturating_add(delay).saturating_add(i64::from(at.timestamp_subsec_nanos()!=0)));
+                    if next.is_none_or(|at|at > now) {
+                        return Ok(next.map_or(Plan::Dormant, |at|Plan::WallDeadline(pioneer_crud::unix_to_datetime(at).into())));
+                    }
+                    let count = this.crud_store.purge_resolved_native_terminal_effects_before(
+                        now.saturating_sub(delay), NATIVE_TERMINAL_EFFECT_PURGE_BATCH_SIZE).await?;
+                    if count > 0 { return Ok(Plan::Runnable); }
+                    // A lost point race is reobserved once; it is never proof
+                    // that unchanged past-due work can be forgotten or spun on.
+                    let next = this.crud_store.native_terminal_effect_archive_deadline(now, retention).await?;
+                    let next = next.map(|at|at.timestamp().saturating_add(delay).saturating_add(i64::from(at.timestamp_subsec_nanos()!=0)));
+                    anyhow::ensure!(next.is_none_or(|at|at > now), "native terminal effect archive due observation did not settle");
+                    Ok::<_,anyhow::Error>(next.map_or(Plan::Dormant, |at|Plan::WallDeadline(pioneer_crud::unix_to_datetime(at).into())))
+                }) => result,
+            };
+            match result {
+                Ok(plan) => {
+                    let _settled = owner.publish(observed, plan);
+                    #[cfg(test)]
+                    if _settled && !matches!(plan, Plan::Runnable) {
+                        this.completed_history_preparation_barrier
+                            .wait_if_armed(
+                                if retention {
+                                    "__effect_retention_settled__"
+                                } else {
+                                    "__effect_retry_settled__"
+                                },
+                                &cancellation,
+                            )
+                            .await;
+                    }
+                    if matches!(plan, Plan::Runnable) {
+                        tokio::select! { _ = cancellation.cancelled() => return, _ = sleep(Duration::from_millis(10)) => {} }
+                    }
+                }
+                Err(error) => {
+                    retry_pass = Default::default();
+                    retry_complete = false;
+                    record_resilience_worker_error(
+                        key,
+                        &error,
+                        ResilienceWorkerFailureImpact::Maintenance,
+                    );
+                    owner.retry_after(observed, error_delay);
+                }
+            }
+        }
+    }
+
+    pub(super) async fn run_agent_action_ledger_worker(processor: Weak<Self>) {
+        use pioneer_sqlite::background::{Plan, Ready};
+        let Some(initial) = processor.upgrade() else {
+            return;
+        };
+        let Some(mut owner) = initial
+            .crud_store
+            .background_work("recovery.ledger")
+            .acquire()
+        else {
+            return;
+        };
+        let cancellation = initial.cli_history_shutdown.clone();
+        drop(initial);
+        let mut upper = None;
+        let mut after = None;
+        let mut next_at: Option<sea_orm::prelude::DateTimeWithTimeZone> = None;
+        let mut retry_at = None;
+        let mut complete = false;
+        let mut previous = None;
+        let mut rescan = false;
+        loop {
+            let ready = tokio::select! { biased; _ = cancellation.cancelled() => return, ready = owner.ready() => ready };
+            if ready == Ready::Closed {
+                return;
+            }
+            let Some(this) = processor.upgrade() else {
+                return;
+            };
+            let this = this.scoped_with_database_class(SqliteWriteClass::Maintenance);
+            if ready == Ready::SettlementRequired {
+                let settle_observation = owner.observe();
+                rescan = true;
+                match this
+                    .crud_store
+                    .database_connection()
+                    .settle_background_change(&owner)
+                    .await
+                {
+                    Ok(true) => {
+                        let external = previous.is_none_or(|old| owner.producer_changed_since(old));
+                        previous = Some(settle_observation);
+                        if complete && (retry_at.is_none() || external) {
+                            upper = None;
+                            after = None;
+                            next_at = None;
+                            retry_at = None;
+                            complete = false;
+                            rescan = false;
+                            owner.publish(settle_observation, Plan::Runnable);
+                        } else if complete {
+                            let mut plan =
+                                next_at.map_or(Plan::Dormant, |at| Plan::WallDeadline(at.into()));
+                            if let Some(at) = retry_at {
+                                plan = plan.with_monotonic_deadline(at);
+                            }
+                            owner.publish(settle_observation, plan);
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        let error = anyhow::Error::new(error);
+                        record_resilience_worker_error(
+                            "agent action ledger settlement",
+                            &error,
+                            ResilienceWorkerFailureImpact::Maintenance,
+                        );
+                        owner.retry_after(
+                            settle_observation,
+                            Duration::from_secs(
+                                AGENT_ACTION_LEDGER_COMPACTION_RETRY_SECONDS as u64,
+                            ),
+                        );
+                    }
+                }
+                continue;
+            }
+            let observed = owner.observe();
+            if complete {
+                upper = None;
+                after = None;
+                next_at = None;
+                retry_at = None;
+                complete = false;
+                rescan = false;
+            } else if previous.is_some_and(|old| old != observed) {
+                rescan = true;
+            }
+            previous = Some(observed);
+            let result = tokio::select! { biased; _ = cancellation.cancelled() => return,
+                result = owner.scope(async {
+                    if upper.is_none() { upper = this.crud_store.terminal_agent_action_ledger_upper().await?; }
+                    let Some(last) = upper.as_ref() else { complete = true; return Ok(()); };
+                    let page = this.crud_store.compact_terminal_agent_action_ledger_page(pioneer_crud::utc_now(), after.as_ref(), last).await?;
+                    after = page.after;
+                    complete = !page.more;
+                    next_at = next_at.into_iter().chain(page.next_at).min();
+                    if !page.errors.is_empty() {
+                        for error in page.errors { record_resilience_worker_error("agent action ledger point", &error, ResilienceWorkerFailureImpact::Maintenance); }
+                        retry_at = Some(tokio::time::Instant::now() + Duration::from_secs(AGENT_ACTION_LEDGER_COMPACTION_RETRY_SECONDS as u64));
+                    }
+                    Ok::<_,anyhow::Error>(())
+                }) => result,
+            };
+            if let Err(error) = result {
+                record_resilience_worker_error(
+                    "agent action ledger",
+                    &error,
+                    ResilienceWorkerFailureImpact::Maintenance,
+                );
+                owner.retry_after(
+                    observed,
+                    Duration::from_secs(AGENT_ACTION_LEDGER_COMPACTION_RETRY_SECONDS as u64),
+                );
+                continue;
+            }
+            if owner.requires_settlement() {
+                continue;
+            }
+            let plan = if !complete {
+                Plan::Runnable
+            } else if retry_at.is_none() && std::mem::take(&mut rescan) {
+                complete = false;
+                upper = None;
+                after = None;
+                next_at = None;
+                Plan::Runnable
+            } else {
+                let mut plan = next_at.map_or(Plan::Dormant, |at| Plan::WallDeadline(at.into()));
+                if let Some(at) = retry_at {
+                    plan = plan.with_monotonic_deadline(at);
+                }
+                plan
+            };
+            let _settled = owner.publish(observed, plan);
+            #[cfg(test)]
+            if _settled && !matches!(plan, Plan::Runnable) {
+                this.completed_history_preparation_barrier
+                    .wait_if_armed("__agent_ledger_settled__", &cancellation)
+                    .await;
+            }
+            if matches!(plan, Plan::Runnable) {
+                tokio::select! { _ = cancellation.cancelled() => return, _ = sleep(Duration::from_millis(10)) => {} }
+            }
+        }
+    }
+
     /// Wake durable terminal work without lending handler latency to the
     /// process-wide resilience loop. One bounded claim wave runs at a time;
-    /// terminal commits and the periodic worker provide subsequent kicks.
+    /// committed source changes and concrete deadlines provide subsequent work.
     pub(super) fn kick_native_terminal_effects(&self) {
         #[cfg(not(test))]
         self.spawn_native_terminal_effect_kick();
@@ -3318,6 +3747,22 @@ impl MessageProcessor {
         &self,
         #[cfg(test)] discovery_clock: Option<Box<dyn Fn() -> i64 + Send>>,
     ) {
+        let work = self.crud_store.background_work("recovery.effects");
+        work.invalidate();
+        // The online runtime owns the retained wait/deadline protocol. An
+        // explicit pre-start foreground kick may still run its existing finite
+        // wave; the common drain excludes overlap with startup reconstruction.
+        if work.has_owner() {
+            return;
+        }
+        let workers = &self.native_turn_event_delivery_workers;
+        let _admission = workers
+            .admission
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if workers.shutdown.is_cancelled() || self.cli_history_shutdown.is_cancelled() {
+            return;
+        }
         // Retain a wakeup that arrives while the bounded worker is already
         // running. Without this bit, a terminal commit racing an earlier
         // preparation kick can leave a newly eligible effect asleep until the
@@ -3331,61 +3776,72 @@ impl MessageProcessor {
             return;
         }
         let this = self.scoped_for_background_reconciliation();
-        tokio::spawn(async move {
-            loop {
-                this.native_terminal_effect_kick_pending
-                    .store(false, Ordering::Release);
-                let discovery_now = now_timestamp_secs();
-                #[cfg(test)]
-                let discovery_now = discovery_clock
-                    .as_ref()
-                    .map_or(discovery_now, |clock| clock());
-                let (dispatched_count, storage_failed) = match this
-                    .process_due_native_terminal_effects(discovery_now, 8)
-                    .await
-                {
-                    Ok(outcome) => (outcome.count, outcome.storage_failed),
-                    Err(_error) => (0, true),
+        let shutdown = workers.shutdown.clone();
+        let mut running = NativeTerminalEffectKickGuard {
+            running: self.native_terminal_effect_kick_running.clone(),
+            owned: true,
+        };
+        workers.tasks.spawn(async move {
+            let wave = async {
+                let Some(_drain) = work.drain().await else {
+                    return;
                 };
-                if storage_failed {
-                    warn!(
-                        dispatched_count,
-                        "native terminal-effect kick failed; retry deferred"
-                    );
-                    // A failed durable deferral/claim must not spin on coalesced
-                    // kicks. The quantum has released all database capacity.
-                    tokio::time::sleep(Duration::from_secs(5)).await;
-                }
+                loop {
+                    this.native_terminal_effect_kick_pending
+                        .store(false, Ordering::Release);
+                    let discovery_now = now_timestamp_secs();
+                    #[cfg(test)]
+                    let discovery_now = discovery_clock
+                        .as_ref()
+                        .map_or(discovery_now, |clock| clock());
+                    let (dispatched_count, storage_failed) = match this
+                        .process_due_native_terminal_effects(discovery_now, 8)
+                        .await
+                    {
+                        Ok(outcome) => (outcome.count, outcome.storage_failed),
+                        Err(_error) => (0, true),
+                    };
+                    if storage_failed {
+                        warn!(
+                            dispatched_count,
+                            "native terminal-effect kick failed; retry deferred"
+                        );
+                        // A failed durable deferral/claim must not spin on coalesced
+                        // kicks. The quantum has released all database capacity.
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                    }
 
-                // Dispatch count is not the input quantum: rotating status
-                // quotas can return fewer records while due work remains.
-                // Continue on successful progress; each bounded wave releases
-                // DB capacity and yields. An empty wave stops, so future retry,
-                // lease and acceptance-gate clocks cannot create a busy loop.
-                if (!storage_failed && dispatched_count > 0)
-                    || this
+                    // Dispatch count is not the input quantum: rotating status
+                    // quotas can return fewer records while due work remains.
+                    // Continue on successful progress; each bounded wave releases
+                    // DB capacity and yields. An empty wave stops, so future retry,
+                    // lease and acceptance-gate clocks cannot create a busy loop.
+                    if (!storage_failed && dispatched_count > 0)
+                        || this
+                            .native_terminal_effect_kick_pending
+                            .load(Ordering::Acquire)
+                    {
+                        tokio::task::yield_now().await;
+                        continue;
+                    }
+
+                    running.release();
+                    // Close the release/reacquire race: a caller that published a
+                    // wake immediately before `running` became false observed the
+                    // old true value and did not spawn a replacement worker.
+                    if !this
                         .native_terminal_effect_kick_pending
-                        .load(Ordering::Acquire)
-                {
-                    tokio::task::yield_now().await;
-                    continue;
+                        .swap(false, Ordering::AcqRel)
+                        || !running.reacquire()
+                    {
+                        break;
+                    }
                 }
-
-                this.native_terminal_effect_kick_running
-                    .store(false, Ordering::Release);
-                // Close the release/reacquire race: a caller that published a
-                // wake immediately before `running` became false observed the
-                // old true value and did not spawn a replacement worker.
-                if !this
-                    .native_terminal_effect_kick_pending
-                    .swap(false, Ordering::AcqRel)
-                    || this
-                        .native_terminal_effect_kick_running
-                        .swap(true, Ordering::AcqRel)
-                {
-                    break;
-                }
-            }
+            };
+            tokio::select! { _ = shutdown.cancelled() => {}, _ = wave => {} }
+            // Dropping a never-polled/cancelled wave releases only its own
+            // running permit; a replacement wave's flag is fenced by owned.
+            drop(running);
         });
     }
 
@@ -7114,6 +7570,7 @@ impl MessageProcessor {
         }
     }
 
+    #[cfg(test)]
     pub(super) async fn poll_timeouts_respecting_human_wait(
         &self,
         now_unix: i64,
@@ -7123,6 +7580,15 @@ impl MessageProcessor {
             .timeout_supervisor
             .list_timeout_candidates(now_unix, limit)
             .await?;
+        self.reconcile_timeout_candidates(candidates, now_unix)
+            .await
+    }
+
+    async fn reconcile_timeout_candidates(
+        &self,
+        candidates: Vec<TimeoutCandidate>,
+        now_unix: i64,
+    ) -> Result<Vec<TimeoutCandidate>> {
         let now_unix_ms = now_unix.saturating_mul(1_000);
         let mut timed_out = Vec::new();
         let mut human_waits = HashMap::<String, bool>::new();
@@ -7241,6 +7707,201 @@ impl MessageProcessor {
             }
         }
         Ok(timed_out)
+    }
+
+    /// An independent owner retains finite raw traversal and actual nullable
+    /// deadlines. Old timeout claims, human wait and liveness authority remain
+    /// in reconcile_timeout_candidates/TimeoutSupervisor unchanged.
+    pub(super) async fn run_execution_timeout_worker(processor: Weak<Self>) {
+        use pioneer_sqlite::background::{Plan, Ready};
+        let Some(initial) = processor.upgrade() else {
+            return;
+        };
+        let work = initial.crud_store.background_work("recovery.timeouts");
+        let Some(mut owner) = work.acquire() else {
+            return;
+        };
+        let cancellation = initial.cli_history_shutdown.clone();
+        drop(initial);
+        let mut upper: Option<String> = None;
+        let mut after: Option<String> = None;
+        let mut nearest: Option<i64> = None;
+        let mut retry_at: Option<tokio::time::Instant> = None;
+        let mut pass_complete = false;
+        let mut previous = None;
+        let mut rescan = false;
+        let mut gates: Vec<Arc<tokio::sync::Mutex<()>>> = Vec::new();
+        loop {
+            let ready = tokio::select! { biased;
+                _ = cancellation.cancelled() => return,
+                _ = pioneer_sqlite::background::wait_for_mutex_release(gates.clone()) => {
+                    upper = None; after = None; nearest = None;
+                    Ready::Work
+                },
+                ready = owner.ready() => ready,
+            };
+            if ready == Ready::Closed {
+                return;
+            }
+            let Some(this) = processor.upgrade() else {
+                return;
+            };
+            let this = this.for_background_reconciliation();
+            if ready == Ready::SettlementRequired {
+                let settle_observation = owner.observe();
+                upper = None;
+                after = None;
+                nearest = None;
+                rescan = true;
+                if this
+                    .crud_store
+                    .database_connection()
+                    .settle_background_change(&owner)
+                    .await
+                    .is_err()
+                {
+                    owner.retry_after(settle_observation, Duration::from_secs(60));
+                }
+                continue;
+            }
+            if pass_complete {
+                // A published clock/release/producer has admitted a new pass.
+                retry_at = None;
+                pass_complete = false;
+            }
+            let observed = owner.observe();
+            if previous.is_some_and(|old| old != observed) && upper.is_some() {
+                rescan = true;
+            }
+            previous = Some(observed);
+            let now = work
+                .wall_now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+                .min(i64::MAX as u64) as i64;
+            let result = tokio::select! { biased; _ = cancellation.cancelled() => return, result = owner.scope(crate::database::attribution::scope_database_workload_result(
+                pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                pioneer_observability::DatabaseOperationSite::ExecutionTimeoutPoll,
+                async {
+                    if upper.is_none() {
+                        gates.clear();
+                        upper = this.crud_store.timeout_supervision_upper().await?;
+                        after = None; nearest = None;
+                    }
+                    let Some(last) = upper.as_deref() else { return Ok::<_, anyhow::Error>(false); };
+                    let page = this.crud_store.timeout_supervision_page(after.as_deref(), last, now).await?;
+                    let complete = page.after.is_none() || page.after.as_deref() == Some(last);
+                    // Capture raw progress even if a point read/policy is poison.
+                    after = page.after;
+                    let mut errors = Vec::new();
+                    for row in page.rows {
+                        let result = async {
+                            let row = row?;
+                            let Some(candidate) = row.candidate else { return Ok(row.next_at_unix); };
+                            let turn_id = candidate.turn_id.clone();
+                            for candidate in this.reconcile_timeout_candidates(vec![candidate], now).await? {
+                                this.handle_timeout_candidate(candidate, now).await;
+                            }
+                            let current = this.crud_store.timeout_supervision_row(&row.id, now).await?;
+                            let Some(current) = current else { return Ok(None); };
+                            if current.next_at_unix.is_none_or(|at| at > now) { return Ok(current.next_at_unix); }
+                            // A proven human wait has its response/ACK deadline.
+                            // Other unchanged overdue rows mean uncertain runtime
+                            // observation/transition, retaining the old2s retry.
+                            let (created, delivery) = this.crud_store.timeout_human_wait_deadlines(&turn_id, NATIVE_HUMAN_INTERACTION_RUNTIME_ID).await?;
+                            let human_ms = crate::human_interaction::HUMAN_INTERACTION_RESPONSE_TIMEOUT_MS;
+                            let clock = created.map(|at| at.timestamp_millis().saturating_add(human_ms))
+                                .into_iter().chain(delivery.map(|at| at.timestamp_millis().saturating_add(30_000)))
+                                .filter(|at| *at > now.saturating_mul(1_000)).min()
+                                .map(|at| at.div_euclid(1_000).saturating_add(i64::from(at.rem_euclid(1_000)!=0)))
+                                ;
+                            if clock.is_some() { return Ok(clock); }
+                            if let Some(binding) = this.crud_store.get_cli_runtime_turn_binding(&turn_id).await? {
+                                let key = crate::cli_runtime::manager::CLIAgentRuntimeSessionKey::new(
+                                    &binding.workspace_id, &binding.runtime_id, &binding.continuation_thread_id,
+                                )?;
+                                let gate = this.cli_runtime_session_transition_mutex(&key).await;
+                                let busy = gate.try_lock().is_err();
+                                if busy {
+                                    if !gates.iter().any(|old| Arc::ptr_eq(old, &gate)) { gates.push(gate); }
+                                    return Ok(None);
+                                }
+                            }
+                            let at = tokio::time::Instant::now() + Duration::from_secs(RESILIENCE_WORKER_POLL_INTERVAL_SECONDS as u64);
+                            retry_at = Some(retry_at.map_or(at, |old| old.min(at)));
+                            Ok::<_, anyhow::Error>(None)
+                        }.await;
+                        match result {
+                            Ok(Some(at)) => nearest = Some(nearest.map_or(at, |old|old.min(at))),
+                            Ok(None) => {},
+                            Err(error) => {
+                                record_resilience_worker_error("timeout supervisor", &error, ResilienceWorkerFailureImpact::CriticalPoll);
+                                errors.push(error);
+                            }
+                        }
+                    }
+                    if !errors.is_empty() {
+                        let at = tokio::time::Instant::now() + Duration::from_secs(if errors.iter().any(is_anyhow_sqlite_transient_access) { 60 } else { 2 });
+                        retry_at = Some(retry_at.map_or(at, |old| old.min(at)));
+                    }
+                    Ok(!complete)
+                },
+            )) => result };
+            match result {
+                Ok(more) if !owner.requires_settlement() => {
+                    let more = if !more && std::mem::take(&mut rescan) {
+                        upper = None;
+                        after = None;
+                        nearest = None;
+                        true
+                    } else {
+                        more
+                    };
+                    let plan = if more {
+                        Plan::Runnable
+                    } else {
+                        upper = None;
+                        after = None;
+                        nearest.map_or(Plan::Dormant, |at| {
+                            Plan::WallDeadline(pioneer_crud::unix_to_datetime(at).into())
+                        })
+                    };
+                    let plan = retry_at.map_or(plan, |at| plan.with_monotonic_deadline(at));
+                    pass_complete = !more;
+                    let settled = owner.publish(observed, plan);
+                    #[cfg(test)]
+                    if settled && !matches!(plan, Plan::Runnable) {
+                        this.completed_history_preparation_barrier
+                            .wait_if_armed("__timeout_owner_settled__", &cancellation)
+                            .await;
+                    }
+                    #[cfg(not(test))]
+                    let _ = settled;
+                    drop(this);
+                    if more {
+                        tokio::select! { _ = cancellation.cancelled() => return, _ = tokio::time::sleep(Duration::from_millis(10)) => {} }
+                    }
+                }
+                result => {
+                    if let Err(error) = &result {
+                        record_resilience_worker_error(
+                            "timeout discovery",
+                            error,
+                            ResilienceWorkerFailureImpact::CriticalPoll,
+                        );
+                    }
+                    let delay = result.as_ref().err().map_or(60, |error| {
+                        if is_anyhow_sqlite_transient_access(error) {
+                            60
+                        } else {
+                            2
+                        }
+                    });
+                    owner.retry_after(observed, Duration::from_secs(delay));
+                }
+            }
+        }
     }
 
     async fn renew_active_native_runtime_turn_deadlines(
@@ -7699,7 +8360,7 @@ impl MessageProcessor {
                 };
                 let execution = tokio::time::timeout(
                     Duration::from_secs(timeout_secs),
-                    self.agent_manager.execute_terminal_effect(
+                    self.agent_manager.execute_terminal_effect_with_run_store(
                         record.effect_id.as_str(),
                         record.claim_token.as_str(),
                         record.runtime_generation,
@@ -7707,6 +8368,9 @@ impl MessageProcessor {
                         record.thread_id.as_str(),
                         record.turn_id.as_str(),
                         record.payload,
+                        Some(Arc::new(crate::hook_run_store::CrudHookRunStore::new(
+                            Arc::new(self.crud_store.with_maintenance_access()),
+                        ))),
                     ),
                 )
                 .await;

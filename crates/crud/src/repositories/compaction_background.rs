@@ -6,10 +6,11 @@ use pioneer_entity::{
     turn_cli_runtime_binding,
 };
 use sea_orm::sea_query::{
-    Alias, Condition, Expr, ExprTrait, Func, JoinType, OnConflict, Order, Query, SelectStatement,
+    Alias, Condition, Expr, ExprTrait, Func, JoinType, OnConflict, Query, SelectStatement,
 };
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, EntityTrait, FromQueryResult, QueryFilter, QuerySelect,
+    ColumnTrait, ConnectionTrait, EntityTrait, FromQueryResult, QueryFilter, QueryOrder,
+    QuerySelect,
 };
 #[derive(Debug, Clone, FromQueryResult)]
 pub struct CompletedHistoryCheck {
@@ -440,10 +441,41 @@ pub(crate) async fn compaction_pending_history_checks<C: ConnectionTrait>(
         .min(i64::MAX as u128) as i64;
     compaction_due_history_checks(db, now).await
 }
-pub(crate) async fn compaction_due_history_checks<C: ConnectionTrait>(
-    db: &C,
-    now: i64,
-) -> Result<Vec<CompletedHistoryCheck>> {
+pub(crate) const HISTORY_DEPENDENCY_OUTCOMES: [&str; 4] = [
+    "preparing",
+    "waiting_catalog",
+    "waiting_executor",
+    "waiting_settings",
+];
+// Healthy dependency parking removes synthetic retries, but the optional hot
+// conversation window is still a real obligation: cancel it at its boundary.
+fn history_eligibility_deadline(hot_window_ms: i64) -> Expr {
+    let activity = Expr::col((
+        compaction_root_activity::Entity,
+        compaction_root_activity::Column::LastUserActivityMs,
+    ));
+    let expiry: Expr = Expr::case(
+        activity.clone().gt(i64::MAX.saturating_sub(hot_window_ms)),
+        Expr::val(i64::MAX),
+    )
+    .finally(activity.add(hot_window_ms))
+    .into();
+    Expr::case(
+        Expr::col((
+            compaction_history_check::Entity,
+            compaction_history_check::Column::Outcome,
+        ))
+        .is_in(["waiting_catalog", "waiting_executor", "waiting_settings"]),
+        expiry,
+    )
+    .finally(Expr::col((
+        compaction_history_check::Entity,
+        compaction_history_check::Column::NextAttemptMs,
+    )))
+    .into()
+}
+
+fn history_projection() -> SelectStatement {
     use compaction_history_check as h;
     use turn_cli_runtime_binding as b;
     let mut query = root_history_checks();
@@ -506,15 +538,222 @@ pub(crate) async fn compaction_due_history_checks<C: ConnectionTrait>(
                 Expr::col((thread::Entity, thread::Column::Model)),
             ]),
             b::Column::Model,
-        )
-        .and_where(Expr::col((h::Entity, h::Column::NextAttemptMs)).lte(now))
-        .order_by((h::Entity, h::Column::NextAttemptMs), Order::Asc)
-        .order_by((h::Entity, h::Column::TurnId), Order::Asc)
-        .limit(16);
-    CompletedHistoryCheck::find_by_statement(db.get_database_backend().build(&query))
+        );
+    query
+}
+
+async fn history_rows<C: ConnectionTrait>(
+    db: &C,
+    query: SelectStatement,
+) -> Result<Vec<CompletedHistoryCheck>> {
+    // Preserve the shared typed projection while using the Entity executor.
+    // Root/lineage predicates and the optional binding join stay identical.
+    let mut select = compaction_history_check::Entity::find().select_only();
+    *QueryTrait::query(&mut select) = query;
+    Ok(select.into_model::<CompletedHistoryCheck>().all(db).await?)
+}
+pub(crate) async fn compaction_due_history_checks<C: ConnectionTrait>(
+    db: &C,
+    now: i64,
+) -> Result<Vec<CompletedHistoryCheck>> {
+    due_history_page(db, now, &[], 16, None).await
+}
+pub(crate) async fn due_history_page<C: ConnectionTrait>(
+    db: &C,
+    now: i64,
+    excluded: &[String],
+    limit: u64,
+    hot_window_ms: Option<i64>,
+) -> Result<Vec<CompletedHistoryCheck>> {
+    ensure!(
+        limit <= 16 && excluded.len() <= 16,
+        "history service input bound exceeded"
+    );
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    use compaction_history_check::{Column as H, Entity as E};
+    // The partial due index orders raw inputs BEFORE any joined/root filters.
+    let keys = E::find()
+        .select_only()
+        .column(H::TurnId)
+        .filter(Expr::col(H::Purpose).eq(literal("root_conversation")))
+        .filter(Expr::col(H::State).eq(literal("pending")))
+        .filter(Expr::col(H::Managed).eq(literal(1_i64)))
+        .filter(H::NextAttemptMs.lte(now))
+        .order_by_asc(H::NextAttemptMs)
+        .order_by_asc(H::TurnId)
+        .limit(limit)
+        .into_tuple::<String>()
         .all(db)
-        .await
-        .map_err(Into::into)
+        .await?;
+    let mut rows = Vec::new();
+    for key in keys {
+        if excluded.contains(&key) {
+            continue;
+        }
+        let mut query = history_projection();
+        query.and_where(Expr::col((E, H::TurnId)).eq(key)).limit(1);
+        if let Some(window) = hot_window_ms {
+            query.and_where(history_eligibility_deadline(window).lte(now));
+        }
+        rows.extend(history_rows(db, query).await?);
+    }
+    Ok(rows)
+}
+/// A dependency pass bounds RAW immutable PK inputs before status/outcome/root
+/// filtering. There is no outcome locator index: LIMIT on matches would permit
+/// an unbounded historical traversal/sort under one reader hold.
+pub(crate) async fn parked_history_page<C: ConnectionTrait>(
+    db: &C,
+    after: Option<&str>,
+    upper: Option<&str>,
+    excluded: &[String],
+    limit: u64,
+    dependencies: u8,
+) -> Result<(
+    Vec<CompletedHistoryCheck>,
+    Option<String>,
+    Option<String>,
+    Option<anyhow::Error>,
+)> {
+    if dependencies == 0 {
+        return Ok((Vec::new(), None, None, None));
+    }
+    let (rows, after, upper, error, _) =
+        history_obligation_page(db, after, upper, excluded, limit, dependencies, i64::MIN, 0)
+            .await?;
+    Ok((
+        rows.into_iter().map(|(row, _)| row).collect(),
+        after,
+        upper,
+        error,
+    ))
+}
+
+pub(crate) async fn history_obligation_page<C: ConnectionTrait>(
+    db: &C,
+    after: Option<&str>,
+    upper: Option<&str>,
+    excluded: &[String],
+    limit: u64,
+    dependencies: u8,
+    now: i64,
+    hot_window_ms: i64,
+) -> Result<(
+    Vec<(CompletedHistoryCheck, bool)>,
+    Option<String>,
+    Option<String>,
+    Option<anyhow::Error>,
+    Option<i64>,
+)> {
+    use compaction_history_check::{Column as H, Entity as E};
+    #[derive(FromQueryResult)]
+    struct RawKey {
+        turn_id: String,
+        state: String,
+        outcome: Option<String>,
+    }
+    ensure!(
+        limit > 0 && limit <= 16 && excluded.len() <= 16,
+        "history dependency input bound exceeded"
+    );
+    let outcomes = HISTORY_DEPENDENCY_OUTCOMES
+        .into_iter()
+        .filter(|outcome| {
+            let bit = match *outcome {
+                "waiting_catalog" => 1,
+                "waiting_settings" => 2,
+                "waiting_executor" => 4,
+                "preparing" => 8,
+                _ => 0,
+            };
+            dependencies & bit != 0
+        })
+        .collect::<Vec<_>>();
+
+    let upper = if let Some(upper) = upper {
+        Some(upper.to_owned())
+    } else {
+        E::find()
+            .select_only()
+            .expr_as(Expr::col(H::TurnId).max(), "upper")
+            .into_tuple::<Option<String>>()
+            .one(db)
+            .await?
+            .flatten()
+    };
+    let Some(upper) = upper else {
+        return Ok((Vec::new(), None, None, None, None));
+    };
+    let mut raw = E::find()
+        .select_only()
+        .columns([H::TurnId, H::State, H::Outcome])
+        .filter(H::TurnId.lte(upper.clone()))
+        .order_by_asc(H::TurnId)
+        .limit(limit);
+    if let Some(after) = after {
+        raw = raw.filter(H::TurnId.gt(after));
+    }
+    let raw = raw.into_model::<RawKey>().all(db).await?;
+    let more = raw.len() == limit as usize && raw.last().map(|row| &row.turn_id) != Some(&upper);
+    let next = if more {
+        raw.last().map(|row| row.turn_id.clone())
+    } else {
+        None
+    };
+    // Reader has been released. Terminal/nonmatching/owned keys still advance
+    // the cursor; selected metadata is hydrated by exact bounded PK separately.
+    let mut rows = Vec::new();
+    let mut first_error = None;
+    let mut earliest = None::<i64>;
+    for key in raw {
+        if key.state != "pending" || excluded.contains(&key.turn_id) {
+            continue;
+        }
+        // The joined deadline expression is evaluated ONLY for this selected PK.
+        let mut deadline_query = root_history_checks();
+        deadline_query
+            .expr_as(
+                history_eligibility_deadline(hot_window_ms),
+                Alias::new("deadline"),
+            )
+            .and_where(Expr::col((E, H::TurnId)).eq(key.turn_id.clone()))
+            .limit(1);
+        let mut select = E::find().select_only();
+        *sea_orm::QueryTrait::query(&mut select) = deadline_query;
+        let deadline = match select.into_tuple::<i64>().one(db).await {
+            Ok(Some(at)) => at,
+            Ok(None) => continue,
+            Err(error) => {
+                first_error.get_or_insert(error.into());
+                continue;
+            }
+        };
+        let dependency = key
+            .outcome
+            .as_deref()
+            .is_some_and(|v| HISTORY_DEPENDENCY_OUTCOMES.contains(&v));
+        let released = key
+            .outcome
+            .as_deref()
+            .is_some_and(|v| outcomes.contains(&v));
+        if deadline > now && !released {
+            earliest = Some(earliest.map_or(deadline, |old| std::cmp::min(old, deadline)));
+            continue;
+        }
+        let mut query = history_projection();
+        query
+            .and_where(Expr::col((compaction_history_check::Entity, H::TurnId)).eq(key.turn_id))
+            .limit(1);
+        match history_rows(db, query).await {
+            Ok(selected) => rows.extend(selected.into_iter().map(|row| (row, dependency))),
+            Err(error) => {
+                first_error.get_or_insert(error);
+            }
+        }
+    }
+    Ok((rows, next, more.then_some(upper), first_error, earliest))
 }
 
 /// Persist the captured settings/deadline before service admission; restart
@@ -576,6 +815,7 @@ pub(crate) async fn claim_history_check(
     id: &str,
     revision: i64,
     now: i64,
+    dependency_outcome: Option<&str>,
 ) -> Result<Option<compaction_history_check::Model>> {
     use compaction_history_check::{ActiveModel as A, Column as C, Entity as E};
     use sea_orm::{Set, TransactionTrait};
@@ -585,7 +825,11 @@ pub(crate) async fn claim_history_check(
             let row = E::find_by_id(id).one(&tx).await?;
             let Some(_) = row.filter(|r| {
                 r.revision == revision
-                    && r.next_attempt_ms <= now
+                    && (r.next_attempt_ms <= now
+                        || dependency_outcome.is_some_and(|outcome| {
+                            HISTORY_DEPENDENCY_OUTCOMES.contains(&outcome)
+                                && r.outcome.as_deref() == Some(outcome)
+                        }))
                     && r.state == "pending"
                     && r.purpose == "root_conversation"
             }) else {

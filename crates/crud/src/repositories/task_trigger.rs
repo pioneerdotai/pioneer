@@ -134,6 +134,55 @@ pub async fn list_due_active_triggers_bounded_through<C: ConnectionTrait>(
         .context("failed to list bounded due task triggers")
 }
 
+/// Finite-reader locator: raw membership survives individual Model decode errors.
+pub async fn list_due_active_trigger_keys_through<C: ConnectionTrait>(
+    db: &C,
+    now: DateTimeWithTimeZone,
+    after: Option<(DateTimeWithTimeZone, &str)>,
+    upper: Option<(DateTimeWithTimeZone, &str)>,
+    limit: u64,
+) -> Result<Vec<(DateTimeWithTimeZone, String, String)>> {
+    let mut query = task_trigger::Entity::find()
+        .filter(task_trigger::Column::Status.eq("active"))
+        .filter(task_trigger::Column::NextFireAt.lte(now));
+    if let Some((at, id)) = after {
+        query = query.filter(
+            Condition::any()
+                .add(task_trigger::Column::NextFireAt.gt(at))
+                .add(
+                    Condition::all()
+                        .add(task_trigger::Column::NextFireAt.eq(at))
+                        .add(task_trigger::Column::Id.gt(id)),
+                ),
+        );
+    }
+    if let Some((at, id)) = upper {
+        query = query.filter(
+            Condition::any()
+                .add(task_trigger::Column::NextFireAt.lt(at))
+                .add(
+                    Condition::all()
+                        .add(task_trigger::Column::NextFireAt.eq(at))
+                        .add(task_trigger::Column::Id.lte(id)),
+                ),
+        );
+    }
+    query
+        .order_by_asc(task_trigger::Column::NextFireAt)
+        .order_by_asc(task_trigger::Column::Id)
+        .limit(limit)
+        .select_only()
+        .columns([
+            task_trigger::Column::NextFireAt,
+            task_trigger::Column::Id,
+            task_trigger::Column::TaskId,
+        ])
+        .into_tuple::<(DateTimeWithTimeZone, String, String)>()
+        .all(db)
+        .await
+        .context("failed to list bounded due task triggers")
+}
+
 /// NULL schedules are dormant, not absent. Cursor rotates the bounded audit
 /// even if the first dormant row is permanently ineligible for recovery.
 pub async fn list_dormant_active_triggers<C: ConnectionTrait>(
@@ -167,6 +216,33 @@ pub async fn list_dormant_active_triggers_through<C: ConnectionTrait>(
         .context("failed to audit dormant task triggers")
 }
 
+/// Finite-reader locator: raw membership survives individual Model decode errors.
+pub async fn list_dormant_active_trigger_keys_through<C: ConnectionTrait>(
+    db: &C,
+    after_id: Option<&str>,
+    upper: Option<&str>,
+    limit: u64,
+) -> Result<Vec<(String, String)>> {
+    let mut query = task_trigger::Entity::find()
+        .filter(task_trigger::Column::Status.eq("active"))
+        .filter(task_trigger::Column::NextFireAt.is_null());
+    if let Some(after_id) = after_id {
+        query = query.filter(task_trigger::Column::Id.gt(after_id));
+    }
+    if let Some(id) = upper {
+        query = query.filter(task_trigger::Column::Id.lte(id));
+    }
+    query
+        .order_by_asc(task_trigger::Column::Id)
+        .limit(limit)
+        .select_only()
+        .columns([task_trigger::Column::Id, task_trigger::Column::TaskId])
+        .into_tuple::<(String, String)>()
+        .all(db)
+        .await
+        .context("failed to audit dormant task triggers")
+}
+
 pub async fn list_active_triggers<C: ConnectionTrait>(db: &C) -> Result<Vec<task_trigger::Model>> {
     task_trigger::Entity::find()
         .filter(task_trigger::Column::Status.eq("active"))
@@ -174,6 +250,74 @@ pub async fn list_active_triggers<C: ConnectionTrait>(db: &C) -> Result<Vec<task
         .all(db)
         .await
         .context("failed to list active task triggers")
+}
+pub(crate) async fn scheduler_task_page<C: ConnectionTrait>(
+    db: &C,
+    task_id: &str,
+) -> Result<Vec<task_trigger::Model>> {
+    Ok(task_trigger::Entity::find()
+        .filter(task_trigger::Column::TaskId.eq(task_id))
+        .filter(task_trigger::Column::Status.eq("active"))
+        .order_by_asc(task_trigger::Column::Id)
+        .limit(64)
+        .all(db)
+        .await?)
+}
+
+pub(crate) async fn next_future_deadline<C: ConnectionTrait>(
+    db: &C,
+    now: DateTimeWithTimeZone,
+) -> Result<Option<DateTimeWithTimeZone>> {
+    Ok(task_trigger::Entity::find()
+        .select_only()
+        .expr_as(task_trigger::Column::NextFireAt.min(), "next_fire_at")
+        .filter(task_trigger::Column::Status.eq("active"))
+        .filter(task_trigger::Column::NextFireAt.gt(now))
+        .into_tuple::<Option<DateTimeWithTimeZone>>()
+        .one(db)
+        .await?
+        .flatten())
+}
+
+/// Raw PK range owns scanned/last/EOF, even when no active matches exist.
+pub(crate) async fn raw_page<C: ConnectionTrait>(
+    db: &C,
+    after: Option<&str>,
+    upper: Option<&str>,
+    limit: u64,
+) -> Result<(Vec<(String, String)>, Option<String>)> {
+    let upper = match upper {
+        Some(id) => Some(id.to_owned()),
+        None => {
+            task_trigger::Entity::find()
+                .select_only()
+                .column(task_trigger::Column::Id)
+                .order_by_desc(task_trigger::Column::Id)
+                .limit(1)
+                .into_tuple::<String>()
+                .one(db)
+                .await?
+        }
+    };
+    let Some(bound) = upper.as_ref() else {
+        return Ok((Vec::new(), None));
+    };
+    let mut query = task_trigger::Entity::find()
+        .select_only()
+        .columns([task_trigger::Column::Id, task_trigger::Column::TaskId])
+        .filter(task_trigger::Column::Id.lte(bound.clone()));
+    if let Some(after) = after {
+        query = query.filter(task_trigger::Column::Id.gt(after));
+    }
+    Ok((
+        query
+            .order_by_asc(task_trigger::Column::Id)
+            .limit(limit)
+            .into_tuple::<(String, String)>()
+            .all(db)
+            .await?,
+        upper,
+    ))
 }
 
 pub async fn update_trigger_schedule<C: ConnectionTrait>(

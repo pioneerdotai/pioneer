@@ -626,13 +626,7 @@ async fn unowned<C: ConnectionTrait>(
     }
     // Acquisition uses the same serialized writer as retirement. Inspect only
     // currently held roots, not the unbounded set of permanent archive roots.
-    let held_ids: Vec<String> = readers
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .keys()
-        .take(65)
-        .cloned()
-        .collect();
+    let held_ids = crate::frozen_lifetime::retention_held_keys(readers);
     if held_ids.len() > 64 {
         return Ok(false);
     }
@@ -717,23 +711,31 @@ impl HtmlPreviewRetentionProgress {
     /// Returns false at discovery EOF. Errors do not pin the cursor to poison
     /// data; the existing maintenance owner revisits every pass/restart.
     pub async fn quantum(&mut self, store: &CrudStore) -> Result<bool> {
-        while self.idle[self.phase] {
-            self.phase = (self.phase + 1) % 3;
-        }
-        let path = self.phase;
-        self.phase = (self.phase + 1) % 3;
-        let more = match path {
-            0 => index_quantum(store, &mut self.index_after, &mut self.imports).await?,
-            1 => input_adoption_quantum(store, &mut self.input_after).await?,
-            _ => self.artifact_quantum(store).await?,
-        };
-        self.idle[path] = !more;
-        if self.idle.iter().all(|idle| *idle) {
-            self.idle = [false; 3];
-            Ok(false)
-        } else {
-            Ok(true)
-        }
+        store
+            .background_changes(
+                &["storage.html.io"],
+                async {
+                    while self.idle[self.phase] {
+                        self.phase = (self.phase + 1) % 3;
+                    }
+                    let path = self.phase;
+                    self.phase = (self.phase + 1) % 3;
+                    let more = match path {
+                        0 => index_quantum(store, &mut self.index_after, &mut self.imports).await?,
+                        1 => input_adoption_quantum(store, &mut self.input_after).await?,
+                        _ => self.artifact_quantum(store).await?,
+                    };
+                    self.idle[path] = !more;
+                    if self.idle.iter().all(|idle| *idle) {
+                        self.idle = [false; 3];
+                        Ok(false)
+                    } else {
+                        Ok(true)
+                    }
+                },
+                |_| false,
+            )
+            .await
     }
     async fn artifact_quantum(&mut self, store: &CrudStore) -> Result<bool> {
         if self.artifact_pending.is_empty() {
@@ -785,6 +787,7 @@ impl HtmlPreviewRetentionProgress {
 }
 
 async fn release(store: &CrudStore, candidate: artifact::Model) -> Result<()> {
+    store.background_changes(&["storage.html.io", "storage.html.retention"], async {
     let metadata: Value = serde_json::from_str(&candidate.metadata_json)?;
     let origin = &metadata["htmlTool"];
     ensure!(
@@ -1168,7 +1171,11 @@ async fn release(store: &CrudStore, candidate: artifact::Model) -> Result<()> {
     if !copy_obligations.is_empty() {
         store.notify_html_preview_io_work();
     }
+    // Actual version ownership release can orphan a blob below the GC cursor.
+    store.background_work("storage.html.retention").dependency_released();
     Ok(())
+
+    }, |_| false).await
 }
 
 impl CrudStore {
@@ -1196,56 +1203,91 @@ impl CrudStore {
         &self,
         after: &str,
         cutoff_ms: i64,
+        grace_ms: i64,
     ) -> Result<(
         String,
         Vec<(String, super::artifact::ArtifactGcBlobCandidateRecord)>,
+        Option<i64>,
     )> {
-        // Page the source rows first, even if every blob still has owners.
-        // This bounds work independently of the number of GC candidates.
+        use sea_orm::FromQueryResult;
+        #[derive(FromQueryResult)]
+        struct BlobPage {
+            id: String,
+            workspace_id: String,
+            storage_key: String,
+            size_bytes: i64,
+            orphan: bool,
+            future_created: Option<sea_orm::prelude::DateTimeWithTimeZone>,
+        }
+        ensure!(grace_ms >= 0, "invalid HTML blob grace");
         let cutoff = chrono::DateTime::from_timestamp_millis(cutoff_ms)
             .ok_or_else(|| anyhow::anyhow!("invalid artifact GC cutoff"))?
             .fixed_offset();
-        let orphan = col("b", artifact_blob::Column::CreatedAt)
-            .lte(cutoff)
-            .and(Func::coalesce([
-                json_field(
-                    col("b", artifact_blob::Column::MetadataJson),
-                    "$.htmlToolTemporary",
-                )
-                .eq(1),
-                Expr::val(0),
-            ]))
-            .and(queries::blob_has_owners("b").not());
-        let query = Query::select()
-            .from_as(artifact_blob::Entity, "b")
+        let unowned = Expr::from(Func::coalesce([
+            json_field(
+                col("artifact_blob", artifact_blob::Column::MetadataJson),
+                "$.htmlToolTemporary",
+            )
+            .eq(1),
+            Expr::val(0),
+        ]))
+        .and(queries::blob_has_owners("artifact_blob").not());
+        // Retain the RAW sixteen-key budget. Future grace is observed in the
+        // same source page; there is no added global orphan MIN/sort/read hold.
+        let rows = artifact_blob::Entity::find()
+            .select_only()
             .columns([
-                ("b", artifact_blob::Column::WorkspaceId),
-                ("b", artifact_blob::Column::Id),
-                ("b", artifact_blob::Column::StorageKey),
-                ("b", artifact_blob::Column::SizeBytes),
+                artifact_blob::Column::Id,
+                artifact_blob::Column::WorkspaceId,
+                artifact_blob::Column::StorageKey,
+                artifact_blob::Column::SizeBytes,
             ])
-            .expr_as(orphan, "orphan")
-            .and_where(col("b", artifact_blob::Column::Id).gt(after))
-            .order_by(("b", artifact_blob::Column::Id), Order::Asc)
+            .expr_as(
+                unowned
+                    .clone()
+                    .and(Expr::col(artifact_blob::Column::CreatedAt).lte(cutoff)),
+                "orphan",
+            )
+            .expr_as(
+                Expr::case(
+                    unowned.and(Expr::col(artifact_blob::Column::CreatedAt).gt(cutoff)),
+                    Expr::col(artifact_blob::Column::CreatedAt),
+                )
+                .finally(Expr::val(
+                    Option::<sea_orm::prelude::DateTimeWithTimeZone>::None,
+                )),
+                "future_created",
+            )
+            .filter(artifact_blob::Column::Id.gt(after))
+            .order_by_asc(artifact_blob::Column::Id)
             .limit(16)
-            .to_owned();
-        let rows = self.connection.query_all(&query).await?;
+            .into_model::<BlobPage>()
+            .all(&self.connection)
+            .await?;
         let mut next = String::new();
         let mut candidates = Vec::new();
+        let mut deadline = None;
         for row in rows {
-            next = row.try_get("", "id")?;
-            if row.try_get::<i64>("", "orphan")? != 0 {
+            next = row.id;
+            if row.orphan {
                 candidates.push((
-                    row.try_get("", "workspace_id")?,
+                    row.workspace_id,
                     super::artifact::ArtifactGcBlobCandidateRecord {
                         blob_id: next.clone(),
-                        storage_key: row.try_get("", "storage_key")?,
-                        size_bytes: std::cmp::max(row.try_get::<i64>("", "size_bytes")?, 0) as u64,
+                        storage_key: row.storage_key,
+                        size_bytes: std::cmp::max(row.size_bytes, 0) as u64,
                     },
                 ));
             }
+            if let Some(created) = row.future_created {
+                let at = created
+                    .timestamp_millis()
+                    .saturating_add(i64::from(created.timestamp_subsec_nanos() % 1_000_000 != 0))
+                    .saturating_add(grace_ms);
+                deadline = Some(deadline.map_or(at, |old: i64| std::cmp::min(old, at)));
+            }
         }
-        Ok((next, candidates))
+        Ok((next, candidates, deadline))
     }
     pub async fn html_preview_released_copies_page(
         &self,
@@ -1337,82 +1379,91 @@ impl CrudStore {
         metadata: &str,
         claim: Option<&crate::HtmlPreviewIoClaim>,
     ) -> Result<bool> {
-        let io_locator = super::html_preview_io_work::HtmlPreviewIoLocator::new(id);
-        self.run_serialized_write(|| async {
-            let tx = self.connection.begin().await?;
-            let callback = if claim.is_none() {
-                super::html_preview_io_work::callback_ticket(&tx, "copies", &io_locator, 0).await?
-            } else {
-                None
-            };
-            if let Some(claim) = claim {
-                ensure!(
-                    pioneer_entity::html_preview_io_work::Entity::find()
-                        .filter(super::html_preview_io_work::fence(&claim.row))
+        self.background_changes(
+            &["storage.html.io"],
+            async {
+                let io_locator = super::html_preview_io_work::HtmlPreviewIoLocator::new(id);
+                self.run_serialized_write(|| async {
+                    let tx = self.connection.begin().await?;
+                    let callback = if claim.is_none() {
+                        super::html_preview_io_work::callback_ticket(&tx, "copies", &io_locator, 0)
+                            .await?
+                    } else {
+                        None
+                    };
+                    if let Some(claim) = claim {
+                        ensure!(
+                            pioneer_entity::html_preview_io_work::Entity::find()
+                                .filter(super::html_preview_io_work::fence(&claim.row))
+                                .one(&tx)
+                                .await?
+                                .is_some(),
+                            "copy claim fence lost"
+                        );
+                    }
+                    // SQL text equality can be case-insensitive. Lock the current
+                    // source (FOR UPDATE on PostgreSQL/MySQL), then compare exact bytes
+                    // in Rust before publishing prepared cleanup and ACK. A locking
+                    // read also avoids an old InnoDB Repeatable Read snapshot. SQLite
+                    // uses the existing serialized writer transaction instead.
+                    let current = artifact::Entity::find_by_id(id)
+                        .select_only()
+                        .columns([
+                            artifact::Column::WorkspaceId,
+                            artifact::Column::CurrentVersionId,
+                            artifact::Column::MetadataJson,
+                        ])
+                        .filter(
+                            super::html_preview_io_work::io_bytes(
+                                tx.get_database_backend(),
+                                Expr::col(artifact::Column::MetadataJson),
+                            )
+                            .lte(1048576),
+                        )
+                        .lock_exclusive()
+                        .into_tuple::<(String, Option<String>, String)>()
                         .one(&tx)
-                        .await?
-                        .is_some(),
-                    "copy claim fence lost"
-                );
-            }
-            // SQL text equality can be case-insensitive. Lock the current
-            // source (FOR UPDATE on PostgreSQL/MySQL), then compare exact bytes
-            // in Rust before publishing prepared cleanup and ACK. A locking
-            // read also avoids an old InnoDB Repeatable Read snapshot. SQLite
-            // uses the existing serialized writer transaction instead.
-            let current = artifact::Entity::find_by_id(id)
-                .select_only()
-                .columns([
-                    artifact::Column::WorkspaceId,
-                    artifact::Column::CurrentVersionId,
-                    artifact::Column::MetadataJson,
-                ])
-                .filter(
-                    super::html_preview_io_work::io_bytes(
-                        tx.get_database_backend(),
-                        Expr::col(artifact::Column::MetadataJson),
-                    )
-                    .lte(1048576),
-                )
-                .lock_exclusive()
-                .into_tuple::<(String, Option<String>, String)>()
-                .one(&tx)
-                .await?;
-            let Some((workspace, current_version, current_metadata)) = current else {
-                tx.rollback().await?;
-                return Ok(false);
-            };
-            if current_metadata != previous
-                || current_version.is_some()
-                || claim.is_some_and(|claim| workspace != claim.row.workspace_id)
-            {
-                tx.rollback().await?;
-                return Ok(false);
-            }
-            let mut update = artifact::Entity::update_many()
-                .col_expr(artifact::Column::MetadataJson, Expr::val(metadata))
-                .filter(artifact::Column::Id.eq(id))
-                .filter(artifact::Column::CurrentVersionId.is_null())
-                .filter(artifact::Column::MetadataJson.eq(previous));
-            if let Some(claim) = claim {
-                update = update.filter(artifact::Column::WorkspaceId.eq(&claim.row.workspace_id));
-            }
-            if update.exec(&tx).await?.rows_affected != 1 {
-                tx.rollback().await?;
-                return Ok(false);
-            }
-            if let Some(claim) = claim {
-                ensure!(
-                    super::html_preview_io_work::ack(&tx, claim).await?,
-                    "copy ACK fence lost"
-                );
-            }
-            if let Some(row) = &callback {
-                super::html_preview_io_work::callback_ack(&tx, row).await?;
-            }
-            tx.commit().await?;
-            Ok(true)
-        })
+                        .await?;
+                    let Some((workspace, current_version, current_metadata)) = current else {
+                        tx.rollback().await?;
+                        return Ok(false);
+                    };
+                    if current_metadata != previous
+                        || current_version.is_some()
+                        || claim.is_some_and(|claim| workspace != claim.row.workspace_id)
+                    {
+                        tx.rollback().await?;
+                        return Ok(false);
+                    }
+                    let mut update = artifact::Entity::update_many()
+                        .col_expr(artifact::Column::MetadataJson, Expr::val(metadata))
+                        .filter(artifact::Column::Id.eq(id))
+                        .filter(artifact::Column::CurrentVersionId.is_null())
+                        .filter(artifact::Column::MetadataJson.eq(previous));
+                    if let Some(claim) = claim {
+                        update = update
+                            .filter(artifact::Column::WorkspaceId.eq(&claim.row.workspace_id));
+                    }
+                    if update.exec(&tx).await?.rows_affected != 1 {
+                        tx.rollback().await?;
+                        return Ok(false);
+                    }
+                    if let Some(claim) = claim {
+                        ensure!(
+                            super::html_preview_io_work::ack(&tx, claim).await?,
+                            "copy ACK fence lost"
+                        );
+                    }
+                    if let Some(row) = &callback {
+                        super::html_preview_io_work::callback_ack(&tx, row).await?;
+                    }
+                    tx.commit().await?;
+                    Ok(true)
+                })
+                .await
+            },
+            |changed| *changed,
+        )
         .await
     }
 }
@@ -1847,108 +1898,119 @@ impl CrudStore {
         archive_hash: &str,
         claim: Option<&crate::HtmlPreviewIoClaim>,
     ) -> Result<bool> {
-        ensure!(
-            archive_hash.len() == 64 && archive_hash.bytes().all(|b| b.is_ascii_hexdigit()),
-            "invalid archival hash"
-        );
-        let reference = serde_json::to_string(&witness.reference)?;
-        let io_locator = super::html_preview_io_work::HtmlPreviewIoLocator::new(&witness.manifest);
-        let Some((source_version, source_id, source_turn)) =
-            frozen_result::Entity::find_by_id((witness.manifest.clone(), witness.ordinal))
-                .select_only()
-                .column(frozen_result::Column::SourceVersion)
-                .column(frozen_result::Column::SourceId)
-                .column(frozen_result::Column::TurnId)
-                .into_tuple::<(String, String, String)>()
-                .one(&self.connection)
-                .await?
-        else {
-            return Ok(false);
-        };
-        let Some(source_revision) = source_version
-            .strip_prefix("revision:")
-            .and_then(|v| v.parse::<i64>().ok())
-        else {
-            return Ok(false);
-        };
-        if source_version != format!("revision:{source_revision}") {
-            return Ok(false);
-        }
-        let current = queries::canonical_preview()
-            .join_as(
-                JoinType::InnerJoin,
-                history::Entity,
-                "h",
-                col("h", history::Column::Id).eq(Expr::col((
-                    frozen_result::Entity,
-                    frozen_result::Column::ManifestId,
-                ))),
-            )
-            .and_where(col("c", turn_llm_context::Column::Id).eq(Expr::col((
-                frozen_result::Entity,
-                frozen_result::Column::SourceId,
-            ))))
-            .and_where(col("c", turn_llm_context::Column::TurnId).eq(Expr::col((
-                frozen_result::Entity,
-                frozen_result::Column::TurnId,
-            ))))
-            .and_where(col("h", history::Column::WorkspaceId).eq(&witness.workspace))
-            .and_where(col("h", history::Column::OwnerThread).eq(&witness.owner_thread))
-            .and_where(col("h", history::Column::Ready).eq(1))
-            .and_where(col("h", history::Column::Expired).eq(0))
-            .and_where(
-                col("th", thread_entity::Column::WorkspaceId)
-                    .eq(col("h", history::Column::WorkspaceId)),
-            )
-            .and_where(col("t", turn_entity::Column::ThreadId).eq(&witness.reference.source_thread))
-            .and_where(col("c", turn_llm_context::Column::Payload).eq(&witness.payload))
-            .and_where(col("v", compaction_source_revision::Column::Revision).eq(source_revision))
-            .to_owned();
-        self.run_serialized_write(|| async {
-            let tx = self.connection.begin().await?;
-            let callback = if claim.is_none() {
-                super::html_preview_io_work::callback_ticket(
-                    &tx,
-                    "witness",
-                    &io_locator,
-                    witness.ordinal,
-                )
-                .await?
-            } else {
-                None
-            };
-            if let Some(claim) = claim {
+        self.background_changes(
+            &["storage.html.io", "storage.html.retention"],
+            async {
                 ensure!(
-                    pioneer_entity::html_preview_io_work::Entity::find()
-                        .filter(super::html_preview_io_work::fence(&claim.row))
-                        .one(&tx)
-                        .await?
-                        .is_some(),
-                    "witness claim fence lost"
+                    archive_hash.len() == 64 && archive_hash.bytes().all(|b| b.is_ascii_hexdigit()),
+                    "invalid archival hash"
                 );
-            }
-            let changed = frozen_result::Entity::update_many()
-                .col_expr(
-                    frozen_result::Column::ArchiveWireSha256,
-                    Expr::val(archive_hash),
-                )
-                .filter(frozen_result::Column::ManifestId.eq(&witness.manifest))
-                .filter(frozen_result::Column::Ordinal.eq(witness.ordinal))
-                .filter(frozen_result::Column::ReferenceJson.eq(&reference))
-                .filter(frozen_result::Column::SourceVersion.eq(&source_version))
-                .filter(frozen_result::Column::SourceId.eq(&source_id))
-                .filter(frozen_result::Column::TurnId.eq(&source_turn))
-                .filter(frozen_result::Column::ArchiveWireSha256.is_null())
-                .filter(Expr::exists(current.clone()))
-                .exec(&tx)
-                .await?
-                .rows_affected;
-            // Zero affected rows alone never establish successful publication.
-            // A concurrent publisher may already have stored this exact receipt;
-            // reread under current domain authority before acknowledging it.
-            if changed != 1 {
-                let stored =
+                let reference = serde_json::to_string(&witness.reference)?;
+                let io_locator =
+                    super::html_preview_io_work::HtmlPreviewIoLocator::new(&witness.manifest);
+                let Some((source_version, source_id, source_turn)) =
                     frozen_result::Entity::find_by_id((witness.manifest.clone(), witness.ordinal))
+                        .select_only()
+                        .column(frozen_result::Column::SourceVersion)
+                        .column(frozen_result::Column::SourceId)
+                        .column(frozen_result::Column::TurnId)
+                        .into_tuple::<(String, String, String)>()
+                        .one(&self.connection)
+                        .await?
+                else {
+                    return Ok(false);
+                };
+                let Some(source_revision) = source_version
+                    .strip_prefix("revision:")
+                    .and_then(|v| v.parse::<i64>().ok())
+                else {
+                    return Ok(false);
+                };
+                if source_version != format!("revision:{source_revision}") {
+                    return Ok(false);
+                }
+                let current = queries::canonical_preview()
+                    .join_as(
+                        JoinType::InnerJoin,
+                        history::Entity,
+                        "h",
+                        col("h", history::Column::Id).eq(Expr::col((
+                            frozen_result::Entity,
+                            frozen_result::Column::ManifestId,
+                        ))),
+                    )
+                    .and_where(col("c", turn_llm_context::Column::Id).eq(Expr::col((
+                        frozen_result::Entity,
+                        frozen_result::Column::SourceId,
+                    ))))
+                    .and_where(col("c", turn_llm_context::Column::TurnId).eq(Expr::col((
+                        frozen_result::Entity,
+                        frozen_result::Column::TurnId,
+                    ))))
+                    .and_where(col("h", history::Column::WorkspaceId).eq(&witness.workspace))
+                    .and_where(col("h", history::Column::OwnerThread).eq(&witness.owner_thread))
+                    .and_where(col("h", history::Column::Ready).eq(1))
+                    .and_where(col("h", history::Column::Expired).eq(0))
+                    .and_where(
+                        col("th", thread_entity::Column::WorkspaceId)
+                            .eq(col("h", history::Column::WorkspaceId)),
+                    )
+                    .and_where(
+                        col("t", turn_entity::Column::ThreadId)
+                            .eq(&witness.reference.source_thread),
+                    )
+                    .and_where(col("c", turn_llm_context::Column::Payload).eq(&witness.payload))
+                    .and_where(
+                        col("v", compaction_source_revision::Column::Revision).eq(source_revision),
+                    )
+                    .to_owned();
+                self.run_serialized_write(|| async {
+                    let tx = self.connection.begin().await?;
+                    let callback = if claim.is_none() {
+                        super::html_preview_io_work::callback_ticket(
+                            &tx,
+                            "witness",
+                            &io_locator,
+                            witness.ordinal,
+                        )
+                        .await?
+                    } else {
+                        None
+                    };
+                    if let Some(claim) = claim {
+                        ensure!(
+                            pioneer_entity::html_preview_io_work::Entity::find()
+                                .filter(super::html_preview_io_work::fence(&claim.row))
+                                .one(&tx)
+                                .await?
+                                .is_some(),
+                            "witness claim fence lost"
+                        );
+                    }
+                    let changed = frozen_result::Entity::update_many()
+                        .col_expr(
+                            frozen_result::Column::ArchiveWireSha256,
+                            Expr::val(archive_hash),
+                        )
+                        .filter(frozen_result::Column::ManifestId.eq(&witness.manifest))
+                        .filter(frozen_result::Column::Ordinal.eq(witness.ordinal))
+                        .filter(frozen_result::Column::ReferenceJson.eq(&reference))
+                        .filter(frozen_result::Column::SourceVersion.eq(&source_version))
+                        .filter(frozen_result::Column::SourceId.eq(&source_id))
+                        .filter(frozen_result::Column::TurnId.eq(&source_turn))
+                        .filter(frozen_result::Column::ArchiveWireSha256.is_null())
+                        .filter(Expr::exists(current.clone()))
+                        .exec(&tx)
+                        .await?
+                        .rows_affected;
+                    // Zero affected rows alone never establish successful publication.
+                    // A concurrent publisher may already have stored this exact receipt;
+                    // reread under current domain authority before acknowledging it.
+                    if changed != 1 {
+                        let stored = frozen_result::Entity::find_by_id((
+                            witness.manifest.clone(),
+                            witness.ordinal,
+                        ))
                         .select_only()
                         .column(frozen_result::Column::ArchiveWireSha256)
                         .filter(frozen_result::Column::ReferenceJson.eq(&reference))
@@ -1960,23 +2022,27 @@ impl CrudStore {
                         .into_tuple::<Option<String>>()
                         .one(&tx)
                         .await?;
-                if !stored.is_some_and(|value| value.as_deref() == Some(archive_hash)) {
-                    tx.rollback().await?;
-                    return Ok(false);
-                }
-            }
-            if let Some(claim) = claim {
-                ensure!(
-                    super::html_preview_io_work::ack(&tx, claim).await?,
-                    "witness ACK fence lost"
-                );
-            }
-            if let Some(row) = &callback {
-                super::html_preview_io_work::callback_ack(&tx, row).await?;
-            }
-            tx.commit().await?;
-            Ok(true)
-        })
+                        if !stored.is_some_and(|value| value.as_deref() == Some(archive_hash)) {
+                            tx.rollback().await?;
+                            return Ok(false);
+                        }
+                    }
+                    if let Some(claim) = claim {
+                        ensure!(
+                            super::html_preview_io_work::ack(&tx, claim).await?,
+                            "witness ACK fence lost"
+                        );
+                    }
+                    if let Some(row) = &callback {
+                        super::html_preview_io_work::callback_ack(&tx, row).await?;
+                    }
+                    tx.commit().await?;
+                    Ok(true)
+                })
+                .await
+            },
+            |changed| *changed,
+        )
         .await
     }
 

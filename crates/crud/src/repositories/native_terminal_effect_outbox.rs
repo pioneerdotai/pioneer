@@ -9,8 +9,8 @@ use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::{Expr, ExprTrait};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, DatabaseBackend, EntityTrait,
-    FromQueryResult, IntoActiveModel, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set,
-    Statement, TransactionTrait,
+    FromQueryResult, IntoActiveModel, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect,
+    QueryTrait, Set, Statement, TransactionTrait,
 };
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
@@ -1263,18 +1263,31 @@ pub(crate) async fn apply_prepared_gate_resolution<C: ConnectionTrait>(
 // SeaQuery has no SQLite INDEXED BY support. The literal predicate makes the
 // partial index usable; INDEXED BY prevents a competing status index and sort
 // from visiting the entire waiting set before LIMIT.
+pub(crate) fn gate_due_query(now: i64) -> sea_orm::Select<native_terminal_effect_outbox::Entity> {
+    native_terminal_effect_outbox::Entity::find()
+        .filter(
+            Expr::col(native_terminal_effect_outbox::Column::Status)
+                .eq(Expr::cust("'waiting_acceptance'")),
+        )
+        .filter(native_terminal_effect_outbox::Column::GateProbeAt.lte(now))
+}
+
 pub(crate) fn gate_due_page(now: i64, limit: u64) -> Statement {
-    Statement::from_sql_and_values(
-        DatabaseBackend::Sqlite,
-        "SELECT native_terminal_effect_outbox.* FROM native_terminal_effect_outbox \
-         INDEXED BY idx_native_terminal_effect_gate_due \
-         WHERE status = 'waiting_acceptance' AND gate_probe_at <= ? \
-         ORDER BY gate_probe_at, prepared_at, effect_id LIMIT ?",
-        [
-            now.into(),
-            (std::cmp::min(limit, EFFECT_INPUT_BUDGET) as i64).into(),
-        ],
-    )
+    let mut statement = gate_due_query(now)
+        .order_by_asc(native_terminal_effect_outbox::Column::GateProbeAt)
+        .order_by_asc(native_terminal_effect_outbox::Column::PreparedAt)
+        .order_by_asc(native_terminal_effect_outbox::Column::EffectId)
+        .limit(std::cmp::min(limit, EFFECT_INPUT_BUDGET))
+        .build(DatabaseBackend::Sqlite);
+    // Installed SeaQuery does not expose INDEXED BY. Keep only this existing
+    // physical access hint as the local exception; eligibility comes from the
+    // same Entity query used for admission.
+    statement.sql = statement.sql.replacen(
+        "FROM \"native_terminal_effect_outbox\"",
+        "FROM \"native_terminal_effect_outbox\" INDEXED BY idx_native_terminal_effect_gate_due",
+        1,
+    );
+    statement
 }
 
 fn probe_delay(attempts: i64) -> i64 {
@@ -1471,6 +1484,20 @@ pub(crate) async fn discover_gate_probes(
         .await?)
 }
 
+pub(crate) fn execution_due_query(
+    status: &str,
+    now: DateTimeWithTimeZone,
+) -> sea_orm::Select<native_terminal_effect_outbox::Entity> {
+    let due_column = if status == STATUS_RUNNING {
+        native_terminal_effect_outbox::Column::ClaimExpiresAt
+    } else {
+        native_terminal_effect_outbox::Column::NextRunAt
+    };
+    native_terminal_effect_outbox::Entity::find()
+        .filter(native_terminal_effect_outbox::Column::Status.eq(status.to_owned()))
+        .filter(due_column.lte(now))
+}
+
 pub(crate) fn claim_page(
     status: &str,
     now: DateTimeWithTimeZone,
@@ -1481,9 +1508,7 @@ pub(crate) fn claim_page(
     } else {
         native_terminal_effect_outbox::Column::NextRunAt
     };
-    native_terminal_effect_outbox::Entity::find()
-        .filter(native_terminal_effect_outbox::Column::Status.eq(status.to_owned()))
-        .filter(due_column.lte(now))
+    execution_due_query(status, now)
         .order_by_asc(due_column)
         .order_by_asc(native_terminal_effect_outbox::Column::PreparedAt)
         .order_by_asc(native_terminal_effect_outbox::Column::EffectId)
@@ -1997,24 +2022,7 @@ pub async fn mark_failed<C: ConnectionTrait>(
     Ok(updated == 1)
 }
 
-/// Reopens a bounded set of recently exhausted post-turn obligations whose
-/// typed failure can make progress after an external provider or storage
-/// outage clears. A legacy write_failed with a checkpoint gets one bounded
-/// revalidation attempt, not a fresh retry budget. The marker is committed with
-/// requeue so recovery cannot repeatedly reopen the legacy code. Legacy
-/// manifest_failed gets the same single attempt without requiring a checkpoint.
-/// Its distinct durable marker is excluded from discovery, including after restart.
-pub async fn requeue_retryable_unresolved<C: ConnectionTrait>(
-    db: &C,
-    now: DateTimeWithTimeZone,
-    completed_before: DateTimeWithTimeZone,
-    prepared_after: DateTimeWithTimeZone,
-    limit: u64,
-) -> Result<u64> {
-    let limit = std::cmp::Ord::min(limit, MAX_RETRYABLE_UNRESOLVED_REQUEUE_BATCH_SIZE);
-    if limit == 0 {
-        return Ok(0);
-    }
+fn retryable_failure_condition() -> Condition {
     // provider_http_403 deliberately stays outside this allowlist: it receives
     // the original durable budget only, never a fresh budget from periodic scans.
     let retryable_codes = [
@@ -2045,20 +2053,43 @@ pub async fn requeue_retryable_unresolved<C: ConnectionTrait>(
             native_terminal_effect_outbox::Column::LastErrorCode
                 .eq("memory.post_turn_extractor.manifest_failed"),
         );
-    let effect_ids = native_terminal_effect_outbox::Entity::find()
-        .select_only()
-        .column(native_terminal_effect_outbox::Column::EffectId)
+    eligible_failures
+}
+fn retryable_unresolved_query(
+    prepared_after: DateTimeWithTimeZone,
+) -> sea_orm::Select<native_terminal_effect_outbox::Entity> {
+    native_terminal_effect_outbox::Entity::find()
         .filter(native_terminal_effect_outbox::Column::Status.eq(STATUS_UNRESOLVED))
         .filter(native_terminal_effect_outbox::Column::EffectKind.eq("post_turn_hook"))
-        .filter(eligible_failures.clone())
-        .filter(native_terminal_effect_outbox::Column::CompletedAt.lte(completed_before))
+        .filter(retryable_failure_condition())
         .filter(native_terminal_effect_outbox::Column::PreparedAt.gte(prepared_after))
-        .order_by_asc(native_terminal_effect_outbox::Column::CompletedAt)
-        .limit(limit)
-        .into_tuple::<String>()
-        .all(db)
-        .await
-        .context("failed to list retryable unresolved native terminal effects")?;
+}
+
+/// Reopens a bounded set of recently exhausted post-turn obligations whose
+/// typed failure can make progress after an external provider or storage
+/// outage clears. A legacy write_failed with a checkpoint gets one bounded
+/// revalidation attempt, not a fresh retry budget. The marker is committed with
+/// requeue so recovery cannot repeatedly reopen the legacy code. Legacy
+/// manifest_failed gets the same single attempt without requiring a checkpoint.
+/// Its distinct durable marker is excluded from discovery, including after restart.
+pub async fn requeue_retryable_unresolved<C: ConnectionTrait>(
+    db: &C,
+    now: DateTimeWithTimeZone,
+    completed_before: DateTimeWithTimeZone,
+    prepared_after: DateTimeWithTimeZone,
+    limit: u64,
+    effect_ids: &[String],
+) -> Result<u64> {
+    let limit = std::cmp::Ord::min(limit, MAX_RETRYABLE_UNRESOLVED_REQUEUE_BATCH_SIZE);
+    if limit == 0 {
+        return Ok(0);
+    }
+    let eligible_failures = retryable_failure_condition();
+    let effect_ids = effect_ids
+        .iter()
+        .take(limit as usize)
+        .cloned()
+        .collect::<Vec<_>>();
     if effect_ids.is_empty() {
         return Ok(0);
     }
@@ -2094,6 +2125,7 @@ pub async fn requeue_retryable_unresolved<C: ConnectionTrait>(
         .filter(native_terminal_effect_outbox::Column::EffectId.is_in(effect_ids))
         .filter(native_terminal_effect_outbox::Column::Status.eq(STATUS_UNRESOLVED))
         .filter(eligible_failures)
+        .filter(native_terminal_effect_outbox::Column::EffectKind.eq("post_turn_hook"))
         .filter(native_terminal_effect_outbox::Column::CompletedAt.lte(completed_before))
         .filter(native_terminal_effect_outbox::Column::PreparedAt.gte(prepared_after))
         .exec(db)
@@ -2113,6 +2145,96 @@ pub async fn load_stats<C: ConnectionTrait>(db: &C) -> Result<NativeTerminalEffe
         succeeded: count_status(db, STATUS_SUCCEEDED).await?,
         unresolved: count_status(db, STATUS_UNRESOLVED).await?,
     })
+}
+
+pub async fn work_deadline<C: ConnectionTrait>(db: &C) -> Result<Option<DateTimeWithTimeZone>> {
+    use sea_orm::{FromQueryResult, QueryTrait};
+    #[derive(FromQueryResult)]
+    struct Clocks {
+        ready: Option<DateTimeWithTimeZone>,
+        claimed: Option<DateTimeWithTimeZone>,
+        gate: Option<i64>,
+    }
+    let clock = |column, statuses: Vec<&str>| {
+        native_terminal_effect_outbox::Entity::find()
+            .select_only()
+            .expr(Expr::col(column).min())
+            .filter(native_terminal_effect_outbox::Column::Status.is_in(statuses))
+    };
+    let mut query = native_terminal_effect_outbox::Entity::find()
+        .select_only()
+        .expr_as(
+            Expr::from(
+                clock(
+                    native_terminal_effect_outbox::Column::NextRunAt,
+                    vec![STATUS_READY, STATUS_RETRY_WAIT],
+                )
+                .into_query(),
+            ),
+            "ready",
+        )
+        .expr_as(
+            Expr::from(
+                clock(
+                    native_terminal_effect_outbox::Column::ClaimExpiresAt,
+                    vec![STATUS_RUNNING],
+                )
+                .into_query(),
+            ),
+            "claimed",
+        )
+        .expr_as(
+            Expr::from(
+                clock(
+                    native_terminal_effect_outbox::Column::GateProbeAt,
+                    vec![STATUS_WAITING_ACCEPTANCE],
+                )
+                .into_query(),
+            ),
+            "gate",
+        );
+    QueryTrait::query(&mut query).from_clear();
+    let row = query
+        .into_model::<Clocks>()
+        .one(db)
+        .await?
+        .context("missing terminal-effect clocks")?;
+    // The authoritative executor samples integer seconds after admission.
+    Ok(row
+        .ready
+        .into_iter()
+        .chain(row.claimed)
+        .chain(row.gate.map(crate::unix_to_datetime))
+        .map(|at| {
+            crate::unix_to_datetime(
+                at.timestamp()
+                    .saturating_add(i64::from(at.timestamp_subsec_nanos() != 0)),
+            )
+        })
+        .min())
+}
+
+pub async fn archive_deadline<C: ConnectionTrait>(
+    db: &C,
+    now: DateTimeWithTimeZone,
+    retention: bool,
+) -> Result<Option<DateTimeWithTimeZone>> {
+    anyhow::ensure!(retention, "retry discovery requires the finite raw pass");
+    let _ = now;
+    let query = native_terminal_effect_outbox::Entity::find().filter(
+        native_terminal_effect_outbox::Column::Status.is_in([
+            STATUS_SUCCEEDED,
+            STATUS_DISCARDED,
+            STATUS_SUPERSEDED,
+        ]),
+    );
+    Ok(query
+        .select_only()
+        .expr(Expr::col(native_terminal_effect_outbox::Column::CompletedAt).min())
+        .into_tuple::<Option<DateTimeWithTimeZone>>()
+        .one(db)
+        .await?
+        .flatten())
 }
 
 /// Delete a bounded batch of old, fully resolved obligations.
@@ -2376,4 +2498,21 @@ pub(crate) fn payload_integrity_matches(
 ) -> bool {
     let actual_sha256 = payload_sha256_hex(payload_json);
     actual_sha256 == payload_sha256 && actual_sha256 == payload_identity_sha256
+}
+
+pub(crate) async fn retry_clock_by_id<C: ConnectionTrait>(
+    db: &C,
+    id: &str,
+    now: DateTimeWithTimeZone,
+) -> Result<Option<DateTimeWithTimeZone>> {
+    Ok(
+        retryable_unresolved_query(now - chrono::Duration::hours(24))
+            .filter(native_terminal_effect_outbox::Column::EffectId.eq(id))
+            .select_only()
+            .column(native_terminal_effect_outbox::Column::CompletedAt)
+            .into_tuple::<Option<DateTimeWithTimeZone>>()
+            .one(db)
+            .await?
+            .flatten(),
+    )
 }

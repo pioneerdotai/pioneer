@@ -14,7 +14,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use zstd::dict::EncoderDictionary;
 
-pub(crate) const PERIODIC_MAINTENANCE_INTERVAL_SECONDS: u64 = 300;
 pub(crate) const PERIODIC_BACKLOG_RECHECK_MILLIS: u64 = 250;
 pub(crate) const PERIODIC_MAINTENANCE_SECONDS: f64 = 10.0;
 #[cfg(test)]
@@ -114,6 +113,7 @@ pub(crate) struct ZstdPeriodicMaintenanceOutcome {
     pub(crate) summaries: Vec<ZstdColumnCompressionSummary>,
     pub(crate) deferred: bool,
     pub(crate) cancelled: bool,
+    pub(crate) continuation: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -121,6 +121,7 @@ struct CooperativeMaintenanceOutcome {
     deferred: bool,
     cancelled: bool,
     columns: Vec<(ZstdColumnConfig, ColumnMaintenanceProgress)>,
+    continuation: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -151,8 +152,40 @@ struct CompressionDictionary {
 // restored only after joining it. Replacement drops the old CDict before copy:
 // at most two native dictionaries exist, including in-flight references.
 // Cancellation drains the join before worker shutdown; no blocking job writes DB.
+// Exclusive runtime ownership makes successfully registered schema knowledge
+// stable. Empty tables remain unknown until an actual payload producer wakes
+// maintenance. No TTL, domain revision or periodic catalog discovery.
+#[derive(Default)]
+struct CompressionSchemaKnowledge {
+    verified: std::sync::atomic::AtomicBool,
+    enabled: std::sync::atomic::AtomicU8,
+}
+impl CompressionSchemaKnowledge {
+    fn bit(config: ZstdColumnConfig) -> u8 {
+        match config.count_source {
+            ZstdColumnCountSource::TurnEvent => 1,
+            ZstdColumnCountSource::TurnItem => 2,
+        }
+    }
+    fn enabled(&self, config: ZstdColumnConfig) -> bool {
+        self.enabled.load(std::sync::atomic::Ordering::Acquire) & Self::bit(config) != 0
+    }
+    fn remember(&self, config: ZstdColumnConfig, ensure: EnsureCompressionResult) {
+        if ensure.was_enabled || ensure.enabled_now {
+            self.enabled
+                .fetch_or(Self::bit(config), std::sync::atomic::Ordering::Release);
+        }
+    }
+}
+
 pub(crate) struct PreparedDictionaryCache {
     database_identity: usize,
+    // Round-robin start survives a slice ending between columns.
+    next_column: usize,
+    remaining_columns: Option<Vec<ZstdColumnConfig>>,
+    #[cfg(test)]
+    slice_batches: Option<usize>,
+    schema: Arc<CompressionSchemaKnowledge>,
     entries: [Option<PreparedDictionaryEntry>; 2],
     #[cfg(test)]
     preparations: Arc<std::sync::atomic::AtomicUsize>,
@@ -162,12 +195,21 @@ pub(crate) struct PreparedDictionaryCache {
     after_training: Option<Arc<dyn Fn() + Send + Sync>>,
     #[cfg(test)]
     pub(crate) after_cycle: Option<Arc<dyn Fn(&Self) + Send + Sync>>,
+    #[cfg(test)]
+    pub(crate) after_publish: Option<Arc<tokio::sync::Barrier>>,
 }
 
 impl PreparedDictionaryCache {
     pub(crate) fn new(store: &CrudStore) -> Self {
         Self {
             database_identity: store.database_connection().runtime_identity(),
+            next_column: 0,
+            remaining_columns: None,
+            #[cfg(test)]
+            slice_batches: None,
+            schema: store
+                .database_connection()
+                .shared_resource::<CompressionSchemaKnowledge>(),
             entries: [None, None],
             #[cfg(test)]
             preparations: Arc::default(),
@@ -177,7 +219,13 @@ impl PreparedDictionaryCache {
             after_training: None,
             #[cfg(test)]
             after_cycle: None,
+            #[cfg(test)]
+            after_publish: None,
         }
+    }
+
+    pub(crate) fn rediscover_backlog(&mut self) {
+        self.remaining_columns = None;
     }
 
     fn retained_native_bytes(&self) -> usize {
@@ -318,7 +366,13 @@ pub(crate) async fn ensure_compression_schema(
 ) -> Result<Vec<ZstdColumnCompressionSummary>> {
     let crud_store = crud_store.with_maintenance_access();
     let db = crud_store.database_connection();
-    zstd_database_phase(Some(cancellation), verify_sqlite_zstd_registered(&db)).await?;
+    let schema = db.shared_resource::<CompressionSchemaKnowledge>();
+    if !schema.verified.load(std::sync::atomic::Ordering::Acquire) {
+        zstd_database_phase(Some(cancellation), verify_sqlite_zstd_registered(&db)).await?;
+        schema
+            .verified
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
 
     let mut summaries = Vec::with_capacity(configs.len());
     for config in configs {
@@ -333,6 +387,7 @@ pub(crate) async fn ensure_compression_schema(
             }
         })
         .await?;
+        schema.remember(*config, ensure);
         summaries.push(summary_without_maintenance(*config, ensure));
     }
     Ok(summaries)
@@ -449,17 +504,42 @@ async fn run_periodic_maintenance_inner(
         cache.database_identity == db.runtime_identity(),
         "zstd cache belongs to a different database worker"
     );
-    zstd_database_phase(cancellation, verify_sqlite_zstd_registered(&db)).await?;
-
+    if row_inspection == RowInspection::Exact
+        || !cache
+            .schema
+            .verified
+            .load(std::sync::atomic::Ordering::Acquire)
+    {
+        zstd_database_phase(cancellation, verify_sqlite_zstd_registered(&db)).await?;
+        cache
+            .schema
+            .verified
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+    let schema = cache.schema.clone();
     let configs = configs.to_vec();
     let before = zstd_database_quantum(crud_store, cancellation, || {
         let db = db.clone();
         let configs = configs.clone();
+        let schema = schema.clone();
         async move {
             let mut before = Vec::with_capacity(configs.len());
             for config in configs {
-                let ensure =
-                    ensure_compression_enabled(&db, config, row_inspection, cancellation).await?;
+                let ensure = if row_inspection == RowInspection::Bounded && schema.enabled(config) {
+                    EnsureCompressionResult {
+                        total_rows: 0,
+                        was_enabled: true,
+                        enabled_now: false,
+                        skipped_empty: false,
+                        counts_exact: false,
+                    }
+                } else {
+                    let ensure =
+                        ensure_compression_enabled(&db, config, row_inspection, cancellation)
+                            .await?;
+                    schema.remember(config, ensure);
+                    ensure
+                };
                 let pending_before = match row_inspection {
                     RowInspection::Exact => {
                         zstd_database_phase(cancellation, pending_uncompressed_rows(&db, config))
@@ -500,6 +580,7 @@ async fn run_periodic_maintenance_inner(
             summaries: Vec::new(),
             deferred: false,
             cancelled: true,
+            continuation: false,
         });
     }
 
@@ -541,6 +622,7 @@ async fn run_periodic_maintenance_inner(
         summaries,
         deferred: maintenance.deferred,
         cancelled: false,
+        continuation: maintenance.continuation,
     })
 }
 
@@ -564,12 +646,25 @@ async fn run_cooperative_maintenance(
         .copied()
         .map(|config| (config, ColumnMaintenanceProgress::default()))
         .collect::<Vec<_>>();
-    let mut active = vec![true; configs.len()];
+    let mut active = configs
+        .iter()
+        .map(|config| {
+            cache
+                .remaining_columns
+                .as_ref()
+                .is_none_or(|remaining| remaining.contains(config))
+        })
+        .collect::<Vec<_>>();
+    #[cfg(test)]
+    let mut batches = 0;
 
     loop {
         let mut attempted = false;
         let mut made_progress = false;
-        for (index, config) in configs.iter().copied().enumerate() {
+        let first = cache.next_column;
+        for offset in 0..configs.len() {
+            let index = (first + offset) % configs.len();
+            let config = configs[index];
             if !active[index] {
                 continue;
             }
@@ -577,13 +672,27 @@ async fn run_cooperative_maintenance(
                 return Ok(CooperativeMaintenanceOutcome {
                     deferred: false,
                     cancelled: true,
+                    continuation: false,
                     columns,
                 });
             }
-            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            let slice_exhausted = deadline.is_some_and(|deadline| Instant::now() >= deadline);
+            #[cfg(test)]
+            let slice_exhausted =
+                slice_exhausted || cache.slice_batches.is_some_and(|limit| batches >= limit);
+            if slice_exhausted {
+                cache.remaining_columns = Some(
+                    configs
+                        .iter()
+                        .copied()
+                        .zip(&active)
+                        .filter_map(|(config, active)| active.then_some(config))
+                        .collect(),
+                );
                 return Ok(CooperativeMaintenanceOutcome {
                     deferred: false,
                     cancelled: false,
+                    continuation: active.iter().any(|active| *active),
                     columns,
                 });
             }
@@ -592,6 +701,11 @@ async fn run_cooperative_maintenance(
             let started_at = Instant::now();
             let batch =
                 run_one_compression_batch(crud_store, cache, db, config, cancellation).await?;
+            cache.next_column = (index + 1) % configs.len();
+            #[cfg(test)]
+            {
+                batches += 1;
+            }
             let progress = &mut columns[index].1;
             progress.observed_rows = progress.observed_rows.saturating_add(batch.observed_rows);
             progress.applied_rows = progress.applied_rows.saturating_add(batch.applied_rows);
@@ -609,6 +723,7 @@ async fn run_cooperative_maintenance(
                 return Ok(CooperativeMaintenanceOutcome {
                     deferred: false,
                     cancelled: true,
+                    continuation: false,
                     columns,
                 });
             }
@@ -619,9 +734,11 @@ async fn run_cooperative_maintenance(
         }
 
         if !active.iter().any(|active| *active) || !attempted || !made_progress {
+            cache.remaining_columns = None;
             return Ok(CooperativeMaintenanceOutcome {
                 deferred: false,
                 cancelled: false,
+                continuation: false,
                 columns,
             });
         }
@@ -1157,6 +1274,18 @@ async fn apply_prepared_payload_rows(
     rows: &[PreparedPayloadRow],
     cancellation: Option<&tokio_util::sync::CancellationToken>,
 ) -> Result<(u64, u64)> {
+    // Physical turn_item payload/dictionary updates can run the existing
+    // compaction service-item triggers even when logical payloads are unchanged.
+    // A row can change its item identity while compression is prepared, so a
+    // pre-read prefix test would be a false-negative race. Invalidate this one
+    // affected domain after a successful nonempty TurnItem CAS batch; never
+    // broadcast or re-open the compression owner's own backlog here.
+    let compaction_change = (config.count_source == ZstdColumnCountSource::TurnItem).then(|| {
+        db.shared_resource::<pioneer_sqlite::background::Registry>()
+            .owner("compaction.lifecycle")
+            .changing()
+    });
+
     check_database_cancellation(cancellation)?;
     let transaction = db
         .begin()
@@ -1201,6 +1330,9 @@ async fn apply_prepared_payload_rows(
         .commit()
         .await
         .with_context(|| format!("failed to commit bounded zstd batch for {}", config.label()))?;
+    if let Some(change) = compaction_change {
+        change.finish(applied > 0);
+    }
     Ok((applied, stale))
 }
 
@@ -1449,6 +1581,10 @@ async fn enable_transparent_compression(
         "compression_level": config.compression_level,
         "dict_chooser": config.dict_chooser
     });
+    let registry = db.shared_resource::<pioneer_sqlite::background::Registry>();
+    let change = registry.owner("storage.zstd").changing();
+    let compaction_change = (config.count_source == ZstdColumnCountSource::TurnItem)
+        .then(|| registry.owner("compaction.lifecycle").changing());
     db.query_one_write_raw(Statement::from_sql_and_values(
         db.get_database_backend(),
         "SELECT zstd_enable_transparent(?) AS value",
@@ -1461,6 +1597,10 @@ async fn enable_transparent_compression(
             config.label()
         )
     })?;
+    change.finish(true);
+    if let Some(change) = compaction_change {
+        change.finish(true);
+    }
     Ok(())
 }
 
@@ -1770,6 +1910,10 @@ mod tests {
         let mut options = ConnectOptions::new(pioneer_sqlite::sqlite_connection_url(&path));
         options.max_connections(1).sqlx_logging(false);
         let writer = Database::connect(options).await.unwrap();
+        writer
+            .execute_unprepared("PRAGMA foreign_keys=OFF")
+            .await
+            .unwrap();
         Migrator::up(&writer, None).await.unwrap();
         writer
             .execute_unprepared("PRAGMA journal_mode=WAL")
@@ -1841,6 +1985,145 @@ mod tests {
             observer,
             payloads,
         }
+    }
+
+    #[tokio::test]
+    async fn empty_zstd_owner_sleeps_and_lower_snapshot_commit_compresses_after_eof() {
+        let fixture = budget_fixture(&[]).await;
+        let lower = CrudStore::new(fixture.store.database_connection());
+        let db = lower.database_connection();
+        db.execute_unprepared("INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES('zstd-thread','ws','','agent','fixture','fixture','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)").await.unwrap();
+        db.execute_unprepared("INSERT INTO turn(id,thread_id,status,created_at,updated_at) VALUES('zstd-turn','zstd-thread','completed',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)").await.unwrap();
+        let mut cache = super::PreparedDictionaryCache::new(&fixture.store);
+        let cycle = Arc::new(Notify::new());
+        let published = cycle.clone();
+        cache.after_cycle = Some(Arc::new(move |_| published.notify_one()));
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let worker = tokio::spawn(crate::database::maintenance::run_zstd_worker_for_test(
+            Arc::new(fixture.store.clone()),
+            cancellation.clone(),
+            cache,
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(5), cycle.notified())
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+        fixture.observer.reads.lock().unwrap().clear();
+        fixture.observer.writes.lock().unwrap().clear();
+        tokio::time::pause();
+        tokio::time::advance(std::time::Duration::from_secs(300)).await;
+        tokio::task::yield_now().await;
+        assert!(fixture.observer.reads.lock().unwrap().is_empty());
+        assert!(fixture.observer.writes.lock().unwrap().is_empty());
+        tokio::time::resume();
+        let item = agent_message_item("late-payload", "actual lower snapshot source");
+        lower
+            .materialize_item_snapshot_updated(
+                pioneer_protocol::ItemUpdatedNotification {
+                    workspace_id: "ws".into(),
+                    thread_id: "zstd-thread".into(),
+                    turn_id: "zstd-turn".into(),
+                    item: item.clone(),
+                },
+                chrono::Utc::now().timestamp(),
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), cycle.notified())
+            .await
+            .unwrap();
+        let stored = lower
+            .get_turn_item("zstd-turn", "late-payload")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored, item);
+        assert!(
+            load_pending_payload_rows(&db, TURN_ITEM_PAYLOAD, 32, 1024 * 1024)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        fixture.observer.reads.lock().unwrap().clear();
+        fixture.observer.writes.lock().unwrap().clear();
+        tokio::time::pause();
+        tokio::time::advance(std::time::Duration::from_secs(300)).await;
+        tokio::task::yield_now().await;
+        assert!(fixture.observer.reads.lock().unwrap().is_empty());
+        assert!(fixture.observer.writes.lock().unwrap().is_empty());
+        cancellation.cancel();
+        worker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn zstd_slice_continues_unvisited_columns_then_parks_without_new_commit() {
+        let fixture = budget_fixture(&["compressible content for both payload columns"]).await;
+        let db = fixture
+            .store
+            .with_maintenance_access()
+            .database_connection();
+        for &config in ZSTD_PAYLOAD_COLUMNS {
+            super::persist_compression_dictionary(
+                &db,
+                config,
+                b"compressible content".to_vec(),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        let mut cache = super::PreparedDictionaryCache::new(&fixture.store);
+        // Deterministic slice exhaustion immediately after one real batch. No
+        // wall-clock benchmark or slow compressor is needed for this boundary.
+        cache.slice_batches = Some(1);
+        let published = Arc::new(tokio::sync::Barrier::new(2));
+        cache.after_publish = Some(published.clone());
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let worker = tokio::spawn(crate::database::maintenance::run_zstd_worker_for_test(
+            Arc::new(fixture.store.clone()),
+            cancellation.clone(),
+            cache,
+        ));
+        published.wait().await; // actual continuation plan published; worker held
+        tokio::time::pause();
+        assert!(
+            load_pending_payload_rows(&db, TURN_EVENT_PAYLOAD, 32, 1024 * 1024)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            load_pending_payload_rows(&db, TURN_ITEM_PAYLOAD, 32, 1024 * 1024)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        published.wait().await; // release first plan after all first-slice SQL
+        tokio::time::advance(std::time::Duration::from_millis(
+            super::PERIODIC_BACKLOG_RECHECK_MILLIS,
+        ))
+        .await;
+        published.wait().await; // second slice published its settled plan
+        for &config in ZSTD_PAYLOAD_COLUMNS {
+            assert!(
+                load_pending_payload_rows(&db, config, 32, 1024 * 1024)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        published.wait().await; // release confirmed complete traversal
+        fixture.observer.reads.lock().unwrap().clear();
+        fixture.observer.writes.lock().unwrap().clear();
+        tokio::time::advance(std::time::Duration::from_secs(300)).await;
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+        assert!(fixture.observer.reads.lock().unwrap().is_empty());
+        assert!(fixture.observer.writes.lock().unwrap().is_empty());
+        cancellation.cancel();
+        worker.await.unwrap();
     }
 
     // Observe actual CDict copies in the blocking miss path, rather than
@@ -1967,19 +2250,25 @@ mod tests {
                     .unwrap()
                     .is_empty()
             );
+        }
+        fixture.observer.reads.lock().unwrap().clear();
+        fixture.observer.writes.lock().unwrap().clear();
+        tokio::time::pause();
+        tokio::time::advance(std::time::Duration::from_secs(300)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(cycles.load(Ordering::SeqCst), 1);
+        assert!(fixture.observer.reads.lock().unwrap().is_empty());
+        assert!(fixture.observer.writes.lock().unwrap().is_empty());
+        tokio::time::resume();
+        // The owned operation guard spans the extension's logical-view trigger
+        // write. Neither compression's own ACK nor writer release broadcasts.
+        let change = fixture.store.background_work("storage.zstd").changing();
+        for &config in ZSTD_PAYLOAD_COLUMNS {
             db.execute_unprepared(&format!("UPDATE {} SET payload = payload", config.table))
                 .await
                 .unwrap();
         }
-        // Skip the worker's actual idle delay after repopulating both sources.
-        // Resume wall-clock timers before DB/CPU waits, so test timeouts do not
-        // auto-advance while SQLite's native threads complete their work.
-        tokio::time::pause();
-        tokio::time::advance(std::time::Duration::from_secs(
-            super::PERIODIC_MAINTENANCE_INTERVAL_SECONDS,
-        ))
-        .await;
-        tokio::time::resume();
+        change.finish(true);
         tokio::time::timeout(std::time::Duration::from_secs(5), worker)
             .await
             .unwrap()

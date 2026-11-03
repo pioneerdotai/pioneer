@@ -1,4 +1,5 @@
 use pioneer_crud::{CrudStore, FrozenStorageLifetimeProgress};
+use pioneer_sqlite::background::{Plan, Ready};
 use std::{
     sync::Arc,
     time::{Duration, Instant},
@@ -15,51 +16,124 @@ const BATCH_STEPS: usize = 64;
 const BATCH_CONVERSION_STEPS: usize = 1;
 const BATCH_TIME: Duration = Duration::from_millis(50);
 const BATCH_PAUSE: Duration = Duration::from_millis(1);
-const IDLE_INTERVAL: Duration = Duration::from_secs(60);
+const ERROR_RETRY: Duration = Duration::from_secs(60);
 
 // Owned by this worker, like the bounded preparations. Only a successful false
 // result records EOF; budgets, scope steps, errors and cancellation do not.
 #[derive(Default)]
 struct DiscoveryAdmission {
-    next_probe: [Option<Instant>; 2],
+    complete: [bool; 2],
 }
 impl DiscoveryAdmission {
-    fn ready(&self, path: usize, now: Instant) -> bool {
-        self.next_probe[path].is_none_or(|at| now >= at)
+    fn ready(&self, path: usize) -> bool {
+        !self.complete[path]
     }
+    fn completed(&mut self, path: usize, more: bool) {
+        self.complete[path] = !more;
+    }
+    fn invalidate(&mut self) {
+        self.complete = [false; 2];
+    }
+}
 
-    fn completed(&mut self, path: usize, more: bool, now: Instant) {
-        self.next_probe[path] = if more {
-            None
-        } else {
-            Some(now + IDLE_INTERVAL)
-        };
-    }
+#[cfg(test)]
+#[derive(Default)]
+struct DormantBarrier {
+    armed: std::sync::atomic::AtomicBool,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
 }
 
 pub(crate) async fn run(store: Arc<CrudStore>, cancellation: CancellationToken) {
     let store = store.with_maintenance_access();
+    let work = store.background_work("storage.frozen");
+    let Some(mut owner) = work.acquire() else {
+        return;
+    };
     let mut progress = FrozenStorageLifetimeProgress::default();
     let mut lifetime = false;
     let mut admission = DiscoveryAdmission::default();
+    let mut previous = None;
+    let mut rescan = false;
     loop {
+        let ready = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return,
+            ready = owner.ready() => ready,
+        };
+        if ready == Ready::Closed {
+            return;
+        }
+        if ready == Ready::SettlementRequired {
+            let settle_observation = owner.observe();
+            rescan = true;
+            admission.invalidate();
+            progress.invalidate_completed_cleanup();
+            if store
+                .database_connection()
+                .settle_background_change(&owner)
+                .await
+                .is_err()
+            {
+                owner.retry_after(settle_observation, ERROR_RETRY);
+            }
+            continue;
+        }
+        let observed = owner.observe();
+        if previous.is_some_and(|old| old != observed) {
+            rescan = true;
+            admission.invalidate();
+            progress.invalidate_completed_cleanup();
+        }
+        previous = Some(observed);
         let outcome = tokio::select! {
             biased;
             _ = cancellation.cancelled() => return,
-            outcome = crate::database::attribution::scope_database_workload_result(pioneer_observability::DatabaseWorkload::FrozenStorageMaintenance, pioneer_observability::DatabaseOperationSite::FrozenStorageBatch,batch(&store, &mut progress, &mut lifetime, &mut admission, BATCH_STEPS, BATCH_TIME)) => outcome,
+            outcome = owner.scope(crate::database::attribution::scope_database_workload_result(
+                pioneer_observability::DatabaseWorkload::FrozenStorageMaintenance,
+                pioneer_observability::DatabaseOperationSite::FrozenStorageBatch,
+                batch(&store, &mut progress, &mut lifetime, &mut admission, BATCH_STEPS, BATCH_TIME),
+            )) => outcome,
         };
-        let pause = match outcome {
-            Ok(more) => pause_after_batch(more, &admission, Instant::now()),
-            Err(_) => {
+        match outcome {
+            Ok(more) if !owner.requires_settlement() => {
+                let more = if !more && rescan {
+                    rescan = false;
+                    admission.invalidate();
+                    progress.invalidate_completed_cleanup();
+                    true
+                } else {
+                    more
+                };
+                let plan = pause_after_batch(more).map_or(Plan::Dormant, |pause| {
+                    Plan::MonotonicDeadline(tokio::time::Instant::now() + pause)
+                });
+                let settled = owner.publish(observed, plan);
+                #[cfg(test)]
+                if settled && matches!(plan, Plan::Dormant) {
+                    let barrier = store
+                        .database_connection()
+                        .shared_resource::<DormantBarrier>();
+                    if barrier
+                        .armed
+                        .swap(false, std::sync::atomic::Ordering::AcqRel)
+                    {
+                        barrier.entered.notify_one();
+                        tokio::select! {
+                            _ = cancellation.cancelled() => return,
+                            _ = barrier.release.notified() => {},
+                        }
+                    }
+                }
+                #[cfg(not(test))]
+                let _ = settled;
+            }
+            _ => {
                 tracing::warn!(
                     "frozen storage maintenance quantum failed; original history preserved"
                 );
-                IDLE_INTERVAL
+                owner.retry_after(observed, ERROR_RETRY);
             }
-        };
-        tokio::select! {
-            _ = cancellation.cancelled() => return,
-            _ = pioneer_observability::live::sleeping(pause,tokio::time::sleep(pause)) => {},
         }
     }
 }
@@ -73,10 +147,9 @@ async fn batch(
     time_limit: Duration,
 ) -> anyhow::Result<bool> {
     let started = Instant::now();
-    progress.revisit_completed_cleanup(started, IDLE_INTERVAL);
     // A per-batch conversion budget is distinct from actual discovery EOF.
     // Completed paths remain latched across batches while the other advances.
-    let mut finished = [!admission.ready(0, started), !admission.ready(1, started)];
+    let mut finished = [!admission.ready(0), !admission.ready(1)];
     let mut steps = 0;
     let mut conversion_steps = 0;
     while !finished.iter().all(|done| *done)
@@ -95,7 +168,7 @@ async fn batch(
         };
         steps += 1;
         finished[path] = !more;
-        admission.completed(path, more, Instant::now());
+        admission.completed(path, more);
         if conversion_steps == BATCH_CONVERSION_STEPS {
             finished[0] = true;
         }
@@ -106,8 +179,7 @@ async fn batch(
         // cancellation and other tasks a cooperative scheduling point.
         tokio::task::yield_now().await;
     }
-    let now = Instant::now();
-    Ok(admission.ready(0, now) || admission.ready(1, now))
+    Ok(admission.ready(0) || admission.ready(1))
 }
 
 fn can_start_step(
@@ -119,19 +191,8 @@ fn can_start_step(
     steps < step_limit && (steps == 0 || elapsed < time_limit)
 }
 
-fn pause_after_batch(more: bool, admission: &DiscoveryAdmission, now: Instant) -> Duration {
-    if more {
-        BATCH_PAUSE
-    } else {
-        // Lifetime may finish partway through conversion's cooldown (or vice
-        // versa). Wake for the earliest probe, without adding another minute.
-        admission
-            .next_probe
-            .iter()
-            .flatten()
-            .min()
-            .map_or(BATCH_PAUSE, |at| at.saturating_duration_since(now))
-    }
+fn pause_after_batch(more: bool) -> Option<Duration> {
+    more.then_some(BATCH_PAUSE)
 }
 
 #[cfg(test)]
@@ -291,7 +352,606 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn real_metadata_batches_are_bounded_continue_and_revisit_idle_without_empty_sleeps() {
+    async fn receipt_owner_keeps_empty_closed_and_revisits_an_old_turn_after_projection() {
+        use pioneer_entity::{turn, turn_event_projection_stream_state as stream};
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, Set};
+        let (_directory, store, observer) = fixture_with_metadata(0).await;
+        let db = store.database_connection();
+        let now = chrono::Utc::now().fixed_offset();
+        turn::Entity::insert(turn::ActiveModel {
+            id: Set("000-old-turn".into()),
+            thread_id: Set("thread".into()),
+            status: Set("in_progress".into()),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        })
+        .exec(&db)
+        .await
+        .unwrap();
+        stream::Entity::insert(stream::ActiveModel {
+            turn_id: Set("000-old-turn".into()),
+            thread_id: Set("thread".into()),
+            status: Set("healthy".into()),
+            projected_through_sequence: Set(0),
+            receipts_compacted_through_sequence: Set(0),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        })
+        .exec(&db)
+        .await
+        .unwrap();
+        store
+            .upsert_projection_meta(pioneer_crud::ProjectionMetaRecord {
+                projection_key: "turn_event_projection_stream_state_backfill".into(),
+                projection_version: 3,
+                status: pioneer_crud::PROJECTION_META_STATUS_COMPLETE.into(),
+                source_thread_count: 0,
+                source_turn_count: 0,
+                source_turn_item_count: 0,
+                source_turn_event_count: 0,
+                last_error: None,
+                backfill_started_at: Some(now),
+                backfilled_at: Some(now),
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .unwrap();
+        observer.reads.lock().unwrap().clear();
+        observer.writes.lock().unwrap().clear();
+        let cancellation = CancellationToken::new();
+        let worker = tokio::spawn(super::super::projection_receipt_cleanup::run(
+            Arc::new(store.clone()),
+            cancellation.clone(),
+        ));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while observer.operations() < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            observer.operations(),
+            2,
+            "backfill + indexed empty stream discovery"
+        );
+        assert!(observer.writes.lock().unwrap().is_empty());
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(300)).await;
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            observer.operations(),
+            2,
+            "settled EOF has no periodic receipt SQL"
+        );
+        tokio::time::resume();
+        let lower = CrudStore::new(db.clone());
+        lower
+            .materialize_item_completed(
+                pioneer_protocol::ItemCompletedNotification {
+                    workspace_id: "ws".into(),
+                    thread_id: "thread".into(),
+                    turn_id: "000-old-turn".into(),
+                    item: pioneer_protocol::TurnItem::AgentMessage {
+                        id: "receipt-wake-item".into(),
+                        text: "new projection below the previous cursor".into(),
+                        phase: Default::default(),
+                        markdown: None,
+                        markdown_version: None,
+                    },
+                },
+                now.timestamp(),
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let current = stream::Entity::find_by_id("000-old-turn")
+                    .one(&db)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if current.receipts_compacted_through_sequence == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            pioneer_entity::turn_event_projection_state::Entity::find()
+                .filter(
+                    pioneer_entity::turn_event_projection_state::Column::TurnId.eq("000-old-turn")
+                )
+                .all(&db)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(db.reader_query_only_enabled().await.unwrap());
+        cancellation.cancel();
+        tokio::time::timeout(Duration::from_secs(5), worker)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn native_cleanup_owner_parks_empty_and_requeues_waiting_after_binding_release() {
+        use pioneer_entity::{cli_runtime_native_event as event, native_event_cleanup_job as job};
+        use pioneer_protocol::{
+            PersistedActorRef, SandboxMode, Thread, ThreadMode, ThreadOriginKind,
+            ThreadSidebarVisibility, ThreadStatus, Turn, TurnOrigin, TurnStatus,
+        };
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, Set};
+        let (_directory, store, observer) = fixture_with_metadata(0).await;
+        let db = store.database_connection();
+        let now = chrono::Utc::now().fixed_offset();
+        let thread = Thread {
+            workspace_id: "ws".into(),
+            id: "thread".into(),
+            name: None,
+            preview: String::new(),
+            preview_author: None,
+            mode: ThreadMode::Agent,
+            model: "m".into(),
+            model_provider: "p".into(),
+            reasoning_effort: None,
+            created_at: now.timestamp(),
+            updated_at: now.timestamp(),
+            status: ThreadStatus::Active,
+            origin_kind: ThreadOriginKind::User,
+            sidebar_visibility: ThreadSidebarVisibility::Visible,
+            agent_nickname: None,
+            agent_role: None,
+            visibility: None,
+            turns: vec![],
+        };
+        let mut turn = Turn {
+            work_owner: Default::default(),
+            id: "native-old-turn".into(),
+            status: TurnStatus::InProgress,
+            turn_kind: Default::default(),
+            origin: TurnOrigin::User,
+            mode: Default::default(),
+            author: None,
+            reply_to_turn_id: None,
+            mentions: vec![],
+            message_revision: 0,
+            message_deleted: false,
+            error: None,
+            prompt_manifest: None,
+            permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
+        };
+        store
+            .materialize_turn_start(
+                &thread,
+                SandboxMode::FullAccess,
+                &turn,
+                &[],
+                PersistedActorRef::System,
+            )
+            .await
+            .unwrap();
+        turn.status = TurnStatus::Completed;
+        store
+            .materialize_turn_completed(
+                pioneer_protocol::TurnCompletedNotification {
+                    workspace_id: "ws".into(),
+                    thread_id: "thread".into(),
+                    turn,
+                },
+                now.timestamp(),
+            )
+            .await
+            .unwrap();
+        store
+            .upsert_cli_runtime_turn_binding(pioneer_crud::NewCliRuntimeTurnBinding {
+                turn_id: "native-old-turn".into(),
+                thread_id: "thread".into(),
+                continuation_thread_id: "thread".into(),
+                workspace_id: "ws".into(),
+                runtime_id: "runtime".into(),
+                runtime_kind: "claude".into(),
+                native_thread_id: "native".into(),
+                native_turn_id: Some("native-turn".into()),
+                request_id: None,
+                status: "running".into(),
+                model: None,
+                cwd: None,
+                sandbox_json: None,
+                approval_policy: None,
+                input_mapping_json: "{}".into(),
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .unwrap();
+        // Restored dependency-waiting history is outside ALL queued lanes.
+        // A complete Empty must be independent of its population size.
+        for index in 0..129 {
+            job::Entity::insert(job::ActiveModel {
+                turn_id: Set(format!("waiting-history-{index:03}")),
+                state: Set("waiting".into()),
+                available_at: Set(0),
+                last_served_at: Set(0),
+                revision: Set(1),
+                last_error: Set(None),
+            })
+            .exec(&db)
+            .await
+            .unwrap();
+        }
+        assert!(
+            store
+                .next_native_event_cleanup_deadline()
+                .await
+                .unwrap()
+                .is_none()
+        );
+        observer.reads.lock().unwrap().clear();
+        observer.writes.lock().unwrap().clear();
+        let idle = db.shared_resource::<super::super::native_event_cleanup::IdleBarrier>();
+        idle.armed.store(true, std::sync::atomic::Ordering::Release);
+        let cancellation = CancellationToken::new();
+        let worker = tokio::spawn(super::super::native_event_cleanup::run(
+            Arc::new(store.clone()),
+            cancellation.clone(),
+        ));
+        // A minimum reader count cannot prove finite bootstrap/duty portions
+        // have completed. Observe the actual successful Empty publication.
+        tokio::time::timeout(Duration::from_secs(5), idle.entered.notified())
+            .await
+            .unwrap();
+        idle.release.notify_one();
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        let initial = observer.operations();
+        let writes = observer.writes.lock().unwrap().len();
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(300)).await;
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            observer.operations(),
+            initial,
+            "completed bootstrap + empty queue has no periodic SQL"
+        );
+        assert_eq!(observer.writes.lock().unwrap().len(), writes);
+        tokio::time::resume();
+        let lower = CrudStore::new(db.clone());
+        lower
+            .append_cli_runtime_native_event(pioneer_crud::NewCliRuntimeNativeEvent {
+                id: "native-release-event".into(),
+                runtime_id: "runtime".into(),
+                runtime_kind: "claude".into(),
+                workspace_id: Some("ws".into()),
+                thread_id: Some("thread".into()),
+                turn_id: Some("native-old-turn".into()),
+                native_thread_id: Some("native".into()),
+                native_turn_id: Some("native-turn".into()),
+                native_method: "item/completed".into(),
+                payload_redacted_json: "{}".into(),
+                sequence: 1,
+                created_at: now,
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if job::Entity::find_by_id("native-old-turn")
+                    .one(&db)
+                    .await
+                    .unwrap()
+                    .is_some_and(|job| job.state == "waiting")
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            event::Entity::find_by_id("native-release-event")
+                .one(&db)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            lower
+                .terminalize_cli_runtime_turn_binding(
+                    "native-old-turn",
+                    "completed",
+                    pioneer_crud::CliRuntimeTurnAttemptStatus::Completed,
+                    None,
+                    now
+                )
+                .await
+                .unwrap()
+                .is_some()
+        );
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if event::Entity::find()
+                    .filter(event::Column::Id.eq("native-release-event"))
+                    .one(&db)
+                    .await
+                    .unwrap()
+                    .is_none()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+        // Represent an existing retry obligation, then publish another real
+        // native source. INSERT OR IGNORE registration preserves this queued
+        // future clock; no client, manual worker call, or later wake is needed.
+        let due = (chrono::Utc::now().timestamp() + 3) * 1_000_000 + 500_123;
+        job::Entity::insert(job::ActiveModel {
+            turn_id: Set("native-old-turn".into()),
+            state: Set("queued".into()),
+            available_at: Set(due),
+            ..Default::default()
+        })
+        .exec(&db)
+        .await
+        .unwrap();
+        assert_eq!(
+            lower
+                .next_native_event_cleanup_deadline()
+                .await
+                .unwrap()
+                .unwrap()
+                .timestamp_micros(),
+            due,
+            "positive retry lane preserves exact microsecond deadline"
+        );
+        lower
+            .append_cli_runtime_native_event(pioneer_crud::NewCliRuntimeNativeEvent {
+                id: "native-timed-retry".into(),
+                runtime_id: "runtime".into(),
+                runtime_kind: "claude".into(),
+                workspace_id: Some("ws".into()),
+                thread_id: Some("thread".into()),
+                turn_id: Some("native-old-turn".into()),
+                native_thread_id: Some("native".into()),
+                native_turn_id: Some("native-turn".into()),
+                native_method: "item/completed".into(),
+                payload_redacted_json: "{}".into(),
+                sequence: 2,
+                created_at: now,
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if event::Entity::find_by_id("native-timed-retry")
+                    .one(&db)
+                    .await
+                    .unwrap()
+                    .is_none()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(db.reader_query_only_enabled().await.unwrap());
+        cancellation.cancel();
+        worker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn frozen_owner_keeps_eof_until_old_source_seals_and_last_blocking_hold_releases() {
+        use pioneer_entity::compaction_frozen_history as history;
+        use sea_orm::EntityTrait;
+        use sha2::{Digest, Sha256};
+        let (_directory, store, observer) = fixture_with_metadata(0).await;
+        let descriptor = FrozenHistoryRef {
+            format: 1,
+            manifest_id: "000-worker-old".into(),
+            messages: 0,
+            identity_sha256: hex::encode(Sha256::digest([])),
+        };
+        store
+            .compaction_begin_frozen_history("ws", "thread", &descriptor)
+            .await
+            .unwrap();
+        let barrier = store
+            .database_connection()
+            .shared_resource::<DormantBarrier>();
+        barrier
+            .armed
+            .store(true, std::sync::atomic::Ordering::Release);
+        let cancellation = CancellationToken::new();
+        let worker = tokio::spawn(run(Arc::new(store.clone()), cancellation.clone()));
+        tokio::time::timeout(Duration::from_secs(10), barrier.entered.notified())
+            .await
+            .unwrap();
+        observer.reads.lock().unwrap().clear();
+        observer.writes.lock().unwrap().clear();
+        barrier.release.notify_one();
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(300)).await;
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            observer.operations(),
+            0,
+            "unchanged completed history does not reopen discovery"
+        );
+        assert!(observer.writes.lock().unwrap().is_empty());
+        tokio::time::resume();
+        let lower = CrudStore::new(store.database_connection());
+        barrier
+            .armed
+            .store(true, std::sync::atomic::Ordering::Release);
+        let hold = lower
+            .compaction_finish_frozen_history_held("ws", "thread", &descriptor)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), barrier.entered.notified())
+            .await
+            .unwrap();
+        let row = history::Entity::find_by_id(&descriptor.manifest_id)
+            .one(&store.database_connection())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (row.storage_registered, row.expired),
+            (1, 0),
+            "old key became convertible, but live input is retained"
+        );
+        barrier
+            .armed
+            .store(true, std::sync::atomic::Ordering::Release);
+        drop(hold);
+        barrier.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(10), barrier.entered.notified())
+            .await
+            .unwrap();
+        assert_eq!(
+            history::Entity::find_by_id(&descriptor.manifest_id)
+                .one(&store.database_connection())
+                .await
+                .unwrap()
+                .unwrap()
+                .expired,
+            1,
+            "last release must finish refused expiry without a timer or new commit"
+        );
+        assert!(
+            store
+                .database_connection()
+                .reader_query_only_enabled()
+                .await
+                .unwrap()
+        );
+        cancellation.cancel();
+        worker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn portable_owner_stays_dormant_and_publishes_new_tool_bytes_from_lower_crud() {
+        use pioneer_entity::{tool_output_chunk as chunk, turn};
+        use sea_orm::{EntityTrait, Set};
+        pioneer_sqlite::zstd::register_auto_extension_once().unwrap();
+        let (_directory, store, observer) = fixture_with_metadata(0).await;
+        let db = store.database_connection();
+        let now = chrono::Utc::now().fixed_offset();
+        turn::Entity::insert(turn::ActiveModel {
+            id: Set("portable-turn".into()),
+            thread_id: Set("thread".into()),
+            status: Set("completed".into()),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        })
+        .exec(&db)
+        .await
+        .unwrap();
+        observer.reads.lock().unwrap().clear();
+        observer.writes.lock().unwrap().clear();
+        let cancellation = CancellationToken::new();
+        let worker = tokio::spawn(super::super::portable_payload::run(
+            Arc::new(store.clone()),
+            cancellation.clone(),
+        ));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while observer.operations() < 6 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            observer.operations(),
+            6,
+            "one raw cleanup EOF plus five family source discoveries"
+        );
+        assert!(observer.writes.lock().unwrap().is_empty());
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(300)).await;
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            observer.operations(),
+            6,
+            "confirmed Empty does not reopen portable discovery"
+        );
+        assert!(observer.writes.lock().unwrap().is_empty());
+        tokio::time::resume();
+        let lower = CrudStore::new(db.clone());
+        let output = pioneer_protocol::ItemDeltaNotification {
+            workspace_id: "ws".into(),
+            thread_id: "thread".into(),
+            turn_id: "portable-turn".into(),
+            item_id: "output".into(),
+            delta: "portable unicode 🦀\n".repeat(4000),
+            stream: None,
+            payload: None,
+            markdown: None,
+            markdown_version: None,
+        };
+        lower
+            .record_tool_output("000-old-output-key", &output)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if chunk::Entity::find_by_id("000-old-output-key")
+                    .one(&db)
+                    .await
+                    .unwrap()
+                    .is_some_and(|row| row.text_payload_id.is_some())
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let page = lower
+            .tool_output_page("ws", "thread", "portable-turn", "output", -1)
+            .await
+            .unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].1.text, output.delta);
+        assert!(db.reader_query_only_enabled().await.unwrap());
+        cancellation.cancel();
+        worker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn real_metadata_batches_are_bounded_and_eof_needs_input_invalidation() {
         let (_directory, store, observer) = fixture().await;
         let mut progress = FrozenStorageLifetimeProgress::default();
         let mut lifetime = false;
@@ -350,11 +1010,9 @@ mod tests {
             }
         }
         assert!(eof);
-        assert!(admission.next_probe.iter().all(Option::is_some));
-        let pause = pause_after_batch(false, &admission, Instant::now());
-        assert!(pause > Duration::ZERO && pause <= IDLE_INTERVAL);
-        // Advance only admission time; no real minute-long wait in this fixture.
-        admission.next_probe = [Some(Instant::now()); 2];
+        assert!(admission.complete.iter().all(|done| *done));
+        assert_eq!(pause_after_batch(false), None);
+        admission.invalidate();
         assert!(
             batch(
                 &store,
@@ -366,7 +1024,7 @@ mod tests {
             )
             .await
             .unwrap(),
-            "fresh round revisits after idle"
+            "explicit source invalidation admits another round"
         );
         assert_eq!(
             store.database_connection().read_class(),
@@ -436,10 +1094,7 @@ mod tests {
             2,
             "only current scope step completes after wait"
         );
-        assert_eq!(
-            pause_after_batch(true, &DiscoveryAdmission::default(), Instant::now()),
-            BATCH_PAUSE
-        );
+        assert_eq!(pause_after_batch(true), Some(BATCH_PAUSE));
 
         let held = store.database_connection().begin_read().await.unwrap();
         let cancellation = CancellationToken::new();
@@ -497,29 +1152,18 @@ mod tests {
         assert!(!admits(1, BATCH_TIME));
         assert!(!admits(1, Duration::from_secs(30)));
         // A DB queue wait ends this batch, but cannot multiply the next pause.
-        assert_eq!(
-            pause_after_batch(true, &DiscoveryAdmission::default(), Instant::now()),
-            Duration::from_millis(1)
-        );
-        let now = Instant::now();
-        for first in 0..2 {
-            let mut admission = DiscoveryAdmission::default();
-            admission.completed(first, false, now);
-            admission.completed(1 - first, false, now + Duration::from_secs(40));
-            assert_eq!(
-                pause_after_batch(false, &admission, now + Duration::from_secs(40)),
-                Duration::from_secs(20)
-            );
-            assert_eq!(
-                pause_after_batch(false, &admission, now + IDLE_INTERVAL),
-                Duration::ZERO
-            );
-            assert!(admission.ready(first, now + IDLE_INTERVAL));
-            assert!(!admission.ready(1 - first, now + IDLE_INTERVAL));
-        }
+        assert_eq!(pause_after_batch(true), Some(Duration::from_millis(1)));
+        let mut admission = DiscoveryAdmission::default();
+        admission.completed(0, false);
+        admission.completed(1, false);
+        assert_eq!(pause_after_batch(false), None);
+        assert!(!admission.ready(0));
+        assert!(!admission.ready(1));
+        admission.invalidate();
+        assert!(admission.ready(0) && admission.ready(1));
     }
     #[tokio::test]
-    async fn conversion_eof_survives_batches_and_due_probe_discovers_new_work() {
+    async fn conversion_eof_survives_batches_and_source_invalidation_discovers_new_work() {
         use pioneer_entity::{
             compaction_frozen_history as history, compaction_frozen_layout as layout,
         };
@@ -531,7 +1175,7 @@ mod tests {
             let mut progress = FrozenStorageLifetimeProgress::default();
             let mut lifetime = false;
             let mut admission = DiscoveryAdmission::default();
-            admission.next_probe[1] = Some(Instant::now() + Duration::from_secs(3600));
+            admission.complete[1] = true;
             let mut useful = 0;
             for _ in 0..128 {
                 let more = batch(
@@ -544,7 +1188,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
-                if admission.next_probe[0].is_some() {
+                if admission.complete[0] {
                     assert!(!more);
                     break;
                 }
@@ -558,7 +1202,7 @@ mod tests {
                 useful > 4,
                 "scope and staged layout validation took bounded steps"
             );
-            let eof = admission.next_probe[0].expect("actual conversion EOF");
+            assert!(admission.complete[0], "actual conversion EOF");
             assert_eq!(
                 history::Entity::find_by_id("live")
                     .one(&store.database_connection())
@@ -580,7 +1224,7 @@ mod tests {
                     .all(|row| row.active == 1 && row.pending == 0 && row.failed == 0)
             );
 
-            admission.next_probe[1] = None;
+            admission.complete[1] = false;
             // Initial locator and proof discovery each issue one metadata read.
             // Repeating the three conversion discovery reads would change the count.
             for _ in 0..2 {
@@ -598,7 +1242,7 @@ mod tests {
                     .unwrap()
                 );
                 assert_eq!(observer.operations() - before, 1);
-                assert_eq!(admission.next_probe[0], Some(eof));
+                assert!(admission.complete[0]);
             }
             if finish_lifetime {
                 let mut idle = false;
@@ -620,10 +1264,10 @@ mod tests {
                 }
                 assert!(
                     idle,
-                    "lifetime reaches its real EOF during conversion cooldown"
+                    "lifetime reaches its real EOF while conversion remains latched"
                 );
-                assert_eq!(admission.next_probe[0], Some(eof));
-                assert!(admission.next_probe[1].is_some());
+                assert!(admission.complete[0]);
+                assert!(admission.complete[1]);
             }
 
             let new = FrozenHistoryRef {
@@ -661,14 +1305,11 @@ mod tests {
                 assert_eq!(
                     observer.operations(),
                     before,
-                    "cooldown performs no SQL or RAM quantum"
+                    "latched EOF performs no SQL or RAM quantum"
                 );
-                assert!(pause_after_batch(false, &admission, Instant::now()) > Duration::ZERO);
+                assert_eq!(pause_after_batch(false), None);
             } else {
-                assert!(
-                    admission.next_probe[1].is_none(),
-                    "lifetime is still admitted"
-                );
+                assert!(!admission.complete[1], "lifetime is still admitted");
             }
             assert_eq!(
                 history::Entity::find_by_id("new-work")
@@ -680,7 +1321,7 @@ mod tests {
                 0
             );
 
-            admission.next_probe[0] = Some(Instant::now());
+            admission.complete[0] = false;
             assert!(
                 batch(
                     &store,
@@ -693,7 +1334,7 @@ mod tests {
                 .await
                 .unwrap()
             );
-            assert!(admission.next_probe[0].is_none());
+            assert!(!admission.complete[0]);
             assert_eq!(
                 history::Entity::find_by_id("new-work")
                     .one(&store.database_connection())
@@ -848,7 +1489,7 @@ mod tests {
             .unwrap()
         );
         assert_eq!(
-            admission.next_probe, [None; 2],
+            admission.complete, [false; 2],
             "scope/budget stop is not EOF"
         );
 
@@ -869,7 +1510,7 @@ mod tests {
             }
             // Dropping this owned future cancels the queued operation.
         }
-        assert_eq!(admission.next_probe, [None; 2]);
+        assert_eq!(admission.complete, [false; 2]);
         drop(held);
         store
             .database_connection()
@@ -890,10 +1531,7 @@ mod tests {
             .await
             .is_err()
         );
-        assert_eq!(
-            admission.next_probe, [None; 2],
-            "DB errors do not latch EOF"
-        );
+        assert_eq!(admission.complete, [false; 2], "DB errors do not latch EOF");
     }
 
     #[tokio::test]
@@ -920,9 +1558,7 @@ mod tests {
         let writes = observer.writes.lock().unwrap().len();
         let before = observer.operations();
         let mut restart = FrozenStorageLifetimeProgress::default();
-        let now = Instant::now();
-        restart.revisit_completed_cleanup(now, IDLE_INTERVAL);
-        restart.revisit_completed_cleanup(now + IDLE_INTERVAL, IDLE_INTERVAL);
+        restart.invalidate_completed_cleanup();
         let mut idle = false;
         for _ in 0..1000 {
             if !restart.quantum(&store).await.unwrap() {

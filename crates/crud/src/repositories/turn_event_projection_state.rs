@@ -409,6 +409,14 @@ pub async fn discover<C: ConnectionTrait>(
     db: &C,
     limit: u64,
 ) -> Result<Vec<(String, DateTimeWithTimeZone)>> {
+    discovery_query(limit)
+        .into_tuple::<(String, DateTimeWithTimeZone)>()
+        .all(db)
+        .await
+        .context("failed to discover eligible event work")
+}
+
+pub(crate) fn discovery_query(limit: u64) -> sea_orm::Select<turn_event_projection_state::Entity> {
     turn_event_projection_state::Entity::find()
         .select_only()
         .column(turn_event_projection_state::Column::EventId)
@@ -426,12 +434,9 @@ pub async fn discover<C: ConnectionTrait>(
         .order_by_asc(turn_event_projection_state::Column::Sequence)
         .order_by_asc(turn_event_projection_state::Column::CreatedAt)
         .limit(limit)
-        .into_tuple::<(String, DateTimeWithTimeZone)>()
-        .all(db)
-        .await
-        .context("failed to discover eligible event work")
 }
 
+#[cfg(test)]
 pub async fn claim_due<C: ConnectionTrait>(
     db: &C,
     now: DateTimeWithTimeZone,
@@ -545,6 +550,7 @@ fn next_for_healthy_stream() -> sea_orm::sea_query::SimpleExpr {
     )
 }
 
+#[cfg(test)]
 pub async fn list_due<C: ConnectionTrait>(
     db: &C,
     now: DateTimeWithTimeZone,

@@ -1380,6 +1380,50 @@ async fn cli_blocked_atomic_commit_keeps_queued_consumer_owned_after_publisher_c
         let path = temp.path().join("after-commit.sqlite");
         let (processor, store, session, workspace) =
             blocked_observation_fixture(&path, kind, true).await;
+        let processor = Arc::new(processor);
+        let hook_calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        install_recoverable_test_hook_runtime(
+            &processor,
+            task_post_turn_recording_hook_runtime(hook_calls.clone()),
+        )
+        .await;
+        let binding = store
+            .get_cli_runtime_turn_binding(BLOCKED_TURN)
+            .await
+            .unwrap()
+            .unwrap();
+        let answer = TurnItem::AgentMessage {
+            id: "blocked-effect-answer".into(),
+            text: "accepted answer".into(),
+            phase: pioneer_protocol::AgentMessagePhase::FinalAnswer,
+            markdown: None,
+            markdown_version: None,
+        };
+        processor
+            .prepare_cli_post_turn_hook(&binding, 1, Some(&answer))
+            .await
+            .unwrap();
+        processor.arm_completed_history_preparation_barrier("__terminal_effect_owner_settled__");
+        let effects = tokio::spawn(MessageProcessor::run_native_terminal_effect_worker(
+            Arc::downgrade(&processor),
+        ));
+        timeout(
+            Duration::from_secs(10),
+            processor.wait_for_completed_history_preparation_barrier(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            store
+                .native_terminal_effect_status(&format!("{BLOCKED_TURN}:terminal-effect:post-turn"))
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "prepared"
+        );
+        assert!(hook_calls.lock().unwrap().is_empty());
+        processor.release_completed_history_preparation_barrier();
         processor.arm_completed_history_preparation_barrier("__cli_blocked_after_atomic_commit__");
         let now_ms = (chrono::Utc::now() + chrono::Duration::minutes(30)).timestamp_millis();
         let mut scan = CliRuntimeStaleTurnScan::default();
@@ -1390,6 +1434,30 @@ async fn cli_blocked_atomic_commit_keeps_queued_consumer_owned_after_publisher_c
                 _ = processor.wait_for_completed_history_preparation_barrier() => {},
                 _ = &mut quantum => panic!("consumer must pause after atomic lifecycle commit"),
             }
+            // The producer remains paused BEFORE the old compensating kick.
+            // Only its committed guards can wake the already dormant owner.
+            timeout(Duration::from_secs(10), async {
+                loop {
+                    if store
+                        .native_terminal_effect_status(&format!(
+                            "{BLOCKED_TURN}:terminal-effect:post-turn"
+                        ))
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .status
+                        == "succeeded"
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(hook_calls.lock().unwrap().len(), 1);
+            effects.abort();
+            let _ = effects.await;
             assert_eq!(
                 store
                     .get_turn(BLOCKED_THREAD, BLOCKED_TURN)
@@ -4497,4 +4565,403 @@ async fn independently_heartbeating_owner_keeps_terminal_authority_and_cancellat
         assert!(heartbeat.await.unwrap_err().is_cancelled());
         // The heartbeat probe was cancelled; do not leave a release permit.
     }
+}
+
+#[tokio::test]
+async fn command_owner_dormant_then_lower_commit_arms_real_heartbeat_and_completion_closes_it() {
+    let observer = Arc::new(NativeSchedulingObserver::default());
+    let (_directory, workspace_manager, store, workspace) =
+        setup_pooled_file_workspace_manager_with_observers(
+            Some(observer.clone()),
+            Some(observer.clone()),
+        )
+        .await;
+    let session = Arc::new(RecordingCliRuntimeSession::default());
+    *session.turn_observation.lock().await = Some(CLIAgentRuntimeTurnObservation {
+        status: CLIAgentRuntimeObservedTurnStatus::InProgress,
+        message: None,
+        reconciliation_events: Vec::new(),
+    });
+    *session.turn_liveness_probe.lock().await =
+        Some(CLIAgentRuntimeTurnLivenessProbe::ConfirmedActive);
+    let manager = test_cli_runtime_manager(session);
+    let processor = with_enabled_test_cli_runtime_catalog(
+        MessageProcessor::new(
+            Arc::new(ThreadManager::new("test", "openai")),
+            test_provider(),
+            Arc::new(SessionManager::new()),
+            workspace_manager,
+            store.clone(),
+            test_gateway_secrets(),
+            test_summary_config(),
+            test_tool_loop_config(),
+        )
+        .with_cli_runtime_manager_for_tests(manager.clone()),
+    )
+    .scoped_for_background_reconciliation();
+    seed_cli_runtime_turn_with_text(
+        &store,
+        &workspace,
+        "codex",
+        "codex",
+        BLOCKED_THREAD,
+        BLOCKED_TURN,
+        BLOCKED_NATIVE_THREAD,
+        "heartbeat owner",
+    )
+    .await;
+    persist_test_cli_instruction_projection(&store, BLOCKED_TURN, CLIAgentRuntimeKind::Codex).await;
+    let binding = store
+        .get_cli_runtime_turn_binding(BLOCKED_TURN)
+        .await
+        .unwrap()
+        .unwrap();
+    let CliRuntimeLaunchSpecRestore::Ready(restored) =
+        processor.restore_cli_runtime_launch_spec(&binding).await
+    else {
+        panic!("fixture launch contract");
+    };
+    manager
+        .get_or_start_with_launch_spec(restored.session_key, restored.launch_spec)
+        .await
+        .unwrap();
+    let processor = Arc::new(processor);
+    let label = "__cli_commands_settled__";
+    processor.arm_completed_history_preparation_barrier(label);
+    observer.reads.lock().unwrap().clear();
+    observer.writes.lock().unwrap().clear();
+    let worker = tokio::spawn(MessageProcessor::run_cli_command_heartbeat_worker(
+        Arc::downgrade(&processor),
+    ));
+    timeout(
+        Duration::from_secs(5),
+        processor.wait_for_completed_history_preparation_barrier(),
+    )
+    .await
+    .unwrap();
+    assert!(observer.writes.lock().unwrap().is_empty());
+    processor.release_completed_history_preparation_barrier();
+    tokio::task::yield_now().await;
+    observer.reads.lock().unwrap().clear();
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(300)).await;
+    tokio::task::yield_now().await;
+    assert!(
+        observer.reads.lock().unwrap().is_empty(),
+        "no command obligation means no periodic rehydration"
+    );
+    assert!(observer.writes.lock().unwrap().is_empty());
+    tokio::time::resume();
+    let lower = CrudStore::new(store.database_connection());
+    // A real lower source change brings the owner to an Empty handoff first.
+    processor.arm_completed_history_preparation_barrier(label);
+    let activity_at = lower
+        .get_turn_liveness(BLOCKED_TURN)
+        .await
+        .unwrap()
+        .map_or(now_timestamp_secs(), |row| {
+            row.last_activity_at_unix.max(now_timestamp_secs())
+        })
+        .saturating_add(1);
+    lower
+        .observe_turn_runtime_activity(BLOCKED_TURN, "runtime/heartbeat-fixture", activity_at)
+        .await
+        .unwrap();
+    timeout(
+        Duration::from_secs(5),
+        processor.wait_for_completed_history_preparation_barrier(),
+    )
+    .await
+    .unwrap();
+    let now = now_timestamp_secs();
+    let started = now - processor.cli_runtime_command_heartbeats.interval_secs() + 3;
+    processor.arm_completed_history_preparation_barrier(label);
+    lower
+        .materialize_item_started_with_attempt_deadlines(
+            ItemStartedNotification {
+                workspace_id: workspace.clone(),
+                thread_id: BLOCKED_THREAD.into(),
+                turn_id: BLOCKED_TURN.into(),
+                item: command_execution_item("timed-command"),
+            },
+            started,
+            TurnItemAttemptDeadlines {
+                lease_expires_at_unix: Some(now + 60),
+                idle_deadline_at_unix: Some(now + 60),
+                hard_deadline_at_unix: Some(now + 3600),
+            },
+        )
+        .await
+        .unwrap();
+    observer.reads.lock().unwrap().clear();
+    observer.writes.lock().unwrap().clear();
+    processor.release_completed_history_preparation_barrier();
+    timeout(
+        Duration::from_secs(5),
+        processor.wait_for_completed_history_preparation_barrier(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        observer.writes.lock().unwrap().is_empty(),
+        "future heartbeat cannot write early"
+    );
+    processor.arm_completed_history_preparation_barrier(label);
+    processor.release_completed_history_preparation_barrier();
+    timeout(
+        Duration::from_secs(5),
+        processor.wait_for_completed_history_preparation_barrier(),
+    )
+    .await
+    .unwrap();
+    assert!(observer.reads.lock().unwrap().iter().all(|event|!matches!(event,
+        pioneer_sqlite::SqliteReadEvent::AdmissionEnqueued {class,..} if *class!=pioneer_sqlite::SqliteReadClass::Maintenance)));
+    assert!(observer.writes.lock().unwrap().iter().any(|event| matches!(
+        event,
+        pioneer_sqlite::SqliteWriteEvent::Acquired {
+            class: pioneer_sqlite::SqliteWriteClass::Critical,
+            ..
+        }
+    )));
+    let running = lower
+        .get_running_turn_item_attempt(BLOCKED_TURN, "timed-command")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        running.last_heartbeat_at_unix.unwrap() > started,
+        "actual native liveness reached guarded durable renewal"
+    );
+    // A captured native owner is no longer authoritative after its attempt
+    // completes, even while the command row itself is still Running.
+    let native_owner = lower
+        .resolve_cli_runtime_native_turn_owner(
+            &binding.runtime_id,
+            binding.native_turn_id.as_deref().unwrap(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        lower
+            .mark_cli_runtime_turn_attempt_terminal(
+                &native_owner.attempt.id,
+                pioneer_crud::CliRuntimeTurnAttemptStatus::Completed,
+                None,
+                utc_now(),
+            )
+            .await
+            .unwrap()
+    );
+    assert!(
+        !processor
+            .timeout_supervisor
+            .heartbeat_cli_command_item_attempt(
+                &native_owner,
+                "timed-command",
+                now_timestamp_secs() + 1,
+            )
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        lower
+            .get_running_turn_item_attempt(BLOCKED_TURN, "timed-command")
+            .await
+            .unwrap()
+            .unwrap()
+            .last_heartbeat_at_unix,
+        running.last_heartbeat_at_unix
+    );
+    // Terminal source commits during the same handoff. The old cache cannot
+    // leave a heartbeat timer after the durable command has completed.
+    processor.arm_completed_history_preparation_barrier(label);
+    let mut completed = command_execution_item("timed-command");
+    if let TurnItem::CommandExecution { status, .. } = &mut completed {
+        *status = ToolCallStatus::Completed;
+    }
+    lower
+        .materialize_item_completed(
+            ItemCompletedNotification {
+                workspace_id: workspace,
+                thread_id: BLOCKED_THREAD.into(),
+                turn_id: BLOCKED_TURN.into(),
+                item: completed,
+            },
+            now_timestamp_secs(),
+        )
+        .await
+        .unwrap();
+    processor.release_completed_history_preparation_barrier();
+    timeout(
+        Duration::from_secs(5),
+        processor.wait_for_completed_history_preparation_barrier(),
+    )
+    .await
+    .unwrap();
+    processor.release_completed_history_preparation_barrier();
+    tokio::task::yield_now().await;
+    observer.reads.lock().unwrap().clear();
+    observer.writes.lock().unwrap().clear();
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(300)).await;
+    tokio::task::yield_now().await;
+    assert!(
+        observer.reads.lock().unwrap().is_empty(),
+        "completed command history stays dormant"
+    );
+    assert!(observer.writes.lock().unwrap().is_empty());
+    processor.cli_history_shutdown.cancel();
+    worker.await.unwrap();
+}
+
+#[tokio::test]
+async fn cli_supervision_source_after_empty_arms_stale_deadline_without_client() {
+    let observer = Arc::new(NativeSchedulingObserver::default());
+    let (_directory, manager, store, workspace) =
+        setup_pooled_file_workspace_manager_with_observers(
+            Some(observer.clone()),
+            Some(observer.clone()),
+        )
+        .await;
+    let processor = Arc::new(MessageProcessor::new(
+        Arc::new(ThreadManager::new("test", "openai")),
+        test_provider(),
+        Arc::new(SessionManager::new()),
+        manager,
+        store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_tool_loop_config(),
+    ));
+    let label = "__cli_supervision_settled__";
+    processor.arm_completed_history_preparation_barrier(label);
+    let worker = tokio::spawn(MessageProcessor::run_cli_supervision_worker(
+        Arc::downgrade(&processor),
+    ));
+    timeout(
+        Duration::from_secs(5),
+        processor.wait_for_completed_history_preparation_barrier(),
+    )
+    .await
+    .unwrap();
+    processor.release_completed_history_preparation_barrier();
+    tokio::task::yield_now().await;
+    observer.reads.lock().unwrap().clear();
+    observer.writes.lock().unwrap().clear();
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(300)).await;
+    tokio::task::yield_now().await;
+    assert!(observer.reads.lock().unwrap().is_empty());
+    assert!(observer.writes.lock().unwrap().is_empty());
+    tokio::time::resume();
+    // Hold a real Empty handoff, then commit a new lower binding. Fixture-only
+    // timestamps make the actual evented stale clock due in three seconds.
+    processor.arm_completed_history_preparation_barrier(label);
+    store.background_work("cli.supervision").invalidate();
+    timeout(
+        Duration::from_secs(5),
+        processor.wait_for_completed_history_preparation_barrier(),
+    )
+    .await
+    .unwrap();
+    let lower = CrudStore::new(store.database_connection());
+    let now = chrono::Utc::now().fixed_offset();
+    insert_turn(
+        &lower,
+        &workspace,
+        "late-supervised",
+        "starting",
+        now,
+        now - chrono::Duration::minutes(15) + chrono::Duration::seconds(3),
+    )
+    .await;
+    processor.arm_completed_history_preparation_barrier(label);
+    processor.release_completed_history_preparation_barrier();
+    timeout(
+        Duration::from_secs(5),
+        processor.wait_for_completed_history_preparation_barrier(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        !has_recovery(&lower, "late-supervised").await,
+        "future liveness deadline cannot fail early"
+    );
+    observer.reads.lock().unwrap().clear();
+    observer.writes.lock().unwrap().clear();
+    processor.arm_completed_history_preparation_barrier(label);
+    processor.release_completed_history_preparation_barrier();
+    timeout(
+        Duration::from_secs(7),
+        processor.wait_for_completed_history_preparation_barrier(),
+    )
+    .await
+    .unwrap();
+    assert!(observer.reads.lock().unwrap().iter().all(|event| !matches!(event,
+        pioneer_sqlite::SqliteReadEvent::AdmissionEnqueued {class,..} if *class!=pioneer_sqlite::SqliteReadClass::Maintenance)));
+    assert!(observer.writes.lock().unwrap().iter().any(|event| matches!(
+        event,
+        pioneer_sqlite::SqliteWriteEvent::Acquired {
+            class: pioneer_sqlite::SqliteWriteClass::Critical,
+            ..
+        }
+    )));
+    assert!(
+        has_recovery(&lower, "late-supervised").await,
+        "unavailable runtime creates the durable observation-recovery obligation at its deadline"
+    );
+    let (_, mut turn) = lower
+        .get_turn("late-supervised", "late-supervised")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        turn.status,
+        TurnStatus::InProgress,
+        "missing binding is not destructive inactivity proof"
+    );
+    turn.status = TurnStatus::Completed;
+    processor.arm_completed_history_preparation_barrier(label);
+    lower
+        .materialize_turn_completed(
+            TurnCompletedNotification {
+                workspace_id: workspace,
+                thread_id: "late-supervised".into(),
+                turn,
+            },
+            now_timestamp_secs(),
+        )
+        .await
+        .unwrap();
+    processor.release_completed_history_preparation_barrier();
+    timeout(
+        Duration::from_secs(5),
+        processor.wait_for_completed_history_preparation_barrier(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        lower
+            .get_cli_runtime_turn_binding("late-supervised")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "completed"
+    );
+    processor.release_completed_history_preparation_barrier();
+    tokio::task::yield_now().await;
+    observer.reads.lock().unwrap().clear();
+    observer.writes.lock().unwrap().clear();
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(300)).await;
+    tokio::task::yield_now().await;
+    assert!(
+        observer.reads.lock().unwrap().is_empty(),
+        "terminal history has no stale-scan timer"
+    );
+    assert!(observer.writes.lock().unwrap().is_empty());
+    processor.cli_history_shutdown.cancel();
+    worker.await.unwrap();
 }

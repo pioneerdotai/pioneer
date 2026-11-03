@@ -10,6 +10,11 @@ mod execution_heartbeat;
 mod frozen_lifetime;
 mod recovery_wake;
 pub use frozen_lifetime::FrozenReadHold;
+pub use recovery_wake::{
+    ControlAdmissionPass, EffectRetryPass, RecoveryAdmission, RecoveryClockPass,
+    TimeoutSupervisionPage, TimeoutSupervisionRow,
+};
+pub use repositories::hook_run::HookClockPass;
 mod tool_output;
 pub use repositories::compaction;
 mod compaction_store;
@@ -44,7 +49,12 @@ pub use repositories::task_occurrence_reconcile::{
 };
 mod task_finish;
 mod task_scheduler;
-pub use task_scheduler::{TaskSchedulerPage, TaskSchedulerRowFailure};
+mod task_wait;
+pub use compaction_store::CompactionHistoryChanges;
+pub use task_scheduler::{
+    TaskSchedulerChanges, TaskSchedulerPage, TaskSchedulerRowFailure, task_event_affects_scheduler,
+};
+pub use task_wait::TaskWaitSignal;
 mod task_terminal;
 mod task_webhook;
 pub use repositories::task_run_occurrence_reconcile::{
@@ -1946,7 +1956,8 @@ pub use crate::thread_episodic::{
     thread_episodic_workspace_capsule_ref, thread_episodic_workspace_capsule_storage_uri,
     thread_episodic_workspace_uri_prefix,
 };
-use crate::util::{optional_typed_json_from_db, typed_json_from_db, unix_to_datetime};
+pub use crate::util::unix_to_datetime;
+use crate::util::{optional_typed_json_from_db, typed_json_from_db};
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -2137,7 +2148,7 @@ pub struct TurnItemAttemptDeadlines {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TurnProjectionReplaySummary {
     /// Earliest eligible clock from this replay's last bounded discovery.
-    /// Advisory only: foreign changes are still discovered on every poll.
+    /// Advisory only: claims revalidate after shared input invalidation.
     pub next_eligible_at_unix: Option<i64>,
     pub claimed: usize,
     pub projected: usize,
@@ -3160,6 +3171,21 @@ pub struct OccurrenceReconcileDiscovery<C> {
     pub audit_error: Option<anyhow::Error>,
 }
 
+/// Memory-only coordination belongs to the physical database runtime, not an
+/// individual CrudStore constructor. Independent stores must see the same wakes
+/// and read holds; scheduling scopes never change this identity.
+#[derive(Default)]
+struct CrudRuntimeState {
+    execution_heartbeats: execution_heartbeat::Registries,
+    finalization_cursor: std::sync::Arc<std::sync::Mutex<turn_finalization::PreparedPass>>,
+    episodic_work: std::sync::Arc<tokio::sync::Notify>,
+    frozen_readers: frozen_lifetime::ReaderCounts,
+    occurrence_compatibility_cursors:
+        std::sync::Arc<[tokio::sync::Mutex<task_occurrence_compatibility::AuditCursor>; 2]>,
+    legacy_task_text_cursors:
+        std::sync::Arc<std::sync::Mutex<repositories::portable_payload_legacy_text::Cursors>>,
+}
+
 #[derive(Clone)]
 pub struct CrudStore {
     #[cfg(test)]
@@ -3171,7 +3197,6 @@ pub struct CrudStore {
             )>,
         >,
     >,
-    recovery_work: std::sync::Arc<tokio::sync::Notify>,
     execution_heartbeats: execution_heartbeat::Registries,
     #[cfg(any(test, feature = "test-support"))]
     delivery_commit_test_gate: std::sync::Arc<
@@ -3183,9 +3208,8 @@ pub struct CrudStore {
     episodic_claim_fault: std::sync::Arc<std::sync::Mutex<Option<(String, &'static str)>>>,
     #[cfg(any(test, feature = "test-support"))]
     episodic_claim_discoveries: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    finalization_cursor: std::sync::Arc<tokio::sync::Mutex<turn_finalization::PreparedPass>>,
+    finalization_cursor: std::sync::Arc<std::sync::Mutex<turn_finalization::PreparedPass>>,
     episodic_work: std::sync::Arc<tokio::sync::Notify>,
-    html_preview_io_work: std::sync::Arc<tokio::sync::Notify>,
     frozen_readers: frozen_lifetime::ReaderCounts,
     occurrence_compatibility_cursors:
         std::sync::Arc<[tokio::sync::Mutex<task_occurrence_compatibility::AuditCursor>; 2]>,
@@ -4779,19 +4803,30 @@ impl CrudStore {
         .await
     }
 
+    /// Addressed process-local invalidation, shared across separately created
+    /// stores of this database. Durable eligibility remains in repositories.
+    pub fn background_work(
+        &self,
+        owner: &'static str,
+    ) -> std::sync::Arc<pioneer_sqlite::background::Wake> {
+        self.connection
+            .shared_resource::<pioneer_sqlite::background::Registry>()
+            .owner(owner)
+    }
+
     pub fn new(connection: impl Into<SqliteDatabase>) -> Self {
+        let connection = connection.into();
+        let runtime = connection.shared_resource::<CrudRuntimeState>();
         Self {
             #[cfg(test)]
             watchdog_preparation_gate: Default::default(),
-            execution_heartbeats: Default::default(),
-            recovery_work: Default::default(),
-            connection: connection.into(),
-            finalization_cursor: Default::default(),
-            episodic_work: std::sync::Arc::new(tokio::sync::Notify::new()),
-            html_preview_io_work: Default::default(),
-            frozen_readers: Default::default(),
-            legacy_task_text_cursors: Default::default(),
-            occurrence_compatibility_cursors: Default::default(),
+            execution_heartbeats: runtime.execution_heartbeats.clone(),
+            connection,
+            finalization_cursor: runtime.finalization_cursor.clone(),
+            episodic_work: runtime.episodic_work.clone(),
+            frozen_readers: runtime.frozen_readers.clone(),
+            legacy_task_text_cursors: runtime.legacy_task_text_cursors.clone(),
+            occurrence_compatibility_cursors: runtime.occurrence_compatibility_cursors.clone(),
             #[cfg(any(test, feature = "test-support"))]
             episodic_claim_fault: Default::default(),
             #[cfg(any(test, feature = "test-support"))]
@@ -5050,7 +5085,7 @@ impl CrudStore {
         Fut: Future<Output = Result<T>>,
     {
         retry_with_backoff(
-            || repositories::portable_payload::after_database_owners(operation()),
+            || repositories::portable_payload::after_database_owners(&self.connection, operation()),
             |error| {
                 is_anyhow_sqlite_lock(error)
                     || task_event::is_idempotency_preflight_race(error)
@@ -5062,6 +5097,19 @@ impl CrudStore {
             Duration::from_millis(DEFAULT_LOCK_RETRY_BASE_DELAY_MS),
         )
         .await
+    }
+
+    /// Startup/backfill metadata also has a live dependent. Keep the ordinary
+    /// repository path and publish only this key's committed readiness change.
+    pub async fn upsert_projection_meta(&self, record: ProjectionMetaRecord) -> Result<()> {
+        let change = (record.projection_key == "turn_event_projection_stream_state_backfill")
+            .then(|| self.background_work("storage.receipts").changing());
+        repositories::thread_timeline_projection::upsert_projection_meta(&self.connection, record)
+            .await?;
+        if let Some(change) = change {
+            change.finish(true);
+        }
+        Ok(())
     }
 
     /// Performs at most one bounded receipt cleanup batch for one stream.
@@ -5097,6 +5145,8 @@ impl CrudStore {
             if prepared.is_empty() {
                 return Ok(outcome);
             }
+            let receipt_change = self.background_work("storage.receipts").changing();
+            let native_change = self.background_work("storage.native_events").changing();
             let transaction = self
                 .connection
                 .begin()
@@ -5127,6 +5177,8 @@ impl CrudStore {
                     outcome.failed = true;
                 }
             }
+            receipt_change.finish(outcome.rows_deleted > 0);
+            native_change.finish(outcome.rows_deleted > 0);
             Ok(outcome)
         })
         .await
@@ -5136,12 +5188,19 @@ impl CrudStore {
         &self,
         entry: NewTurnLlmContextEntry,
     ) -> Result<pioneer_entity::turn_llm_context::Model> {
-        self.run_serialized_write(|| async {
-            let tx = self.connection.begin().await?;
-            let row = turn_llm_context::insert_turn_llm_context(&tx, entry.clone()).await?;
-            tx.commit().await?;
-            Ok(row)
-        })
+        self.background_changes(
+            &["tasks.lifecycle"],
+            async {
+                self.run_serialized_write(|| async {
+                    let tx = self.connection.begin().await?;
+                    let row = turn_llm_context::insert_turn_llm_context(&tx, entry.clone()).await?;
+                    tx.commit().await?;
+                    Ok(row)
+                })
+                .await
+            },
+            |_| true,
+        )
         .await
     }
 
@@ -5150,60 +5209,71 @@ impl CrudStore {
         entry: NewTurnLlmContextEntry,
         delivery_key: &str,
     ) -> Result<TurnLlmContextAppendOutcome> {
-        let preview_archive = if entry.source == "tool_result_v2"
-            && entry.tool_name.as_deref() == Some("html_preview")
-        {
-            Some(repositories::html_preview_retention::archive_result(
-                &entry.payload,
-            ))
-        } else {
-            None
-        };
-        // Prepare outside writer admission. An invalid/unknown preview remains
-        // unchanged unless the commit finds an authoritative release marker.
-        let preview_archive = preview_archive.map(|result| result.ok());
-        let delivery_key = delivery_key.to_owned();
-        self.run_serialized_write(|| {
-            let mut entry = entry.clone();
-            let preview_archive = preview_archive.clone();
-            let delivery_key = delivery_key.clone();
-            async move {
-                let transaction = self
-                    .connection
-                    .begin()
-                    .await
-                    .context("failed to begin turn_llm_context append transaction")?;
-                if let Some(prepared) = preview_archive {
-                    if repositories::html_preview_retention::preview_result_was_released(
-                        &transaction,
-                        &entry.turn_id,
-                        entry.item_id.as_deref().unwrap_or_default(),
-                    )
-                    .await?
-                    {
-                        entry.payload = prepared.ok_or_else(|| {
-                            anyhow::anyhow!("released HTML preview result cannot be reintroduced")
-                        })?;
-                    }
-                }
-                let outcome =
-                    turn_llm_context::append_turn_llm_context(&transaction, entry, &delivery_key)
-                        .await;
-                match outcome {
-                    Ok(outcome) => {
-                        transaction
-                            .commit()
+        self.background_changes(
+            &["tasks.lifecycle"],
+            async {
+                let preview_archive = if entry.source == "tool_result_v2"
+                    && entry.tool_name.as_deref() == Some("html_preview")
+                {
+                    Some(repositories::html_preview_retention::archive_result(
+                        &entry.payload,
+                    ))
+                } else {
+                    None
+                };
+                // Prepare outside writer admission. An invalid/unknown preview remains
+                // unchanged unless the commit finds an authoritative release marker.
+                let preview_archive = preview_archive.map(|result| result.ok());
+                let delivery_key = delivery_key.to_owned();
+                self.run_serialized_write(|| {
+                    let mut entry = entry.clone();
+                    let preview_archive = preview_archive.clone();
+                    let delivery_key = delivery_key.clone();
+                    async move {
+                        let transaction = self
+                            .connection
+                            .begin()
                             .await
-                            .context("failed to commit turn_llm_context append transaction")?;
-                        Ok(outcome)
+                            .context("failed to begin turn_llm_context append transaction")?;
+                        if let Some(prepared) = preview_archive {
+                            if repositories::html_preview_retention::preview_result_was_released(
+                                &transaction,
+                                &entry.turn_id,
+                                entry.item_id.as_deref().unwrap_or_default(),
+                            )
+                            .await?
+                            {
+                                entry.payload = prepared.ok_or_else(|| {
+                                    anyhow::anyhow!(
+                                        "released HTML preview result cannot be reintroduced"
+                                    )
+                                })?;
+                            }
+                        }
+                        let outcome = turn_llm_context::append_turn_llm_context(
+                            &transaction,
+                            entry,
+                            &delivery_key,
+                        )
+                        .await;
+                        match outcome {
+                            Ok(outcome) => {
+                                transaction.commit().await.context(
+                                    "failed to commit turn_llm_context append transaction",
+                                )?;
+                                Ok(outcome)
+                            }
+                            Err(error) => {
+                                let _ = transaction.rollback().await;
+                                Err(error)
+                            }
+                        }
                     }
-                    Err(error) => {
-                        let _ = transaction.rollback().await;
-                        Err(error)
-                    }
-                }
-            }
-        })
+                })
+                .await
+            },
+            |outcome| !outcome.already_committed,
+        )
         .await
     }
 
@@ -5212,11 +5282,21 @@ impl CrudStore {
     }
 
     pub async fn delete_turn_llm_context_for_turn(&self, turn_id: &str) -> Result<u64> {
-        turn_llm_context::delete_turn_llm_context_for_turn(&self.connection, turn_id).await
+        self.background_changes(
+            &["storage.html.history", "storage.html.retention"],
+            turn_llm_context::delete_turn_llm_context_for_turn(&self.connection, turn_id),
+            |deleted| *deleted > 0,
+        )
+        .await
     }
 
     pub async fn delete_expired_turn_llm_context(&self) -> Result<u64> {
-        turn_llm_context::delete_expired_turn_llm_context(&self.connection).await
+        self.background_changes(
+            &["storage.html.history", "storage.html.retention"],
+            turn_llm_context::delete_expired_turn_llm_context(&self.connection),
+            |deleted| *deleted > 0,
+        )
+        .await
     }
 
     pub async fn list_unreconciled_terminal_task_child_turns(
@@ -5332,19 +5412,40 @@ impl CrudStore {
         thread_id: &str,
         turn_id: &str,
     ) -> Result<Option<bool>> {
-        self.run_serialized_write(|| async {
-            let tx =
-                repositories::task_child_cleanup::begin_authoritative(&self.connection).await?;
-            repositories::task_child_cleanup::lock_authority(&tx, thread_id, turn_id).await?;
-            let ready = repositories::task_child_cleanup::ready(&tx, thread_id, turn_id).await?;
-            if ready == Some(true) {
-                turn_llm_context::delete_turn_llm_context_for_turn(&tx, turn_id).await?;
-                turn_runtime_snapshot::delete_turn_runtime_snapshot(&tx, turn_id).await?;
-            }
-            tx.commit().await?;
-            Ok(ready)
-        })
+        self.background_changes(
+            &[
+                "storage.frozen",
+                "storage.html.history",
+                "storage.html.retention",
+            ],
+            async {
+                self.run_serialized_write(|| async {
+                    let tx =
+                        repositories::task_child_cleanup::begin_authoritative(&self.connection)
+                            .await?;
+                    repositories::task_child_cleanup::lock_authority(&tx, thread_id, turn_id)
+                        .await?;
+                    let ready =
+                        repositories::task_child_cleanup::ready(&tx, thread_id, turn_id).await?;
+                    let mut changed = false;
+                    if ready == Some(true) {
+                        changed |= turn_llm_context::delete_turn_llm_context_for_turn(&tx, turn_id)
+                            .await?
+                            > 0;
+                        changed |=
+                            turn_runtime_snapshot::delete_turn_runtime_snapshot(&tx, turn_id)
+                                .await?
+                                > 0;
+                    }
+                    tx.commit().await?;
+                    Ok((ready, changed))
+                })
+                .await
+            },
+            |(_, changed)| *changed,
+        )
         .await
+        .map(|(ready, _)| ready)
     }
 
     pub async fn list_active_execution_authorities(
@@ -5443,14 +5544,20 @@ impl CrudStore {
         Ok(
             turn_event_delivery::next_deadline(&self.connection, consumer)
                 .await?
-                .map(|at| at.timestamp()),
+                .map(|at| {
+                    at.timestamp()
+                        .saturating_add(i64::from(at.timestamp_subsec_nanos() != 0))
+                }),
         )
     }
 
     pub async fn next_turn_event_projection_deadline(&self) -> Result<Option<i64>> {
         Ok(turn_event_projection_state::next_deadline(&self.connection)
             .await?
-            .map(|at| at.timestamp()))
+            .map(|at| {
+                at.timestamp()
+                    .saturating_add(i64::from(at.timestamp_subsec_nanos() != 0))
+            }))
     }
 
     pub async fn claim_due_turn_event_deliveries(
@@ -5474,7 +5581,10 @@ impl CrudStore {
         // One compact reader discovery supplies both due IDs and an eligible
         // timer. Empty polls need no second query, writer or payload load.
         let page = turn_event_delivery::discover(&self.connection, consumer, limit).await?;
-        let next_eligible_at_unix = page.first().map(|(_, at)| at.timestamp());
+        let next_eligible_at_unix = page.first().map(|(_, at)| {
+            at.timestamp()
+                .saturating_add(i64::from(at.timestamp_subsec_nanos() != 0))
+        });
         let candidates = page
             .into_iter()
             .filter(|(_, at)| *at <= unix_to_datetime(now_unix))
@@ -5487,6 +5597,12 @@ impl CrudStore {
             });
         }
         let consumer = consumer.to_owned();
+        let work = match consumer.as_str() {
+            NATIVE_TURN_EVENT_LIVE_CONSUMER => "turn.delivery.live",
+            NATIVE_TURN_EVENT_EPISODIC_CONSUMER => "turn.delivery.episodic",
+            _ => anyhow::bail!("unknown turn-event delivery consumer"),
+        };
+        let change = self.background_work(work).changing();
         let claimed = self
             .run_serialized_write(|| {
                 let consumer = consumer.clone();
@@ -5505,6 +5621,7 @@ impl CrudStore {
                 }
             })
             .await?;
+        change.finish(!claimed.is_empty());
         // Claim writes are committed before event reads/JSON decoding. A read
         // error leaves the durable lease recoverable and dispatches no claim.
         let mut records = Vec::with_capacity(claimed.len());
@@ -5531,6 +5648,18 @@ impl CrudStore {
         })
     }
 
+    async fn track_turn_delivery_change(
+        &self,
+        operation: impl Future<Output = Result<Option<String>>>,
+    ) -> Result<bool> {
+        let live = self.background_work("turn.delivery.live").changing();
+        let episodic = self.background_work("turn.delivery.episodic").changing();
+        let result = operation.await?;
+        live.finish(result.as_deref() == Some(NATIVE_TURN_EVENT_LIVE_CONSUMER));
+        episodic.finish(result.as_deref() == Some(NATIVE_TURN_EVENT_EPISODIC_CONSUMER));
+        Ok(result.is_some())
+    }
+
     pub async fn complete_turn_event_delivery(
         &self,
         id: &str,
@@ -5539,7 +5668,7 @@ impl CrudStore {
     ) -> Result<bool> {
         let id = id.to_owned();
         let claim_token = claim_token.to_owned();
-        self.run_serialized_write(|| async {
+        self.track_turn_delivery_change(self.run_serialized_write(|| async {
             turn_event_delivery::mark_delivered(
                 &self.connection,
                 id.as_str(),
@@ -5547,7 +5676,7 @@ impl CrudStore {
                 unix_to_datetime(now_unix),
             )
             .await
-        })
+        }))
         .await
     }
 
@@ -5561,7 +5690,7 @@ impl CrudStore {
     ) -> Result<bool> {
         let id = id.to_owned();
         let claim_token = claim_token.to_owned();
-        self.run_serialized_write(|| {
+        self.track_turn_delivery_change(self.run_serialized_write(|| {
             let error = error.clone();
             let id = id.clone();
             let claim_token = claim_token.clone();
@@ -5581,12 +5710,17 @@ impl CrudStore {
                 )
                 .await
             }
-        })
+        }))
         .await
     }
 
     pub async fn delete_turn_llm_context_for_terminal_turns(&self) -> Result<u64> {
-        turn_llm_context::delete_turn_llm_context_for_terminal_turns(&self.connection).await
+        self.background_changes(
+            &["storage.html.history", "storage.html.retention"],
+            turn_llm_context::delete_turn_llm_context_for_terminal_turns(&self.connection),
+            |deleted| *deleted > 0,
+        )
+        .await
     }
 
     pub async fn upsert_turn_runtime_snapshot(
@@ -5605,34 +5739,53 @@ impl CrudStore {
         snapshot: NewTurnRuntimeSnapshot,
         source_epochs: &std::collections::BTreeMap<String, u64>,
     ) -> Result<TurnRuntimeSnapshotRecord> {
-        let root = frozen_lifetime::PreparedFrozenRoot::history(&snapshot.history_json)?;
-        // Preparation reads these epochs without writer capacity. Edits can
-        // race the handoff, so revalidate them in the runtime-root transaction.
-        let source_epochs_json = serde_json::to_string(source_epochs)?;
-        anyhow::ensure!(
-            source_epochs_json.len() <= compaction::SOURCE_PAGE_BYTES,
-            "runtime source epochs exceed metadata byte bound"
-        );
-        self.run_serialized_write(|| async {
-            let transaction = self.connection.begin().await?;
-            let result = async {
-                turn_runtime_snapshot::verify_source_epochs(
-                    &transaction,
-                    &snapshot.workspace_id,
-                    &source_epochs_json,
-                )
-                .await?;
-                turn_runtime_snapshot::upsert_turn_runtime_snapshot(
-                    &transaction,
-                    snapshot.clone(),
-                    &root,
+        self.background_changes(
+            &[
+                "storage.frozen",
+                "storage.html.retention",
+                "storage.html.history",
+            ],
+            async {
+                self.background_changes(
+                    &["tasks.lifecycle"],
+                    async {
+                        let root =
+                            frozen_lifetime::PreparedFrozenRoot::history(&snapshot.history_json)?;
+                        // Preparation reads these epochs without writer capacity. Edits can
+                        // race the handoff, so revalidate them in the runtime-root transaction.
+                        let source_epochs_json = serde_json::to_string(source_epochs)?;
+                        anyhow::ensure!(
+                            source_epochs_json.len() <= compaction::SOURCE_PAGE_BYTES,
+                            "runtime source epochs exceed metadata byte bound"
+                        );
+                        self.run_serialized_write(|| async {
+                            let transaction = self.connection.begin().await?;
+                            let result = async {
+                                turn_runtime_snapshot::verify_source_epochs(
+                                    &transaction,
+                                    &snapshot.workspace_id,
+                                    &source_epochs_json,
+                                )
+                                .await?;
+                                turn_runtime_snapshot::upsert_turn_runtime_snapshot(
+                                    &transaction,
+                                    snapshot.clone(),
+                                    &root,
+                                )
+                                .await
+                            }
+                            .await?;
+                            transaction.commit().await?;
+                            Ok(result)
+                        })
+                        .await
+                    },
+                    |_| true,
                 )
                 .await
-            }
-            .await?;
-            transaction.commit().await?;
-            Ok(result)
-        })
+            },
+            |_| true,
+        )
         .await
     }
 
@@ -5671,19 +5824,46 @@ impl CrudStore {
     }
 
     pub async fn delete_turn_runtime_snapshot(&self, turn_id: &str) -> Result<u64> {
-        let turn_id = turn_id.to_owned();
-        self.run_serialized_write(|| async {
-            turn_runtime_snapshot::delete_turn_runtime_snapshot(&self.connection, turn_id.as_str())
+        self.background_changes(
+            &[
+                "storage.frozen",
+                "storage.html.retention",
+                "storage.html.history",
+            ],
+            async {
+                let turn_id = turn_id.to_owned();
+                self.run_serialized_write(|| async {
+                    turn_runtime_snapshot::delete_turn_runtime_snapshot(
+                        &self.connection,
+                        turn_id.as_str(),
+                    )
+                    .await
+                })
                 .await
-        })
+            },
+            |changed| *changed > 0,
+        )
         .await
     }
 
     pub async fn delete_turn_runtime_snapshots_for_closed_turns(&self) -> Result<u64> {
-        self.run_serialized_write(|| async {
-            turn_runtime_snapshot::delete_turn_runtime_snapshots_for_closed_turns(&self.connection)
+        self.background_changes(
+            &[
+                "storage.frozen",
+                "storage.html.retention",
+                "storage.html.history",
+            ],
+            async {
+                self.run_serialized_write(|| async {
+                    turn_runtime_snapshot::delete_turn_runtime_snapshots_for_closed_turns(
+                        &self.connection,
+                    )
+                    .await
+                })
                 .await
-        })
+            },
+            |changed| *changed > 0,
+        )
         .await
     }
 
@@ -5716,17 +5896,33 @@ impl CrudStore {
         &self,
         binding: NewCliRuntimeThreadBinding,
     ) -> Result<CliRuntimeThreadBindingRecord> {
-        let root = frozen_lifetime::PreparedFrozenRoot::cli(&binding.resume_cursor_json, true)?;
-        self.run_serialized_write(|| async {
-            let transaction = self.connection.begin().await?;
-            let result = async {
-                cli_runtime_binding::upsert_thread_binding(&transaction, binding.clone(), &root)
-                    .await
-            }
-            .await?;
-            transaction.commit().await?;
-            Ok(result)
-        })
+        self.background_changes(
+            &[
+                "storage.frozen",
+                "storage.html.retention",
+                "storage.html.history",
+            ],
+            async {
+                let root =
+                    frozen_lifetime::PreparedFrozenRoot::cli(&binding.resume_cursor_json, true)?;
+                self.run_serialized_write(|| async {
+                    let transaction = self.connection.begin().await?;
+                    let result = async {
+                        cli_runtime_binding::upsert_thread_binding(
+                            &transaction,
+                            binding.clone(),
+                            &root,
+                        )
+                        .await
+                    }
+                    .await?;
+                    transaction.commit().await?;
+                    Ok(result)
+                })
+                .await
+            },
+            |_| true,
+        )
         .await
     }
 
@@ -5820,28 +6016,39 @@ impl CrudStore {
         resume_cursor_json: String,
         updated_at: sea_orm::entity::prelude::DateTimeWithTimeZone,
     ) -> Result<CliRuntimeThreadBindingRecord> {
-        let thread_id = thread_id.to_owned();
-        let expected_native_thread_id = expected_native_thread_id.to_owned();
-        let expected_cursor_json = expected_cursor_json.to_owned();
-        let root = frozen_lifetime::PreparedFrozenRoot::cli(&resume_cursor_json, true)?;
-        self.run_serialized_write(|| async {
-            let transaction = self.connection.begin().await?;
-            let result = async {
-                cli_runtime_binding::update_thread_resume_cursor(
-                    &transaction,
-                    thread_id.as_str(),
-                    expected_native_thread_id.as_str(),
-                    expected_cursor_json.as_str(),
-                    resume_cursor_json.clone(),
-                    updated_at,
-                    &root,
-                )
+        self.background_changes(
+            &[
+                "storage.frozen",
+                "storage.html.retention",
+                "storage.html.history",
+            ],
+            async {
+                let thread_id = thread_id.to_owned();
+                let expected_native_thread_id = expected_native_thread_id.to_owned();
+                let expected_cursor_json = expected_cursor_json.to_owned();
+                let root = frozen_lifetime::PreparedFrozenRoot::cli(&resume_cursor_json, true)?;
+                self.run_serialized_write(|| async {
+                    let transaction = self.connection.begin().await?;
+                    let result = async {
+                        cli_runtime_binding::update_thread_resume_cursor(
+                            &transaction,
+                            thread_id.as_str(),
+                            expected_native_thread_id.as_str(),
+                            expected_cursor_json.as_str(),
+                            resume_cursor_json.clone(),
+                            updated_at,
+                            &root,
+                        )
+                        .await
+                    }
+                    .await?;
+                    transaction.commit().await?;
+                    Ok(result)
+                })
                 .await
-            }
-            .await?;
-            transaction.commit().await?;
-            Ok(result)
-        })
+            },
+            |_| true,
+        )
         .await
     }
 
@@ -5944,26 +6151,67 @@ impl CrudStore {
         &self,
         binding: NewCliRuntimeTurnBinding,
     ) -> Result<CliRuntimeTurnBindingRecord> {
-        let root = frozen_lifetime::PreparedFrozenRoot::cli(&binding.input_mapping_json, false)?;
-        let result = self
-            .run_serialized_write(|| async {
-                let prepared_binding = binding.clone();
-                let transaction = self.connection.begin().await?;
-                let result = async {
-                    let stored = cli_runtime_binding::upsert_turn_binding(
-                        &transaction,
-                        prepared_binding,
-                        &root,
-                    )
-                    .await?;
-                    Ok::<_, anyhow::Error>(stored)
-                }
-                .await?;
-                transaction.commit().await?;
-                Ok(result)
-            })
-            .await?;
-        cli_runtime_binding::hydrate_record(&self.connection, result).await
+        self.cli_runtime_semantic_change(
+            async {
+                self.background_changes(
+                    &[
+                        "storage.frozen",
+                        "storage.portable",
+                        "storage.html.retention",
+                        "storage.html.history",
+                    ],
+                    async {
+                        self.background_change(
+                            "storage.native_events",
+                            async {
+                                self.track_compaction_history(
+                                    true,
+                                    6,
+                                    async {
+                                        let root = frozen_lifetime::PreparedFrozenRoot::cli(
+                                            &binding.input_mapping_json,
+                                            false,
+                                        )?;
+                                        let result = self
+                                            .run_serialized_write(|| async {
+                                                let prepared_binding = binding.clone();
+                                                let transaction = self.connection.begin().await?;
+                                                let result = async {
+                                                    let stored =
+                                                        cli_runtime_binding::upsert_turn_binding(
+                                                            &transaction,
+                                                            prepared_binding,
+                                                            &root,
+                                                        )
+                                                        .await?;
+                                                    Ok::<_, anyhow::Error>(stored)
+                                                }
+                                                .await?;
+                                                transaction.commit().await?;
+                                                Ok(result)
+                                            })
+                                            .await?;
+                                        cli_runtime_binding::hydrate_record(
+                                            &self.connection,
+                                            result,
+                                        )
+                                        .await
+                                    },
+                                    |_| true,
+                                )
+                                .await
+                            },
+                            |_| true,
+                        )
+                        .await
+                    },
+                    |_| true,
+                )
+                .await
+            },
+            |_| true,
+        )
+        .await
     }
 
     pub async fn get_cli_runtime_turn_binding(
@@ -6014,44 +6262,53 @@ impl CrudStore {
         expected: Option<CliRuntimeTurnTerminalGuard>,
         execution_owner_id: &str,
     ) -> Result<Option<CliRuntimeTurnBindingRecord>> {
-        let turn_id = turn_id.to_owned();
-        let result = self
-            .run_serialized_write(|| async {
-                let transaction = self.connection.begin().await?;
-                if let Some(expected) = &expected {
-                    let current =
-                        cli_runtime_turn_terminal_snapshot(&transaction, &turn_id).await?;
-                    if let Some(owner) = turn_execution::find(&transaction, &turn_id).await?
-                        && (owner.owner_id != execution_owner_id
-                            || !owner.status.is_active()
-                            || owner.lease_until <= chrono::Utc::now().fixed_offset())
-                    {
-                        transaction.rollback().await?;
-                        return Ok(None);
-                    }
-                    if !current.as_ref().is_some_and(|current| {
-                        expected
-                            .terminal_event_source()
-                            .zip(current.terminal_event_source())
-                            .is_some_and(|(selected, actual)| selected.same_execution(&actual))
-                    }) {
-                        transaction.rollback().await?;
-                        return Ok(None);
-                    }
-                }
-                let binding = cli_runtime_binding::set_turn_native_goal_state(
-                    &transaction,
-                    turn_id.as_str(),
-                    status.clone(),
-                    native_goal_turn_id.clone(),
-                    observed_at,
-                )
-                .await?;
-                transaction.commit().await?;
-                Ok(Some(binding))
-            })
-            .await?;
-        hydrate_cli_binding_optional(&self.connection, result).await
+        self.cli_runtime_semantic_change(
+            async {
+                let turn_id = turn_id.to_owned();
+                let result = self
+                    .run_serialized_write(|| async {
+                        let transaction = self.connection.begin().await?;
+                        if let Some(expected) = &expected {
+                            let current =
+                                cli_runtime_turn_terminal_snapshot(&transaction, &turn_id).await?;
+                            if let Some(owner) =
+                                turn_execution::find(&transaction, &turn_id).await?
+                                && (owner.owner_id != execution_owner_id
+                                    || !owner.status.is_active()
+                                    || owner.lease_until <= chrono::Utc::now().fixed_offset())
+                            {
+                                transaction.rollback().await?;
+                                return Ok(None);
+                            }
+                            if !current.as_ref().is_some_and(|current| {
+                                expected
+                                    .terminal_event_source()
+                                    .zip(current.terminal_event_source())
+                                    .is_some_and(|(selected, actual)| {
+                                        selected.same_execution(&actual)
+                                    })
+                            }) {
+                                transaction.rollback().await?;
+                                return Ok(None);
+                            }
+                        }
+                        let binding = cli_runtime_binding::set_turn_native_goal_state(
+                            &transaction,
+                            turn_id.as_str(),
+                            status.clone(),
+                            native_goal_turn_id.clone(),
+                            observed_at,
+                        )
+                        .await?;
+                        transaction.commit().await?;
+                        Ok(Some(binding))
+                    })
+                    .await?;
+                hydrate_cli_binding_optional(&self.connection, result).await
+            },
+            |row| row.is_some(),
+        )
+        .await
     }
 
     /// Atomically binds the runtime turn metadata and the same activation
@@ -6279,11 +6536,16 @@ impl CrudStore {
         CliRuntimeTurnAttemptRecord,
         CliRuntimeExecutionSegmentRecord,
     )> {
-        let turn_id = turn_id.to_owned();
-        let native_thread_id = native_thread_id.to_owned();
-        let native_turn_id = native_turn_id.to_owned();
-        let segment_id = pioneer_protocol::generate_id(DB_ID_LEN);
-        let result = self.run_serialized_write(|| {
+        self.cli_runtime_semantic_change(
+            async {
+                self.background_change(
+                    "storage.native_events",
+                    async {
+                        let turn_id = turn_id.to_owned();
+                        let native_thread_id = native_thread_id.to_owned();
+                        let native_turn_id = native_turn_id.to_owned();
+                        let segment_id = pioneer_protocol::generate_id(DB_ID_LEN);
+                        let result = self.run_serialized_write(|| {
             let segment_id = segment_id.clone();
             let turn_id = turn_id.clone();
             let native_thread_id = native_thread_id.clone();
@@ -6383,7 +6645,15 @@ impl CrudStore {
             }
         })
         .await?;
-        hydrate_cli_binding_triple(&self.connection, result).await
+                        hydrate_cli_binding_triple(&self.connection, result).await
+                    },
+                    |_| true,
+                )
+                .await
+            },
+            |_| true,
+        )
+        .await
     }
 
     pub async fn terminalize_cli_runtime_execution_segment(
@@ -6400,9 +6670,14 @@ impl CrudStore {
             CliRuntimeExecutionSegmentRecord,
         )>,
     > {
-        let runtime_id = runtime_id.to_owned();
-        let native_turn_id = native_turn_id.to_owned();
-        let result = self
+        self.cli_runtime_semantic_change(
+            async {
+                self.background_change(
+                    "storage.native_events",
+                    async {
+                        let runtime_id = runtime_id.to_owned();
+                        let native_turn_id = native_turn_id.to_owned();
+                        let result = self
             .run_serialized_write(|| async {
                 let transaction = self.connection.begin().await.context(
                     "failed to begin CLI runtime execution segment terminal transaction",
@@ -6459,7 +6734,15 @@ impl CrudStore {
                 Ok(Some((binding, attempt, stored)))
             })
             .await?;
-        hydrate_cli_binding_optional_triple(&self.connection, result).await
+                        hydrate_cli_binding_optional_triple(&self.connection, result).await
+                    },
+                    |changed| changed.is_some(),
+                )
+                .await
+            },
+            |row| row.is_some(),
+        )
+        .await
     }
 
     pub async fn mark_cli_runtime_turn_attempt_terminal(
@@ -6469,26 +6752,36 @@ impl CrudStore {
         failure_reason: Option<String>,
         completed_at: sea_orm::entity::prelude::DateTimeWithTimeZone,
     ) -> Result<bool> {
-        self.run_serialized_write(|| async {
-            let transaction = self
-                .connection
-                .begin()
+        self.cli_runtime_semantic_change(
+            async {
+                self.background_change(
+                    "storage.native_events",
+                    async {
+                        self.run_serialized_write(|| async {
+                            let transaction = self.connection.begin().await.context(
+                                "failed to begin CLI runtime attempt terminal transaction",
+                            )?;
+                            let changed = cli_runtime_binding::mark_turn_attempt_terminal(
+                                &transaction,
+                                id,
+                                status,
+                                failure_reason.clone(),
+                                completed_at,
+                            )
+                            .await?;
+                            transaction.commit().await.context(
+                                "failed to commit CLI runtime attempt terminal transaction",
+                            )?;
+                            Ok(changed)
+                        })
+                        .await
+                    },
+                    |changed| *changed,
+                )
                 .await
-                .context("failed to begin CLI runtime attempt terminal transaction")?;
-            let changed = cli_runtime_binding::mark_turn_attempt_terminal(
-                &transaction,
-                id,
-                status,
-                failure_reason.clone(),
-                completed_at,
-            )
-            .await?;
-            transaction
-                .commit()
-                .await
-                .context("failed to commit CLI runtime attempt terminal transaction")?;
-            Ok(changed)
-        })
+            },
+            |changed| *changed,
+        )
         .await
     }
 
@@ -6498,15 +6791,28 @@ impl CrudStore {
         recovery_attempt_id: &str,
         confirmed_at: sea_orm::entity::prelude::DateTimeWithTimeZone,
     ) -> Result<bool> {
-        self.run_serialized_write(|| async {
-            cli_runtime_binding::mark_turn_attempt_recovery_confirmed(
-                &self.connection,
-                id,
-                recovery_attempt_id,
-                confirmed_at,
-            )
-            .await
-        })
+        self.cli_runtime_semantic_change(
+            async {
+                self.background_change(
+                    "storage.native_events",
+                    async {
+                        self.run_serialized_write(|| async {
+                            cli_runtime_binding::mark_turn_attempt_recovery_confirmed(
+                                &self.connection,
+                                id,
+                                recovery_attempt_id,
+                                confirmed_at,
+                            )
+                            .await
+                        })
+                        .await
+                    },
+                    |changed| *changed,
+                )
+                .await
+            },
+            |changed| *changed,
+        )
         .await
     }
 
@@ -6516,8 +6822,28 @@ impl CrudStore {
         attempt_id: String,
         execution_window_index: u32,
     ) -> Result<(CliRuntimeTurnBindingRecord, CliRuntimeTurnAttemptRecord)> {
-        let root = frozen_lifetime::PreparedFrozenRoot::cli(&binding.input_mapping_json, false)?;
-        let result = self.run_serialized_write(|| async {
+        self.cli_runtime_semantic_change(
+            async {
+                self.background_changes(
+                    &[
+                        "storage.frozen",
+                        "storage.portable",
+                        "storage.html.retention",
+                        "storage.html.history",
+                    ],
+                    async {
+                        self.track_compaction_history(
+                            true,
+                            6,
+                            async {
+                                self.background_changes(
+                                    &["tasks.lifecycle", "compaction.lifecycle"],
+                                    async {
+                                        let root = frozen_lifetime::PreparedFrozenRoot::cli(
+                                            &binding.input_mapping_json,
+                                            false,
+                                        )?;
+                                        let result = self.run_serialized_write(|| async {
             let prepared_binding=binding.clone();
             let transaction = self
                 .connection
@@ -6633,7 +6959,23 @@ impl CrudStore {
             Ok((stored_binding, attempt))
         })
         .await?;
-        hydrate_cli_binding_pair(&self.connection, result).await
+                                        hydrate_cli_binding_pair(&self.connection, result).await
+                                    },
+                                    |_| true,
+                                )
+                                .await
+                            },
+                            |_| true,
+                        )
+                        .await
+                    },
+                    |_| true,
+                )
+                .await
+            },
+            |_| true,
+        )
+        .await
     }
 
     /// Transfer a completed native attempt to task orchestration without
@@ -6647,190 +6989,207 @@ impl CrudStore {
         continuation: NewCliRuntimeNativeEvent,
         ack: NewCliRuntimeNativeEvent,
     ) -> Result<(CliRuntimeTurnBindingRecord, CliRuntimeTurnAttemptRecord)> {
-        let source_terminal_id = source.terminal_delivery_id();
-        let expected_ack_id = format!("{source_terminal_id}:ack");
-        let expected_continuation_id = format!("{attempt_id}:task-continuation");
-        let result = self
-            .run_serialized_write(|| {
-                let source = source.clone();
-                let source_terminal_id = source_terminal_id.clone();
-                let expected_ack_id = expected_ack_id.clone();
-                let expected_continuation_id = expected_continuation_id.clone();
-                let owner_id = owner_id.clone();
-                let attempt_id = attempt_id.clone();
-                let continuation = continuation.clone();
-                let ack = ack.clone();
-                async move {
-                    let tx = self.connection.begin().await?;
-                    let now = continuation.created_at;
-                    let binding = cli_runtime_binding::find_turn_binding(&tx, &source.turn_id)
-                        .await?
-                        .context("task continuation binding disappeared")?;
-                    let latest = cli_runtime_binding::latest_turn_attempt(&tx, &source.turn_id)
-                        .await?
-                        .context("task continuation attempt disappeared")?;
-                    let owner = turn_execution::find(&tx, &source.turn_id)
-                        .await?
-                        .context("task continuation owner disappeared")?;
-                    anyhow::ensure!(
-                        owner.owner_id == owner_id
-                            && owner.executor_kind == TurnExecutorKind::CliRuntime
-                            && owner.executor_key.as_deref() == Some(source.runtime_id.as_str())
-                            && owner.status.is_active()
-                            && owner.lease_until > chrono::Utc::now().fixed_offset(),
-                        "task continuation execution authority unavailable"
-                    );
-                    let turn =
-                        turn::find_turn_by_thread_and_id(&tx, &binding.thread_id, &source.turn_id)
+        self.cli_runtime_semantic_change(
+            async {
+                let source_terminal_id = source.terminal_delivery_id();
+                let expected_ack_id = format!("{source_terminal_id}:ack");
+                let expected_continuation_id = format!("{attempt_id}:task-continuation");
+                let result = self
+                    .run_serialized_write(|| {
+                        let source = source.clone();
+                        let source_terminal_id = source_terminal_id.clone();
+                        let expected_ack_id = expected_ack_id.clone();
+                        let expected_continuation_id = expected_continuation_id.clone();
+                        let owner_id = owner_id.clone();
+                        let attempt_id = attempt_id.clone();
+                        let continuation = continuation.clone();
+                        let ack = ack.clone();
+                        async move {
+                            let tx = self.connection.begin().await?;
+                            let now = continuation.created_at;
+                            let binding =
+                                cli_runtime_binding::find_turn_binding(&tx, &source.turn_id)
+                                    .await?
+                                    .context("task continuation binding disappeared")?;
+                            let latest =
+                                cli_runtime_binding::latest_turn_attempt(&tx, &source.turn_id)
+                                    .await?
+                                    .context("task continuation attempt disappeared")?;
+                            let owner = turn_execution::find(&tx, &source.turn_id)
+                                .await?
+                                .context("task continuation owner disappeared")?;
+                            anyhow::ensure!(
+                                owner.owner_id == owner_id
+                                    && owner.executor_kind == TurnExecutorKind::CliRuntime
+                                    && owner.executor_key.as_deref()
+                                        == Some(source.runtime_id.as_str())
+                                    && owner.status.is_active()
+                                    && owner.lease_until > chrono::Utc::now().fixed_offset(),
+                                "task continuation execution authority unavailable"
+                            );
+                            let turn = turn::find_turn_by_thread_and_id(
+                                &tx,
+                                &binding.thread_id,
+                                &source.turn_id,
+                            )
                             .await?
                             .context("task continuation Turn disappeared")?;
-                    anyhow::ensure!(
-                        turn_status_from_db(&turn.status) == Some(TurnStatus::InProgress)
-                            && binding.workspace_id == source.workspace_id
-                            && binding.thread_id == source.thread_id
-                            && binding.continuation_thread_id == source.continuation_thread_id
-                            && binding.runtime_id == source.runtime_id
-                            && binding.runtime_kind == source.runtime_kind
-                            && binding.native_thread_id == source.native_thread_id,
-                        "task continuation execution is no longer current"
-                    );
-                    if latest.id == attempt_id {
-                        tx.commit().await?;
-                        return Ok((binding, latest));
-                    }
-                    let snapshot = cli_runtime_turn_terminal_snapshot(&tx, &source.turn_id).await?;
-                    let current = snapshot.as_ref().and_then(|snapshot| {
-                        cli_runtime_continuation_guard_from_snapshot(snapshot, true)
-                    });
-                    anyhow::ensure!(
-                        current
-                            .as_ref()
-                            .is_some_and(|current| current.same_execution(&source)),
-                        "CLI source changed before task continuation"
-                    );
-                    let snapshot = snapshot
-                        .as_ref()
-                        .context("task continuation snapshot disappeared")?;
-                    anyhow::ensure!(
-                        snapshot.turn_status == TurnStatus::InProgress,
-                        "task continuation Turn is no longer active"
-                    );
-                    anyhow::ensure!(
-                        latest.status == CliRuntimeTurnAttemptStatus::Completed
-                            || cli_runtime_terminal_outcome_pending(
+                            anyhow::ensure!(
+                                turn_status_from_db(&turn.status) == Some(TurnStatus::InProgress)
+                                    && binding.workspace_id == source.workspace_id
+                                    && binding.thread_id == source.thread_id
+                                    && binding.continuation_thread_id
+                                        == source.continuation_thread_id
+                                    && binding.runtime_id == source.runtime_id
+                                    && binding.runtime_kind == source.runtime_kind
+                                    && binding.native_thread_id == source.native_thread_id,
+                                "task continuation execution is no longer current"
+                            );
+                            if latest.id == attempt_id {
+                                tx.commit().await?;
+                                return Ok((binding, latest));
+                            }
+                            let snapshot =
+                                cli_runtime_turn_terminal_snapshot(&tx, &source.turn_id).await?;
+                            let current = snapshot.as_ref().and_then(|snapshot| {
+                                cli_runtime_continuation_guard_from_snapshot(snapshot, true)
+                            });
+                            anyhow::ensure!(
+                                current
+                                    .as_ref()
+                                    .is_some_and(|current| current.same_execution(&source)),
+                                "CLI source changed before task continuation"
+                            );
+                            let snapshot = snapshot
+                                .as_ref()
+                                .context("task continuation snapshot disappeared")?;
+                            anyhow::ensure!(
+                                snapshot.turn_status == TurnStatus::InProgress,
+                                "task continuation Turn is no longer active"
+                            );
+                            anyhow::ensure!(
+                                latest.status == CliRuntimeTurnAttemptStatus::Completed
+                                    || cli_runtime_terminal_outcome_pending(
+                                        &tx,
+                                        snapshot,
+                                        &source_terminal_id
+                                    )
+                                    .await?,
+                                "task continuation has no pending accepted terminal outcome"
+                            );
+                            anyhow::ensure!(
+                                latest.id == source.attempt_id,
+                                "task continuation source attempt changed"
+                            );
+                            anyhow::ensure!(
+                                ack.id == expected_ack_id
+                                    && ack.native_method == "gateway/terminal_ack"
+                                    && continuation.id == expected_continuation_id
+                                    && continuation.turn_id.as_deref()
+                                        == Some(source.turn_id.as_str()),
+                                "invalid task continuation identity"
+                            );
+                            // The saved terminal outcome remains durable, but this ACK
+                            // records that its effect is a continuation, never TurnCompleted.
+                            cli_runtime_binding::append_native_event_if_absent(&tx, continuation)
+                                .await?;
+                            if cli_runtime_binding::find_native_event(&tx, &source_terminal_id)
+                                .await?
+                                .is_some()
+                                && cli_runtime_binding::find_native_event(&tx, &expected_ack_id)
+                                    .await?
+                                    .is_none()
+                            {
+                                cli_runtime_binding::append_native_event_if_absent(&tx, ack)
+                                    .await?;
+                            }
+                            if latest.status.is_active() {
+                                anyhow::ensure!(
+                                    cli_runtime_binding::mark_turn_attempt_terminal(
+                                        &tx,
+                                        &latest.id,
+                                        CliRuntimeTurnAttemptStatus::Completed,
+                                        None,
+                                        now
+                                    )
+                                    .await?,
+                                    "source attempt changed"
+                                );
+                            } else {
+                                anyhow::ensure!(
+                                    latest.status == CliRuntimeTurnAttemptStatus::Completed,
+                                    "task continuation requires a completed attempt"
+                                );
+                            }
+                            let next_index = latest
+                                .attempt_index
+                                .checked_add(1)
+                                .context("task continuation attempt overflow")?;
+                            let attempt = cli_runtime_binding::create_turn_attempt(
                                 &tx,
-                                snapshot,
-                                &source_terminal_id
+                                NewCliRuntimeTurnAttempt {
+                                    id: attempt_id,
+                                    turn_id: source.turn_id.clone(),
+                                    attempt_index: next_index,
+                                    runtime_id: binding.runtime_id.clone(),
+                                    runtime_kind: binding.runtime_kind.clone(),
+                                    native_thread_id: binding.native_thread_id.clone(),
+                                    native_turn_id: None,
+                                    recovery_job_id: None,
+                                    recovery_attempt_id: None,
+                                    // Orchestration continues the current execution window;
+                                    // waiting for children is not budget exhaustion or failure.
+                                    execution_window_index: latest.execution_window_index,
+                                    status: CliRuntimeTurnAttemptStatus::Starting,
+                                    failure_reason: None,
+                                    started_at: None,
+                                    completed_at: None,
+                                    created_at: now,
+                                    updated_at: now,
+                                },
                             )
-                            .await?,
-                        "task continuation has no pending accepted terminal outcome"
-                    );
-                    anyhow::ensure!(
-                        latest.id == source.attempt_id,
-                        "task continuation source attempt changed"
-                    );
-                    anyhow::ensure!(
-                        ack.id == expected_ack_id
-                            && ack.native_method == "gateway/terminal_ack"
-                            && continuation.id == expected_continuation_id
-                            && continuation.turn_id.as_deref() == Some(source.turn_id.as_str()),
-                        "invalid task continuation identity"
-                    );
-                    // The saved terminal outcome remains durable, but this ACK
-                    // records that its effect is a continuation, never TurnCompleted.
-                    cli_runtime_binding::append_native_event_if_absent(&tx, continuation).await?;
-                    if cli_runtime_binding::find_native_event(&tx, &source_terminal_id)
-                        .await?
-                        .is_some()
-                        && cli_runtime_binding::find_native_event(&tx, &expected_ack_id)
-                            .await?
-                            .is_none()
-                    {
-                        cli_runtime_binding::append_native_event_if_absent(&tx, ack).await?;
-                    }
-                    if latest.status.is_active() {
-                        anyhow::ensure!(
-                            cli_runtime_binding::mark_turn_attempt_terminal(
+                            .await?;
+                            cli_runtime_binding::update_turn_control(
                                 &tx,
-                                &latest.id,
-                                CliRuntimeTurnAttemptStatus::Completed,
-                                None,
-                                now
+                                NewCliRuntimeTurnBinding {
+                                    turn_id: binding.turn_id.clone(),
+                                    thread_id: binding.thread_id,
+                                    continuation_thread_id: binding.continuation_thread_id,
+                                    workspace_id: binding.workspace_id,
+                                    runtime_id: binding.runtime_id,
+                                    runtime_kind: binding.runtime_kind,
+                                    native_thread_id: binding.native_thread_id,
+                                    native_turn_id: None,
+                                    request_id: binding.request_id,
+                                    status: "starting".to_owned(),
+                                    model: binding.model,
+                                    cwd: binding.cwd,
+                                    sandbox_json: binding.sandbox_json,
+                                    approval_policy: binding.approval_policy,
+                                    input_mapping_json: binding.input_mapping_json,
+                                    created_at: binding.created_at,
+                                    updated_at: now,
+                                },
                             )
-                            .await?,
-                            "source attempt changed"
-                        );
-                    } else {
-                        anyhow::ensure!(
-                            latest.status == CliRuntimeTurnAttemptStatus::Completed,
-                            "task continuation requires a completed attempt"
-                        );
-                    }
-                    let next_index = latest
-                        .attempt_index
-                        .checked_add(1)
-                        .context("task continuation attempt overflow")?;
-                    let attempt = cli_runtime_binding::create_turn_attempt(
-                        &tx,
-                        NewCliRuntimeTurnAttempt {
-                            id: attempt_id,
-                            turn_id: source.turn_id.clone(),
-                            attempt_index: next_index,
-                            runtime_id: binding.runtime_id.clone(),
-                            runtime_kind: binding.runtime_kind.clone(),
-                            native_thread_id: binding.native_thread_id.clone(),
-                            native_turn_id: None,
-                            recovery_job_id: None,
-                            recovery_attempt_id: None,
-                            // Orchestration continues the current execution window;
-                            // waiting for children is not budget exhaustion or failure.
-                            execution_window_index: latest.execution_window_index,
-                            status: CliRuntimeTurnAttemptStatus::Starting,
-                            failure_reason: None,
-                            started_at: None,
-                            completed_at: None,
-                            created_at: now,
-                            updated_at: now,
-                        },
-                    )
+                            .await?;
+                            let binding = cli_runtime_binding::clear_turn_native_goal_state(
+                                &tx,
+                                &source.turn_id,
+                                now,
+                            )
+                            .await?;
+                            self.project_cli_runtime_turn_binding_state(&tx, &source.turn_id, now)
+                                .await?;
+                            tx.commit().await?;
+                            Ok((binding, attempt))
+                        }
+                    })
                     .await?;
-                    cli_runtime_binding::update_turn_control(
-                        &tx,
-                        NewCliRuntimeTurnBinding {
-                            turn_id: binding.turn_id.clone(),
-                            thread_id: binding.thread_id,
-                            continuation_thread_id: binding.continuation_thread_id,
-                            workspace_id: binding.workspace_id,
-                            runtime_id: binding.runtime_id,
-                            runtime_kind: binding.runtime_kind,
-                            native_thread_id: binding.native_thread_id,
-                            native_turn_id: None,
-                            request_id: binding.request_id,
-                            status: "starting".to_owned(),
-                            model: binding.model,
-                            cwd: binding.cwd,
-                            sandbox_json: binding.sandbox_json,
-                            approval_policy: binding.approval_policy,
-                            input_mapping_json: binding.input_mapping_json,
-                            created_at: binding.created_at,
-                            updated_at: now,
-                        },
-                    )
-                    .await?;
-                    let binding = cli_runtime_binding::clear_turn_native_goal_state(
-                        &tx,
-                        &source.turn_id,
-                        now,
-                    )
-                    .await?;
-                    self.project_cli_runtime_turn_binding_state(&tx, &source.turn_id, now)
-                        .await?;
-                    tx.commit().await?;
-                    Ok((binding, attempt))
-                }
-            })
-            .await?;
-        hydrate_cli_binding_pair(&self.connection, result).await
+                hydrate_cli_binding_pair(&self.connection, result).await
+            },
+            |_| true,
+        )
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -6845,6 +7204,8 @@ impl CrudStore {
         prepared_at: sea_orm::entity::prelude::DateTimeWithTimeZone,
         terminal_source: Option<(pioneer_protocol::CliRuntimeBlockedTurnGuard, String, String)>,
     ) -> Result<(CliRuntimeTurnBindingRecord, CliRuntimeTurnAttemptRecord)> {
+        self.cli_runtime_semantic_change(async {
+        self.background_changes(&["storage.frozen", "storage.portable", "storage.html.retention", "storage.html.history"], async {
         if execution_window_index == 0 {
             bail!("CLI runtime recovery execution window index must be positive");
         }
@@ -7046,6 +7407,8 @@ impl CrudStore {
         })
         .await?;
         hydrate_cli_binding_pair(&self.connection, result).await
+        }, |_| true).await
+        }, |_| true).await
     }
 
     pub async fn activate_cli_runtime_turn_attempt(
@@ -7100,6 +7463,7 @@ impl CrudStore {
         execution_owner_id: Option<&str>,
         execution_lease_until: Option<sea_orm::entity::prelude::DateTimeWithTimeZone>,
     ) -> Result<(CliRuntimeTurnBindingRecord, CliRuntimeTurnAttemptRecord)> {
+        self.cli_runtime_semantic_change(async {
         let turn_id = turn_id.to_owned();
         let attempt_id = attempt_id.to_owned();
         let native_turn_id = native_turn_id.to_owned();
@@ -7269,6 +7633,7 @@ impl CrudStore {
         })
         .await?;
         hydrate_cli_binding_pair(&self.connection, result).await
+        }, |_| true).await
     }
 
     pub async fn cli_runtime_turn_terminal_guard(
@@ -7430,96 +7795,112 @@ impl CrudStore {
         expected: &pioneer_protocol::CliRuntimeBlockedTurnGuard,
         owner_id: &str,
     ) -> Result<bool> {
-        anyhow::ensure!(
-            event.runtime_id == expected.runtime_id
-                && event.runtime_kind == expected.runtime_kind
-                && event.turn_id.as_deref() == Some(expected.turn_id.as_str())
-                && event.thread_id.as_deref() == Some(expected.thread_id.as_str())
-                && event.workspace_id.as_deref() == Some(expected.workspace_id.as_str())
-                && event.native_thread_id.as_deref() == Some(expected.native_thread_id.as_str())
-                && event.native_turn_id.as_deref()
-                    == expected
-                        .segment
-                        .as_ref()
-                        .map(|(_, native, _)| native.as_str())
-                        .or(expected.attempt_native_turn_id.as_deref())
-                && event.native_method == "gateway/terminal_delivery",
-            "native terminal delivery does not match its selected source"
-        );
-        self.run_serialized_write(|| async {
-            let transaction = self.connection.begin().await?;
-            if let Some(owner) = turn_execution::find(&transaction, &expected.turn_id).await?
-                && (owner.owner_id != owner_id
-                    || !owner.status.is_active()
-                    || owner.lease_until <= chrono::Utc::now().fixed_offset())
-            {
-                transaction.rollback().await?;
-                return Ok(false);
-            }
-            let Some(binding) =
-                cli_runtime_binding::find_turn_binding(&transaction, &expected.turn_id).await?
-            else {
-                transaction.rollback().await?;
-                return Ok(false);
-            };
-            let turn = turn::find_turn_by_thread_and_id(
-                &transaction,
-                &expected.thread_id,
-                &expected.turn_id,
-            )
-            .await?;
-            let attempt =
-                cli_runtime_binding::latest_turn_attempt(&transaction, &expected.turn_id).await?;
-            let segment = if let Some(attempt) = attempt.as_ref() {
-                cli_runtime_binding::latest_execution_segment_for_attempt(&transaction, &attempt.id)
-                    .await?
-            } else {
-                None
-            };
-            let execution_owner = turn_execution::find(&transaction, &expected.turn_id)
-                .await?
-                .map(|owner| (owner.owner_id, owner.owner_generation));
-            let actual = if let Some(turn) = turn {
-                Some(CliRuntimeTurnTerminalGuard {
-                    binding,
-                    attempt,
-                    segment,
-                    execution_owner,
-                    turn_status: turn_status_from_db(&turn.status)
-                        .context("unknown canonical Turn status")?,
-                })
-            } else {
-                None
-            };
-            let actual = actual
-                .as_ref()
-                .and_then(cli_runtime_event_guard_from_snapshot);
-            if !actual
-                .as_ref()
-                .is_some_and(|actual| actual.same_execution(expected))
-            {
-                transaction.rollback().await?;
-                return Ok(false);
-            }
-            if !cli_runtime_recovery_authority_is_current(
-                &transaction,
-                actual.as_ref().expect("source checked"),
-            )
-            .await?
-            {
-                transaction.rollback().await?;
-                return Ok(false);
-            }
-            if cli_runtime_binding::find_native_event(&transaction, &event.id)
-                .await?
-                .is_none()
-            {
-                cli_runtime_binding::append_native_event_if_absent(&transaction, event.clone())
+        self.cli_runtime_semantic_change(
+            async {
+                anyhow::ensure!(
+                    event.runtime_id == expected.runtime_id
+                        && event.runtime_kind == expected.runtime_kind
+                        && event.turn_id.as_deref() == Some(expected.turn_id.as_str())
+                        && event.thread_id.as_deref() == Some(expected.thread_id.as_str())
+                        && event.workspace_id.as_deref() == Some(expected.workspace_id.as_str())
+                        && event.native_thread_id.as_deref()
+                            == Some(expected.native_thread_id.as_str())
+                        && event.native_turn_id.as_deref()
+                            == expected
+                                .segment
+                                .as_ref()
+                                .map(|(_, native, _)| native.as_str())
+                                .or(expected.attempt_native_turn_id.as_deref())
+                        && event.native_method == "gateway/terminal_delivery",
+                    "native terminal delivery does not match its selected source"
+                );
+                self.run_serialized_write(|| async {
+                    let transaction = self.connection.begin().await?;
+                    if let Some(owner) =
+                        turn_execution::find(&transaction, &expected.turn_id).await?
+                        && (owner.owner_id != owner_id
+                            || !owner.status.is_active()
+                            || owner.lease_until <= chrono::Utc::now().fixed_offset())
+                    {
+                        transaction.rollback().await?;
+                        return Ok(false);
+                    }
+                    let Some(binding) =
+                        cli_runtime_binding::find_turn_binding(&transaction, &expected.turn_id)
+                            .await?
+                    else {
+                        transaction.rollback().await?;
+                        return Ok(false);
+                    };
+                    let turn = turn::find_turn_by_thread_and_id(
+                        &transaction,
+                        &expected.thread_id,
+                        &expected.turn_id,
+                    )
                     .await?;
-            }
-            transaction.commit().await?;
-            Ok(true)
-        })
+                    let attempt =
+                        cli_runtime_binding::latest_turn_attempt(&transaction, &expected.turn_id)
+                            .await?;
+                    let segment = if let Some(attempt) = attempt.as_ref() {
+                        cli_runtime_binding::latest_execution_segment_for_attempt(
+                            &transaction,
+                            &attempt.id,
+                        )
+                        .await?
+                    } else {
+                        None
+                    };
+                    let execution_owner = turn_execution::find(&transaction, &expected.turn_id)
+                        .await?
+                        .map(|owner| (owner.owner_id, owner.owner_generation));
+                    let actual = if let Some(turn) = turn {
+                        Some(CliRuntimeTurnTerminalGuard {
+                            binding,
+                            attempt,
+                            segment,
+                            execution_owner,
+                            turn_status: turn_status_from_db(&turn.status)
+                                .context("unknown canonical Turn status")?,
+                        })
+                    } else {
+                        None
+                    };
+                    let actual = actual
+                        .as_ref()
+                        .and_then(cli_runtime_event_guard_from_snapshot);
+                    if !actual
+                        .as_ref()
+                        .is_some_and(|actual| actual.same_execution(expected))
+                    {
+                        transaction.rollback().await?;
+                        return Ok(false);
+                    }
+                    if !cli_runtime_recovery_authority_is_current(
+                        &transaction,
+                        actual.as_ref().expect("source checked"),
+                    )
+                    .await?
+                    {
+                        transaction.rollback().await?;
+                        return Ok(false);
+                    }
+                    if cli_runtime_binding::find_native_event(&transaction, &event.id)
+                        .await?
+                        .is_none()
+                    {
+                        cli_runtime_binding::append_native_event_if_absent(
+                            &transaction,
+                            event.clone(),
+                        )
+                        .await?;
+                    }
+                    transaction.commit().await?;
+                    Ok(true)
+                })
+                .await
+            },
+            |changed| *changed,
+        )
         .await
     }
 
@@ -7553,173 +7934,244 @@ impl CrudStore {
         execution_owner_id: &str,
         event_timestamp_secs: i64,
     ) -> Result<bool> {
-        let _release_wake = execution_heartbeat::ReleaseWake(self.execution_heartbeats.clone());
-        anyhow::ensure!(
-            notification.turn.id == expected.turn_id
-                && notification.thread_id == expected.thread_id
-                && notification.workspace_id == expected.workspace_id
-                && notification.turn.status == TurnStatus::Blocked,
-            "Blocked event does not match its native source"
-        );
-        let outcome_id = expected.terminal_delivery_id();
-        let accepted_outcome = expected.terminal_delivery_id.is_some();
-        if let Some(id) = expected.terminal_delivery_id.as_deref() {
-            anyhow::ensure!(id == outcome_id, "Blocked source outcome identity changed");
-        }
-        let mut expected_execution = expected.clone();
-        expected_execution.terminal_delivery_id = None;
-        let event = TurnEventPayload::TurnBlocked(notification);
-        let mut envelope =
-            prepare_turn_event_envelope_for_permanent_storage(&self.connection, event).await?;
-        envelope.projection_context_json = serialize_turn_event_projection_context(
-            &TurnEventProjectionContext {
-                enqueue_optional_deliveries: true,
-                ..Default::default()
+        self.cli_runtime_semantic_change(
+            async {
+                self.track_compaction_history(
+                    true,
+                    4,
+                    async {
+                        self.background_changes(
+                            &[
+                                "recovery.effects",
+                                "recovery.effects.retry",
+                                "recovery.effects.retention",
+                                "tasks.lifecycle",
+                                "turn.projection",
+                                "recovery.control",
+                                "recovery.timeouts",
+                                "cli.commands",
+                                "storage.zstd",
+                                "turn.finalization",
+                                "turn.delivery.live",
+                                "turn.delivery.episodic",
+                                "storage.receipts",
+                                "storage.native_events",
+                                "compaction.lifecycle",
+                            ],
+                            async {
+                                let _release_wake = execution_heartbeat::ReleaseWake(
+                                    self.execution_heartbeats.clone(),
+                                );
+                                anyhow::ensure!(
+                                    notification.turn.id == expected.turn_id
+                                        && notification.thread_id == expected.thread_id
+                                        && notification.workspace_id == expected.workspace_id
+                                        && notification.turn.status == TurnStatus::Blocked,
+                                    "Blocked event does not match its native source"
+                                );
+                                let outcome_id = expected.terminal_delivery_id();
+                                let accepted_outcome = expected.terminal_delivery_id.is_some();
+                                if let Some(id) = expected.terminal_delivery_id.as_deref() {
+                                    anyhow::ensure!(
+                                        id == outcome_id,
+                                        "Blocked source outcome identity changed"
+                                    );
+                                }
+                                let mut expected_execution = expected.clone();
+                                expected_execution.terminal_delivery_id = None;
+                                let event = TurnEventPayload::TurnBlocked(notification);
+                                let mut envelope =
+                                    prepare_turn_event_envelope_for_permanent_storage(
+                                        &self.connection,
+                                        event,
+                                    )
+                                    .await?;
+                                envelope.projection_context_json =
+                                    serialize_turn_event_projection_context(
+                                        &TurnEventProjectionContext {
+                                            enqueue_optional_deliveries: true,
+                                            ..Default::default()
+                                        },
+                                        envelope.event.id(),
+                                    )?;
+                                let created_at = unix_to_datetime(event_timestamp_secs);
+                                let expires_at = unix_to_datetime(
+                                    event_timestamp_secs
+                                        .saturating_add(TURN_EVENT_PROJECTION_LEASE_SECS),
+                                );
+                                // These existing preparation APIs parse JSON and build terminal-effect
+                                // plans without an open transaction. Their apply methods fence mutable
+                                // item/effect sources; the canonical source row is also checked below.
+                                let prepared_turn_source = turn::find_turn_by_thread_and_id(
+                                    &self.connection,
+                                    &expected.thread_id,
+                                    &expected.turn_id,
+                                )
+                                .await?;
+                                let prepared = prepare_projected_turn_event_from_envelope(
+                                    &self.connection,
+                                    envelope.clone(),
+                                    created_at,
+                                )
+                                .await?;
+                                self.run_serialized_write(|| async {
+                                    let prepared = prepared.clone();
+                                    let transaction = self.connection.begin().await?;
+                                    let Some(binding) = cli_runtime_binding::find_turn_binding(
+                                        &transaction,
+                                        &expected.turn_id,
+                                    )
+                                    .await?
+                                    else {
+                                        transaction.rollback().await?;
+                                        return Ok(false);
+                                    };
+                                    let turn = turn::find_turn_by_thread_and_id(
+                                        &transaction,
+                                        &expected.thread_id,
+                                        &expected.turn_id,
+                                    )
+                                    .await?;
+                                    let attempt = cli_runtime_binding::latest_turn_attempt(
+                                        &transaction,
+                                        &expected.turn_id,
+                                    )
+                                    .await?;
+                                    let segment = if let Some(attempt) = attempt.as_ref() {
+                                        cli_runtime_binding::latest_execution_segment_for_attempt(
+                                            &transaction,
+                                            &attempt.id,
+                                        )
+                                        .await?
+                                    } else {
+                                        None
+                                    };
+                                    let execution_owner =
+                                        turn_execution::find(&transaction, &expected.turn_id)
+                                            .await?
+                                            .map(|owner| (owner.owner_id, owner.owner_generation));
+                                    if turn != prepared_turn_source {
+                                        transaction.rollback().await?;
+                                        return Ok(false);
+                                    }
+                                    let actual_snapshot = turn
+                                        .and_then(|turn| turn_status_from_db(&turn.status))
+                                        .map(|turn_status| CliRuntimeTurnTerminalGuard {
+                                            binding,
+                                            attempt,
+                                            segment,
+                                            execution_owner,
+                                            turn_status,
+                                        });
+                                    let actual = actual_snapshot.as_ref().and_then(|snapshot| {
+                                        if accepted_outcome {
+                                            cli_runtime_event_guard_from_snapshot(snapshot)
+                                        } else {
+                                            cli_runtime_blocked_guard_from_snapshot(snapshot)
+                                        }
+                                    });
+                                    let recovery_is_current = if expected.recovery_confirmed {
+                                        // Existing durable confirmation ends recovery authority. The
+                                        // attempt identity and confirmation are still checked above.
+                                        true
+                                    } else if let (Some(job_id), Some(attempt_id)) =
+                                        (&expected.recovery_job_id, &expected.recovery_attempt_id)
+                                    {
+                                        let job =
+                                            recovery_job::find_job_by_id(&transaction, job_id)
+                                                .await?;
+                                        job.is_some_and(|job| {
+                                            job.turn_id == expected.turn_id
+                                                && job.status == "active"
+                                                && job.active_attempt_id.as_ref()
+                                                    == Some(attempt_id)
+                                        })
+                                    } else {
+                                        expected.recovery_job_id.is_none()
+                                            && expected.recovery_attempt_id.is_none()
+                                    };
+                                    if actual.as_ref() != Some(&expected_execution)
+                                        || !recovery_is_current
+                                    {
+                                        transaction.rollback().await?;
+                                        return Ok(false);
+                                    }
+                                    let outcome_pending = cli_runtime_terminal_outcome_pending(
+                                        &transaction,
+                                        actual_snapshot.as_ref().expect("source checked"),
+                                        &outcome_id,
+                                    )
+                                    .await?;
+                                    // Observational Blocked cannot consume a saved outcome. An explicit
+                                    // accepted-outcome delivery must still own that exact pending row;
+                                    // ACK and Blocked commit together, preserving restart/replay fencing.
+                                    if outcome_pending != accepted_outcome {
+                                        transaction.rollback().await?;
+                                        return Ok(false);
+                                    }
+                                    validate_turn_event_execution_owner(
+                                        &transaction,
+                                        envelope.event.payload(),
+                                        Some(execution_owner_id),
+                                    )
+                                    .await?;
+                                    if !cli_runtime_binding::mark_turn_attempt_terminal(
+                                        &transaction,
+                                        &expected.attempt_id,
+                                        CliRuntimeTurnAttemptStatus::Interrupted,
+                                        match prepared.event.payload() {
+                                            TurnEventPayload::TurnBlocked(notification) => {
+                                                notification.turn.error.clone()
+                                            }
+                                            _ => unreachable!(),
+                                        },
+                                        created_at,
+                                    )
+                                    .await?
+                                    {
+                                        transaction.rollback().await?;
+                                        return Ok(false);
+                                    }
+                                    if accepted_outcome {
+                                        ack_cli_runtime_outcome(
+                                            &transaction,
+                                            Some(expected),
+                                            "gateway/terminal_ack",
+                                        )
+                                        .await?;
+                                    }
+                                    self.append_and_project_turn_event_in_transaction(
+                                        &transaction,
+                                        prepared,
+                                        created_at,
+                                        expires_at,
+                                        true,
+                                    )
+                                    .await?;
+                                    // Binding remains discoverable until the shared terminal cleanup.
+                                    // If its consumer is cancelled after commit, canonical status plus
+                                    // this same terminal attempt lets the next active round repair it.
+                                    self.project_cli_runtime_turn_binding_state(
+                                        &transaction,
+                                        &expected.turn_id,
+                                        created_at,
+                                    )
+                                    .await?;
+                                    transaction.commit().await?;
+                                    Ok(true)
+                                })
+                                .await
+                            },
+                            |changed| *changed,
+                        )
+                        .await
+                    },
+                    |changed| *changed,
+                )
+                .await
             },
-            envelope.event.id(),
-        )?;
-        let created_at = unix_to_datetime(event_timestamp_secs);
-        let expires_at =
-            unix_to_datetime(event_timestamp_secs.saturating_add(TURN_EVENT_PROJECTION_LEASE_SECS));
-        // These existing preparation APIs parse JSON and build terminal-effect
-        // plans without an open transaction. Their apply methods fence mutable
-        // item/effect sources; the canonical source row is also checked below.
-        let prepared_turn_source = turn::find_turn_by_thread_and_id(
-            &self.connection,
-            &expected.thread_id,
-            &expected.turn_id,
+            |changed| *changed,
         )
-        .await?;
-        let prepared = prepare_projected_turn_event_from_envelope(
-            &self.connection,
-            envelope.clone(),
-            created_at,
-        )
-        .await?;
-        self.run_serialized_write(|| async {
-            let prepared = prepared.clone();
-            let transaction = self.connection.begin().await?;
-            let Some(binding) =
-                cli_runtime_binding::find_turn_binding(&transaction, &expected.turn_id).await?
-            else {
-                transaction.rollback().await?;
-                return Ok(false);
-            };
-            let turn = turn::find_turn_by_thread_and_id(
-                &transaction,
-                &expected.thread_id,
-                &expected.turn_id,
-            )
-            .await?;
-            let attempt =
-                cli_runtime_binding::latest_turn_attempt(&transaction, &expected.turn_id).await?;
-            let segment = if let Some(attempt) = attempt.as_ref() {
-                cli_runtime_binding::latest_execution_segment_for_attempt(&transaction, &attempt.id)
-                    .await?
-            } else {
-                None
-            };
-            let execution_owner = turn_execution::find(&transaction, &expected.turn_id)
-                .await?
-                .map(|owner| (owner.owner_id, owner.owner_generation));
-            if turn != prepared_turn_source {
-                transaction.rollback().await?;
-                return Ok(false);
-            }
-            let actual_snapshot =
-                turn.and_then(|turn| turn_status_from_db(&turn.status))
-                    .map(|turn_status| CliRuntimeTurnTerminalGuard {
-                        binding,
-                        attempt,
-                        segment,
-                        execution_owner,
-                        turn_status,
-                    });
-            let actual = actual_snapshot.as_ref().and_then(|snapshot| {
-                if accepted_outcome {
-                    cli_runtime_event_guard_from_snapshot(snapshot)
-                } else {
-                    cli_runtime_blocked_guard_from_snapshot(snapshot)
-                }
-            });
-            let recovery_is_current = if expected.recovery_confirmed {
-                // Existing durable confirmation ends recovery authority. The
-                // attempt identity and confirmation are still checked above.
-                true
-            } else if let (Some(job_id), Some(attempt_id)) =
-                (&expected.recovery_job_id, &expected.recovery_attempt_id)
-            {
-                let job = recovery_job::find_job_by_id(&transaction, job_id).await?;
-                job.is_some_and(|job| {
-                    job.turn_id == expected.turn_id
-                        && job.status == "active"
-                        && job.active_attempt_id.as_ref() == Some(attempt_id)
-                })
-            } else {
-                expected.recovery_job_id.is_none() && expected.recovery_attempt_id.is_none()
-            };
-            if actual.as_ref() != Some(&expected_execution) || !recovery_is_current {
-                transaction.rollback().await?;
-                return Ok(false);
-            }
-            let outcome_pending = cli_runtime_terminal_outcome_pending(
-                &transaction,
-                actual_snapshot.as_ref().expect("source checked"),
-                &outcome_id,
-            )
-            .await?;
-            // Observational Blocked cannot consume a saved outcome. An explicit
-            // accepted-outcome delivery must still own that exact pending row;
-            // ACK and Blocked commit together, preserving restart/replay fencing.
-            if outcome_pending != accepted_outcome {
-                transaction.rollback().await?;
-                return Ok(false);
-            }
-            validate_turn_event_execution_owner(
-                &transaction,
-                envelope.event.payload(),
-                Some(execution_owner_id),
-            )
-            .await?;
-            if !cli_runtime_binding::mark_turn_attempt_terminal(
-                &transaction,
-                &expected.attempt_id,
-                CliRuntimeTurnAttemptStatus::Interrupted,
-                match prepared.event.payload() {
-                    TurnEventPayload::TurnBlocked(notification) => notification.turn.error.clone(),
-                    _ => unreachable!(),
-                },
-                created_at,
-            )
-            .await?
-            {
-                transaction.rollback().await?;
-                return Ok(false);
-            }
-            if accepted_outcome {
-                ack_cli_runtime_outcome(&transaction, Some(expected), "gateway/terminal_ack")
-                    .await?;
-            }
-            self.append_and_project_turn_event_in_transaction(
-                &transaction,
-                prepared,
-                created_at,
-                expires_at,
-                true,
-            )
-            .await?;
-            // Binding remains discoverable until the shared terminal cleanup.
-            // If its consumer is cancelled after commit, canonical status plus
-            // this same terminal attempt lets the next active round repair it.
-            self.project_cli_runtime_turn_binding_state(
-                &transaction,
-                &expected.turn_id,
-                created_at,
-            )
-            .await?;
-            transaction.commit().await?;
-            Ok(true)
-        })
         .await
     }
 
@@ -7752,33 +8204,38 @@ impl CrudStore {
         completed_at: sea_orm::entity::prelude::DateTimeWithTimeZone,
         expected: Option<&CliRuntimeTurnTerminalGuard>,
     ) -> Result<Option<CliRuntimeTurnBindingRecord>> {
-        if attempt_status.is_active() {
-            bail!(
-                "CLI runtime terminal binding cannot use active attempt status `{}`",
-                attempt_status.as_str()
-            );
-        }
-        if let Some(expected) = expected
-            && binding_status != turn_status_to_db(expected.turn_status)
-        {
-            bail!("terminal binding projection does not match its canonical Turn decision");
-        }
-        // Preserve the original mapping comparison outside writer capacity.
-        // A logical update after preflight increments the revision checked in
-        // the transaction; physical compression leaves that revision intact.
-        if let Some(expected) = expected {
-            let Some(current) = self.get_cli_runtime_turn_binding(turn_id).await? else {
-                return Ok(None);
-            };
-            if !cli_runtime_binding::same_binding_version(&current, &expected.binding)
-                || current.input_mapping_json != expected.binding.input_mapping_json
-            {
-                return Ok(None);
-            }
-        }
-        let turn_id = turn_id.to_owned();
-        let binding_status = binding_status.to_owned();
-        let result = self
+        self.cli_runtime_semantic_change(
+            async {
+                self.background_change(
+            "storage.native_events",
+            async {
+                if attempt_status.is_active() {
+                    bail!(
+                        "CLI runtime terminal binding cannot use active attempt status `{}`",
+                        attempt_status.as_str()
+                    );
+                }
+                if let Some(expected) = expected
+                    && binding_status != turn_status_to_db(expected.turn_status)
+                {
+                    bail!("terminal binding projection does not match its canonical Turn decision");
+                }
+                // Preserve the original mapping comparison outside writer capacity.
+                // A logical update after preflight increments the revision checked in
+                // the transaction; physical compression leaves that revision intact.
+                if let Some(expected) = expected {
+                    let Some(current) = self.get_cli_runtime_turn_binding(turn_id).await? else {
+                        return Ok(None);
+                    };
+                    if !cli_runtime_binding::same_binding_version(&current, &expected.binding)
+                        || current.input_mapping_json != expected.binding.input_mapping_json
+                    {
+                        return Ok(None);
+                    }
+                }
+                let turn_id = turn_id.to_owned();
+                let binding_status = binding_status.to_owned();
+                let result = self
             .run_serialized_write(|| async {
                 let transaction = self
                     .connection
@@ -7880,37 +8337,50 @@ impl CrudStore {
                 Ok(Some(stored_binding))
             })
             .await?;
-        hydrate_cli_binding_optional(&self.connection, result).await
+                hydrate_cli_binding_optional(&self.connection, result).await
+            },
+            |changed| changed.is_some(),
+        )
+        .await
+            },
+            |row| row.is_some(),
+        )
+        .await
     }
 
     pub async fn create_cli_runtime_pending_request(
         &self,
         request: NewCliRuntimePendingRequest,
     ) -> Result<CliRuntimePendingRequestRecord> {
-        self.run_serialized_write(|| async {
-            let transaction = self
-                .connection
-                .begin()
+        self.background_changes(
+            &["recovery.timeouts", "cli.commands", "cli.supervision"],
+            async {
+                self.run_serialized_write(|| async {
+                    let transaction = self.connection.begin().await.context(
+                        "failed to begin CLI runtime pending request create transaction",
+                    )?;
+                    let record =
+                        cli_runtime_binding::create_pending_request(&transaction, request.clone())
+                            .await?;
+                    if let Err(error) = self
+                        .project_cli_runtime_pending_request(&transaction, &record)
+                        .await
+                    {
+                        return Err(repositories::portable_payload::rollback_with_hold_refusal(
+                            transaction,
+                            error,
+                        )
+                        .await);
+                    }
+                    transaction.commit().await.context(
+                        "failed to commit CLI runtime pending request create transaction",
+                    )?;
+                    Ok(record)
+                })
                 .await
-                .context("failed to begin CLI runtime pending request create transaction")?;
-            let record =
-                cli_runtime_binding::create_pending_request(&transaction, request.clone()).await?;
-            if let Err(error) = self
-                .project_cli_runtime_pending_request(&transaction, &record)
-                .await
-            {
-                return Err(repositories::portable_payload::rollback_with_hold_refusal(
-                    transaction,
-                    error,
-                )
-                .await);
-            }
-            transaction
-                .commit()
-                .await
-                .context("failed to commit CLI runtime pending request create transaction")?;
-            Ok(record)
-        })
+            },
+            |_| true,
+        )
         .await
     }
 
@@ -7918,30 +8388,37 @@ impl CrudStore {
         &self,
         request: NewCliRuntimePendingRequest,
     ) -> Result<CliRuntimePendingRequestRecord> {
-        self.run_serialized_write(|| async {
-            let transaction = self
-                .connection
-                .begin()
+        self.background_changes(
+            &["recovery.timeouts", "cli.commands", "cli.supervision"],
+            async {
+                self.run_serialized_write(|| async {
+                    let transaction =
+                        self.connection.begin().await.context(
+                            "failed to begin CLI runtime pending request open transaction",
+                        )?;
+                    let record =
+                        cli_runtime_binding::open_pending_request(&transaction, request.clone())
+                            .await?;
+                    if let Err(error) = self
+                        .project_cli_runtime_pending_request(&transaction, &record)
+                        .await
+                    {
+                        return Err(repositories::portable_payload::rollback_with_hold_refusal(
+                            transaction,
+                            error,
+                        )
+                        .await);
+                    }
+                    transaction
+                        .commit()
+                        .await
+                        .context("failed to commit CLI runtime pending request open transaction")?;
+                    Ok(record)
+                })
                 .await
-                .context("failed to begin CLI runtime pending request open transaction")?;
-            let record =
-                cli_runtime_binding::open_pending_request(&transaction, request.clone()).await?;
-            if let Err(error) = self
-                .project_cli_runtime_pending_request(&transaction, &record)
-                .await
-            {
-                return Err(repositories::portable_payload::rollback_with_hold_refusal(
-                    transaction,
-                    error,
-                )
-                .await);
-            }
-            transaction
-                .commit()
-                .await
-                .context("failed to commit CLI runtime pending request open transaction")?;
-            Ok(record)
-        })
+            },
+            |_| true,
+        )
         .await
     }
 
@@ -7951,45 +8428,52 @@ impl CrudStore {
         authorization: CliRuntimeRequestAuthorizationBinding,
         max_pending_requests: usize,
     ) -> Result<CliRuntimePendingRequestRecord> {
-        self.run_serialized_write(|| async {
-            let transaction = self
-                .connection
-                .begin()
+        self.background_changes(
+            &["recovery.timeouts", "cli.commands", "cli.supervision"],
+            async {
+                self.run_serialized_write(|| async {
+                    let transaction =
+                        self.connection.begin().await.context(
+                            "failed to begin authorized CLI runtime request transaction",
+                        )?;
+                    if let Some(turn_id) = request.turn_id.as_deref() {
+                        cli_runtime_binding::ensure_pending_request_capacity(
+                            &transaction,
+                            request.request_id.as_str(),
+                            turn_id,
+                            max_pending_requests,
+                        )
+                        .await?;
+                    }
+                    let opened =
+                        cli_runtime_binding::open_pending_request(&transaction, request.clone())
+                            .await?;
+                    let record = cli_runtime_binding::bind_pending_request_authorization(
+                        &transaction,
+                        opened.request_id.as_str(),
+                        &authorization,
+                    )
+                    .await?;
+                    if let Err(error) = self
+                        .project_cli_runtime_pending_request(&transaction, &record)
+                        .await
+                    {
+                        return Err(repositories::portable_payload::rollback_with_hold_refusal(
+                            transaction,
+                            error,
+                        )
+                        .await);
+                    }
+                    transaction
+                        .commit()
+                        .await
+                        .context("failed to commit authorized CLI runtime request transaction")?;
+                    Ok(record)
+                })
                 .await
-                .context("failed to begin authorized CLI runtime request transaction")?;
-            if let Some(turn_id) = request.turn_id.as_deref() {
-                cli_runtime_binding::ensure_pending_request_capacity(
-                    &transaction,
-                    request.request_id.as_str(),
-                    turn_id,
-                    max_pending_requests,
-                )
-                .await?;
-            }
-            let opened =
-                cli_runtime_binding::open_pending_request(&transaction, request.clone()).await?;
-            let record = cli_runtime_binding::bind_pending_request_authorization(
-                &transaction,
-                opened.request_id.as_str(),
-                &authorization,
-            )
-            .await?;
-            if let Err(error) = self
-                .project_cli_runtime_pending_request(&transaction, &record)
-                .await
-            {
-                return Err(repositories::portable_payload::rollback_with_hold_refusal(
-                    transaction,
-                    error,
-                )
-                .await);
-            }
-            transaction
-                .commit()
-                .await
-                .context("failed to commit authorized CLI runtime request transaction")?;
-            Ok(record)
-        })
+            },
+            |_| true,
+        )
         .await
     }
 
@@ -7999,6 +8483,7 @@ impl CrudStore {
         authorization: CliRuntimeRequestAuthorizationBinding,
         max_pending_requests: usize,
     ) -> Result<CliRuntimePendingRequestRecord> {
+        self.background_change("recovery.timeouts", async {
         self.run_serialized_write(|| async {
             let transaction = self
                 .connection
@@ -8044,27 +8529,37 @@ impl CrudStore {
             Ok(record)
         })
         .await
+        }, |_| true).await
     }
 
     pub async fn resolve_native_human_interaction_request(
         &self,
         resolution: ResolveCliRuntimePendingRequest,
     ) -> Result<Option<CliRuntimePendingRequestRecord>> {
-        self.run_serialized_write(|| async {
-            let transaction = self
-                .connection
-                .begin()
-                .await
-                .context("failed to begin native human interaction resolution")?;
-            let record =
-                cli_runtime_binding::resolve_pending_request(&transaction, resolution.clone())
+        self.background_changes(
+            &["recovery.timeouts", "cli.commands", "cli.supervision"],
+            async {
+                self.run_serialized_write(|| async {
+                    let transaction = self
+                        .connection
+                        .begin()
+                        .await
+                        .context("failed to begin native human interaction resolution")?;
+                    let record = cli_runtime_binding::resolve_pending_request(
+                        &transaction,
+                        resolution.clone(),
+                    )
                     .await?;
-            transaction
-                .commit()
+                    transaction
+                        .commit()
+                        .await
+                        .context("failed to commit native human interaction resolution")?;
+                    Ok(record)
+                })
                 .await
-                .context("failed to commit native human interaction resolution")?;
-            Ok(record)
-        })
+            },
+            |record| record.is_some(),
+        )
         .await
     }
 
@@ -8072,23 +8567,30 @@ impl CrudStore {
         &self,
         response: AcceptCliRuntimePendingRequestResponse,
     ) -> Result<Option<CliRuntimePendingRequestRecord>> {
-        self.run_serialized_write(|| async {
-            let transaction = self
-                .connection
-                .begin()
+        self.background_change(
+            "recovery.timeouts",
+            async {
+                self.run_serialized_write(|| async {
+                    let transaction = self
+                        .connection
+                        .begin()
+                        .await
+                        .context("failed to begin native human interaction acceptance")?;
+                    let record = cli_runtime_binding::accept_pending_request_response(
+                        &transaction,
+                        response.clone(),
+                    )
+                    .await?;
+                    transaction
+                        .commit()
+                        .await
+                        .context("failed to commit native human interaction acceptance")?;
+                    Ok(record)
+                })
                 .await
-                .context("failed to begin native human interaction acceptance")?;
-            let record = cli_runtime_binding::accept_pending_request_response(
-                &transaction,
-                response.clone(),
-            )
-            .await?;
-            transaction
-                .commit()
-                .await
-                .context("failed to commit native human interaction acceptance")?;
-            Ok(record)
-        })
+            },
+            |record| record.is_some(),
+        )
         .await
     }
 
@@ -8096,23 +8598,29 @@ impl CrudStore {
         &self,
         transition: TransitionCliRuntimePendingRequestDelivery,
     ) -> Result<Option<CliRuntimePendingRequestRecord>> {
-        self.run_serialized_write(|| async {
-            let transaction = self
-                .connection
-                .begin()
+        self.background_change(
+            "recovery.timeouts",
+            async {
+                self.run_serialized_write(|| async {
+                    let transaction =
+                        self.connection.begin().await.context(
+                            "failed to begin native human interaction delivery transition",
+                        )?;
+                    let record = cli_runtime_binding::transition_pending_request_delivery(
+                        &transaction,
+                        transition.clone(),
+                    )
+                    .await?;
+                    transaction
+                        .commit()
+                        .await
+                        .context("failed to commit native human interaction delivery transition")?;
+                    Ok(record)
+                })
                 .await
-                .context("failed to begin native human interaction delivery transition")?;
-            let record = cli_runtime_binding::transition_pending_request_delivery(
-                &transaction,
-                transition.clone(),
-            )
-            .await?;
-            transaction
-                .commit()
-                .await
-                .context("failed to commit native human interaction delivery transition")?;
-            Ok(record)
-        })
+            },
+            |record| record.is_some(),
+        )
         .await
     }
 
@@ -8148,32 +8656,38 @@ impl CrudStore {
         &self,
         resolution: ResolveCliRuntimePendingRequest,
     ) -> Result<Option<CliRuntimePendingRequestRecord>> {
-        self.run_serialized_write(|| async {
-            let transaction = self
-                .connection
-                .begin()
-                .await
-                .context("failed to begin CLI runtime pending request resolve transaction")?;
-            let record =
-                cli_runtime_binding::resolve_pending_request(&transaction, resolution.clone())
+        self.background_changes(
+            &["recovery.timeouts", "cli.commands", "cli.supervision"],
+            async {
+                self.run_serialized_write(|| async {
+                    let transaction = self.connection.begin().await.context(
+                        "failed to begin CLI runtime pending request resolve transaction",
+                    )?;
+                    let record = cli_runtime_binding::resolve_pending_request(
+                        &transaction,
+                        resolution.clone(),
+                    )
                     .await?;
-            if let Some(record) = &record
-                && let Err(error) = self
-                    .project_cli_runtime_pending_request(&transaction, record)
-                    .await
-            {
-                return Err(repositories::portable_payload::rollback_with_hold_refusal(
-                    transaction,
-                    error,
-                )
-                .await);
-            }
-            transaction
-                .commit()
+                    if let Some(record) = &record
+                        && let Err(error) = self
+                            .project_cli_runtime_pending_request(&transaction, record)
+                            .await
+                    {
+                        return Err(repositories::portable_payload::rollback_with_hold_refusal(
+                            transaction,
+                            error,
+                        )
+                        .await);
+                    }
+                    transaction.commit().await.context(
+                        "failed to commit CLI runtime pending request resolve transaction",
+                    )?;
+                    Ok(record)
+                })
                 .await
-                .context("failed to commit CLI runtime pending request resolve transaction")?;
-            Ok(record)
-        })
+            },
+            |record| record.is_some(),
+        )
         .await
     }
 
@@ -8181,34 +8695,39 @@ impl CrudStore {
         &self,
         response: AcceptCliRuntimePendingRequestResponse,
     ) -> Result<Option<CliRuntimePendingRequestRecord>> {
-        self.run_serialized_write(|| async {
-            let transaction = self
-                .connection
-                .begin()
+        self.background_changes(
+            &["recovery.timeouts", "cli.commands", "cli.supervision"],
+            async {
+                self.run_serialized_write(|| async {
+                    let transaction = self.connection.begin().await.context(
+                        "failed to begin human interaction response acceptance transaction",
+                    )?;
+                    let record = cli_runtime_binding::accept_pending_request_response(
+                        &transaction,
+                        response.clone(),
+                    )
+                    .await?;
+                    if let Some(record) = &record
+                        && let Err(error) = self
+                            .project_cli_runtime_pending_request(&transaction, record)
+                            .await
+                    {
+                        return Err(repositories::portable_payload::rollback_with_hold_refusal(
+                            transaction,
+                            error,
+                        )
+                        .await);
+                    }
+                    transaction
+                        .commit()
+                        .await
+                        .context("failed to commit human interaction response acceptance")?;
+                    Ok(record)
+                })
                 .await
-                .context("failed to begin human interaction response acceptance transaction")?;
-            let record = cli_runtime_binding::accept_pending_request_response(
-                &transaction,
-                response.clone(),
-            )
-            .await?;
-            if let Some(record) = &record
-                && let Err(error) = self
-                    .project_cli_runtime_pending_request(&transaction, record)
-                    .await
-            {
-                return Err(repositories::portable_payload::rollback_with_hold_refusal(
-                    transaction,
-                    error,
-                )
-                .await);
-            }
-            transaction
-                .commit()
-                .await
-                .context("failed to commit human interaction response acceptance")?;
-            Ok(record)
-        })
+            },
+            |record| record.is_some(),
+        )
         .await
     }
 
@@ -8216,34 +8735,41 @@ impl CrudStore {
         &self,
         transition: TransitionCliRuntimePendingRequestDelivery,
     ) -> Result<Option<CliRuntimePendingRequestRecord>> {
-        self.run_serialized_write(|| async {
-            let transaction = self
-                .connection
-                .begin()
+        self.background_changes(
+            &["recovery.timeouts", "cli.commands", "cli.supervision"],
+            async {
+                self.run_serialized_write(|| async {
+                    let transaction = self
+                        .connection
+                        .begin()
+                        .await
+                        .context("failed to begin human interaction delivery transaction")?;
+                    let record = cli_runtime_binding::transition_pending_request_delivery(
+                        &transaction,
+                        transition.clone(),
+                    )
+                    .await?;
+                    if let Some(record) = &record
+                        && let Err(error) = self
+                            .project_cli_runtime_pending_request(&transaction, record)
+                            .await
+                    {
+                        return Err(repositories::portable_payload::rollback_with_hold_refusal(
+                            transaction,
+                            error,
+                        )
+                        .await);
+                    }
+                    transaction
+                        .commit()
+                        .await
+                        .context("failed to commit human interaction delivery transition")?;
+                    Ok(record)
+                })
                 .await
-                .context("failed to begin human interaction delivery transaction")?;
-            let record = cli_runtime_binding::transition_pending_request_delivery(
-                &transaction,
-                transition.clone(),
-            )
-            .await?;
-            if let Some(record) = &record
-                && let Err(error) = self
-                    .project_cli_runtime_pending_request(&transaction, record)
-                    .await
-            {
-                return Err(repositories::portable_payload::rollback_with_hold_refusal(
-                    transaction,
-                    error,
-                )
-                .await);
-            }
-            transaction
-                .commit()
-                .await
-                .context("failed to commit human interaction delivery transition")?;
-            Ok(record)
-        })
+            },
+            |record| record.is_some(),
+        )
         .await
     }
 
@@ -8253,37 +8779,41 @@ impl CrudStore {
         response_json: Option<String>,
         updated_at: sea_orm::entity::prelude::DateTimeWithTimeZone,
     ) -> Result<Option<CliRuntimePendingRequestRecord>> {
-        let request_id = request_id.to_owned();
-        self.run_serialized_write(|| async {
-            let transaction = self
-                .connection
-                .begin()
+        self.background_changes(
+            &["recovery.timeouts", "cli.commands", "cli.supervision"],
+            async {
+                let request_id = request_id.to_owned();
+                self.run_serialized_write(|| async {
+                    let transaction = self.connection.begin().await.context(
+                        "failed to begin CLI runtime pending request cancel transaction",
+                    )?;
+                    let record = cli_runtime_binding::cancel_pending_request(
+                        &transaction,
+                        request_id.clone(),
+                        response_json.clone(),
+                        updated_at,
+                    )
+                    .await?;
+                    if let Some(record) = &record
+                        && let Err(error) = self
+                            .project_cli_runtime_pending_request(&transaction, record)
+                            .await
+                    {
+                        return Err(repositories::portable_payload::rollback_with_hold_refusal(
+                            transaction,
+                            error,
+                        )
+                        .await);
+                    }
+                    transaction.commit().await.context(
+                        "failed to commit CLI runtime pending request cancel transaction",
+                    )?;
+                    Ok(record)
+                })
                 .await
-                .context("failed to begin CLI runtime pending request cancel transaction")?;
-            let record = cli_runtime_binding::cancel_pending_request(
-                &transaction,
-                request_id.clone(),
-                response_json.clone(),
-                updated_at,
-            )
-            .await?;
-            if let Some(record) = &record
-                && let Err(error) = self
-                    .project_cli_runtime_pending_request(&transaction, record)
-                    .await
-            {
-                return Err(repositories::portable_payload::rollback_with_hold_refusal(
-                    transaction,
-                    error,
-                )
-                .await);
-            }
-            transaction
-                .commit()
-                .await
-                .context("failed to commit CLI runtime pending request cancel transaction")?;
-            Ok(record)
-        })
+            },
+            |record| record.is_some(),
+        )
         .await
     }
 
@@ -8293,37 +8823,41 @@ impl CrudStore {
         response_json: Option<String>,
         updated_at: sea_orm::entity::prelude::DateTimeWithTimeZone,
     ) -> Result<Option<CliRuntimePendingRequestRecord>> {
-        let request_id = request_id.to_owned();
-        self.run_serialized_write(|| async {
-            let transaction = self
-                .connection
-                .begin()
+        self.background_changes(
+            &["recovery.timeouts", "cli.commands", "cli.supervision"],
+            async {
+                let request_id = request_id.to_owned();
+                self.run_serialized_write(|| async {
+                    let transaction = self.connection.begin().await.context(
+                        "failed to begin CLI runtime pending request expire transaction",
+                    )?;
+                    let record = cli_runtime_binding::expire_pending_request(
+                        &transaction,
+                        request_id.clone(),
+                        response_json.clone(),
+                        updated_at,
+                    )
+                    .await?;
+                    if let Some(record) = &record
+                        && let Err(error) = self
+                            .project_cli_runtime_pending_request(&transaction, record)
+                            .await
+                    {
+                        return Err(repositories::portable_payload::rollback_with_hold_refusal(
+                            transaction,
+                            error,
+                        )
+                        .await);
+                    }
+                    transaction.commit().await.context(
+                        "failed to commit CLI runtime pending request expire transaction",
+                    )?;
+                    Ok(record)
+                })
                 .await
-                .context("failed to begin CLI runtime pending request expire transaction")?;
-            let record = cli_runtime_binding::expire_pending_request(
-                &transaction,
-                request_id.clone(),
-                response_json.clone(),
-                updated_at,
-            )
-            .await?;
-            if let Some(record) = &record
-                && let Err(error) = self
-                    .project_cli_runtime_pending_request(&transaction, record)
-                    .await
-            {
-                return Err(repositories::portable_payload::rollback_with_hold_refusal(
-                    transaction,
-                    error,
-                )
-                .await);
-            }
-            transaction
-                .commit()
-                .await
-                .context("failed to commit CLI runtime pending request expire transaction")?;
-            Ok(record)
-        })
+            },
+            |record| record.is_some(),
+        )
         .await
     }
 
@@ -8331,21 +8865,42 @@ impl CrudStore {
         &self,
         event: NewCliRuntimeNativeEvent,
     ) -> Result<CliRuntimeNativeEventRecord> {
-        self.run_serialized_write(|| async {
-            cli_runtime_binding::append_native_event(&self.connection, event.clone()).await
-        })
-        .await
+        let supervision = self.background_work("cli.supervision").changing();
+        let change = cli_runtime_binding::registers_native_cleanup(&event)
+            .then(|| self.background_work("storage.native_events").changing());
+        let record = self
+            .run_serialized_write(|| async {
+                cli_runtime_binding::append_native_event(&self.connection, event.clone()).await
+            })
+            .await?;
+        if let Some(change) = change {
+            change.finish(true);
+        }
+        supervision.finish(true);
+        Ok(record)
     }
 
     pub async fn append_cli_runtime_native_event_if_absent(
         &self,
         event: NewCliRuntimeNativeEvent,
     ) -> Result<CliRuntimeNativeEventRecord> {
-        self.run_serialized_write(|| async {
-            cli_runtime_binding::append_native_event_if_absent(&self.connection, event.clone())
+        let supervision = self.background_work("cli.supervision").changing();
+        let change = cli_runtime_binding::registers_native_cleanup(&event)
+            .then(|| self.background_work("storage.native_events").changing());
+        let (record, inserted) = self
+            .run_serialized_write(|| async {
+                cli_runtime_binding::append_native_event_if_absent_outcome(
+                    &self.connection,
+                    event.clone(),
+                )
                 .await
-        })
-        .await
+            })
+            .await?;
+        if let Some(change) = change {
+            change.finish(inserted);
+        }
+        supervision.finish(inserted);
+        Ok(record)
     }
 
     pub async fn list_cli_runtime_native_events(
@@ -8365,6 +8920,17 @@ impl CrudStore {
             .await
         })
         .await
+    }
+
+    pub async fn next_native_event_cleanup_deadline(&self) -> Result<Option<DateTimeWithTimeZone>> {
+        repositories::native_event_cleanup::next_deadline(&self.connection)
+            .await?
+            .map(|at| {
+                chrono::DateTime::from_timestamp_micros(at)
+                    .map(|at| at.fixed_offset())
+                    .context("native event cleanup clock is out of range")
+            })
+            .transpose()
     }
 
     /// Incremental registration of pre-upgrade rows; completion is durable.
@@ -8389,6 +8955,8 @@ impl CrudStore {
         transition: NativeExecutionWindowTransition,
         event_timestamp_secs: i64,
     ) -> Result<()> {
+        self.track_compaction_history(true, 4, async {
+        self.background_changes(&["tasks.lifecycle", "storage.frozen", "storage.html.retention", "storage.html.history", "turn.projection", "recovery.control", "recovery.timeouts", "cli.commands", "cli.supervision", "storage.zstd", "recovery.effects", "recovery.ledger", "turn.finalization", "turn.delivery.live", "turn.delivery.episodic", "storage.receipts", "storage.native_events", "compaction.lifecycle"], async {
         let _release_wake = matches!(&transition, NativeExecutionWindowTransition::Blocked { .. })
             .then(|| execution_heartbeat::ReleaseWake(self.execution_heartbeats.clone()));
         let created_at = unix_to_datetime(event_timestamp_secs);
@@ -8959,6 +9527,8 @@ impl CrudStore {
             }
         })
         .await
+        }, |_| true).await
+        }, |_| true).await
     }
 
     pub async fn create_turn_execution_window(
@@ -9234,6 +9804,7 @@ impl CrudStore {
         limits: Option<(u64, u64)>,
         commit_guard: Option<(u64, tokio_util::sync::CancellationToken)>,
     ) -> Result<IngestedArtifactRecord> {
+        self.background_changes(&["storage.html.retention","storage.html.history","storage.html.io"], async {
         let prepared_at = chrono::Utc::now().fixed_offset();
         let blob_id = generate_id(DB_ID_LEN);
         let artifact_id = identity.clone().unwrap_or_else(|| generate_id(DB_ID_LEN));
@@ -9391,27 +9962,43 @@ impl CrudStore {
             self.notify_html_preview_io_work();
         }
         Ok(result)
+
+        }, |_| true).await
     }
 
     pub async fn find_or_create_artifact_blob(
         &self,
         blob: NewArtifactBlobRecord,
     ) -> Result<ArtifactBlobRecord> {
-        let id = generate_id(DB_ID_LEN);
-        let at = chrono::Utc::now().fixed_offset();
-        let size = artifact_repository::checked_size_bytes(blob.size_bytes)?;
-        let metadata = artifact_repository::metadata_to_db(&blob.metadata)?;
-        self.run_serialized_write(|| {
-            let blob = blob.clone();
-            let id = id.clone();
-            let metadata = metadata.clone();
-            async move {
-                artifact_repository::ArtifactRepository::new()
-                    .find_or_create_blob_prepared(&self.connection, blob, id, at, size, metadata)
-                    .await
-                    .map_err(Into::into)
-            }
-        })
+        self.background_changes(
+            &["storage.html.retention", "storage.html.history"],
+            async {
+                let id = generate_id(DB_ID_LEN);
+                let at = chrono::Utc::now().fixed_offset();
+                let size = artifact_repository::checked_size_bytes(blob.size_bytes)?;
+                let metadata = artifact_repository::metadata_to_db(&blob.metadata)?;
+                self.run_serialized_write(|| {
+                    let blob = blob.clone();
+                    let id = id.clone();
+                    let metadata = metadata.clone();
+                    async move {
+                        artifact_repository::ArtifactRepository::new()
+                            .find_or_create_blob_prepared(
+                                &self.connection,
+                                blob,
+                                id,
+                                at,
+                                size,
+                                metadata,
+                            )
+                            .await
+                            .map_err(Into::into)
+                    }
+                })
+                .await
+            },
+            |_| true,
+        )
         .await
     }
 
@@ -9423,76 +10010,83 @@ impl CrudStore {
         target: ArtifactBindingTargetRecord,
         metadata: BTreeMap<String, serde_json::Value>,
     ) -> Result<ArtifactBindingSummary> {
-        let binding_id = generate_id(DB_ID_LEN);
-        let created_at = chrono::Utc::now().fixed_offset();
-        let metadata_json = artifact_repository::metadata_to_db(&metadata)?;
-        self.run_serialized_write(|| {
-            let workspace_id = workspace_id.to_owned();
-            let artifact_id = artifact_id.to_owned();
-            let version_id = version_id.map(ToOwned::to_owned);
-            let target = target.clone();
-            let binding_id = binding_id.clone();
-            let metadata_json = metadata_json.clone();
-            async move {
-                let repository = artifact_repository::ArtifactRepository::new();
-                let resolved_version_id = repository
-                    .resolve_binding_version(
-                        &self.connection,
-                        &workspace_id,
-                        &artifact_id,
-                        version_id.as_deref(),
-                    )
-                    .await?;
-                let transaction = self
-                    .connection
-                    .begin()
-                    .await
-                    .context("failed to begin artifact bind transaction")?;
-                let result = async {
-                    let fenced_version_id = repository
-                        .resolve_binding_version(
-                            &transaction,
-                            &workspace_id,
-                            &artifact_id,
-                            version_id.as_deref(),
-                        )
-                        .await?;
-                    if fenced_version_id != resolved_version_id {
-                        return Err(ArtifactCrudError::InvalidRequest {
+        self.background_changes(
+            &["storage.html.retention", "storage.html.history"],
+            async {
+                let binding_id = generate_id(DB_ID_LEN);
+                let created_at = chrono::Utc::now().fixed_offset();
+                let metadata_json = artifact_repository::metadata_to_db(&metadata)?;
+                self.run_serialized_write(|| {
+                    let workspace_id = workspace_id.to_owned();
+                    let artifact_id = artifact_id.to_owned();
+                    let version_id = version_id.map(ToOwned::to_owned);
+                    let target = target.clone();
+                    let binding_id = binding_id.clone();
+                    let metadata_json = metadata_json.clone();
+                    async move {
+                        let repository = artifact_repository::ArtifactRepository::new();
+                        let resolved_version_id = repository
+                            .resolve_binding_version(
+                                &self.connection,
+                                &workspace_id,
+                                &artifact_id,
+                                version_id.as_deref(),
+                            )
+                            .await?;
+                        let transaction = self
+                            .connection
+                            .begin()
+                            .await
+                            .context("failed to begin artifact bind transaction")?;
+                        let result = async {
+                            let fenced_version_id = repository
+                                .resolve_binding_version(
+                                    &transaction,
+                                    &workspace_id,
+                                    &artifact_id,
+                                    version_id.as_deref(),
+                                )
+                                .await?;
+                            if fenced_version_id != resolved_version_id {
+                                return Err(ArtifactCrudError::InvalidRequest {
                             message: "artifact current version changed during binding preparation"
                                 .to_owned(),
                         });
-                    }
-                    repository
-                        .create_binding_prepared(
-                            &transaction,
-                            &workspace_id,
-                            &artifact_id,
-                            Some(resolved_version_id.as_str()),
-                            &target,
-                            binding_id,
-                            created_at,
-                            metadata_json,
-                        )
-                        .await
-                }
-                .await;
+                            }
+                            repository
+                                .create_binding_prepared(
+                                    &transaction,
+                                    &workspace_id,
+                                    &artifact_id,
+                                    Some(resolved_version_id.as_str()),
+                                    &target,
+                                    binding_id,
+                                    created_at,
+                                    metadata_json,
+                                )
+                                .await
+                        }
+                        .await;
 
-                let binding = match result {
-                    Ok(binding) => binding,
-                    Err(error) => {
-                        let _ = transaction.rollback().await;
-                        return Err(error.into());
-                    }
-                };
+                        let binding = match result {
+                            Ok(binding) => binding,
+                            Err(error) => {
+                                let _ = transaction.rollback().await;
+                                return Err(error.into());
+                            }
+                        };
 
-                transaction
-                    .commit()
-                    .await
-                    .context("failed to commit artifact bind transaction")?;
-                Ok(binding)
-            }
-        })
+                        transaction
+                            .commit()
+                            .await
+                            .context("failed to commit artifact bind transaction")?;
+                        Ok(binding)
+                    }
+                })
+                .await
+            },
+            |_| true,
+        )
         .await
     }
 
@@ -9642,47 +10236,54 @@ impl CrudStore {
         status: ArtifactStatus,
         deleted_at: Option<DateTimeWithTimeZone>,
     ) -> Result<ArtifactRecord> {
-        let at = chrono::Utc::now().fixed_offset();
-        self.run_serialized_write(|| {
-            let workspace_id = workspace_id.to_owned();
-            let artifact_id = artifact_id.to_owned();
-            let deleted_at = deleted_at.clone();
-            async move {
-                let transaction = self.connection.begin().await?;
-                let repository = artifact_repository::ArtifactRepository::new();
-                let result = async {
-                    let artifact = repository
-                        .update_artifact_status(
-                            &transaction,
-                            &workspace_id,
-                            &artifact_id,
-                            status,
-                            deleted_at,
-                        )
-                        .await?;
-                    repository
-                        .touch_html_artifact_projection(
-                            &transaction,
-                            &workspace_id,
-                            &artifact_id,
-                            at,
-                        )
-                        .await?;
-                    Ok::<_, artifact_repository::ArtifactCrudError>(artifact)
-                }
-                .await;
-                match result {
-                    Ok(artifact) => {
-                        transaction.commit().await?;
-                        Ok(artifact)
+        self.background_changes(
+            &["storage.html.retention", "storage.html.history"],
+            async {
+                let at = chrono::Utc::now().fixed_offset();
+                self.run_serialized_write(|| {
+                    let workspace_id = workspace_id.to_owned();
+                    let artifact_id = artifact_id.to_owned();
+                    let deleted_at = deleted_at.clone();
+                    async move {
+                        let transaction = self.connection.begin().await?;
+                        let repository = artifact_repository::ArtifactRepository::new();
+                        let result = async {
+                            let artifact = repository
+                                .update_artifact_status(
+                                    &transaction,
+                                    &workspace_id,
+                                    &artifact_id,
+                                    status,
+                                    deleted_at,
+                                )
+                                .await?;
+                            repository
+                                .touch_html_artifact_projection(
+                                    &transaction,
+                                    &workspace_id,
+                                    &artifact_id,
+                                    at,
+                                )
+                                .await?;
+                            Ok::<_, artifact_repository::ArtifactCrudError>(artifact)
+                        }
+                        .await;
+                        match result {
+                            Ok(artifact) => {
+                                transaction.commit().await?;
+                                Ok(artifact)
+                            }
+                            Err(error) => {
+                                let _ = transaction.rollback().await;
+                                Err(error.into())
+                            }
+                        }
                     }
-                    Err(error) => {
-                        let _ = transaction.rollback().await;
-                        Err(error.into())
-                    }
-                }
-            }
-        })
+                })
+                .await
+            },
+            |_| true,
+        )
         .await
     }
 
@@ -9720,29 +10321,36 @@ impl CrudStore {
         blob_id: Option<String>,
         metadata: BTreeMap<String, serde_json::Value>,
     ) -> Result<ArtifactProjectionRecord> {
-        self.run_serialized_write(|| {
-            let workspace_id = workspace_id.to_owned();
-            let artifact_id = artifact_id.to_owned();
-            let artifact_version_id = artifact_version_id.to_owned();
-            let text_content = text_content.clone();
-            let blob_id = blob_id.clone();
-            let metadata = metadata.clone();
-            async move {
-                artifact_repository::replace_projection(
-                    &self.connection,
-                    &workspace_id,
-                    &artifact_id,
-                    &artifact_version_id,
-                    projection_kind,
-                    status,
-                    text_content,
-                    blob_id,
-                    metadata,
-                )
+        self.background_changes(
+            &["storage.html.retention", "storage.html.history"],
+            async {
+                self.run_serialized_write(|| {
+                    let workspace_id = workspace_id.to_owned();
+                    let artifact_id = artifact_id.to_owned();
+                    let artifact_version_id = artifact_version_id.to_owned();
+                    let text_content = text_content.clone();
+                    let blob_id = blob_id.clone();
+                    let metadata = metadata.clone();
+                    async move {
+                        artifact_repository::replace_projection(
+                            &self.connection,
+                            &workspace_id,
+                            &artifact_id,
+                            &artifact_version_id,
+                            projection_kind,
+                            status,
+                            text_content,
+                            blob_id,
+                            metadata,
+                        )
+                        .await
+                        .map_err(Into::into)
+                    }
+                })
                 .await
-                .map_err(Into::into)
-            }
-        })
+            },
+            |_| true,
+        )
         .await
     }
 
@@ -9776,14 +10384,21 @@ impl CrudStore {
         &self,
         request: UpsertArtifactExternalRefRequest,
     ) -> Result<ArtifactExternalRefRecord> {
-        self.run_serialized_write(|| {
-            let request = request.clone();
-            async move {
-                artifact_repository::upsert_external_ref(&self.connection, request)
-                    .await
-                    .map_err(Into::into)
-            }
-        })
+        self.background_changes(
+            &["storage.html.retention", "storage.html.history"],
+            async {
+                self.run_serialized_write(|| {
+                    let request = request.clone();
+                    async move {
+                        artifact_repository::upsert_external_ref(&self.connection, request)
+                            .await
+                            .map_err(Into::into)
+                    }
+                })
+                .await
+            },
+            |_| true,
+        )
         .await
     }
 
@@ -9792,18 +10407,25 @@ impl CrudStore {
         workspace_id: &str,
         now_unix_ms: i64,
     ) -> Result<u64> {
-        self.run_serialized_write(|| {
-            let workspace_id = workspace_id.to_owned();
-            async move {
-                artifact_repository::prune_expired_external_refs(
-                    &self.connection,
-                    &workspace_id,
-                    now_unix_ms,
-                )
+        self.background_changes(
+            &["storage.html.retention"],
+            async {
+                self.run_serialized_write(|| {
+                    let workspace_id = workspace_id.to_owned();
+                    async move {
+                        artifact_repository::prune_expired_external_refs(
+                            &self.connection,
+                            &workspace_id,
+                            now_unix_ms,
+                        )
+                        .await
+                        .map_err(Into::into)
+                    }
+                })
                 .await
-                .map_err(Into::into)
-            }
-        })
+            },
+            |rows| *rows > 0,
+        )
         .await
     }
 
@@ -9850,19 +10472,26 @@ impl CrudStore {
         workspace_id: &str,
         projection_id: &str,
     ) -> Result<u64> {
-        self.run_serialized_write(|| {
-            let workspace_id = workspace_id.to_owned();
-            let projection_id = projection_id.to_owned();
-            async move {
-                artifact_repository::delete_projection_row(
-                    &self.connection,
-                    &workspace_id,
-                    &projection_id,
-                )
+        self.background_changes(
+            &["storage.html.retention", "storage.html.history"],
+            async {
+                self.run_serialized_write(|| {
+                    let workspace_id = workspace_id.to_owned();
+                    let projection_id = projection_id.to_owned();
+                    async move {
+                        artifact_repository::delete_projection_row(
+                            &self.connection,
+                            &workspace_id,
+                            &projection_id,
+                        )
+                        .await
+                        .map_err(Into::into)
+                    }
+                })
                 .await
-                .map_err(Into::into)
-            }
-        })
+            },
+            |_| true,
+        )
         .await
     }
 
@@ -9930,16 +10559,95 @@ impl CrudStore {
         .await
     }
 
+    pub async fn hook_recovery_clock_quantum(
+        &self,
+        pass: &mut HookClockPass,
+        stale_ms: u64,
+    ) -> Result<bool> {
+        hook_run::recovery_clock_quantum(&self.connection, pass, stale_ms).await
+    }
+
+    pub async fn next_hook_recovery_deadline(
+        &self,
+        stale_running_after_ms: u64,
+    ) -> Result<Option<DateTimeWithTimeZone>> {
+        hook_run::next_recoverable_deadline(&self.connection, stale_running_after_ms).await
+    }
+
+    async fn cli_runtime_semantic_change<T>(
+        &self,
+        operation: impl std::future::Future<Output = Result<T>>,
+        changed: impl FnOnce(&T) -> bool,
+    ) -> Result<T> {
+        let names = [
+            "cli.supervision",
+            "cli.commands",
+            "recovery.timeouts",
+            "recovery.control",
+        ];
+        let changes: Vec<_> = names
+            .iter()
+            .map(|name| self.background_work(name).changing())
+            .collect();
+        let result = operation.await?;
+        let did_change = changed(&result);
+        for change in changes {
+            change.finish(did_change);
+        }
+        if did_change {
+            // This is a semantic ownership transition, never a routine heartbeat
+            // or maintenance ACK. A previously parked dependent phase must revisit.
+            for name in names {
+                self.background_work(name).dependency_released();
+            }
+        }
+        Ok(result)
+    }
+
+    /// A narrow process-local hint around one existing domain operation. Only
+    /// known successful outcomes publish a change; errors/cancellation retain
+    /// unknown settlement debt. No SQL/authority is supplied by the hint.
+    async fn background_change<T>(
+        &self,
+        name: &'static str,
+        operation: impl std::future::Future<Output = Result<T>>,
+        changed: impl FnOnce(&T) -> bool,
+    ) -> Result<T> {
+        self.background_changes(&[name], operation, changed).await
+    }
+
+    async fn background_changes<T>(
+        &self,
+        names: &[&'static str],
+        operation: impl std::future::Future<Output = Result<T>>,
+        changed: impl FnOnce(&T) -> bool,
+    ) -> Result<T> {
+        let changes: Vec<_> = names
+            .iter()
+            .map(|name| self.background_work(name).changing())
+            .collect();
+        let result = operation.await?;
+        let changed = changed(&result);
+        for change in changes {
+            change.finish(changed);
+        }
+        Ok(result)
+    }
+
     pub async fn create_hook_run(
         &self,
         run: NewHookRunRecord,
         now: DateTimeWithTimeZone,
     ) -> Result<HookRunRecord> {
-        self.run_serialized_write(|| {
-            let run = run.clone();
-            let now = now.clone();
-            async move { hook_run::create_hook_run(&self.connection, run, now).await }
-        })
+        self.background_change(
+            "hooks.recovery",
+            self.run_serialized_write(|| {
+                let run = run.clone();
+                let now = now.clone();
+                async move { hook_run::create_hook_run(&self.connection, run, now).await }
+            }),
+            |_| true,
+        )
         .await
     }
 
@@ -9971,10 +10679,14 @@ impl CrudStore {
         run_id: &pioneer_hooks::HookRunId,
         now: DateTimeWithTimeZone,
     ) -> Result<Option<HookRunRecord>> {
-        self.run_serialized_write(|| {
-            let now = now.clone();
-            async move { hook_run::mark_hook_run_running(&self.connection, run_id, now).await }
-        })
+        self.background_change(
+            "hooks.recovery",
+            self.run_serialized_write(|| {
+                let now = now.clone();
+                async move { hook_run::mark_hook_run_running(&self.connection, run_id, now).await }
+            }),
+            |row| row.is_some(),
+        )
         .await
     }
 
@@ -9984,11 +10696,17 @@ impl CrudStore {
         completion: HookRunCompletionRecord,
         now: DateTimeWithTimeZone,
     ) -> Result<Option<HookRunRecord>> {
-        self.run_serialized_write(|| {
-            let completion = completion.clone();
-            let now = now.clone();
-            async move { hook_run::complete_hook_run(&self.connection, run_id, completion, now).await }
-        })
+        self.background_change(
+            "hooks.recovery",
+            self.run_serialized_write(|| {
+                let completion = completion.clone();
+                let now = now.clone();
+                async move {
+                    hook_run::complete_hook_run(&self.connection, run_id, completion, now).await
+                }
+            }),
+            |row| row.is_some(),
+        )
         .await
     }
 
@@ -10029,6 +10747,14 @@ impl CrudStore {
         hook_run::list_hook_run_attempts(&self.connection, run_id).await
     }
 
+    pub async fn recoverable_hook_run_by_id(
+        &self,
+        scan: pioneer_hooks::HookRecoveryScan,
+        id: &str,
+    ) -> Result<Vec<RecoverableHookRunRecord>> {
+        hook_run::recoverable_hook_run_by_id(&self.connection, scan, id).await
+    }
+
     pub async fn list_recoverable_hook_runs(
         &self,
         scan: pioneer_hooks::HookRecoveryScan,
@@ -10042,13 +10768,17 @@ impl CrudStore {
         schedule: pioneer_hooks::HookRetrySchedule,
         now: DateTimeWithTimeZone,
     ) -> Result<Option<HookRunRecord>> {
-        self.run_serialized_write(|| {
-            let schedule = schedule.clone();
-            let now = now.clone();
-            async move {
-                hook_run::schedule_hook_run_retry(&self.connection, run_id, schedule, now).await
-            }
-        })
+        self.background_change(
+            "hooks.recovery",
+            self.run_serialized_write(|| {
+                let schedule = schedule.clone();
+                let now = now.clone();
+                async move {
+                    hook_run::schedule_hook_run_retry(&self.connection, run_id, schedule, now).await
+                }
+            }),
+            |row| row.is_some(),
+        )
         .await
     }
 
@@ -10058,14 +10788,23 @@ impl CrudStore {
         completion: HookRunCompletionRecord,
         now: DateTimeWithTimeZone,
     ) -> Result<Option<HookRunRecord>> {
-        self.run_serialized_write(|| {
-            let completion = completion.clone();
-            let now = now.clone();
-            async move {
-                hook_run::mark_stale_hook_run_timed_out(&self.connection, run_id, completion, now)
+        self.background_change(
+            "hooks.recovery",
+            self.run_serialized_write(|| {
+                let completion = completion.clone();
+                let now = now.clone();
+                async move {
+                    hook_run::mark_stale_hook_run_timed_out(
+                        &self.connection,
+                        run_id,
+                        completion,
+                        now,
+                    )
                     .await
-            }
-        })
+                }
+            }),
+            |row| row.is_some(),
+        )
         .await
     }
 
@@ -10075,14 +10814,18 @@ impl CrudStore {
         completion: HookRunCompletionRecord,
         now: DateTimeWithTimeZone,
     ) -> Result<Option<HookRunRecord>> {
-        self.run_serialized_write(|| {
-            let completion = completion.clone();
-            let now = now.clone();
-            async move {
-                hook_run::mark_hook_run_unrecoverable(&self.connection, run_id, completion, now)
-                    .await
-            }
-        })
+        self.background_change(
+            "hooks.recovery",
+            self.run_serialized_write(|| {
+                let completion = completion.clone();
+                let now = now.clone();
+                async move {
+                    hook_run::mark_hook_run_unrecoverable(&self.connection, run_id, completion, now)
+                        .await
+                }
+            }),
+            |row| row.is_some(),
+        )
         .await
     }
 
@@ -14967,21 +15710,32 @@ impl CrudStore {
         &self,
         expected: &TurnExecutionRecord,
     ) -> Result<bool> {
-        self.run_serialized_write(|| async {
-            let tx = self.connection.begin().await?;
-            if turn_event_projection_stream_state::has_accepted_terminal(&tx, &expected.turn_id)
-                .await?
-            {
-                return Ok(false);
-            }
-            // Writer admission (and a storage retry) may outlive the lease.
-            // Read the clock in this attempt, after acquiring the writer and
-            // immediately before evaluating the activation fence.
-            let claimed =
-                repositories::turn_execution::claim_unactivated(&tx, expected, utc_now()).await?;
-            tx.commit().await?;
-            Ok(claimed)
-        })
+        self.background_changes(
+            &["tasks.lifecycle"],
+            async {
+                self.run_serialized_write(|| async {
+                    let tx = self.connection.begin().await?;
+                    if turn_event_projection_stream_state::has_accepted_terminal(
+                        &tx,
+                        &expected.turn_id,
+                    )
+                    .await?
+                    {
+                        return Ok(false);
+                    }
+                    // Writer admission (and a storage retry) may outlive the lease.
+                    // Read the clock in this attempt, after acquiring the writer and
+                    // immediately before evaluating the activation fence.
+                    let claimed =
+                        repositories::turn_execution::claim_unactivated(&tx, expected, utc_now())
+                            .await?;
+                    tx.commit().await?;
+                    Ok(claimed)
+                })
+                .await
+            },
+            |value| *value,
+        )
         .await
     }
 
@@ -15006,6 +15760,46 @@ impl CrudStore {
         limit: u64,
     ) -> Result<Vec<TurnExecutionRecord>> {
         turn_execution::list_owned_recovering(&self.connection, owner_id, limit).await
+    }
+
+    pub async fn expired_foreign_execution_upper(
+        &self,
+        owner: &str,
+        now_unix: i64,
+    ) -> Result<Option<String>> {
+        turn_execution::expired_foreign_upper(&self.connection, owner, unix_to_datetime(now_unix))
+            .await
+    }
+    pub async fn expired_foreign_execution_page(
+        &self,
+        owner: &str,
+        now_unix: i64,
+        after: Option<&str>,
+        upper: &str,
+        limit: u64,
+    ) -> Result<(Option<String>, Vec<Result<TurnExecutionRecord>>)> {
+        turn_execution::expired_foreign_page(
+            &self.connection,
+            owner,
+            unix_to_datetime(now_unix),
+            after,
+            upper,
+            limit,
+        )
+        .await
+    }
+
+    pub async fn owned_recovering_execution_upper(&self, owner: &str) -> Result<Option<String>> {
+        turn_execution::owned_recovering_upper(&self.connection, owner).await
+    }
+    pub async fn owned_recovering_execution_page(
+        &self,
+        owner: &str,
+        after: Option<&str>,
+        upper: &str,
+        limit: u64,
+    ) -> Result<(Option<String>, Vec<Result<TurnExecutionRecord>>)> {
+        turn_execution::owned_recovering_page(&self.connection, owner, after, upper, limit).await
     }
 
     pub async fn claim_expired_turn_execution(
@@ -15096,6 +15890,7 @@ impl CrudStore {
         let notification = notification.clone();
         let expected_task_finalization_revision =
             expected_task_finalization_revision.map(str::to_owned);
+        self.background_change("turn.finalization", async {
         self.run_serialized_write(|| async {
             let tx = self
                 .connection
@@ -15201,6 +15996,7 @@ impl CrudStore {
             }
         })
         .await
+        }, |outcome| *outcome == PrepareTurnFinalizationOutcome::Prepared).await
     }
 
     pub async fn list_prepared_turn_finalization_ids(&self, limit: u64) -> Result<Vec<String>> {
@@ -15226,7 +16022,19 @@ impl CrudStore {
         // Serialize only this domain owner's cursor, never database capacity.
         // One bounded eligible page per call; failures advance too, then retry
         // after the pass wraps. Discovery errors leave the cursor unchanged.
-        let mut pass = self.finalization_cursor.lock().await;
+        let work = self.background_work("turn.finalization");
+        let observed = work.observe();
+        let _drain = work.drain().await.context("finalization owner closed")?;
+        let mut pass = turn_finalization::PreparedPassGuard::take(
+            self.finalization_cursor.clone(),
+            work.clone(),
+        );
+        // The generation belongs to this shared finite traversal, including
+        // foreground calls. Consume it only while its admission owns real state.
+        if pass.upper.is_some() && pass.observation != Some(observed) {
+            pass.rescan = true;
+        }
+        pass.observation = Some(observed);
         if pass.upper.is_none() {
             pass.upper = turn_finalization::prepared_upper(&self.connection)
                 .await
@@ -15270,13 +16078,14 @@ impl CrudStore {
             }
         }
         pass.failed |= !summary.failures.is_empty();
-        summary.pass_complete = complete;
+        summary.pass_complete = complete && !pass.rescan;
         summary.pass_failed = pass.failed;
         if complete {
-            *pass = turn_finalization::PreparedPass::default();
+            pass.pass = turn_finalization::PreparedPass::default();
         } else {
             pass.after = last;
         }
+        pass.settled = true;
         Ok(summary)
     }
 
@@ -15288,6 +16097,8 @@ impl CrudStore {
         turn_id: &str,
         event_timestamp_secs: i64,
     ) -> Result<TurnFinalizationCommitOutcome> {
+        self.track_compaction_history(true, 4, async {
+        self.background_changes(&["tasks.lifecycle", "compaction.lifecycle", "turn.finalization", "recovery.effects", "recovery.effects.retry", "recovery.effects.retention", "storage.native_events", "turn.delivery.live", "turn.delivery.episodic", "storage.receipts"], async {
         let _release_wake = execution_heartbeat::ReleaseWake(self.execution_heartbeats.clone());
         let turn_id = turn_id.to_owned();
         self.run_serialized_write(|| async {
@@ -15557,6 +16368,8 @@ impl CrudStore {
             }
         })
         .await
+        }, |outcome| matches!(outcome, TurnFinalizationCommitOutcome::Committed(value) if !value.already_committed)).await
+        }, |outcome| matches!(outcome, TurnFinalizationCommitOutcome::Committed(value) if !value.already_committed)).await
     }
 
     pub async fn materialize_agent_diff_final_snapshot_if_changed(
@@ -15606,6 +16419,25 @@ impl CrudStore {
         notification: pioneer_protocol::ItemUpdatedNotification,
         event_timestamp_secs: i64,
     ) -> Result<()> {
+        let owners = if notification.item.item_id().starts_with("compaction:") {
+            &[
+                "compaction.lifecycle",
+                "storage.zstd",
+                "recovery.control",
+                "recovery.timeouts",
+                "cli.commands",
+                "cli.supervision",
+            ][..]
+        } else {
+            &[
+                "storage.zstd",
+                "recovery.control",
+                "recovery.timeouts",
+                "cli.commands",
+                "cli.supervision",
+            ][..]
+        };
+        self.background_changes(owners, async {
         let updated_at = unix_to_datetime(event_timestamp_secs);
         let status =
             crate::turn_item_terminal::terminal_turn_item_status_from_payload(&notification.item);
@@ -15718,6 +16550,7 @@ impl CrudStore {
         .await?;
         self.episodic_work.notify_one();
         Ok(())
+        }, |_| true).await
     }
 
     pub async fn materialize_item_timeout_detected(
@@ -15965,10 +16798,10 @@ impl CrudStore {
         event: TaskEventPayload,
         event_timestamp_secs: i64,
     ) -> Result<AppendedTaskEvent> {
-        self.run_serialized_write(|| {
-            self.append_task_event_once(event.clone(), event_timestamp_secs)
-        })
-        .await
+        let mut events = self
+            .append_task_events(vec![event], event_timestamp_secs)
+            .await?;
+        events.pop().context("single Task event result missing")
     }
 
     pub async fn append_task_events(
@@ -15988,12 +16821,15 @@ impl CrudStore {
         event_timestamp_secs: i64,
         agent_action: AgentCommitInput,
     ) -> Result<Vec<AppendedTaskEvent>> {
-        self.run_serialized_write(|| {
-            self.append_task_events_with_agent_action_once(
-                events.clone(),
-                event_timestamp_secs,
-                agent_action.clone(),
-            )
+        self.task_scheduler_event_change(Some(&events), async {
+            self.run_serialized_write(|| {
+                self.append_task_events_with_agent_action_once(
+                    events.clone(),
+                    event_timestamp_secs,
+                    agent_action.clone(),
+                )
+            })
+            .await
         })
         .await
     }
@@ -16004,12 +16840,15 @@ impl CrudStore {
         event_timestamp_secs: i64,
         admission: NewTaskExecutionAdmission,
     ) -> Result<Vec<AppendedTaskEvent>> {
-        self.run_serialized_write(|| {
-            self.append_task_events_with_execution_admission_once(
-                events.clone(),
-                event_timestamp_secs,
-                admission.clone(),
-            )
+        self.task_scheduler_event_change(Some(&events), async {
+            self.run_serialized_write(|| {
+                self.append_task_events_with_execution_admission_once(
+                    events.clone(),
+                    event_timestamp_secs,
+                    admission.clone(),
+                )
+            })
+            .await
         })
         .await
     }
@@ -16020,12 +16859,15 @@ impl CrudStore {
         event_timestamp_secs: i64,
         admission: NewTaskExecutionAdmission,
     ) -> Result<Vec<AppendedTaskEvent>> {
-        self.run_serialized_write(|| {
-            self.append_task_events_with_execution_readmission_once(
-                events.clone(),
-                event_timestamp_secs,
-                admission.clone(),
-            )
+        self.task_scheduler_event_change(Some(&events), async {
+            self.run_serialized_write(|| {
+                self.append_task_events_with_execution_readmission_once(
+                    events.clone(),
+                    event_timestamp_secs,
+                    admission.clone(),
+                )
+            })
+            .await
         })
         .await
     }
@@ -16037,13 +16879,16 @@ impl CrudStore {
         admission: NewTaskExecutionAdmission,
         agent_action: AgentCommitInput,
     ) -> Result<Vec<AppendedTaskEvent>> {
-        self.run_serialized_write(|| {
-            self.append_task_events_with_execution_readmission_and_agent_action_once(
-                events.clone(),
-                event_timestamp_secs,
-                admission.clone(),
-                agent_action.clone(),
-            )
+        self.task_scheduler_event_change(Some(&events), async {
+            self.run_serialized_write(|| {
+                self.append_task_events_with_execution_readmission_and_agent_action_once(
+                    events.clone(),
+                    event_timestamp_secs,
+                    admission.clone(),
+                    agent_action.clone(),
+                )
+            })
+            .await
         })
         .await
     }
@@ -16057,13 +16902,18 @@ impl CrudStore {
         &self,
         input: TaskCreationCommitInput,
     ) -> Result<Vec<AppendedTaskEvent>> {
-        let root = input
-            .conversation_snapshot
-            .as_ref()
-            .map(|s| frozen_lifetime::PreparedFrozenRoot::history(&s.history_json))
-            .transpose()?;
-        self.run_serialized_write(|| self.commit_task_creation_once(input.clone(), root.clone()))
+        self.task_scheduler_event_change(None, async {
+            let root = input
+                .conversation_snapshot
+                .as_ref()
+                .map(|s| frozen_lifetime::PreparedFrozenRoot::history(&s.history_json))
+                .transpose()?;
+            self.run_serialized_write(|| {
+                self.commit_task_creation_once(input.clone(), root.clone())
+            })
             .await
+        })
+        .await
     }
 
     /// Creates an agent-owned Thread, its execution-scoped continuation route
@@ -16100,26 +16950,29 @@ impl CrudStore {
         occurrence_contracts: Vec<pioneer_protocol::TaskOccurrenceContract>,
         reserve_executions: Vec<(String, TaskExecutorKind)>,
     ) -> Result<Vec<AppendedTaskEvent>> {
-        if trigger.status != TaskTriggerStatus::Active {
-            return Ok(Vec::new());
-        }
-        let Some(expected_next_fire_at) = trigger.next_fire_at else {
-            return Ok(Vec::new());
-        };
-        // Schedule calculation and observation happen outside the writer.
-        // Revalidate their complete input, including same-time reschedules,
-        // in the existing atomic trigger + occurrence + Run transaction.
-        let expected_snapshot = (trigger.clone(), serde_json::to_string(&trigger.spec)?);
-        self.run_serialized_write(|| {
-            self.append_due_trigger_task_events_once(
-                trigger.id.clone(),
-                expected_next_fire_at,
-                Some(expected_snapshot.clone()),
-                now,
-                events.clone(),
-                occurrence_contracts.clone(),
-                reserve_executions.clone(),
-            )
+        self.task_scheduler_event_change(Some(&events), async {
+            if trigger.status != TaskTriggerStatus::Active {
+                return Ok(Vec::new());
+            }
+            let Some(expected_next_fire_at) = trigger.next_fire_at else {
+                return Ok(Vec::new());
+            };
+            // Schedule calculation and observation happen outside the writer.
+            // Revalidate their complete input, including same-time reschedules,
+            // in the existing atomic trigger + occurrence + Run transaction.
+            let expected_snapshot = (trigger.clone(), serde_json::to_string(&trigger.spec)?);
+            self.run_serialized_write(|| {
+                self.append_due_trigger_task_events_once(
+                    trigger.id.clone(),
+                    expected_next_fire_at,
+                    Some(expected_snapshot.clone()),
+                    now,
+                    events.clone(),
+                    occurrence_contracts.clone(),
+                    reserve_executions.clone(),
+                )
+            })
+            .await
         })
         .await
     }
@@ -16135,25 +16988,28 @@ impl CrudStore {
         error: TaskError,
         now: i64,
     ) -> Result<Vec<AppendedTaskEvent>> {
-        let Some(expected_next_fire_at) = trigger.next_fire_at else {
-            return Ok(Vec::new());
-        };
-        let expected_snapshot = (trigger.clone(), serde_json::to_string(&trigger.spec)?);
-        let events = vec![TaskEventPayload::TaskBlocked {
-            task_id: trigger.task_id.clone(),
-            error: Some(error),
-            blocked_at: now,
-        }];
-        self.run_serialized_write(|| {
-            self.append_due_trigger_task_events_once(
-                trigger.id.clone(),
-                expected_next_fire_at,
-                Some(expected_snapshot.clone()),
-                now,
-                events.clone(),
-                Vec::new(),
-                Vec::new(),
-            )
+        self.task_scheduler_event_change(None, async {
+            let Some(expected_next_fire_at) = trigger.next_fire_at else {
+                return Ok(Vec::new());
+            };
+            let expected_snapshot = (trigger.clone(), serde_json::to_string(&trigger.spec)?);
+            let events = vec![TaskEventPayload::TaskBlocked {
+                task_id: trigger.task_id.clone(),
+                error: Some(error),
+                blocked_at: now,
+            }];
+            self.run_serialized_write(|| {
+                self.append_due_trigger_task_events_once(
+                    trigger.id.clone(),
+                    expected_next_fire_at,
+                    Some(expected_snapshot.clone()),
+                    now,
+                    events.clone(),
+                    Vec::new(),
+                    Vec::new(),
+                )
+            })
+            .await
         })
         .await
     }
@@ -16168,13 +17024,47 @@ impl CrudStore {
         expected_next_fire_at: i64,
         now: i64,
     ) -> Result<Option<DueTaskTriggerReconciliation>> {
-        self.run_serialized_write(|| {
-            self.reconcile_due_trigger_for_nonexecuting_task_once(
-                trigger_id.to_owned(),
-                expected_next_fire_at,
-                now,
-            )
-        })
+        self.background_change(
+            "tasks.fanout",
+            async {
+                self.track_task_scheduler(
+                    async {
+                        self.run_serialized_write(|| {
+                            self.reconcile_due_trigger_for_nonexecuting_task_once(
+                                trigger_id.to_owned(),
+                                expected_next_fire_at,
+                                now,
+                            )
+                        })
+                        .await
+                    },
+                    |outcome, changes| {
+                        if outcome.is_some() {
+                            changes.reconstruct();
+                            true
+                        } else {
+                            false
+                        }
+                    },
+                    |outcome, wait| {
+                        wait.finish_events(
+                            outcome
+                                .as_ref()
+                                .map_or(&[][..], |outcome| outcome.appended_events.as_slice()),
+                        )
+                    },
+                )
+                .await
+            },
+            |outcome| {
+                outcome.as_ref().is_some_and(|outcome| {
+                    outcome
+                        .appended_events
+                        .iter()
+                        .any(|event| event.append_status.is_inserted())
+                })
+            },
+        )
         .await
     }
 
@@ -16268,10 +17158,24 @@ impl CrudStore {
         contract: &pioneer_protocol::TaskActorContract,
         now: i64,
     ) -> Result<()> {
-        repositories::task_actor_contract::upsert_task_actor_contract(
-            &self.connection,
-            contract,
-            now,
+        self.background_changes(
+            &["tasks.lifecycle", "tasks.live"],
+            async {
+                self.background_change(
+                    "tasks.live",
+                    async {
+                        repositories::task_actor_contract::upsert_task_actor_contract(
+                            &self.connection,
+                            contract,
+                            now,
+                        )
+                        .await
+                    },
+                    |_| true,
+                )
+                .await
+            },
+            |_| true,
         )
         .await
     }
@@ -16319,37 +17223,51 @@ impl CrudStore {
         contract: &pioneer_protocol::TaskOccurrenceContract,
         now: i64,
     ) -> Result<()> {
-        self.run_serialized_write(|| async {
-            let transaction = self
-                .connection
-                .begin()
-                .await
-                .context("failed to begin Task occurrence contract transition")?;
-            repositories::task_actor_contract::upsert_task_occurrence_contract(
-                &transaction,
-                contract,
-                now,
-            )
-            .await?;
-            if matches!(
-                contract.status,
-                pioneer_protocol::TaskOccurrenceStatus::Delivered
-                    | pioneer_protocol::TaskOccurrenceStatus::Failed
-                    | pioneer_protocol::TaskOccurrenceStatus::Cancelled
-            ) && let Some(root_id) = contract.work_graph_root_execution_id.as_deref()
-            {
-                repositories::agent_domain::close_agent_root_scope_if_drained(
-                    &transaction,
-                    root_id,
-                    unix_to_datetime(now),
+        self.background_changes(
+            &["tasks.lifecycle", "tasks.live"],
+            async {
+                self.background_change(
+                    "tasks.live",
+                    async {
+                        self.run_serialized_write(|| async {
+                            let transaction =
+                                self.connection.begin().await.context(
+                                    "failed to begin Task occurrence contract transition",
+                                )?;
+                            repositories::task_actor_contract::upsert_task_occurrence_contract(
+                                &transaction,
+                                contract,
+                                now,
+                            )
+                            .await?;
+                            if matches!(
+                                contract.status,
+                                pioneer_protocol::TaskOccurrenceStatus::Delivered
+                                    | pioneer_protocol::TaskOccurrenceStatus::Failed
+                                    | pioneer_protocol::TaskOccurrenceStatus::Cancelled
+                            ) && let Some(root_id) =
+                                contract.work_graph_root_execution_id.as_deref()
+                            {
+                                repositories::agent_domain::close_agent_root_scope_if_drained(
+                                    &transaction,
+                                    root_id,
+                                    unix_to_datetime(now),
+                                )
+                                .await?;
+                            }
+                            transaction
+                                .commit()
+                                .await
+                                .context("failed to commit Task occurrence contract transition")
+                        })
+                        .await
+                    },
+                    |_| true,
                 )
-                .await?;
-            }
-            transaction
-                .commit()
                 .await
-                .context("failed to commit Task occurrence contract transition")
-        })
+            },
+            |_| true,
+        )
         .await
     }
 
@@ -16423,35 +17341,61 @@ impl CrudStore {
         &self,
         snapshot: NewTaskRunConversationSnapshot,
     ) -> Result<TaskRunConversationSnapshotRecord> {
-        let root = frozen_lifetime::PreparedFrozenRoot::history(&snapshot.history_json)?;
-        self.run_serialized_write(|| async {
-            // An already accepted winner is a complete logical read. Do not
-            // acquire/replace its root or replay a committed write to hydrate.
-            if let Some(winner) = self
-                .get_task_run_conversation_snapshot(&snapshot.run_id)
-                .await?
-            {
-                return Ok(winner);
-            }
-            let insertion = snapshot.clone();
-            let transaction = self.connection.begin().await?;
-            if task_run_conversation_snapshot::find_by_run(&transaction, &snapshot.run_id)
-                .await?
-                .is_some()
-            {
-                return Err(repositories::portable_payload::PreflightRace.into());
-            }
-            let stored =
-                task_run_conversation_snapshot::insert_if_absent(&transaction, insertion, &root)
-                    .await?;
-            transaction.commit().await?;
-            // This transaction inserted the winner. Its original bytes are
-            // already prepared, so deletion immediately after commit is safe.
-            task_run_conversation_snapshot::record_from_insert(
-                stored,
-                snapshot.history_json.clone(),
-            )
-        })
+        self.background_changes(
+            &[
+                "storage.frozen",
+                "storage.portable",
+                "storage.html.retention",
+                "storage.html.history",
+            ],
+            async {
+                self.background_changes(
+                    &["tasks.lifecycle", "tasks.live"],
+                    async {
+                        let root =
+                            frozen_lifetime::PreparedFrozenRoot::history(&snapshot.history_json)?;
+                        self.run_serialized_write(|| async {
+                            // An already accepted winner is a complete logical read. Do not
+                            // acquire/replace its root or replay a committed write to hydrate.
+                            if let Some(winner) = self
+                                .get_task_run_conversation_snapshot(&snapshot.run_id)
+                                .await?
+                            {
+                                return Ok(winner);
+                            }
+                            let insertion = snapshot.clone();
+                            let transaction = self.connection.begin().await?;
+                            if task_run_conversation_snapshot::find_by_run(
+                                &transaction,
+                                &snapshot.run_id,
+                            )
+                            .await?
+                            .is_some()
+                            {
+                                return Err(repositories::portable_payload::PreflightRace.into());
+                            }
+                            let stored = task_run_conversation_snapshot::insert_if_absent(
+                                &transaction,
+                                insertion,
+                                &root,
+                            )
+                            .await?;
+                            transaction.commit().await?;
+                            // This transaction inserted the winner. Its original bytes are
+                            // already prepared, so deletion immediately after commit is safe.
+                            task_run_conversation_snapshot::record_from_insert(
+                                stored,
+                                snapshot.history_json.clone(),
+                            )
+                        })
+                        .await
+                    },
+                    |_| true,
+                )
+                .await
+            },
+            |_| true,
+        )
         .await
     }
 
@@ -16519,15 +17463,28 @@ impl CrudStore {
     }
 
     pub async fn delete_task_run_conversation_snapshot(&self, run_id: &str) -> Result<u64> {
-        self.run_serialized_write(|| async {
-            let tx = self.connection.begin().await?;
-            let deleted = task_run_conversation_snapshot::delete_by_run(&tx, run_id).await?;
-            if deleted > 0 {
-                repositories::task_child_producers::run(&tx, run_id).await?;
-            }
-            tx.commit().await?;
-            Ok(deleted)
-        })
+        self.background_changes(
+            &[
+                "storage.frozen",
+                "storage.portable",
+                "storage.html.retention",
+                "storage.html.history",
+            ],
+            async {
+                self.run_serialized_write(|| async {
+                    let tx = self.connection.begin().await?;
+                    let deleted =
+                        task_run_conversation_snapshot::delete_by_run(&tx, run_id).await?;
+                    if deleted > 0 {
+                        repositories::task_child_producers::run(&tx, run_id).await?;
+                    }
+                    tx.commit().await?;
+                    Ok(deleted)
+                })
+                .await
+            },
+            |changed| *changed > 0,
+        )
         .await
     }
 
@@ -16805,16 +17762,26 @@ impl CrudStore {
         repositories::task_event_fanout::has_pending(&self.with_maintenance_access().connection)
             .await
     }
+    pub async fn next_task_event_fanout_deadline(&self) -> Result<Option<i64>> {
+        repositories::task_event_fanout::next_deadline(&self.connection).await
+    }
     pub async fn claim_task_event_fanout(
         &self,
         row: &pioneer_entity::task_event_fanout_pending::Model,
         clock: &(dyn Fn() -> i64 + Send + Sync),
     ) -> Result<Option<TaskEventFanoutClaim>> {
-        repositories::task_event_fanout::claim(
-            &self.with_maintenance_access().connection,
-            row,
-            pioneer_protocol::generate_id(21),
-            clock,
+        self.background_change(
+            "tasks.fanout",
+            async {
+                repositories::task_event_fanout::claim(
+                    &self.with_maintenance_access().connection,
+                    row,
+                    pioneer_protocol::generate_id(21),
+                    clock,
+                )
+                .await
+            },
+            |outcome| outcome.is_some(),
         )
         .await
     }
@@ -16823,10 +17790,17 @@ impl CrudStore {
         claim: &TaskEventFanoutClaim,
         clock: &(dyn Fn() -> i64 + Send + Sync),
     ) -> Result<bool> {
-        repositories::task_event_fanout::renew(
-            &self.with_maintenance_access().connection,
-            claim,
-            clock,
+        self.background_change(
+            "tasks.fanout",
+            async {
+                repositories::task_event_fanout::renew(
+                    &self.with_maintenance_access().connection,
+                    claim,
+                    clock,
+                )
+                .await
+            },
+            |outcome| *outcome,
         )
         .await
     }
@@ -16836,7 +17810,14 @@ impl CrudStore {
         sequence: i64,
         clock: &(dyn Fn() -> i64 + Send + Sync),
     ) -> Result<()> {
-        repositories::task_event_fanout::ack(&self.connection, claim, sequence, clock).await
+        self.background_change(
+            "tasks.fanout",
+            async {
+                repositories::task_event_fanout::ack(&self.connection, claim, sequence, clock).await
+            },
+            |_| true,
+        )
+        .await
     }
     pub async fn release_task_event_fanout(
         &self,
@@ -16844,11 +17825,18 @@ impl CrudStore {
         outcome: TaskEventFanoutOutcome,
         clock: &(dyn Fn() -> i64 + Send + Sync),
     ) -> Result<()> {
-        repositories::task_event_fanout::release(
-            &self.with_maintenance_access().connection,
-            claim,
-            outcome,
-            clock,
+        self.background_change(
+            "tasks.fanout",
+            async {
+                repositories::task_event_fanout::release(
+                    &self.with_maintenance_access().connection,
+                    claim,
+                    outcome,
+                    clock,
+                )
+                .await
+            },
+            |_| true,
         )
         .await
     }
@@ -16895,11 +17883,18 @@ impl CrudStore {
         task_id: &str,
         sequence: i64,
     ) -> Result<()> {
-        task_event::advance_fanout_cursor(
-            &self.connection,
-            task_id,
-            sequence,
-            chrono::Utc::now().fixed_offset(),
+        self.background_change(
+            "tasks.fanout",
+            async {
+                task_event::advance_fanout_cursor(
+                    &self.connection,
+                    task_id,
+                    sequence,
+                    chrono::Utc::now().fixed_offset(),
+                )
+                .await
+            },
+            |_| true,
         )
         .await
     }
@@ -16978,18 +17973,41 @@ impl CrudStore {
         lease_until: i64,
         mode: TaskExecutionOccurrenceClaimMode,
     ) -> Result<Option<TaskRunExecution>> {
-        let run_id = run_id.to_owned();
-        let worker_id = worker_id.to_owned();
-        self.run_serialized_write(|| {
-            self.claim_task_run_execution_with_occurrence_once(
-                run_id.clone(),
-                executor_kind,
-                worker_id.clone(),
-                now,
-                lease_until,
-                mode,
-            )
-        })
+        self.track_task_wait_result(
+            async {
+                self.background_changes(
+                    &["tasks.lifecycle", "tasks.live"],
+                    async {
+                        self.background_change(
+                            "tasks.live",
+                            async {
+                                let run_id = run_id.to_owned();
+                                let worker_id = worker_id.to_owned();
+                                self.run_serialized_write(|| {
+                                    self.claim_task_run_execution_with_occurrence_once(
+                                        run_id.clone(),
+                                        executor_kind,
+                                        worker_id.clone(),
+                                        now,
+                                        lease_until,
+                                        mode,
+                                    )
+                                })
+                                .await
+                            },
+                            |value| value.is_some(),
+                        )
+                        .await
+                    },
+                    |value| value.is_some(),
+                )
+                .await
+            },
+            |row| {
+                row.as_ref()
+                    .map(|row| (row.task_id.clone(), Some(row.task_run_id.clone())))
+            },
+        )
         .await
     }
 
@@ -17100,41 +18118,48 @@ impl CrudStore {
         expected_run_status: TaskRunStatus,
         now: i64,
     ) -> Result<bool> {
-        let expected_run_status_db = task_run_status_to_db(expected_run_status).to_owned();
-        let desired_occurrence_status = match expected_run_status {
-            TaskRunStatus::Queued => pioneer_protocol::TaskOccurrenceStatus::Queued,
-            TaskRunStatus::WaitingReview => pioneer_protocol::TaskOccurrenceStatus::WaitingReview,
-            _ => bail!("active Task occurrence sync requires queued or waiting-review status"),
-        };
-        let run_id = run_id.to_owned();
-        self.run_serialized_write(|| {
-            let run_id = run_id.clone();
-            let expected_run_status_db = expected_run_status_db.clone();
-            let desired_occurrence_status = desired_occurrence_status.clone();
-            async move {
-                let transaction = self
-                    .connection
-                    .begin()
-                    .await
-                    .context("failed to begin active Task occurrence sync transaction")?;
-                let result = async {
-                    let Some(run) = task_run::find_run_by_id(&transaction, run_id.as_str()).await?
-                    else {
-                        return Ok(false);
-                    };
-                    if run.status != expected_run_status_db {
-                        return Ok(false);
+        self.background_change(
+            "tasks.live",
+            async {
+                let expected_run_status_db = task_run_status_to_db(expected_run_status).to_owned();
+                let desired_occurrence_status = match expected_run_status {
+                    TaskRunStatus::Queued => pioneer_protocol::TaskOccurrenceStatus::Queued,
+                    TaskRunStatus::WaitingReview => {
+                        pioneer_protocol::TaskOccurrenceStatus::WaitingReview
                     }
-                    let Some(mut occurrence) =
-                        repositories::task_actor_contract::find_task_occurrence_by_run_id(
-                            &transaction,
-                            run_id.as_str(),
-                        )
-                        .await?
-                    else {
-                        return Ok(false);
-                    };
-                    if occurrence.task_id != run.task_id
+                    _ => bail!(
+                        "active Task occurrence sync requires queued or waiting-review status"
+                    ),
+                };
+                let run_id = run_id.to_owned();
+                self.run_serialized_write(|| {
+                    let run_id = run_id.clone();
+                    let expected_run_status_db = expected_run_status_db.clone();
+                    let desired_occurrence_status = desired_occurrence_status.clone();
+                    async move {
+                        let transaction =
+                            self.connection.begin().await.context(
+                                "failed to begin active Task occurrence sync transaction",
+                            )?;
+                        let result = async {
+                            let Some(run) =
+                                task_run::find_run_by_id(&transaction, run_id.as_str()).await?
+                            else {
+                                return Ok(false);
+                            };
+                            if run.status != expected_run_status_db {
+                                return Ok(false);
+                            }
+                            let Some(mut occurrence) =
+                                repositories::task_actor_contract::find_task_occurrence_by_run_id(
+                                    &transaction,
+                                    run_id.as_str(),
+                                )
+                                .await?
+                            else {
+                                return Ok(false);
+                            };
+                            if occurrence.task_id != run.task_id
                         || occurrence.run_id != run.id
                         || repositories::task_actor_contract::is_terminal_task_occurrence_status(
                             &occurrence.status,
@@ -17142,33 +18167,36 @@ impl CrudStore {
                     {
                         return Ok(false);
                     }
-                    if occurrence.status != desired_occurrence_status {
-                        occurrence.status = desired_occurrence_status.clone();
-                        repositories::task_actor_contract::upsert_task_occurrence_contract(
-                            &transaction,
-                            &occurrence,
-                            now,
-                        )
-                        .await?;
+                            if occurrence.status != desired_occurrence_status {
+                                occurrence.status = desired_occurrence_status.clone();
+                                repositories::task_actor_contract::upsert_task_occurrence_contract(
+                                    &transaction,
+                                    &occurrence,
+                                    now,
+                                )
+                                .await?;
+                            }
+                            Ok(true)
+                        }
+                        .await;
+                        match result {
+                            Ok(revalidated) => {
+                                transaction.commit().await.context(
+                                    "failed to commit active Task occurrence sync transaction",
+                                )?;
+                                Ok(revalidated)
+                            }
+                            Err(error) => {
+                                let _ = transaction.rollback().await;
+                                Err(error)
+                            }
+                        }
                     }
-                    Ok(true)
-                }
-                .await;
-                match result {
-                    Ok(revalidated) => {
-                        transaction
-                            .commit()
-                            .await
-                            .context("failed to commit active Task occurrence sync transaction")?;
-                        Ok(revalidated)
-                    }
-                    Err(error) => {
-                        let _ = transaction.rollback().await;
-                        Err(error)
-                    }
-                }
-            }
-        })
+                })
+                .await
+            },
+            |value| *value,
+        )
         .await
     }
 
@@ -17202,9 +18230,19 @@ impl CrudStore {
         executor_kind: TaskExecutorKind,
         now: i64,
     ) -> Result<TaskRunExecution> {
-        self.run_serialized_write(|| {
-            self.reserve_execution_for_run_once(run_id.to_owned(), executor_kind, now)
-        })
+        self.track_task_wait_result(
+            async {
+                self.background_changes(
+                    &["tasks.live", "tasks.lifecycle"],
+                    self.run_serialized_write(|| {
+                        self.reserve_execution_for_run_once(run_id.to_owned(), executor_kind, now)
+                    }),
+                    |_| true,
+                )
+                .await
+            },
+            |row| Some((row.task_id.clone(), Some(row.task_run_id.clone()))),
+        )
         .await
     }
 
@@ -17246,34 +18284,98 @@ impl CrudStore {
         &self,
         input: AgentExecutionGraphCommitInput,
     ) -> Result<AgentExecutionGraphCommitResult> {
-        self.run_serialized_write(|| {
-            let input = input.clone();
-            async move {
-                let transaction = self
-                    .connection
-                    .begin()
-                    .await
-                    .context("failed to begin agent execution graph transaction")?;
-                match crate::repositories::agent_domain::commit_agent_execution_graph(
-                    &transaction,
-                    &input,
+        self.background_changes(
+            &[
+                "recovery.control",
+                "recovery.ledger",
+                "tasks.lifecycle",
+                "tasks.live",
+            ],
+            async {
+                self.background_changes(
+                    &["tasks.lifecycle", "tasks.live"],
+                    async {
+                        self.run_serialized_write(|| {
+                    let input = input.clone();
+                    async move {
+                        let transaction = self
+                            .connection
+                            .begin()
+                            .await
+                            .context("failed to begin agent execution graph transaction")?;
+                        match crate::repositories::agent_domain::commit_agent_execution_graph(
+                            &transaction,
+                            &input,
+                        )
+                        .await
+                        {
+                            Ok(result) => {
+                                transaction.commit().await.context(
+                                    "failed to commit agent execution graph transaction",
+                                )?;
+                                Ok(result)
+                            }
+                            Err(error) => {
+                                let _ = transaction.rollback().await;
+                                Err(error)
+                            }
+                        }
+                    }
+                })
+                .await
+                    },
+                    |_| true,
                 )
                 .await
-                {
-                    Ok(result) => {
-                        transaction
-                            .commit()
-                            .await
-                            .context("failed to commit agent execution graph transaction")?;
-                        Ok(result)
-                    }
-                    Err(error) => {
-                        let _ = transaction.rollback().await;
-                        Err(error)
-                    }
-                }
-            }
-        })
+            },
+            |_| true,
+        )
+        .await
+    }
+
+    pub async fn terminal_agent_action_ledger_upper(
+        &self,
+    ) -> Result<Option<repositories::agent_domain::AgentActionLedgerKey>> {
+        repositories::agent_domain::terminal_agent_action_ledger_upper(&self.connection).await
+    }
+    pub async fn compact_terminal_agent_action_ledger_page(
+        &self,
+        now: DateTimeWithTimeZone,
+        after: Option<&repositories::agent_domain::AgentActionLedgerKey>,
+        upper: &repositories::agent_domain::AgentActionLedgerKey,
+    ) -> Result<repositories::agent_domain::AgentActionLedgerPage> {
+        let change = self.background_work("recovery.ledger").changing();
+        let page = repositories::agent_domain::compact_terminal_agent_action_ledger_page(
+            &self.connection,
+            now,
+            after,
+            upper,
+        )
+        .await?;
+        if page.errors.is_empty() {
+            change.finish(page.summary.compacted_rows > 0);
+        }
+        // Any failed point commit can be ambiguous. Preserve settlement debt,
+        // while returning raw progress and healthy outcomes from this page.
+        Ok(page)
+    }
+
+    pub async fn wake_agent_action_outbox_for_execution(
+        &self,
+        execution_id: &str,
+        now: DateTimeWithTimeZone,
+    ) -> Result<u64> {
+        self.background_change(
+            "recovery.control",
+            self.run_serialized_write(|| {
+                repositories::agent_domain::wake_agent_action_outbox_for_execution(
+                    &self.connection,
+                    execution_id,
+                    now,
+                )
+            }),
+            |rows| *rows > 0,
+        )
         .await
     }
 
@@ -17284,36 +18386,46 @@ impl CrudStore {
         idle_timeout_secs: i64,
         hard_timeout_secs: i64,
     ) -> Result<Vec<PromotedAgentExecution>> {
-        self.run_serialized_write(|| {
-            let now = now.clone();
-            async move {
-                let transaction = self
-                    .connection
-                    .begin()
-                    .await
-                    .context("failed to begin queued AgentExecution promotion transaction")?;
-                match crate::repositories::agent_domain::promote_queued_agent_executions(
-                    &transaction,
-                    now,
-                    limit,
-                    idle_timeout_secs,
-                    hard_timeout_secs,
-                )
-                .await
-                {
-                    Ok(promoted) => {
-                        transaction.commit().await.context(
-                            "failed to commit queued AgentExecution promotion transaction",
+        self.background_changes(
+            &[
+                "recovery.control",
+                "recovery.ledger",
+                "tasks.lifecycle",
+                "tasks.live",
+            ],
+            async {
+                self.run_serialized_write(|| {
+                    let now = now.clone();
+                    async move {
+                        let transaction = self.connection.begin().await.context(
+                            "failed to begin queued AgentExecution promotion transaction",
                         )?;
-                        Ok(promoted)
+                        match crate::repositories::agent_domain::promote_queued_agent_executions(
+                            &transaction,
+                            now,
+                            limit,
+                            idle_timeout_secs,
+                            hard_timeout_secs,
+                        )
+                        .await
+                        {
+                            Ok(promoted) => {
+                                transaction.commit().await.context(
+                                    "failed to commit queued AgentExecution promotion transaction",
+                                )?;
+                                Ok(promoted)
+                            }
+                            Err(error) => {
+                                let _ = transaction.rollback().await;
+                                Err(error)
+                            }
+                        }
                     }
-                    Err(error) => {
-                        let _ = transaction.rollback().await;
-                        Err(error)
-                    }
-                }
-            }
-        })
+                })
+                .await
+            },
+            |rows| !rows.is_empty(),
+        )
         .await
     }
 
@@ -17326,29 +18438,52 @@ impl CrudStore {
         terminal_status: &str,
         finished_at: sea_orm::prelude::DateTimeWithTimeZone,
     ) -> Result<bool> {
-        self.run_serialized_write(|| {
-            let finished_at = finished_at.clone();
-            async move {
-                let transaction = self
-                    .connection
-                    .begin()
+        let outcome = self
+            .background_changes(
+                &[
+                    "recovery.control",
+                    "recovery.ledger",
+                    "tasks.lifecycle",
+                    "tasks.live",
+                ],
+                async {
+                    self.background_changes(
+                        &["tasks.lifecycle", "tasks.live"],
+                        async {
+                            self.run_serialized_write(|| {
+                                let finished_at = finished_at.clone();
+                                async move {
+                                    let transaction = self.connection.begin().await.context(
+                                        "failed to begin AgentExecution finalization transaction",
+                                    )?;
+                                    let finalized =
+                                    crate::repositories::agent_domain::finalize_agent_execution(
+                                        &transaction,
+                                        execution_id,
+                                        terminal_status,
+                                        finished_at,
+                                    )
+                                    .await?;
+                                    transaction.commit().await.context(
+                                        "failed to commit AgentExecution finalization transaction",
+                                    )?;
+                                    Ok(finalized)
+                                }
+                            })
+                            .await
+                        },
+                        |value| *value,
+                    )
                     .await
-                    .context("failed to begin AgentExecution finalization transaction")?;
-                let finalized = crate::repositories::agent_domain::finalize_agent_execution(
-                    &transaction,
-                    execution_id,
-                    terminal_status,
-                    finished_at,
-                )
-                .await?;
-                transaction
-                    .commit()
-                    .await
-                    .context("failed to commit AgentExecution finalization transaction")?;
-                Ok(finalized)
-            }
-        })
-        .await
+                },
+                |changed| *changed,
+            )
+            .await;
+        if outcome.as_ref().is_ok_and(|changed| *changed) {
+            self.background_work("recovery.control")
+                .dependency_released();
+        }
+        outcome
     }
 
     /// Outbox replay may release only the exact terminal Turn generation it
@@ -17360,52 +18495,96 @@ impl CrudStore {
         execution_id: &str,
         now: DateTimeWithTimeZone,
     ) -> Result<bool> {
-        self.run_serialized_write(|| async {
-            let tx = self.connection.begin().await?;
-            let Some(current) = turn_execution::find(&tx, &expected.turn_id).await? else {
-                return Ok(false);
-            };
-            if current.owner_id != expected.owner_id
-                || current.owner_generation != expected.owner_generation
-                || current.thread_id != expected.thread_id
-                || current.workspace_id != expected.workspace_id
-                || !turn_event_projection_stream_state::has_accepted_terminal(
-                    &tx,
-                    &expected.turn_id,
+        self.background_changes(
+            &[
+                "recovery.control",
+                "recovery.ledger",
+                "tasks.lifecycle",
+                "tasks.live",
+            ],
+            async {
+                self.track_compaction_history(
+                    true,
+                    4,
+                    async {
+                        self.background_changes(
+                            &["tasks.lifecycle", "tasks.live", "compaction.lifecycle"],
+                            async {
+                                self.run_serialized_write(|| async {
+                                    let tx = self.connection.begin().await?;
+                                    let Some(current) =
+                                        turn_execution::find(&tx, &expected.turn_id).await?
+                                    else {
+                                        return Ok(false);
+                                    };
+                                    if current.owner_id != expected.owner_id
+                                || current.owner_generation != expected.owner_generation
+                                || current.thread_id != expected.thread_id
+                                || current.workspace_id != expected.workspace_id
+                                || !turn_event_projection_stream_state::has_accepted_terminal(
+                                    &tx,
+                                    &expected.turn_id,
+                                )
+                                .await?
+                            {
+                                return Ok(false);
+                            }
+                                    let (turn_status, graph_status) = match current.status {
+                                        TurnExecutionStatus::Completed => {
+                                            (TurnStatus::Completed, "completed")
+                                        }
+                                        TurnExecutionStatus::Failed => {
+                                            (TurnStatus::Failed, "failed")
+                                        }
+                                        TurnExecutionStatus::Interrupted => {
+                                            (TurnStatus::Interrupted, "cancelled")
+                                        }
+                                        TurnExecutionStatus::Blocked => {
+                                            (TurnStatus::Blocked, "blocked")
+                                        }
+                                        _ => return Ok(false),
+                                    };
+                                    let saved = turn::find_turn_by_thread_and_id(
+                                        &tx,
+                                        &current.thread_id,
+                                        &current.turn_id,
+                                    )
+                                    .await?
+                                    .context("terminal Agent Turn disappeared")?;
+                                    let response =
+                                        repositories::agent_domain::load_agent_turn_response(
+                                            &tx,
+                                            &current.turn_id,
+                                        )
+                                        .await?
+                                        .context("terminal Agent Turn response disappeared")?;
+                                    if turn_status_from_db(&saved.status) != Some(turn_status)
+                                        || response.execution_id != execution_id
+                                    {
+                                        return Ok(false);
+                                    }
+                                    repositories::agent_domain::finalize_agent_execution(
+                                        &tx,
+                                        execution_id,
+                                        graph_status,
+                                        now,
+                                    )
+                                    .await?;
+                                    tx.commit().await?;
+                                    Ok(true)
+                                })
+                                .await
+                            },
+                            |value| *value,
+                        )
+                        .await
+                    },
+                    |changed| *changed,
                 )
-                .await?
-            {
-                return Ok(false);
-            }
-            let (turn_status, graph_status) = match current.status {
-                TurnExecutionStatus::Completed => (TurnStatus::Completed, "completed"),
-                TurnExecutionStatus::Failed => (TurnStatus::Failed, "failed"),
-                TurnExecutionStatus::Interrupted => (TurnStatus::Interrupted, "cancelled"),
-                TurnExecutionStatus::Blocked => (TurnStatus::Blocked, "blocked"),
-                _ => return Ok(false),
-            };
-            let saved = turn::find_turn_by_thread_and_id(&tx, &current.thread_id, &current.turn_id)
-                .await?
-                .context("terminal Agent Turn disappeared")?;
-            let response =
-                repositories::agent_domain::load_agent_turn_response(&tx, &current.turn_id)
-                    .await?
-                    .context("terminal Agent Turn response disappeared")?;
-            if turn_status_from_db(&saved.status) != Some(turn_status)
-                || response.execution_id != execution_id
-            {
-                return Ok(false);
-            }
-            repositories::agent_domain::finalize_agent_execution(
-                &tx,
-                execution_id,
-                graph_status,
-                now,
-            )
-            .await?;
-            tx.commit().await?;
-            Ok(true)
-        })
+                .await
+            },
+            |changed| *changed,
+        )
         .await
     }
 
@@ -17429,45 +18608,62 @@ impl CrudStore {
         finished_at: sea_orm::prelude::DateTimeWithTimeZone,
         initiator: Option<(&str, &str, &str)>,
     ) -> Result<Vec<AgentWorkGraphCancellationTarget>> {
-        self.run_serialized_write(|| {
-            let finished_at = finished_at.clone();
-            async move {
-                let transaction = self
-                    .connection
-                    .begin()
-                    .await
-                    .context("failed to begin Agent work-graph cancellation transaction")?;
-                if let Some((actor, thread, turn)) = initiator {
-                    repositories::task_cancellation_actor::record_graph(
-                        &transaction,
-                        actor,
-                        thread,
-                        turn,
-                        root_execution_id,
-                    )
-                    .await?;
-                }
-                match crate::repositories::agent_domain::cancel_agent_work_graph(
-                    &transaction,
-                    root_execution_id,
-                    terminal_reason,
-                    finished_at,
+        self.background_changes(
+            &[
+                "recovery.control",
+                "recovery.ledger",
+                "tasks.lifecycle",
+                "tasks.live",
+            ],
+            async {
+                self.background_changes(
+                    &["tasks.lifecycle", "tasks.live"],
+                    async {
+                        self.run_serialized_write(|| {
+                            let finished_at = finished_at.clone();
+                            async move {
+                                let transaction = self.connection.begin().await.context(
+                                    "failed to begin Agent work-graph cancellation transaction",
+                                )?;
+                                if let Some((actor, thread, turn)) = initiator {
+                                    repositories::task_cancellation_actor::record_graph(
+                                        &transaction,
+                                        actor,
+                                        thread,
+                                        turn,
+                                        root_execution_id,
+                                    )
+                                    .await?;
+                                }
+                                match crate::repositories::agent_domain::cancel_agent_work_graph(
+                                    &transaction,
+                                    root_execution_id,
+                                    terminal_reason,
+                                    finished_at,
+                                )
+                                .await
+                                {
+                                    Ok(targets) => {
+                                        transaction.commit().await.context(
+                                    "failed to commit Agent work-graph cancellation transaction",
+                                )?;
+                                        Ok(targets)
+                                    }
+                                    Err(error) => {
+                                        let _ = transaction.rollback().await;
+                                        Err(error)
+                                    }
+                                }
+                            }
+                        })
+                        .await
+                    },
+                    |targets| !targets.is_empty(),
                 )
                 .await
-                {
-                    Ok(targets) => {
-                        transaction.commit().await.context(
-                            "failed to commit Agent work-graph cancellation transaction",
-                        )?;
-                        Ok(targets)
-                    }
-                    Err(error) => {
-                        let _ = transaction.rollback().await;
-                        Err(error)
-                    }
-                }
-            }
-        })
+            },
+            |rows| !rows.is_empty(),
+        )
         .await
     }
 
@@ -17509,21 +18705,44 @@ impl CrudStore {
         now: i64,
         lease_until: i64,
     ) -> Result<Option<TaskRunExecution>> {
-        self.run_serialized_write(|| async {
-            let tx = self.connection.begin().await?;
-            let outcome = task_run_execution::claim_execution(
-                &tx,
-                execution_id,
-                worker_id,
-                unix_to_datetime(now),
-                unix_to_datetime(lease_until),
-            )
-            .await?
-            .map(task_run_execution_from_db_model)
-            .transpose()?;
-            tx.commit().await?;
-            Ok(outcome)
-        })
+        self.track_task_wait_result(
+            async {
+                self.background_changes(
+                    &["tasks.lifecycle", "tasks.live"],
+                    async {
+                        self.background_change(
+                            "tasks.live",
+                            async {
+                                self.run_serialized_write(|| async {
+                                    let tx = self.connection.begin().await?;
+                                    let outcome = task_run_execution::claim_execution(
+                                        &tx,
+                                        execution_id,
+                                        worker_id,
+                                        unix_to_datetime(now),
+                                        unix_to_datetime(lease_until),
+                                    )
+                                    .await?
+                                    .map(task_run_execution_from_db_model)
+                                    .transpose()?;
+                                    tx.commit().await?;
+                                    Ok(outcome)
+                                })
+                                .await
+                            },
+                            |value| value.is_some(),
+                        )
+                        .await
+                    },
+                    |value| value.is_some(),
+                )
+                .await
+            },
+            |row| {
+                row.as_ref()
+                    .map(|row| (row.task_id.clone(), Some(row.task_run_id.clone())))
+            },
+        )
         .await
     }
 
@@ -17533,20 +18752,43 @@ impl CrudStore {
         started_at: i64,
         lease_until: Option<i64>,
     ) -> Result<Option<TaskRunExecution>> {
-        self.run_serialized_write(|| async {
-            let tx = self.connection.begin().await?;
-            let outcome = task_run_execution::mark_execution_running(
-                &tx,
-                execution_id,
-                unix_to_datetime(started_at),
-                lease_until.map(unix_to_datetime),
-            )
-            .await?
-            .map(task_run_execution_from_db_model)
-            .transpose()?;
-            tx.commit().await?;
-            Ok(outcome)
-        })
+        self.track_task_wait_result(
+            async {
+                self.background_changes(
+                    &["tasks.lifecycle", "tasks.live"],
+                    async {
+                        self.background_change(
+                            "tasks.live",
+                            async {
+                                self.run_serialized_write(|| async {
+                                    let tx = self.connection.begin().await?;
+                                    let outcome = task_run_execution::mark_execution_running(
+                                        &tx,
+                                        execution_id,
+                                        unix_to_datetime(started_at),
+                                        lease_until.map(unix_to_datetime),
+                                    )
+                                    .await?
+                                    .map(task_run_execution_from_db_model)
+                                    .transpose()?;
+                                    tx.commit().await?;
+                                    Ok(outcome)
+                                })
+                                .await
+                            },
+                            |value| value.is_some(),
+                        )
+                        .await
+                    },
+                    |value| value.is_some(),
+                )
+                .await
+            },
+            |row| {
+                row.as_ref()
+                    .map(|row| (row.task_id.clone(), Some(row.task_run_id.clone())))
+            },
+        )
         .await
     }
 
@@ -17558,7 +18800,28 @@ impl CrudStore {
         result: Option<&TaskResult>,
         error: Option<&TaskError>,
     ) -> Result<Option<TaskRunExecution>> {
-        self.run_serialized_write(|| async {
+        self.track_task_wait_result(
+            async {
+                self.background_changes(
+                    &[
+                        "recovery.control",
+                        "recovery.ledger",
+                        "recovery.effects",
+                        "recovery.effects.retry",
+                        "recovery.effects.retention",
+                    ],
+                    async {
+                        self.track_compaction_history(
+                            true,
+                            4,
+                            async {
+                                self.background_changes(
+                                    &["tasks.lifecycle", "tasks.live"],
+                                    async {
+                                        self.background_change(
+                                            "tasks.live",
+                                            async {
+                                                self.run_serialized_write(|| async {
             let transaction = self
                 .connection
                 .begin()
@@ -17645,6 +18908,29 @@ impl CrudStore {
                 .transpose()
         })
         .await
+                                            },
+                                            |value| value.is_some(),
+                                        )
+                                        .await
+                                    },
+                                    |value| value.is_some(),
+                                )
+                                .await
+                            },
+                            |outcome| outcome.is_some(),
+                        )
+                        .await
+                    },
+                    |row| row.is_some(),
+                )
+                .await
+            },
+            |row| {
+                row.as_ref()
+                    .map(|row| (row.task_id.clone(), Some(row.task_run_id.clone())))
+            },
+        )
+        .await
     }
 
     pub async fn heartbeat_execution(
@@ -17680,44 +18966,61 @@ impl CrudStore {
         heartbeat_at: i64,
         lease_until: Option<i64>,
     ) -> Result<Option<TaskRunExecution>> {
-        self.run_serialized_write(|| async {
-            let transaction = self
-                .connection
-                .begin()
-                .await
-                .context("failed to begin execution heartbeat transition")?;
-            if let Some(expected_attempt_generation) = expected_attempt_generation {
-                let current = crate::repositories::agent_domain::heartbeat_agent_execution(
-                    &transaction,
-                    execution_id,
-                    expected_attempt_generation,
-                    unix_to_datetime(heartbeat_at),
-                    lease_until.map(unix_to_datetime),
-                )
-                .await?;
-                if !current {
-                    transaction
-                        .rollback()
+        self.track_task_wait_result(
+            async {
+                self.background_change(
+                    "tasks.live",
+                    async {
+                        self.run_serialized_write(|| async {
+                            let transaction = self
+                                .connection
+                                .begin()
+                                .await
+                                .context("failed to begin execution heartbeat transition")?;
+                            if let Some(expected_attempt_generation) = expected_attempt_generation {
+                                let current =
+                                    crate::repositories::agent_domain::heartbeat_agent_execution(
+                                        &transaction,
+                                        execution_id,
+                                        expected_attempt_generation,
+                                        unix_to_datetime(heartbeat_at),
+                                        lease_until.map(unix_to_datetime),
+                                    )
+                                    .await?;
+                                if !current {
+                                    transaction
+                                        .rollback()
+                                        .await
+                                        .context("failed to roll back stale agent heartbeat")?;
+                                    return Ok(None);
+                                }
+                            }
+                            let task_execution = task_run_execution::heartbeat_execution(
+                                &transaction,
+                                execution_id,
+                                unix_to_datetime(heartbeat_at),
+                                lease_until.map(unix_to_datetime),
+                            )
+                            .await?;
+                            transaction
+                                .commit()
+                                .await
+                                .context("failed to commit execution heartbeat transition")?;
+                            task_execution
+                                .map(task_run_execution_from_db_model)
+                                .transpose()
+                        })
                         .await
-                        .context("failed to roll back stale agent heartbeat")?;
-                    return Ok(None);
-                }
-            }
-            let task_execution = task_run_execution::heartbeat_execution(
-                &transaction,
-                execution_id,
-                unix_to_datetime(heartbeat_at),
-                lease_until.map(unix_to_datetime),
-            )
-            .await?;
-            transaction
-                .commit()
+                    },
+                    |value| value.is_some(),
+                )
                 .await
-                .context("failed to commit execution heartbeat transition")?;
-            task_execution
-                .map(task_run_execution_from_db_model)
-                .transpose()
-        })
+            },
+            |row| {
+                row.as_ref()
+                    .map(|row| (row.task_id.clone(), Some(row.task_run_id.clone())))
+            },
+        )
         .await
     }
 
@@ -17747,25 +19050,41 @@ impl CrudStore {
         &self,
         binding: TaskRunThreadBinding,
     ) -> Result<TaskRunThreadBinding> {
-        self.run_serialized_write(|| async {
-            task_run_thread_binding::upsert_binding(
-                &self.connection,
-                task_run_thread_binding::NewTaskRunThreadBinding {
-                    id: binding.id.clone(),
-                    task_id: binding.task_id.clone(),
-                    run_id: binding.run_id.clone(),
-                    execution_id: binding.execution_id.clone(),
-                    thread_id: binding.thread_id.clone(),
-                    binding_kind: binding.binding_kind,
-                    created_at: binding.created_at,
-                },
-            )
-            .await?;
-            let row = task_run_thread_binding::find_binding_by_id(&self.connection, &binding.id)
-                .await?
-                .context("task run thread binding missing after upsert")?;
-            task_run_thread_binding_from_db_model(row)
-        })
+        self.track_task_wait_result(
+            async {
+                self.background_changes(
+                    &["tasks.live", "tasks.lifecycle"],
+                    async {
+                        self.run_serialized_write(|| async {
+                            task_run_thread_binding::upsert_binding(
+                                &self.connection,
+                                task_run_thread_binding::NewTaskRunThreadBinding {
+                                    id: binding.id.clone(),
+                                    task_id: binding.task_id.clone(),
+                                    run_id: binding.run_id.clone(),
+                                    execution_id: binding.execution_id.clone(),
+                                    thread_id: binding.thread_id.clone(),
+                                    binding_kind: binding.binding_kind,
+                                    created_at: binding.created_at,
+                                },
+                            )
+                            .await?;
+                            let row = task_run_thread_binding::find_binding_by_id(
+                                &self.connection,
+                                &binding.id,
+                            )
+                            .await?
+                            .context("task run thread binding missing after upsert")?;
+                            task_run_thread_binding_from_db_model(row)
+                        })
+                        .await
+                    },
+                    |_| true,
+                )
+                .await
+            },
+            |row| Some((row.task_id.clone(), Some(row.run_id.clone()))),
+        )
         .await
     }
 
@@ -17815,36 +19134,53 @@ impl CrudStore {
     }
 
     pub async fn upsert_task_run_turn(&self, turn: TaskRunTurn) -> Result<TaskRunTurn> {
-        self.run_serialized_write(|| async {
-            let transaction = self.connection.begin().await?;
-            task_run_turn::upsert_turn(
-                &transaction,
-                task_run_turn::NewTaskRunTurn {
-                    id: turn.id.clone(),
-                    task_id: turn.task_id.clone(),
-                    run_id: turn.run_id.clone(),
-                    execution_id: turn.execution_id.clone(),
-                    thread_id: turn.thread_id.clone(),
-                    turn_id: turn.turn_id.clone(),
-                    kind: turn.kind,
-                    round: turn.round,
-                    sequence: turn.sequence,
-                    status: turn.status,
-                    reviews_candidate_id: turn.reviews_candidate_id.clone(),
-                    requested_by_candidate_id: turn.requested_by_candidate_id.clone(),
-                    requested_by_review_event_id: turn.requested_by_review_event_id.clone(),
-                    created_at: turn.created_at,
-                    started_at: turn.started_at,
-                    completed_at: turn.completed_at,
-                },
-            )
-            .await?;
-            let row = task_run_turn::find_turn_by_id(&transaction, &turn.id)
-                .await?
-                .context("task run turn missing after upsert")?;
-            transaction.commit().await?;
-            task_run_turn_from_db_model(row)
-        })
+        self.track_task_wait_result(
+            async {
+                self.background_changes(
+                    &["tasks.lifecycle", "tasks.live"],
+                    async {
+                        self.run_serialized_write(|| async {
+                            let transaction = self.connection.begin().await?;
+                            task_run_turn::upsert_turn(
+                                &transaction,
+                                task_run_turn::NewTaskRunTurn {
+                                    id: turn.id.clone(),
+                                    task_id: turn.task_id.clone(),
+                                    run_id: turn.run_id.clone(),
+                                    execution_id: turn.execution_id.clone(),
+                                    thread_id: turn.thread_id.clone(),
+                                    turn_id: turn.turn_id.clone(),
+                                    kind: turn.kind,
+                                    round: turn.round,
+                                    sequence: turn.sequence,
+                                    status: turn.status,
+                                    reviews_candidate_id: turn.reviews_candidate_id.clone(),
+                                    requested_by_candidate_id: turn
+                                        .requested_by_candidate_id
+                                        .clone(),
+                                    requested_by_review_event_id: turn
+                                        .requested_by_review_event_id
+                                        .clone(),
+                                    created_at: turn.created_at,
+                                    started_at: turn.started_at,
+                                    completed_at: turn.completed_at,
+                                },
+                            )
+                            .await?;
+                            let row = task_run_turn::find_turn_by_id(&transaction, &turn.id)
+                                .await?
+                                .context("task run turn missing after upsert")?;
+                            transaction.commit().await?;
+                            task_run_turn_from_db_model(row)
+                        })
+                        .await
+                    },
+                    |_| true,
+                )
+                .await
+            },
+            |row| Some((row.task_id.clone(), Some(row.run_id.clone()))),
+        )
         .await
     }
 
@@ -17887,13 +19223,34 @@ impl CrudStore {
         status: TaskRunTurnStatus,
         completed_at: Option<i64>,
     ) -> Result<Option<TaskRunTurn>> {
-        self.run_serialized_write(|| async {
-            let transaction = self.connection.begin().await?;
-            let row =
-                task_run_turn::update_turn_status(&transaction, id, status, completed_at).await?;
-            transaction.commit().await?;
-            row.map(task_run_turn_from_db_model).transpose()
-        })
+        self.track_task_wait_result(
+            async {
+                self.background_changes(
+                    &["tasks.lifecycle", "tasks.live"],
+                    async {
+                        self.run_serialized_write(|| async {
+                            let transaction = self.connection.begin().await?;
+                            let row = task_run_turn::update_turn_status(
+                                &transaction,
+                                id,
+                                status,
+                                completed_at,
+                            )
+                            .await?;
+                            transaction.commit().await?;
+                            row.map(task_run_turn_from_db_model).transpose()
+                        })
+                        .await
+                    },
+                    |value| value.is_some(),
+                )
+                .await
+            },
+            |row| {
+                row.as_ref()
+                    .map(|row| (row.task_id.clone(), Some(row.run_id.clone())))
+            },
+        )
         .await
     }
 
@@ -17901,14 +19258,25 @@ impl CrudStore {
         &self,
         candidate: TaskResultCandidate,
     ) -> Result<TaskResultCandidate> {
-        let prepared_candidate = task_result_candidate::prepare_protocol_candidate(&candidate)?;
-        let persisted = self
-            .run_serialized_write(|| {
-                let prepared_candidate = prepared_candidate.clone();
-                async {
-                    let candidate_status =
-                        crate::convention::task_result_candidate_status_to_db(candidate.status);
-                    let gate_resolution =
+        self.track_task_wait_result(
+            async {
+                self.background_change(
+                    "recovery.effects",
+                    async {
+                        self.background_change(
+                            "tasks.review",
+                            async {
+                                let prepared_candidate =
+                                    task_result_candidate::prepare_protocol_candidate(&candidate)?;
+                                let persisted = self
+                                    .run_serialized_write(|| {
+                                        let prepared_candidate = prepared_candidate.clone();
+                                        async {
+                                            let candidate_status =
+                                        crate::convention::task_result_candidate_status_to_db(
+                                            candidate.status,
+                                        );
+                                            let gate_resolution =
                         native_terminal_effect_outbox::prepare_gate_resolution_for_candidate(
                             &self.connection,
                             Some(native_terminal_effect_outbox::CandidateGateMetadata {
@@ -17922,44 +19290,57 @@ impl CrudStore {
                             None,
                         )
                         .await?;
-                    let transaction = self
-                        .connection
-                        .begin()
+                                            let transaction = self.connection.begin().await.context(
+                                        "failed to begin task result candidate upsert transaction",
+                                    )?;
+                                            let result = async {
+                                task_result_candidate::upsert_candidate(
+                                    &transaction,
+                                    prepared_candidate,
+                                )
+                                .await?;
+                                native_terminal_effect_outbox::apply_prepared_gate_resolution(
+                                    &transaction,
+                                    gate_resolution,
+                                )
+                                .await?;
+                                let row = task_result_candidate::find_candidate_by_id(
+                                    &transaction,
+                                    &candidate.id,
+                                )
+                                .await?
+                                .context("task result candidate missing after upsert")?;
+                                Ok(row)
+                            }
+                            .await;
+                                            match result {
+                                                Ok(candidate) => {
+                                                    transaction.commit().await.context(
+                                        "failed to commit task result candidate upsert transaction",
+                                    )?;
+                                                    Ok(candidate)
+                                                }
+                                                Err(error) => {
+                                                    let _ = transaction.rollback().await;
+                                                    Err(error)
+                                                }
+                                            }
+                                        }
+                                    })
+                                    .await?;
+                                task_result_candidate_from_db_model(persisted)
+                            },
+                            |_| true,
+                        )
                         .await
-                        .context("failed to begin task result candidate upsert transaction")?;
-                    let result = async {
-                        task_result_candidate::upsert_candidate(&transaction, prepared_candidate)
-                            .await?;
-                        native_terminal_effect_outbox::apply_prepared_gate_resolution(
-                            &transaction,
-                            gate_resolution,
-                        )
-                        .await?;
-                        let row = task_result_candidate::find_candidate_by_id(
-                            &transaction,
-                            &candidate.id,
-                        )
-                        .await?
-                        .context("task result candidate missing after upsert")?;
-                        Ok(row)
-                    }
-                    .await;
-                    match result {
-                        Ok(candidate) => {
-                            transaction.commit().await.context(
-                                "failed to commit task result candidate upsert transaction",
-                            )?;
-                            Ok(candidate)
-                        }
-                        Err(error) => {
-                            let _ = transaction.rollback().await;
-                            Err(error)
-                        }
-                    }
-                }
-            })
-            .await?;
-        task_result_candidate_from_db_model(persisted)
+                    },
+                    |_| true,
+                )
+                .await
+            },
+            |row| Some((row.task_id.clone(), Some(row.run_id.clone()))),
+        )
+        .await
     }
 
     pub async fn get_task_result_candidate(&self, id: &str) -> Result<Option<TaskResultCandidate>> {
@@ -18026,103 +19407,140 @@ impl CrudStore {
         resolved_at: Option<i64>,
         updated_at: i64,
     ) -> Result<Option<TaskResultCandidate>> {
-        let persisted = self
-            .run_serialized_write(|| async {
-                let Some(current) =
-                    task_result_candidate::find_candidate_by_id(&self.connection, id).await?
-                else {
-                    return Ok(None);
-                };
-                let desired_status =
-                    crate::convention::task_result_candidate_status_to_db(status).to_owned();
-                let gate_resolution =
-                    native_terminal_effect_outbox::prepare_gate_resolution_for_candidate(
-                        &self.connection,
-                        Some(native_terminal_effect_outbox::CandidateGateMetadata {
-                            id: current.id.clone(),
-                            status: desired_status.clone(),
-                            updated_at: if current.status == desired_status {
-                                current.updated_at
-                            } else {
-                                unix_to_datetime(updated_at)
-                            },
-                        }),
-                        current.thread_id.as_str(),
-                        current.turn_id.as_str(),
-                        unix_to_datetime(updated_at),
-                        None,
-                    )
-                    .await?;
-                let transaction = self
-                    .connection
-                    .begin()
-                    .await
-                    .context("failed to begin task result candidate resolution transaction")?;
-                let result = async {
-                    let candidate = task_result_candidate::update_candidate_resolution(
-                        &transaction,
-                        id,
-                        status,
-                        final_review_event_id,
-                        resolved_at,
-                        updated_at,
-                    )
-                    .await?;
-                    if let Some(candidate) = candidate.as_ref() {
-                        // The gate locator was read before writer admission.
-                        if candidate.thread_id != current.thread_id
-                            || candidate.turn_id != current.turn_id
-                        {
-                            bail!("candidate gate locator changed before resolution");
+        self.track_task_wait_result(
+            async {
+                self.background_change(
+                    "recovery.effects",
+                    async {
+                        self.background_change(
+                            "tasks.review",
+                            async {
+                                let persisted = self
+                                    .run_serialized_write(|| async {
+                                        let Some(current) =
+                                            task_result_candidate::find_candidate_by_id(
+                                                &self.connection,
+                                                id,
+                                            )
+                                            .await?
+                                        else {
+                                            return Ok(None);
+                                        };
+                                        let desired_status =
+                                            crate::convention::task_result_candidate_status_to_db(
+                                                status,
+                                            )
+                                            .to_owned();
+                                        let gate_resolution =
+                            native_terminal_effect_outbox::prepare_gate_resolution_for_candidate(
+                                &self.connection,
+                                Some(native_terminal_effect_outbox::CandidateGateMetadata {
+                                    id: current.id.clone(),
+                                    status: desired_status.clone(),
+                                    updated_at: if current.status == desired_status {
+                                        current.updated_at
+                                    } else {
+                                        unix_to_datetime(updated_at)
+                                    },
+                                }),
+                                current.thread_id.as_str(),
+                                current.turn_id.as_str(),
+                                unix_to_datetime(updated_at),
+                                None,
+                            )
+                            .await?;
+                                        let transaction = self.connection.begin().await.context(
+                                    "failed to begin task result candidate resolution transaction",
+                                )?;
+                                        let result = async {
+                            let candidate = task_result_candidate::update_candidate_resolution(
+                                &transaction,
+                                id,
+                                status,
+                                final_review_event_id,
+                                resolved_at,
+                                updated_at,
+                            )
+                            .await?;
+                            if let Some(candidate) = candidate.as_ref() {
+                                // The gate locator was read before writer admission.
+                                if candidate.thread_id != current.thread_id
+                                    || candidate.turn_id != current.turn_id
+                                {
+                                    bail!("candidate gate locator changed before resolution");
+                                }
+                                native_terminal_effect_outbox::apply_prepared_gate_resolution(
+                                    &transaction,
+                                    gate_resolution,
+                                )
+                                .await?;
+                            }
+                            Ok(candidate)
                         }
-                        native_terminal_effect_outbox::apply_prepared_gate_resolution(
-                            &transaction,
-                            gate_resolution,
+                        .await;
+                                        match result {
+                                            Ok(candidate) => {
+                                                transaction.commit().await.context(
+                                    "failed to commit task result candidate resolution transaction",
+                                )?;
+                                                Ok(candidate)
+                                            }
+                                            Err(error) => {
+                                                let _ = transaction.rollback().await;
+                                                Err(error)
+                                            }
+                                        }
+                                    })
+                                    .await?;
+                                persisted
+                                    .map(task_result_candidate_from_db_model)
+                                    .transpose()
+                            },
+                            |outcome| outcome.is_some(),
                         )
-                        .await?;
-                    }
-                    Ok(candidate)
-                }
-                .await;
-                match result {
-                    Ok(candidate) => {
-                        transaction.commit().await.context(
-                            "failed to commit task result candidate resolution transaction",
-                        )?;
-                        Ok(candidate)
-                    }
-                    Err(error) => {
-                        let _ = transaction.rollback().await;
-                        Err(error)
-                    }
-                }
-            })
-            .await?;
-        persisted
-            .map(task_result_candidate_from_db_model)
-            .transpose()
+                        .await
+                    },
+                    |row| row.is_some(),
+                )
+                .await
+            },
+            |row| {
+                row.as_ref()
+                    .map(|row| (row.task_id.clone(), Some(row.run_id.clone())))
+            },
+        )
+        .await
     }
 
     pub async fn upsert_task_result_review_event(
         &self,
         review_event: TaskResultReviewEvent,
     ) -> Result<TaskResultReviewEvent> {
-        let prepared_review =
-            task_result_review_event::prepare_protocol_review_event(&review_event)?;
-        self.run_serialized_write(|| {
-            let prepared_review = prepared_review.clone();
+        self.track_task_wait_result(
             async {
-                task_result_review_event::upsert_review_event(&self.connection, prepared_review)
-                    .await?;
-                let row = task_result_review_event::find_review_event_by_id(
-                    &self.connection,
-                    &review_event.id,
-                )
-                .await?
-                .context("task result review event missing after upsert")?;
-                task_result_review_event_from_db_model(row)
-            }
-        })
+                let prepared_review =
+                    task_result_review_event::prepare_protocol_review_event(&review_event)?;
+                self.run_serialized_write(|| {
+                    let prepared_review = prepared_review.clone();
+                    async {
+                        task_result_review_event::upsert_review_event(
+                            &self.connection,
+                            prepared_review,
+                        )
+                        .await?;
+                        let row = task_result_review_event::find_review_event_by_id(
+                            &self.connection,
+                            &review_event.id,
+                        )
+                        .await?
+                        .context("task result review event missing after upsert")?;
+                        task_result_review_event_from_db_model(row)
+                    }
+                })
+                .await
+            },
+            |row| Some((row.task_id.clone(), Some(row.run_id.clone()))),
+        )
         .await
     }
 
@@ -18498,9 +19916,44 @@ impl CrudStore {
         run_id: &str,
         claimed_at: i64,
     ) -> Result<Option<(TaskRun, AppendedTaskEvent)>> {
-        self.run_serialized_write(|| {
-            self.claim_task_run_for_dispatch_once(run_id.to_owned(), claimed_at, None)
-        })
+        self.background_change(
+            "tasks.fanout",
+            async {
+                self.track_task_scheduler(
+                    async {
+                        self.run_serialized_write(|| {
+                            self.claim_task_run_for_dispatch_once(
+                                run_id.to_owned(),
+                                claimed_at,
+                                None,
+                            )
+                        })
+                        .await
+                    },
+                    |outcome, changes| {
+                        if let Some((run, _)) = outcome {
+                            changes.record(&run.task_id);
+                            true
+                        } else {
+                            false
+                        }
+                    },
+                    |outcome, wait| {
+                        wait.finish_events(
+                            outcome
+                                .as_ref()
+                                .map_or(&[][..], |(_, event)| std::slice::from_ref(event)),
+                        )
+                    },
+                )
+                .await
+            },
+            |outcome| {
+                outcome
+                    .as_ref()
+                    .is_some_and(|(_, event)| event.append_status.is_inserted())
+            },
+        )
         .await
     }
 
@@ -18513,17 +19966,48 @@ impl CrudStore {
         claimed_at: i64,
         occurrence: pioneer_protocol::TaskOccurrenceContract,
     ) -> Result<Option<(TaskRun, AppendedTaskEvent)>> {
-        anyhow::ensure!(
-            occurrence.run_id == run_id,
-            "retry occurrence belongs to another run"
-        );
-        self.run_serialized_write(|| {
-            self.claim_task_run_for_dispatch_once(
-                run_id.to_owned(),
-                claimed_at,
-                Some(occurrence.clone()),
-            )
-        })
+        self.background_change(
+            "tasks.fanout",
+            async {
+                self.track_task_scheduler(
+                    async {
+                        anyhow::ensure!(
+                            occurrence.run_id == run_id,
+                            "retry occurrence belongs to another run"
+                        );
+                        self.run_serialized_write(|| {
+                            self.claim_task_run_for_dispatch_once(
+                                run_id.to_owned(),
+                                claimed_at,
+                                Some(occurrence.clone()),
+                            )
+                        })
+                        .await
+                    },
+                    |outcome, changes| {
+                        if let Some((run, _)) = outcome {
+                            changes.record(&run.task_id);
+                            true
+                        } else {
+                            false
+                        }
+                    },
+                    |outcome, wait| {
+                        wait.finish_events(
+                            outcome
+                                .as_ref()
+                                .map_or(&[][..], |(_, event)| std::slice::from_ref(event)),
+                        )
+                    },
+                )
+                .await
+            },
+            |outcome| {
+                outcome
+                    .as_ref()
+                    .is_some_and(|(_, event)| event.append_status.is_inserted())
+            },
+        )
         .await
     }
 
@@ -18648,9 +20132,40 @@ impl CrudStore {
         run_id: String,
         started_at: i64,
     ) -> Result<Option<AppendedTaskEvent>> {
-        self.run_serialized_write(|| {
-            self.append_task_run_started_once_inner(task_id.clone(), run_id.clone(), started_at)
-        })
+        self.background_change(
+            "tasks.fanout",
+            async {
+                self.track_task_scheduler(
+                    async {
+                        self.run_serialized_write(|| {
+                            self.append_task_run_started_once_inner(
+                                task_id.clone(),
+                                run_id.clone(),
+                                started_at,
+                            )
+                        })
+                        .await
+                    },
+                    |outcome, changes| {
+                        if let Some(event) = outcome {
+                            changes.record(&event.task_id);
+                            event.append_status.is_inserted()
+                        } else {
+                            false
+                        }
+                    },
+                    |outcome, wait| {
+                        wait.finish_events(outcome.as_ref().map_or(&[][..], std::slice::from_ref))
+                    },
+                )
+                .await
+            },
+            |outcome| {
+                outcome
+                    .as_ref()
+                    .is_some_and(|event| event.append_status.is_inserted())
+            },
+        )
         .await
     }
 
@@ -19260,10 +20775,36 @@ impl CrudStore {
         &self,
         request: EditTurnMessageRequest,
     ) -> Result<TurnMessageEditedEvent> {
-        self.run_serialized_write(|| {
-            let request = request.clone();
-            async move { self.edit_turn_message_once(request).await }
-        })
+        self.track_compaction_history(
+            true,
+            4,
+            async {
+                self.background_changes(
+                    &[
+                        "turn.projection",
+                        "recovery.control",
+                        "recovery.timeouts",
+                        "cli.commands",
+                        "storage.zstd",
+                        "turn.finalization",
+                        "turn.delivery.live",
+                        "turn.delivery.episodic",
+                        "storage.receipts",
+                        "storage.native_events",
+                    ],
+                    async {
+                        self.run_serialized_write(|| {
+                            let request = request.clone();
+                            async move { self.edit_turn_message_once(request).await }
+                        })
+                        .await
+                    },
+                    |_| true,
+                )
+                .await
+            },
+            |_| true,
+        )
         .await
     }
 
@@ -19468,10 +21009,36 @@ impl CrudStore {
         &self,
         request: DeleteTurnMessageRequest,
     ) -> Result<DeleteTurnMessageResult> {
-        self.run_serialized_write(|| {
-            let request = request.clone();
-            async move { self.delete_turn_message_once(request).await }
-        })
+        self.track_compaction_history(
+            true,
+            4,
+            async {
+                self.background_changes(
+                    &[
+                        "turn.projection",
+                        "recovery.control",
+                        "recovery.timeouts",
+                        "cli.commands",
+                        "storage.zstd",
+                        "turn.finalization",
+                        "turn.delivery.live",
+                        "turn.delivery.episodic",
+                        "storage.receipts",
+                        "storage.native_events",
+                    ],
+                    async {
+                        self.run_serialized_write(|| {
+                            let request = request.clone();
+                            async move { self.delete_turn_message_once(request).await }
+                        })
+                        .await
+                    },
+                    |_| true,
+                )
+                .await
+            },
+            |_| true,
+        )
         .await
     }
 
@@ -20018,49 +21585,80 @@ impl CrudStore {
         error: Option<&str>,
         event_timestamp_secs: i64,
     ) -> Result<bool> {
-        let _release_wake = (!matches!(status, TurnStatus::InProgress))
-            .then(|| execution_heartbeat::ReleaseWake(self.execution_heartbeats.clone()));
-        self.run_serialized_write(|| async {
-            let updated_at = unix_to_datetime(event_timestamp_secs);
-            let transaction = self
-                .connection
-                .begin()
-                .await
-                .context("failed to begin Turn status transaction")?;
-            let updated = turn::update_turn_status(
-                &transaction,
-                thread_id,
-                turn_id,
-                status,
-                error,
-                updated_at,
-            )
-            .await?;
-            if updated {
-                turn::append_turn_status_history(
-                    &transaction,
-                    turn_id,
-                    status,
-                    error.map(str::to_owned),
-                    updated_at,
+        self.track_compaction_history(
+            true,
+            4,
+            async {
+                self.background_changes(
+                    &[
+                        "tasks.lifecycle",
+                        "compaction.lifecycle",
+                        "turn.finalization",
+                        "storage.native_events",
+                        "recovery.control",
+                        "recovery.timeouts",
+                        "cli.commands",
+                        "cli.supervision",
+                        "storage.frozen",
+                        "storage.html.history",
+                        "storage.html.retention",
+                    ],
+                    async {
+                        let _release_wake =
+                            (!matches!(status, TurnStatus::InProgress)).then(|| {
+                                execution_heartbeat::ReleaseWake(self.execution_heartbeats.clone())
+                            });
+                        self.run_serialized_write(|| async {
+                            let updated_at = unix_to_datetime(event_timestamp_secs);
+                            let transaction = self
+                                .connection
+                                .begin()
+                                .await
+                                .context("failed to begin Turn status transaction")?;
+                            let updated = turn::update_turn_status(
+                                &transaction,
+                                thread_id,
+                                turn_id,
+                                status,
+                                error,
+                                updated_at,
+                            )
+                            .await?;
+                            if updated {
+                                turn::append_turn_status_history(
+                                    &transaction,
+                                    turn_id,
+                                    status,
+                                    error.map(str::to_owned),
+                                    updated_at,
+                                )
+                                .await?;
+                                if let Some(execution_status) =
+                                    terminal_turn_execution_status(status)
+                                {
+                                    turn_execution::mark_terminal(
+                                        &transaction,
+                                        turn_id,
+                                        execution_status,
+                                        updated_at,
+                                    )
+                                    .await?;
+                                }
+                            }
+                            transaction
+                                .commit()
+                                .await
+                                .context("failed to commit Turn status transaction")?;
+                            Ok(updated)
+                        })
+                        .await
+                    },
+                    |value| *value,
                 )
-                .await?;
-                if let Some(execution_status) = terminal_turn_execution_status(status) {
-                    turn_execution::mark_terminal(
-                        &transaction,
-                        turn_id,
-                        execution_status,
-                        updated_at,
-                    )
-                    .await?;
-                }
-            }
-            transaction
-                .commit()
                 .await
-                .context("failed to commit Turn status transaction")?;
-            Ok(updated)
-        })
+            },
+            |changed| *changed,
+        )
         .await
     }
 
@@ -21266,96 +22864,105 @@ impl CrudStore {
         upload_id: &str,
         event_timestamp_secs: i64,
     ) -> Result<bool> {
-        if installation.pack_id.is_some() || installation.pack_member_key.is_some() {
-            bail!("pack members must be inserted through a pack transaction");
-        }
-        if policy.workspace_id != installation.scope_key || policy.skill_id != installation.skill_id
-        {
-            bail!("skill install lifecycle requires the matching workspace policy");
-        }
-        if audit_records.is_empty()
-            || audit_records
-                .iter()
-                .any(|audit| audit.skill_id.as_str() != installation.skill_id.as_str())
-        {
-            bail!("skill install lifecycle requires audit events for the installed SkillId");
-        }
-        validate_atomic_skill_audit_bound(audit_records)?;
+        self.background_change(
+            "skills.uploads",
+            async {
+                if installation.pack_id.is_some() || installation.pack_member_key.is_some() {
+                    bail!("pack members must be inserted through a pack transaction");
+                }
+                if policy.workspace_id != installation.scope_key
+                    || policy.skill_id != installation.skill_id
+                {
+                    bail!("skill install lifecycle requires the matching workspace policy");
+                }
+                if audit_records.is_empty()
+                    || audit_records
+                        .iter()
+                        .any(|audit| audit.skill_id.as_str() != installation.skill_id.as_str())
+                {
+                    bail!(
+                        "skill install lifecycle requires audit events for the installed SkillId"
+                    );
+                }
+                validate_atomic_skill_audit_bound(audit_records)?;
 
-        let now = unix_to_datetime(event_timestamp_secs);
-        let prepared_installation =
-            skill_installation::prepare_skill_installation(installation, now, now);
-        let prepared_policy =
-            skill_workspace_policy::prepare_workspace_skill_policy(policy, now, now);
-        let prepared_audit_records =
-            skill_audit_event::prepare_skill_audit_events(None, audit_records);
-        let upload_id = upload_id.to_owned();
-        self.run_serialized_write(|| {
-            let prepared_installation = prepared_installation.clone();
-            let prepared_policy = prepared_policy.clone();
-            let prepared_audit_records = prepared_audit_records.clone();
-            let upload_id = upload_id.clone();
-            async move {
-                let transaction = self
-                    .connection
-                    .begin()
-                    .await
-                    .context("failed to begin skill lifecycle install transaction")?;
-                let result: Result<bool> = async {
-                    skill_installation::insert_prepared_skill_installations(
-                        &transaction,
-                        std::slice::from_ref(&prepared_installation),
-                    )
-                    .await?;
-                    skill_workspace_policy::upsert_prepared_workspace_skill_policies(
-                        &transaction,
-                        std::slice::from_ref(&prepared_policy),
-                    )
-                    .await?;
-                    skill_audit_event::insert_prepared_skill_audit_events(
-                        &transaction,
-                        prepared_audit_records,
-                    )
-                    .await?;
-                    if !skill_upload_session::transition_skill_upload_status(
-                        &transaction,
-                        upload_id.as_str(),
-                        &["finalized"],
-                        "consumed",
-                        None,
-                        Some(event_timestamp_secs),
-                        None,
-                        now,
-                    )
-                    .await?
-                    {
-                        return Ok(false);
-                    }
-                    Ok(true)
-                }
-                .await;
-                match result {
-                    Ok(true) => {
-                        transaction
-                            .commit()
+                let now = unix_to_datetime(event_timestamp_secs);
+                let prepared_installation =
+                    skill_installation::prepare_skill_installation(installation, now, now);
+                let prepared_policy =
+                    skill_workspace_policy::prepare_workspace_skill_policy(policy, now, now);
+                let prepared_audit_records =
+                    skill_audit_event::prepare_skill_audit_events(None, audit_records);
+                let upload_id = upload_id.to_owned();
+                self.run_serialized_write(|| {
+                    let prepared_installation = prepared_installation.clone();
+                    let prepared_policy = prepared_policy.clone();
+                    let prepared_audit_records = prepared_audit_records.clone();
+                    let upload_id = upload_id.clone();
+                    async move {
+                        let transaction = self
+                            .connection
+                            .begin()
                             .await
-                            .context("failed to commit skill lifecycle install")?;
-                        Ok(true)
+                            .context("failed to begin skill lifecycle install transaction")?;
+                        let result: Result<bool> = async {
+                            skill_installation::insert_prepared_skill_installations(
+                                &transaction,
+                                std::slice::from_ref(&prepared_installation),
+                            )
+                            .await?;
+                            skill_workspace_policy::upsert_prepared_workspace_skill_policies(
+                                &transaction,
+                                std::slice::from_ref(&prepared_policy),
+                            )
+                            .await?;
+                            skill_audit_event::insert_prepared_skill_audit_events(
+                                &transaction,
+                                prepared_audit_records,
+                            )
+                            .await?;
+                            if !skill_upload_session::transition_skill_upload_status(
+                                &transaction,
+                                upload_id.as_str(),
+                                &["finalized"],
+                                "consumed",
+                                None,
+                                Some(event_timestamp_secs),
+                                None,
+                                now,
+                            )
+                            .await?
+                            {
+                                return Ok(false);
+                            }
+                            Ok(true)
+                        }
+                        .await;
+                        match result {
+                            Ok(true) => {
+                                transaction
+                                    .commit()
+                                    .await
+                                    .context("failed to commit skill lifecycle install")?;
+                                Ok(true)
+                            }
+                            Ok(false) => {
+                                transaction.rollback().await.context(
+                                    "failed to roll back conflicted skill lifecycle install",
+                                )?;
+                                Ok(false)
+                            }
+                            Err(error) => {
+                                let _ = transaction.rollback().await;
+                                Err(error)
+                            }
+                        }
                     }
-                    Ok(false) => {
-                        transaction
-                            .rollback()
-                            .await
-                            .context("failed to roll back conflicted skill lifecycle install")?;
-                        Ok(false)
-                    }
-                    Err(error) => {
-                        let _ = transaction.rollback().await;
-                        Err(error)
-                    }
-                }
-            }
-        })
+                })
+                .await
+            },
+            |_| true,
+        )
         .await
     }
 
@@ -21579,94 +23186,105 @@ impl CrudStore {
         upload_id: &str,
         event_timestamp_secs: i64,
     ) -> Result<bool> {
-        if audit_records.is_empty()
-            || audit_records
-                .iter()
-                .any(|audit| &audit.skill_id != skill_id)
-        {
-            bail!("skill update lifecycle requires audit events for the updated SkillId");
-        }
-        validate_atomic_skill_audit_bound(audit_records)?;
+        self.background_change(
+            "skills.uploads",
+            async {
+                if audit_records.is_empty()
+                    || audit_records
+                        .iter()
+                        .any(|audit| &audit.skill_id != skill_id)
+                {
+                    bail!("skill update lifecycle requires audit events for the updated SkillId");
+                }
+                validate_atomic_skill_audit_bound(audit_records)?;
 
-        let fence = prepare_generic_skill_update_fence(&self.connection, skill_id, patch).await?;
-        let now = unix_to_datetime(event_timestamp_secs);
-        let skill_id = skill_id.clone();
-        let patch = patch.clone();
-        let prepared_audit_records =
-            skill_audit_event::prepare_skill_audit_events(None, audit_records);
-        let upload_id = upload_id.to_owned();
-        self.run_serialized_write(|| {
-            let skill_id = skill_id.clone();
-            let patch = patch.clone();
-            let prepared_audit_records = prepared_audit_records.clone();
-            let upload_id = upload_id.clone();
-            let fence = fence.clone();
-            async move {
-                let transaction = self
-                    .connection
-                    .begin()
-                    .await
-                    .context("failed to begin skill lifecycle update transaction")?;
-                let result: Result<bool> = async {
-                    if !revalidate_generic_skill_update_fence(&transaction, &skill_id, &fence)
-                        .await?
-                    {
-                        return Ok(false);
-                    }
-                    if !skill_installation::update_skill_installation(
-                        &transaction,
-                        &skill_id,
-                        &patch,
-                        now,
-                    )
-                    .await?
-                    {
-                        return Ok(false);
-                    }
-                    skill_audit_event::insert_prepared_skill_audit_events(
-                        &transaction,
-                        prepared_audit_records,
-                    )
-                    .await?;
-                    if !skill_upload_session::transition_skill_upload_status(
-                        &transaction,
-                        upload_id.as_str(),
-                        &["finalized"],
-                        "consumed",
-                        None,
-                        Some(event_timestamp_secs),
-                        None,
-                        now,
-                    )
-                    .await?
-                    {
-                        return Ok(false);
-                    }
-                    Ok(true)
-                }
-                .await;
-                match result {
-                    Ok(true) => {
-                        transaction
-                            .commit()
+                let fence =
+                    prepare_generic_skill_update_fence(&self.connection, skill_id, patch).await?;
+                let now = unix_to_datetime(event_timestamp_secs);
+                let skill_id = skill_id.clone();
+                let patch = patch.clone();
+                let prepared_audit_records =
+                    skill_audit_event::prepare_skill_audit_events(None, audit_records);
+                let upload_id = upload_id.to_owned();
+                self.run_serialized_write(|| {
+                    let skill_id = skill_id.clone();
+                    let patch = patch.clone();
+                    let prepared_audit_records = prepared_audit_records.clone();
+                    let upload_id = upload_id.clone();
+                    let fence = fence.clone();
+                    async move {
+                        let transaction = self
+                            .connection
+                            .begin()
                             .await
-                            .context("failed to commit skill lifecycle update")?;
-                        Ok(true)
+                            .context("failed to begin skill lifecycle update transaction")?;
+                        let result: Result<bool> = async {
+                            if !revalidate_generic_skill_update_fence(
+                                &transaction,
+                                &skill_id,
+                                &fence,
+                            )
+                            .await?
+                            {
+                                return Ok(false);
+                            }
+                            if !skill_installation::update_skill_installation(
+                                &transaction,
+                                &skill_id,
+                                &patch,
+                                now,
+                            )
+                            .await?
+                            {
+                                return Ok(false);
+                            }
+                            skill_audit_event::insert_prepared_skill_audit_events(
+                                &transaction,
+                                prepared_audit_records,
+                            )
+                            .await?;
+                            if !skill_upload_session::transition_skill_upload_status(
+                                &transaction,
+                                upload_id.as_str(),
+                                &["finalized"],
+                                "consumed",
+                                None,
+                                Some(event_timestamp_secs),
+                                None,
+                                now,
+                            )
+                            .await?
+                            {
+                                return Ok(false);
+                            }
+                            Ok(true)
+                        }
+                        .await;
+                        match result {
+                            Ok(true) => {
+                                transaction
+                                    .commit()
+                                    .await
+                                    .context("failed to commit skill lifecycle update")?;
+                                Ok(true)
+                            }
+                            Ok(false) => {
+                                transaction.rollback().await.context(
+                                    "failed to roll back conflicted skill lifecycle update",
+                                )?;
+                                Ok(false)
+                            }
+                            Err(error) => {
+                                let _ = transaction.rollback().await;
+                                Err(error)
+                            }
+                        }
                     }
-                    Ok(false) => {
-                        transaction
-                            .rollback()
-                            .await
-                            .context("failed to roll back conflicted skill lifecycle update")?;
-                        Ok(false)
-                    }
-                    Err(error) => {
-                        let _ = transaction.rollback().await;
-                        Err(error)
-                    }
-                }
-            }
-        })
+                })
+                .await
+            },
+            |_| true,
+        )
         .await
     }
 
@@ -21734,6 +23352,10 @@ impl CrudStore {
         after: Option<&str>,
     ) -> Result<Vec<pioneer_entity::workspace::Model>> {
         repositories::membership::list_active_workspace_page(&self.connection, after).await
+    }
+
+    pub async fn list_active_workspace_id_page(&self, after: Option<&str>) -> Result<Vec<String>> {
+        repositories::membership::list_active_workspace_id_page(&self.connection, after).await
     }
 
     /// Pending import registration is fenced by the same Workspace snapshot as
@@ -22123,123 +23745,132 @@ impl CrudStore {
         upload_id: &str,
         event_timestamp_secs: i64,
     ) -> Result<bool> {
-        validate_skill_pack_children_scope(parent, children)?;
-        validate_atomic_skill_audit_bound(audit_records)?;
-        let child_ids = children
-            .iter()
-            .map(|child| child.skill_id.clone())
-            .collect::<HashSet<_>>();
-        if child_ids.len() != children.len() {
-            bail!("skill pack install children must have unique SkillId values");
-        }
-        let policy_ids = policies
-            .iter()
-            .map(|policy| {
-                if policy.workspace_id != parent.scope_key {
-                    bail!(
-                        "skill policy `{}` scope does not match pack `{}`",
-                        policy.skill_id,
-                        parent.pack_id
-                    );
+        self.background_change(
+            "skills.uploads",
+            async {
+                validate_skill_pack_children_scope(parent, children)?;
+                validate_atomic_skill_audit_bound(audit_records)?;
+                let child_ids = children
+                    .iter()
+                    .map(|child| child.skill_id.clone())
+                    .collect::<HashSet<_>>();
+                if child_ids.len() != children.len() {
+                    bail!("skill pack install children must have unique SkillId values");
                 }
-                Ok(policy.skill_id.clone())
-            })
-            .collect::<Result<HashSet<_>>>()?;
-        if policy_ids != child_ids || policies.len() != children.len() {
-            bail!("skill pack install requires exactly one policy per child");
-        }
-        let audit_ids = audit_records
-            .iter()
-            .map(|audit| audit.skill_id.clone())
-            .collect::<HashSet<_>>();
-        if audit_ids != child_ids {
-            bail!("skill pack install requires child audit coverage");
-        }
-        let now = unix_to_datetime(event_timestamp_secs);
-        let prepared_parent = skill_pack_installation::prepare_skill_pack_installation(parent);
-        let prepared_children = children
-            .iter()
-            .map(|child| skill_installation::prepare_skill_installation(child, now, now))
-            .collect::<Vec<_>>();
-        let prepared_policies = policies
-            .iter()
-            .map(|policy| skill_workspace_policy::prepare_workspace_skill_policy(policy, now, now))
-            .collect::<Vec<_>>();
-        let prepared_audit_records =
-            skill_audit_event::prepare_skill_audit_events(None, audit_records);
-        let upload_id = upload_id.to_owned();
-        self.run_serialized_write(|| {
-            let prepared_parent = prepared_parent.clone();
-            let prepared_children = prepared_children.clone();
-            let prepared_policies = prepared_policies.clone();
-            let prepared_audit_records = prepared_audit_records.clone();
-            let upload_id = upload_id.clone();
-            async move {
-                let transaction = self
-                    .connection
-                    .begin()
-                    .await
-                    .context("failed to begin skill pack lifecycle install transaction")?;
-                let result: Result<bool> = async {
-                    skill_pack_installation::insert_prepared_skill_pack_installation(
-                        &transaction,
-                        prepared_parent,
-                    )
-                    .await?;
-                    skill_installation::insert_prepared_skill_installations(
-                        &transaction,
-                        prepared_children.as_slice(),
-                    )
-                    .await?;
-                    skill_workspace_policy::upsert_prepared_workspace_skill_policies(
-                        &transaction,
-                        prepared_policies.as_slice(),
-                    )
-                    .await?;
-                    skill_audit_event::insert_prepared_skill_audit_events(
-                        &transaction,
-                        prepared_audit_records,
-                    )
-                    .await?;
-                    if !skill_upload_session::transition_skill_upload_status(
-                        &transaction,
-                        upload_id.as_str(),
-                        &["finalized"],
-                        "consumed",
-                        None,
-                        Some(event_timestamp_secs),
-                        None,
-                        now,
-                    )
-                    .await?
-                    {
-                        return Ok(false);
-                    }
-                    Ok(true)
+                let policy_ids = policies
+                    .iter()
+                    .map(|policy| {
+                        if policy.workspace_id != parent.scope_key {
+                            bail!(
+                                "skill policy `{}` scope does not match pack `{}`",
+                                policy.skill_id,
+                                parent.pack_id
+                            );
+                        }
+                        Ok(policy.skill_id.clone())
+                    })
+                    .collect::<Result<HashSet<_>>>()?;
+                if policy_ids != child_ids || policies.len() != children.len() {
+                    bail!("skill pack install requires exactly one policy per child");
                 }
-                .await;
-                match result {
-                    Ok(true) => {
-                        transaction
-                            .commit()
-                            .await
-                            .context("failed to commit skill pack lifecycle install")?;
-                        Ok(true)
-                    }
-                    Ok(false) => {
-                        transaction
-                            .rollback()
-                            .await
-                            .context("failed to roll back conflicted skill pack install")?;
-                        Ok(false)
-                    }
-                    Err(error) => {
-                        let _ = transaction.rollback().await;
-                        Err(error)
-                    }
+                let audit_ids = audit_records
+                    .iter()
+                    .map(|audit| audit.skill_id.clone())
+                    .collect::<HashSet<_>>();
+                if audit_ids != child_ids {
+                    bail!("skill pack install requires child audit coverage");
                 }
-            }
-        })
+                let now = unix_to_datetime(event_timestamp_secs);
+                let prepared_parent =
+                    skill_pack_installation::prepare_skill_pack_installation(parent);
+                let prepared_children = children
+                    .iter()
+                    .map(|child| skill_installation::prepare_skill_installation(child, now, now))
+                    .collect::<Vec<_>>();
+                let prepared_policies = policies
+                    .iter()
+                    .map(|policy| {
+                        skill_workspace_policy::prepare_workspace_skill_policy(policy, now, now)
+                    })
+                    .collect::<Vec<_>>();
+                let prepared_audit_records =
+                    skill_audit_event::prepare_skill_audit_events(None, audit_records);
+                let upload_id = upload_id.to_owned();
+                self.run_serialized_write(|| {
+                    let prepared_parent = prepared_parent.clone();
+                    let prepared_children = prepared_children.clone();
+                    let prepared_policies = prepared_policies.clone();
+                    let prepared_audit_records = prepared_audit_records.clone();
+                    let upload_id = upload_id.clone();
+                    async move {
+                        let transaction =
+                            self.connection.begin().await.context(
+                                "failed to begin skill pack lifecycle install transaction",
+                            )?;
+                        let result: Result<bool> = async {
+                            skill_pack_installation::insert_prepared_skill_pack_installation(
+                                &transaction,
+                                prepared_parent,
+                            )
+                            .await?;
+                            skill_installation::insert_prepared_skill_installations(
+                                &transaction,
+                                prepared_children.as_slice(),
+                            )
+                            .await?;
+                            skill_workspace_policy::upsert_prepared_workspace_skill_policies(
+                                &transaction,
+                                prepared_policies.as_slice(),
+                            )
+                            .await?;
+                            skill_audit_event::insert_prepared_skill_audit_events(
+                                &transaction,
+                                prepared_audit_records,
+                            )
+                            .await?;
+                            if !skill_upload_session::transition_skill_upload_status(
+                                &transaction,
+                                upload_id.as_str(),
+                                &["finalized"],
+                                "consumed",
+                                None,
+                                Some(event_timestamp_secs),
+                                None,
+                                now,
+                            )
+                            .await?
+                            {
+                                return Ok(false);
+                            }
+                            Ok(true)
+                        }
+                        .await;
+                        match result {
+                            Ok(true) => {
+                                transaction
+                                    .commit()
+                                    .await
+                                    .context("failed to commit skill pack lifecycle install")?;
+                                Ok(true)
+                            }
+                            Ok(false) => {
+                                transaction
+                                    .rollback()
+                                    .await
+                                    .context("failed to roll back conflicted skill pack install")?;
+                                Ok(false)
+                            }
+                            Err(error) => {
+                                let _ = transaction.rollback().await;
+                                Err(error)
+                            }
+                        }
+                    }
+                })
+                .await
+            },
+            |_| true,
+        )
         .await
     }
 
@@ -22381,220 +24012,231 @@ impl CrudStore {
         upload_id: &str,
         event_timestamp_secs: i64,
     ) -> Result<bool> {
-        if parent.pack_id != expected_parent.pack_id
-            || parent.scope_key != expected_parent.scope_key
-            || parent.source_kind != expected_parent.source_kind
-            || parent.created_at_unix != expected_parent.created_at_unix
-        {
-            bail!("skill pack update cannot change parent identity or source");
-        }
-        validate_skill_pack_children_scope(expected_parent, expected_children)?;
-        validate_skill_pack_child_diff(parent, expected_children, diff)?;
-        validate_atomic_skill_audit_bound(audit_records)?;
-        let added_ids = diff
-            .added
-            .iter()
-            .map(|child| child.skill_id.clone())
-            .collect::<HashSet<_>>();
-        let policy_ids = added_policies
-            .iter()
-            .map(|policy| {
-                if policy.workspace_id != parent.scope_key {
-                    bail!(
-                        "added skill policy `{}` scope does not match pack",
-                        policy.skill_id
-                    );
+        self.background_change(
+            "skills.uploads",
+            async {
+                if parent.pack_id != expected_parent.pack_id
+                    || parent.scope_key != expected_parent.scope_key
+                    || parent.source_kind != expected_parent.source_kind
+                    || parent.created_at_unix != expected_parent.created_at_unix
+                {
+                    bail!("skill pack update cannot change parent identity or source");
                 }
-                Ok(policy.skill_id.clone())
-            })
-            .collect::<Result<HashSet<_>>>()?;
-        if policy_ids != added_ids || added_policies.len() != diff.added.len() {
-            bail!("pack update requires exactly one default policy per added child");
-        }
-        let affected_ids = diff
-            .retained
-            .iter()
-            .map(|child| child.skill_id.clone())
-            .chain(diff.added.iter().map(|child| child.skill_id.clone()))
-            .chain(diff.removed.iter().cloned())
-            .collect::<HashSet<_>>();
-        let audit_ids = audit_records
-            .iter()
-            .map(|audit| audit.skill_id.clone())
-            .collect::<HashSet<_>>();
-        if audit_ids != affected_ids {
-            bail!("skill pack update requires affected-child audit coverage");
-        }
+                validate_skill_pack_children_scope(expected_parent, expected_children)?;
+                validate_skill_pack_child_diff(parent, expected_children, diff)?;
+                validate_atomic_skill_audit_bound(audit_records)?;
+                let added_ids = diff
+                    .added
+                    .iter()
+                    .map(|child| child.skill_id.clone())
+                    .collect::<HashSet<_>>();
+                let policy_ids = added_policies
+                    .iter()
+                    .map(|policy| {
+                        if policy.workspace_id != parent.scope_key {
+                            bail!(
+                                "added skill policy `{}` scope does not match pack",
+                                policy.skill_id
+                            );
+                        }
+                        Ok(policy.skill_id.clone())
+                    })
+                    .collect::<Result<HashSet<_>>>()?;
+                if policy_ids != added_ids || added_policies.len() != diff.added.len() {
+                    bail!("pack update requires exactly one default policy per added child");
+                }
+                let affected_ids = diff
+                    .retained
+                    .iter()
+                    .map(|child| child.skill_id.clone())
+                    .chain(diff.added.iter().map(|child| child.skill_id.clone()))
+                    .chain(diff.removed.iter().cloned())
+                    .collect::<HashSet<_>>();
+                let audit_ids = audit_records
+                    .iter()
+                    .map(|audit| audit.skill_id.clone())
+                    .collect::<HashSet<_>>();
+                if audit_ids != affected_ids {
+                    bail!("skill pack update requires affected-child audit coverage");
+                }
 
-        let Some(expected_parent_model) = skill_pack_installation::find_skill_pack_installation(
-            &self.connection,
-            expected_parent.scope_key.as_str(),
-            &expected_parent.pack_id,
-        )
-        .await?
-        else {
-            return Ok(false);
-        };
-        if skill_pack_installation_record_from_model(expected_parent_model.clone())?
-            != *expected_parent
-        {
-            return Ok(false);
-        }
-        let expected_children_models = skill_installation::list_skill_installations_by_pack_id(
-            &self.connection,
-            &expected_parent.pack_id,
-        )
-        .await?;
-        let current_children = expected_children_models
-            .iter()
-            .cloned()
-            .map(skill_installation_record_from_model)
-            .collect::<Result<Vec<_>>>()?;
-        if current_children != expected_children {
-            return Ok(false);
-        }
-        let now = unix_to_datetime(event_timestamp_secs);
-        let removed_skill_ids = diff.removed.clone();
-        let mut prepared_children = diff
-            .retained
-            .iter()
-            .map(|child| {
-                let timestamp = unix_to_datetime(child.updated_at_unix);
-                skill_installation::prepare_skill_installation(child, timestamp, timestamp)
-            })
-            .collect::<Vec<_>>();
-        prepared_children.extend(
-            diff.added
-                .iter()
-                .map(|child| skill_installation::prepare_skill_installation(child, now, now)),
-        );
-        let prepared_added_policies = added_policies
-            .iter()
-            .map(|policy| skill_workspace_policy::prepare_workspace_skill_policy(policy, now, now))
-            .collect::<Vec<_>>();
-        let expected_parent = expected_parent.clone();
-        let parent = parent.clone();
-        let prepared_audit_records =
-            skill_audit_event::prepare_skill_audit_events(None, audit_records);
-        let upload_id = upload_id.to_owned();
-        self.run_serialized_write(|| {
-            let expected_parent = expected_parent.clone();
-            let parent = parent.clone();
-            let removed_skill_ids = removed_skill_ids.clone();
-            let prepared_children = prepared_children.clone();
-            let prepared_added_policies = prepared_added_policies.clone();
-            let prepared_audit_records = prepared_audit_records.clone();
-            let upload_id = upload_id.clone();
-            let expected_parent_model = expected_parent_model.clone();
-            let expected_children_models = expected_children_models.clone();
-            async move {
-                let transaction = self
-                    .connection
-                    .begin()
-                    .await
-                    .context("failed to begin skill pack lifecycle update transaction")?;
-                let result: Result<bool> = async {
-                    let Some(current_parent_model) =
-                        skill_pack_installation::find_skill_pack_installation(
-                            &transaction,
-                            expected_parent.scope_key.as_str(),
-                            &expected_parent.pack_id,
-                        )
-                        .await?
-                    else {
-                        return Ok(false);
-                    };
-                    if current_parent_model != expected_parent_model {
-                        return Ok(false);
-                    }
-                    let current_children_models =
-                        skill_installation::list_skill_installations_by_pack_id(
-                            &transaction,
-                            &expected_parent.pack_id,
-                        )
-                        .await?;
-                    if current_children_models != expected_children_models {
-                        return Ok(false);
-                    }
-                    let deleted = skill_installation::delete_skill_installations(
-                        &transaction,
-                        removed_skill_ids.as_slice(),
-                    )
-                    .await?;
-                    if deleted != u64::try_from(removed_skill_ids.len()).unwrap_or(u64::MAX) {
-                        return Ok(false);
-                    }
-                    skill_workspace_policy::delete_workspace_skill_policies(
-                        &transaction,
-                        parent.scope_key.as_str(),
-                        removed_skill_ids.as_slice(),
-                    )
-                    .await?;
-                    skill_installation::upsert_prepared_pack_skill_installations(
-                        &transaction,
-                        prepared_children.as_slice(),
-                    )
-                    .await?;
-                    skill_workspace_policy::upsert_prepared_workspace_skill_policies(
-                        &transaction,
-                        prepared_added_policies.as_slice(),
-                    )
-                    .await?;
-                    if !skill_pack_installation::update_skill_pack_installation_name(
-                        &transaction,
-                        parent.scope_key.as_str(),
-                        &parent.pack_id,
-                        parent.name.as_str(),
-                        now,
+                let Some(expected_parent_model) =
+                    skill_pack_installation::find_skill_pack_installation(
+                        &self.connection,
+                        expected_parent.scope_key.as_str(),
+                        &expected_parent.pack_id,
                     )
                     .await?
-                    {
-                        return Ok(false);
-                    }
-                    skill_audit_event::insert_prepared_skill_audit_events(
-                        &transaction,
-                        prepared_audit_records,
+                else {
+                    return Ok(false);
+                };
+                if skill_pack_installation_record_from_model(expected_parent_model.clone())?
+                    != *expected_parent
+                {
+                    return Ok(false);
+                }
+                let expected_children_models =
+                    skill_installation::list_skill_installations_by_pack_id(
+                        &self.connection,
+                        &expected_parent.pack_id,
                     )
                     .await?;
-                    if !skill_upload_session::transition_skill_upload_status(
-                        &transaction,
-                        upload_id.as_str(),
-                        &["finalized"],
-                        "consumed",
-                        None,
-                        Some(event_timestamp_secs),
-                        None,
-                        now,
-                    )
-                    .await?
-                    {
-                        return Ok(false);
-                    }
-                    Ok(true)
+                let current_children = expected_children_models
+                    .iter()
+                    .cloned()
+                    .map(skill_installation_record_from_model)
+                    .collect::<Result<Vec<_>>>()?;
+                if current_children != expected_children {
+                    return Ok(false);
                 }
-                .await;
-                match result {
-                    Ok(true) => {
-                        transaction
-                            .commit()
-                            .await
-                            .context("failed to commit skill pack lifecycle update")?;
-                        Ok(true)
+                let now = unix_to_datetime(event_timestamp_secs);
+                let removed_skill_ids = diff.removed.clone();
+                let mut prepared_children = diff
+                    .retained
+                    .iter()
+                    .map(|child| {
+                        let timestamp = unix_to_datetime(child.updated_at_unix);
+                        skill_installation::prepare_skill_installation(child, timestamp, timestamp)
+                    })
+                    .collect::<Vec<_>>();
+                prepared_children.extend(
+                    diff.added.iter().map(|child| {
+                        skill_installation::prepare_skill_installation(child, now, now)
+                    }),
+                );
+                let prepared_added_policies = added_policies
+                    .iter()
+                    .map(|policy| {
+                        skill_workspace_policy::prepare_workspace_skill_policy(policy, now, now)
+                    })
+                    .collect::<Vec<_>>();
+                let expected_parent = expected_parent.clone();
+                let parent = parent.clone();
+                let prepared_audit_records =
+                    skill_audit_event::prepare_skill_audit_events(None, audit_records);
+                let upload_id = upload_id.to_owned();
+                self.run_serialized_write(|| {
+                    let expected_parent = expected_parent.clone();
+                    let parent = parent.clone();
+                    let removed_skill_ids = removed_skill_ids.clone();
+                    let prepared_children = prepared_children.clone();
+                    let prepared_added_policies = prepared_added_policies.clone();
+                    let prepared_audit_records = prepared_audit_records.clone();
+                    let upload_id = upload_id.clone();
+                    let expected_parent_model = expected_parent_model.clone();
+                    let expected_children_models = expected_children_models.clone();
+                    async move {
+                        let transaction =
+                            self.connection.begin().await.context(
+                                "failed to begin skill pack lifecycle update transaction",
+                            )?;
+                        let result: Result<bool> = async {
+                            let Some(current_parent_model) =
+                                skill_pack_installation::find_skill_pack_installation(
+                                    &transaction,
+                                    expected_parent.scope_key.as_str(),
+                                    &expected_parent.pack_id,
+                                )
+                                .await?
+                            else {
+                                return Ok(false);
+                            };
+                            if current_parent_model != expected_parent_model {
+                                return Ok(false);
+                            }
+                            let current_children_models =
+                                skill_installation::list_skill_installations_by_pack_id(
+                                    &transaction,
+                                    &expected_parent.pack_id,
+                                )
+                                .await?;
+                            if current_children_models != expected_children_models {
+                                return Ok(false);
+                            }
+                            let deleted = skill_installation::delete_skill_installations(
+                                &transaction,
+                                removed_skill_ids.as_slice(),
+                            )
+                            .await?;
+                            if deleted != u64::try_from(removed_skill_ids.len()).unwrap_or(u64::MAX)
+                            {
+                                return Ok(false);
+                            }
+                            skill_workspace_policy::delete_workspace_skill_policies(
+                                &transaction,
+                                parent.scope_key.as_str(),
+                                removed_skill_ids.as_slice(),
+                            )
+                            .await?;
+                            skill_installation::upsert_prepared_pack_skill_installations(
+                                &transaction,
+                                prepared_children.as_slice(),
+                            )
+                            .await?;
+                            skill_workspace_policy::upsert_prepared_workspace_skill_policies(
+                                &transaction,
+                                prepared_added_policies.as_slice(),
+                            )
+                            .await?;
+                            if !skill_pack_installation::update_skill_pack_installation_name(
+                                &transaction,
+                                parent.scope_key.as_str(),
+                                &parent.pack_id,
+                                parent.name.as_str(),
+                                now,
+                            )
+                            .await?
+                            {
+                                return Ok(false);
+                            }
+                            skill_audit_event::insert_prepared_skill_audit_events(
+                                &transaction,
+                                prepared_audit_records,
+                            )
+                            .await?;
+                            if !skill_upload_session::transition_skill_upload_status(
+                                &transaction,
+                                upload_id.as_str(),
+                                &["finalized"],
+                                "consumed",
+                                None,
+                                Some(event_timestamp_secs),
+                                None,
+                                now,
+                            )
+                            .await?
+                            {
+                                return Ok(false);
+                            }
+                            Ok(true)
+                        }
+                        .await;
+                        match result {
+                            Ok(true) => {
+                                transaction
+                                    .commit()
+                                    .await
+                                    .context("failed to commit skill pack lifecycle update")?;
+                                Ok(true)
+                            }
+                            Ok(false) => {
+                                transaction
+                                    .rollback()
+                                    .await
+                                    .context("failed to roll back conflicted skill pack update")?;
+                                Ok(false)
+                            }
+                            Err(error) => {
+                                let _ = transaction.rollback().await;
+                                Err(error)
+                            }
+                        }
                     }
-                    Ok(false) => {
-                        transaction
-                            .rollback()
-                            .await
-                            .context("failed to roll back conflicted skill pack update")?;
-                        Ok(false)
-                    }
-                    Err(error) => {
-                        let _ = transaction.rollback().await;
-                        Err(error)
-                    }
-                }
-            }
-        })
+                })
+                .await
+            },
+            |_| true,
+        )
         .await
     }
 
@@ -22994,21 +24636,46 @@ impl CrudStore {
         .await
     }
 
+    pub async fn skill_upload_cleanup_upper(&self) -> Result<Option<String>> {
+        skill_upload_session::cleanup_upper(&self.connection).await
+    }
+    pub async fn skill_upload_cleanup_page(
+        &self,
+        after: Option<&str>,
+        upper: &str,
+    ) -> Result<(Option<String>, Vec<Result<SkillUploadSessionRecord>>)> {
+        let (after, rows) =
+            skill_upload_session::cleanup_page(&self.connection, after, upper).await?;
+        Ok((
+            after,
+            rows.into_iter()
+                .map(|row| row.map(skill_upload_session_record_from_model))
+                .collect(),
+        ))
+    }
+
     pub async fn insert_skill_upload_session(
         &self,
         record: &SkillUploadSessionRecord,
     ) -> Result<()> {
-        self.run_serialized_write(|| async {
-            let created_at = unix_to_datetime(record.created_at_unix);
-            let updated_at = unix_to_datetime(record.created_at_unix);
-            skill_upload_session::insert_skill_upload_session(
-                &self.connection,
-                record,
-                created_at,
-                updated_at,
-            )
-            .await
-        })
+        self.background_change(
+            "skills.uploads",
+            async {
+                self.run_serialized_write(|| async {
+                    let created_at = unix_to_datetime(record.created_at_unix);
+                    let updated_at = unix_to_datetime(record.created_at_unix);
+                    skill_upload_session::insert_skill_upload_session(
+                        &self.connection,
+                        record,
+                        created_at,
+                        updated_at,
+                    )
+                    .await
+                })
+                .await
+            },
+            |_| true,
+        )
         .await
     }
 
@@ -23051,28 +24718,38 @@ impl CrudStore {
         aborted_at_unix: Option<i64>,
         updated_at_unix: i64,
     ) -> Result<Option<SkillUploadSessionRecord>> {
-        self.run_serialized_write(|| async {
-            let updated_at = unix_to_datetime(updated_at_unix);
-            if !skill_upload_session::transition_skill_upload_status(
-                &self.connection,
-                upload_id,
-                expected_statuses,
-                status,
-                finalized_at_unix,
-                consumed_at_unix,
-                aborted_at_unix,
-                updated_at,
-            )
-            .await?
-            {
-                return Ok(None);
-            }
-            Ok(
-                skill_upload_session::find_skill_upload_session(&self.connection, upload_id)
+        self.background_change(
+            "skills.uploads",
+            async {
+                self.run_serialized_write(|| async {
+                    let updated_at = unix_to_datetime(updated_at_unix);
+                    if !skill_upload_session::transition_skill_upload_status(
+                        &self.connection,
+                        upload_id,
+                        expected_statuses,
+                        status,
+                        finalized_at_unix,
+                        consumed_at_unix,
+                        aborted_at_unix,
+                        updated_at,
+                    )
                     .await?
-                    .map(skill_upload_session_record_from_model),
-            )
-        })
+                    {
+                        return Ok(None);
+                    }
+                    Ok(
+                        skill_upload_session::find_skill_upload_session(
+                            &self.connection,
+                            upload_id,
+                        )
+                        .await?
+                        .map(skill_upload_session_record_from_model),
+                    )
+                })
+                .await
+            },
+            |row| row.is_some(),
+        )
         .await
     }
 
@@ -23923,27 +25600,42 @@ impl CrudStore {
         thread_model: &Thread,
         creator: PersistedActorRef,
     ) -> Result<()> {
-        let thread_model = thread_model.clone();
-        let creator = creator.clone();
-        let created_at = unix_to_datetime(thread_model.created_at);
-        let updated_at = unix_to_datetime(thread_model.updated_at);
-        self.run_serialized_write(|| {
-            let thread_model = thread_model.clone();
-            let creator = creator.clone();
-            async move {
-                let tx = self.connection.begin().await?;
-                thread::upsert_thread_with_creator(
-                    &tx,
-                    &thread_model,
-                    &creator,
-                    created_at,
-                    updated_at,
+        self.track_compaction_history(
+            true,
+            6,
+            async {
+                self.background_changes(
+                    &["tasks.lifecycle", "compaction.lifecycle"],
+                    async {
+                        let thread_model = thread_model.clone();
+                        let creator = creator.clone();
+                        let created_at = unix_to_datetime(thread_model.created_at);
+                        let updated_at = unix_to_datetime(thread_model.updated_at);
+                        self.run_serialized_write(|| {
+                            let thread_model = thread_model.clone();
+                            let creator = creator.clone();
+                            async move {
+                                let tx = self.connection.begin().await?;
+                                thread::upsert_thread_with_creator(
+                                    &tx,
+                                    &thread_model,
+                                    &creator,
+                                    created_at,
+                                    updated_at,
+                                )
+                                .await?;
+                                tx.commit().await?;
+                                Ok(())
+                            }
+                        })
+                        .await
+                    },
+                    |_| true,
                 )
-                .await?;
-                tx.commit().await?;
-                Ok(())
-            }
-        })
+                .await
+            },
+            |_| true,
+        )
         .await
     }
 
@@ -25374,18 +27066,25 @@ impl CrudStore {
         idle_deadline_at_unix: Option<i64>,
         hard_deadline_at_unix: Option<i64>,
     ) -> Result<bool> {
-        self.run_serialized_write(|| async {
-            turn_item_attempt::configure_running_attempt_deadlines(
-                &self.connection,
-                turn_id,
-                item_id,
-                unix_to_datetime(heartbeat_at_unix),
-                lease_expires_at_unix.map(unix_to_datetime),
-                idle_deadline_at_unix.map(unix_to_datetime),
-                hard_deadline_at_unix.map(unix_to_datetime),
-            )
-            .await
-        })
+        self.background_changes(
+            &["recovery.timeouts"],
+            async {
+                self.run_serialized_write(|| async {
+                    turn_item_attempt::configure_running_attempt_deadlines(
+                        &self.connection,
+                        turn_id,
+                        item_id,
+                        unix_to_datetime(heartbeat_at_unix),
+                        lease_expires_at_unix.map(unix_to_datetime),
+                        idle_deadline_at_unix.map(unix_to_datetime),
+                        hard_deadline_at_unix.map(unix_to_datetime),
+                    )
+                    .await
+                })
+                .await
+            },
+            |changed| *changed,
+        )
         .await
     }
 
@@ -25424,52 +27123,118 @@ impl CrudStore {
         hard_deadline_at_unix: Option<i64>,
         activity_kind: &str,
     ) -> Result<bool> {
-        self.run_serialized_write(|| async {
-            let heartbeat_at = unix_to_datetime(heartbeat_at_unix);
-            let updated = turn_item_attempt::heartbeat_running_attempt(
-                &self.connection,
-                turn_id,
-                item_id,
-                heartbeat_at,
-                lease_expires_at_unix.map(unix_to_datetime),
-                idle_deadline_at_unix.map(unix_to_datetime),
-                hard_deadline_at_unix.map(unix_to_datetime),
-            )
-            .await?;
-            if !updated {
-                return Ok(false);
-            }
+        self.background_changes(
+            &["recovery.timeouts"],
+            async {
+                self.run_serialized_write(|| async {
+                    let heartbeat_at = unix_to_datetime(heartbeat_at_unix);
+                    let updated = turn_item_attempt::heartbeat_running_attempt(
+                        &self.connection,
+                        turn_id,
+                        item_id,
+                        heartbeat_at,
+                        lease_expires_at_unix.map(unix_to_datetime),
+                        idle_deadline_at_unix.map(unix_to_datetime),
+                        hard_deadline_at_unix.map(unix_to_datetime),
+                    )
+                    .await?;
+                    if !updated {
+                        return Ok(false);
+                    }
 
-            // An owner lease proves only that the supervising loop is alive;
-            // it is not causal work progress and must not replace the Turn's
-            // durable progress frontier. Confirmed external activity is
-            // recorded through the explicit activity kind below.
-            if activity_kind == "item/heartbeat" {
-                return Ok(true);
-            }
+                    // An owner lease proves only that the supervising loop is alive;
+                    // it is not causal work progress and must not replace the Turn's
+                    // durable progress frontier. Confirmed external activity is
+                    // recorded through the explicit activity kind below.
+                    if activity_kind == "item/heartbeat" {
+                        return Ok(true);
+                    }
 
-            let Some(turn_model) = turn::find_turn_by_id(&self.connection, turn_id).await? else {
-                return Ok(true);
-            };
-            let source_sequence = turn_event::latest_event_for_turn(&self.connection, turn_id)
-                .await?
-                .map(|event| event.sequence)
-                .unwrap_or(0);
-            turn_liveness::observe_activity(
-                &self.connection,
-                turn_liveness::TurnLivenessObservation {
-                    turn_id: turn_id.to_owned(),
-                    thread_id: turn_model.thread_id,
-                    activity_sequence: source_sequence,
-                    activity_kind: activity_kind.to_owned(),
-                    item_id: Some(item_id.to_owned()),
-                    item_type: Some(turn_item_type_to_db(item_type).to_owned()),
-                    observed_at: heartbeat_at,
-                },
-            )
-            .await?;
-            Ok(true)
-        })
+                    let Some(turn_model) = turn::find_turn_by_id(&self.connection, turn_id).await?
+                    else {
+                        return Ok(true);
+                    };
+                    let source_sequence =
+                        turn_event::latest_event_for_turn(&self.connection, turn_id)
+                            .await?
+                            .map(|event| event.sequence)
+                            .unwrap_or(0);
+                    turn_liveness::observe_activity(
+                        &self.connection,
+                        turn_liveness::TurnLivenessObservation {
+                            turn_id: turn_id.to_owned(),
+                            thread_id: turn_model.thread_id,
+                            activity_sequence: source_sequence,
+                            activity_kind: activity_kind.to_owned(),
+                            item_id: Some(item_id.to_owned()),
+                            item_type: Some(turn_item_type_to_db(item_type).to_owned()),
+                            observed_at: heartbeat_at,
+                        },
+                    )
+                    .await?;
+                    Ok(true)
+                })
+                .await
+            },
+            |changed| *changed,
+        )
+        .await
+    }
+
+    /// Renew only the native owner that supplied the authoritative activity
+    /// proof. Parallel timeout/terminal/new-attempt commits cannot slip between
+    /// validation and renewal; ordinary generic heartbeat callers keep their API.
+    pub async fn heartbeat_cli_runtime_command_attempt(
+        &self,
+        expected: &CliRuntimeNativeTurnOwner,
+        item_id: &str,
+        execution_class: TurnItemExecutionClass,
+        heartbeat_at_unix: i64,
+        lease_expires_at_unix: i64,
+        idle_deadline_at_unix: i64,
+        hard_deadline_at_unix: Option<i64>,
+    ) -> Result<bool> {
+        self.background_changes(
+            &["cli.commands", "recovery.timeouts"],
+            async {
+                self.run_serialized_write(|| async {
+                    let tx = self.connection.begin().await?;
+                    if !cli_runtime_binding::command_heartbeat_owner_is_current(&tx, expected)
+                        .await?
+                    {
+                        tx.rollback().await?;
+                        return Ok(false);
+                    }
+                    let running = turn_item_attempt::find_latest_running_attempt(
+                        &tx,
+                        &expected.binding.turn_id,
+                        item_id,
+                    )
+                    .await?;
+                    if running.as_ref().is_none_or(|row| {
+                        row.execution_class != Some(execution_class)
+                            || row.item_type != TurnItemType::CommandExecution
+                    }) {
+                        tx.rollback().await?;
+                        return Ok(false);
+                    }
+                    let changed = turn_item_attempt::heartbeat_running_attempt(
+                        &tx,
+                        &expected.binding.turn_id,
+                        item_id,
+                        unix_to_datetime(heartbeat_at_unix),
+                        Some(unix_to_datetime(lease_expires_at_unix)),
+                        Some(unix_to_datetime(idle_deadline_at_unix)),
+                        hard_deadline_at_unix.map(unix_to_datetime),
+                    )
+                    .await?;
+                    tx.commit().await?;
+                    Ok(changed)
+                })
+                .await
+            },
+            |changed| *changed,
+        )
         .await
     }
 
@@ -25479,28 +27244,42 @@ impl CrudStore {
         activity_kind: &str,
         observed_at_unix: i64,
     ) -> Result<bool> {
-        self.run_serialized_write(|| async {
-            let Some(turn_model) = turn::find_turn_by_id(&self.connection, turn_id).await? else {
-                return Ok(false);
-            };
-            let source_sequence = turn_event::latest_event_for_turn(&self.connection, turn_id)
-                .await?
-                .map(|event| event.sequence)
-                .unwrap_or(0);
-            turn_liveness::observe_activity(
-                &self.connection,
-                turn_liveness::TurnLivenessObservation {
-                    turn_id: turn_id.to_owned(),
-                    thread_id: turn_model.thread_id,
-                    activity_sequence: source_sequence,
-                    activity_kind: activity_kind.to_owned(),
-                    item_id: None,
-                    item_type: None,
-                    observed_at: unix_to_datetime(observed_at_unix),
-                },
-            )
-            .await
-        })
+        self.background_changes(
+            &[
+                "recovery.timeouts",
+                "cli.commands",
+                "cli.supervision",
+                "recovery.control",
+            ],
+            async {
+                self.run_serialized_write(|| async {
+                    let Some(turn_model) = turn::find_turn_by_id(&self.connection, turn_id).await?
+                    else {
+                        return Ok(false);
+                    };
+                    let source_sequence =
+                        turn_event::latest_event_for_turn(&self.connection, turn_id)
+                            .await?
+                            .map(|event| event.sequence)
+                            .unwrap_or(0);
+                    turn_liveness::observe_activity(
+                        &self.connection,
+                        turn_liveness::TurnLivenessObservation {
+                            turn_id: turn_id.to_owned(),
+                            thread_id: turn_model.thread_id,
+                            activity_sequence: source_sequence,
+                            activity_kind: activity_kind.to_owned(),
+                            item_id: None,
+                            item_type: None,
+                            observed_at: unix_to_datetime(observed_at_unix),
+                        },
+                    )
+                    .await
+                })
+                .await
+            },
+            |changed| *changed,
+        )
         .await
     }
 
@@ -25706,22 +27485,21 @@ impl CrudStore {
             turn_item_attempt::list_timed_out_without_recovery(&self.connection, limit).await?;
         Ok(rows
             .into_iter()
-            .map(|row| TimeoutCandidate {
-                attempt_id: row.id,
-                turn_id: row.turn_id,
-                item_id: row.item_id,
-                item_type: row.item_type,
-                execution_class: row.execution_class,
-                attempt_number: row.attempt_number,
-                timeout_reason: row.timeout_reason,
-                started_at_unix: row.started_at.timestamp(),
-                started_event_sequence: row.started_event_sequence,
-                last_heartbeat_at_unix: row.last_heartbeat_at.map(|value| value.timestamp()),
-                lease_expires_at_unix: row.lease_expires_at.map(|value| value.timestamp()),
-                idle_deadline_at_unix: row.idle_deadline_at.map(|value| value.timestamp()),
-                hard_deadline_at_unix: row.hard_deadline_at.map(|value| value.timestamp()),
-            })
+            .map(timeout_candidate_from_timed_out_snapshot)
             .collect())
+    }
+
+    /// Exact selected identity only; rechecks the original eligibility before
+    /// hydration/processing. No filtered population selector on the live path.
+    pub async fn unqueued_timeout_candidate_by_id(
+        &self,
+        id: &str,
+    ) -> Result<Option<TimeoutCandidate>> {
+        Ok(
+            turn_item_attempt::find_unqueued_timeout_by_id(&self.connection, id)
+                .await?
+                .map(timeout_candidate_from_timed_out_snapshot),
+        )
     }
 
     pub async fn list_read_model_invariant_violations(
@@ -25840,42 +27618,49 @@ impl CrudStore {
     pub async fn repair_deterministic_read_model_violations_with_timings(
         &self,
     ) -> Result<ReadModelRepairReport> {
-        let maintenance = self.with_maintenance_access();
-        let mut timings = ReadModelRepairTimings::default();
-        let mut summary = RepairSummary::default();
-        summary.merge(
-            maintenance
-                .repair_terminal_turn_item_payloads(&mut timings)
-                .await?,
-        );
-        summary.merge(
-            timings
-                .observe(
-                    ReadModelRepairStage::TerminalTurnRunningAttempts,
-                    maintenance.repair_terminal_turn_running_attempts(),
-                )
-                .await?,
-        );
-        summary.merge(
-            timings
-                .observe(
-                    ReadModelRepairStage::TerminalTasksMissingCompletedAt,
-                    maintenance.repair_terminal_tasks_missing_completed_at(),
-                )
-                .await?,
-        );
-        summary.merge(
-            timings
-                .observe(
-                    ReadModelRepairStage::TerminalRunsMissingCompletedAt,
-                    maintenance.repair_terminal_runs_missing_completed_at(),
-                )
-                .await?,
-        );
-        Ok(ReadModelRepairReport {
-            summary,
-            stage_timings: timings.into_stage_timings(),
-        })
+        self.background_change(
+            "storage.zstd",
+            async {
+                let maintenance = self.with_maintenance_access();
+                let mut timings = ReadModelRepairTimings::default();
+                let mut summary = RepairSummary::default();
+                summary.merge(
+                    maintenance
+                        .repair_terminal_turn_item_payloads(&mut timings)
+                        .await?,
+                );
+                summary.merge(
+                    timings
+                        .observe(
+                            ReadModelRepairStage::TerminalTurnRunningAttempts,
+                            maintenance.repair_terminal_turn_running_attempts(),
+                        )
+                        .await?,
+                );
+                summary.merge(
+                    timings
+                        .observe(
+                            ReadModelRepairStage::TerminalTasksMissingCompletedAt,
+                            maintenance.repair_terminal_tasks_missing_completed_at(),
+                        )
+                        .await?,
+                );
+                summary.merge(
+                    timings
+                        .observe(
+                            ReadModelRepairStage::TerminalRunsMissingCompletedAt,
+                            maintenance.repair_terminal_runs_missing_completed_at(),
+                        )
+                        .await?,
+                );
+                Ok(ReadModelRepairReport {
+                    summary,
+                    stage_timings: timings.into_stage_timings(),
+                })
+            },
+            |report| report.summary.repaired > 0,
+        )
+        .await
     }
 
     async fn repair_terminal_turn_item_payloads(
@@ -26934,59 +28719,72 @@ impl CrudStore {
         candidate: &TimeoutCandidate,
         now_unix: i64,
     ) -> Result<bool> {
-        let now = unix_to_datetime(now_unix);
-        let snapshot = turn_item_attempt::RunningAttemptSnapshot {
-            id: candidate.attempt_id.clone(),
-            turn_id: candidate.turn_id.clone(),
-            item_id: candidate.item_id.clone(),
-            item_type: candidate.item_type,
-            execution_class: Some(candidate.execution_class),
-            attempt_number: candidate.attempt_number,
-            started_at: unix_to_datetime(candidate.started_at_unix),
-            started_event_sequence: candidate.started_event_sequence,
-            last_heartbeat_at: candidate.last_heartbeat_at_unix.map(unix_to_datetime),
-            lease_expires_at: candidate.lease_expires_at_unix.map(unix_to_datetime),
-            idle_deadline_at: candidate.idle_deadline_at_unix.map(unix_to_datetime),
-            hard_deadline_at: candidate.hard_deadline_at_unix.map(unix_to_datetime),
-        };
-        let Some(prepared) = turn_item_attempt::prepare_running_attempt_timeout(
-            &self.connection,
-            &snapshot,
-            candidate.timeout_reason,
-            now,
-        )
-        .await?
-        else {
-            return Ok(false);
-        };
-        self.run_serialized_write(|| {
-            let prepared = prepared.clone();
-            async move {
-                let tx = self
-                    .connection
-                    .begin()
-                    .await
-                    .context("failed to begin timeout transition transaction")?;
-                let transitioned =
-                    turn_item_attempt::transition_prepared_running_attempt_to_timed_out(
-                        &tx, prepared,
-                    )
-                    .await?;
-
-                if !transitioned {
-                    tx.rollback()
-                        .await
-                        .context("failed to rollback timeout transition transaction")?;
+        self.background_changes(
+            &[
+                "recovery.timeouts",
+                "cli.commands",
+                "cli.supervision",
+                "recovery.control",
+                "storage.zstd",
+            ],
+            async {
+                let now = unix_to_datetime(now_unix);
+                let snapshot = turn_item_attempt::RunningAttemptSnapshot {
+                    id: candidate.attempt_id.clone(),
+                    turn_id: candidate.turn_id.clone(),
+                    item_id: candidate.item_id.clone(),
+                    item_type: candidate.item_type,
+                    execution_class: Some(candidate.execution_class),
+                    attempt_number: candidate.attempt_number,
+                    started_at: unix_to_datetime(candidate.started_at_unix),
+                    started_event_sequence: candidate.started_event_sequence,
+                    last_heartbeat_at: candidate.last_heartbeat_at_unix.map(unix_to_datetime),
+                    lease_expires_at: candidate.lease_expires_at_unix.map(unix_to_datetime),
+                    idle_deadline_at: candidate.idle_deadline_at_unix.map(unix_to_datetime),
+                    hard_deadline_at: candidate.hard_deadline_at_unix.map(unix_to_datetime),
+                };
+                let Some(prepared) = turn_item_attempt::prepare_running_attempt_timeout(
+                    &self.connection,
+                    &snapshot,
+                    candidate.timeout_reason,
+                    now,
+                )
+                .await?
+                else {
                     return Ok(false);
-                }
+                };
+                self.run_serialized_write(|| {
+                    let prepared = prepared.clone();
+                    async move {
+                        let tx = self
+                            .connection
+                            .begin()
+                            .await
+                            .context("failed to begin timeout transition transaction")?;
+                        let transitioned =
+                            turn_item_attempt::transition_prepared_running_attempt_to_timed_out(
+                                &tx, prepared,
+                            )
+                            .await?;
 
-                tx.commit()
-                    .await
-                    .context("failed to commit timeout transition transaction")?;
+                        if !transitioned {
+                            tx.rollback()
+                                .await
+                                .context("failed to rollback timeout transition transaction")?;
+                            return Ok(false);
+                        }
 
-                Ok(true)
-            }
-        })
+                        tx.commit()
+                            .await
+                            .context("failed to commit timeout transition transaction")?;
+
+                        Ok(true)
+                    }
+                })
+                .await
+            },
+            |changed| *changed,
+        )
         .await
     }
 
@@ -27022,50 +28820,53 @@ impl CrudStore {
         heartbeat_at_unix: i64,
         deadlines: TurnItemAttemptDeadlines,
     ) -> Result<bool> {
-        let attempt_id = attempt_id.to_owned();
-        let Some(prepared) = turn_item_attempt::prepare_timed_out_attempt_reactivation(
-            &self.connection,
-            attempt_id.as_str(),
-        )
-        .await?
-        else {
-            return Ok(false);
-        };
-        let heartbeat_at = unix_to_datetime(heartbeat_at_unix);
-        let deadlines = turn_item_attempt::AttemptDeadlines {
-            lease_expires_at: deadlines.lease_expires_at_unix.map(unix_to_datetime),
-            idle_deadline_at: deadlines.idle_deadline_at_unix.map(unix_to_datetime),
-            hard_deadline_at: deadlines.hard_deadline_at_unix.map(unix_to_datetime),
-        };
-        self.run_serialized_write(|| {
-            let prepared = prepared.clone();
-            let deadlines = deadlines.clone();
-            async move {
-                let transaction = self
-                    .connection
-                    .begin()
-                    .await
-                    .context("failed to begin timed_out attempt reactivation transaction")?;
-                let reactivated = turn_item_attempt::reactivate_prepared_timed_out_attempt(
-                    &transaction,
-                    prepared,
-                    heartbeat_at,
-                    deadlines,
+        // Reactivation creates both timeout and (for command attempts) command
+        // supervision obligations. Register before preparation: cancellation
+        // after a sent COMMIT must retain Unknown even without a heartbeat.
+        self.background_changes(
+            &["recovery.timeouts", "cli.commands"],
+            async {
+                let attempt_id = attempt_id.to_owned();
+                let Some(prepared) = turn_item_attempt::prepare_timed_out_attempt_reactivation(
+                    &self.connection,
+                    attempt_id.as_str(),
                 )
-                .await?;
-                transaction
-                    .commit()
-                    .await
-                    .context("failed to commit timed_out attempt reactivation")?;
-                Ok(reactivated)
-            }
-        })
+                .await?
+                else {
+                    return Ok(false);
+                };
+                let heartbeat_at = unix_to_datetime(heartbeat_at_unix);
+                let deadlines = turn_item_attempt::AttemptDeadlines {
+                    lease_expires_at: deadlines.lease_expires_at_unix.map(unix_to_datetime),
+                    idle_deadline_at: deadlines.idle_deadline_at_unix.map(unix_to_datetime),
+                    hard_deadline_at: deadlines.hard_deadline_at_unix.map(unix_to_datetime),
+                };
+                self.run_serialized_write(|| {
+                    let prepared = prepared.clone();
+                    let deadlines = deadlines.clone();
+                    async move {
+                        let transaction = self.connection.begin().await.context(
+                            "failed to begin timed_out attempt reactivation transaction",
+                        )?;
+                        let reactivated = turn_item_attempt::reactivate_prepared_timed_out_attempt(
+                            &transaction,
+                            prepared,
+                            heartbeat_at,
+                            deadlines,
+                        )
+                        .await?;
+                        transaction
+                            .commit()
+                            .await
+                            .context("failed to commit timed_out attempt reactivation")?;
+                        Ok(reactivated)
+                    }
+                })
+                .await
+            },
+            |reactivated| *reactivated,
+        )
         .await
-    }
-
-    /// Scoped clones share this retained postcommit recovery hint.
-    pub fn recovery_job_notification(&self) -> std::sync::Arc<tokio::sync::Notify> {
-        self.recovery_work.clone()
     }
 
     pub async fn enqueue_recovery_job(
@@ -27086,43 +28887,49 @@ impl CrudStore {
         policy_snapshot: serde_json::Value,
         now_unix: i64,
     ) -> Result<RecoveryJobRecord> {
-        let _recovery_change = recovery_wake::RecoveryChange(self.recovery_work.clone());
-        self.run_serialized_write(|| async {
-            let now = unix_to_datetime(now_unix);
-            let retry_delay_secs = retry_after_ms
-                .map(|retry_after_ms| retry_after_ms.max(0).saturating_add(999) / 1_000)
-                .unwrap_or(0);
-            let scheduled_at = unix_to_datetime(now_unix.saturating_add(retry_delay_secs));
-            let policy_json = serde_json::to_string(&policy_json)
-                .context("failed to serialize recovery policy json")?;
-            let policy_snapshot_json = serde_json::to_string(&policy_snapshot)
-                .context("failed to serialize recovery policy snapshot json")?;
-            let row = recovery_job::enqueue_recovery_job(
-                &self.connection,
-                recovery_job::NewRecoveryJob {
-                    diagnostic_json: None,
-                    turn_id: turn_id.clone(),
-                    item_id: item_id.clone(),
-                    item_type,
-                    source_attempt_id: source_attempt_id.clone(),
-                    trigger,
-                    action,
-                    reason: reason.clone(),
-                    policy_json,
-                    error_class,
-                    transport_stage,
-                    retry_after_ms,
-                    provider_attempt_number,
-                    policy_snapshot_json,
-                    max_attempts,
-                    created_at: now,
-                    scheduled_at,
-                    next_run_at: scheduled_at,
-                },
-            )
-            .await?;
-            Ok(recovery_job_record_from_model(row))
-        })
+        self.background_changes(
+            &["recovery.due", "recovery.control", "storage.native_events"],
+            async {
+                self.run_serialized_write(|| async {
+                    let now = unix_to_datetime(now_unix);
+                    let retry_delay_secs = retry_after_ms
+                        .map(|retry_after_ms| retry_after_ms.max(0).saturating_add(999) / 1_000)
+                        .unwrap_or(0);
+                    let scheduled_at = unix_to_datetime(now_unix.saturating_add(retry_delay_secs));
+                    let policy_json = serde_json::to_string(&policy_json)
+                        .context("failed to serialize recovery policy json")?;
+                    let policy_snapshot_json = serde_json::to_string(&policy_snapshot)
+                        .context("failed to serialize recovery policy snapshot json")?;
+                    let row = recovery_job::enqueue_recovery_job(
+                        &self.connection,
+                        recovery_job::NewRecoveryJob {
+                            diagnostic_json: None,
+                            turn_id: turn_id.clone(),
+                            item_id: item_id.clone(),
+                            item_type,
+                            source_attempt_id: source_attempt_id.clone(),
+                            trigger,
+                            action,
+                            reason: reason.clone(),
+                            policy_json,
+                            error_class,
+                            transport_stage,
+                            retry_after_ms,
+                            provider_attempt_number,
+                            policy_snapshot_json,
+                            max_attempts,
+                            created_at: now,
+                            scheduled_at,
+                            next_run_at: scheduled_at,
+                        },
+                    )
+                    .await?;
+                    Ok(recovery_job_record_from_model(row))
+                })
+                .await
+            },
+            |_| true,
+        )
         .await
     }
 
@@ -27189,74 +28996,81 @@ impl CrudStore {
         diagnostic: Option<pioneer_protocol::RecoveryDiagnostic>,
         now_unix: i64,
     ) -> Result<AtomicRecoveryJobEnqueueOutcome> {
-        let _recovery_change = recovery_wake::RecoveryChange(self.recovery_work.clone());
-        let diagnostic_json = diagnostic.as_ref().map(serde_json::to_string).transpose()?;
-        self.run_serialized_write(|| async {
-            let tx = self
-                .connection
-                .begin()
-                .await
-                .context("failed to begin atomic recovery enqueue transaction")?;
-            let result = async {
-                if let Some(existing) =
-                    recovery_job::find_unresolved_job_by_turn(&tx, turn_id.as_str()).await?
-                {
-                    return Ok(AtomicRecoveryJobEnqueueOutcome::Reused(
-                        recovery_job_record_from_model(existing),
-                    ));
-                }
-
-                let now = unix_to_datetime(now_unix);
-                let retry_delay_secs = retry_after_ms
-                    .map(|retry_after_ms| retry_after_ms.max(0).saturating_add(999) / 1_000)
-                    .unwrap_or(0);
-                let scheduled_at = unix_to_datetime(now_unix.saturating_add(retry_delay_secs));
-                let policy_json = serde_json::to_string(&policy_json)
-                    .context("failed to serialize recovery policy json")?;
-                let policy_snapshot_json = serde_json::to_string(&policy_snapshot)
-                    .context("failed to serialize recovery policy snapshot json")?;
-                let row = recovery_job::enqueue_recovery_job(
-                    &tx,
-                    recovery_job::NewRecoveryJob {
-                        diagnostic_json: diagnostic_json.clone(),
-                        turn_id: turn_id.clone(),
-                        item_id: item_id.clone(),
-                        item_type,
-                        source_attempt_id: source_attempt_id.clone(),
-                        trigger,
-                        action,
-                        reason: reason.clone(),
-                        policy_json,
-                        error_class,
-                        transport_stage,
-                        retry_after_ms,
-                        provider_attempt_number,
-                        policy_snapshot_json,
-                        max_attempts,
-                        created_at: now,
-                        scheduled_at,
-                        next_run_at: scheduled_at,
-                    },
-                )
-                .await?;
-                Ok(AtomicRecoveryJobEnqueueOutcome::Created(
-                    recovery_job_record_from_model(row),
-                ))
-            }
-            .await;
-            match result {
-                Ok(outcome) => {
-                    tx.commit()
+        self.background_changes(
+            &["recovery.due", "recovery.control", "storage.native_events"],
+            async {
+                let diagnostic_json = diagnostic.as_ref().map(serde_json::to_string).transpose()?;
+                self.run_serialized_write(|| async {
+                    let tx = self
+                        .connection
+                        .begin()
                         .await
-                        .context("failed to commit atomic recovery enqueue transaction")?;
-                    Ok(outcome)
-                }
-                Err(error) => {
-                    let _ = tx.rollback().await;
-                    Err(error)
-                }
-            }
-        })
+                        .context("failed to begin atomic recovery enqueue transaction")?;
+                    let result = async {
+                        if let Some(existing) =
+                            recovery_job::find_unresolved_job_by_turn(&tx, turn_id.as_str()).await?
+                        {
+                            return Ok(AtomicRecoveryJobEnqueueOutcome::Reused(
+                                recovery_job_record_from_model(existing),
+                            ));
+                        }
+
+                        let now = unix_to_datetime(now_unix);
+                        let retry_delay_secs = retry_after_ms
+                            .map(|retry_after_ms| retry_after_ms.max(0).saturating_add(999) / 1_000)
+                            .unwrap_or(0);
+                        let scheduled_at =
+                            unix_to_datetime(now_unix.saturating_add(retry_delay_secs));
+                        let policy_json = serde_json::to_string(&policy_json)
+                            .context("failed to serialize recovery policy json")?;
+                        let policy_snapshot_json = serde_json::to_string(&policy_snapshot)
+                            .context("failed to serialize recovery policy snapshot json")?;
+                        let row = recovery_job::enqueue_recovery_job(
+                            &tx,
+                            recovery_job::NewRecoveryJob {
+                                diagnostic_json: diagnostic_json.clone(),
+                                turn_id: turn_id.clone(),
+                                item_id: item_id.clone(),
+                                item_type,
+                                source_attempt_id: source_attempt_id.clone(),
+                                trigger,
+                                action,
+                                reason: reason.clone(),
+                                policy_json,
+                                error_class,
+                                transport_stage,
+                                retry_after_ms,
+                                provider_attempt_number,
+                                policy_snapshot_json,
+                                max_attempts,
+                                created_at: now,
+                                scheduled_at,
+                                next_run_at: scheduled_at,
+                            },
+                        )
+                        .await?;
+                        Ok(AtomicRecoveryJobEnqueueOutcome::Created(
+                            recovery_job_record_from_model(row),
+                        ))
+                    }
+                    .await;
+                    match result {
+                        Ok(outcome) => {
+                            tx.commit()
+                                .await
+                                .context("failed to commit atomic recovery enqueue transaction")?;
+                            Ok(outcome)
+                        }
+                        Err(error) => {
+                            let _ = tx.rollback().await;
+                            Err(error)
+                        }
+                    }
+                })
+                .await
+            },
+            |outcome| matches!(outcome, AtomicRecoveryJobEnqueueOutcome::Created(_)),
+        )
         .await
     }
 
@@ -27278,39 +29092,75 @@ impl CrudStore {
         .await
     }
 
+    pub async fn next_recovery_job_deadline(&self) -> Result<Option<DateTimeWithTimeZone>> {
+        let mut pass = RecoveryClockPass::default();
+        while !self.recovery_clock_quantum(&mut pass, false).await? {}
+        Ok(pass.job_next)
+    }
+
     pub async fn claim_due_recovery_jobs(
         &self,
         now_unix: i64,
         claim_lease_secs: u64,
         limit: u64,
     ) -> Result<Vec<RecoveryJobRecord>> {
-        let now = unix_to_datetime(now_unix);
-        // Bounded advisory identities only; release the reader before writer
-        // admission. A reschedule/lease change is revalidated at the UPDATE.
-        let candidates = recovery_job::list_due_job_ids(&self.connection, now, limit).await?;
-        if candidates.is_empty() {
-            return Ok(Vec::new());
-        }
-        let claim_expires_at = i64::try_from(claim_lease_secs)
-            .ok()
-            .and_then(|secs| now_unix.checked_add(secs))
-            .map(unix_to_datetime)
-            .unwrap_or(now);
-        let jobs = self
-            .run_serialized_write(|| async {
-                recovery_job::claim_due_job_ids(
-                    &self.connection,
-                    &candidates,
-                    now,
-                    claim_expires_at,
-                )
-                .await
-            })
-            .await?;
-        Ok(jobs
-            .into_iter()
-            .map(recovery_job_record_from_model)
-            .collect())
+        self.claim_due_recovery_jobs_inner(now_unix, claim_lease_secs, limit, None)
+            .await
+    }
+
+    pub async fn claim_due_recovery_job_candidate(
+        &self,
+        now_unix: i64,
+        claim_lease_secs: u64,
+        id: &str,
+    ) -> Result<Vec<RecoveryJobRecord>> {
+        self.claim_due_recovery_jobs_inner(now_unix, claim_lease_secs, 1, Some(id))
+            .await
+    }
+
+    async fn claim_due_recovery_jobs_inner(
+        &self,
+        now_unix: i64,
+        claim_lease_secs: u64,
+        limit: u64,
+        candidate: Option<&str>,
+    ) -> Result<Vec<RecoveryJobRecord>> {
+        self.background_changes(
+            &["recovery.due", "recovery.control", "storage.native_events"],
+            async {
+                let now = unix_to_datetime(now_unix);
+                // Reader resources drop before conditional writer admission.
+                let candidates = match candidate {
+                    Some(id) => recovery_job::due_job_id(&self.connection, now, id).await?,
+                    None => recovery_job::list_due_job_ids(&self.connection, now, limit).await?,
+                };
+                if candidates.is_empty() {
+                    return Ok(Vec::new());
+                }
+                let claim_expires_at = i64::try_from(claim_lease_secs)
+                    .ok()
+                    .and_then(|secs| now_unix.checked_add(secs))
+                    .map(unix_to_datetime)
+                    .unwrap_or(now);
+                let jobs = self
+                    .run_serialized_write(|| async {
+                        recovery_job::claim_due_job_ids(
+                            &self.connection,
+                            &candidates,
+                            now,
+                            claim_expires_at,
+                        )
+                        .await
+                    })
+                    .await?;
+                Ok(jobs
+                    .into_iter()
+                    .map(recovery_job_record_from_model)
+                    .collect())
+            },
+            |rows| !rows.is_empty(),
+        )
+        .await
     }
 
     pub async fn list_due_pending_recovery_jobs_by_action(
@@ -27471,42 +29321,48 @@ impl CrudStore {
         now_unix: i64,
         accepted_cli_outcome: Option<&pioneer_protocol::CliRuntimeBlockedTurnGuard>,
     ) -> Result<bool> {
-        let _recovery_change = recovery_wake::RecoveryChange(self.recovery_work.clone());
-        let diagnostic_json = diagnostic.as_ref().map(serde_json::to_string).transpose()?;
-        let last_error_value = last_error.clone();
-        let cli_source = self
-            .prepare_cli_runtime_recovery_outcome_source(job_id)
-            .await?;
-        self.run_serialized_write(|| async {
-            let tx = self.connection.begin().await?;
-            if !cli_runtime_recovery_transition_allowed(
-                &tx,
-                job_id,
-                cli_source.as_ref(),
-                accepted_cli_outcome,
-            )
-            .await?
-            {
-                tx.rollback().await?;
-                return Ok(false);
-            }
-            let affected = recovery_job::mark_job_retrying(
-                &tx,
-                job_id,
-                active_attempt_id,
-                unix_to_datetime(next_run_at_unix),
-                budget_origin_after_cooldown_unix.map(unix_to_datetime),
-                last_error_value.clone(),
-                diagnostic_json.clone(),
-                unix_to_datetime(now_unix),
-            )
-            .await?;
-            if affected {
-                ack_cli_runtime_recovery_outcome(&tx, accepted_cli_outcome).await?;
-            }
-            tx.commit().await?;
-            Ok(affected)
-        })
+        self.background_changes(
+            &["recovery.due", "recovery.control", "storage.native_events"],
+            async {
+                let diagnostic_json = diagnostic.as_ref().map(serde_json::to_string).transpose()?;
+                let last_error_value = last_error.clone();
+                let cli_source = self
+                    .prepare_cli_runtime_recovery_outcome_source(job_id)
+                    .await?;
+                self.run_serialized_write(|| async {
+                    let tx = self.connection.begin().await?;
+                    if !cli_runtime_recovery_transition_allowed(
+                        &tx,
+                        job_id,
+                        cli_source.as_ref(),
+                        accepted_cli_outcome,
+                    )
+                    .await?
+                    {
+                        tx.rollback().await?;
+                        return Ok(false);
+                    }
+                    let affected = recovery_job::mark_job_retrying(
+                        &tx,
+                        job_id,
+                        active_attempt_id,
+                        unix_to_datetime(next_run_at_unix),
+                        budget_origin_after_cooldown_unix.map(unix_to_datetime),
+                        last_error_value.clone(),
+                        diagnostic_json.clone(),
+                        unix_to_datetime(now_unix),
+                    )
+                    .await?;
+                    if affected {
+                        ack_cli_runtime_recovery_outcome(&tx, accepted_cli_outcome).await?;
+                    }
+                    tx.commit().await?;
+                    Ok(affected)
+                })
+                .await
+            },
+            |changed| *changed,
+        )
         .await
     }
 
@@ -27518,31 +29374,42 @@ impl CrudStore {
         last_error: Option<String>,
         now_unix: i64,
     ) -> Result<bool> {
-        let _recovery_change = recovery_wake::RecoveryChange(self.recovery_work.clone());
-        let last_error_value = last_error.clone();
-        let cli_source = self
-            .prepare_cli_runtime_recovery_outcome_source(job_id)
-            .await?;
-        self.run_serialized_write(|| async {
-            let tx = self.connection.begin().await?;
-            if !cli_runtime_recovery_transition_allowed(&tx, job_id, cli_source.as_ref(), None)
-                .await?
-            {
-                tx.rollback().await?;
-                return Ok(false);
-            }
-            let affected = recovery_job::defer_active_job(
-                &tx,
-                job_id,
-                active_attempt_id,
-                unix_to_datetime(next_run_at_unix),
-                last_error_value.clone(),
-                unix_to_datetime(now_unix),
-            )
-            .await?;
-            tx.commit().await?;
-            Ok(affected)
-        })
+        self.background_changes(
+            &["recovery.due", "recovery.control", "storage.native_events"],
+            async {
+                let last_error_value = last_error.clone();
+                let cli_source = self
+                    .prepare_cli_runtime_recovery_outcome_source(job_id)
+                    .await?;
+                self.run_serialized_write(|| async {
+                    let tx = self.connection.begin().await?;
+                    if !cli_runtime_recovery_transition_allowed(
+                        &tx,
+                        job_id,
+                        cli_source.as_ref(),
+                        None,
+                    )
+                    .await?
+                    {
+                        tx.rollback().await?;
+                        return Ok(false);
+                    }
+                    let affected = recovery_job::defer_active_job(
+                        &tx,
+                        job_id,
+                        active_attempt_id,
+                        unix_to_datetime(next_run_at_unix),
+                        last_error_value.clone(),
+                        unix_to_datetime(now_unix),
+                    )
+                    .await?;
+                    tx.commit().await?;
+                    Ok(affected)
+                })
+                .await
+            },
+            |changed| *changed,
+        )
         .await
     }
 
@@ -27554,19 +29421,25 @@ impl CrudStore {
         last_error: Option<String>,
         now_unix: i64,
     ) -> Result<bool> {
-        let _recovery_change = recovery_wake::RecoveryChange(self.recovery_work.clone());
-        let last_error_value = last_error.clone();
-        self.run_serialized_write(|| async {
-            recovery_job::mark_claimed_job_retrying(
-                &self.connection,
-                job_id,
-                claim_token,
-                unix_to_datetime(next_run_at_unix),
-                last_error_value.clone(),
-                unix_to_datetime(now_unix),
-            )
-            .await
-        })
+        self.background_changes(
+            &["recovery.due", "recovery.control", "storage.native_events"],
+            async {
+                let last_error_value = last_error.clone();
+                self.run_serialized_write(|| async {
+                    recovery_job::mark_claimed_job_retrying(
+                        &self.connection,
+                        job_id,
+                        claim_token,
+                        unix_to_datetime(next_run_at_unix),
+                        last_error_value.clone(),
+                        unix_to_datetime(now_unix),
+                    )
+                    .await
+                })
+                .await
+            },
+            |changed| *changed,
+        )
         .await
     }
 
@@ -27577,27 +29450,34 @@ impl CrudStore {
         active_attempt_id: &str,
         now_unix: i64,
     ) -> Result<ClaimedRecoveryActivation> {
-        self.run_serialized_write(|| async {
-            let outcome = recovery_job::mark_claimed_job_active(
-                &self.connection,
-                job_id,
-                claim_token,
-                active_attempt_id,
-                unix_to_datetime(now_unix),
-            )
-            .await?;
-            Ok(match outcome {
-                recovery_job::ClaimedJobActivation::Activated => {
-                    ClaimedRecoveryActivation::Activated
-                }
-                recovery_job::ClaimedJobActivation::BlockedByActiveRecovery => {
-                    ClaimedRecoveryActivation::BlockedByActiveRecovery
-                }
-                recovery_job::ClaimedJobActivation::ClaimNotFound => {
-                    ClaimedRecoveryActivation::ClaimNotFound
-                }
-            })
-        })
+        self.background_changes(
+            &["recovery.due", "recovery.control", "storage.native_events"],
+            async {
+                self.run_serialized_write(|| async {
+                    let outcome = recovery_job::mark_claimed_job_active(
+                        &self.connection,
+                        job_id,
+                        claim_token,
+                        active_attempt_id,
+                        unix_to_datetime(now_unix),
+                    )
+                    .await?;
+                    Ok(match outcome {
+                        recovery_job::ClaimedJobActivation::Activated => {
+                            ClaimedRecoveryActivation::Activated
+                        }
+                        recovery_job::ClaimedJobActivation::BlockedByActiveRecovery => {
+                            ClaimedRecoveryActivation::BlockedByActiveRecovery
+                        }
+                        recovery_job::ClaimedJobActivation::ClaimNotFound => {
+                            ClaimedRecoveryActivation::ClaimNotFound
+                        }
+                    })
+                })
+                .await
+            },
+            |outcome| matches!(outcome, ClaimedRecoveryActivation::Activated),
+        )
         .await
     }
 
@@ -27609,18 +29489,25 @@ impl CrudStore {
         last_error: Option<String>,
         now_unix: i64,
     ) -> Result<bool> {
-        let last_error_value = last_error.clone();
-        self.run_serialized_write(|| async {
-            recovery_job::release_claimed_job(
-                &self.connection,
-                job_id,
-                claim_token,
-                unix_to_datetime(next_run_at_unix),
-                last_error_value.clone(),
-                unix_to_datetime(now_unix),
-            )
-            .await
-        })
+        self.background_changes(
+            &["recovery.due", "recovery.control", "storage.native_events"],
+            async {
+                let last_error_value = last_error.clone();
+                self.run_serialized_write(|| async {
+                    recovery_job::release_claimed_job(
+                        &self.connection,
+                        job_id,
+                        claim_token,
+                        unix_to_datetime(next_run_at_unix),
+                        last_error_value.clone(),
+                        unix_to_datetime(now_unix),
+                    )
+                    .await
+                })
+                .await
+            },
+            |changed| *changed,
+        )
         .await
     }
 
@@ -27647,52 +29534,58 @@ impl CrudStore {
         diagnostic: Option<pioneer_protocol::RecoveryDiagnostic>,
         now_unix: i64,
     ) -> Result<bool> {
-        let _recovery_change = recovery_wake::RecoveryChange(self.recovery_work.clone());
-        let diagnostic_json = diagnostic.as_ref().map(serde_json::to_string).transpose()?;
-        let last_error_value = last_error.clone();
-        self.run_serialized_write(|| async {
-            let tx = self
-                .connection
-                .begin()
+        self.background_changes(
+            &["recovery.due", "recovery.control", "storage.native_events"],
+            async {
+                let diagnostic_json = diagnostic.as_ref().map(serde_json::to_string).transpose()?;
+                let last_error_value = last_error.clone();
+                self.run_serialized_write(|| async {
+                    let tx = self
+                        .connection
+                        .begin()
+                        .await
+                        .context("failed to begin due pending recovery terminal transaction")?;
+                    let affected = match recovery_job::mark_due_pending_job_terminal_if_turn_idle(
+                        &tx,
+                        job_id,
+                        action,
+                        status,
+                        last_error_value.clone(),
+                        unix_to_datetime(now_unix),
+                    )
+                    .await
+                    {
+                        Ok(affected) => affected,
+                        Err(error) => {
+                            let _ = tx.rollback().await;
+                            return Err(error);
+                        }
+                    };
+                    if affected {
+                        if let Some(value) = &diagnostic_json {
+                            recovery_job::set_diagnostic(&tx, job_id, value.clone()).await?;
+                        }
+                    }
+                    if affected
+                        && let Err(error) = enqueue_recovery_terminalization_if_required(
+                            &tx,
+                            job_id,
+                            unix_to_datetime(now_unix),
+                        )
+                        .await
+                    {
+                        let _ = tx.rollback().await;
+                        return Err(error);
+                    }
+                    tx.commit()
+                        .await
+                        .context("failed to commit due pending recovery terminal transaction")?;
+                    Ok(affected)
+                })
                 .await
-                .context("failed to begin due pending recovery terminal transaction")?;
-            let affected = match recovery_job::mark_due_pending_job_terminal_if_turn_idle(
-                &tx,
-                job_id,
-                action,
-                status,
-                last_error_value.clone(),
-                unix_to_datetime(now_unix),
-            )
-            .await
-            {
-                Ok(affected) => affected,
-                Err(error) => {
-                    let _ = tx.rollback().await;
-                    return Err(error);
-                }
-            };
-            if affected {
-                if let Some(value) = &diagnostic_json {
-                    recovery_job::set_diagnostic(&tx, job_id, value.clone()).await?;
-                }
-            }
-            if affected
-                && let Err(error) = enqueue_recovery_terminalization_if_required(
-                    &tx,
-                    job_id,
-                    unix_to_datetime(now_unix),
-                )
-                .await
-            {
-                let _ = tx.rollback().await;
-                return Err(error);
-            }
-            tx.commit()
-                .await
-                .context("failed to commit due pending recovery terminal transaction")?;
-            Ok(affected)
-        })
+            },
+            |changed| *changed,
+        )
         .await
     }
 
@@ -27724,56 +29617,67 @@ impl CrudStore {
         diagnostic: Option<pioneer_protocol::RecoveryDiagnostic>,
         now_unix: i64,
     ) -> Result<bool> {
-        let _recovery_change = recovery_wake::RecoveryChange(self.recovery_work.clone());
-        let diagnostic_json = diagnostic.as_ref().map(serde_json::to_string).transpose()?;
-        let last_error_value = last_error.clone();
-        let cli_source = self
-            .prepare_cli_runtime_recovery_outcome_source(job_id)
-            .await?;
-        self.run_serialized_write(|| async {
-            let tx = self
-                .connection
-                .begin()
+        self.background_changes(
+            &["recovery.due", "recovery.control", "storage.native_events"],
+            async {
+                let diagnostic_json = diagnostic.as_ref().map(serde_json::to_string).transpose()?;
+                let last_error_value = last_error.clone();
+                let cli_source = self
+                    .prepare_cli_runtime_recovery_outcome_source(job_id)
+                    .await?;
+                self.run_serialized_write(|| async {
+                    let tx = self
+                        .connection
+                        .begin()
+                        .await
+                        .context("failed to begin claimed recovery terminal transaction")?;
+                    if matches!(
+                        status,
+                        RecoveryJobStatus::Failed
+                            | RecoveryJobStatus::Exhausted
+                            | RecoveryJobStatus::Blocked
+                    ) && !cli_runtime_recovery_transition_allowed(
+                        &tx,
+                        job_id,
+                        cli_source.as_ref(),
+                        None,
+                    )
+                    .await?
+                    {
+                        tx.rollback().await?;
+                        return Ok(false);
+                    }
+                    let affected = recovery_job::mark_claimed_job_terminal(
+                        &tx,
+                        job_id,
+                        claim_token,
+                        status,
+                        last_error_value.clone(),
+                        unix_to_datetime(now_unix),
+                    )
+                    .await?;
+                    if affected {
+                        if let Some(value) = &diagnostic_json {
+                            recovery_job::set_diagnostic(&tx, job_id, value.clone()).await?;
+                        } else if status == RecoveryJobStatus::Blocked {
+                            recovery_job::clear_diagnostic_stop_reason(&tx, job_id).await?;
+                        }
+                        enqueue_recovery_terminalization_if_required(
+                            &tx,
+                            job_id,
+                            unix_to_datetime(now_unix),
+                        )
+                        .await?;
+                    }
+                    tx.commit()
+                        .await
+                        .context("failed to commit claimed recovery terminal transaction")?;
+                    Ok(affected)
+                })
                 .await
-                .context("failed to begin claimed recovery terminal transaction")?;
-            if matches!(
-                status,
-                RecoveryJobStatus::Failed
-                    | RecoveryJobStatus::Exhausted
-                    | RecoveryJobStatus::Blocked
-            ) && !cli_runtime_recovery_transition_allowed(&tx, job_id, cli_source.as_ref(), None)
-                .await?
-            {
-                tx.rollback().await?;
-                return Ok(false);
-            }
-            let affected = recovery_job::mark_claimed_job_terminal(
-                &tx,
-                job_id,
-                claim_token,
-                status,
-                last_error_value.clone(),
-                unix_to_datetime(now_unix),
-            )
-            .await?;
-            if affected {
-                if let Some(value) = &diagnostic_json {
-                    recovery_job::set_diagnostic(&tx, job_id, value.clone()).await?;
-                } else if status == RecoveryJobStatus::Blocked {
-                    recovery_job::clear_diagnostic_stop_reason(&tx, job_id).await?;
-                }
-                enqueue_recovery_terminalization_if_required(
-                    &tx,
-                    job_id,
-                    unix_to_datetime(now_unix),
-                )
-                .await?;
-            }
-            tx.commit()
-                .await
-                .context("failed to commit claimed recovery terminal transaction")?;
-            Ok(affected)
-        })
+            },
+            |changed| *changed,
+        )
         .await
     }
 
@@ -27784,52 +29688,63 @@ impl CrudStore {
         last_error: Option<String>,
         now_unix: i64,
     ) -> Result<bool> {
-        let _recovery_change = recovery_wake::RecoveryChange(self.recovery_work.clone());
-        let last_error_value = last_error.clone();
-        let cli_source = self
-            .prepare_cli_runtime_recovery_outcome_source(job_id)
-            .await?;
-        self.run_serialized_write(|| async {
-            let tx = self
-                .connection
-                .begin()
+        self.background_changes(
+            &["recovery.due", "recovery.control", "storage.native_events"],
+            async {
+                let last_error_value = last_error.clone();
+                let cli_source = self
+                    .prepare_cli_runtime_recovery_outcome_source(job_id)
+                    .await?;
+                self.run_serialized_write(|| async {
+                    let tx = self
+                        .connection
+                        .begin()
+                        .await
+                        .context("failed to begin recovery terminal transaction")?;
+                    if matches!(
+                        status,
+                        RecoveryJobStatus::Failed
+                            | RecoveryJobStatus::Exhausted
+                            | RecoveryJobStatus::Blocked
+                    ) && !cli_runtime_recovery_transition_allowed(
+                        &tx,
+                        job_id,
+                        cli_source.as_ref(),
+                        None,
+                    )
+                    .await?
+                    {
+                        tx.rollback().await?;
+                        return Ok(false);
+                    }
+                    let affected = recovery_job::mark_job_terminal(
+                        &tx,
+                        job_id,
+                        status,
+                        last_error_value.clone(),
+                        unix_to_datetime(now_unix),
+                    )
+                    .await?;
+                    if affected {
+                        if status == RecoveryJobStatus::Blocked {
+                            recovery_job::clear_diagnostic_stop_reason(&tx, job_id).await?;
+                        }
+                        enqueue_recovery_terminalization_if_required(
+                            &tx,
+                            job_id,
+                            unix_to_datetime(now_unix),
+                        )
+                        .await?;
+                    }
+                    tx.commit()
+                        .await
+                        .context("failed to commit recovery terminal transaction")?;
+                    Ok(affected)
+                })
                 .await
-                .context("failed to begin recovery terminal transaction")?;
-            if matches!(
-                status,
-                RecoveryJobStatus::Failed
-                    | RecoveryJobStatus::Exhausted
-                    | RecoveryJobStatus::Blocked
-            ) && !cli_runtime_recovery_transition_allowed(&tx, job_id, cli_source.as_ref(), None)
-                .await?
-            {
-                tx.rollback().await?;
-                return Ok(false);
-            }
-            let affected = recovery_job::mark_job_terminal(
-                &tx,
-                job_id,
-                status,
-                last_error_value.clone(),
-                unix_to_datetime(now_unix),
-            )
-            .await?;
-            if affected {
-                if status == RecoveryJobStatus::Blocked {
-                    recovery_job::clear_diagnostic_stop_reason(&tx, job_id).await?;
-                }
-                enqueue_recovery_terminalization_if_required(
-                    &tx,
-                    job_id,
-                    unix_to_datetime(now_unix),
-                )
-                .await?;
-            }
-            tx.commit()
-                .await
-                .context("failed to commit recovery terminal transaction")?;
-            Ok(affected)
-        })
+            },
+            |changed| *changed,
+        )
         .await
     }
 
@@ -27854,55 +29769,66 @@ impl CrudStore {
         diagnostic: Option<pioneer_protocol::RecoveryDiagnostic>,
         now_unix: i64,
     ) -> Result<bool> {
-        let _recovery_change = recovery_wake::RecoveryChange(self.recovery_work.clone());
-        let diagnostic_json = diagnostic.as_ref().map(serde_json::to_string).transpose()?;
-        let last_error_value = last_error.clone();
-        let cli_source = self
-            .prepare_cli_runtime_recovery_outcome_source(job_id)
-            .await?;
-        self.run_serialized_write(|| async {
-            let tx = self
-                .connection
-                .begin()
+        self.background_changes(
+            &["recovery.due", "recovery.control", "storage.native_events"],
+            async {
+                let diagnostic_json = diagnostic.as_ref().map(serde_json::to_string).transpose()?;
+                let last_error_value = last_error.clone();
+                let cli_source = self
+                    .prepare_cli_runtime_recovery_outcome_source(job_id)
+                    .await?;
+                self.run_serialized_write(|| async {
+                    let tx = self
+                        .connection
+                        .begin()
+                        .await
+                        .context("failed to begin malformed recovery terminal transaction")?;
+                    if matches!(
+                        status,
+                        RecoveryJobStatus::Failed
+                            | RecoveryJobStatus::Exhausted
+                            | RecoveryJobStatus::Blocked
+                    ) && !cli_runtime_recovery_transition_allowed(
+                        &tx,
+                        job_id,
+                        cli_source.as_ref(),
+                        None,
+                    )
+                    .await?
+                    {
+                        tx.rollback().await?;
+                        return Ok(false);
+                    }
+                    let affected = recovery_job::mark_active_without_attempt_terminal(
+                        &tx,
+                        job_id,
+                        status,
+                        last_error_value.clone(),
+                        unix_to_datetime(now_unix),
+                    )
+                    .await?;
+                    if affected {
+                        if let Some(value) = &diagnostic_json {
+                            recovery_job::set_diagnostic(&tx, job_id, value.clone()).await?;
+                        } else if status == RecoveryJobStatus::Blocked {
+                            recovery_job::clear_diagnostic_stop_reason(&tx, job_id).await?;
+                        }
+                        enqueue_recovery_terminalization_if_required(
+                            &tx,
+                            job_id,
+                            unix_to_datetime(now_unix),
+                        )
+                        .await?;
+                    }
+                    tx.commit()
+                        .await
+                        .context("failed to commit malformed recovery terminal transaction")?;
+                    Ok(affected)
+                })
                 .await
-                .context("failed to begin malformed recovery terminal transaction")?;
-            if matches!(
-                status,
-                RecoveryJobStatus::Failed
-                    | RecoveryJobStatus::Exhausted
-                    | RecoveryJobStatus::Blocked
-            ) && !cli_runtime_recovery_transition_allowed(&tx, job_id, cli_source.as_ref(), None)
-                .await?
-            {
-                tx.rollback().await?;
-                return Ok(false);
-            }
-            let affected = recovery_job::mark_active_without_attempt_terminal(
-                &tx,
-                job_id,
-                status,
-                last_error_value.clone(),
-                unix_to_datetime(now_unix),
-            )
-            .await?;
-            if affected {
-                if let Some(value) = &diagnostic_json {
-                    recovery_job::set_diagnostic(&tx, job_id, value.clone()).await?;
-                } else if status == RecoveryJobStatus::Blocked {
-                    recovery_job::clear_diagnostic_stop_reason(&tx, job_id).await?;
-                }
-                enqueue_recovery_terminalization_if_required(
-                    &tx,
-                    job_id,
-                    unix_to_datetime(now_unix),
-                )
-                .await?;
-            }
-            tx.commit()
-                .await
-                .context("failed to commit malformed recovery terminal transaction")?;
-            Ok(affected)
-        })
+            },
+            |changed| *changed,
+        )
         .await
     }
 
@@ -27936,64 +29862,69 @@ impl CrudStore {
         now_unix: i64,
         accepted_cli_outcome: Option<&pioneer_protocol::CliRuntimeBlockedTurnGuard>,
     ) -> Result<bool> {
-        let _recovery_change = recovery_wake::RecoveryChange(self.recovery_work.clone());
-        let diagnostic_json = diagnostic.as_ref().map(serde_json::to_string).transpose()?;
-        let last_error_value = last_error.clone();
-        let cli_source = self
-            .prepare_cli_runtime_recovery_outcome_source(job_id)
-            .await?;
-        self.run_serialized_write(|| async {
-            let tx = self
-                .connection
-                .begin()
+        self.background_changes(
+            &["recovery.due", "recovery.control", "storage.native_events"],
+            async {
+                let diagnostic_json = diagnostic.as_ref().map(serde_json::to_string).transpose()?;
+                let last_error_value = last_error.clone();
+                let cli_source = self
+                    .prepare_cli_runtime_recovery_outcome_source(job_id)
+                    .await?;
+                self.run_serialized_write(|| async {
+                    let tx =
+                        self.connection.begin().await.context(
+                            "failed to begin recovery-after-attempt terminal transaction",
+                        )?;
+                    if matches!(
+                        status,
+                        RecoveryJobStatus::Failed
+                            | RecoveryJobStatus::Exhausted
+                            | RecoveryJobStatus::Blocked
+                    ) && !cli_runtime_recovery_transition_allowed(
+                        &tx,
+                        job_id,
+                        cli_source.as_ref(),
+                        accepted_cli_outcome,
+                    )
+                    .await?
+                    {
+                        tx.rollback().await?;
+                        return Ok(false);
+                    }
+                    let affected = recovery_job::mark_job_terminal_after_attempt(
+                        &tx,
+                        job_id,
+                        active_attempt_id,
+                        status,
+                        last_error_value.clone(),
+                        unix_to_datetime(now_unix),
+                    )
+                    .await?;
+                    if affected {
+                        if let Some(value) = &diagnostic_json {
+                            recovery_job::set_diagnostic(&tx, job_id, value.clone()).await?;
+                        } else if status == RecoveryJobStatus::Blocked {
+                            recovery_job::clear_diagnostic_stop_reason(&tx, job_id).await?;
+                        }
+                        enqueue_recovery_terminalization_if_required(
+                            &tx,
+                            job_id,
+                            unix_to_datetime(now_unix),
+                        )
+                        .await?;
+                    }
+                    if affected {
+                        ack_cli_runtime_recovery_outcome(&tx, accepted_cli_outcome).await?;
+                    }
+                    tx.commit()
+                        .await
+                        .context("failed to commit recovery-after-attempt terminal transaction")?;
+                    Ok(affected)
+                })
                 .await
-                .context("failed to begin recovery-after-attempt terminal transaction")?;
-            if matches!(
-                status,
-                RecoveryJobStatus::Failed
-                    | RecoveryJobStatus::Exhausted
-                    | RecoveryJobStatus::Blocked
-            ) && !cli_runtime_recovery_transition_allowed(
-                &tx,
-                job_id,
-                cli_source.as_ref(),
-                accepted_cli_outcome,
-            )
-            .await?
-            {
-                tx.rollback().await?;
-                return Ok(false);
-            }
-            let affected = recovery_job::mark_job_terminal_after_attempt(
-                &tx,
-                job_id,
-                active_attempt_id,
-                status,
-                last_error_value.clone(),
-                unix_to_datetime(now_unix),
-            )
-            .await?;
-            if affected {
-                if let Some(value) = &diagnostic_json {
-                    recovery_job::set_diagnostic(&tx, job_id, value.clone()).await?;
-                } else if status == RecoveryJobStatus::Blocked {
-                    recovery_job::clear_diagnostic_stop_reason(&tx, job_id).await?;
-                }
-                enqueue_recovery_terminalization_if_required(
-                    &tx,
-                    job_id,
-                    unix_to_datetime(now_unix),
-                )
-                .await?;
-            }
-            if affected {
-                ack_cli_runtime_recovery_outcome(&tx, accepted_cli_outcome).await?;
-            }
-            tx.commit()
-                .await
-                .context("failed to commit recovery-after-attempt terminal transaction")?;
-            Ok(affected)
-        })
+            },
+            |changed| *changed,
+        )
         .await
     }
 
@@ -28005,24 +29936,32 @@ impl CrudStore {
         now_unix: i64,
         lease_until_unix: i64,
     ) -> Result<bool> {
-        self.run_serialized_write(|| async {
-            let tx = self.connection.begin().await?;
-            if !native_recovery_start_transition_allowed(&tx, execution, recovery, now_unix).await?
-            {
-                tx.rollback().await?;
-                return Ok(false);
-            }
-            let applied = turn_execution::mark_running_owned(
-                &tx,
-                &execution.turn_id,
-                &execution.owner_id,
-                unix_to_datetime(now_unix),
-                unix_to_datetime(lease_until_unix),
-            )
-            .await?;
-            tx.commit().await?;
-            Ok(applied)
-        })
+        self.background_changes(
+            &["recovery.due", "recovery.control", "storage.native_events"],
+            async {
+                self.run_serialized_write(|| async {
+                    let tx = self.connection.begin().await?;
+                    if !native_recovery_start_transition_allowed(&tx, execution, recovery, now_unix)
+                        .await?
+                    {
+                        tx.rollback().await?;
+                        return Ok(false);
+                    }
+                    let applied = turn_execution::mark_running_owned(
+                        &tx,
+                        &execution.turn_id,
+                        &execution.owner_id,
+                        unix_to_datetime(now_unix),
+                        unix_to_datetime(lease_until_unix),
+                    )
+                    .await?;
+                    tx.commit().await?;
+                    Ok(applied)
+                })
+                .await
+            },
+            |changed| *changed,
+        )
         .await
     }
 
@@ -28039,70 +29978,84 @@ impl CrudStore {
         diagnostic: Option<pioneer_protocol::RecoveryDiagnostic>,
         now_unix: i64,
     ) -> Result<bool> {
-        let _recovery_change = recovery_wake::RecoveryChange(self.recovery_work.clone());
-        anyhow::ensure!(
-            matches!(
-                status,
-                RecoveryJobStatus::Pending | RecoveryJobStatus::Exhausted
-            ),
-            "unexpected native pre-start recovery outcome"
-        );
-        let diagnostic_json = diagnostic.as_ref().map(serde_json::to_string).transpose()?;
-        self.run_serialized_write(|| async {
-            let tx = self.connection.begin().await?;
-            if !native_recovery_start_transition_allowed(&tx, execution, recovery, now_unix).await?
-            {
-                tx.rollback().await?;
-                return Ok(false);
-            }
-            let now = unix_to_datetime(now_unix);
-            let applied = if status == RecoveryJobStatus::Pending {
-                let applied = recovery_job::mark_job_retrying(
-                    &tx,
-                    &recovery.job_id,
-                    &recovery.attempt_id,
-                    unix_to_datetime(next_run_at_unix.context("native retry deadline is missing")?),
-                    None,
-                    last_error.clone(),
-                    diagnostic_json.clone(),
-                    now,
-                )
-                .await?;
-                if applied {
-                    anyhow::ensure!(
-                        turn_execution::mark_recovering_owned(
-                            &tx,
-                            &execution.turn_id,
-                            &execution.owner_id,
-                            now
-                        )
-                        .await?,
-                        "native recovery execution changed during refusal"
-                    );
-                }
-                applied
-            } else {
-                let applied = recovery_job::mark_job_terminal_after_attempt(
-                    &tx,
-                    &recovery.job_id,
-                    &recovery.attempt_id,
-                    status,
-                    last_error.clone(),
-                    now,
-                )
-                .await?;
-                if applied {
-                    if let Some(value) = &diagnostic_json {
-                        recovery_job::set_diagnostic(&tx, &recovery.job_id, value.clone()).await?;
+        self.background_changes(
+            &["recovery.due", "recovery.control", "storage.native_events"],
+            async {
+                anyhow::ensure!(
+                    matches!(
+                        status,
+                        RecoveryJobStatus::Pending | RecoveryJobStatus::Exhausted
+                    ),
+                    "unexpected native pre-start recovery outcome"
+                );
+                let diagnostic_json = diagnostic.as_ref().map(serde_json::to_string).transpose()?;
+                self.run_serialized_write(|| async {
+                    let tx = self.connection.begin().await?;
+                    if !native_recovery_start_transition_allowed(&tx, execution, recovery, now_unix)
+                        .await?
+                    {
+                        tx.rollback().await?;
+                        return Ok(false);
                     }
-                    enqueue_recovery_terminalization_if_required(&tx, &recovery.job_id, now)
+                    let now = unix_to_datetime(now_unix);
+                    let applied = if status == RecoveryJobStatus::Pending {
+                        let applied = recovery_job::mark_job_retrying(
+                            &tx,
+                            &recovery.job_id,
+                            &recovery.attempt_id,
+                            unix_to_datetime(
+                                next_run_at_unix.context("native retry deadline is missing")?,
+                            ),
+                            None,
+                            last_error.clone(),
+                            diagnostic_json.clone(),
+                            now,
+                        )
                         .await?;
-                }
-                applied
-            };
-            tx.commit().await?;
-            Ok(applied)
-        })
+                        if applied {
+                            anyhow::ensure!(
+                                turn_execution::mark_recovering_owned(
+                                    &tx,
+                                    &execution.turn_id,
+                                    &execution.owner_id,
+                                    now
+                                )
+                                .await?,
+                                "native recovery execution changed during refusal"
+                            );
+                        }
+                        applied
+                    } else {
+                        let applied = recovery_job::mark_job_terminal_after_attempt(
+                            &tx,
+                            &recovery.job_id,
+                            &recovery.attempt_id,
+                            status,
+                            last_error.clone(),
+                            now,
+                        )
+                        .await?;
+                        if applied {
+                            if let Some(value) = &diagnostic_json {
+                                recovery_job::set_diagnostic(&tx, &recovery.job_id, value.clone())
+                                    .await?;
+                            }
+                            enqueue_recovery_terminalization_if_required(
+                                &tx,
+                                &recovery.job_id,
+                                now,
+                            )
+                            .await?;
+                        }
+                        applied
+                    };
+                    tx.commit().await?;
+                    Ok(applied)
+                })
+                .await
+            },
+            |changed| *changed,
+        )
         .await
     }
 
@@ -28165,50 +30118,60 @@ impl CrudStore {
             &pioneer_protocol::RecoveryAttemptContext,
         )>,
     ) -> Result<()> {
-        native_terminal_effect_outbox::prepare_input(preparation.clone())?;
-        let candidate = repositories::native_cancellation_context::prepare_registration(
-            &preparation,
-            owner_id,
-            unix_to_datetime(now_unix),
-        )?;
-        self.run_serialized_write(|| async {
-            let candidate = candidate.clone();
-            let tx = self.connection.begin().await?;
-            if let Some((execution, recovery)) = recovery_source {
-                anyhow::ensure!(
-                    native_recovery_start_transition_allowed(&tx, execution, recovery, now_unix)
+        self.background_changes(
+            &["tasks.lifecycle", "compaction.lifecycle"],
+            async {
+                native_terminal_effect_outbox::prepare_input(preparation.clone())?;
+                let candidate = repositories::native_cancellation_context::prepare_registration(
+                    &preparation,
+                    owner_id,
+                    unix_to_datetime(now_unix),
+                )?;
+                self.run_serialized_write(|| async {
+                    let candidate = candidate.clone();
+                    let tx = self.connection.begin().await?;
+                    if let Some((execution, recovery)) = recovery_source {
+                        anyhow::ensure!(
+                            native_recovery_start_transition_allowed(
+                                &tx, execution, recovery, now_unix
+                            )
+                            .await?,
+                            "native recovery start source changed before ACK"
+                        );
+                    }
+                    anyhow::ensure!(
+                        !turn_event_projection_stream_state::has_accepted_terminal(
+                            &tx,
+                            &preparation.turn_id,
+                        )
                         .await?,
-                    "native recovery start source changed before ACK"
-                );
-            }
-            anyhow::ensure!(
-                !turn_event_projection_stream_state::has_accepted_terminal(
-                    &tx,
-                    &preparation.turn_id,
-                )
-                .await?,
-                "native cancellation context cannot confirm an accepted terminal Turn"
-            );
-            if let Some(execution) = turn_execution::find(&tx, &preparation.turn_id).await? {
-                anyhow::ensure!(
-                    execution.owner_id == owner_id
-                        && execution.thread_id == preparation.thread_id
-                        && execution.workspace_id == preparation.workspace_id
-                        && execution.status.is_active(),
-                    "native cancellation context has stale execution scope or owner"
-                );
-            }
-            repositories::native_cancellation_context::insert_once(
-                &tx,
-                &preparation,
-                candidate,
-                initial_turn,
-                owner_id,
-            )
-            .await?;
-            tx.commit().await?;
-            Ok(())
-        })
+                        "native cancellation context cannot confirm an accepted terminal Turn"
+                    );
+                    if let Some(execution) = turn_execution::find(&tx, &preparation.turn_id).await?
+                    {
+                        anyhow::ensure!(
+                            execution.owner_id == owner_id
+                                && execution.thread_id == preparation.thread_id
+                                && execution.workspace_id == preparation.workspace_id
+                                && execution.status.is_active(),
+                            "native cancellation context has stale execution scope or owner"
+                        );
+                    }
+                    repositories::native_cancellation_context::insert_once(
+                        &tx,
+                        &preparation,
+                        candidate,
+                        initial_turn,
+                        owner_id,
+                    )
+                    .await?;
+                    tx.commit().await?;
+                    Ok(())
+                })
+                .await
+            },
+            |_| true,
+        )
         .await
     }
 
@@ -28409,37 +30372,107 @@ impl CrudStore {
         .await
     }
 
+    pub async fn native_terminal_effect_work_deadline(
+        &self,
+    ) -> Result<Option<DateTimeWithTimeZone>> {
+        native_terminal_effect_outbox::work_deadline(&self.connection).await
+    }
+    pub async fn native_terminal_effect_archive_deadline(
+        &self,
+        now_unix: i64,
+        retention: bool,
+    ) -> Result<Option<DateTimeWithTimeZone>> {
+        if !retention {
+            use pioneer_entity::native_terminal_effect_outbox as effect;
+            let upper = effect::Entity::find()
+                .select_only()
+                .column(effect::Column::EffectId)
+                .order_by_desc(effect::Column::EffectId)
+                .limit(1)
+                .into_tuple::<String>()
+                .one(&self.connection)
+                .await?;
+            let Some(upper) = upper else {
+                return Ok(None);
+            };
+            let mut after = String::new();
+            let mut next = None;
+            loop {
+                let ids = effect::Entity::find()
+                    .select_only()
+                    .column(effect::Column::EffectId)
+                    .filter(effect::Column::EffectId.gt(after.clone()))
+                    .filter(effect::Column::EffectId.lte(upper.clone()))
+                    .order_by_asc(effect::Column::EffectId)
+                    .limit(32)
+                    .into_tuple::<String>()
+                    .all(&self.connection)
+                    .await?;
+                let done = ids.len() < 32;
+                for id in ids {
+                    let at = native_terminal_effect_outbox::retry_clock_by_id(
+                        &self.connection,
+                        &id,
+                        unix_to_datetime(now_unix),
+                    )
+                    .await?;
+                    next = next.into_iter().chain(at).min();
+                    after = id;
+                }
+                if done {
+                    return Ok(next);
+                }
+            }
+        }
+        native_terminal_effect_outbox::archive_deadline(
+            &self.connection,
+            unix_to_datetime(now_unix),
+            retention,
+        )
+        .await
+    }
+
     pub async fn prepare_native_terminal_effects(
         &self,
         preparation: pioneer_protocol::NativeTerminalEffectPreparation,
         now_unix: i64,
     ) -> Result<()> {
-        let prepared = native_terminal_effect_outbox::prepare_input(preparation)?;
-        self.run_serialized_write(|| {
-            let prepared = prepared.clone();
-            async move {
-                let transaction =
-                    self.connection.begin().await.context(
-                        "failed to begin native terminal-effect preparation transaction",
-                    )?;
-                let result = native_terminal_effect_outbox::prepare(
-                    &transaction,
-                    prepared,
-                    unix_to_datetime(now_unix),
-                )
-                .await;
-                match result {
-                    Ok(()) => transaction
-                        .commit()
-                        .await
-                        .context("failed to commit native terminal-effect preparation"),
-                    Err(error) => {
-                        let _ = transaction.rollback().await;
-                        Err(error)
+        self.background_changes(
+            &[
+                "recovery.effects",
+                "recovery.effects.retry",
+                "recovery.effects.retention",
+            ],
+            async {
+                let prepared = native_terminal_effect_outbox::prepare_input(preparation)?;
+                self.run_serialized_write(|| {
+                    let prepared = prepared.clone();
+                    async move {
+                        let transaction = self.connection.begin().await.context(
+                            "failed to begin native terminal-effect preparation transaction",
+                        )?;
+                        let result = native_terminal_effect_outbox::prepare(
+                            &transaction,
+                            prepared,
+                            unix_to_datetime(now_unix),
+                        )
+                        .await;
+                        match result {
+                            Ok(()) => transaction
+                                .commit()
+                                .await
+                                .context("failed to commit native terminal-effect preparation"),
+                            Err(error) => {
+                                let _ = transaction.rollback().await;
+                                Err(error)
+                            }
+                        }
                     }
-                }
-            }
-        })
+                })
+                .await
+            },
+            |_| true,
+        )
         .await
     }
 
@@ -28454,31 +30487,42 @@ impl CrudStore {
         expected_cli_attempt_index: i64,
         now_unix: i64,
     ) -> Result<()> {
-        let turn_id = preparation.turn_id.clone();
-        let prepared = native_terminal_effect_outbox::prepare_input(preparation)?;
-        self.run_serialized_write(|| {
-            let prepared = prepared.clone();
-            let turn_id = turn_id.clone();
-            async move {
-                let tx = self.connection.begin().await?;
-                // Transcript preparation happens outside DB capacity. Fence
-                // the attempt so obsolete callbacks cannot replace its successor.
-                let attempt = cli_runtime_binding::latest_turn_attempt(&tx, &turn_id)
-                    .await?
-                    .context("CLI post-turn attempt is missing")?;
-                if i64::from(attempt.attempt_index) != expected_cli_attempt_index {
-                    bail!("CLI post-turn preparation belongs to an obsolete attempt");
-                }
-                native_terminal_effect_outbox::prepare_post_turn_once(
-                    &tx,
-                    prepared,
-                    unix_to_datetime(now_unix),
-                )
-                .await?;
-                tx.commit().await?;
-                Ok(())
-            }
-        })
+        self.background_changes(
+            &[
+                "recovery.effects",
+                "recovery.effects.retry",
+                "recovery.effects.retention",
+            ],
+            async {
+                let turn_id = preparation.turn_id.clone();
+                let prepared = native_terminal_effect_outbox::prepare_input(preparation)?;
+                self.run_serialized_write(|| {
+                    let prepared = prepared.clone();
+                    let turn_id = turn_id.clone();
+                    async move {
+                        let tx = self.connection.begin().await?;
+                        // Transcript preparation happens outside DB capacity. Fence
+                        // the attempt so obsolete callbacks cannot replace its successor.
+                        let attempt = cli_runtime_binding::latest_turn_attempt(&tx, &turn_id)
+                            .await?
+                            .context("CLI post-turn attempt is missing")?;
+                        if i64::from(attempt.attempt_index) != expected_cli_attempt_index {
+                            bail!("CLI post-turn preparation belongs to an obsolete attempt");
+                        }
+                        native_terminal_effect_outbox::prepare_post_turn_once(
+                            &tx,
+                            prepared,
+                            unix_to_datetime(now_unix),
+                        )
+                        .await?;
+                        tx.commit().await?;
+                        Ok(())
+                    }
+                })
+                .await
+            },
+            |_| true,
+        )
         .await
     }
 
@@ -28523,6 +30567,7 @@ impl CrudStore {
         limit: u64,
         clock: &(dyn Fn() -> i64 + Send + Sync),
     ) -> Result<NativeTerminalEffectClaimOutcome> {
+        self.background_changes(&["recovery.effects"], async {
         let limit = limit.min(native_terminal_effect_outbox::EFFECT_INPUT_BUDGET);
         if limit == 0 {
             return Ok(NativeTerminalEffectClaimOutcome::default());
@@ -28744,6 +30789,7 @@ impl CrudStore {
             records: valid,
             storage_failed,
         })
+        }, |_| true).await
     }
 
     pub async fn requeue_retryable_unresolved_native_terminal_effects(
@@ -28751,16 +30797,26 @@ impl CrudStore {
         now_unix: i64,
         limit: u64,
     ) -> Result<u64> {
-        self.run_serialized_write(|| {
-            native_terminal_effect_outbox::requeue_retryable_unresolved(
-                &self.connection,
-                unix_to_datetime(now_unix),
-                unix_to_datetime(now_unix.saturating_sub(60 * 60)),
-                unix_to_datetime(now_unix.saturating_sub(24 * 60 * 60)),
-                limit,
-            )
-        })
-        .await
+        let limit =
+            limit.min(native_terminal_effect_outbox::MAX_RETRYABLE_UNRESOLVED_REQUEUE_BATCH_SIZE);
+        let mut pass = EffectRetryPass::default();
+        let mut changed = 0;
+        if limit == 0 {
+            return Ok(0);
+        }
+        loop {
+            let (done, count) = self
+                .native_terminal_effect_retry_quantum(
+                    &mut pass,
+                    now_unix,
+                    limit.saturating_sub(changed).min(32),
+                )
+                .await?;
+            changed += count;
+            if done || changed >= limit {
+                return Ok(changed);
+            }
+        }
     }
 
     pub async fn complete_native_terminal_effect(
@@ -28769,14 +30825,25 @@ impl CrudStore {
         claim_token: &str,
         now_unix: i64,
     ) -> Result<bool> {
-        self.run_serialized_write(|| {
-            native_terminal_effect_outbox::mark_succeeded(
-                &self.connection,
-                effect_id,
-                claim_token,
-                unix_to_datetime(now_unix),
-            )
-        })
+        self.background_changes(
+            &[
+                "recovery.effects",
+                "recovery.effects.retry",
+                "recovery.effects.retention",
+            ],
+            async {
+                self.run_serialized_write(|| {
+                    native_terminal_effect_outbox::mark_succeeded(
+                        &self.connection,
+                        effect_id,
+                        claim_token,
+                        unix_to_datetime(now_unix),
+                    )
+                })
+                .await
+            },
+            |changed| *changed,
+        )
         .await
     }
 
@@ -28823,18 +30890,29 @@ impl CrudStore {
         retry_at_unix: i64,
         now_unix: i64,
     ) -> Result<bool> {
-        self.run_serialized_write(|| {
-            native_terminal_effect_outbox::mark_failed(
-                &self.connection,
-                effect_id,
-                claim_token,
-                error_code,
-                error_message,
-                retryable,
-                unix_to_datetime(retry_at_unix),
-                unix_to_datetime(now_unix),
-            )
-        })
+        self.background_changes(
+            &[
+                "recovery.effects",
+                "recovery.effects.retry",
+                "recovery.effects.retention",
+            ],
+            async {
+                self.run_serialized_write(|| {
+                    native_terminal_effect_outbox::mark_failed(
+                        &self.connection,
+                        effect_id,
+                        claim_token,
+                        error_code,
+                        error_message,
+                        retryable,
+                        unix_to_datetime(retry_at_unix),
+                        unix_to_datetime(now_unix),
+                    )
+                })
+                .await
+            },
+            |changed| *changed,
+        )
         .await
     }
 
@@ -28847,13 +30925,24 @@ impl CrudStore {
         cutoff_unix: i64,
         limit: u64,
     ) -> Result<u64> {
-        self.run_serialized_write(|| {
-            native_terminal_effect_outbox::purge_resolved_before(
-                &self.connection,
-                unix_to_datetime(cutoff_unix),
-                limit,
-            )
-        })
+        self.background_changes(
+            &[
+                "recovery.effects",
+                "recovery.effects.retry",
+                "recovery.effects.retention",
+            ],
+            async {
+                self.run_serialized_write(|| {
+                    native_terminal_effect_outbox::purge_resolved_before(
+                        &self.connection,
+                        unix_to_datetime(cutoff_unix),
+                        limit,
+                    )
+                })
+                .await
+            },
+            |changed| *changed > 0,
+        )
         .await
     }
 
@@ -28994,99 +31083,112 @@ impl CrudStore {
         claim_lease_secs: u64,
         limit: u64,
     ) -> Result<Vec<ClaimedRecoveryTerminalizationRecord>> {
-        self.run_serialized_write(|| async {
-            let now = unix_to_datetime(now_unix);
-            let claim_expires_at = unix_to_datetime(
-                now_unix.saturating_add(i64::try_from(claim_lease_secs).unwrap_or(i64::MAX)),
-            );
-            let transaction = self
-                .connection
-                .begin()
-                .await
-                .context("failed to begin recovery terminalization batch claim")?;
-            let claimed = match recovery_terminalization_outbox::claim_due(
-                &transaction,
-                now,
-                claim_expires_at,
-                limit,
-            )
-            .await
-            {
-                Ok(claimed) => {
-                    transaction
-                        .commit()
+        self.background_change(
+            "recovery.control",
+            async {
+                self.run_serialized_write(|| async {
+                    let now = unix_to_datetime(now_unix);
+                    let claim_expires_at = unix_to_datetime(
+                        now_unix
+                            .saturating_add(i64::try_from(claim_lease_secs).unwrap_or(i64::MAX)),
+                    );
+                    let transaction = self
+                        .connection
+                        .begin()
                         .await
-                        .context("failed to commit recovery terminalization batch claim")?;
-                    claimed
-                }
-                Err(error) => {
-                    let _ = transaction.rollback().await;
-                    return Err(error);
-                }
-            };
-            let mut valid = Vec::with_capacity(claimed.len());
-            for claimed in claimed {
-                let row = claimed.row;
-                let recovery_job_id = row.recovery_job_id.clone();
-                let claim_token = claimed.claim_token.clone();
-                let decoded = (|| -> Result<ClaimedRecoveryTerminalizationRecord> {
-                    let item_type =
-                        turn_item_type_from_db(row.item_type.as_str()).ok_or_else(|| {
-                            permanent_recovery_terminalization_error(
-                                "unknown_item_type",
-                                "recovery terminalization has an unknown item type",
+                        .context("failed to begin recovery terminalization batch claim")?;
+                    let claimed = match recovery_terminalization_outbox::claim_due(
+                        &transaction,
+                        now,
+                        claim_expires_at,
+                        limit,
+                    )
+                    .await
+                    {
+                        Ok(claimed) => {
+                            transaction
+                                .commit()
+                                .await
+                                .context("failed to commit recovery terminalization batch claim")?;
+                            claimed
+                        }
+                        Err(error) => {
+                            let _ = transaction.rollback().await;
+                            return Err(error);
+                        }
+                    };
+                    let mut valid = Vec::with_capacity(claimed.len());
+                    for claimed in claimed {
+                        let row = claimed.row;
+                        let recovery_job_id = row.recovery_job_id.clone();
+                        let claim_token = claimed.claim_token.clone();
+                        let decoded = (|| -> Result<ClaimedRecoveryTerminalizationRecord> {
+                            let item_type = turn_item_type_from_db(row.item_type.as_str())
+                                .ok_or_else(|| {
+                                    permanent_recovery_terminalization_error(
+                                        "unknown_item_type",
+                                        "recovery terminalization has an unknown item type",
+                                    )
+                                })?;
+                            let recovery_status = recovery_job_status_from_db(
+                                row.recovery_status.as_str(),
                             )
-                        })?;
-                    let recovery_status = recovery_job_status_from_db(row.recovery_status.as_str())
-                        .ok_or_else(|| {
-                            permanent_recovery_terminalization_error(
-                                "unknown_recovery_status",
-                                "recovery terminalization has an unknown recovery status",
-                            )
-                        })?;
-                    let attempt_number = u32::try_from(row.attempt_number).map_err(|_| {
-                        permanent_recovery_terminalization_error(
-                            "invalid_attempt_number",
-                            "recovery terminalization attempt number is invalid",
-                        )
-                    })?;
-                    Ok(ClaimedRecoveryTerminalizationRecord {
-                        recovery_job_id: row.recovery_job_id,
-                        turn_id: row.turn_id,
-                        item_id: row.item_id,
-                        item_type,
-                        recovery_status,
-                        attempt_number,
-                        error_message: row.error_message,
-                        attempt_count: u32::try_from(row.attempt_count).unwrap_or(u32::MAX),
-                        claim_token: claimed.claim_token,
-                    })
-                })();
-                match decoded {
-                    Ok(record) => valid.push(record),
-                    Err(error) => {
-                        let permanent = error
-                            .downcast_ref::<PermanentRecoveryTerminalizationError>()
-                            .expect("claim decoding only returns permanent validation errors");
-                        if !recovery_terminalization_outbox::quarantine_claim(
-                            &self.connection,
-                            recovery_job_id.as_str(),
-                            claim_token.as_str(),
-                            permanent.reason_code,
-                            permanent.message.as_str(),
-                            now,
-                        )
-                        .await?
-                        {
-                            anyhow::bail!(
-                                "recovery terminalization claim was lost before quarantine"
-                            );
+                            .ok_or_else(|| {
+                                permanent_recovery_terminalization_error(
+                                    "unknown_recovery_status",
+                                    "recovery terminalization has an unknown recovery status",
+                                )
+                            })?;
+                            let attempt_number =
+                                u32::try_from(row.attempt_number).map_err(|_| {
+                                    permanent_recovery_terminalization_error(
+                                        "invalid_attempt_number",
+                                        "recovery terminalization attempt number is invalid",
+                                    )
+                                })?;
+                            Ok(ClaimedRecoveryTerminalizationRecord {
+                                recovery_job_id: row.recovery_job_id,
+                                turn_id: row.turn_id,
+                                item_id: row.item_id,
+                                item_type,
+                                recovery_status,
+                                attempt_number,
+                                error_message: row.error_message,
+                                attempt_count: u32::try_from(row.attempt_count).unwrap_or(u32::MAX),
+                                claim_token: claimed.claim_token,
+                            })
+                        })();
+                        match decoded {
+                            Ok(record) => valid.push(record),
+                            Err(error) => {
+                                let permanent = error
+                                    .downcast_ref::<PermanentRecoveryTerminalizationError>()
+                                    .expect(
+                                        "claim decoding only returns permanent validation errors",
+                                    );
+                                if !recovery_terminalization_outbox::quarantine_claim(
+                                    &self.connection,
+                                    recovery_job_id.as_str(),
+                                    claim_token.as_str(),
+                                    permanent.reason_code,
+                                    permanent.message.as_str(),
+                                    now,
+                                )
+                                .await?
+                                {
+                                    anyhow::bail!(
+                                        "recovery terminalization claim was lost before quarantine"
+                                    );
+                                }
+                            }
                         }
                     }
-                }
-            }
-            Ok(valid)
-        })
+                    Ok(valid)
+                })
+                .await
+            },
+            |rows| !rows.is_empty(),
+        )
         .await
     }
 
@@ -29099,69 +31201,128 @@ impl CrudStore {
         limit: u64,
         now_unix: i64,
     ) -> Result<u64> {
-        if limit == 0 {
-            return Ok(0);
-        }
-        let now = unix_to_datetime(now_unix);
-        self.run_serialized_write(|| async {
-            let mut remaining = limit;
-            let mut total_enqueued = 0_u64;
-            while remaining > 0 {
-                let batch_limit = remaining.min(RECOVERY_TERMINALIZATION_BACKFILL_BATCH_SIZE);
-                let tx = self
-                    .connection
-                    .begin()
-                    .await
-                    .context("failed to begin recovery terminalization audit batch")?;
-                let result = async {
-                    let rows = tx
-                        .query_all_raw(Statement::from_sql_and_values(
-                            tx.get_database_backend(),
-                            "SELECT r.id FROM recovery_job r \
+        self.background_change(
+            "recovery.control",
+            async {
+                if limit == 0 {
+                    return Ok(0);
+                }
+                let now = unix_to_datetime(now_unix);
+                self.run_serialized_write(|| async {
+                    let mut remaining = limit;
+                    let mut total_enqueued = 0_u64;
+                    while remaining > 0 {
+                        let batch_limit =
+                            remaining.min(RECOVERY_TERMINALIZATION_BACKFILL_BATCH_SIZE);
+                        let tx = self
+                            .connection
+                            .begin()
+                            .await
+                            .context("failed to begin recovery terminalization audit batch")?;
+                        let result = async {
+                            let rows = tx
+                                .query_all_raw(Statement::from_sql_and_values(
+                                    tx.get_database_backend(),
+                                    "SELECT r.id FROM recovery_job r \
                              LEFT JOIN recovery_terminalization_outbox o \
                                ON o.recovery_job_id = r.id \
                              WHERE r.status IN ('failed', 'exhausted', 'blocked') \
                                AND r.resolution_pending = 1 \
                                AND o.recovery_job_id IS NULL \
                              ORDER BY r.updated_at ASC, r.id ASC LIMIT ?"
-                                .to_owned(),
-                            [i64::try_from(batch_limit).unwrap_or(i64::MAX).into()],
-                        ))
-                        .await
-                        .context("failed to scan terminal recovery jobs missing outbox")?;
-                    let row_count = rows.len() as u64;
-                    for row in rows {
-                        let job_id: String = row.try_get("", "id")?;
-                        enqueue_recovery_terminalization_if_required(&tx, job_id.as_str(), now)
-                            .await?;
+                                        .to_owned(),
+                                    [i64::try_from(batch_limit).unwrap_or(i64::MAX).into()],
+                                ))
+                                .await
+                                .context("failed to scan terminal recovery jobs missing outbox")?;
+                            let row_count = rows.len() as u64;
+                            for row in rows {
+                                let job_id: String = row.try_get("", "id")?;
+                                enqueue_recovery_terminalization_if_required(
+                                    &tx,
+                                    job_id.as_str(),
+                                    now,
+                                )
+                                .await?;
+                            }
+                            Ok::<u64, anyhow::Error>(row_count)
+                        }
+                        .await;
+                        let enqueued = match result {
+                            Ok(enqueued) => {
+                                tx.commit().await.context(
+                                    "failed to commit recovery terminalization audit batch",
+                                )?;
+                                enqueued
+                            }
+                            Err(error) => {
+                                let _ = tx.rollback().await;
+                                return Err(error);
+                            }
+                        };
+                        total_enqueued = total_enqueued.saturating_add(enqueued);
+                        remaining = remaining.saturating_sub(enqueued);
+                        if enqueued < batch_limit {
+                            break;
+                        }
+                        // The next batch must acquire a fresh maintenance reservation;
+                        // queued interactive work is therefore admitted between
+                        // durable batches by the writer executor.
                     }
-                    Ok::<u64, anyhow::Error>(row_count)
-                }
-                .await;
-                let enqueued = match result {
-                    Ok(enqueued) => {
-                        tx.commit()
-                            .await
-                            .context("failed to commit recovery terminalization audit batch")?;
-                        enqueued
-                    }
-                    Err(error) => {
-                        let _ = tx.rollback().await;
-                        return Err(error);
-                    }
-                };
-                total_enqueued = total_enqueued.saturating_add(enqueued);
-                remaining = remaining.saturating_sub(enqueued);
-                if enqueued < batch_limit {
-                    break;
-                }
-                // The next batch must acquire a fresh maintenance reservation;
-                // queued interactive work is therefore admitted between
-                // durable batches by the writer executor.
-            }
-            Ok(total_enqueued)
-        })
+                    Ok(total_enqueued)
+                })
+                .await
+            },
+            |count| *count > 0,
+        )
         .await
+    }
+
+    /// Bounded locators from RecoveryClockPass, not a population readiness scan.
+    pub async fn enqueue_missing_recovery_terminalization_candidates(
+        &self,
+        ids: &[String],
+        now_unix: i64,
+    ) -> Result<u64> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let mut count = 0;
+        let mut failure = None;
+        for id in ids.iter().take(64) {
+            let result = self
+                .background_change(
+                    "recovery.control",
+                    async {
+                        self.run_serialized_write(|| async {
+                            let tx = self.connection.begin().await?;
+                            let changed = recovery_terminalization_outbox::enqueue_missing_for_job(
+                                &tx,
+                                id,
+                                unix_to_datetime(now_unix),
+                            )
+                            .await?;
+                            tx.commit().await?;
+                            Ok(changed)
+                        })
+                        .await
+                    },
+                    |changed| *changed,
+                )
+                .await;
+            match result {
+                Ok(changed) => count += u64::from(changed),
+                Err(error) => {
+                    failure.get_or_insert(error);
+                }
+            }
+        }
+        // Each independent point commits before the next; one poisoned source
+        // retains Unknown/error without rolling back a healthy selected tail.
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        Ok(count)
     }
 
     pub async fn fail_recovery_terminalization_claim(
@@ -29171,17 +31332,24 @@ impl CrudStore {
         retry_at_unix: i64,
         now_unix: i64,
     ) -> Result<bool> {
-        self.run_serialized_write(|| async {
-            recovery_terminalization_outbox::mark_failed(
-                &self.connection,
-                record.recovery_job_id.as_str(),
-                record.claim_token.as_str(),
-                error.clone(),
-                unix_to_datetime(retry_at_unix),
-                unix_to_datetime(now_unix),
-            )
-            .await
-        })
+        self.background_change(
+            "recovery.control",
+            async {
+                self.run_serialized_write(|| async {
+                    recovery_terminalization_outbox::mark_failed(
+                        &self.connection,
+                        record.recovery_job_id.as_str(),
+                        record.claim_token.as_str(),
+                        error.clone(),
+                        unix_to_datetime(retry_at_unix),
+                        unix_to_datetime(now_unix),
+                    )
+                    .await
+                })
+                .await
+            },
+            |changed| *changed,
+        )
         .await
     }
 
@@ -29194,177 +31362,200 @@ impl CrudStore {
         record: &ClaimedRecoveryTerminalizationRecord,
         now_unix: i64,
     ) -> Result<RecoveryTerminalizationClaimDisposition> {
-        enum Decision {
-            NeedsCommit,
-            AlreadyTerminal,
-            Superseded(TurnStatus),
-            Quarantine {
-                reason_code: &'static str,
-                message: String,
+        self.background_change(
+            "recovery.control",
+            async {
+                enum Decision {
+                    NeedsCommit,
+                    AlreadyTerminal,
+                    Superseded(TurnStatus),
+                    Quarantine {
+                        reason_code: &'static str,
+                        message: String,
+                    },
+                }
+
+                let record = record.clone();
+                self.run_serialized_write(|| async {
+                    let now = unix_to_datetime(now_unix);
+                    let tx = self
+                        .connection
+                        .begin()
+                        .await
+                        .context("failed to begin recovery terminalization classification")?;
+                    let result = async {
+                        let outbox =
+                            pioneer_entity::recovery_terminalization_outbox::Entity::find_by_id(
+                                record.recovery_job_id.clone(),
+                            )
+                            .one(&tx)
+                            .await?
+                            .context("recovery terminalization outbox row disappeared")?;
+                        if outbox.status != recovery_terminalization_outbox::STATUS_DELIVERING
+                            || outbox.claim_token.as_deref() != Some(record.claim_token.as_str())
+                        {
+                            anyhow::bail!("recovery terminalization claim is no longer owned");
+                        }
+                        let Some(job) =
+                            recovery_job::find_job_by_id(&tx, record.recovery_job_id.as_str())
+                                .await?
+                        else {
+                            return Ok(Decision::Quarantine {
+                                reason_code: "missing_recovery_job",
+                                message: "recovery terminalization job is missing".to_owned(),
+                            });
+                        };
+                        let Some(job_status) = recovery_job_status_from_db(job.status.as_str())
+                        else {
+                            return Ok(Decision::Quarantine {
+                                reason_code: "unknown_recovery_status",
+                                message: "recovery terminalization job has an unknown status"
+                                    .to_owned(),
+                            });
+                        };
+                        let Some(job_item_type) = turn_item_type_from_db(job.item_type.as_str())
+                        else {
+                            return Ok(Decision::Quarantine {
+                                reason_code: "unknown_item_type",
+                                message: "recovery terminalization job has an unknown item type"
+                                    .to_owned(),
+                            });
+                        };
+                        let Ok(job_attempt_number) = u32::try_from(job.run_count.max(1)) else {
+                            return Ok(Decision::Quarantine {
+                                reason_code: "invalid_attempt_number",
+                                message:
+                                    "recovery terminalization job has an invalid attempt number"
+                                        .to_owned(),
+                            });
+                        };
+                        let job_error_message = job
+                            .last_error
+                            .clone()
+                            .or_else(|| job.reason.clone())
+                            .unwrap_or_else(|| "recovery reached a terminal outcome".to_owned());
+                        if job.turn_id != record.turn_id
+                            || job.item_id != record.item_id
+                            || job_item_type != record.item_type
+                            || job_status != record.recovery_status
+                            || job_attempt_number != record.attempt_number
+                            || job_error_message != record.error_message
+                        {
+                            return Ok(Decision::Quarantine {
+                                reason_code: "job_identity_mismatch",
+                                message:
+                                    "recovery terminalization no longer matches its recovery job"
+                                        .to_owned(),
+                            });
+                        }
+                        if !matches!(
+                            job_status,
+                            RecoveryJobStatus::Blocked
+                                | RecoveryJobStatus::Failed
+                                | RecoveryJobStatus::Exhausted
+                        ) {
+                            return Ok(Decision::Quarantine {
+                                reason_code: "non_terminal_recovery_job",
+                                message: "recovery terminalization job is not terminalizable"
+                                    .to_owned(),
+                            });
+                        }
+                        let Some(turn_model) =
+                            turn::find_turn_by_id(&tx, record.turn_id.as_str()).await?
+                        else {
+                            return Ok(Decision::Quarantine {
+                                reason_code: "missing_turn",
+                                message: "recovery terminalization Turn is missing".to_owned(),
+                            });
+                        };
+                        let Some(current_status) = turn_status_from_db(turn_model.status.as_str())
+                        else {
+                            return Ok(Decision::Quarantine {
+                                reason_code: "unknown_turn_status",
+                                message: "recovery terminalization Turn has an unknown status"
+                                    .to_owned(),
+                            });
+                        };
+                        let desired_status = if job_status == RecoveryJobStatus::Blocked {
+                            TurnStatus::Blocked
+                        } else {
+                            TurnStatus::Failed
+                        };
+                        if current_status == TurnStatus::InProgress {
+                            Ok(Decision::NeedsCommit)
+                        } else if current_status == desired_status {
+                            Ok(Decision::AlreadyTerminal)
+                        } else {
+                            Ok(Decision::Superseded(current_status))
+                        }
+                    }
+                    .await;
+
+                    let disposition = match result {
+                        Ok(Decision::NeedsCommit) => {
+                            RecoveryTerminalizationClaimDisposition::NeedsCommit
+                        }
+                        Ok(Decision::AlreadyTerminal) => {
+                            RecoveryTerminalizationClaimDisposition::AlreadyTerminal
+                        }
+                        Ok(Decision::Superseded(current_status)) => {
+                            let reason = format!(
+                                "superseded by authoritative terminal Turn status `{:?}`",
+                                current_status
+                            );
+                            if !recovery_terminalization_outbox::cancel_claim(
+                                &tx,
+                                record.recovery_job_id.as_str(),
+                                record.claim_token.as_str(),
+                                reason.as_str(),
+                                now,
+                            )
+                            .await?
+                            {
+                                anyhow::bail!(
+                                    "recovery terminalization claim was lost before supersession"
+                                );
+                            }
+                            RecoveryTerminalizationClaimDisposition::SupersededByTerminalStatus(
+                                current_status,
+                            )
+                        }
+                        Ok(Decision::Quarantine {
+                            reason_code,
+                            message,
+                        }) => {
+                            if !recovery_terminalization_outbox::quarantine_claim(
+                                &tx,
+                                record.recovery_job_id.as_str(),
+                                record.claim_token.as_str(),
+                                reason_code,
+                                message.as_str(),
+                                now,
+                            )
+                            .await?
+                            {
+                                anyhow::bail!(
+                                    "recovery terminalization claim was lost before quarantine"
+                                );
+                            }
+                            RecoveryTerminalizationClaimDisposition::Quarantined {
+                                reason_code: reason_code.to_owned(),
+                            }
+                        }
+                        Err(error) => {
+                            let _ = tx.rollback().await;
+                            return Err(error);
+                        }
+                    };
+                    tx.commit()
+                        .await
+                        .context("failed to commit recovery terminalization classification")?;
+                    Ok(disposition)
+                })
+                .await
             },
-        }
-
-        let record = record.clone();
-        self.run_serialized_write(|| async {
-            let now = unix_to_datetime(now_unix);
-            let tx = self
-                .connection
-                .begin()
-                .await
-                .context("failed to begin recovery terminalization classification")?;
-            let result = async {
-                let outbox = pioneer_entity::recovery_terminalization_outbox::Entity::find_by_id(
-                    record.recovery_job_id.clone(),
-                )
-                .one(&tx)
-                .await?
-                .context("recovery terminalization outbox row disappeared")?;
-                if outbox.status != recovery_terminalization_outbox::STATUS_DELIVERING
-                    || outbox.claim_token.as_deref() != Some(record.claim_token.as_str())
-                {
-                    anyhow::bail!("recovery terminalization claim is no longer owned");
-                }
-                let Some(job) =
-                    recovery_job::find_job_by_id(&tx, record.recovery_job_id.as_str()).await?
-                else {
-                    return Ok(Decision::Quarantine {
-                        reason_code: "missing_recovery_job",
-                        message: "recovery terminalization job is missing".to_owned(),
-                    });
-                };
-                let Some(job_status) = recovery_job_status_from_db(job.status.as_str()) else {
-                    return Ok(Decision::Quarantine {
-                        reason_code: "unknown_recovery_status",
-                        message: "recovery terminalization job has an unknown status".to_owned(),
-                    });
-                };
-                let Some(job_item_type) = turn_item_type_from_db(job.item_type.as_str()) else {
-                    return Ok(Decision::Quarantine {
-                        reason_code: "unknown_item_type",
-                        message: "recovery terminalization job has an unknown item type".to_owned(),
-                    });
-                };
-                let Ok(job_attempt_number) = u32::try_from(job.run_count.max(1)) else {
-                    return Ok(Decision::Quarantine {
-                        reason_code: "invalid_attempt_number",
-                        message: "recovery terminalization job has an invalid attempt number"
-                            .to_owned(),
-                    });
-                };
-                let job_error_message = job
-                    .last_error
-                    .clone()
-                    .or_else(|| job.reason.clone())
-                    .unwrap_or_else(|| "recovery reached a terminal outcome".to_owned());
-                if job.turn_id != record.turn_id
-                    || job.item_id != record.item_id
-                    || job_item_type != record.item_type
-                    || job_status != record.recovery_status
-                    || job_attempt_number != record.attempt_number
-                    || job_error_message != record.error_message
-                {
-                    return Ok(Decision::Quarantine {
-                        reason_code: "job_identity_mismatch",
-                        message: "recovery terminalization no longer matches its recovery job"
-                            .to_owned(),
-                    });
-                }
-                if !matches!(
-                    job_status,
-                    RecoveryJobStatus::Blocked
-                        | RecoveryJobStatus::Failed
-                        | RecoveryJobStatus::Exhausted
-                ) {
-                    return Ok(Decision::Quarantine {
-                        reason_code: "non_terminal_recovery_job",
-                        message: "recovery terminalization job is not terminalizable".to_owned(),
-                    });
-                }
-                let Some(turn_model) = turn::find_turn_by_id(&tx, record.turn_id.as_str()).await?
-                else {
-                    return Ok(Decision::Quarantine {
-                        reason_code: "missing_turn",
-                        message: "recovery terminalization Turn is missing".to_owned(),
-                    });
-                };
-                let Some(current_status) = turn_status_from_db(turn_model.status.as_str()) else {
-                    return Ok(Decision::Quarantine {
-                        reason_code: "unknown_turn_status",
-                        message: "recovery terminalization Turn has an unknown status".to_owned(),
-                    });
-                };
-                let desired_status = if job_status == RecoveryJobStatus::Blocked {
-                    TurnStatus::Blocked
-                } else {
-                    TurnStatus::Failed
-                };
-                if current_status == TurnStatus::InProgress {
-                    Ok(Decision::NeedsCommit)
-                } else if current_status == desired_status {
-                    Ok(Decision::AlreadyTerminal)
-                } else {
-                    Ok(Decision::Superseded(current_status))
-                }
-            }
-            .await;
-
-            let disposition = match result {
-                Ok(Decision::NeedsCommit) => RecoveryTerminalizationClaimDisposition::NeedsCommit,
-                Ok(Decision::AlreadyTerminal) => {
-                    RecoveryTerminalizationClaimDisposition::AlreadyTerminal
-                }
-                Ok(Decision::Superseded(current_status)) => {
-                    let reason = format!(
-                        "superseded by authoritative terminal Turn status `{:?}`",
-                        current_status
-                    );
-                    if !recovery_terminalization_outbox::cancel_claim(
-                        &tx,
-                        record.recovery_job_id.as_str(),
-                        record.claim_token.as_str(),
-                        reason.as_str(),
-                        now,
-                    )
-                    .await?
-                    {
-                        anyhow::bail!(
-                            "recovery terminalization claim was lost before supersession"
-                        );
-                    }
-                    RecoveryTerminalizationClaimDisposition::SupersededByTerminalStatus(
-                        current_status,
-                    )
-                }
-                Ok(Decision::Quarantine {
-                    reason_code,
-                    message,
-                }) => {
-                    if !recovery_terminalization_outbox::quarantine_claim(
-                        &tx,
-                        record.recovery_job_id.as_str(),
-                        record.claim_token.as_str(),
-                        reason_code,
-                        message.as_str(),
-                        now,
-                    )
-                    .await?
-                    {
-                        anyhow::bail!("recovery terminalization claim was lost before quarantine");
-                    }
-                    RecoveryTerminalizationClaimDisposition::Quarantined {
-                        reason_code: reason_code.to_owned(),
-                    }
-                }
-                Err(error) => {
-                    let _ = tx.rollback().await;
-                    return Err(error);
-                }
-            };
-            tx.commit()
-                .await
-                .context("failed to commit recovery terminalization classification")?;
-            Ok(disposition)
-        })
+            |_| true,
+        )
         .await
     }
 
@@ -29381,41 +31572,42 @@ impl CrudStore {
             RecoveryTerminalizationClaimDisposition,
         )>,
     > {
-        if records.is_empty() {
-            return Ok(Vec::new());
-        }
-        anyhow::ensure!(
-            records.len() <= 100,
-            "recovery terminalization classification batch exceeds its bounded limit"
-        );
-        let claim_token = records[0].claim_token.clone();
-        anyhow::ensure!(
-            records
-                .iter()
-                .all(|record| record.claim_token == claim_token),
-            "recovery terminalization classification batch crosses claim tokens"
-        );
-        anyhow::ensure!(
-            records
-                .iter()
-                .map(|record| record.recovery_job_id.as_str())
-                .collect::<HashSet<_>>()
-                .len()
-                == records.len(),
-            "recovery terminalization classification batch contains duplicate jobs"
-        );
-        let records = records.to_vec();
-        self.run_serialized_write(|| {
-            let records = records.clone();
-            let claim_token = claim_token.clone();
-            async move {
-                let now = unix_to_datetime(now_unix);
-                let tx = self
-                    .connection
-                    .begin()
-                    .await
-                    .context("failed to begin recovery terminalization batch classification")?;
-                let result = async {
+        self.background_change(
+            "recovery.control",
+            async {
+                if records.is_empty() {
+                    return Ok(Vec::new());
+                }
+                anyhow::ensure!(
+                    records.len() <= 100,
+                    "recovery terminalization classification batch exceeds its bounded limit"
+                );
+                let claim_token = records[0].claim_token.clone();
+                anyhow::ensure!(
+                    records
+                        .iter()
+                        .all(|record| record.claim_token == claim_token),
+                    "recovery terminalization classification batch crosses claim tokens"
+                );
+                anyhow::ensure!(
+                    records
+                        .iter()
+                        .map(|record| record.recovery_job_id.as_str())
+                        .collect::<HashSet<_>>()
+                        .len()
+                        == records.len(),
+                    "recovery terminalization classification batch contains duplicate jobs"
+                );
+                let records = records.to_vec();
+                self.run_serialized_write(|| {
+                    let records = records.clone();
+                    let claim_token = claim_token.clone();
+                    async move {
+                        let now = unix_to_datetime(now_unix);
+                        let tx = self.connection.begin().await.context(
+                            "failed to begin recovery terminalization batch classification",
+                        )?;
+                        let result = async {
                     let placeholders = std::iter::repeat_n("?", records.len())
                         .collect::<Vec<_>>()
                         .join(", ");
@@ -29624,20 +31816,24 @@ impl CrudStore {
                     Ok::<_, anyhow::Error>(classified)
                 }
                 .await;
-                match result {
-                    Ok(classified) => {
-                        tx.commit()
-                            .await
-                            .context("failed to commit terminalization batch classification")?;
-                        Ok(classified)
+                        match result {
+                            Ok(classified) => {
+                                tx.commit().await.context(
+                                    "failed to commit terminalization batch classification",
+                                )?;
+                                Ok(classified)
+                            }
+                            Err(error) => {
+                                let _ = tx.rollback().await;
+                                Err(error)
+                            }
+                        }
                     }
-                    Err(error) => {
-                        let _ = tx.rollback().await;
-                        Err(error)
-                    }
-                }
-            }
-        })
+                })
+                .await
+            },
+            |_| true,
+        )
         .await
     }
 
@@ -29974,6 +32170,8 @@ impl CrudStore {
         cleanup_plan: RecoveryTerminalCleanupPlan,
         event_timestamp_secs: i64,
     ) -> Result<RecoveryTerminalizationApplyOutcome> {
+        self.track_compaction_history(true, 4, async {
+        self.background_changes(&["tasks.lifecycle", "storage.frozen", "storage.html.retention", "storage.html.history", "turn.projection", "recovery.control", "recovery.timeouts", "cli.commands", "cli.supervision", "storage.zstd", "recovery.effects", "recovery.effects.retry", "recovery.effects.retention", "recovery.ledger", "turn.finalization", "turn.delivery.live", "turn.delivery.episodic", "storage.receipts", "storage.native_events", "compaction.lifecycle"], async {
         let _release_wake = execution_heartbeat::ReleaseWake(self.execution_heartbeats.clone());
         let record = record.clone();
         self.run_serialized_write(|| async {
@@ -30247,6 +32445,8 @@ impl CrudStore {
             }
         })
         .await
+        }, |outcome| matches!(outcome, RecoveryTerminalizationApplyOutcome::Applied(_))).await
+        }, |outcome| matches!(outcome, RecoveryTerminalizationApplyOutcome::Applied(_))).await
     }
 
     pub async fn find_recovery_jobs_by_turn_and_status(
@@ -30275,142 +32475,175 @@ impl CrudStore {
         execution_owner_id: &str,
         execution_lease_until_unix: i64,
     ) -> Result<BlockedTurnRecoveryResumeOutcome> {
-        let _recovery_change = recovery_wake::RecoveryChange(self.recovery_work.clone());
-        let _ownership_change = self.execution_heartbeats.changing(execution_owner_id);
-        self.run_serialized_write(|| async {
-            let now = unix_to_datetime(now_unix);
-            let tx = self
-                .connection
-                .begin()
-                .await
-                .context("failed to begin blocked turn resume transaction")?;
+        self.track_compaction_history(
+            true,
+            4,
+            async {
+                self.background_changes(
+                    &["tasks.lifecycle", "compaction.lifecycle"],
+                    async {
+                        self.background_changes(
+                            &["recovery.due", "recovery.control", "storage.native_events"],
+                            async {
+                                let _ownership_change =
+                                    self.execution_heartbeats.changing(execution_owner_id);
+                                self.run_serialized_write(|| async {
+                            let now = unix_to_datetime(now_unix);
+                            let tx = self
+                                .connection
+                                .begin()
+                                .await
+                                .context("failed to begin blocked turn resume transaction")?;
 
-            let Some(turn_model) =
-                turn::find_turn_by_thread_and_id(&tx, thread_id, turn_id).await?
-            else {
-                tx.rollback()
-                    .await
-                    .context("failed to rollback missing blocked turn resume transaction")?;
-                return Ok(BlockedTurnRecoveryResumeOutcome::NotFound);
-            };
-            if turn_status_from_db(turn_model.status.as_str()) != Some(TurnStatus::Blocked) {
-                tx.rollback()
-                    .await
-                    .context("failed to rollback non-blocked turn resume transaction")?;
-                return Ok(BlockedTurnRecoveryResumeOutcome::NotFound);
-            }
+                            let Some(turn_model) =
+                                turn::find_turn_by_thread_and_id(&tx, thread_id, turn_id).await?
+                            else {
+                                tx.rollback().await.context(
+                                    "failed to rollback missing blocked turn resume transaction",
+                                )?;
+                                return Ok(BlockedTurnRecoveryResumeOutcome::NotFound);
+                            };
+                            if turn_status_from_db(turn_model.status.as_str())
+                                != Some(TurnStatus::Blocked)
+                            {
+                                tx.rollback().await.context(
+                                    "failed to rollback non-blocked turn resume transaction",
+                                )?;
+                                return Ok(BlockedTurnRecoveryResumeOutcome::NotFound);
+                            }
 
-            let Some(job) =
-                recovery_job::find_blocked_job_by_turn(&tx, turn_id, recovery_job_id).await?
-            else {
-                tx.rollback()
-                    .await
-                    .context("failed to rollback blocked turn resume without recovery job")?;
-                return Ok(BlockedTurnRecoveryResumeOutcome::NotFound);
-            };
+                            let Some(job) = recovery_job::find_blocked_job_by_turn(
+                                &tx,
+                                turn_id,
+                                recovery_job_id,
+                            )
+                            .await?
+                            else {
+                                tx.rollback().await.context(
+                                    "failed to rollback blocked turn resume without recovery job",
+                                )?;
+                                return Ok(BlockedTurnRecoveryResumeOutcome::NotFound);
+                            };
 
-            let item_type = turn_item_type_from_db(job.item_type.as_str())
-                .unwrap_or(TurnItemType::DynamicToolCall);
-            if item_type.is_tool_item()
-                && turn_runtime_snapshot::find_turn_runtime_snapshot(&tx, turn_id)
-                    .await?
-                    .is_none()
-            {
-                let recovery_job_id = job.id.clone();
-                tx.rollback()
-                    .await
-                    .context("failed to rollback blocked tool recovery without snapshot")?;
-                return Ok(BlockedTurnRecoveryResumeOutcome::MissingRuntimeSnapshot {
-                    recovery_job_id,
-                });
-            }
+                            let item_type = turn_item_type_from_db(job.item_type.as_str())
+                                .unwrap_or(TurnItemType::DynamicToolCall);
+                            if item_type.is_tool_item()
+                                && turn_runtime_snapshot::find_turn_runtime_snapshot(&tx, turn_id)
+                                    .await?
+                                    .is_none()
+                            {
+                                let recovery_job_id = job.id.clone();
+                                tx.rollback().await.context(
+                                    "failed to rollback blocked tool recovery without snapshot",
+                                )?;
+                                return Ok(
+                                    BlockedTurnRecoveryResumeOutcome::MissingRuntimeSnapshot {
+                                        recovery_job_id,
+                                    },
+                                );
+                            }
 
-            let max_attempts = job.max_attempts.max(job.run_count.saturating_add(1));
-            let resumed = recovery_job::resume_blocked_job(
-                &tx,
-                &job,
-                RecoveryAction::RestartTurn,
-                max_attempts,
-                now,
-            )
-            .await?;
-            if !resumed {
-                tx.rollback()
-                    .await
-                    .context("failed to rollback stale blocked recovery resume transaction")?;
-                return Ok(BlockedTurnRecoveryResumeOutcome::NotFound);
-            }
+                            let max_attempts =
+                                job.max_attempts.max(job.run_count.saturating_add(1));
+                            let resumed = recovery_job::resume_blocked_job(
+                                &tx,
+                                &job,
+                                RecoveryAction::RestartTurn,
+                                max_attempts,
+                                now,
+                            )
+                            .await?;
+                            if !resumed {
+                                tx.rollback().await.context(
+                                    "failed to rollback stale blocked recovery resume transaction",
+                                )?;
+                                return Ok(BlockedTurnRecoveryResumeOutcome::NotFound);
+                            }
 
-            recovery_terminalization_outbox::cancel_undelivered_for_job(
-                &tx,
-                job.id.as_str(),
-                "superseded by explicit blocked Turn resume",
-                now,
-            )
-            .await?;
+                            recovery_terminalization_outbox::cancel_undelivered_for_job(
+                                &tx,
+                                job.id.as_str(),
+                                "superseded by explicit blocked Turn resume",
+                                now,
+                            )
+                            .await?;
 
-            turn_event_projection_stream_state::clear_confirmed_blocked_for_resume(
-                &tx,
-                thread_id,
-                turn_id,
-                now,
-                &turn_model,
-            )
-            .await?;
-            let updated = turn::update_turn_status(
-                &tx,
-                thread_id,
-                turn_id,
-                TurnStatus::InProgress,
-                None,
-                now,
-            )
-            .await?;
-            if !updated {
-                tx.rollback()
-                    .await
-                    .context("failed to rollback blocked turn resume after status miss")?;
-                return Ok(BlockedTurnRecoveryResumeOutcome::NotFound);
-            }
-            turn::append_turn_status_history(
-                &tx,
-                turn_id,
-                TurnStatus::InProgress,
-                Some("blocked turn resumed by explicit request".to_owned()),
-                now,
-            )
-            .await?;
-            if !turn_execution::reacquire_blocked(
-                &tx,
-                turn_id,
-                execution_owner_id,
-                now,
-                unix_to_datetime(execution_lease_until_unix),
-            )
-            .await?
-            {
-                tx.rollback().await.context(
+                            turn_event_projection_stream_state::clear_confirmed_blocked_for_resume(
+                                &tx,
+                                thread_id,
+                                turn_id,
+                                now,
+                                &turn_model,
+                            )
+                            .await?;
+                            let updated = turn::update_turn_status(
+                                &tx,
+                                thread_id,
+                                turn_id,
+                                TurnStatus::InProgress,
+                                None,
+                                now,
+                            )
+                            .await?;
+                            if !updated {
+                                tx.rollback().await.context(
+                                    "failed to rollback blocked turn resume after status miss",
+                                )?;
+                                return Ok(BlockedTurnRecoveryResumeOutcome::NotFound);
+                            }
+                            turn::append_turn_status_history(
+                                &tx,
+                                turn_id,
+                                TurnStatus::InProgress,
+                                Some("blocked turn resumed by explicit request".to_owned()),
+                                now,
+                            )
+                            .await?;
+                            if !turn_execution::reacquire_blocked(
+                                &tx,
+                                turn_id,
+                                execution_owner_id,
+                                now,
+                                unix_to_datetime(execution_lease_until_unix),
+                            )
+                            .await?
+                            {
+                                tx.rollback().await.context(
                     "failed to rollback blocked turn resume after execution ownership conflict",
                 )?;
-                return Ok(BlockedTurnRecoveryResumeOutcome::NotFound);
-            }
+                                return Ok(BlockedTurnRecoveryResumeOutcome::NotFound);
+                            }
 
-            let acquired_execution = turn_execution::find(&tx, turn_id).await?;
-            tx.commit()
+                            let acquired_execution = turn_execution::find(&tx, turn_id).await?;
+                            tx.commit()
+                                .await
+                                .context("failed to commit blocked turn resume transaction")?;
+                            if let Some(execution) = acquired_execution.as_ref() {
+                                _ownership_change.register(execution);
+                            }
+
+                            Ok(
+                                recovery_job::find_job_by_id(&self.connection, job.id.as_str())
+                                    .await?
+                                    .map(recovery_job_record_from_model)
+                                    .map(BlockedTurnRecoveryResumeOutcome::Resumed)
+                                    .unwrap_or(BlockedTurnRecoveryResumeOutcome::NotFound),
+                            )
+                        })
+                        .await
+                            },
+                            |outcome| {
+                                matches!(outcome, BlockedTurnRecoveryResumeOutcome::Resumed(_))
+                            },
+                        )
+                        .await
+                    },
+                    |outcome| matches!(outcome, BlockedTurnRecoveryResumeOutcome::Resumed(_)),
+                )
                 .await
-                .context("failed to commit blocked turn resume transaction")?;
-            if let Some(execution) = acquired_execution.as_ref() {
-                _ownership_change.register(execution);
-            }
-
-            Ok(
-                recovery_job::find_job_by_id(&self.connection, job.id.as_str())
-                    .await?
-                    .map(recovery_job_record_from_model)
-                    .map(BlockedTurnRecoveryResumeOutcome::Resumed)
-                    .unwrap_or(BlockedTurnRecoveryResumeOutcome::NotFound),
-            )
-        })
+            },
+            |outcome| matches!(outcome, BlockedTurnRecoveryResumeOutcome::Resumed(_)),
+        )
         .await
     }
 
@@ -30430,9 +32663,38 @@ impl CrudStore {
         execution_owner_id: &str,
         execution_lease_until_unix: i64,
     ) -> Result<Option<TaskOwnedTurnResumeOutcome>> {
-        let _recovery_change = recovery_wake::RecoveryChange(self.recovery_work.clone());
-        let _ownership_change = self.execution_heartbeats.changing(execution_owner_id);
-        self.run_serialized_write(|| async {
+        self.background_changes(
+            &[
+                "recovery.control",
+                "recovery.ledger",
+                "recovery.effects",
+                "recovery.effects.retry",
+                "recovery.effects.retention",
+            ],
+            async {
+                self.track_compaction_history(
+                    true,
+                    4,
+                    async {
+                        self.background_changes(
+                            &["tasks.lifecycle", "tasks.live", "compaction.lifecycle"],
+                            async {
+                                self.track_task_scheduler(
+                                    async {
+                                        self.background_change(
+                                            "tasks.fanout",
+                                            async {
+                                                self.background_changes(
+                                                    &[
+                                                        "recovery.due",
+                                                        "recovery.control",
+                                                        "storage.native_events",
+                                                    ],
+                                                    async {
+                                                        let _ownership_change = self
+                                                            .execution_heartbeats
+                                                            .changing(execution_owner_id);
+                                                        self.run_serialized_write(|| async {
             let now = unix_to_datetime(now_unix);
             let Some(task_run_turn_model) =
                 task_run_turn::find_turn_by_thread_and_turn(&self.connection, thread_id, turn_id)
@@ -30614,7 +32876,7 @@ impl CrudStore {
                 .prepare_task_events_for_write(vec![
                     TaskEventPayload::TaskResumed {
                         task: resumed_task.clone(),
-                        triggers,
+                        triggers: triggers.clone(),
                         reason: Some("blocked task child resumed".to_owned()),
                         resumed_at: now_unix,
                     },
@@ -31052,6 +33314,7 @@ impl CrudStore {
             tx.commit()
                 .await
                 .context("failed to commit task-owned turn resume transaction")?;
+            for trigger in &triggers { self.task_scheduler_changes().register_trigger(trigger); }
             if let Some(execution) = acquired_execution.as_ref() {
                 _ownership_change.register(execution);
             }
@@ -31091,6 +33354,64 @@ impl CrudStore {
             }))
         })
         .await
+                                                    },
+                                                    |outcome| {
+                                                        matches!(
+                                                    outcome,
+                                                    Some(
+                                                        TaskOwnedTurnResumeOutcome::Resumed { .. }
+                                                    )
+                                                )
+                                                    },
+                                                )
+                                                .await
+                                            },
+                                            |outcome| {
+                                                matches!(
+                                                    outcome,
+                                                    Some(
+                                                        TaskOwnedTurnResumeOutcome::Resumed { .. }
+                                                    )
+                                                )
+                                            },
+                                        )
+                                        .await
+                                    },
+                                    |outcome, changes| {
+                                        if let Some(TaskOwnedTurnResumeOutcome::Resumed {
+                                            task,
+                                            ..
+                                        }) = outcome
+                                        {
+                                            changes.record(&task.id);
+                                            true
+                                        } else {
+                                            false
+                                        }
+                                    },
+                                    |outcome, wait| {
+                                        wait.finish_identity(match outcome {
+                                            Some(TaskOwnedTurnResumeOutcome::Resumed {
+                                                task,
+                                                ..
+                                            }) => Some((task.id.clone(), None)),
+                                            _ => None,
+                                        })
+                                    },
+                                )
+                                .await
+                            },
+                            |outcome| outcome.is_some(),
+                        )
+                        .await
+                    },
+                    |outcome| outcome.is_some(),
+                )
+                .await
+            },
+            |row| row.is_some(),
+        )
+        .await
     }
 
     /// Compact reader probe; errors remain unknown rather than proving empty.
@@ -31103,14 +33424,16 @@ impl CrudStore {
         after: Option<&str>,
         upper: &str,
         limit: u64,
-    ) -> Result<Vec<RecoveryJobRecord>> {
-        Ok(
+    ) -> Result<(Option<String>, Vec<Result<RecoveryJobRecord>>)> {
+        let (after, rows) =
             repositories::recovery_watchdog::active_page(&self.connection, after, upper, limit)
-                .await?
-                .into_iter()
-                .map(recovery_job_record_from_model)
+                .await?;
+        Ok((
+            after,
+            rows.into_iter()
+                .map(|row| row.map(recovery_job_record_from_model))
                 .collect(),
-        )
+        ))
     }
 
     /// Prepared watchdog decisions commit only if current policy, episode and
@@ -31126,136 +33449,145 @@ impl CrudStore {
         now_unix: i64,
         observed_liveness: Option<&TurnLivenessRecord>,
     ) -> Result<bool> {
-        let _recovery_change = recovery_wake::RecoveryChange(self.recovery_work.clone());
-        let Some(raw) =
-            repositories::recovery_watchdog::raw_policy(&self.connection, &expected.id, None)
-                .await?
-        else {
-            return Ok(false);
-        };
-        // Interpret legacy values only outside DB capacity. Raw strings retain
-        // unknown non-NULL values and formatting for exact commit revalidation.
-        if !raw.agrees_with(expected) {
-            return Ok(false);
-        }
-        // Keep exact persisted timestamps for the fence. Public watchdog records
-        // expose seconds, while activity and legacy episode timestamps may have
-        // fractions; reconstructing their SQL values would reject unchanged rows.
-        let raw_liveness =
-            turn_liveness::find_by_turn_id(&self.connection, &expected.turn_id).await?;
-        let agrees = match (observed_liveness, raw_liveness.as_ref()) {
-            (None, None) => true,
-            (Some(observed), Some(raw)) => {
-                observed.turn_id == raw.turn_id
-                    && observed.thread_id == raw.thread_id
-                    && observed.last_activity_sequence == raw.last_activity_sequence
-                    && observed.last_activity_kind == raw.last_activity_kind
-                    && observed.last_activity_item_id == raw.last_activity_item_id
-                    && observed.last_activity_item_type == raw.last_activity_item_type
-                    && observed.last_activity_at_unix == raw.last_activity_at.timestamp()
-            }
-            _ => false,
-        };
-        if !agrees {
-            return Ok(false);
-        }
-        let diagnostic_json = diagnostic.as_ref().map(serde_json::to_string).transpose()?;
-        let token = pioneer_protocol::generate_id(21);
-        let cli_source = self
-            .prepare_cli_runtime_recovery_outcome_source(&expected.id)
-            .await?;
-        #[cfg(test)]
-        {
-            let gate = self.watchdog_preparation_gate.lock().unwrap().take();
-            if let Some((entered, release)) = gate {
-                entered.notify_one();
-                release.notified().await;
-            }
-        }
-        self.run_serialized_write(|| async {
-            let tx = self.connection.begin().await?;
-            if !cli_runtime_recovery_transition_allowed(
-                &tx,
-                &expected.id,
-                cli_source.as_ref(),
-                None,
-            )
-            .await?
-                || !repositories::recovery_watchdog::fence(
-                    &tx,
-                    expected,
-                    &raw,
-                    raw_liveness.as_ref(),
-                    &token,
+        self.background_changes(
+            &["recovery.due", "recovery.control", "storage.native_events"],
+            async {
+                let Some(raw) = repositories::recovery_watchdog::raw_policy(
+                    &self.connection,
+                    &expected.id,
+                    None,
                 )
                 .await?
-            {
-                tx.rollback().await?;
-                return Ok(false);
-            }
-            // SQL TEXT equality may use a case-insensitive collation. The
-            // successful fence owns the job's write lock; a current locked read
-            // now verifies bytes before any domain mutation. No JSON parsing.
-            if repositories::recovery_watchdog::raw_policy(&tx, &expected.id, Some(&token))
-                .await?
-                .as_ref()
-                != Some(&raw)
-            {
-                tx.rollback().await?;
-                return Ok(false);
-            }
-            let applied = if let Some(attempt) = &expected.active_attempt_id {
-                if let Some(next) = next_run_at_unix {
-                    recovery_job::mark_job_retrying(
+                else {
+                    return Ok(false);
+                };
+                // Interpret legacy values only outside DB capacity. Raw strings retain
+                // unknown non-NULL values and formatting for exact commit revalidation.
+                if !raw.agrees_with(expected) {
+                    return Ok(false);
+                }
+                // Keep exact persisted timestamps for the fence. Public watchdog records
+                // expose seconds, while activity and legacy episode timestamps may have
+                // fractions; reconstructing their SQL values would reject unchanged rows.
+                let raw_liveness =
+                    turn_liveness::find_by_turn_id(&self.connection, &expected.turn_id).await?;
+                let agrees = match (observed_liveness, raw_liveness.as_ref()) {
+                    (None, None) => true,
+                    (Some(observed), Some(raw)) => {
+                        observed.turn_id == raw.turn_id
+                            && observed.thread_id == raw.thread_id
+                            && observed.last_activity_sequence == raw.last_activity_sequence
+                            && observed.last_activity_kind == raw.last_activity_kind
+                            && observed.last_activity_item_id == raw.last_activity_item_id
+                            && observed.last_activity_item_type == raw.last_activity_item_type
+                            && observed.last_activity_at_unix == raw.last_activity_at.timestamp()
+                    }
+                    _ => false,
+                };
+                if !agrees {
+                    return Ok(false);
+                }
+                let diagnostic_json = diagnostic.as_ref().map(serde_json::to_string).transpose()?;
+                let token = pioneer_protocol::generate_id(21);
+                let cli_source = self
+                    .prepare_cli_runtime_recovery_outcome_source(&expected.id)
+                    .await?;
+                #[cfg(test)]
+                {
+                    let gate = self.watchdog_preparation_gate.lock().unwrap().take();
+                    if let Some((entered, release)) = gate {
+                        entered.notify_one();
+                        release.notified().await;
+                    }
+                }
+                self.run_serialized_write(|| async {
+                    let tx = self.connection.begin().await?;
+                    if !cli_runtime_recovery_transition_allowed(
                         &tx,
                         &expected.id,
-                        attempt,
-                        unix_to_datetime(next),
+                        cli_source.as_ref(),
                         None,
-                        last_error.clone(),
-                        diagnostic_json.clone(),
-                        unix_to_datetime(now_unix),
                     )
                     .await?
-                } else {
-                    recovery_job::mark_job_terminal_after_attempt(
-                        &tx,
-                        &expected.id,
-                        attempt,
-                        status,
-                        last_error.clone(),
-                        unix_to_datetime(now_unix),
-                    )
-                    .await?
-                }
-            } else {
-                recovery_job::mark_active_without_attempt_terminal(
-                    &tx,
-                    &expected.id,
-                    status,
-                    last_error.clone(),
-                    unix_to_datetime(now_unix),
-                )
-                .await?
-            };
-            if !applied {
-                tx.rollback().await?;
-                return Ok(false);
-            }
-            if next_run_at_unix.is_none() {
-                if let Some(value) = &diagnostic_json {
-                    recovery_job::set_diagnostic(&tx, &expected.id, value.clone()).await?;
-                }
-                enqueue_recovery_terminalization_if_required(
-                    &tx,
-                    &expected.id,
-                    unix_to_datetime(now_unix),
-                )
-                .await?;
-            }
-            tx.commit().await?;
-            Ok(true)
-        })
+                        || !repositories::recovery_watchdog::fence(
+                            &tx,
+                            expected,
+                            &raw,
+                            raw_liveness.as_ref(),
+                            &token,
+                        )
+                        .await?
+                    {
+                        tx.rollback().await?;
+                        return Ok(false);
+                    }
+                    // SQL TEXT equality may use a case-insensitive collation. The
+                    // successful fence owns the job's write lock; a current locked read
+                    // now verifies bytes before any domain mutation. No JSON parsing.
+                    if repositories::recovery_watchdog::raw_policy(&tx, &expected.id, Some(&token))
+                        .await?
+                        .as_ref()
+                        != Some(&raw)
+                    {
+                        tx.rollback().await?;
+                        return Ok(false);
+                    }
+                    let applied = if let Some(attempt) = &expected.active_attempt_id {
+                        if let Some(next) = next_run_at_unix {
+                            recovery_job::mark_job_retrying(
+                                &tx,
+                                &expected.id,
+                                attempt,
+                                unix_to_datetime(next),
+                                None,
+                                last_error.clone(),
+                                diagnostic_json.clone(),
+                                unix_to_datetime(now_unix),
+                            )
+                            .await?
+                        } else {
+                            recovery_job::mark_job_terminal_after_attempt(
+                                &tx,
+                                &expected.id,
+                                attempt,
+                                status,
+                                last_error.clone(),
+                                unix_to_datetime(now_unix),
+                            )
+                            .await?
+                        }
+                    } else {
+                        recovery_job::mark_active_without_attempt_terminal(
+                            &tx,
+                            &expected.id,
+                            status,
+                            last_error.clone(),
+                            unix_to_datetime(now_unix),
+                        )
+                        .await?
+                    };
+                    if !applied {
+                        tx.rollback().await?;
+                        return Ok(false);
+                    }
+                    if next_run_at_unix.is_none() {
+                        if let Some(value) = &diagnostic_json {
+                            recovery_job::set_diagnostic(&tx, &expected.id, value.clone()).await?;
+                        }
+                        enqueue_recovery_terminalization_if_required(
+                            &tx,
+                            &expected.id,
+                            unix_to_datetime(now_unix),
+                        )
+                        .await?;
+                    }
+                    tx.commit().await?;
+                    Ok(true)
+                })
+                .await
+            },
+            |changed| *changed,
+        )
         .await
     }
 
@@ -31302,22 +33634,28 @@ impl CrudStore {
         reason: Option<String>,
         now_unix: i64,
     ) -> Result<Vec<RecoveryJobRecord>> {
-        let _recovery_change = recovery_wake::RecoveryChange(self.recovery_work.clone());
-        let reason_value = reason.clone();
-        self.run_serialized_write(|| async {
-            let jobs = recovery_job::cancel_open_jobs_for_turn(
-                &self.connection,
-                turn_id,
-                exclude_job_id,
-                reason_value.clone(),
-                unix_to_datetime(now_unix),
-            )
-            .await?;
-            Ok(jobs
-                .into_iter()
-                .map(recovery_job_record_from_model)
-                .collect::<Vec<_>>())
-        })
+        self.background_changes(
+            &["recovery.due", "recovery.control", "storage.native_events"],
+            async {
+                let reason_value = reason.clone();
+                self.run_serialized_write(|| async {
+                    let jobs = recovery_job::cancel_open_jobs_for_turn(
+                        &self.connection,
+                        turn_id,
+                        exclude_job_id,
+                        reason_value.clone(),
+                        unix_to_datetime(now_unix),
+                    )
+                    .await?;
+                    Ok(jobs
+                        .into_iter()
+                        .map(recovery_job_record_from_model)
+                        .collect::<Vec<_>>())
+                })
+                .await
+            },
+            |rows| !rows.is_empty(),
+        )
         .await
     }
 
@@ -31933,6 +34271,16 @@ impl CrudStore {
         execution_graph: Option<AgentExecutionGraphCommitInput>,
         agent_turn_response: Option<AgentTurnResponseInput>,
     ) -> Result<Option<AgentExecutionGraphCommitResult>> {
+        let history_input = events.iter().any(turn_event_changes_history_input);
+        self.track_compaction_history(history_input, 4, async {
+        let mut owners = vec!["tasks.lifecycle", "turn.projection", "recovery.control", "recovery.timeouts", "cli.commands", "cli.supervision", "storage.zstd", "recovery.effects", "recovery.effects.retry", "recovery.effects.retention", "recovery.ledger", "turn.finalization", "turn.delivery.live", "turn.delivery.episodic", "storage.receipts", "storage.native_events"];
+        if events.iter().any(turn_event_changes_compaction_source) {
+            owners.push("compaction.lifecycle");
+        }
+        let live_change = execution_graph
+            .as_ref()
+            .map(|_| self.background_work("tasks.live").changing());
+        let result = self.background_changes(&owners, async {
         if events.len() > MAX_ATOMIC_TURN_EVENT_BATCH_SIZE {
             bail!("atomic Turn event batch exceeds {MAX_ATOMIC_TURN_EVENT_BATCH_SIZE} events");
         }
@@ -32181,6 +34529,12 @@ impl CrudStore {
         }
 
         Ok(execution_graph_result)
+        }, |_| true).await;
+        if let (Some(change), Ok(outcome)) = (live_change, result.as_ref()) {
+            change.finish(outcome.is_some());
+        }
+        result
+        }, |_| true).await
     }
 
     async fn append_and_project_turn_event_in_transaction(
@@ -32409,248 +34763,333 @@ impl CrudStore {
         execution_owner_id: Option<&str>,
         operation_guard: Option<sea_orm::Statement>,
     ) -> Result<Option<crate::events::AppendedTurnEvent>> {
-        let _release_wake = (terminal_turn_execution_status_for_event(&event).is_some())
-            .then(|| execution_heartbeat::ReleaseWake(self.execution_heartbeats.clone()));
-        let event = prepare_turn_event_for_permanent_storage(&self.connection, event).await?;
-        let projection_context_json =
-            serialize_turn_event_projection_context(&projection_context, event.id())?;
-        let native_cancellation = projection_context.native_cancellation.clone();
-        let transaction = self
-            .connection
-            .begin()
-            .await
-            .context("failed to begin turn event append transaction")?;
+        let history_input = turn_event_changes_history_input(&event);
+        self.track_compaction_history(
+            history_input,
+            4,
+            async {
+                let mut owners = vec![
+                    "tasks.lifecycle",
+                    "turn.projection",
+                    "recovery.control",
+                    "recovery.timeouts",
+                    "cli.commands",
+                    "storage.zstd",
+                    "turn.finalization",
+                    "turn.delivery.live",
+                    "turn.delivery.episodic",
+                    "storage.receipts",
+                    "storage.native_events",
+                ];
+                if terminal_turn_execution_status_for_event(&event).is_some() {
+                    owners.extend([
+                        "recovery.effects",
+                        "recovery.effects.retry",
+                        "recovery.effects.retention",
+                    ]);
+                }
+                if turn_event_changes_compaction_source(&event) {
+                    owners.push("compaction.lifecycle");
+                }
 
-        validate_turn_event_durable_owner(&transaction, event.payload()).await?;
-        validate_turn_event_execution_owner(&transaction, event.payload(), execution_owner_id)
-            .await?;
-        if cli_mcp_call::cli_mcp_observation_is_superseded(&transaction, event.payload(), None)
-            .await?
-            && !turn_event::prepared_event_already_exists(&transaction, &event).await?
-        {
-            transaction.rollback().await?;
-            return Ok(None);
-        }
-        // Fence execution writes and competing terminal results. Independently
-        // owned service lifecycle and user edits retain their existing guards.
-        if (execution_owner_id.is_some()
-            || terminal_turn_execution_status_for_event(event.payload()).is_some())
-            && repositories::native_cancellation_context::has_accepted(
-                &transaction,
-                event.payload().turn_id(),
-            )
-            .await?
-        {
-            anyhow::ensure!(
-                turn_event::prepared_event_already_exists(&transaction, &event).await?,
-                "turn event conflicts with accepted native cancellation"
-            );
-        }
+                self.background_changes(
+                    &owners,
+                    async {
+                        let _release_wake = (terminal_turn_execution_status_for_event(&event)
+                            .is_some())
+                        .then(|| {
+                            execution_heartbeat::ReleaseWake(self.execution_heartbeats.clone())
+                        });
+                        let event =
+                            prepare_turn_event_for_permanent_storage(&self.connection, event)
+                                .await?;
+                        let projection_context_json = serialize_turn_event_projection_context(
+                            &projection_context,
+                            event.id(),
+                        )?;
+                        let native_cancellation = projection_context.native_cancellation.clone();
+                        let transaction = self
+                            .connection
+                            .begin()
+                            .await
+                            .context("failed to begin turn event append transaction")?;
 
-        if let Some(guard) = operation_guard {
-            anyhow::ensure!(
-                transaction.query_one_raw(guard).await?.is_some(),
-                "compaction lifecycle owner or generation changed"
-            );
-        }
-
-        if let Some(expected) = projection_context.unactivated_terminal.as_ref()
-            && !turn_event::prepared_event_already_exists(&transaction, &event).await?
-        {
-            let current = turn_execution::find(&transaction, &expected.turn_id)
-                .await?
-                .context("unactivated terminal execution disappeared")?;
-            anyhow::ensure!(
-                current.owner_id == expected.owner_id
-                    && current.owner_generation == expected.owner_generation
-                    && current.thread_id == expected.thread_id
-                    && current.workspace_id == expected.workspace_id
-                    && matches!(
-                        current.status,
-                        TurnExecutionStatus::Starting
-                            | TurnExecutionStatus::Queued
-                            | TurnExecutionStatus::Running
-                    )
-                    && (current.started_at.is_none()
-                        || current.status == TurnExecutionStatus::Starting)
-                    && !repositories::native_cancellation_context::is_registered(
-                        &transaction,
-                        &expected.turn_id
-                    )
-                    .await?
-                    && cli_runtime_binding::latest_turn_attempt(&transaction, &expected.turn_id)
+                        validate_turn_event_durable_owner(&transaction, event.payload()).await?;
+                        validate_turn_event_execution_owner(
+                            &transaction,
+                            event.payload(),
+                            execution_owner_id,
+                        )
+                        .await?;
+                        if cli_mcp_call::cli_mcp_observation_is_superseded(
+                            &transaction,
+                            event.payload(),
+                            None,
+                        )
                         .await?
-                        .is_none()
-                    && !turn_event_projection_stream_state::has_accepted_terminal(
-                        &transaction,
-                        &expected.turn_id
+                            && !turn_event::prepared_event_already_exists(&transaction, &event)
+                                .await?
+                        {
+                            transaction.rollback().await?;
+                            return Ok(None);
+                        }
+                        // Fence execution writes and competing terminal results. Independently
+                        // owned service lifecycle and user edits retain their existing guards.
+                        if (execution_owner_id.is_some()
+                            || terminal_turn_execution_status_for_event(event.payload()).is_some())
+                            && repositories::native_cancellation_context::has_accepted(
+                                &transaction,
+                                event.payload().turn_id(),
+                            )
+                            .await?
+                        {
+                            anyhow::ensure!(
+                                turn_event::prepared_event_already_exists(&transaction, &event)
+                                    .await?,
+                                "turn event conflicts with accepted native cancellation"
+                            );
+                        }
+
+                        if let Some(guard) = operation_guard {
+                            anyhow::ensure!(
+                                transaction.query_one_raw(guard).await?.is_some(),
+                                "compaction lifecycle owner or generation changed"
+                            );
+                        }
+
+                        if let Some(expected) = projection_context.unactivated_terminal.as_ref()
+                            && !turn_event::prepared_event_already_exists(&transaction, &event)
+                                .await?
+                        {
+                            let current = turn_execution::find(&transaction, &expected.turn_id)
+                                .await?
+                                .context("unactivated terminal execution disappeared")?;
+                            anyhow::ensure!(
+                                current.owner_id == expected.owner_id
+                                    && current.owner_generation == expected.owner_generation
+                                    && current.thread_id == expected.thread_id
+                                    && current.workspace_id == expected.workspace_id
+                                    && matches!(
+                                        current.status,
+                                        TurnExecutionStatus::Starting
+                                            | TurnExecutionStatus::Queued
+                                            | TurnExecutionStatus::Running
+                                    )
+                                    && (current.started_at.is_none()
+                                        || current.status == TurnExecutionStatus::Starting)
+                                    && !repositories::native_cancellation_context::is_registered(
+                                        &transaction,
+                                        &expected.turn_id
+                                    )
+                                    .await?
+                                    && cli_runtime_binding::latest_turn_attempt(
+                                        &transaction,
+                                        &expected.turn_id
+                                    )
+                                    .await?
+                                    .is_none()
+                                    && !turn_event_projection_stream_state::has_accepted_terminal(
+                                        &transaction,
+                                        &expected.turn_id
+                                    )
+                                    .await?,
+                                UnactivatedTurnPhaseChanged
+                            );
+                        }
+
+                        let cancellation_turn_id = if let Some(cancellation) = native_cancellation {
+                            if !turn_event::prepared_event_already_exists(&transaction, &event)
+                                .await?
+                            {
+                                repositories::native_cancellation_context::revalidate(
+                                    &transaction,
+                                    cancellation.revalidation,
+                                )
+                                .await?;
+                                anyhow::ensure!(
+                                    !turn_event_projection_stream_state::has_accepted_terminal(
+                                        &transaction,
+                                        event.payload().turn_id()
+                                    )
+                                    .await?,
+                                    "native cancellation conflicts with accepted terminal result"
+                                );
+                                native_terminal_effect_outbox::prepare(
+                                    &transaction,
+                                    cancellation.effects,
+                                    created_at,
+                                )
+                                .await?;
+                                Some(event.payload().turn_id().to_owned())
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+
+                        let appended_event = match turn_event::append_prepared_event(
+                            &transaction,
+                            event,
+                            created_at,
+                        )
+                        .await
+                        {
+                            Ok(event) => event,
+                            Err(error) => {
+                                let _ = transaction.rollback().await;
+                                return Err(error);
+                            }
+                        };
+
+                        if let Some(turn_id) = cancellation_turn_id {
+                            repositories::native_cancellation_context::mark_accepted(
+                                &transaction,
+                                &turn_id,
+                                &appended_event.id,
+                            )
+                            .await?;
+                        }
+
+                        if !appended_event.was_inserted {
+                            let projected = turn_event_projection_state::is_projected(
+                                &transaction,
+                                appended_event.id.as_str(),
+                                appended_event.turn_id.as_str(),
+                                appended_event.sequence,
+                            )
+                            .await?;
+                            transaction
+                                .rollback()
+                                .await
+                                .context("failed to rollback idempotent turn event lookup")?;
+                            if projected || projection_context.native_cancellation.is_some() {
+                                return Ok(Some(appended_event));
+                            }
+                            // Another producer may have committed this exact canonical event
+                            // and still be projecting it. Its durable append is just as
+                            // authoritative as our own: callers must not roll back local
+                            // terminal state while the original projection is in flight.
+                            return Err(TurnEventProjectionAfterAppendError::pending(
+                        appended_event.id,
+                        appended_event.turn_id,
+                        appended_event.sequence,
+                        "idempotent canonical event is waiting for its authoritative projection"
+                            .to_owned(),
                     )
-                    .await?,
-                UnactivatedTurnPhaseChanged
-            );
-        }
+                    .into());
+                        }
 
-        let cancellation_turn_id = if let Some(cancellation) = native_cancellation {
-            if !turn_event::prepared_event_already_exists(&transaction, &event).await? {
-                repositories::native_cancellation_context::revalidate(
-                    &transaction,
-                    cancellation.revalidation,
+                        if let Some(actor) = projection_context.cancellation_actor_id.as_deref()
+                            && let TurnEventPayload::TurnFailed(n) = &appended_event.payload
+                            && n.turn.status == pioneer_protocol::TurnStatus::Interrupted
+                        {
+                            repositories::task_cancellation_actor::record_turn(
+                                &transaction,
+                                actor,
+                                &n.workspace_id,
+                                &n.thread_id,
+                                &n.turn.id,
+                            )
+                            .await?;
+                        }
+
+                        if let Err(error) = turn_event_projection_state::insert_claimed(
+                            &transaction,
+                            turn_event_projection_state::NewTurnEventProjectionState {
+                                event_id: appended_event.id.clone(),
+                                thread_id: appended_event.thread_id.clone(),
+                                turn_id: appended_event.turn_id.clone(),
+                                sequence: appended_event.sequence,
+                                projection_context_json,
+                                claim_token,
+                                claim_expires_at,
+                                created_at,
+                            },
+                        )
+                        .await
+                        {
+                            let _ = transaction.rollback().await;
+                            return Err(error);
+                        }
+                        turn_event_projection_stream_state::accept_terminal(
+                            &transaction,
+                            &appended_event,
+                        )
+                        .await?;
+                        if let Some(expected) = projection_context.unactivated_terminal.as_ref() {
+                            let status =
+                                terminal_turn_execution_status_for_event(&appended_event.payload)
+                                    .context(
+                                    "unactivated terminal event has no terminal execution status",
+                                )?;
+                            let graph_status = match status {
+                                TurnExecutionStatus::Interrupted => "cancelled",
+                                TurnExecutionStatus::Blocked => "blocked",
+                                TurnExecutionStatus::Failed => "failed",
+                                _ => bail!("unsupported unactivated terminal event"),
+                            };
+                            turn_execution::mark_terminal(
+                                &transaction,
+                                &expected.turn_id,
+                                status,
+                                created_at,
+                            )
+                            .await?;
+                            if let Some(response) =
+                                crate::repositories::agent_domain::load_agent_turn_response(
+                                    &transaction,
+                                    &expected.turn_id,
+                                )
+                                .await?
+                            {
+                                let execution =
+                                    crate::repositories::agent_domain::load_agent_execution(
+                                        &transaction,
+                                        &response.execution_id,
+                                    )
+                                    .await?
+                                    .context(
+                                        "unactivated cancellation response execution disappeared",
+                                    )?;
+                                // True Task occurrences retain their own candidate/run cleanup.
+                                if execution.parent_task_id.is_none() {
+                                    crate::repositories::agent_domain::finalize_agent_execution(
+                                        &transaction,
+                                        &response.execution_id,
+                                        graph_status,
+                                        created_at,
+                                    )
+                                    .await?;
+                                }
+                            }
+                        }
+
+                        if let Err(error) = turn_event_delivery::insert_pending_for_event(
+                            &transaction,
+                            &appended_event,
+                            created_at,
+                            projection_context.enqueue_optional_deliveries,
+                        )
+                        .await
+                        {
+                            let _ = transaction.rollback().await;
+                            return Err(error);
+                        }
+                        transaction
+                            .commit()
+                            .await
+                            .context("failed to commit turn event append transaction")?;
+
+                        Ok(Some(appended_event))
+                    },
+                    |outcome| outcome.as_ref().is_some_and(|event| event.was_inserted),
                 )
-                .await?;
-                anyhow::ensure!(
-                    !turn_event_projection_stream_state::has_accepted_terminal(
-                        &transaction,
-                        event.payload().turn_id()
-                    )
-                    .await?,
-                    "native cancellation conflicts with accepted terminal result"
-                );
-                native_terminal_effect_outbox::prepare(
-                    &transaction,
-                    cancellation.effects,
-                    created_at,
-                )
-                .await?;
-                Some(event.payload().turn_id().to_owned())
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        let appended_event =
-            match turn_event::append_prepared_event(&transaction, event, created_at).await {
-                Ok(event) => event,
-                Err(error) => {
-                    let _ = transaction.rollback().await;
-                    return Err(error);
-                }
-            };
-
-        if let Some(turn_id) = cancellation_turn_id {
-            repositories::native_cancellation_context::mark_accepted(
-                &transaction,
-                &turn_id,
-                &appended_event.id,
-            )
-            .await?;
-        }
-
-        if !appended_event.was_inserted {
-            let projected = turn_event_projection_state::is_projected(
-                &transaction,
-                appended_event.id.as_str(),
-                appended_event.turn_id.as_str(),
-                appended_event.sequence,
-            )
-            .await?;
-            transaction
-                .rollback()
                 .await
-                .context("failed to rollback idempotent turn event lookup")?;
-            if projected || projection_context.native_cancellation.is_some() {
-                return Ok(Some(appended_event));
-            }
-            // Another producer may have committed this exact canonical event
-            // and still be projecting it. Its durable append is just as
-            // authoritative as our own: callers must not roll back local
-            // terminal state while the original projection is in flight.
-            return Err(TurnEventProjectionAfterAppendError::pending(
-                appended_event.id,
-                appended_event.turn_id,
-                appended_event.sequence,
-                "idempotent canonical event is waiting for its authoritative projection".to_owned(),
-            )
-            .into());
-        }
-
-        if let Some(actor) = projection_context.cancellation_actor_id.as_deref()
-            && let TurnEventPayload::TurnFailed(n) = &appended_event.payload
-            && n.turn.status == pioneer_protocol::TurnStatus::Interrupted
-        {
-            repositories::task_cancellation_actor::record_turn(
-                &transaction,
-                actor,
-                &n.workspace_id,
-                &n.thread_id,
-                &n.turn.id,
-            )
-            .await?;
-        }
-
-        if let Err(error) = turn_event_projection_state::insert_claimed(
-            &transaction,
-            turn_event_projection_state::NewTurnEventProjectionState {
-                event_id: appended_event.id.clone(),
-                thread_id: appended_event.thread_id.clone(),
-                turn_id: appended_event.turn_id.clone(),
-                sequence: appended_event.sequence,
-                projection_context_json,
-                claim_token,
-                claim_expires_at,
-                created_at,
             },
+            |outcome| outcome.as_ref().is_some_and(|event| event.was_inserted),
         )
         .await
-        {
-            let _ = transaction.rollback().await;
-            return Err(error);
-        }
-        turn_event_projection_stream_state::accept_terminal(&transaction, &appended_event).await?;
-        if let Some(expected) = projection_context.unactivated_terminal.as_ref() {
-            let status = terminal_turn_execution_status_for_event(&appended_event.payload)
-                .context("unactivated terminal event has no terminal execution status")?;
-            let graph_status = match status {
-                TurnExecutionStatus::Interrupted => "cancelled",
-                TurnExecutionStatus::Blocked => "blocked",
-                TurnExecutionStatus::Failed => "failed",
-                _ => bail!("unsupported unactivated terminal event"),
-            };
-            turn_execution::mark_terminal(&transaction, &expected.turn_id, status, created_at)
-                .await?;
-            if let Some(response) = crate::repositories::agent_domain::load_agent_turn_response(
-                &transaction,
-                &expected.turn_id,
-            )
-            .await?
-            {
-                let execution = crate::repositories::agent_domain::load_agent_execution(
-                    &transaction,
-                    &response.execution_id,
-                )
-                .await?
-                .context("unactivated cancellation response execution disappeared")?;
-                // True Task occurrences retain their own candidate/run cleanup.
-                if execution.parent_task_id.is_none() {
-                    crate::repositories::agent_domain::finalize_agent_execution(
-                        &transaction,
-                        &response.execution_id,
-                        graph_status,
-                        created_at,
-                    )
-                    .await?;
-                }
-            }
-        }
-
-        if let Err(error) = turn_event_delivery::insert_pending_for_event(
-            &transaction,
-            &appended_event,
-            created_at,
-            projection_context.enqueue_optional_deliveries,
-        )
-        .await
-        {
-            let _ = transaction.rollback().await;
-            return Err(error);
-        }
-        transaction
-            .commit()
-            .await
-            .context("failed to commit turn event append transaction")?;
-
-        Ok(Some(appended_event))
     }
 
     async fn project_claimed_turn_event_once(
@@ -32660,6 +35099,36 @@ impl CrudStore {
         claim_token: String,
         projected_at: DateTimeWithTimeZone,
     ) -> Result<TurnEventProjectionOutcome> {
+        let history_input = turn_event_changes_history_input(&appended_event.payload);
+        self.track_compaction_history(
+            history_input,
+            4,
+            async {
+                let mut owners = vec![
+                    "tasks.lifecycle",
+                    "turn.projection",
+                    "recovery.control",
+                    "recovery.timeouts",
+                    "cli.commands",
+                    "storage.zstd",
+                    "turn.finalization",
+                    "turn.delivery.live",
+                    "turn.delivery.episodic",
+                    "storage.receipts",
+                    "storage.native_events",
+                ];
+                if terminal_turn_execution_status_for_event(&appended_event.payload).is_some() {
+                    owners.extend([
+                        "recovery.effects",
+                        "recovery.effects.retry",
+                        "recovery.effects.retention",
+                    ]);
+                }
+                if turn_event_changes_compaction_source(&appended_event.payload) {
+                    owners.push("compaction.lifecycle");
+                }
+
+                self.background_changes(&owners, async {
         let _release_wake = (terminal_turn_execution_status_for_event(&appended_event.payload)
             .is_some())
         .then(|| execution_heartbeat::ReleaseWake(self.execution_heartbeats.clone()));
@@ -32843,6 +35312,11 @@ impl CrudStore {
             .context("failed to commit turn event projection transaction")?;
 
         Ok(TurnEventProjectionOutcome::Projected)
+        }, |outcome| *outcome == TurnEventProjectionOutcome::Projected).await
+            },
+            |outcome| *outcome == TurnEventProjectionOutcome::Projected,
+        )
+        .await
     }
 
     async fn mark_turn_event_projection_pending_once(
@@ -32851,37 +35325,59 @@ impl CrudStore {
         claim_token: String,
         deferred_at_unix: i64,
     ) -> Result<bool> {
-        let transaction = self
-            .connection
-            .begin()
-            .await
-            .context("failed to begin deferred turn event projection transaction")?;
-        let deferred_at = unix_to_datetime(deferred_at_unix);
-        let next_run_at = unix_to_datetime(
-            deferred_at_unix.saturating_add(turn_event_projection_retry_delay_secs(0)),
-        );
-        let released = match turn_event_projection_state::release_claim_as_pending(
-            &transaction,
-            event_id.as_str(),
-            claim_token.as_str(),
-            next_run_at,
-            deferred_at,
+        self.background_changes(
+            &[
+                "tasks.lifecycle",
+                "turn.projection",
+                "recovery.control",
+                "recovery.timeouts",
+                "cli.commands",
+                "cli.supervision",
+                "storage.zstd",
+                "recovery.effects",
+                "recovery.ledger",
+                "turn.finalization",
+                "turn.delivery.live",
+                "turn.delivery.episodic",
+                "storage.receipts",
+                "storage.native_events",
+            ],
+            async {
+                let transaction = self
+                    .connection
+                    .begin()
+                    .await
+                    .context("failed to begin deferred turn event projection transaction")?;
+                let deferred_at = unix_to_datetime(deferred_at_unix);
+                let next_run_at = unix_to_datetime(
+                    deferred_at_unix.saturating_add(turn_event_projection_retry_delay_secs(0)),
+                );
+                let released = match turn_event_projection_state::release_claim_as_pending(
+                    &transaction,
+                    event_id.as_str(),
+                    claim_token.as_str(),
+                    next_run_at,
+                    deferred_at,
+                )
+                .await
+                {
+                    Ok(released) => released,
+                    Err(error) => {
+                        let _ = transaction.rollback().await;
+                        return Err(error);
+                    }
+                };
+
+                transaction
+                    .commit()
+                    .await
+                    .context("failed to commit deferred turn event projection transaction")?;
+
+                Ok(released)
+            },
+            |value| *value,
         )
         .await
-        {
-            Ok(released) => released,
-            Err(error) => {
-                let _ = transaction.rollback().await;
-                return Err(error);
-            }
-        };
-
-        transaction
-            .commit()
-            .await
-            .context("failed to commit deferred turn event projection transaction")?;
-
-        Ok(released)
     }
 
     async fn mark_turn_event_projection_failure_once(
@@ -32895,81 +35391,103 @@ impl CrudStore {
         failed_at_unix: i64,
         force_exhausted: bool,
     ) -> Result<TurnEventProjectionFailureOutcome> {
-        let transaction = self
-            .connection
-            .begin()
-            .await
-            .context("failed to begin turn event projection failure transaction")?;
+        self.background_changes(
+            &[
+                "tasks.lifecycle",
+                "turn.projection",
+                "recovery.control",
+                "recovery.timeouts",
+                "cli.commands",
+                "cli.supervision",
+                "storage.zstd",
+                "recovery.effects",
+                "recovery.ledger",
+                "turn.finalization",
+                "turn.delivery.live",
+                "turn.delivery.episodic",
+                "storage.receipts",
+                "storage.native_events",
+            ],
+            async {
+                let transaction = self
+                    .connection
+                    .begin()
+                    .await
+                    .context("failed to begin turn event projection failure transaction")?;
 
-        let failed_at = unix_to_datetime(failed_at_unix);
-        let exhausted = force_exhausted
-            || attempt_count.saturating_add(1) >= TURN_EVENT_PROJECTION_MAX_ATTEMPTS;
-        let marked = if exhausted {
-            turn_event_projection_state::mark_exhausted_claimed(
-                &transaction,
-                event_id.as_str(),
-                claim_token.as_str(),
-                error_message.clone(),
-                failed_at,
-            )
-            .await
-        } else {
-            let next_run_at = unix_to_datetime(
-                failed_at_unix
-                    .saturating_add(turn_event_projection_retry_delay_secs(attempt_count)),
-            );
-            turn_event_projection_state::mark_failed_claimed(
-                &transaction,
-                event_id.as_str(),
-                claim_token.as_str(),
-                error_message.clone(),
-                next_run_at,
-                failed_at,
-            )
-            .await
-        };
+                let failed_at = unix_to_datetime(failed_at_unix);
+                let exhausted = force_exhausted
+                    || attempt_count.saturating_add(1) >= TURN_EVENT_PROJECTION_MAX_ATTEMPTS;
+                let marked = if exhausted {
+                    turn_event_projection_state::mark_exhausted_claimed(
+                        &transaction,
+                        event_id.as_str(),
+                        claim_token.as_str(),
+                        error_message.clone(),
+                        failed_at,
+                    )
+                    .await
+                } else {
+                    let next_run_at = unix_to_datetime(
+                        failed_at_unix
+                            .saturating_add(turn_event_projection_retry_delay_secs(attempt_count)),
+                    );
+                    turn_event_projection_state::mark_failed_claimed(
+                        &transaction,
+                        event_id.as_str(),
+                        claim_token.as_str(),
+                        error_message.clone(),
+                        next_run_at,
+                        failed_at,
+                    )
+                    .await
+                };
 
-        let marked = match marked {
-            Ok(marked) => marked,
-            Err(error) => {
-                let _ = transaction.rollback().await;
-                return Err(error);
-            }
-        };
+                let marked = match marked {
+                    Ok(marked) => marked,
+                    Err(error) => {
+                        let _ = transaction.rollback().await;
+                        return Err(error);
+                    }
+                };
 
-        if !marked {
-            transaction
-                .commit()
-                .await
-                .context("failed to commit lost turn event projection claim transaction")?;
-            return Ok(TurnEventProjectionFailureOutcome::LostClaim);
-        }
+                if !marked {
+                    transaction
+                        .commit()
+                        .await
+                        .context("failed to commit lost turn event projection claim transaction")?;
+                    return Ok(TurnEventProjectionFailureOutcome::LostClaim);
+                }
 
-        if exhausted
-            && let Err(error) = turn_event_projection_stream_state::quarantine(
-                &transaction,
-                thread_id.as_str(),
-                turn_id.as_str(),
-                event_id.as_str(),
-                error_message,
-                failed_at,
-            )
-            .await
-        {
-            let _ = transaction.rollback().await;
-            return Err(error);
-        }
+                if exhausted
+                    && let Err(error) = turn_event_projection_stream_state::quarantine(
+                        &transaction,
+                        thread_id.as_str(),
+                        turn_id.as_str(),
+                        event_id.as_str(),
+                        error_message,
+                        failed_at,
+                    )
+                    .await
+                {
+                    let _ = transaction.rollback().await;
+                    return Err(error);
+                }
 
-        transaction
-            .commit()
-            .await
-            .context("failed to commit turn event projection failure transaction")?;
+                transaction
+                    .commit()
+                    .await
+                    .context("failed to commit turn event projection failure transaction")?;
 
-        Ok(if exhausted {
-            TurnEventProjectionFailureOutcome::Quarantined
-        } else {
-            TurnEventProjectionFailureOutcome::Failed
-        })
+                Ok(if exhausted {
+                    TurnEventProjectionFailureOutcome::Quarantined
+                } else {
+                    TurnEventProjectionFailureOutcome::Failed
+                })
+            },
+            |outcome| *outcome != TurnEventProjectionFailureOutcome::LostClaim,
+        )
+        .await
     }
 
     pub async fn get_turn_event_projection_stream_state(
@@ -33012,6 +35530,7 @@ impl CrudStore {
         after_turn_id: Option<&str>,
         limit: u64,
     ) -> Result<TurnProjectionStreamBackfillBatch> {
+        self.background_changes(&["tasks.lifecycle", "turn.projection", "recovery.control", "recovery.timeouts", "cli.commands", "cli.supervision", "storage.zstd", "recovery.effects", "recovery.ledger", "turn.finalization", "turn.delivery.live", "turn.delivery.episodic", "storage.receipts", "storage.native_events"], async {
         if limit == 0 || limit > TURN_PROJECTION_STREAM_BACKFILL_MAX_BATCH_SIZE {
             bail!(
                 "projection stream backfill batch size must be between 1 and {}",
@@ -33213,6 +35732,7 @@ impl CrudStore {
             }
         })
         .await
+        }, |batch| batch.streams_quarantined > 0 || batch.orphan_streams_quarantined > 0 || batch.streams_repaired > 0 || batch.watermarks_advanced > 0 || batch.events_repaired > 0).await
     }
 
     /// Re-enables a quarantined projection stream after an operator has
@@ -33226,6 +35746,7 @@ impl CrudStore {
         expected_blocking_event_id: &str,
         restored_at_unix: i64,
     ) -> Result<RestoreTurnProjectionStreamOutcome> {
+        self.background_changes(&["tasks.lifecycle", "turn.projection", "recovery.control", "recovery.timeouts", "cli.commands", "cli.supervision", "storage.zstd", "recovery.effects", "recovery.ledger", "turn.finalization", "turn.delivery.live", "turn.delivery.episodic", "storage.receipts", "storage.native_events"], async {
         self.run_serialized_write(|| async {
             let transaction = self
                 .connection
@@ -33333,6 +35854,7 @@ impl CrudStore {
             }
         })
         .await
+        }, |outcome| *outcome == RestoreTurnProjectionStreamOutcome::Restored).await
     }
 
     pub async fn replay_due_turn_event_projections(
@@ -33351,7 +35873,10 @@ impl CrudStore {
         // can still use the replay budget without monopolizing the first batch.
         while remaining > 0 {
             let page = turn_event_projection_state::discover(&self.connection, remaining).await?;
-            summary.next_eligible_at_unix = page.first().map(|(_, at)| at.timestamp());
+            summary.next_eligible_at_unix = page.first().map(|(_, at)| {
+                at.timestamp()
+                    .saturating_add(i64::from(at.timestamp_subsec_nanos() != 0))
+            });
             let candidates = page
                 .into_iter()
                 .filter(|(_, at)| *at <= now)
@@ -33360,6 +35885,7 @@ impl CrudStore {
             if candidates.is_empty() {
                 break;
             }
+            let change = self.background_work("turn.projection").changing();
             let claimed = self
                 .run_serialized_write(|| {
                     turn_event_projection_state::claim_candidates(
@@ -33370,6 +35896,7 @@ impl CrudStore {
                     )
                 })
                 .await?;
+            change.finish(!claimed.is_empty());
             if claimed.is_empty() {
                 break;
             }
@@ -33559,40 +36086,6 @@ impl CrudStore {
         Ok(summary)
     }
 
-    async fn append_task_event_once(
-        &self,
-        event: TaskEventPayload,
-        event_timestamp_secs: i64,
-    ) -> Result<AppendedTaskEvent> {
-        let events = self.prepare_task_events_for_write(vec![event]).await?;
-        let transaction = self
-            .connection
-            .begin()
-            .await
-            .context("failed to begin task event materialization transaction")?;
-
-        let mut appended_events = match self
-            .append_task_events_in_connection(&transaction, events, event_timestamp_secs)
-            .await
-        {
-            Ok(events) => events,
-            Err(error) => {
-                let _ = transaction.rollback().await;
-                return Err(error);
-            }
-        };
-
-        transaction
-            .commit()
-            .await
-            .context("failed to commit task event materialization transaction")?;
-
-        appended_events
-            .pop()
-            .map(DeferredAppendedTaskEvent::into_owned)
-            .context("single Task event materialization returned no event")
-    }
-
     async fn append_task_events_once(
         &self,
         events: Vec<TaskEventPayload>,
@@ -33604,29 +36097,37 @@ impl CrudStore {
         // large import cannot monopolize the single physical writer. Event
         // identities make a retry after a partially committed call idempotent.
         for chunk in events.chunks(MAX_ATOMIC_TASK_EVENT_BATCH_SIZE) {
-            let prepared = self.prepare_task_events_for_write(chunk.to_vec()).await?;
-            let transaction = self
-                .connection
-                .begin()
-                .await
-                .context("failed to begin task event batch materialization transaction")?;
+            let committed = self
+                .task_scheduler_event_change(Some(chunk), async {
+                    let prepared = self.prepare_task_events_for_write(chunk.to_vec()).await?;
+                    let transaction =
+                        self.connection.begin().await.context(
+                            "failed to begin task event batch materialization transaction",
+                        )?;
 
-            let chunk_events = match self
-                .append_task_events_in_connection(&transaction, prepared, event_timestamp_secs)
-                .await
-            {
-                Ok(appended_events) => appended_events,
-                Err(error) => {
-                    let _ = transaction.rollback().await;
-                    return Err(error);
-                }
-            };
+                    let chunk_events = match self
+                        .append_task_events_in_connection(
+                            &transaction,
+                            prepared,
+                            event_timestamp_secs,
+                        )
+                        .await
+                    {
+                        Ok(appended_events) => appended_events,
+                        Err(error) => {
+                            let _ = transaction.rollback().await;
+                            return Err(error);
+                        }
+                    };
 
-            transaction
-                .commit()
-                .await
-                .context("failed to commit task event batch materialization transaction")?;
-            appended_events.extend(materialize_task_events(chunk_events));
+                    transaction
+                        .commit()
+                        .await
+                        .context("failed to commit task event batch materialization transaction")?;
+                    Ok(materialize_task_events(chunk_events))
+                })
+                .await?;
+            appended_events.extend(committed);
         }
 
         Ok(appended_events)
@@ -33638,33 +36139,51 @@ impl CrudStore {
         event_timestamp_secs: i64,
         agent_action: AgentCommitInput,
     ) -> Result<Vec<AppendedTaskEvent>> {
-        let events = self.prepare_task_events_for_write(events).await?;
-        let transaction = self
-            .connection
-            .begin()
-            .await
-            .context("failed to begin Task action materialization transaction")?;
-        let result = async {
-            let appended = self
-                .append_task_events_in_connection(&transaction, events, event_timestamp_secs)
-                .await?;
-            repositories::agent_domain::commit_agent_action(&transaction, &agent_action).await?;
-            Ok(appended)
-        }
-        .await;
-        match result {
-            Ok(appended) => {
-                transaction
-                    .commit()
+        self.background_changes(
+            &[
+                "recovery.control",
+                "recovery.ledger",
+                "recovery.effects",
+                "recovery.effects.retry",
+                "recovery.effects.retention",
+            ],
+            async {
+                let events = self.prepare_task_events_for_write(events).await?;
+                let transaction = self
+                    .connection
+                    .begin()
                     .await
-                    .context("failed to commit Task action materialization transaction")?;
-                Ok(materialize_task_events(appended))
-            }
-            Err(error) => {
-                let _ = transaction.rollback().await;
-                Err(error)
-            }
-        }
+                    .context("failed to begin Task action materialization transaction")?;
+                let result = async {
+                    let appended = self
+                        .append_task_events_in_connection(
+                            &transaction,
+                            events,
+                            event_timestamp_secs,
+                        )
+                        .await?;
+                    repositories::agent_domain::commit_agent_action(&transaction, &agent_action)
+                        .await?;
+                    Ok(appended)
+                }
+                .await;
+                match result {
+                    Ok(appended) => {
+                        transaction
+                            .commit()
+                            .await
+                            .context("failed to commit Task action materialization transaction")?;
+                        Ok(materialize_task_events(appended))
+                    }
+                    Err(error) => {
+                        let _ = transaction.rollback().await;
+                        Err(error)
+                    }
+                }
+            },
+            |events| !events.is_empty(),
+        )
+        .await
     }
 
     async fn materialize_task_notification_once(
@@ -33672,6 +36191,12 @@ impl CrudStore {
         notification: NewUserNotificationOutbox,
         agent_action: Option<AgentCommitInput>,
     ) -> Result<pioneer_entity::user_notification_outbox::Model> {
+        let owners: &[&'static str] = if agent_action.is_some() {
+            &["recovery.control", "recovery.ledger"]
+        } else {
+            &[]
+        };
+        self.background_changes(owners, async {
         let payload: pioneer_protocol::TaskUserNotificationDeliveredNotification =
             serde_json::from_str(notification.payload_json.as_str())
                 .context("durable Task notification payload is invalid")?;
@@ -33753,6 +36278,7 @@ impl CrudStore {
                 Err(error)
             }
         }
+        }, |_|true).await
     }
 
     async fn append_task_events_with_execution_admission_once(
@@ -33834,34 +36360,52 @@ impl CrudStore {
         admission: NewTaskExecutionAdmission,
         agent_action: AgentCommitInput,
     ) -> Result<Vec<AppendedTaskEvent>> {
-        let events = self.prepare_task_events_for_write(events).await?;
-        let transaction = self
-            .connection
-            .begin()
-            .await
-            .context("failed to begin Task action readmission transaction")?;
-        let result = async {
-            let appended = self
-                .append_task_events_in_connection(&transaction, events, event_timestamp_secs)
-                .await?;
-            task_execution_admission::readmit_immutable(&transaction, admission).await?;
-            repositories::agent_domain::commit_agent_action(&transaction, &agent_action).await?;
-            Ok(appended)
-        }
-        .await;
-        match result {
-            Ok(appended) => {
-                transaction
-                    .commit()
+        self.background_changes(
+            &[
+                "recovery.control",
+                "recovery.ledger",
+                "recovery.effects",
+                "recovery.effects.retry",
+                "recovery.effects.retention",
+            ],
+            async {
+                let events = self.prepare_task_events_for_write(events).await?;
+                let transaction = self
+                    .connection
+                    .begin()
                     .await
-                    .context("failed to commit Task action readmission transaction")?;
-                Ok(materialize_task_events(appended))
-            }
-            Err(error) => {
-                let _ = transaction.rollback().await;
-                Err(error)
-            }
-        }
+                    .context("failed to begin Task action readmission transaction")?;
+                let result = async {
+                    let appended = self
+                        .append_task_events_in_connection(
+                            &transaction,
+                            events,
+                            event_timestamp_secs,
+                        )
+                        .await?;
+                    task_execution_admission::readmit_immutable(&transaction, admission).await?;
+                    repositories::agent_domain::commit_agent_action(&transaction, &agent_action)
+                        .await?;
+                    Ok(appended)
+                }
+                .await;
+                match result {
+                    Ok(appended) => {
+                        transaction
+                            .commit()
+                            .await
+                            .context("failed to commit Task action readmission transaction")?;
+                        Ok(materialize_task_events(appended))
+                    }
+                    Err(error) => {
+                        let _ = transaction.rollback().await;
+                        Err(error)
+                    }
+                }
+            },
+            |events| !events.is_empty(),
+        )
+        .await
     }
 
     async fn commit_task_creation_once(
@@ -33869,68 +36413,81 @@ impl CrudStore {
         input: TaskCreationCommitInput,
         root: Option<frozen_lifetime::PreparedFrozenRoot>,
     ) -> Result<Vec<AppendedTaskEvent>> {
-        // Prepare the bounded admission binding outside writer capacity. The
-        // status is revalidated inside the Task/action transaction below: Stop
-        // or recovery must win atomically against acceptance of new work.
-        let composer_admissions = input
-            .events
-            .iter()
-            .filter_map(|event| {
-                let TaskEventPayload::TaskCreated { task } = event else {
-                    return None;
-                };
-                let work = task.metadata.as_ref()?.composer_work.as_ref()?;
-                Some((
-                    task.workspace_id.clone(),
-                    task.owner_id.clone(),
-                    task.created_by_thread_id.clone(),
-                    task.created_by_turn_id.clone(),
-                    work.launch.thread_id.clone(),
-                    work.launch.turn_id.clone(),
-                ))
-            })
-            .collect::<Vec<_>>();
-        let prepared_events = self
-            .prepare_task_events_for_write(input.events.clone())
-            .await?;
-        // Capture and compare the immutable winner before reserving the writer.
-        // Inside the writer, identity/revision/domain CAS revalidates this exact
-        // capture. A winner arriving with the Task events forces a full retry.
-        let snapshot_preflight = if let Some(expected) = &input.conversation_snapshot {
-            let winner =
-                task_run_conversation_snapshot::find_by_run(&self.connection, &expected.run_id)
-                    .await?;
-            let winner = match winner {
-                Some(record) => Some(
-                    task_run_conversation_snapshot::hydrate_record(&self.connection, record)
-                        .await?,
-                ),
-                None => None,
-            };
-            if let Some(persisted) = &winner {
-                if persisted.run_id != expected.run_id
-                    || persisted.task_id != expected.task_id
-                    || persisted.workspace_id != expected.workspace_id
-                    || persisted.conversation_thread_id != expected.conversation_thread_id
-                    || persisted.source_turn_id != expected.source_turn_id
-                    || persisted.history_json != expected.history_json
-                {
-                    bail!(
-                        "task run `{}` conversation snapshot conflicts with Task creation",
-                        expected.run_id
-                    );
-                }
-            }
-            winner
+        let owners: &[&'static str] = if input.agent_action.is_some() {
+            &["recovery.control", "recovery.ledger"]
         } else {
-            None
+            &[]
         };
-        let transaction = self
-            .connection
-            .begin()
-            .await
-            .context("failed to begin atomic Task creation transaction")?;
-        let result = async {
+        self.background_changes(
+            owners,
+            async {
+                // Prepare the bounded admission binding outside writer capacity. The
+                // status is revalidated inside the Task/action transaction below: Stop
+                // or recovery must win atomically against acceptance of new work.
+                let composer_admissions = input
+                    .events
+                    .iter()
+                    .filter_map(|event| {
+                        let TaskEventPayload::TaskCreated { task } = event else {
+                            return None;
+                        };
+                        let work = task.metadata.as_ref()?.composer_work.as_ref()?;
+                        Some((
+                            task.workspace_id.clone(),
+                            task.owner_id.clone(),
+                            task.created_by_thread_id.clone(),
+                            task.created_by_turn_id.clone(),
+                            work.launch.thread_id.clone(),
+                            work.launch.turn_id.clone(),
+                        ))
+                    })
+                    .collect::<Vec<_>>();
+                let prepared_events = self
+                    .prepare_task_events_for_write(input.events.clone())
+                    .await?;
+                // Capture and compare the immutable winner before reserving the writer.
+                // Inside the writer, identity/revision/domain CAS revalidates this exact
+                // capture. A winner arriving with the Task events forces a full retry.
+                let snapshot_preflight = if let Some(expected) = &input.conversation_snapshot {
+                    let winner = task_run_conversation_snapshot::find_by_run(
+                        &self.connection,
+                        &expected.run_id,
+                    )
+                    .await?;
+                    let winner = match winner {
+                        Some(record) => Some(
+                            task_run_conversation_snapshot::hydrate_record(
+                                &self.connection,
+                                record,
+                            )
+                            .await?,
+                        ),
+                        None => None,
+                    };
+                    if let Some(persisted) = &winner {
+                        if persisted.run_id != expected.run_id
+                            || persisted.task_id != expected.task_id
+                            || persisted.workspace_id != expected.workspace_id
+                            || persisted.conversation_thread_id != expected.conversation_thread_id
+                            || persisted.source_turn_id != expected.source_turn_id
+                            || persisted.history_json != expected.history_json
+                        {
+                            bail!(
+                                "task run `{}` conversation snapshot conflicts with Task creation",
+                                expected.run_id
+                            );
+                        }
+                    }
+                    winner
+                } else {
+                    None
+                };
+                let transaction = self
+                    .connection
+                    .begin()
+                    .await
+                    .context("failed to begin atomic Task creation transaction")?;
+                let result = async {
             for (workspace_id, owner_id, creator_thread, creator_turn, thread_id, turn_id) in
                 &composer_admissions
             {
@@ -34022,20 +36579,24 @@ impl CrudStore {
         }
         .await;
 
-        match result {
-            Ok(appended_events) => {
-                transaction
-                    .commit()
-                    .await
-                    .context("failed to commit atomic Task creation transaction")?;
-                Ok(materialize_task_events(appended_events))
-            }
-            Err(error) => Err(repositories::portable_payload::rollback_with_hold_refusal(
-                transaction,
-                error,
-            )
-            .await),
-        }
+                match result {
+                    Ok(appended_events) => {
+                        transaction
+                            .commit()
+                            .await
+                            .context("failed to commit atomic Task creation transaction")?;
+                        Ok(materialize_task_events(appended_events))
+                    }
+                    Err(error) => Err(repositories::portable_payload::rollback_with_hold_refusal(
+                        transaction,
+                        error,
+                    )
+                    .await),
+                }
+            },
+            |_| true,
+        )
+        .await
     }
 
     async fn commit_agent_thread_creation_with_action_once(
@@ -34048,38 +36609,52 @@ impl CrudStore {
         updated_at: DateTimeWithTimeZone,
         agent_action: AgentCommitInput,
     ) -> Result<()> {
-        let transaction = self
-            .connection
-            .begin()
-            .await
-            .context("failed to begin agent Thread creation transaction")?;
-        let result = async {
-            repositories::agent_domain::commit_agent_thread_creation(
-                &transaction,
-                &AgentThreadCreationCommitInput {
-                    thread: &thread,
-                    execution_id,
-                    route,
-                    lineage,
-                    created_at,
-                    updated_at,
-                },
-            )
-            .await?;
-            repositories::agent_domain::commit_agent_action(&transaction, &agent_action).await?;
-            Ok(())
-        }
-        .await;
-        match result {
-            Ok(()) => transaction
-                .commit()
-                .await
-                .context("failed to commit agent Thread creation transaction"),
-            Err(error) => {
-                let _ = transaction.rollback().await;
-                Err(error)
-            }
-        }
+        self.background_changes(
+            &[
+                "recovery.control",
+                "recovery.ledger",
+                "recovery.effects",
+                "recovery.effects.retry",
+                "recovery.effects.retention",
+            ],
+            async {
+                let transaction = self
+                    .connection
+                    .begin()
+                    .await
+                    .context("failed to begin agent Thread creation transaction")?;
+                let result = async {
+                    repositories::agent_domain::commit_agent_thread_creation(
+                        &transaction,
+                        &AgentThreadCreationCommitInput {
+                            thread: &thread,
+                            execution_id,
+                            route,
+                            lineage,
+                            created_at,
+                            updated_at,
+                        },
+                    )
+                    .await?;
+                    repositories::agent_domain::commit_agent_action(&transaction, &agent_action)
+                        .await?;
+                    Ok(())
+                }
+                .await;
+                match result {
+                    Ok(()) => transaction
+                        .commit()
+                        .await
+                        .context("failed to commit agent Thread creation transaction"),
+                    Err(error) => {
+                        let _ = transaction.rollback().await;
+                        Err(error)
+                    }
+                }
+            },
+            |_| true,
+        )
+        .await
     }
 
     async fn reconcile_due_trigger_for_nonexecuting_task_once(
@@ -34744,7 +37319,7 @@ impl CrudStore {
         // future; it may perform reader work and retry backoff.
         let mut operation = operation;
         retry_with_backoff(
-            || repositories::portable_payload::after_database_owners(operation()),
+            || repositories::portable_payload::after_database_owners(&self.connection, operation()),
             |error| {
                 is_anyhow_sqlite_lock(error)
                     || repositories::task_child_work::is_transaction_retry(error)
@@ -34758,6 +37333,40 @@ impl CrudStore {
             Duration::from_millis(DEFAULT_LOCK_RETRY_BASE_DELAY_MS),
         )
         .await
+    }
+}
+
+// The existing lifecycle triggers cover Turn identity/status and only service
+// items with this durable identity. This is an invalidation predicate, never
+// permission to repair or publish a compaction result.
+fn turn_event_changes_history_input(event: &CanonicalTurnEventPayload) -> bool {
+    matches!(
+        event,
+        CanonicalTurnEventPayload::TurnStarted(_)
+            | CanonicalTurnEventPayload::TurnCompleted(_)
+            | CanonicalTurnEventPayload::TurnFailed(_)
+            | CanonicalTurnEventPayload::TurnBlocked(_)
+            | CanonicalTurnEventPayload::TurnMessageEdited(_)
+            | CanonicalTurnEventPayload::TurnMessageDeleted(_)
+    )
+}
+
+fn turn_event_changes_compaction_source(event: &CanonicalTurnEventPayload) -> bool {
+    match event {
+        CanonicalTurnEventPayload::TurnStarted(_)
+        | CanonicalTurnEventPayload::TurnCompleted(_)
+        | CanonicalTurnEventPayload::TurnFailed(_)
+        | CanonicalTurnEventPayload::TurnBlocked(_) => true,
+        CanonicalTurnEventPayload::ItemStarted(value) => {
+            value.item.item_id().starts_with("compaction:")
+        }
+        CanonicalTurnEventPayload::ItemCompleted(value) => {
+            value.item.item_id().starts_with("compaction:")
+        }
+        CanonicalTurnEventPayload::ItemUpdated(value) => {
+            value.item.item_id().starts_with("compaction:")
+        }
+        _ => false,
     }
 }
 
@@ -36344,6 +38953,26 @@ fn recovery_job_record_from_model(model: pioneer_entity::recovery_job::Model) ->
             .active_attempt_started_at
             .map(|timestamp| timestamp.timestamp()),
         resolution_pending: model.resolution_pending,
+    }
+}
+
+fn timeout_candidate_from_timed_out_snapshot(
+    row: turn_item_attempt::TimedOutAttemptSnapshot,
+) -> TimeoutCandidate {
+    TimeoutCandidate {
+        attempt_id: row.id,
+        turn_id: row.turn_id,
+        item_id: row.item_id,
+        item_type: row.item_type,
+        execution_class: row.execution_class,
+        attempt_number: row.attempt_number,
+        timeout_reason: row.timeout_reason,
+        started_at_unix: row.started_at.timestamp(),
+        started_event_sequence: row.started_event_sequence,
+        last_heartbeat_at_unix: row.last_heartbeat_at.map(|value| value.timestamp()),
+        lease_expires_at_unix: row.lease_expires_at.map(|value| value.timestamp()),
+        idle_deadline_at_unix: row.idle_deadline_at.map(|value| value.timestamp()),
+        hard_deadline_at_unix: row.hard_deadline_at.map(|value| value.timestamp()),
     }
 }
 
@@ -38935,6 +41564,55 @@ mod tests {
         assert!(committed.already_committed);
         assert_eq!(committed.final_item, final_notification);
 
+        for consumer in [
+            NATIVE_TURN_EVENT_LIVE_CONSUMER,
+            NATIVE_TURN_EVENT_EPISODIC_CONSUMER,
+        ] {
+            assert!(
+                restarted
+                    .next_turn_event_delivery_deadline(consumer)
+                    .await
+                    .unwrap()
+                    .is_some_and(|at| at <= 1_700_000_102)
+            );
+        }
+        let claims = restarted
+            .claim_due_turn_event_deliveries_with_deadline(
+                NATIVE_TURN_EVENT_LIVE_CONSUMER,
+                1_700_000_102,
+                64,
+            )
+            .await
+            .unwrap();
+        assert!(!claims.deliveries.is_empty());
+        // A pending successor must not bypass the live causal head's lease.
+        // The sibling consumer remains independently eligible.
+        assert_eq!(
+            restarted
+                .next_turn_event_delivery_deadline(NATIVE_TURN_EVENT_LIVE_CONSUMER)
+                .await
+                .unwrap(),
+            Some(1_700_000_222)
+        );
+        assert!(
+            restarted
+                .next_turn_event_delivery_deadline(NATIVE_TURN_EVENT_EPISODIC_CONSUMER)
+                .await
+                .unwrap()
+                .is_some_and(|at| at <= 1_700_000_103)
+        );
+        for (now, due) in [(1_700_000_221, false), (1_700_000_222, true)] {
+            let candidates = turn_event_delivery::list_due(
+                &restarted.connection,
+                NATIVE_TURN_EVENT_LIVE_CONSUMER,
+                unix_to_datetime(now),
+                64,
+            )
+            .await
+            .unwrap();
+            assert_eq!(!candidates.is_empty(), due);
+        }
+
         let (_, terminal) = restarted
             .get_turn("thr_native_finalization", "turn_native_finalize")
             .await
@@ -39142,6 +41820,16 @@ mod tests {
             .await
             .unwrap();
         mark_first_turn_projection_failed(&store, turn_id, at + 20).await;
+        assert_eq!(
+            store.next_turn_event_projection_deadline().await.unwrap(),
+            Some(at + 20)
+        );
+        let parked = store
+            .reconcile_prepared_turn_finalizations(1, at + 2)
+            .await
+            .unwrap();
+        assert_eq!(parked.scanned, 0);
+        assert!(parked.failures.is_empty());
         // A corrupt stored payload must be examined only when its causal prefix
         // is ready. Deferral must not run answer preparation or ACK the intent.
         pioneer_entity::turn_finalization::Entity::update_many()
@@ -39164,6 +41852,22 @@ mod tests {
             .replay_due_turn_event_projections(at + 30, 10)
             .await
             .unwrap();
+        // Dependency release admits the still-durable intent without loading
+        // its corrupt payload as part of the readiness observation.
+        let upper = turn_finalization::prepared_upper(&store.connection)
+            .await
+            .unwrap()
+            .unwrap();
+        let ready = turn_finalization::list_eligible_prepared(&store.connection, None, &upper, 1)
+            .await
+            .unwrap();
+        assert_eq!(
+            ready
+                .iter()
+                .map(|row| row.turn_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![turn_id]
+        );
         assert!(
             store
                 .commit_prepared_turn_finalization(turn_id, at + 31)
@@ -51322,6 +54026,293 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn independent_stores_share_runtime_wakes_and_ambiguous_settlement() {
+        use futures_util::FutureExt;
+        use pioneer_sqlite::background::{Plan, Ready};
+        let (store, observer, _path) = recovery_discovery_fixture().await;
+        let independent = CrudStore::new(store.database_connection().maintenance());
+        let wake = store.background_work("test-owner");
+        assert!(std::sync::Arc::ptr_eq(
+            &wake,
+            &independent.background_work("test-owner")
+        ));
+        assert!(std::sync::Arc::ptr_eq(
+            &store.background_work("recovery.due"),
+            &independent.background_work("recovery.due")
+        ));
+        assert!(std::sync::Arc::ptr_eq(
+            &store.frozen_readers,
+            &independent.frozen_readers
+        ));
+        let mut owner = wake.acquire().unwrap();
+        assert!(owner.publish(owner.observe(), Plan::Dormant));
+        observer.events.lock().unwrap().clear();
+        observer.reads.lock().unwrap().clear();
+        assert!(owner.ready().now_or_never().is_none());
+        assert!(
+            store
+                .connection
+                .settle_background_change(&owner)
+                .await
+                .unwrap()
+        );
+        assert!(observer.events.lock().unwrap().is_empty());
+        assert!(observer.reads.lock().unwrap().is_empty());
+        let changing = independent.background_work("test-owner").changing();
+        drop(changing); // Unknown outcome, not a fabricated successful rollback.
+        assert_eq!(owner.ready().await, Ready::SettlementRequired);
+        assert!(!owner.publish(owner.observe(), Plan::Dormant));
+        assert!(
+            store
+                .connection
+                .settle_background_change(&owner)
+                .await
+                .unwrap()
+        );
+        assert!(!observer.events.lock().unwrap().is_empty());
+        assert_eq!(owner.ready().await, Ready::Work);
+        assert!(owner.publish(owner.observe(), Plan::Dormant));
+    }
+
+    #[tokio::test]
+    async fn task_wait_subscription_during_commit_and_after_lost_outcome_settles_durable_state() {
+        use futures_util::FutureExt;
+        use pioneer_sqlite::background::{Plan, Ready};
+        let (store, observer, _path) = recovery_discovery_fixture().await;
+        let lower = CrudStore::new(store.database_connection().maintenance());
+        let task = sample_task(1_700_000_000);
+        lower
+            .append_task_event(
+                TaskEventPayload::TaskCreated { task: task.clone() },
+                task.created_at,
+            )
+            .await
+            .unwrap();
+        // Begin the actual protocol guard before subscription. The request
+        // cannot publish an Empty from a snapshot preceding this operation.
+        let operation = lower.task_wait_mutation(None);
+        let signal = store.subscribe_task_wait(&[task.id.clone()], &[]);
+        let mut owner = signal.acquire().unwrap();
+        assert!(!owner.publish(owner.observe(), Plan::Dormant));
+        let event = lower
+            .append_task_event(
+                TaskEventPayload::TaskCancelled {
+                    task_id: task.id.clone(),
+                    reason: Some("committed before reply".into()),
+                    completed_at: task.created_at + 1,
+                },
+                task.created_at + 1,
+            )
+            .await
+            .unwrap();
+        operation.finish_events(std::slice::from_ref(&event));
+        assert_eq!(owner.ready().await, Ready::Work);
+        assert!(signal.take_committed_event());
+        assert_eq!(
+            store.get_task(&task.id).await.unwrap().unwrap().task.status,
+            TaskStatus::Cancelled
+        );
+        assert!(owner.publish(owner.observe(), Plan::Dormant));
+        observer.events.lock().unwrap().clear();
+        assert!(owner.ready().now_or_never().is_none());
+        assert!(store.settle_task_wait_changes(&owner).await.unwrap());
+        assert!(
+            observer.events.lock().unwrap().is_empty(),
+            "healthy subscription adds no writer fence"
+        );
+
+        // A producer loses its completion callback after an actual committed
+        // event. A new request born AFTER the lost callback must inherit debt,
+        // not treat absence of its own in-flight guard as a known rollback.
+        let lost = lower.task_wait_mutation(None);
+        lower
+            .append_task_event(
+                TaskEventPayload::Progress {
+                    task_id: task.id.clone(),
+                    run_id: None,
+                    message: "durable".into(),
+                    details: None,
+                },
+                task.created_at + 2,
+            )
+            .await
+            .unwrap();
+        drop(lost);
+        let late = store.subscribe_task_wait(&[task.id.clone()], &[]);
+        let mut late_owner = late.acquire().unwrap();
+        assert_eq!(late_owner.ready().await, Ready::SettlementRequired);
+        assert!(
+            !late.take_committed_event(),
+            "uncertainty is not confirmed activity"
+        );
+        observer.events.lock().unwrap().clear();
+        assert!(store.settle_task_wait_changes(&late_owner).await.unwrap());
+        assert!(
+            !observer.events.lock().unwrap().is_empty(),
+            "ambiguous producer uses the serialized connection-order fence"
+        );
+        assert_eq!(late_owner.ready().await, Ready::Work);
+        assert_eq!(
+            store.get_task(&task.id).await.unwrap().unwrap().task.status,
+            TaskStatus::Cancelled
+        );
+        assert!(late_owner.publish(late_owner.observe(), Plan::Dormant));
+        assert!(late_owner.ready().now_or_never().is_none());
+        observer.events.lock().unwrap().clear();
+        let settled = store.subscribe_task_wait(&[task.id], &[]);
+        let settled_owner = settled.acquire().unwrap();
+        assert!(
+            store
+                .settle_task_wait_changes(&settled_owner)
+                .await
+                .unwrap()
+        );
+        assert!(
+            observer.events.lock().unwrap().is_empty(),
+            "settled parent debt is not replayed to later requests"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_recovery_admission_uses_maintenance_readers_without_writer_admission() {
+        let (store, observer, _path) = recovery_discovery_fixture().await;
+        let scoped = store.with_maintenance_reads_and_critical_writes();
+        let held_writer = store.connection.begin().await.unwrap();
+        observer.events.lock().unwrap().clear();
+        observer.reads.lock().unwrap().clear();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            for now in [1_700_000_000, 1_700_000_002, 1_700_000_004] {
+                let before = observer.reads.lock().unwrap().len();
+                let ready = scoped.recovery_admission("local-owner", now).await.unwrap();
+                assert!(
+                    observer.reads.lock().unwrap().len() > before,
+                    "each explicit observation must actually reach its reader"
+                );
+                assert!(!ready.orphan && !ready.backfill && !ready.active);
+                assert!(!ready.terminal_repair);
+                assert!(!ready.terminal_audit && !ready.terminal_delivery && !ready.queue);
+                assert!(!ready.action_outbox);
+            }
+        })
+        .await
+        .expect("admission must complete independently of writer capacity");
+        assert!(observer.events.lock().unwrap().is_empty());
+        // Compatibility observation folds several released raw heads. Assert
+        // the physical class/reader independence, not an obsolete SQL count.
+        let reads = observer.reads.lock().unwrap().clone();
+        assert!(
+            reads
+                .iter()
+                .all(|class| *class == pioneer_sqlite::SqliteReadClass::Maintenance)
+        );
+        held_writer.rollback().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn recovery_admission_observes_foreign_reschedule_claim_expiry_and_rollback() {
+        use pioneer_entity::recovery_job as entity;
+        let (store, _observer, _path) = recovery_discovery_fixture().await;
+        let now = 1_700_000_000;
+        let job = store
+            .enqueue_recovery_job(
+                "admission-turn".into(),
+                "item".into(),
+                TurnItemType::Reasoning,
+                None,
+                RecoveryTrigger::ProviderError,
+                RecoveryAction::MarkFailed,
+                None,
+                None,
+                None,
+                None,
+                0,
+                3,
+                serde_json::json!({}),
+                serde_json::json!({}),
+                now,
+            )
+            .await
+            .unwrap();
+        // Direct committed ORM writes deliberately emit no process-local hint.
+        entity::Entity::update_many()
+            .col_expr(
+                entity::Column::NextRunAt,
+                sea_orm::sea_query::Expr::value(unix_to_datetime(now + 20)),
+            )
+            .filter(entity::Column::Id.eq(job.id.clone()))
+            .exec(&store.connection)
+            .await
+            .unwrap();
+        let scoped = store.with_maintenance_access();
+        assert!(
+            !scoped
+                .recovery_admission("owner", now)
+                .await
+                .unwrap()
+                .terminal_repair
+        );
+        let tx = store.connection.begin().await.unwrap();
+        entity::Entity::update_many()
+            .col_expr(
+                entity::Column::NextRunAt,
+                sea_orm::sea_query::Expr::value(unix_to_datetime(now)),
+            )
+            .filter(entity::Column::Id.eq(job.id.clone()))
+            .exec(&tx)
+            .await
+            .unwrap();
+        tx.rollback().await.unwrap();
+        assert!(
+            !scoped
+                .recovery_admission("owner", now)
+                .await
+                .unwrap()
+                .terminal_repair
+        );
+        assert!(
+            scoped
+                .recovery_admission("owner", now + 20)
+                .await
+                .unwrap()
+                .terminal_repair
+        );
+        entity::Entity::update_many()
+            .col_expr(
+                entity::Column::NextRunAt,
+                sea_orm::sea_query::Expr::value(unix_to_datetime(now)),
+            )
+            .col_expr(
+                entity::Column::ClaimExpiresAt,
+                sea_orm::sea_query::Expr::value(unix_to_datetime(now + 10)),
+            )
+            .filter(entity::Column::Id.eq(job.id.clone()))
+            .exec(&store.connection)
+            .await
+            .unwrap();
+        assert!(
+            !scoped
+                .recovery_admission("owner", now + 9)
+                .await
+                .unwrap()
+                .terminal_repair
+        );
+        assert!(
+            scoped
+                .recovery_admission("owner", now + 10)
+                .await
+                .unwrap()
+                .terminal_repair
+        );
+        assert!(
+            !scoped
+                .recovery_admission("owner", now - 100)
+                .await
+                .unwrap()
+                .terminal_repair
+        );
+    }
+
+    #[tokio::test]
     async fn empty_recovery_discovery_and_active_reads_do_not_reserve_writer() {
         use pioneer_sqlite::SqliteReadClass;
         let (store, observer, _path) = recovery_discovery_fixture().await;
@@ -51417,6 +54408,10 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+        assert_eq!(
+            store.next_recovery_job_deadline().await.unwrap(),
+            Some(unix_to_datetime(now))
+        );
         let ids = recovery_job::list_due_job_ids(&store.connection, unix_to_datetime(now), 1)
             .await
             .unwrap();
@@ -51436,6 +54431,10 @@ mod tests {
             })
             .await
             .unwrap();
+        assert_eq!(
+            store.next_recovery_job_deadline().await.unwrap(),
+            Some(unix_to_datetime(now + 10))
+        );
         let stale_claims = store
             .run_serialized_write(|| async {
                 recovery_job::claim_due_job_ids(
@@ -51464,12 +54463,47 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+        assert_eq!(
+            store.next_recovery_job_deadline().await.unwrap(),
+            Some(unix_to_datetime(now + 55)),
+            "retained claim expiry dominates the earlier next_run_at"
+        );
         let second = store
             .claim_due_recovery_jobs(now + 55, 45, 1)
             .await
             .unwrap()
             .remove(0);
         assert_ne!(first.claim_token, second.claim_token);
+        assert_eq!(
+            store.next_recovery_job_deadline().await.unwrap(),
+            Some(unix_to_datetime(now + 100))
+        );
+        // A restored fractional retry after that lease becomes eligible at the
+        // next integer second used by the real owner, without a busy early loop.
+        entity::Entity::update_many()
+            .col_expr(
+                entity::Column::NextRunAt,
+                sea_orm::sea_query::Expr::value(
+                    unix_to_datetime(now + 100) + chrono::Duration::milliseconds(500),
+                ),
+            )
+            .filter(entity::Column::Id.eq(job.id.clone()))
+            .exec(&store.connection)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.next_recovery_job_deadline().await.unwrap(),
+            Some(unix_to_datetime(now + 101))
+        );
+        entity::Entity::update_many()
+            .col_expr(
+                entity::Column::NextRunAt,
+                sea_orm::sea_query::Expr::value(unix_to_datetime(now + 10)),
+            )
+            .filter(entity::Column::Id.eq(job.id.clone()))
+            .exec(&store.connection)
+            .await
+            .unwrap();
         // The original candidate ID must not bypass a renewed foreign claim.
         assert!(
             store
@@ -51516,6 +54550,10 @@ mod tests {
                 .await
                 .unwrap()
                 .is_some()
+        );
+        assert!(
+            store.next_recovery_job_deadline().await.unwrap().is_none(),
+            "active work belongs to independent supervision, not due rediscovery"
         );
     }
 
