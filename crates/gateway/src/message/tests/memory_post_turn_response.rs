@@ -6,6 +6,7 @@ use pioneer_memory::hooks::{
     MemoryDurableTerminalEffectClaim, MemoryManifest, MemoryManifestRequest,
     MemoryPostTurnExtractorContext, MemoryPostTurnExtractorRequest, MemoryTurnContext,
 };
+use pioneer_protocol::MemoryStatus;
 use pioneer_provider::{ProviderFailureClassification, ProviderTermination};
 use sea_orm::EntityTrait;
 use std::collections::VecDeque;
