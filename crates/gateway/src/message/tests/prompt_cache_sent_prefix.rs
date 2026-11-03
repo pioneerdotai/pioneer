@@ -723,15 +723,6 @@ fn sequential_detached_executions_keep_the_sent_input_prefix_on_both_wires() {
                     Arc::new(tokio::sync::Semaphore::new(1)),
                 ))))))
                 .await;
-            let images = tempfile::tempdir().unwrap();
-            let image_path = images.path().join("detached-prefix.webp");
-            std::fs::write(
-                &image_path,
-                include_bytes!(
-                    "../../../../provider/tests/fixtures/capabilities/hermes-feature-connect.webp"
-                ),
-            )
-            .unwrap();
             let parent = "detached-prefix-parent";
             let started = processor
                 .thread_manager
@@ -764,6 +755,19 @@ fn sequential_detached_executions_keep_the_sent_input_prefix_on_both_wires() {
                 )
                 .await
                 .unwrap();
+            let image = ingest_typed_test_artifact_for_thread(
+                processor,
+                workspace,
+                Some(parent),
+                "detached-prefix.webp",
+                include_bytes!(
+                    "../../../../provider/tests/fixtures/capabilities/hermes-feature-connect.webp"
+                )
+                .to_vec(),
+                pioneer_protocol::ArtifactKind::Image,
+                "image/webp",
+            )
+            .await;
             let mut first_requests = Vec::new();
             let mut first_wire = Vec::new();
             let mut first_projection = None;
@@ -788,8 +792,9 @@ fn sequential_detached_executions_keep_the_sent_input_prefix_on_both_wires() {
                         text: text.into(),
                         text_elements: vec![],
                     },
-                    UserInput::LocalImage {
-                        path: image_path.to_string_lossy().into_owned(),
+                    UserInput::Artifact {
+                        artifact_id: image.artifact_id.clone(),
+                        version_id: image.version_id.clone(),
                     },
                 ];
                 Arc::clone(processor).process_owned_request(context, json!({

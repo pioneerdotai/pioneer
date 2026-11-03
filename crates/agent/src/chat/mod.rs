@@ -7826,8 +7826,8 @@ mod tests {
         ReviewRequiredTaskObservation,
     };
     use pioneer_promt::{
-        PromptRuntimeBuiltInSectionId, PromptRuntimeSectionId, PromptRuntimeSectionInput,
-        PromptSectionId,
+        FILESYSTEM_CAPABILITY_RUNTIME_SECTION_ID, PromptRuntimeBuiltInSectionId,
+        PromptRuntimeSectionId, PromptRuntimeSectionInput, PromptSectionId,
     };
 
     // Owns the context-gate lifecycle contract shared by model-fact preload
@@ -10835,7 +10835,10 @@ mod tests {
             event = durable.recv() => { event.unwrap(); durable.acknowledge_last(Ok(())); }
         }
         match work.await {
-            Err(error) => assert!(error.to_string().contains("removed required inventory")),
+            Err(super::ChatTurnError::Blocked(message)) => {
+                assert!(message.contains("removed required inventory"));
+            }
+            Err(error) => panic!("expected inventory admission to block dispatch, got {error:?}"),
             Ok(_) => panic!("missing baseline must block dispatch"),
         }
         assert_eq!(capture.0.lock().unwrap().len(), 3);

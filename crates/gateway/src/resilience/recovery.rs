@@ -4328,7 +4328,7 @@ impl RecoveryCoordinator {
         })
     }
 
-    async fn retained_provider_history_for_turn(
+    pub(crate) async fn retained_provider_history_for_turn(
         &self,
         turn_id: &str,
     ) -> Result<Vec<RetainedProviderHistoryMessage>> {

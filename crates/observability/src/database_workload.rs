@@ -397,6 +397,12 @@ fn emit_database_workload(snapshot: DatabaseWorkloadSnapshot) {
     if !super::telemetry_sample_allowed(snapshot.consent_generation) {
         return;
     }
+    let _write = super::metrics::DB_RECORD_GATE
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !super::telemetry_sample_allowed(snapshot.consent_generation) {
+        return;
+    }
     let Some(state) = super::telemetry::state() else {
         return;
     };
@@ -707,4 +713,32 @@ mod shared_context_tests {
         assert!(crate::work::current_database().is_none());
         crate::set_telemetry_enabled(old);
     }
+}
+
+pub(crate) fn workload_metric_index(name: &str) -> Option<usize> {
+    Some(match name {
+        "unclassified" => 0,
+        "agent.progress" => 1,
+        "turn_event.commit_projection" => 2,
+        "projection.recovery" => 3,
+        "finalization.recovery" => 4,
+        "event.delivery" => 5,
+        "task.reconcile" => 6,
+        "execution.supervision" => 7,
+        "recovery_terminalization.audit" => 8,
+        "recovery_terminalization.apply" => 9,
+        "task_event.fanout" => 10,
+        "hook.recovery" => 11,
+        "timeline.page" => 12,
+        "thread_tree.load" => 13,
+        "skills.watch" => 14,
+        "episodic.maintenance" => 15,
+        "zstd.maintenance" => 16,
+        "projection.receipt_cleanup" => 17,
+        "cli_runtime.native_event_cleanup" => 18,
+        "frozen_storage.maintenance" => 19,
+        "html_preview.maintenance" => 20,
+        "portable_payload.maintenance" => 21,
+        _ => return None,
+    })
 }

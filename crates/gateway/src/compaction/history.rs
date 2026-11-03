@@ -1575,10 +1575,39 @@ async fn suppress_prepared_input_copy_events(
                 .get(&(origin.thread_id.clone(), turn.to_owned()))
                 .is_some_and(|copies| {
                     copies.iter().any(|parts| {
-                        message
-                            .content_parts
-                            .iter()
-                            .all(|part| parts.contains(part))
+                        message.content_parts.iter().all(|part| {
+                            parts.iter().any(|prepared| {
+                                if prepared == part {
+                                    return true;
+                                }
+                                // The UI stores an immutable artifact reference; the
+                                // exact saved input can already contain resolved bytes.
+                                let attachments = match (part, prepared) {
+                                    (
+                                        MessageContentPart::Image { image: original },
+                                        MessageContentPart::Image { image: saved },
+                                    )
+                                    | (
+                                        MessageContentPart::File { file: original },
+                                        MessageContentPart::File { file: saved },
+                                    ) => Some((original, saved)),
+                                    _ => None,
+                                };
+                                attachments.is_some_and(|(original, saved)| {
+                                    original.artifact.as_ref().is_some_and(|artifact| {
+                                        (artifact.workspace_id.is_empty()
+                                            || artifact.workspace_id == workspace)
+                                            && artifact.artifact_version_id.is_some()
+                                            && saved.artifact.as_ref().is_some_and(|accepted| {
+                                                accepted.workspace_id == workspace
+                                                    && accepted.artifact_id == artifact.artifact_id
+                                                    && accepted.artifact_version_id
+                                                        == artifact.artifact_version_id
+                                            })
+                                    })
+                                })
+                            })
+                        })
                     })
                 })
         {

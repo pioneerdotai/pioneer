@@ -82,11 +82,18 @@ async fn memory_prompt_contract_preserves_visible_tools_and_policy() {
             _ => None,
         })
         .expect("tool contract");
+    for guidance in [
+        "Call memory_search when prior memory is relevant",
+        "Use memory_get after memory_search",
+        "If the user asks you to forget something, call memory_forget.",
+    ] {
+        assert!(section.content.as_str().contains(guidance));
+    }
     assert!(
-        section
+        !section
             .content
             .as_str()
-            .contains("Available memory tools: memory_search, memory_get, memory_forget")
+            .contains("Call memory_remember proactively")
     );
     assert!(
         section

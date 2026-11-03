@@ -10650,13 +10650,9 @@ impl MessageProcessor {
                     let Some(artifact) = attachment.artifact.as_ref() else {
                         continue;
                     };
-                    if !matches!(
-                        &attachment.source,
-                        pioneer_provider::AttachmentDataSource::Reference { reference }
-                            if reference == &format!("pioneer-artifact:{}", artifact.artifact_id)
-                    ) {
-                        continue;
-                    }
+                    // Prepared input history may already contain resolved bytes or a
+                    // path. The accepted artifact identity still requires a fresh
+                    // availability check before another provider delivery.
                     anyhow::ensure!(
                         artifact.workspace_id.is_empty() || artifact.workspace_id == workspace_id,
                         "historical attachment {message_index}:{part_index} belongs to another workspace"
@@ -10698,7 +10694,11 @@ impl MessageProcessor {
                         resolved_is_image == expected_image,
                         "historical attachment kind changed after accepted capture"
                     );
-                    *attachment = resolved.attachment;
+                    // Validate availability even for saved materialized bytes, but
+                    // preserve their accepted representation on subsequent requests.
+                    if matches!(attachment.source, pioneer_provider::AttachmentDataSource::Reference { .. }) {
+                        *attachment = resolved.attachment;
+                    }
                 }
             }
             Ok(history)

@@ -892,14 +892,7 @@ async fn portable_cli_mapping_preserves_sent_bytes_control_updates_and_upsert() 
         .await
         .unwrap();
     for _ in 0..180 {
-        if let Err(error) = progress.quantum(&store).await {
-            // A CAS miss is a diagnosed maintenance refusal. Only the old
-            // staged source may be discarded; the replacement must converge.
-            assert_eq!(
-                error.to_string(),
-                "portable source changed before publication"
-            );
-        }
+        progress.quantum(&store).await.unwrap();
     }
     assert_eq!(scalar(&store,"SELECT count(*) n FROM turn_cli_runtime_binding WHERE input_mapping_json_payload_id IS NOT NULL AND octet_length(input_mapping_json)<256").await,1);
     assert_eq!(
@@ -1320,4 +1313,143 @@ async fn portable_active_staging_cannot_be_reclaimed_by_another_progress_owner()
         Some(serde_json::to_string(&payload).unwrap())
     );
     assert_eq!(scalar(&store,"SELECT count(*) n FROM portable_payload_block b LEFT JOIN portable_payload p ON p.id=b.payload_id WHERE p.id IS NULL").await,0);
+}
+
+#[tokio::test]
+async fn portable_unavailable_history_pages_yield_and_revisit_without_blocking_other_sources() {
+    let (_file, store, _writer) = fixture().await;
+    let root = pioneer_compaction::frozen::FrozenHistoryRef {
+        format: 1,
+        manifest_id: "unavailable".into(),
+        messages: 0,
+        identity_sha256: "a".repeat(64),
+    };
+    let history = serde_json::to_string(&root).unwrap();
+    store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+        "INSERT INTO compaction_frozen_history(id,workspace_id,owner_thread,identity_sha256,message_count,next_ordinal,import_count,next_import,imports_sha256,ready) VALUES('unavailable','ws','thread',?,0,0,0,0,'',1)", [root.identity_sha256.clone().into()]
+    )).await.unwrap();
+    let mut input = task_snapshot_input(&store, history.clone()).await;
+    store
+        .insert_task_run_conversation_snapshot_if_absent(input.clone())
+        .await
+        .unwrap();
+    // More than two discovery pages, all admitted while the root was available.
+    for i in 0..130 {
+        let id = format!("a-{i:03}");
+        store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+            "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES(?,'task',?,1,?,'succeeded','agent')", [id.clone().into(), id.clone().into(), (i64::from(i) + 2).into()]
+        )).await.unwrap();
+        input.run_id = id;
+        store
+            .insert_task_run_conversation_snapshot_if_absent(input.clone())
+            .await
+            .unwrap();
+    }
+    store
+        .database_connection()
+        .execute_unprepared("UPDATE compaction_frozen_history SET expired=1 WHERE id='unavailable'")
+        .await
+        .unwrap();
+    let mut progress = pioneer_crud::PortablePayloadProgress::default();
+    // False feeds the existing worker's idle policy; poison-only pages must
+    // neither stage bytes nor report endless active work.
+    for _ in 0..30 {
+        assert!(!progress.quantum(&store).await.unwrap());
+    }
+    assert_eq!(
+        scalar(&store, "SELECT count(*) n FROM portable_payload").await,
+        0
+    );
+    store.database_connection().execute_unprepared(
+        "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES('zz-legacy','task','zz-legacy',1,132,'succeeded','agent')"
+    ).await.unwrap();
+    input.run_id = "zz-legacy".into();
+    input.history_json = r#"[{"role":"user","content":"legacy inline"}]"#.into();
+    store
+        .insert_task_run_conversation_snapshot_if_absent(input)
+        .await
+        .unwrap();
+    let output = pioneer_protocol::ItemDeltaNotification {
+        workspace_id: "ws".into(),
+        thread_id: "thread".into(),
+        turn_id: "turn".into(),
+        item_id: "eligible".into(),
+        delta: "other family".repeat(1000),
+        stream: None,
+        payload: None,
+        markdown: None,
+        markdown_version: None,
+    };
+    store.record_tool_output("eligible", &output).await.unwrap();
+    for _ in 0..150 {
+        progress.quantum(&store).await.unwrap();
+    }
+    assert_eq!(
+        scalar(
+            &store,
+            "SELECT count(*) n FROM tool_output_chunk WHERE text_payload_id IS NOT NULL"
+        )
+        .await,
+        1
+    );
+    assert_eq!(scalar(&store, "SELECT count(*) n FROM task_run_conversation_snapshot WHERE run_id='zz-legacy' AND frozen_manifest_id IS NULL AND history_json_payload_id IS NOT NULL").await, 1);
+    assert_eq!(scalar(&store, "SELECT count(*) n FROM task_run_conversation_snapshot WHERE frozen_manifest_id='unavailable' AND history_json_payload_id IS NULL").await, 131);
+    // A missing/unready root can later become available. No source marker was
+    // written by discovery, and a fresh pass must reconsider keys below cursor.
+    store
+        .database_connection()
+        .execute_unprepared("DELETE FROM compaction_frozen_history WHERE id='unavailable'")
+        .await
+        .unwrap();
+    for _ in 0..30 {
+        assert!(!progress.quantum(&store).await.unwrap());
+    }
+    store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+        "INSERT INTO compaction_frozen_history(id,workspace_id,owner_thread,identity_sha256,message_count,next_ordinal,import_count,next_import,imports_sha256,ready) VALUES('unavailable','ws','thread',?,0,0,0,0,'',0)", [root.identity_sha256.into()]
+    )).await.unwrap();
+    for _ in 0..30 {
+        assert!(!progress.quantum(&store).await.unwrap());
+    }
+    store
+        .database_connection()
+        .execute_unprepared(
+            "UPDATE compaction_frozen_history SET next_ordinal=-1 WHERE id='unavailable'",
+        )
+        .await
+        .unwrap();
+    let mut errors = 0;
+    for _ in 0..30 {
+        if progress.quantum(&store).await.is_err() {
+            errors += 1;
+        }
+    }
+    assert!(
+        errors > 0,
+        "malformed frozen counters must not become idle skips"
+    );
+    store
+        .database_connection()
+        .execute_unprepared(
+            "UPDATE compaction_frozen_history SET next_ordinal=0 WHERE id='unavailable'",
+        )
+        .await
+        .unwrap();
+    store
+        .database_connection()
+        .execute_unprepared("UPDATE compaction_frozen_history SET ready=1 WHERE id='unavailable'")
+        .await
+        .unwrap();
+    for _ in 0..2200 {
+        progress.quantum(&store).await.unwrap();
+    }
+    assert_eq!(scalar(&store, "SELECT count(*) n FROM task_run_conversation_snapshot WHERE history_json_payload_id IS NOT NULL").await, 132);
+    assert_eq!(
+        store
+            .get_task_run_conversation_snapshot("run")
+            .await
+            .unwrap()
+            .unwrap()
+            .history_json,
+        history
+    );
 }

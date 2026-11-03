@@ -30,6 +30,7 @@ mod metrics;
 mod operations;
 mod patch_telemetry;
 mod performance;
+pub mod pool_context;
 pub mod portable_payload;
 #[cfg(feature = "qualification-diagnostics")]
 mod qualification_diagnostics;
@@ -49,15 +50,17 @@ pub use database_workload::{
 };
 pub use desktop_gateway::{DesktopGatewayLifecycleOperation, DesktopGatewayLifecycleTrace};
 pub use metrics::{
-    DatabaseAdmissionMetric, DatabaseOperation, DatabaseOperationMetric, DatabasePoolSnapshot,
-    DatabaseReadAdmissionMetric, DatabaseReadMetric, DatabaseRole, NativeLifecycleDepthKind,
-    NativeLifecycleEventMetric, NativeLifecycleOutcome, NativeLifecycleStage, NativeProviderClass,
-    NativeReadinessComponent, NativeReadinessState, PatchOperationMetric,
-    record_database_admission, record_database_operation, record_database_read,
-    record_database_read_admission, record_gateway_active_connections,
-    record_gateway_database_size_bytes, record_native_lifecycle_depth,
-    record_native_lifecycle_event, record_native_readiness_component,
-    record_patch_mutation_fallback, record_patch_operation, register_database_pool_observer,
+    DatabaseAdmissionMetric, DatabaseOperation, DatabaseOperationMetric, DatabaseOperationSeries,
+    DatabasePoolSnapshot, DatabaseReadAdmissionMetric, DatabaseReadMetric, DatabaseRole,
+    NativeLifecycleDepthKind, NativeLifecycleEventMetric, NativeLifecycleOutcome,
+    NativeLifecycleStage, NativeProviderClass, NativeReadinessComponent, NativeReadinessState,
+    PatchOperationMetric, record_database_admission, record_database_admission_for_consent,
+    record_database_operation, record_database_read, record_database_read_admission,
+    record_database_read_admission_for_consent, record_database_read_for_consent,
+    record_gateway_active_connections, record_gateway_database_size_bytes,
+    record_native_lifecycle_depth, record_native_lifecycle_event,
+    record_native_readiness_component, record_patch_mutation_fallback, record_patch_operation,
+    register_database_pool_observer,
 };
 pub use operations::{
     GatewayCliRuntimeKind, GatewayOperation, GatewayOperationItemKind, GatewayOperationStage,
@@ -261,7 +264,7 @@ where
 }
 
 fn database_metrics_target_enabled(target: &str, consent_enabled: bool) -> bool {
-    consent_enabled && matches!(target, "sqlx::pool::acquire" | "pioneer_sqlite::pool")
+    consent_enabled && target == "sqlx::pool::acquire"
 }
 
 pub fn capture_anyhow(error: &anyhow::Error) {
@@ -871,8 +874,7 @@ mod tests {
         let events = Arc::new(AtomicUsize::new(0));
         let database_metrics_filter = Targets::new()
             .with_default(LevelFilter::OFF)
-            .with_target("sqlx::pool::acquire", LevelFilter::TRACE)
-            .with_target("pioneer_sqlite::pool", LevelFilter::TRACE);
+            .with_target("sqlx::pool::acquire", LevelFilter::TRACE);
         let log_filter = Targets::new().with_default(LevelFilter::INFO);
         let subscriber = tracing_subscriber::registry()
             .with(
@@ -899,7 +901,7 @@ mod tests {
             false
         ));
         assert!(database_metrics_target_enabled("sqlx::pool::acquire", true));
-        assert!(database_metrics_target_enabled(
+        assert!(!database_metrics_target_enabled(
             "pioneer_sqlite::pool",
             true
         ));
@@ -1469,3 +1471,21 @@ pub(crate) fn record_in_epoch<T>(epoch: u64, callback: impl FnOnce() -> T) -> Op
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     telemetry_sample_allowed(Some(epoch)).then(callback)
 }
+
+#[cfg(test)]
+mod read_outcome_tests;
+
+// Compile the exact production adapter into this unit-test target so its TLS
+// and the private SDK fixture have one identity; no second observability lib.
+#[cfg(test)]
+extern crate self as pioneer_observability;
+#[cfg(test)]
+mod db_pool_integration_tests;
+#[cfg(test)]
+#[path = "../../sqlite/src/query_scope.rs"]
+mod sqlite_query_scope;
+
+// Exercise Gateway's exact private admission owner against this target's SDK fixture.
+#[cfg(test)]
+#[path = "../../gateway/src/database/query_fingerprint.rs"]
+mod query_fingerprint_fixture;
