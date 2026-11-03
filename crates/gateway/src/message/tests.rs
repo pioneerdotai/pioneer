@@ -42601,11 +42601,12 @@ async fn task_anchor_publication_scenario(scenario: &str) {
                 {
                     saw_metadata = true;
                 }
-                if value["method"] == events::TURN_WORK_STATE_CHANGED
-                    && value["params"]["thread_id"] == thread_id
-                    && value["params"]["turn_id"] == turn_id
-                {
-                    panic!("Work snapshot escaped initial publication: {value}");
+                if value["method"] == events::TURN_WORK_STATE_CHANGED {
+                    let snapshot: pioneer_protocol::TurnWorkStateChangedNotification =
+                        serde_json::from_value(value["params"].clone()).unwrap();
+                    if snapshot.thread_id == thread_id && snapshot.turn_id == turn_id {
+                        panic!("Work snapshot escaped initial publication: {value}");
+                    }
                 }
             }
             assert!(
@@ -42640,30 +42641,29 @@ async fn task_anchor_publication_scenario(scenario: &str) {
                             assert!(!started);
                             started = true;
                         }
-                        if value["method"] == events::TURN_WORK_STATE_CHANGED
-                            && value["params"]["thread_id"] == thread_id
-                            && value["params"]["turn_id"] == turn_id
-                        {
-                            assert!(started, "Work preceded start: {value}");
+                        if value["method"] == events::TURN_WORK_STATE_CHANGED {
                             let snapshot: pioneer_protocol::TurnWorkStateChangedNotification =
                                 serde_json::from_value(value["params"].clone()).unwrap();
-                            assert_eq!(snapshot.work.turn_id, turn_id);
-                            assert_eq!(
-                                snapshot.work.state,
-                                pioneer_protocol::TurnWorkState::Blocked
-                            );
-                            assert!(
-                                snapshot.source_high_watermark
-                                    >= terminal_work.source_high_watermark
-                            );
-                            assert_eq!(
-                                snapshot.work.completed_at_unix_ms,
-                                terminal_work
-                                    .completed_at
-                                    .as_ref()
-                                    .map(|at| at.timestamp_millis())
-                            );
-                            observed = true;
+                            if snapshot.thread_id == thread_id && snapshot.turn_id == turn_id {
+                                assert!(started, "Work preceded start: {value}");
+                                assert_eq!(snapshot.work.turn_id, turn_id);
+                                assert_eq!(
+                                    snapshot.work.state,
+                                    pioneer_protocol::TurnWorkState::Blocked
+                                );
+                                assert!(
+                                    snapshot.source_high_watermark
+                                        >= terminal_work.source_high_watermark
+                                );
+                                assert_eq!(
+                                    snapshot.work.completed_at_unix_ms,
+                                    terminal_work
+                                        .completed_at
+                                        .as_ref()
+                                        .map(|at| at.timestamp_millis())
+                                );
+                                observed = true;
+                            }
                         }
                     }
                     if observed {
