@@ -6223,7 +6223,7 @@ mod tests {
                     viewed_row_ids: vec![],
                     viewed_through_block: None,
                     read_requires_unread: false,
-                    prefetch_on_visibility: false,
+                    prefetch_on_visibility: true,
                     boundary_request_limit: 1,
                 };
                 let plan = core.thread_registry.lock().unwrap().timeline.update(
@@ -6634,12 +6634,20 @@ mod tests {
                 assert_eq!(request["params"]["turn_id"], "new");
                 assert!(old.send(Ok(serde_json::Value::Null)).is_err());
                 assert!(new.is_active());
-                assert!(
-                    core.thread_coordinator_snapshot("a")
-                        .unwrap()
-                        .resume
-                        .in_progress
-                );
+                // The rejected old reply must leave the new Resume usable.
+                new.send(Ok(serde_json::to_value(
+                    pioneer_protocol::TurnGetResponse {
+                        thread_id: "a".into(),
+                        workspace_id: "ws".into(),
+                        turn: running_turn("new"),
+                    },
+                )
+                .unwrap()))
+                    .unwrap();
+                let (request, items) = requests.recv_timeout(watchdog).unwrap();
+                assert_eq!(request["method"], "turn/items/page");
+                assert_eq!(request["params"]["turn_id"], "new");
+                assert!(items.is_active());
                 core.shutdown();
                 wait_history_owner_exit(&waiting);
             }
