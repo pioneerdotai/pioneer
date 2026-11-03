@@ -450,16 +450,20 @@ pub(crate) async fn run_normal_connection_inner(
             let _ = start.await;
         }
         let mut sealed = false;
-        while let Some(envelope) = tokio::select! {
-            biased;
-            _ = writer_outbound.writer_stopped() => anyhow::bail!("outbound writer retired"),
-            _ = writer_outbound.closed(), if !sealed => {
-                outbound_rx.seal();
-                sealed = true;
-                continue;
-            }
-            envelope = outbound_rx.recv() => envelope,
-        } {
+        loop {
+            let envelope = tokio::select! {
+                biased;
+                _ = writer_outbound.writer_stopped() => anyhow::bail!("outbound writer retired"),
+                _ = writer_outbound.closed(), if !sealed => {
+                    outbound_rx.seal();
+                    sealed = true;
+                    continue;
+                }
+                envelope = outbound_rx.recv() => envelope,
+            };
+            let Some(envelope) = envelope else {
+                break;
+            };
             let crate::session::outbound::OutboundEnvelope {
                 item,
                 reservation: _reservation,
