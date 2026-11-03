@@ -1769,18 +1769,24 @@ mod connection_generation_tests {
         assert_eq!(core.route_gateway_event(&settings), None);
     }
 
-    // NOT_RUN / NOT_COMPILED. Raw queue only; no transport worker/network.
+    // Raw queue only; no transport worker/network.
     #[test]
     fn bound_native_request_does_not_recapture_route_changed_before_send() {
         use crate::rpc::JsonRpcRequestTransport;
         let (command_tx, mut queue) = work_channel(Boundary::ClientCommand);
         let sender = GatewayWsCommandSender {
             command_tx,
+            voice_budget: Arc::default(),
+            socket: Arc::default(),
+            test_cancels: Arc::default(),
             next_connection_id: Arc::new(AtomicU64::new(8)),
             session_access: Arc::new(Mutex::new(None)),
             connection_generations: Arc::default(),
             test_requests: Arc::default(),
         };
+        let (receipt, owner) = SocketReceipt::new(7);
+        *sender.socket.lock().unwrap() = Some(receipt);
+        *sender.test_cancels.lock().unwrap() = Some(owner);
         sender.connection_generations.lock().unwrap().active = Some(7);
         let bound = sender.requests_for_connection(7);
         // Models replacement after native work's last current check. Every
@@ -1792,7 +1798,11 @@ mod connection_generation_tests {
             "skills/policy/set",
             "mcp/oauth",
         ] {
-            let (response_tx, _) = mpsc::channel();
+            let (response_tx, _response_rx) = mpsc::channel();
+            let response_tx = crate::rpc::JsonRpcResponseSender::new(
+                response_tx,
+                std::time::Instant::now() + crate::rpc::RPC_REQUEST_TIMEOUT,
+            );
             bound
                 .send_json_rpc_request("request".into(), method.into(), response_tx)
                 .unwrap();
