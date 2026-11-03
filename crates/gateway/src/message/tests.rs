@@ -6446,6 +6446,17 @@ fn canonical_provider_messages_for_artifact_parity(
             message.content =
                 canonical_prompt_text_for_parity(message.content.as_str(), turn_private_paths);
         }
+        if let Some(metadata) = message.application_context.as_mut() {
+            if metadata["kind"] == "turn_input" {
+                let context = metadata["context"].as_str().expect("prepared context");
+                metadata["context"] = json!(canonical_prompt_text_for_parity(
+                    context,
+                    turn_private_paths
+                ));
+                message.content =
+                    canonical_prompt_text_for_parity(&message.content, turn_private_paths);
+            }
+        }
         for content_part in &mut message.content_parts {
             let attachment = match content_part {
                 pioneer_provider::MessageContentPart::File { file } => file,
@@ -6651,6 +6662,7 @@ fn canonical_main_request_execution_thread_for_parity(
     expected_thread_id: &str,
     history_thread_id: &str,
     history_turn_id: &str,
+    expected_actor_id: Option<&str>,
 ) -> ChatRequest {
     // Independent executions must advertise their own thread, not the same ID.
     // Validate that identity against the fixture/lineage before comparing content.
@@ -6716,6 +6728,29 @@ fn canonical_main_request_execution_thread_for_parity(
                 origin["unit_id"],
                 format!("{actual_turn}:turn-input-projection")
             );
+            let initiator = format!("Initiating thread: {history_thread_id}");
+            assert_eq!(
+                context
+                    .lines()
+                    .filter(|line| line.starts_with("Initiating thread: "))
+                    .collect::<Vec<_>>(),
+                vec![initiator.as_str()]
+            );
+            let actor = format!(
+                "Actor: {}",
+                if actual_turn == history_turn_id {
+                    "unavailable"
+                } else {
+                    expected_actor_id.unwrap_or("unavailable")
+                }
+            );
+            assert_eq!(
+                context
+                    .lines()
+                    .filter(|line| line.starts_with("Actor: "))
+                    .collect::<Vec<_>>(),
+                vec![actor.as_str()]
+            );
             let thread_canonical = canonical_execution_thread_for_parity(context, actual_thread);
             let expected_turn_line = format!("Turn: {actual_turn}");
             assert_eq!(
@@ -6730,6 +6765,10 @@ fn canonical_main_request_execution_thread_for_parity(
                 .map(|line| {
                     if line == expected_turn_line {
                         "Turn: <verified execution turn>"
+                    } else if line == initiator {
+                        "Initiating thread: <verified initiating thread>"
+                    } else if line == actor {
+                        "Actor: <verified execution actor>"
                     } else {
                         line
                     }
@@ -16126,9 +16165,7 @@ async fn followup_history_preserves_typed_recorded_artifact_version() {
         .messages
         .iter()
         .find_map(|message| {
-            message
-                .content
-                .strip_prefix("Что за машина?\nHistorical input reference: ")
+            prepared_user_text(message).strip_prefix("Что за машина?\nHistorical input reference: ")
         })
         .expect("the original question and typed artifact input must remain together");
     assert_eq!(
@@ -27369,27 +27406,21 @@ async fn recovered_hidden_task_run_dispatches_restored_child_main_without_planne
         "main dispatch must be the first provider request"
     );
     assert!(requests[child_main_pos].compiled_prompt.is_some());
-    let restored_prompt = requests[child_main_pos]
-        .compiled_prompt
-        .as_ref()
-        .expect("restored child main request should have compiled prompt");
+    let restored_context = requests[child_main_pos]
+        .messages
+        .iter()
+        .filter_map(|message| message.application_context.as_ref())
+        .filter(|metadata| metadata["kind"] == "turn_input")
+        .filter_map(|metadata| metadata["context"].as_str())
+        .find(|context| context.contains("Execution Continuation"))
+        .expect("restored child input should include execution continuation context");
     assert!(
-        restored_prompt
-            .full_system_text
-            .contains("Execution Continuation"),
-        "restored child prompt should include execution continuation section"
+        restored_context.contains("Completed window: index=1"),
+        "restored child input should include checkpoint window facts"
     );
     assert!(
-        restored_prompt
-            .full_system_text
-            .contains("Completed window: index=1"),
-        "restored child prompt should include checkpoint window facts"
-    );
-    assert!(
-        restored_prompt
-            .full_system_text
-            .contains("Original request preview: Recovered hidden preflight child"),
-        "restored child prompt should include checkpoint original request facts"
+        restored_context.contains("Original request preview: Recovered hidden preflight child"),
+        "restored child input should include checkpoint original request facts"
     );
     let recovered_main_request = &requests[child_main_pos];
     assert!(
@@ -38302,12 +38333,14 @@ async fn detached_composer_work_matches_parent_llm_prompts_end_to_end_impl() {
         direct_parent_thread_id,
         direct_parent_thread_id,
         direct_seed_turn_id,
+        None,
     );
     let child_main = canonical_main_request_execution_thread_for_parity(
         child_main,
         &lineage.child_thread_id,
         task_parent_thread_id,
         task_seed_turn_id,
+        Some(task.task.id.as_str()),
     );
     assert_exact_chat_request_parity("main turn", &direct_main, &child_main);
 
@@ -38795,12 +38828,14 @@ async fn detached_composer_work_matches_full_parent_llm_request_end_to_end_impl(
         direct_parent_thread_id,
         direct_parent_thread_id,
         direct_seed_turn_id,
+        None,
     );
     let child_main = canonical_main_request_execution_thread_for_parity(
         child_main,
         &lineage.child_thread_id,
         task_parent_thread_id,
         task_seed_turn_id,
+        Some(task.task.id.as_str()),
     );
     assert_exact_chat_request_parity_with_turn_private_paths(
         "full main turn",
@@ -82682,7 +82717,7 @@ async fn native_foreground_controller_uses_interactive_database_scope() {
                 request
                     .messages
                     .iter()
-                    .any(|message| message.content == "small foreground request")
+                    .any(|message| prepared_user_text(message) == "small foreground request")
             }) {
                 break;
             }
@@ -82698,7 +82733,7 @@ async fn native_foreground_controller_uses_interactive_database_scope() {
             request
                 .messages
                 .iter()
-                .any(|message| message.content == "small foreground request")
+                .any(|message| prepared_user_text(message) == "small foreground request")
         })
         .expect("native foreground request was not captured");
     assert!(foreground_request.messages.iter().any(|message| {
@@ -82718,7 +82753,7 @@ async fn native_foreground_controller_uses_interactive_database_scope() {
     let current_index = foreground_request
         .messages
         .iter()
-        .position(|message| message.content == "small foreground request")
+        .position(|message| prepared_user_text(message) == "small foreground request")
         .unwrap();
     assert!(
         prior_index < current_index,

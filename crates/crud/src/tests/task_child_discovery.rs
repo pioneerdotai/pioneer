@@ -490,7 +490,7 @@ async fn queued_cleanup_revalidates_late_lineage_receipt_and_capsule_without_sel
                 turn_id: "gated_child".into(),
                 item_id: Some(source.into()),
                 attempt_id: None,
-                sequence: sequence as i64,
+                sequence: sequence as i64 + 1,
                 source: source.into(),
                 tool_name: None,
                 payload: "{}".into(),
