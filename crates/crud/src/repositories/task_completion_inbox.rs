@@ -420,7 +420,9 @@ fn internal_completion() -> Expr {
     // SQLite's freedom to reorder WHERE terms. NULL cannot prove internal work.
     let safe_json = |value: Expr| -> Expr {
         Expr::case(
-            Func::cust(Alias::new("json_valid")).arg(value.clone()),
+            Func::cust(Alias::new("json_valid"))
+                .arg(value.clone())
+                .eq(1),
             value,
         )
         .finally(Expr::val("{}"))
