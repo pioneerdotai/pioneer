@@ -2294,7 +2294,10 @@ async fn corrections_require_original_active_manifest_identity_and_authorized_in
             manifest: MemoryManifest {
                 active: vec![MemoryManifestActiveItem {
                     memory_id: "active".into(),
-                    scope: user_scope(),
+                    scope: MemoryScope {
+                        kind: MemoryScopeKind::User,
+                        key: "default".to_owned(),
+                    },
                     category: MemoryCategory::Identity,
                     key: Some(key.into()),
                     content_preview: "previous name".into(),

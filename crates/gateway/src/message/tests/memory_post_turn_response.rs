@@ -1342,7 +1342,7 @@ fn memory_response_canary_is_absent_from_sentry_events_and_breadcrumbs() {
         assert!(!serialized.contains(CANARY));
         assert!(serialized.contains("fresh_response_validation"));
         assert!(serialized.contains("test-model"));
-        assert!(serialized.contains("structure"));
+        assert!(serialized.contains("facts_not_array"));
     });
 }
 

@@ -1939,7 +1939,7 @@ async fn manifest_reports_further_pages_and_clipped_items_without_claiming_globa
         manifest
             .active
             .iter()
-            .all(|item| item.content_truncated && item.content_preview.chars().count() == 8)
+            .all(|item| item.content_truncated && item.content_preview == "bounded ...")
     );
     assert!(
         manifest
