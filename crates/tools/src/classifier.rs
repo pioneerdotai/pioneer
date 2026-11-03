@@ -1040,18 +1040,6 @@ mod tests {
     }
 
     #[test]
-    fn rejected_tool_error_is_a_local_non_retryable_permission_denial() {
-        let outcome = DefaultErrorClassifier.classify_error(
-            &invocation_for("read_file"),
-            &ToolError::Rejected("path is outside allowed roots".to_owned()),
-        );
-
-        assert_eq!(outcome.status, ToolOutcomeStatus::FatalError);
-        assert_eq!(outcome.error_class, Some(ToolErrorClass::PermissionDenied));
-        assert!(!outcome.should_retry);
-    }
-
-    #[test]
     fn bounded_list_dir_page_is_success_even_when_more_entries_exist() {
         let outcome = DefaultErrorClassifier.classify_result(
             &invocation_for("list_dir"),
@@ -1175,20 +1163,6 @@ mod tests {
     }
 
     #[test]
-    fn wrapped_filesystem_permission_error_is_not_retryable() {
-        let outcome = DefaultErrorClassifier.classify_error(
-            &invocation_for("read_file"),
-            &ToolError::ExecutionFailed(
-                "failed to read `/restricted`: Permission denied (os error 13)".to_owned(),
-            ),
-        );
-
-        assert_eq!(outcome.status, ToolOutcomeStatus::FatalError);
-        assert_eq!(outcome.error_class, Some(ToolErrorClass::PermissionDenied));
-        assert!(!outcome.should_retry);
-    }
-
-    #[test]
     fn shell_permission_denial_is_not_retryable() {
         let payload = build_exec_model_payload(ExecPayloadInput {
             exit_code: Some(1),
@@ -1248,5 +1222,30 @@ mod tests {
         assert_eq!(outcome.status, ToolOutcomeStatus::FatalError);
         assert_eq!(outcome.error_class, Some(ToolErrorClass::PermissionDenied));
         assert!(!outcome.should_retry);
+    }
+
+    #[test]
+    fn context_sensitive_tool_errors_are_fatal_and_non_retryable() {
+        for (case, invocation, error, expected_class) in [
+            (
+                "rejected_tool_error_is_a_local_non_retryable_permission_denial",
+                invocation_for("read_file"),
+                ToolError::Rejected("path is outside allowed roots".to_owned()),
+                ToolErrorClass::PermissionDenied,
+            ),
+            (
+                "wrapped_filesystem_permission_error_is_not_retryable",
+                invocation_for("read_file"),
+                ToolError::ExecutionFailed(
+                    "failed to read `/restricted`: Permission denied (os error 13)".to_owned(),
+                ),
+                ToolErrorClass::PermissionDenied,
+            ),
+        ] {
+            let outcome = DefaultErrorClassifier.classify_error(&invocation, &error);
+            assert_eq!(outcome.status, ToolOutcomeStatus::FatalError, "{case}");
+            assert_eq!(outcome.error_class, Some(expected_class), "{case}");
+            assert!(!outcome.should_retry, "{case}");
+        }
     }
 }

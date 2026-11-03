@@ -91,6 +91,11 @@ pub async fn upsert_prepared_task<C: ConnectionTrait>(
     db: &C,
     prepared: PreparedTaskProjection,
 ) -> Result<()> {
+    let id = prepared.0.id.as_ref().to_owned();
+    let old = task::Entity::find_by_id(&id)
+        .lock_exclusive()
+        .one(db)
+        .await?;
     task::Entity::insert(prepared.0)
         .on_conflict(
             OnConflict::column(task::Column::Id)
@@ -124,6 +129,12 @@ pub async fn upsert_prepared_task<C: ConnectionTrait>(
         .exec(db)
         .await
         .context("failed to upsert task")?;
+    let new = task::Entity::find_by_id(&id)
+        .lock_exclusive()
+        .one(db)
+        .await?;
+    super::task_child_producers::task_change(db, old.as_ref(), new.as_ref()).await?;
+    super::task_occurrence_producers::task_change(db, old.as_ref(), new.as_ref()).await?;
     Ok(())
 }
 
@@ -305,7 +316,11 @@ pub async fn update_task_status<C: ConnectionTrait>(
     updated_at: DateTimeWithTimeZone,
     completed_at: Option<DateTimeWithTimeZone>,
 ) -> Result<ProjectionWriteOutcome> {
-    let Some(model) = find_task_by_id(db, task_id).await? else {
+    let Some(model) = task::Entity::find_by_id(task_id)
+        .lock_exclusive()
+        .one(db)
+        .await?
+    else {
         return Ok(ProjectionWriteOutcome::InvariantViolation {
             reason: format!("task `{task_id}` missing for status update"),
         });
@@ -327,6 +342,12 @@ pub async fn update_task_status<C: ConnectionTrait>(
             reason: format!("task `{task_id}` status update affected zero rows"),
         });
     }
+    let new = task::Entity::find_by_id(task_id)
+        .lock_exclusive()
+        .one(db)
+        .await?;
+    super::task_child_producers::task_change(db, Some(&model), new.as_ref()).await?;
+    super::task_occurrence_producers::task_change(db, Some(&model), new.as_ref()).await?;
     Ok(ProjectionWriteOutcome::Applied)
 }
 
@@ -338,7 +359,11 @@ pub async fn update_task_result_json<C: ConnectionTrait>(
     updated_at: DateTimeWithTimeZone,
     completed_at: Option<DateTimeWithTimeZone>,
 ) -> Result<ProjectionWriteOutcome> {
-    let Some(model) = find_task_by_id(db, task_id).await? else {
+    let Some(model) = task::Entity::find_by_id(task_id)
+        .lock_exclusive()
+        .one(db)
+        .await?
+    else {
         return Ok(ProjectionWriteOutcome::InvariantViolation {
             reason: format!("task `{task_id}` missing for result update"),
         });
@@ -363,6 +388,12 @@ pub async fn update_task_result_json<C: ConnectionTrait>(
             reason: format!("task `{task_id}` result update affected zero rows"),
         });
     }
+    let new = task::Entity::find_by_id(task_id)
+        .lock_exclusive()
+        .one(db)
+        .await?;
+    super::task_child_producers::task_change(db, Some(&model), new.as_ref()).await?;
+    super::task_occurrence_producers::task_change(db, Some(&model), new.as_ref()).await?;
     Ok(ProjectionWriteOutcome::Applied)
 }
 
@@ -374,7 +405,11 @@ pub async fn update_task_error_json<C: ConnectionTrait>(
     updated_at: DateTimeWithTimeZone,
     completed_at: Option<DateTimeWithTimeZone>,
 ) -> Result<ProjectionWriteOutcome> {
-    let Some(model) = find_task_by_id(db, task_id).await? else {
+    let Some(model) = task::Entity::find_by_id(task_id)
+        .lock_exclusive()
+        .one(db)
+        .await?
+    else {
         return Ok(ProjectionWriteOutcome::InvariantViolation {
             reason: format!("task `{task_id}` missing for error update"),
         });
@@ -399,6 +434,12 @@ pub async fn update_task_error_json<C: ConnectionTrait>(
             reason: format!("task `{task_id}` error update affected zero rows"),
         });
     }
+    let new = task::Entity::find_by_id(task_id)
+        .lock_exclusive()
+        .one(db)
+        .await?;
+    super::task_child_producers::task_change(db, Some(&model), new.as_ref()).await?;
+    super::task_occurrence_producers::task_change(db, Some(&model), new.as_ref()).await?;
     Ok(ProjectionWriteOutcome::Applied)
 }
 

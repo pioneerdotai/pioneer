@@ -378,56 +378,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gc_removes_expired_artifact_output_dirs() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let artifact_root = temp.path().join("artifacts");
-        let dir = create_artifact_output_dir(&artifact_root, "ws_gc", "thr_gc", "turn_old")
-            .await
-            .expect("create output dir");
-        fs::write(dir.path.join("result.txt"), b"result")
-            .await
-            .expect("write output");
-
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_millis() as i64
-            + 60_000;
-        let output_path = dir.path.clone();
-        drop(dir);
-        let report = execute_output_dir_gc(&artifact_root, "ws_gc", now_ms, 0)
-            .await
-            .expect("gc");
-
-        assert_eq!(report.deleted_dirs, 1);
-        assert_eq!(report.plan.candidates.len(), 1);
-        assert!(!fs::try_exists(output_path).await.expect("exists check"));
-    }
-
-    #[tokio::test]
-    async fn gc_keeps_recent_artifact_output_dirs() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let artifact_root = temp.path().join("artifacts");
-        let dir = create_artifact_output_dir(&artifact_root, "ws_gc", "thr_gc", "turn_recent")
-            .await
-            .expect("create output dir");
-        fs::write(dir.path.join("result.txt"), b"result")
-            .await
-            .expect("write output");
-
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_millis() as i64;
-        let report = execute_output_dir_gc(&artifact_root, "ws_gc", now_ms, 24 * 60 * 60)
-            .await
-            .expect("gc");
-
-        assert_eq!(report.deleted_dirs, 0);
-        assert!(fs::try_exists(dir.path).await.expect("exists check"));
-    }
-
-    #[tokio::test]
     async fn gc_never_removes_an_active_artifact_output_dir() {
         let temp = tempfile::tempdir().expect("tempdir");
         let artifact_root = temp.path().join("artifacts");
@@ -450,5 +400,39 @@ mod tests {
         assert_eq!(report.deleted_dirs, 0);
         assert!(report.plan.candidates.is_empty());
         assert!(fs::try_exists(dir.path).await.expect("exists check"));
+    }
+
+    #[tokio::test]
+    async fn inactive_output_directories_are_collected_only_after_their_ttl() {
+        for (turn_id, age_offset_ms, ttl_secs, deleted, candidates, exists) in [
+            ("turn_old", 60_000, 0, 1, 1, false),
+            ("turn_recent", 0, 24 * 60 * 60, 0, 0, true),
+        ] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let artifact_root = temp.path().join("artifacts");
+            let dir = create_artifact_output_dir(&artifact_root, "ws_gc", "thr_gc", turn_id)
+                .await
+                .expect("create output dir");
+            fs::write(dir.path.join("result.txt"), b"result")
+                .await
+                .expect("write output");
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time")
+                .as_millis() as i64
+                + age_offset_ms;
+            let output_path = dir.path.clone();
+            drop(dir);
+            let report = execute_output_dir_gc(&artifact_root, "ws_gc", now_ms, ttl_secs)
+                .await
+                .expect("gc");
+            assert_eq!(report.deleted_dirs, deleted, "{turn_id}");
+            assert_eq!(report.plan.candidates.len(), candidates, "{turn_id}");
+            assert_eq!(
+                fs::try_exists(output_path).await.expect("exists check"),
+                exists,
+                "{turn_id}"
+            );
+        }
     }
 }

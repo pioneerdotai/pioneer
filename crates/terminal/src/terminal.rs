@@ -378,16 +378,6 @@ mod tests {
     use std::sync::mpsc::channel;
 
     #[test]
-    fn test_terminal_creation() {
-        let (tx, _rx) = channel();
-        let event_proxy = GpuiEventProxy::new(tx);
-        let terminal = TerminalState::new(80, 24, event_proxy);
-
-        assert_eq!(terminal.cols(), 80);
-        assert_eq!(terminal.rows(), 24);
-    }
-
-    #[test]
     fn test_process_bytes() {
         let (tx, _rx) = channel();
         let event_proxy = GpuiEventProxy::new(tx);
@@ -424,43 +414,25 @@ mod tests {
     }
 
     #[test]
-    fn test_mode() {
+    fn test_initial_terminal_accessors() {
         let (tx, _rx) = channel();
         let event_proxy = GpuiEventProxy::new(tx);
         let terminal = TerminalState::new(80, 24, event_proxy);
+
+        assert_eq!(terminal.cols(), 80);
+        assert_eq!(terminal.rows(), 24);
 
         let mode = terminal.mode();
         // Mode should be a valid TermMode value (just verify we can get it)
         let _bits = mode.bits();
-    }
-
-    #[test]
-    fn test_with_term() {
-        let (tx, _rx) = channel();
-        let event_proxy = GpuiEventProxy::new(tx);
-        let terminal = TerminalState::new(80, 24, event_proxy);
 
         let cols = terminal.with_term(|term| term.grid().columns());
         assert_eq!(cols, 80);
-    }
-
-    #[test]
-    fn test_with_term_mut() {
-        let (tx, _rx) = channel();
-        let event_proxy = GpuiEventProxy::new(tx);
-        let terminal = TerminalState::new(80, 24, event_proxy);
 
         terminal.with_term_mut(|term| {
             // Just verify we can get mutable access
             let _grid = term.grid_mut();
         });
-    }
-
-    #[test]
-    fn test_term_arc() {
-        let (tx, _rx) = channel();
-        let event_proxy = GpuiEventProxy::new(tx);
-        let terminal = TerminalState::new(80, 24, event_proxy);
 
         let arc1 = terminal.term_arc();
         let arc2 = terminal.term_arc();

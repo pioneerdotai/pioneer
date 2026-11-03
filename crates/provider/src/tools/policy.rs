@@ -125,6 +125,11 @@ fn prepare_request_for_api(
         .try_with(|(owner, public, _)| owner != provider || *public)
         .unwrap_or(true);
     let catalog = catalog.filter(|_| use_public_catalog);
+    // Capability discovery can materialize the same authorized set in a different
+    // order. Canonicalize only the wire ordering; never retain revoked schemas.
+    if let Some(tools) = request.tools.as_mut() {
+        tools.sort_by(|left, right| left.name.cmp(&right.name));
+    }
     let tools = request.tools.as_deref().unwrap_or_default();
     let mut names = BTreeSet::new();
     for tool in tools {
@@ -366,8 +371,17 @@ fn prepare_history_for_api(
             message.tool_call_id = Some(normalized);
             continue;
         }
+        // Responses has an ordered, heterogeneous input item list; results
+        // bind by call_id rather than by a Chat/Messages role boundary. Keep
+        // real user input in its source position while awaiting those results.
+        // A new assistant round still requires every pending result, and all
+        // orphan/duplicate/name checks above remain in force.
+        // https://developers.openai.com/api/reference/resources/responses/methods/create
         ensure!(
-            pending.is_empty(),
+            pending.is_empty()
+                || (responses
+                    && message.role == Role::User
+                    && message.tool_calls.as_ref().is_none_or(Vec::is_empty)),
             "provider `{provider}`: missing results before next message/round"
         );
         for call in message.tool_calls.iter_mut().flatten() {
@@ -475,6 +489,38 @@ pub(crate) fn test_request() -> ChatRequest {
 mod tests {
     use super::*;
     use crate::ProviderToolCall;
+
+    #[test]
+    fn schema_order_is_stable_and_revocation_does_not_retain_a_schema() {
+        let mut request = test_request();
+        let mut second = request.tools.as_ref().unwrap()[0].clone();
+        second.name = "alpha".into();
+        second.description = "Another authorized tool".into();
+        request.tools.as_mut().unwrap().push(second);
+        let mut reversed = request.clone();
+        reversed.tools.as_mut().unwrap().reverse();
+        // Both API policies converge before the adapter serializes native tools.
+        for responses in [false, true] {
+            let first =
+                prepare_request_for_api("openai", request.clone(), None, responses).unwrap();
+            let other =
+                prepare_request_for_api("openai", reversed.clone(), None, responses).unwrap();
+            assert_eq!(
+                serde_json::to_value(&first.tools).unwrap(),
+                serde_json::to_value(&other.tools).unwrap()
+            );
+            assert_eq!(first.tools.as_ref().unwrap()[0].name, "alpha");
+            let mut revoked = request.clone();
+            revoked
+                .tools
+                .as_mut()
+                .unwrap()
+                .retain(|tool| tool.name != "lookup");
+            let current = prepare_request_for_api("openai", revoked, None, responses).unwrap();
+            assert_eq!(current.tools.as_ref().unwrap().len(), 1);
+            assert_eq!(current.tools.as_ref().unwrap()[0].name, "alpha");
+        }
+    }
 
     pub(crate) fn round(ids: &[&str]) -> Vec<ChatMessage> {
         let mut assistant = ChatMessage::assistant("");
@@ -674,6 +720,48 @@ mod tests {
         let hashed = wire_id("mistral", "foreign/id").unwrap();
         collision.extend(round(&[&hashed]));
         assert!(prepare_history("mistral", &mut collision).is_err());
+    }
+
+    #[test]
+    fn responses_keeps_intermediate_user_input_and_still_requires_exact_results() {
+        let mut history = round(&["one", "two"]);
+        history.insert(
+            1,
+            ChatMessage::user("genuine input while tools were running"),
+        );
+        let expected = history.clone();
+        prepare_responses_history("openai", &mut history).unwrap();
+        assert_eq!(
+            serde_json::to_value(&history).unwrap(),
+            serde_json::to_value(&expected).unwrap()
+        );
+        for mut invalid in [
+            history[..2].to_vec(),
+            {
+                let mut copy = history.clone();
+                copy.push(history[2].clone());
+                copy
+            },
+            {
+                let mut copy = history.clone();
+                copy[2].tool_call_id = Some("foreign".into());
+                copy
+            },
+            {
+                let mut copy = history.clone();
+                copy[2].name = Some("wrong".into());
+                copy
+            },
+            {
+                let mut copy = history.clone();
+                copy.insert(2, ChatMessage::assistant("next assistant round"));
+                copy
+            },
+        ] {
+            assert!(prepare_responses_history("openai", &mut invalid).is_err());
+        }
+        // The Responses item contract does not change stricter adapters.
+        assert!(prepare_history("anthropic", &mut expected.clone()).is_err());
     }
 
     #[test]

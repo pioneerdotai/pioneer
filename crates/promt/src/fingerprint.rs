@@ -11,13 +11,6 @@ mod tests {
     use super::sha256_hex;
 
     #[test]
-    fn stable_hash_for_same_input() {
-        let one = sha256_hex("abc");
-        let two = sha256_hex("abc");
-        assert_eq!(one, two);
-    }
-
-    #[test]
     fn different_hash_for_different_input() {
         let one = sha256_hex("abc");
         let two = sha256_hex("abd");

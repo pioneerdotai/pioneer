@@ -180,23 +180,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn quarantine_is_memory_scoped_and_removes_visibility() {
-        let transition = MemoryLifecycleTransition::service(
-            MemoryLifecycleSubjectKind::Memory,
-            MemoryLifecycleTransitionKind::Quarantined,
-            MemoryLifecycleReasonCode::ManualDeveloperAdminQuarantine,
-        )
-        .expect("valid quarantine transition");
-
-        assert!(memory_transition_removes_product_visibility(
-            transition.kind
-        ));
-        assert!(!memory_transition_restores_product_eligibility(
-            transition.kind
-        ));
-    }
-
-    #[test]
     fn restore_requires_explicit_restore_reason() {
         let error = MemoryLifecycleTransition::service(
             MemoryLifecycleSubjectKind::Memory,
@@ -214,34 +197,38 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_candidate_rejection_is_candidate_scoped() {
-        let transition = MemoryLifecycleTransition::service(
-            MemoryLifecycleSubjectKind::Candidate,
-            MemoryLifecycleTransitionKind::Rejected,
-            MemoryLifecycleReasonCode::CandidateRejected,
-        )
-        .expect("valid candidate rejection");
-
-        assert!(candidate_transition_is_candidate_scoped(transition.kind));
-        assert!(!memory_transition_removes_product_visibility(
-            transition.kind
-        ));
-    }
-
-    #[test]
-    fn repair_transitions_do_not_restore_memory_visibility() {
-        let transition = MemoryLifecycleTransition::service(
-            MemoryLifecycleSubjectKind::RepairJob,
-            MemoryLifecycleTransitionKind::RepairCompleted,
-            MemoryLifecycleReasonCode::RepairReconciliation,
-        )
-        .expect("valid repair transition");
-
-        assert!(!memory_transition_removes_product_visibility(
-            transition.kind
-        ));
-        assert!(!memory_transition_restores_product_eligibility(
-            transition.kind
-        ));
+    fn service_transition_projection_predicates_preserve_subject_kinds() {
+        for (subject, kind, reason, expected) in [
+            (
+                MemoryLifecycleSubjectKind::Memory,
+                MemoryLifecycleTransitionKind::Quarantined,
+                MemoryLifecycleReasonCode::ManualDeveloperAdminQuarantine,
+                (true, false, false),
+            ),
+            (
+                MemoryLifecycleSubjectKind::Candidate,
+                MemoryLifecycleTransitionKind::Rejected,
+                MemoryLifecycleReasonCode::CandidateRejected,
+                (false, false, true),
+            ),
+            (
+                MemoryLifecycleSubjectKind::RepairJob,
+                MemoryLifecycleTransitionKind::RepairCompleted,
+                MemoryLifecycleReasonCode::RepairReconciliation,
+                (false, false, false),
+            ),
+        ] {
+            let transition = MemoryLifecycleTransition::service(subject, kind, reason)
+                .expect("valid service transition");
+            assert_eq!(
+                (
+                    memory_transition_removes_product_visibility(transition.kind),
+                    memory_transition_restores_product_eligibility(transition.kind),
+                    candidate_transition_is_candidate_scoped(transition.kind),
+                ),
+                expected,
+                "{subject:?}: {kind:?}"
+            );
+        }
     }
 }

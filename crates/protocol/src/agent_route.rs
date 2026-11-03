@@ -421,24 +421,6 @@ mod tests {
     }
 
     #[test]
-    fn route_is_bounded_and_action_scoped() {
-        let route = route();
-        route.validate(None).unwrap();
-        assert!(route.permits(AgentRouteAction::SendMessage, None));
-        assert!(!route.permits(AgentRouteAction::StartAgent, None));
-    }
-
-    #[test]
-    fn revoked_or_expired_route_cannot_be_used() {
-        let mut route = route();
-        route.status = AgentRouteStatus::Revoked;
-        assert!(!route.permits(AgentRouteAction::SendMessage, None));
-        route.status = AgentRouteStatus::Active;
-        route.expires_at = Some(10);
-        assert!(!route.permits(AgentRouteAction::SendMessage, Some(10)));
-    }
-
-    #[test]
     fn ordinary_text_authority_does_not_imply_result_return_authority() {
         let mut route = route();
         route.allowed_actions = vec![AgentRouteAction::DeliverResult];
@@ -482,13 +464,6 @@ mod tests {
     }
 
     #[test]
-    fn prepared_route_cannot_authorize_a_write() {
-        let mut route = route();
-        route.status = AgentRouteStatus::Prepared;
-        assert!(!route.permits(AgentRouteAction::SendMessage, None));
-    }
-
-    #[test]
     fn route_rejects_cross_workspace_and_gateway() {
         let mut route = route();
         route.destination_workspace_id = "W12345678901234567891".to_owned();
@@ -529,5 +504,27 @@ mod tests {
             route.validate(Some(10)),
             Err(AgentRouteValidationError::InvalidExpiry)
         );
+    }
+
+    #[test]
+    fn route_permits_only_live_unexpired_allowed_actions() {
+        use AgentRouteAction::{SendMessage, StartAgent};
+        use AgentRouteStatus::{Active, Prepared, Revoked};
+        let base = route();
+        base.validate(None).unwrap();
+        for (status, expires_at, action, now, expected) in [
+            (Active, None, SendMessage, None, true),
+            (Active, None, StartAgent, None, false),
+            (Revoked, None, SendMessage, None, false),
+            (Active, Some(10), SendMessage, Some(10), false),
+            (Prepared, None, SendMessage, None, false),
+        ] {
+            let route = AgentDelegationRouteProjection {
+                status,
+                expires_at,
+                ..base.clone()
+            };
+            assert_eq!(route.permits(action, now), expected);
+        }
     }
 }

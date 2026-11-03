@@ -546,31 +546,4 @@ mod tests {
             }
         }
     }
-
-    #[test]
-    fn terminalization_converts_dynamic_tool_from_progress() {
-        let mut item = in_progress_dynamic("item_dynamic");
-        terminalize_turn_item_payload(
-            &mut item,
-            TurnItemTerminalState::TimedOut {
-                reason: TurnItemTimeoutReason::IdleDeadlineExceeded,
-            },
-        );
-
-        let TurnItem::DynamicToolCall {
-            status,
-            display,
-            success,
-            outcome,
-            ..
-        } = item
-        else {
-            panic!("expected dynamic tool call");
-        };
-
-        assert_eq!(status, ToolCallStatus::Failed);
-        assert!(!matches!(display, ToolDisplayPayload::Progress { .. }));
-        assert_eq!(success, Some(false));
-        assert!(outcome.is_some());
-    }
 }

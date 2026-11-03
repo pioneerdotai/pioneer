@@ -343,15 +343,22 @@ async fn cancelled_discovery_or_late_read_releases_maintenance_capacity_for_retr
     .await;
     assert!(store.connection.reader_query_only_enabled().await.unwrap());
     ready(&store).await;
-    for late in [false, true] {
+    for stage in ["page", "pending_preflight", "late"] {
         let mut progress = FrozenStorageLifetimeProgress::default();
         progress.discard_after = "cp-0".into();
         assert!(discard_preflight(&store, "cp-1").await.unwrap());
+        if stage == "pending_preflight" {
+            // Populate the physical page by refusing cp-0, then cancel the
+            // next key's preflight while retaining the same progress owner.
+            progress.discard_after.clear();
+            assert!(progress.discard_quantum(&store).await.unwrap());
+            assert_eq!(progress.discard_after, "cp-0");
+        }
         let reader = store.connection.begin_read().await.unwrap();
         routes.reads.lock().unwrap().clear();
         routes.writes.lock().unwrap().clear();
         let mut pending = Box::pin(async {
-            if late {
+            if stage == "late" {
                 prepare_discard_candidate(&store, "cp-1").await.map(|_| ())
             } else {
                 progress.discard_quantum(&store).await.map(|_| ())
@@ -439,4 +446,270 @@ async fn cancelled_discovery_or_late_read_releases_maintenance_capacity_for_retr
             ..
         }
     )));
+}
+
+async fn private_key(store: &CrudStore, id: &str, portion: i64, status: &str) {
+    // A small metadata-only checkpoint. No new graph/payload fixture is needed.
+    store.connection.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+        "INSERT INTO compaction_checkpoint(id,operation_id,owner,portion,summary,identity_sha256,selection,projection_version,format_version,status) SELECT ?1,operation_id,owner,?2,summary,identity_sha256,selection,projection_version,format_version,?3 FROM compaction_checkpoint WHERE id='cp-0'",
+        [id.into(),portion.into(),status.into()])).await.unwrap();
+}
+
+#[tokio::test]
+async fn sparse_physical_pages_yield_without_false_eof_and_keep_tail_after_cleanup() {
+    let (store, _) = fixture(false).await;
+    ready(&store).await;
+    later_candidate(&store).await;
+    let count = META_ROWS * 2 + 1;
+    for n in 0..count {
+        private_key(&store, &format!("a-{n:04}"), (n + 2) as i64, "applied").await;
+    }
+    // Column removal is a behavioral negative control: even a length/JSON
+    // access would fail. All physical discovery and negative preflights must
+    // continue through multiple completely ineligible pages without it.
+    store
+        .connection
+        .execute_unprepared(
+            "ALTER TABLE compaction_runner_state RENAME COLUMN state TO unavailable_state",
+        )
+        .await
+        .unwrap();
+    let mut progress = FrozenStorageLifetimeProgress::default();
+    for n in 0..count {
+        if n == META_ROWS {
+            let confirmed = progress.discard_after.clone();
+            store
+                .connection
+                .execute_unprepared(
+                    "ALTER TABLE compaction_checkpoint_import RENAME TO unavailable_import",
+                )
+                .await
+                .unwrap();
+            assert!(progress.discard_quantum(&store).await.is_err());
+            assert_eq!(
+                progress.discard_after, confirmed,
+                "page boundary error acknowledges no key"
+            );
+            assert!(progress.discard.is_none());
+            store
+                .connection
+                .execute_unprepared(
+                    "ALTER TABLE unavailable_import RENAME TO compaction_checkpoint_import",
+                )
+                .await
+                .unwrap();
+        }
+        assert!(progress.discard_quantum(&store).await.unwrap());
+        assert_eq!(progress.discard_after, format!("a-{n:04}"));
+        assert!(progress.discard.is_none());
+        assert!(progress.discard_pending.len() < META_ROWS as usize);
+        assert!(
+            progress
+                .discard_pending
+                .iter()
+                .flatten()
+                .map(String::len)
+                .sum::<usize>()
+                <= META_ROWS as usize * SCOPE_PAGE_KEY_BYTES as usize
+        );
+    }
+    // cp-0 is refused for its incoming edge. The next quantum would need the
+    // runner; restore it and prove both eligible keys survive the page tail.
+    assert!(progress.discard_quantum(&store).await.unwrap());
+    assert_eq!(progress.discard_after, "cp-0");
+    store
+        .connection
+        .execute_unprepared(
+            "ALTER TABLE compaction_runner_state RENAME COLUMN unavailable_state TO state",
+        )
+        .await
+        .unwrap();
+    for id in ["cp-1", "cp-2"] {
+        assert!(progress.discard_quantum(&store).await.unwrap());
+        assert_eq!(progress.discard.as_ref().unwrap().id, id);
+        for _ in 0..64 {
+            if progress.discard.is_none() {
+                break;
+            }
+            assert!(progress.discard_quantum(&store).await.unwrap());
+        }
+        assert!(progress.discard.is_none());
+        assert_eq!(
+            value(&store, "compaction_checkpoint_event_input", id).await,
+            0
+        );
+    }
+    assert!(!progress.discard_quantum(&store).await.unwrap());
+    assert!(progress.discard_after.is_empty() && progress.discard_pending.is_empty());
+}
+
+#[tokio::test]
+async fn physical_eof_and_periodic_revisit_find_new_eligibility_behind_cursor() {
+    let (store, _) = fixture(false).await;
+    ready(&store).await;
+    later_candidate(&store).await;
+    store
+        .connection
+        .execute_unprepared("UPDATE compaction_operation SET status='running' WHERE id='op'")
+        .await
+        .unwrap();
+    let mut progress = FrozenStorageLifetimeProgress::default();
+    // Keep another discovery family unfinished so the real periodic cleanup
+    // revisit path, rather than a test-only cursor reset, reopens discard.
+    progress.scope.done = true;
+    progress.pass_done = [true, false, true, true, false, true];
+    for id in ["cp-0", "cp-1", "cp-2"] {
+        assert!(progress.discard_quantum(&store).await.unwrap());
+        assert_eq!(progress.discard_after, id);
+    }
+    for _ in 0..64 {
+        if progress.discard.is_none() {
+            break;
+        }
+        progress.discard_quantum(&store).await.unwrap();
+    }
+    assert!(progress.discard.is_none());
+    assert_eq!(
+        value(&store, "compaction_checkpoint_event_input", "cp-1").await,
+        1
+    );
+    // Eligibility changes while its physical visit is already behind us.
+    store
+        .connection
+        .execute_unprepared("UPDATE compaction_operation SET status='failed' WHERE id='op'")
+        .await
+        .unwrap();
+    progress.phase = 4;
+    assert!(progress.quantum(&store).await.unwrap());
+    assert!(progress.pass_done[4] && progress.discard_after.is_empty());
+    let now = Instant::now();
+    let interval = Duration::from_secs(60);
+    progress.revisit_completed_cleanup(now, interval);
+    progress.revisit_completed_cleanup(now + interval, interval);
+    assert!(!progress.pass_done[4]);
+    for _ in 0..64 {
+        progress.phase = 4;
+        assert!(progress.quantum(&store).await.unwrap());
+        if value(&store, "compaction_checkpoint_event_input", "cp-1").await == 0 {
+            break;
+        }
+    }
+    assert_eq!(
+        value(&store, "compaction_checkpoint_event_input", "cp-1").await,
+        0
+    );
+    assert_eq!(progress.discard_after, "cp-1");
+}
+
+#[tokio::test]
+async fn oversized_page_sentinel_reseeks_after_error_without_skipping_tail() {
+    let (store, _) = fixture(false).await;
+    ready(&store).await;
+    let huge = format!("a-{}", "雪".repeat(SCOPE_PAGE_KEY_BYTES as usize / 3 + 1));
+    assert!(huge.len() > SCOPE_PAGE_KEY_BYTES as usize);
+    private_key(&store, &huge, 2, "applied").await;
+    private_key(&store, "b-tail", 3, "applied").await;
+    let mut progress = FrozenStorageLifetimeProgress::default();
+    // A fault after physical selection cannot acknowledge even an ineligible
+    // oversized key; the next seek must observe repair/deletion of that row.
+    store
+        .connection
+        .execute_unprepared("ALTER TABLE compaction_checkpoint_import RENAME TO unavailable_import")
+        .await
+        .unwrap();
+    assert!(progress.discard_quantum(&store).await.is_err());
+    assert!(progress.discard_after.is_empty());
+    assert!(
+        progress.discard_pending.is_empty(),
+        "oversized tail is never retained"
+    );
+    store
+        .connection
+        .execute_unprepared("ALTER TABLE unavailable_import RENAME TO compaction_checkpoint_import")
+        .await
+        .unwrap();
+    checkpoint::Entity::delete_by_id(huge)
+        .exec(&store.connection)
+        .await
+        .unwrap();
+    assert!(progress.discard_quantum(&store).await.unwrap());
+    assert_eq!(progress.discard_after, "b-tail");
+    assert!(progress.discard_quantum(&store).await.unwrap());
+    assert_eq!(progress.discard_after, "cp-0");
+    assert!(progress.discard_quantum(&store).await.unwrap());
+    assert_eq!(progress.discard.as_ref().unwrap().id, "cp-1");
+}
+
+#[tokio::test]
+async fn unsealed_writer_fences_owner_scope_and_status_after_discovery() {
+    for change in [
+        "owner",
+        "operation_owner",
+        "workspace",
+        "thread",
+        "checkpoint_status",
+        "applied",
+    ] {
+        let (store, _) = fixture(false).await;
+        ready(&store).await;
+        later_candidate(&store).await;
+        // cp-2 has real staging but is unsealed, so schema immutability does
+        // not mask the writer fence exercised here.
+        let mut prepared = prepare_discard_candidate(&store, "cp-2")
+            .await
+            .unwrap()
+            .unwrap();
+        while !prepared.reverse.done() {
+            prepared.reverse.step(&store).await.unwrap();
+        }
+        assert!(!prepared.reverse.reachable);
+        let sql = match change {
+            "owner" => "UPDATE compaction_checkpoint SET owner='changed-owner' WHERE id='cp-2'",
+            "operation_owner" => {
+                "UPDATE compaction_operation SET owner='changed-owner' WHERE id='later-op'"
+            }
+            // Use a separate unsealed context, because cp-1 seals 'owner'.
+            "workspace" | "thread" => {
+                store.connection.execute_unprepared("INSERT INTO compaction_context(owner,workspace_id,thread_id,format_version) VALUES('unsealed','ws','thread',1)").await.unwrap();
+                store
+                    .connection
+                    .execute_unprepared(
+                        "UPDATE compaction_operation SET owner='unsealed' WHERE id='later-op'",
+                    )
+                    .await
+                    .unwrap();
+                store
+                    .connection
+                    .execute_unprepared(
+                        "UPDATE compaction_checkpoint SET owner='unsealed' WHERE id='cp-2'",
+                    )
+                    .await
+                    .unwrap();
+                prepared = prepare_discard_candidate(&store, "cp-2")
+                    .await
+                    .unwrap()
+                    .unwrap();
+                while !prepared.reverse.done() {
+                    prepared.reverse.step(&store).await.unwrap();
+                }
+                if change == "workspace" {
+                    "UPDATE compaction_context SET workspace_id='other' WHERE owner='unsealed'"
+                } else {
+                    "UPDATE compaction_context SET thread_id='other' WHERE owner='unsealed'"
+                }
+            }
+            "checkpoint_status" => {
+                "UPDATE compaction_checkpoint SET status='retained' WHERE id='cp-2'"
+            }
+            "applied" => "UPDATE compaction_checkpoint SET status='applied' WHERE id='cp-2'",
+            _ => unreachable!(),
+        };
+        store.connection.execute_unprepared(sql).await.unwrap();
+        prepared.cleanup(&store).await.unwrap();
+        assert_eq!(
+            value(&store, "compaction_checkpoint_event_input", "cp-2").await,
+            1,
+            "{change}"
+        );
+    }
 }

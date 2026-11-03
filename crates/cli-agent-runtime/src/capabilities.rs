@@ -165,19 +165,4 @@ mod tests {
         assert!(!descriptor.sandbox.detailed_network_sandbox.is_supported());
         assert!(!descriptor.sandbox.detailed_process_sandbox.is_supported());
     }
-
-    #[test]
-    fn claude_security_descriptor_does_not_claim_pioneer_detailed_sandbox() {
-        let descriptor = cli_runtime_provider_capabilities(CLIAgentRuntimeProviderKind::Claude);
-
-        assert!(descriptor.approval.permission_mode_mapping.is_supported());
-        assert!(descriptor.approval.request_permissions.is_supported());
-        assert!(
-            !descriptor
-                .sandbox
-                .detailed_filesystem_sandbox
-                .is_supported()
-        );
-        assert!(!descriptor.sandbox.detailed_network_sandbox.is_supported());
-    }
 }

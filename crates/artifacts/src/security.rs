@@ -330,62 +330,6 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn safe_path_symlink_inside_root_to_inside_root_is_rejected() {
-        use std::os::unix::fs::symlink;
-
-        let temp = tempfile::tempdir().expect("tempdir");
-        let root = temp.path().join("allowed");
-        tokio::fs::create_dir_all(root.as_path())
-            .await
-            .expect("create root");
-        let target = root.join("target.txt");
-        tokio::fs::write(target.as_path(), b"target")
-            .await
-            .expect("write target");
-        let link = root.join("link.txt");
-        symlink(target.as_path(), link.as_path()).expect("create symlink");
-
-        let error =
-            read_validated_local_file(link.as_path(), &ArtifactLocalPathPolicy::new(vec![root]))
-                .await
-                .expect_err("symlink should be rejected");
-
-        assert_eq!(
-            rejection_kind(error),
-            ArtifactLocalPathRejectionKind::SymlinkNotAllowed
-        );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn safe_path_symlink_inside_root_to_outside_root_is_rejected() {
-        use std::os::unix::fs::symlink;
-
-        let temp = tempfile::tempdir().expect("tempdir");
-        let root = temp.path().join("allowed");
-        tokio::fs::create_dir_all(root.as_path())
-            .await
-            .expect("create root");
-        let outside = temp.path().join("outside.txt");
-        tokio::fs::write(outside.as_path(), b"outside")
-            .await
-            .expect("write outside");
-        let link = root.join("outside-link.txt");
-        symlink(outside.as_path(), link.as_path()).expect("create symlink");
-
-        let error =
-            read_validated_local_file(link.as_path(), &ArtifactLocalPathPolicy::new(vec![root]))
-                .await
-                .expect_err("symlink should be rejected");
-
-        assert_eq!(
-            rejection_kind(error),
-            ArtifactLocalPathRejectionKind::SymlinkNotAllowed
-        );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
     async fn safe_path_rejects_parent_symlink_even_when_it_points_inside_root() {
         use std::os::unix::fs::symlink;
 
@@ -415,27 +359,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn safe_path_directory_is_rejected() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let root = temp.path().join("allowed");
-        tokio::fs::create_dir_all(root.as_path())
-            .await
-            .expect("create root");
-
-        let error = read_validated_local_file(
-            root.as_path(),
-            &ArtifactLocalPathPolicy::new(vec![root.clone()]),
-        )
-        .await
-        .expect_err("directory should be rejected");
-
-        assert_eq!(
-            rejection_kind(error),
-            ArtifactLocalPathRejectionKind::NotRegularFile
-        );
-    }
-
-    #[tokio::test]
     async fn safe_path_outside_allowed_root_is_rejected() {
         let temp = tempfile::tempdir().expect("tempdir");
         let root = temp.path().join("allowed");
@@ -455,28 +378,6 @@ mod tests {
         assert_eq!(
             rejection_kind(error),
             ArtifactLocalPathRejectionKind::OutsideAllowedRoots
-        );
-    }
-
-    #[tokio::test]
-    async fn safe_path_traversal_input_is_rejected() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let root = temp.path().join("allowed");
-        tokio::fs::create_dir_all(root.as_path())
-            .await
-            .expect("create root");
-        let traversal = root.join("nested").join("..").join("file.txt");
-
-        let error = read_validated_local_file(
-            traversal.as_path(),
-            &ArtifactLocalPathPolicy::new(vec![root]),
-        )
-        .await
-        .expect_err("traversal path should be rejected");
-
-        assert_eq!(
-            rejection_kind(error),
-            ArtifactLocalPathRejectionKind::InvalidPath
         );
     }
 
@@ -504,30 +405,99 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn safe_path_missing_file_returns_stable_not_found_error() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let root = temp.path().join("allowed");
-        tokio::fs::create_dir_all(root.as_path())
-            .await
-            .expect("create root");
-        let missing = root.join("missing.txt");
-
-        let error =
-            read_validated_local_file(missing.as_path(), &ArtifactLocalPathPolicy::new(vec![root]))
-                .await
-                .expect_err("missing path should be rejected");
-
-        assert_eq!(
-            rejection_kind(error),
-            ArtifactLocalPathRejectionKind::FileNotFound
-        );
-    }
-
     fn rejection_kind(error: ArtifactError) -> ArtifactLocalPathRejectionKind {
         match error {
             ArtifactError::LocalPathRejected { kind, .. } => kind,
             other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn safe_path_leaf_symlinks_are_rejected_before_target_authorization() {
+        use std::os::unix::fs::symlink;
+
+        for (target_relative, payload, link_name, write_message, expected) in [
+            (
+                "allowed/target.txt",
+                b"target".as_slice(),
+                "link.txt",
+                "write target",
+                ArtifactLocalPathRejectionKind::SymlinkNotAllowed,
+            ),
+            (
+                "outside.txt",
+                b"outside".as_slice(),
+                "outside-link.txt",
+                "write outside",
+                ArtifactLocalPathRejectionKind::SymlinkNotAllowed,
+            ),
+        ] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let root = temp.path().join("allowed");
+            tokio::fs::create_dir_all(root.as_path())
+                .await
+                .expect("create root");
+            let target = temp.path().join(target_relative);
+            tokio::fs::write(target.as_path(), payload)
+                .await
+                .expect(write_message);
+            let link = root.join(link_name);
+            symlink(target.as_path(), link.as_path()).expect("create symlink");
+
+            let policy = ArtifactLocalPathPolicy::new(vec![root]);
+            let error = read_validated_local_file(link.as_path(), &policy)
+                .await
+                .expect_err("symlink should be rejected");
+
+            assert_eq!(rejection_kind(error), expected, "{target_relative}");
+        }
+    }
+
+    #[test]
+    fn empty_allowed_root_preserves_directory_traversal_and_missing_error_kinds() {
+        for (components, expected, diagnostic) in [
+            (
+                &[][..],
+                ArtifactLocalPathRejectionKind::NotRegularFile,
+                "directory should be rejected",
+            ),
+            (
+                &["nested", "..", "file.txt"][..],
+                ArtifactLocalPathRejectionKind::InvalidPath,
+                "traversal path should be rejected",
+            ),
+            (
+                &["missing.txt"][..],
+                ArtifactLocalPathRejectionKind::FileNotFound,
+                "missing path should be rejected",
+            ),
+        ] {
+            let body = async {
+                let temp = tempfile::tempdir().expect("tempdir");
+                let root = temp.path().join("allowed");
+                tokio::fs::create_dir_all(root.as_path())
+                    .await
+                    .expect("create root");
+                let mut requested = root.clone();
+                for component in components {
+                    requested.push(component);
+                }
+                let error = read_validated_local_file(
+                    requested.as_path(),
+                    &ArtifactLocalPathPolicy::new(vec![root]),
+                )
+                .await
+                .expect_err(diagnostic);
+                assert_eq!(rejection_kind(error), expected, "{components:?}");
+            };
+            let body = std::pin::pin!(body);
+            let body: std::pin::Pin<&mut dyn std::future::Future<Output = ()>> = body;
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime")
+                .block_on(body);
         }
     }
 }

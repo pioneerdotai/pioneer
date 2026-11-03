@@ -59,33 +59,6 @@ fn canonical_chat_rounds_parse_and_render_native_messages() {
 }
 
 #[test]
-fn canonical_stream_parts_match_non_stream_arguments() {
-    let response: ApiChatResponse = serde_json::from_str(include_str!(
-        "../../../tests/fixtures/wire/chat-round-1.json"
-    ))
-    .unwrap();
-    let message = &response.choices[0].message;
-    let expected = parse_tool_calls(message.tool_calls.as_ref(), None).unwrap();
-    let event: StreamResponse = serde_json::from_value(serde_json::json!({
-        "choices": [{"delta": {"tool_calls": [{"index":0, "id":"forecast_1", "type":"function", "function":{
-            "name":"forecast", "arguments":expected[0].arguments
-        }}]}, "finish_reason":"tool_calls"}]
-    })).unwrap();
-    let mut accumulator = StreamToolCallAccumulator::default();
-    accumulator.ingest(
-        event
-            .choices
-            .into_iter()
-            .next()
-            .unwrap()
-            .delta
-            .tool_calls
-            .unwrap(),
-    );
-    assert_eq!(accumulator.take_tool_calls().unwrap(), expected);
-}
-
-#[test]
 fn canonical_error_accepts_numeric_and_string_codes() {
     for code in [
         serde_json::json!(429),

@@ -5170,28 +5170,35 @@ done
                 },
                 &event,
             );
+            if item.native_item_id == "call-b" {
+                assert!(
+                    projected.durable.is_empty(),
+                    "an error response must not acknowledge the task outcome"
+                );
+                continue;
+            }
+            assert_eq!(projected.durable.len(), 1);
             let AgentDurableEvent::ItemCompleted { notification } = &projected.durable[0] else {
-                panic!("durable completion");
+                panic!("durable observation receipt");
             };
-            let TurnItem::DynamicToolCall {
-                storage: pioneer_protocol::ToolStoragePayload::Metadata { metadata },
+            let TurnItem::SystemEvent {
+                code,
+                details: Some(details),
                 ..
             } = &notification.item
             else {
-                panic!("stored metadata");
+                panic!("task observation receipt");
             };
-            let metadata = metadata.to_json();
-            let ids = pioneer_agent::observed_terminal_task_outcomes_from_payload(
-                "task_accept",
-                &metadata["taskResult"],
-            );
+            assert_eq!(code.as_deref(), Some("task.terminal.observed"));
+            assert_eq!(item.native_item_id, "call-a");
             assert_eq!(
-                ids.contains(&pioneer_agent::ObservedTaskOutcome::AcceptedCandidate {
-                    task_id: "accepted_task".into(),
-                    run_id: "run".into(),
-                    candidate_id: "candidate".into()
-                }),
-                item.native_item_id == "call-a"
+                details["outcomes"],
+                json!([{
+                    "kind": "acceptedCandidate",
+                    "taskId": "accepted_task",
+                    "runId": "run",
+                    "candidateId": "candidate"
+                }])
             );
         }
         child.kill().await.unwrap();
@@ -5275,22 +5282,22 @@ done
         assert_eq!(id, "call-a");
         assert_eq!(tool_name, "mcp_server_tool_a");
         assert_eq!(*status, ToolCallStatus::InProgress);
-        let AgentDurableEvent::ItemCompleted { notification } = &projected_terminal.durable[0]
-        else {
-            panic!("expected projected MCP terminal");
+        assert!(
+            projected_terminal.durable.is_empty(),
+            "native delivery must not create another canonical MCP outcome"
+        );
+        let RuntimeEvent::ItemCompleted(success_terminal) = &completed[0] else {
+            panic!("expected received MCP terminal");
         };
-        let TurnItem::DynamicToolCall {
-            id,
-            status,
-            success,
-            ..
-        } = &notification.item
-        else {
-            panic!("expected terminal canonical dynamic tool item");
-        };
-        assert_eq!(id, "call-a");
-        assert_eq!(*status, ToolCallStatus::Completed);
-        assert_eq!(*success, Some(true));
+        assert_eq!(success_terminal.native_item_id, "call-a");
+        assert_eq!(
+            success_terminal.metadata.as_ref().unwrap()["status"],
+            json!("completed")
+        );
+        assert_eq!(
+            success_terminal.metadata.as_ref().unwrap()["success"],
+            json!(true)
+        );
 
         let error_terminal = completed
             .iter()
@@ -5302,6 +5309,15 @@ done
         assert_eq!(
             error_terminal.metadata.as_ref().unwrap()["status"],
             json!("failed")
+        );
+        assert!(
+            project_cli_runtime_event(
+                &projector_context,
+                &RuntimeEvent::ItemCompleted(error_terminal.clone()),
+            )
+            .durable
+            .is_empty(),
+            "native error delivery must not replace the confirmed MCP outcome"
         );
 
         assert!(
@@ -6158,6 +6174,75 @@ done
     }
 
     #[test]
+    fn claude_literal_data_image_url_participates_in_model_input_admission() {
+        use crate::cli_runtime::context::{
+            CLIRuntimeContextBuildInput, compile_cli_runtime_delivery_plan,
+            validate_cli_runtime_turn_input_frame,
+        };
+        use pioneer_cli_agent_runtime::input::{
+            CLIRuntimeTurnInputItem, CLIRuntimeTurnInputMapping,
+        };
+        use pioneer_protocol::CLIAgentRuntimeKind;
+        let root = tempfile::tempdir().unwrap();
+        let plan = compile_cli_runtime_delivery_plan(
+            root.path(),
+            CLIRuntimeContextBuildInput {
+                workspace_id: "workspace",
+                thread_id: "thread",
+                initiating_thread_id: "thread",
+                turn_id: "turn",
+                runtime_id: "claude",
+                runtime_label: "Claude CLI",
+                runtime_kind: CLIAgentRuntimeKind::Claude,
+                model: Some("fixture"),
+                cwd: Some(root.path().to_str().unwrap()),
+                permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
+                history: None,
+                selected_skill_names: &[],
+                selected_capabilities: None,
+            },
+        )
+        .unwrap();
+        let mapping = |length| CLIRuntimeTurnInputMapping {
+            input: vec![CLIRuntimeTurnInputItem::Image {
+                url: format!("data:image/png;base64,{}", "A".repeat(length)),
+            }],
+            diagnostics: vec![],
+        };
+        let large = mapping(8192);
+        let delivered =
+            claude_prompt_from_input(serde_json::to_value(&large.input).unwrap()).unwrap();
+        let text = delivered[0]["text"].as_str().unwrap();
+        assert_eq!(delivered[0]["type"], "text");
+        if let CLIRuntimeTurnInputItem::Image { url } = &large.input[0] {
+            assert!(text.contains(url));
+        } else {
+            panic!("fixture image missing");
+        }
+        let cap = pioneer_compaction::text_tokens(&plan.provider_instructions.text) + 512;
+        assert!(pioneer_compaction::text_tokens(text) > 512);
+        validate_cli_runtime_turn_input_frame(
+            &mapping(16),
+            &plan,
+            Some(cap),
+            CLIAgentRuntimeKind::Claude,
+        )
+        .unwrap();
+        // Actual payload fits the independent hard byte limit; its literal
+        // model text still exceeds the selected input budget.
+        validate_cli_runtime_turn_input_frame(&large, &plan, None, CLIAgentRuntimeKind::Claude)
+            .unwrap();
+        let error = validate_cli_runtime_turn_input_frame(
+            &large,
+            &plan,
+            Some(cap),
+            CLIAgentRuntimeKind::Claude,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("approximately"));
+    }
+
+    #[test]
     fn claude_provider_frame_limit_counts_materialized_base64_image() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let image_path = temp_dir.path().join("oversized.png");
@@ -6190,23 +6275,6 @@ done
                     "type": "text",
                     "text": "Attached file available at local path:\n/tmp/report.pdf\nUse this path if the task requires inspecting the file.",
                 },
-            ])
-        );
-    }
-
-    #[test]
-    fn claude_prompt_from_input_keeps_native_skill_directive_as_text() {
-        let directive = "Before completing the user's task, invoke every selected skill through Claude's native Skill tool in this order: pdf, slides.";
-        let content = claude_prompt_from_input(json!([
-            { "type": "text", "text": directive },
-            { "type": "text", "text": "Create the report" }
-        ]))
-        .unwrap();
-        assert_eq!(
-            content,
-            json!([
-                { "type": "text", "text": directive },
-                { "type": "text", "text": "Create the report" }
             ])
         );
     }
@@ -6291,7 +6359,30 @@ done
             .await
             .unwrap();
 
-        let lines = wait_logged_json_lines(log_path.as_path(), 2).await;
+        let ordered_directive = "Before completing the user's task, invoke every selected skill through Claude's native Skill tool in this order: pdf, slides.";
+        client
+            .start_turn(
+                "claude-thread".to_owned(),
+                "claude-ordered-skill-turn".to_owned(),
+                None,
+                None,
+                json!([
+                    { "type": "text", "text": ordered_directive },
+                    { "type": "text", "text": "Create the report" }
+                ]),
+                Duration::from_secs(2),
+            )
+            .await
+            .unwrap();
+
+        let lines = wait_logged_json_lines(log_path.as_path(), 3).await;
+        assert_eq!(
+            lines[2]["message"]["content"],
+            json!([
+                { "type": "text", "text": ordered_directive },
+                { "type": "text", "text": "Create the report" }
+            ])
+        );
         let skill_line = serde_json::to_string(&lines[0]).unwrap();
         let zero_line = serde_json::to_string(&lines[1]).unwrap();
         assert!(skill_line.contains("proposal-51-sentinel"));
@@ -6308,67 +6399,46 @@ done
 
     #[tokio::test]
     async fn claude_start_turn_sends_effort_control_request() {
-        let temp_dir = tempfile::tempdir().expect("tempdir");
-        let log_path = temp_dir.path().join("claude-jsonl.log");
-        let (client, mut child) = fake_claude_stream_client(log_path.as_path()).await;
-
-        client
-            .start_turn(
-                "claude-thread".to_owned(),
-                "claude-turn".to_owned(),
-                Some("sonnet".to_owned()),
-                Some("medium".to_owned()),
-                json!([{ "type": "text", "text": "Run tests" }]),
-                Duration::from_secs(2),
-            )
-            .await
-            .expect("start turn should send effort and prompt");
-
-        let lines = wait_logged_json_lines(log_path.as_path(), 3).await;
-        assert_eq!(lines[0]["type"], "control_request");
-        assert_eq!(lines[0]["request"]["subtype"], "set_model");
-        assert_eq!(lines[0]["request"]["model"], "sonnet");
-        assert_eq!(lines[1]["type"], "control_request");
-        assert_eq!(lines[1]["request"]["subtype"], "apply_flag_settings");
-        assert_eq!(
-            lines[1]["request"]["settings"]["effortLevel"],
-            json!("medium")
-        );
-        assert_eq!(lines[2]["type"], "user");
-        assert!(!serde_json::to_string(&lines[2]).unwrap().contains("medium"));
-
-        let _ = child.kill().await;
-    }
-
-    #[tokio::test]
-    async fn claude_start_turn_omits_effort_control_request_when_not_selected() {
-        let temp_dir = tempfile::tempdir().expect("tempdir");
-        let log_path = temp_dir.path().join("claude-jsonl.log");
-        let (client, mut child) = fake_claude_stream_client(log_path.as_path()).await;
-
-        client
-            .start_turn(
-                "claude-thread".to_owned(),
-                "claude-turn".to_owned(),
-                Some("sonnet".to_owned()),
-                None,
-                json!([{ "type": "text", "text": "Run tests" }]),
-                Duration::from_secs(2),
-            )
-            .await
-            .expect("start turn should send prompt");
-
-        let lines = wait_logged_json_lines(log_path.as_path(), 2).await;
-        assert_eq!(lines[0]["type"], "control_request");
-        assert_eq!(lines[0]["request"]["subtype"], "set_model");
-        assert_eq!(lines[1]["type"], "user");
-        assert!(
-            lines
-                .iter()
-                .all(|line| line["request"]["subtype"] != "apply_flag_settings")
-        );
-
-        let _ = child.kill().await;
+        for effort in [Some("medium"), None] {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let log_path = temp_dir.path().join("claude-jsonl.log");
+            let (client, mut child) = fake_claude_stream_client(log_path.as_path()).await;
+            client
+                .start_turn(
+                    "claude-thread".to_owned(),
+                    "claude-turn".to_owned(),
+                    Some("sonnet".to_owned()),
+                    effort.map(str::to_owned),
+                    json!([{ "type": "text", "text": "Run tests" }]),
+                    Duration::from_secs(2),
+                )
+                .await
+                .expect("start turn should send selected controls and prompt");
+            let lines =
+                wait_logged_json_lines(log_path.as_path(), if effort.is_some() { 3 } else { 2 })
+                    .await;
+            assert_eq!(lines[0]["type"], "control_request");
+            assert_eq!(lines[0]["request"]["subtype"], "set_model");
+            assert_eq!(lines[0]["request"]["model"], "sonnet");
+            if effort.is_some() {
+                assert_eq!(lines[1]["type"], "control_request");
+                assert_eq!(lines[1]["request"]["subtype"], "apply_flag_settings");
+                assert_eq!(
+                    lines[1]["request"]["settings"]["effortLevel"],
+                    json!("medium")
+                );
+                assert_eq!(lines[2]["type"], "user");
+                assert!(!serde_json::to_string(&lines[2]).unwrap().contains("medium"));
+            } else {
+                assert_eq!(lines[1]["type"], "user");
+                assert!(
+                    lines
+                        .iter()
+                        .all(|line| line["request"]["subtype"] != "apply_flag_settings")
+                );
+            }
+            let _ = child.kill().await;
+        }
     }
 
     #[tokio::test]

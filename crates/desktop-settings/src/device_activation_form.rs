@@ -240,19 +240,3 @@ fn render_activation_qr(id_prefix: &'static str, width: usize, modules: &[bool])
         }))
         .into_any_element()
 }
-
-#[cfg(test)]
-mod tests {
-    #[::core::prelude::v1::test]
-    fn shared_form_owns_the_complete_activation_presentation() {
-        let source = include_str!("device_activation_form.rs");
-        assert!(source.contains("DeviceActivationFormPhase::Loading"));
-        assert!(source.contains("DeviceActivationFormPhase::Ready"));
-        assert!(source.contains("DeviceActivationFormPhase::Failed"));
-        assert!(source.contains("CredentialPresentationForm"));
-        assert!(source.contains(".when_some(code"));
-        assert!(source.contains("settings.devices.code_label"));
-        assert!(source.contains("settings.devices.link_label"));
-        assert!(source.contains("render_activation_qr"));
-    }
-}

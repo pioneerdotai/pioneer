@@ -1,126 +1,4 @@
 use super::*;
-use serde::{Deserialize, Serialize};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MemoryActiveRecallMode {
-    /// Do not run active recall.
-    Disabled,
-    /// Use deterministic pre-turn recall only. Never call the internal planner provider.
-    DeterministicOnly,
-    /// Use deterministic planning first and call the internal planner provider only when needed.
-    Hybrid,
-    /// Explicit diagnostic mode for broad fallback/debug behavior.
-    StrictDebug,
-}
-
-impl Default for MemoryActiveRecallMode {
-    fn default() -> Self {
-        Self::Hybrid
-    }
-}
-
-impl MemoryActiveRecallMode {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Disabled => "disabled",
-            Self::DeterministicOnly => "deterministic_only",
-            Self::Hybrid => "hybrid",
-            Self::StrictDebug => "strict_debug",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MemoryActiveRecallPlannerFallbackPolicy {
-    Deterministic,
-    SkipActiveRecall,
-}
-
-impl Default for MemoryActiveRecallPlannerFallbackPolicy {
-    fn default() -> Self {
-        Self::Deterministic
-    }
-}
-
-impl MemoryActiveRecallPlannerFallbackPolicy {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Deterministic => "deterministic",
-            Self::SkipActiveRecall => "skip_active_recall",
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MemoryActiveRecallPlannerConfig {
-    pub enabled: bool,
-    pub timeout_ms: u64,
-    pub max_input_chars: usize,
-    pub max_output_chars: usize,
-    pub fallback: MemoryActiveRecallPlannerFallbackPolicy,
-}
-
-impl Default for MemoryActiveRecallPlannerConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            timeout_ms: 60_000,
-            max_input_chars: 4_000,
-            max_output_chars: 2_000,
-            fallback: MemoryActiveRecallPlannerFallbackPolicy::Deterministic,
-        }
-    }
-}
-
-impl MemoryActiveRecallPlannerConfig {
-    pub fn normalized(&self) -> Self {
-        Self {
-            enabled: self.enabled,
-            timeout_ms: self.timeout_ms.max(1),
-            max_input_chars: self.max_input_chars.max(1),
-            max_output_chars: self.max_output_chars.max(1),
-            fallback: self.fallback,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MemoryActiveRecallConfig {
-    pub mode: MemoryActiveRecallMode,
-    pub timeout_ms: u64,
-    pub max_queries: usize,
-    pub top_k_per_query: u32,
-    pub max_prompt_chars: usize,
-    pub planner: MemoryActiveRecallPlannerConfig,
-}
-
-impl Default for MemoryActiveRecallConfig {
-    fn default() -> Self {
-        Self {
-            mode: MemoryActiveRecallMode::Hybrid,
-            timeout_ms: 70_000,
-            max_queries: 3,
-            top_k_per_query: 5,
-            max_prompt_chars: 1_500,
-            planner: MemoryActiveRecallPlannerConfig::default(),
-        }
-    }
-}
-
-impl MemoryActiveRecallConfig {
-    pub fn normalized(&self) -> Self {
-        Self {
-            mode: self.mode,
-            timeout_ms: self.timeout_ms.max(1),
-            max_queries: self.max_queries.max(1),
-            top_k_per_query: self.top_k_per_query.max(1),
-            max_prompt_chars: self.max_prompt_chars.max(1),
-            planner: self.planner.normalized(),
-        }
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemoryPostTurnExtractorConfig {
@@ -186,18 +64,14 @@ impl MemoryPostTurnExtractorConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemoryLoopConfig {
-    pub deterministic_recall_enabled: bool,
     pub tools_enabled: bool,
-    pub active_recall: MemoryActiveRecallConfig,
     pub post_turn_extractor: MemoryPostTurnExtractorConfig,
 }
 
 impl Default for MemoryLoopConfig {
     fn default() -> Self {
         Self {
-            deterministic_recall_enabled: true,
             tools_enabled: true,
-            active_recall: MemoryActiveRecallConfig::default(),
             post_turn_extractor: MemoryPostTurnExtractorConfig::default(),
         }
     }
@@ -206,9 +80,7 @@ impl Default for MemoryLoopConfig {
 impl MemoryLoopConfig {
     pub fn normalized(&self) -> Self {
         Self {
-            deterministic_recall_enabled: self.deterministic_recall_enabled,
             tools_enabled: self.tools_enabled,
-            active_recall: self.active_recall.normalized(),
             post_turn_extractor: self.post_turn_extractor.normalized(),
         }
     }

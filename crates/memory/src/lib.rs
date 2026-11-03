@@ -18,7 +18,6 @@ mod policy;
 mod quality;
 mod quality_gate;
 mod ranking;
-mod recall;
 mod recall_visibility;
 mod service;
 mod thread_episodic;
@@ -67,14 +66,11 @@ pub use quality::{
     audit_memory_candidate_quality, audit_memory_record_quality, classify_memory_source_context,
     classify_semantic_memory_fact, resolve_semantic_write_source_context,
 };
-pub use recall::{
-    MemoryModeRecallParams, MemoryModeRecallResponse, MemoryRecallItem, MemoryRecallMode,
-    MemoryRecallParams, MemoryRecallResponse, MemoryRecallTarget,
-};
 pub use service::MemoryService;
 pub use thread_episodic::{
     MemvidThreadEpisodicBackend, PioneerAdaptiveCutoff, PioneerAdaptiveCutoffConfig,
     PioneerAdaptiveCutoffDiagnostics, PioneerAdaptiveCutoffReason,
+    THREAD_EPISODIC_MEMVID_BATCH_BYTES, THREAD_EPISODIC_MEMVID_BATCH_ITEMS,
     ThreadEpisodicAdaptiveRetrievalImplementation, ThreadEpisodicCandidateSuppression,
     ThreadEpisodicCandidateSuppressionReason, ThreadEpisodicExactSourceTarget,
     ThreadEpisodicFilteredSearchCandidates, ThreadEpisodicMemvidAskRetrievalMode,

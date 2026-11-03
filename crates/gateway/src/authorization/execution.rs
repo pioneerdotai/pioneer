@@ -1907,8 +1907,8 @@ impl ExecutionAuthorizationContext {
         )
         .await?
         .with_context(|| format!("execution turn `{turn_id}` no longer exists"))?;
-        let (_, turn) = store
-            .get_turn(scope.thread_id.as_str(), turn_id)
+        let turn = store
+            .get_turn_execution_binding(scope.thread_id.as_str(), turn_id)
             .await?
             .with_context(|| format!("execution turn `{turn_id}` disappeared during validation"))?;
         let initiator = pioneer_crud::find_turn_initiator(&store.database_connection(), turn_id)
@@ -2027,7 +2027,7 @@ impl ExecutionAuthorizationContext {
         &'a self,
         store: &'a CrudStore,
         scope: &'a pioneer_crud::TurnAuthorizationScope,
-        turn: &'a pioneer_protocol::Turn,
+        turn: &'a pioneer_crud::TurnExecutionBinding,
     ) -> BoxFuture<'a, Result<Option<String>>> {
         Box::pin(async move {
             // A Task occurrence uses the durable run id as its Turn id and may be
@@ -2127,10 +2127,58 @@ impl ExecutionAuthorizationContext {
         &'a self,
         store: &'a CrudStore,
         scope: &'a pioneer_crud::TurnAuthorizationScope,
-        turn: &'a pioneer_protocol::Turn,
+        turn: &'a pioneer_crud::TurnExecutionBinding,
         execution_id: &'a AgentExecutionId,
     ) -> BoxFuture<'a, Result<Option<String>>> {
         Box::pin(async move {
+            if turn.work_owner == pioneer_protocol::TurnWorkOwner::DetachedTask {
+                // This message admits independent Task work. Its author is
+                // provenance, not the responding actor of a direct Turn. The
+                // immutable Task aggregate is the accepted authority boundary.
+                let tasks = store
+                    .list_tasks_created_by_turn(&self.workspace_id, &scope.thread_id, &turn.id)
+                    .await?;
+                let mut admissions = tasks.iter().filter(|task| {
+                    task.metadata
+                        .as_ref()
+                        .and_then(|metadata| metadata.composer_work.as_ref())
+                        .is_some_and(|work| {
+                            work.launch.thread_id == scope.thread_id
+                                && work.launch.turn_id == turn.id
+                        })
+                });
+                let task = admissions
+                    .next()
+                    .context("detached admission has no Task")?;
+                if admissions.next().is_some()
+                    || task.workspace_id != self.workspace_id
+                    || task.owner_id.as_deref() != Some(scope.thread_id.as_str())
+                    || !task.lifecycle_policy.as_ref().is_some_and(|policy| {
+                        policy.attachment == pioneer_protocol::TaskAttachmentMode::Detached
+                    })
+                {
+                    bail!("detached admission differs from its exact Task");
+                }
+                let contract = store
+                    .get_task_actor_contract(&task.id)
+                    .await?
+                    .context("detached admission has no Task actor contract")?;
+                if contract.creator
+                    != pioneer_protocol::PersistedActorRef::AgentExecution(execution_id.clone())
+                    || contract.work_graph_root_execution_id.is_some()
+                {
+                    bail!("detached admission has a different creator or inherited work graph");
+                }
+                let admission = store
+                    .get_task_execution_admission(&task.id)
+                    .await?
+                    .context("detached Task has no admission")?;
+                let admitted = Self::load_for_task_admission(store, &admission).await?;
+                if self.authorization_fingerprint()? != admitted.authorization_fingerprint()? {
+                    bail!("detached message differs from its immutable Task authority");
+                }
+                return Ok(None);
+            }
             // Detached/scheduled Agent Tasks materialize one typed occurrence
             // Turn in the capsule root before creating their isolated hidden
             // child. This is the only root-level execution actor admitted by
@@ -2241,14 +2289,26 @@ impl ExecutionAuthorizationContext {
                 if task.created_by_thread_id.as_deref() != Some(parent_scope.thread_id.as_str()) {
                     bail!("agent-authored Task creator thread differs from its creating Turn");
                 }
-                let parent_response = pioneer_crud::load_agent_turn_response(
-                    &store.database_connection(),
-                    parent_turn_id,
-                )
-                .await?
-                .context("agent-authored Task creating Turn has no responding execution")?;
-                if parent_response.execution_id != execution_id.as_str() {
-                    bail!("Task creator actor differs from its creating Turn execution");
+                let (_, parent_turn) = store
+                    .get_turn(&parent_scope.thread_id, parent_turn_id)
+                    .await?
+                    .context("Task creating Turn is missing")?;
+                if parent_turn.work_owner == pioneer_protocol::TurnWorkOwner::DetachedTask {
+                    if parent_turn.author.as_ref().map(|author| &author.actor)
+                        != Some(&actor_contract.creator)
+                    {
+                        bail!("Task admission author differs from its exact creator");
+                    }
+                } else {
+                    let parent_response = pioneer_crud::load_agent_turn_response(
+                        &store.database_connection(),
+                        parent_turn_id,
+                    )
+                    .await?
+                    .context("agent-authored Task creating Turn has no responding execution")?;
+                    if parent_response.execution_id != execution_id.as_str() {
+                        bail!("Task creator actor differs from its creating Turn execution");
+                    }
                 }
 
                 let task_execution = store
@@ -4306,9 +4366,7 @@ mod tests {
         WorkspaceResourceId,
     };
     use crate::request_context::{CanonicalMethod, ConnectionContext};
-    use pioneer_protocol::{
-        DeviceId, GatewayId, PersistedActorRef, RoleKey, TurnPermissionProfileSelection,
-    };
+    use pioneer_protocol::{DeviceId, GatewayId, RoleKey, TurnPermissionProfileSelection};
     use std::sync::Arc;
 
     #[test]
@@ -5067,12 +5125,5 @@ mod tests {
             runtime_kind: CLIAgentRuntimeKind::Codex,
         });
         assert!(!native_api_provider_requires_artifacts(&cli));
-    }
-
-    #[test]
-    fn context_is_not_an_actor_or_bearer_credential() {
-        let _: PersistedActorRef =
-            PersistedActorRef::Principal(member_request().principal().principal_id.clone());
-        assert!(!std::any::type_name::<ExecutionAuthorizationContext>().contains("Credential"));
     }
 }

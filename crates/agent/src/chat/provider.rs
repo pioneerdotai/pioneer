@@ -1404,17 +1404,21 @@ fn adapter_error_for_target(
     prefix: &str,
     error: &anyhow::Error,
 ) -> ChatTurnError {
-    let mut classification = if let Some(http_error) =
-        error.downcast_ref::<pioneer_provider::ProviderHttpErrorBodyTooLarge>()
-    {
-        Some(classify_http_error_body_too_large(http_error.status))
-    } else if error.downcast_ref::<ProviderResponseTooLarge>().is_some() {
-        Some(ProviderFailureClassification::new(
-            ProviderFailureClass::ProviderRejected,
-        ))
-    } else {
-        provider.classify_failure(error)
-    };
+    // Adapter facts can include request/retry metadata even for bounded-body
+    // failures. Use the size-only fallback only when no typed facts exist.
+    let mut classification = provider.classify_failure(error).or_else(|| {
+        if let Some(http_error) =
+            error.downcast_ref::<pioneer_provider::ProviderHttpErrorBodyTooLarge>()
+        {
+            Some(classify_http_error_body_too_large(http_error.status))
+        } else if error.downcast_ref::<ProviderResponseTooLarge>().is_some() {
+            Some(ProviderFailureClassification::new(
+                ProviderFailureClass::ProviderRejected,
+            ))
+        } else {
+            None
+        }
+    });
     if let Some(id) = pioneer_provider::usage::error_usage(error)
         .and_then(|usage| usage.request_id.clone())
         .and_then(|id| pioneer_protocol::ProviderRequestId::try_from(id).ok())
@@ -1799,6 +1803,7 @@ fn provider_failure_error_with_classification(
     );
     let ProviderFailureClassification {
         is_network_error: _,
+        raw_response,
         error_reason,
         request_id,
         class,
@@ -1812,6 +1817,7 @@ fn provider_failure_error_with_classification(
         item_id: item_id.to_owned(),
         item_type,
         failure: ProviderFailureDetails {
+            raw_response,
             error_reason,
             request_id,
             provider: provider.to_owned(),
@@ -1834,10 +1840,13 @@ fn infer_failure_classification(
 ) -> ProviderFailureClassification {
     ProviderFailureClassification {
         is_network_error: false,
+        raw_response: None,
         error_reason: None,
         request_id: None,
         class: classify_provider_failure_message(message, stage),
-        http_status: extract_http_status(message),
+        // Message text can classify legacy failures, but cannot prove that an
+        // HTTP response was received (or establish its numeric status).
+        http_status: None,
         provider_code: extract_provider_code(message),
         retry_after_ms: extract_retry_after_ms(&message.to_ascii_lowercase()),
     }
@@ -1845,18 +1854,55 @@ fn infer_failure_classification(
 
 fn merge_failure_classification(
     classification: Option<ProviderFailureClassification>,
-    inferred: ProviderFailureClassification,
+    mut inferred: ProviderFailureClassification,
 ) -> ProviderFailureClassification {
+    // Display text can retain legacy transient hints, but must never authorize
+    // history reduction. Both adapter translation and final failure creation
+    // merge here, so a second fallback cannot restore an unconfirmed overflow.
+    if matches!(
+        inferred.class,
+        ProviderFailureClass::PromptTooLong | ProviderFailureClass::ContextTooLarge
+    ) {
+        inferred.class = ProviderFailureClass::Unknown;
+    }
     match classification {
-        Some(classification) => ProviderFailureClassification {
-            is_network_error: classification.is_network_error,
-            error_reason: classification.error_reason,
-            request_id: classification.request_id,
-            class: classification.class,
-            http_status: classification.http_status.or(inferred.http_status),
-            provider_code: classification.provider_code.or(inferred.provider_code),
-            retry_after_ms: classification.retry_after_ms.or(inferred.retry_after_ms),
-        },
+        Some(mut classification) => {
+            if matches!(
+                classification.class,
+                ProviderFailureClass::PromptTooLong | ProviderFailureClass::ContextTooLarge
+            ) {
+                // A few adapters classify a typed HTTP rejection's body using
+                // legacy text rules. Auth/transient HTTP evidence vetoes that
+                // body's misleading size claim; other typed classes stay authoritative.
+                classification.class = match classification.http_status {
+                    Some(401) => ProviderFailureClass::AuthExpired,
+                    Some(403) => ProviderFailureClass::AuthOrPermission,
+                    Some(408 | 425) => ProviderFailureClass::NetworkTransient,
+                    Some(429) => ProviderFailureClass::RateLimit,
+                    Some(500..=599) => ProviderFailureClass::Provider5xx,
+                    _ => classification.class,
+                };
+            }
+            ProviderFailureClassification {
+                is_network_error: classification.is_network_error,
+                raw_response: classification.raw_response,
+                error_reason: classification.error_reason,
+                request_id: classification.request_id,
+                class: classification.class,
+                // Do not promote a Display-only number to HTTP authority for
+                // the second merge of a confirmed overflow classification.
+                http_status: if matches!(
+                    classification.class,
+                    ProviderFailureClass::PromptTooLong | ProviderFailureClass::ContextTooLarge
+                ) {
+                    classification.http_status
+                } else {
+                    classification.http_status.or(inferred.http_status)
+                },
+                provider_code: classification.provider_code.or(inferred.provider_code),
+                retry_after_ms: classification.retry_after_ms.or(inferred.retry_after_ms),
+            }
+        }
         None => inferred,
     }
 }
@@ -1999,6 +2045,7 @@ mod tests {
                 message,
                 classification: typed.then(|| ProviderFailureClassification {
                     is_network_error: false,
+                    raw_response: None,
                     error_reason: None,
                     request_id: None,
                     class,
@@ -2042,12 +2089,12 @@ mod tests {
             assert_eq!(after.provider_code, before.provider_code);
             assert_eq!(after.retry_after_ms, before.retry_after_ms);
             if message.starts_with("OpenRouter API error 429") {
-                assert_eq!(after.http_status, Some(429));
+                assert_eq!(after.http_status, None);
                 assert_eq!(after.provider_code.as_deref(), Some("rate_limit_exceeded"));
                 assert_eq!(after.retry_after_ms, Some(2000));
             }
             if message.starts_with("OpenRouter API error 503") {
-                assert_eq!(after.http_status, Some(503));
+                assert_eq!(after.http_status, None);
             }
             assert_eq!(after.is_recoverable_hint, before.is_recoverable_hint);
             assert_eq!(after.stage, before.stage);
@@ -2227,6 +2274,203 @@ mod tests {
         .await
     }
 
+    #[tokio::test]
+    async fn responses_failures_retain_original_responses_separately_from_public_messages() {
+        use pioneer_protocol::{ProviderErrorReason as Reason, RecoveryDiagnostic};
+        for (code, message, reason) in [
+            (
+                "invalid_request_error",
+                "Item 'rs_private_payload' of type 'reasoning' was provided without its required following item.",
+                Reason::ResponsesMissingRequiredItem,
+            ),
+            (
+                "invalid_request_error",
+                "No tool call found for function call output with call_id private_payload.",
+                Reason::ResponsesUnpairedToolCall,
+            ),
+            (
+                "invalid_request_error",
+                "Missing required parameter: 'private_payload'.",
+                Reason::MissingRequiredParameter,
+            ),
+            (
+                "invalid_request_error",
+                "Unsupported parameter: 'private_payload'.",
+                Reason::UnsupportedParameter,
+            ),
+            (
+                "unsupported_value",
+                "private_payload https://private.example/?key=secret",
+                Reason::InvalidParameterValue,
+            ),
+            (
+                "invalid_type",
+                "private_payload https://private.example/?key=secret",
+                Reason::InvalidParameterType,
+            ),
+            (
+                "private_payload",
+                "private_payload https://private.example/?key=secret",
+                Reason::Unmapped,
+            ),
+        ] {
+            for stream in [false, true] {
+                let body = format!(
+                    "  {}\n",
+                    serde_json::json!({"error":{
+                        "type":"invalid_request_error", "code":code,
+                        "message":message, "param":"private_payload"
+                    }})
+                );
+                let failure = failure_from_local_endpoint(
+                    "openai",
+                    400,
+                    "",
+                    stream,
+                    Some(body.clone()),
+                    true,
+                    "X-Request-Id: req_diag_fixture\r\n",
+                    false,
+                )
+                .await;
+                assert_eq!(
+                    failure.class,
+                    ProviderFailureClass::MalformedProviderRequest
+                );
+                assert_eq!(failure.http_status, Some(400));
+                assert!(!failure.is_recoverable_hint);
+                assert_eq!(failure.error_reason, Some(reason));
+                assert_eq!(
+                    failure.request_id.clone().map(String::from).as_deref(),
+                    Some("req_diag_fixture")
+                );
+                let diagnostic = RecoveryDiagnostic::provider(&failure);
+                let raw = diagnostic
+                    .last_failure
+                    .as_ref()
+                    .unwrap()
+                    .raw_response
+                    .as_ref()
+                    .unwrap();
+                assert_eq!(raw.body, body);
+                assert!(!raw.truncated);
+                assert_eq!(failure.raw_response.as_ref(), Some(raw));
+                let stored = serde_json::to_string(&diagnostic).unwrap();
+                assert_eq!(
+                    serde_json::from_str::<RecoveryDiagnostic>(&stored).unwrap(),
+                    diagnostic
+                );
+                assert!(
+                    diagnostic
+                        .public_message()
+                        .contains(reason.public_description())
+                );
+                for safe in [
+                    diagnostic.public_message(),
+                    format!("{failure:?} {diagnostic:?}"),
+                ] {
+                    assert!(!safe.contains("private_payload"));
+                    assert!(!safe.contains("private.example"));
+                    assert!(!safe.contains("key=secret"));
+                }
+            }
+        }
+        // Distinct transport shapes must retain the actual body/event rather
+        // than reconstructing JSON or retaining only recognized error fields.
+        let native = r#"{ "type":"error", "message":"unknown private_payload", "extra":42 }"#;
+        let failed = r#"{ "status":"failed", "error":{"message":"private_payload"} }"#;
+        let failed_event = format!(r#"{{ "type":"response.failed", "response":{failed} }}"#);
+        let long_response = format!("{} retained_tail", "private_payload ".repeat(2048));
+        let oversized = "x".repeat(pioneer_protocol::ProviderErrorResponse::MAX_BYTES + 1);
+        for (status, stream, body, expected, truncated, interrupted) in [
+            (
+                400,
+                false,
+                "upstream private_payload".to_owned(),
+                "upstream private_payload".to_owned(),
+                false,
+                false,
+            ),
+            (
+                400,
+                false,
+                long_response.clone(),
+                long_response,
+                false,
+                false,
+            ),
+            (
+                400,
+                true,
+                oversized.clone(),
+                oversized[..oversized.len() - 1].to_owned(),
+                true,
+                false,
+            ),
+            (
+                400,
+                false,
+                "partial private_payload".to_owned(),
+                "partial private_payload".to_owned(),
+                true,
+                true,
+            ),
+            (
+                200,
+                false,
+                failed.to_owned(),
+                failed.to_owned(),
+                false,
+                false,
+            ),
+            (
+                200,
+                true,
+                format!("data: {native}\n\n"),
+                native.to_owned(),
+                false,
+                false,
+            ),
+            (
+                200,
+                true,
+                format!("data: {failed_event}\n\n"),
+                failed_event,
+                false,
+                false,
+            ),
+        ] {
+            let wire_body = body.clone();
+            let failure = failure_from_local_endpoint(
+                "openai",
+                status,
+                "",
+                stream,
+                Some(body),
+                true,
+                "",
+                interrupted,
+            )
+            .await;
+            let diagnostic = RecoveryDiagnostic::provider(&failure);
+            let raw = diagnostic
+                .last_failure
+                .as_ref()
+                .unwrap()
+                .raw_response
+                .as_ref()
+                .unwrap();
+            assert_eq!(raw.body, expected);
+            assert_eq!(raw.truncated, truncated);
+            assert!(raw.processing_error.is_none());
+            assert_eq!(
+                raw.stream_context.as_deref(),
+                (status == 200 && stream).then_some(wire_body.as_str())
+            );
+            assert!(!diagnostic.public_message().contains("private_payload"));
+        }
+    }
+
     // Injected adapter fixtures use the required authority wrapper without
     // custom-endpoint redaction masking leaks in standard diagnostics.
     async fn failure_from_local_endpoint(
@@ -2241,6 +2485,7 @@ mod tests {
     ) -> ProviderFailureDetails {
         failure_from_local_response(
             provider_name,
+            "fixture",
             status,
             message,
             stream_request,
@@ -2254,6 +2499,7 @@ mod tests {
 
     async fn failure_from_local_response(
         provider_name: &'static str,
+        model: &'static str,
         status: u16,
         message: &'static str,
         stream_request: bool,
@@ -2266,6 +2512,7 @@ mod tests {
             std::time::Duration::from_secs(10),
             failure_from_local_response_inner(
                 provider_name,
+                model,
                 status,
                 message,
                 stream_request,
@@ -2285,6 +2532,7 @@ mod tests {
 
     async fn failure_from_local_response_inner(
         provider_name: &'static str,
+        model: &'static str,
         status: u16,
         message: &'static str,
         stream_request: bool,
@@ -2368,7 +2616,7 @@ mod tests {
             .unwrap()
         };
         let request = ChatRequest {
-            model: "fixture".into(),
+            model: model.into(),
             messages: vec![pioneer_provider::ChatMessage::user("hello")],
             temperature: None,
             max_tokens: None,
@@ -2416,10 +2664,11 @@ mod tests {
                 .chain()
                 .any(|cause| format!("{cause:?}").contains(secret))
         );
+        let error = error.context("provider call context");
         let ChatTurnError::ProviderFailure { failure, .. } = adapter_error_for_target(
             FailureTarget::new("item", TurnItemType::Reasoning),
             provider.as_ref(),
-            "fixture",
+            model,
             if stream_request {
                 ProviderTransportKind::Stream
             } else {
@@ -2435,7 +2684,14 @@ mod tests {
         ) else {
             panic!("expected provider failure")
         };
-        assert!(!serde_json::to_string(&failure).unwrap().contains(secret));
+        assert!(!format!("{failure:?}").contains(secret));
+        let mut public_fields = failure.clone();
+        public_fields.raw_response = None;
+        assert!(
+            !serde_json::to_string(&public_fields)
+                .unwrap()
+                .contains(secret)
+        );
         failure
     }
 
@@ -2659,6 +2915,7 @@ mod tests {
             ] {
                 let failure = failure_from_local_response(
                     "openrouter",
+                    "fixture",
                     502,
                     "",
                     false,
@@ -2699,6 +2956,7 @@ mod tests {
             ] {
                 let failure = failure_from_local_response(
                     "openrouter",
+                    "fixture",
                     200,
                     "",
                     false,
@@ -2765,7 +3023,7 @@ mod tests {
                 )
                 .await;
                 assert_eq!(failure.class, ProviderFailureClass::Provider5xx);
-                assert_eq!(failure.http_status, Some(502));
+                assert_eq!(failure.http_status, None);
                 assert_eq!(
                     failure
                         .request_id
@@ -2791,7 +3049,7 @@ mod tests {
             }
         }
         let choice_error = serde_json::json!({"id":"gen-fixture", "choices":[{"error":{
-            "code":502,"metadata":{"error_type":"provider_unavailable"}
+            "code":403,"metadata":{"error_type":"provider_unavailable"}
         }}]})
         .to_string();
         for stream in [false, true] {
@@ -2806,11 +3064,21 @@ mod tests {
                 "",
                 stream,
                 Some(body),
-                false,
+                true,
                 "",
                 false,
             )
             .await;
+            assert_eq!(failure.class, ProviderFailureClass::AuthOrPermission);
+            assert_eq!(failure.http_status, None);
+            assert_eq!(
+                RecoveryDiagnostic::provider(&failure)
+                    .last_failure
+                    .as_ref()
+                    .unwrap()
+                    .http_status,
+                None
+            );
             assert_eq!(
                 RecoveryDiagnostic::provider(&failure)
                     .last_failure
@@ -2952,7 +3220,7 @@ mod tests {
                 )
                 .await;
                 assert_eq!(failure.class, ProviderFailureClass::Provider5xx);
-                assert_eq!(failure.http_status, Some(502));
+                assert_eq!(failure.http_status, (!stream).then_some(502));
                 assert_eq!(failure.retry_after_ms, Some(2000));
                 assert_eq!(
                     failure.stage,
@@ -2995,6 +3263,138 @@ mod tests {
                     assert!(!safe.contains(secret));
                 }
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_http_facts_survive_error_body_failures_to_recovery_details() {
+        use pioneer_protocol::RecoveryDiagnostic;
+        // One representative per distinct adapter; vllm uses the shared Chat
+        // compatible path, and deepseek delegates classification to that path.
+        for (provider, model) in [
+            ("openai", "gpt-audio"),
+            ("anthropic", "fixture"),
+            ("gemini", "fixture"),
+            ("glm", "fixture"),
+            ("copilot", "fixture"),
+            ("telnyx", "fixture"),
+            ("ollama", "fixture"),
+            ("vllm", "fixture"),
+            ("deepseek", "fixture"),
+        ] {
+            for stream in [false, true] {
+                for (status, body, truncated, class) in [
+                    (
+                        408,
+                        b"private_fixture".to_vec(),
+                        true,
+                        ProviderFailureClass::NetworkTransient,
+                    ),
+                    (
+                        408,
+                        b"private_fixture".to_vec(),
+                        false,
+                        ProviderFailureClass::Unknown,
+                    ),
+                    (408, vec![0xff], false, ProviderFailureClass::Unknown),
+                    (
+                        403,
+                        b"private_fixture forbidden".to_vec(),
+                        false,
+                        ProviderFailureClass::AuthOrPermission,
+                    ),
+                    (
+                        403,
+                        b"private_fixture".to_vec(),
+                        true,
+                        ProviderFailureClass::AuthOrPermission,
+                    ),
+                    (
+                        403,
+                        vec![0xff],
+                        false,
+                        ProviderFailureClass::AuthOrPermission,
+                    ),
+                    (
+                        403,
+                        vec![b'x'; 16 * 1024 + 1],
+                        false,
+                        ProviderFailureClass::ProviderRejected,
+                    ),
+                    (
+                        503,
+                        b"private_fixture body mentions 403".to_vec(),
+                        true,
+                        ProviderFailureClass::Provider5xx,
+                    ),
+                    (
+                        429,
+                        b"private_fixture body mentions 403".to_vec(),
+                        false,
+                        ProviderFailureClass::RateLimit,
+                    ),
+                ] {
+                    // Shared semantics are owned by the OpenAI / compatible
+                    // rows; other rows protect their adapter wiring only.
+                    if !matches!(provider, "openai" | "vllm") && !(status == 403 && truncated) {
+                        continue;
+                    }
+                    let failure = failure_from_local_response(
+                        provider,
+                        model,
+                        status,
+                        "",
+                        stream,
+                        Some(body),
+                        true,
+                        "Retry-After: 7\r\n",
+                        truncated,
+                    )
+                    .await;
+                    assert_eq!(failure.http_status, Some(status), "{provider}");
+                    assert_eq!(failure.class, class, "{provider}");
+                    assert_eq!(failure.stage, ProviderFailureStage::Connect);
+                    assert_eq!(failure.retry_after_ms, Some(7000));
+                    let last = RecoveryDiagnostic::provider(&failure).last_failure.unwrap();
+                    assert_eq!(last.http_status, Some(status));
+                    assert_eq!(last.retry_after_ms, Some(7000));
+                    if status == 408 {
+                        // Only a real body-read network failure restores the
+                        // old retry hint; complete/local decode failures do not.
+                        assert_eq!(failure.is_recoverable_hint, truncated);
+                        assert_eq!(last.class, class);
+                        assert_eq!(last.stage, ProviderFailureStage::Connect);
+                    }
+                    assert!(
+                        !serde_json::to_string(&failure)
+                            .unwrap()
+                            .contains("private_fixture")
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn local_and_native_403_text_cannot_invent_http_response_facts() {
+        let provider = pioneer_provider::providers::OpenAiProvider::new("fixture");
+        for error in [
+            anyhow::anyhow!("connection reset by peer; local diagnostic 403"),
+            anyhow::Error::from(pioneer_provider::failure::AnthropicStreamError::Permission)
+                .context("HTTP 200 stream event mentions 403"),
+        ] {
+            let ChatTurnError::ProviderFailure { failure, .. } = adapter_error_for_target(
+                FailureTarget::new("item", TurnItemType::Reasoning),
+                &provider,
+                "fixture",
+                ProviderTransportKind::Stream,
+                ProviderFailureStage::MidStream,
+                "provider error",
+                &error,
+            ) else {
+                panic!("expected provider failure")
+            };
+            assert_eq!(failure.http_status, None);
         }
     }
 
@@ -3132,7 +3532,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn endpoint_path_is_absent_from_durable_failure_details() {
+    async fn endpoint_path_is_retained_only_in_the_original_error_response() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3177,7 +3577,9 @@ mod tests {
         ) else {
             panic!("expected provider failure")
         };
-        assert!(!serde_json::to_string(&failure).unwrap().contains(secret));
+        assert!(failure.raw_response.as_ref().unwrap().body.contains(secret));
+        assert!(!format!("{failure:?}").contains(secret));
+        assert!(!failure.message.as_deref().unwrap().contains(secret));
         assert_eq!(failure.class, ProviderFailureClass::RateLimit);
         assert_eq!(failure.http_status, Some(429));
         assert!(failure.is_recoverable_hint);
@@ -3201,27 +3603,6 @@ mod tests {
     }
 
     #[test]
-    fn openrouter_image_input_endpoint_error_is_recoverable_capability_rejection() {
-        let error = r#"provider stream error: OpenRouter API error (404 Not Found): {"error":{"message":"No endpoints found that support image input","code":404}}"#;
-
-        let ChatTurnError::ProviderFailure { failure, .. } = provider_failure_error(
-            "reasoning_item",
-            TurnItemType::Reasoning,
-            "openrouter",
-            "deepseek/deepseek-v4-flash",
-            ProviderTransportKind::Stream,
-            ProviderFailureStage::Connect,
-            error.to_owned(),
-        ) else {
-            panic!("expected provider failure");
-        };
-
-        assert_eq!(failure.class, ProviderFailureClass::UnsupportedImageInput);
-        assert_eq!(failure.http_status, Some(404));
-        assert!(failure.is_recoverable_hint);
-    }
-
-    #[test]
     fn plain_404_still_maps_to_model_not_found() {
         assert_eq!(
             classify_provider_failure_class(
@@ -3231,40 +3612,6 @@ mod tests {
                 None,
             ),
             ProviderFailureClass::ModelNotFound
-        );
-    }
-
-    #[test]
-    fn provider_400_bad_request_is_non_retryable_provider_rejection() {
-        let error = r#"provider stream error: API error (400 Bad Request): {"error":{"message":"bad request","code":400}}"#;
-
-        let ChatTurnError::ProviderFailure { failure, .. } = provider_failure_error(
-            "reasoning_item",
-            TurnItemType::Reasoning,
-            "openrouter",
-            "minimax/minimax-m3",
-            ProviderTransportKind::Stream,
-            ProviderFailureStage::MidStream,
-            error.to_owned(),
-        ) else {
-            panic!("expected provider failure");
-        };
-
-        assert_eq!(failure.class, ProviderFailureClass::ProviderRejected);
-        assert_eq!(failure.http_status, Some(400));
-        assert!(!failure.is_recoverable_hint);
-    }
-
-    #[test]
-    fn unsupported_streaming_maps_to_provider_neutral_class() {
-        assert_eq!(
-            classify_provider_failure_class(
-                "provider error: this model does not support streaming",
-                ProviderFailureStage::Connect,
-                Some(400),
-                None,
-            ),
-            ProviderFailureClass::UnsupportedStreaming
         );
     }
 
@@ -3315,6 +3662,7 @@ mod tests {
                 "provider error: HTTP 400 opaque rejection".to_owned(),
                 Some(ProviderFailureClassification {
                     is_network_error: false,
+                    raw_response: None,
                     error_reason: None,
                     request_id: None,
                     class: ProviderFailureClass::UnsupportedStreaming,
@@ -3333,19 +3681,6 @@ mod tests {
             Some("streaming_not_supported")
         );
         assert!(failure.is_recoverable_hint);
-    }
-
-    #[test]
-    fn context_length_maps_to_context_too_large() {
-        assert_eq!(
-            classify_provider_failure_class(
-                "provider error: maximum context length exceeded",
-                ProviderFailureStage::Connect,
-                Some(400),
-                None,
-            ),
-            ProviderFailureClass::ContextTooLarge
-        );
     }
 
     #[test]
@@ -3496,6 +3831,41 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn message_only_provider_failures_keep_class_without_inventing_http_status() {
+        for (model, stage, error, class, recoverable) in [
+            (
+                "deepseek/deepseek-v4-flash",
+                ProviderFailureStage::Connect,
+                r#"provider stream error: OpenRouter API error (404 Not Found): {"error":{"message":"No endpoints found that support image input","code":404}}"#,
+                ProviderFailureClass::UnsupportedImageInput,
+                true,
+            ),
+            (
+                "minimax/minimax-m3",
+                ProviderFailureStage::MidStream,
+                r#"provider stream error: API error (400 Bad Request): {"error":{"message":"bad request","code":400}}"#,
+                ProviderFailureClass::ProviderRejected,
+                false,
+            ),
+        ] {
+            let ChatTurnError::ProviderFailure { failure, .. } = provider_failure_error(
+                "reasoning_item",
+                TurnItemType::Reasoning,
+                "openrouter",
+                model,
+                ProviderTransportKind::Stream,
+                stage,
+                error.to_owned(),
+            ) else {
+                panic!("expected provider failure");
+            };
+            assert_eq!(failure.class, class);
+            assert_eq!(failure.http_status, None);
+            assert_eq!(failure.is_recoverable_hint, recoverable);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3593,6 +3963,7 @@ mod partial_observation_tests {
                     events.acknowledge_last(Ok(()));
                     if let Some(details) = usage {
                         assert_eq!(details["status"], "failed");
+                        assert_eq!(details["purpose"], "main");
                         assert_eq!(details["usage"]["generation_id"], "gen-header");
                         assert_eq!(details["usage"]["request_id"], "req-distinct");
                         assert_eq!(details["usage"]["reported_model"], "actual-returned");
@@ -3684,6 +4055,8 @@ fn observe_startup_chunk(turn_id: &str, chunk: &pioneer_provider::StreamChunk) {
 /// survive error; no usage is invented for a failed connect or missing terminal.
 pub(super) struct ProviderAttemptObservation {
     id: String,
+    purpose: &'static str,
+    connection: Option<String>,
     provider: String,
     model: String,
     api: String,
@@ -3694,6 +4067,8 @@ impl ProviderAttemptObservation {
     pub(super) fn new(provider: &dyn Provider, model: &str) -> Self {
         Self {
             id: super::generate_id(super::TURN_ITEM_ID_LEN),
+            purpose: "main",
+            connection: provider.authority_fingerprint().map(str::to_owned),
             provider: provider.name().to_owned(),
             model: model.to_owned(),
             api: provider.usage_api().to_owned(),
@@ -3746,6 +4121,8 @@ impl ProviderAttemptObservation {
                 "physical_attempt_id":usage.physical_attempt_id,
                 "request_sent":serde_json::Value::Null,
                 "provider":self.provider,"model":self.model,"api":self.api,"route":self.route,
+                "purpose":self.purpose,
+                "connection_id":self.connection,
                 "status":match completed {None=>"started",Some(true)=>"completed",Some(false)=>"failed"},
                 "complete":completed == Some(true),"usage":usage})),
         };
@@ -3787,17 +4164,22 @@ pub(super) async fn request_agent_round(
     observation
         .publish(event_tx, workspace_id, thread_id, turn_id, None)
         .await?;
-    let result = request_agent_round_observed(
-        provider,
-        request,
+    let result = pioneer_provider::prompt_cache::scope(
         workspace_id,
         thread_id,
-        turn_id,
-        thinking_item_id,
-        force_non_stream,
-        provider_timeout_policy,
-        event_tx,
-        &observation,
+        "main",
+        request_agent_round_observed(
+            provider,
+            request,
+            workspace_id,
+            thread_id,
+            turn_id,
+            thinking_item_id,
+            force_non_stream,
+            provider_timeout_policy,
+            event_tx,
+            &observation,
+        ),
     )
     .await;
     observation
@@ -3827,17 +4209,22 @@ pub(super) async fn stream_provider_response(
     observation
         .publish(event_tx, workspace_id, thread_id, turn_id, None)
         .await?;
-    let result = stream_provider_response_observed(
-        provider,
-        request,
+    let result = pioneer_provider::prompt_cache::scope(
         workspace_id,
         thread_id,
-        turn_id,
-        thinking_item_id,
-        message_item_id,
-        provider_timeout_policy,
-        event_tx,
-        &observation,
+        "main",
+        stream_provider_response_observed(
+            provider,
+            request,
+            workspace_id,
+            thread_id,
+            turn_id,
+            thinking_item_id,
+            message_item_id,
+            provider_timeout_policy,
+            event_tx,
+            &observation,
+        ),
     )
     .await;
     observation
@@ -3866,16 +4253,21 @@ pub(super) async fn non_stream_provider_response(
     observation
         .publish(event_tx, workspace_id, thread_id, turn_id, None)
         .await?;
-    let result = non_stream_provider_response_observed(
-        provider,
-        request,
+    let result = pioneer_provider::prompt_cache::scope(
         workspace_id,
         thread_id,
-        turn_id,
-        thinking_item_id,
-        message_item_id,
-        event_tx,
-        &observation,
+        "main",
+        non_stream_provider_response_observed(
+            provider,
+            request,
+            workspace_id,
+            thread_id,
+            turn_id,
+            thinking_item_id,
+            message_item_id,
+            event_tx,
+            &observation,
+        ),
     )
     .await;
     observation
@@ -3900,6 +4292,7 @@ mod terminal_boundary_tests {
         chunks: Vec<StreamChunk>,
         fail: bool,
         attempts: Arc<AtomicUsize>,
+        non_stream_attempts: Arc<AtomicUsize>,
     }
     #[async_trait]
     impl Provider for FixtureProvider {
@@ -3913,6 +4306,7 @@ mod terminal_boundary_tests {
             }
         }
         async fn chat(&self, _: ChatRequest) -> anyhow::Result<pioneer_provider::ChatResponse> {
+            self.non_stream_attempts.fetch_add(1, Ordering::SeqCst);
             anyhow::bail!("unexpected fallback/retry")
         }
         async fn stream_chat(
@@ -3974,6 +4368,7 @@ mod terminal_boundary_tests {
             }])],
             fail: true,
             attempts: attempts.clone(),
+            non_stream_attempts: Arc::new(AtomicUsize::new(0)),
         });
         let hub = AgentEventHub::new();
         let (result, events) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -4022,6 +4417,7 @@ mod terminal_boundary_tests {
             chunks: vec![terminal],
             fail: false,
             attempts: Arc::new(AtomicUsize::new(0)),
+            non_stream_attempts: Arc::new(AtomicUsize::new(0)),
         });
         let hub = AgentEventHub::new();
         let (result, _) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -4044,6 +4440,58 @@ mod terminal_boundary_tests {
         .expect("provider round and all durable acknowledgements must finish");
         let result = result.unwrap();
         assert_eq!(result.text, "terminal text");
+    }
+
+    #[tokio::test]
+    async fn forced_non_stream_round_preserves_transport_on_streaming_capable_provider() {
+        // The recovery owner tests choose the flag from durable transport.
+        // Exercise its consumer here, observing actual Provider entry points.
+        for force_non_stream in [false, true] {
+            let stream_attempts = Arc::new(AtomicUsize::new(0));
+            let non_stream_attempts = Arc::new(AtomicUsize::new(0));
+            let provider: Arc<dyn Provider> = Arc::new(FixtureProvider {
+                chunks: vec![
+                    StreamChunk::delta("streamed response"),
+                    StreamChunk::final_chunk_with(ProviderTermination::Complete),
+                ],
+                fail: false,
+                attempts: stream_attempts.clone(),
+                non_stream_attempts: non_stream_attempts.clone(),
+            });
+            let hub = AgentEventHub::new();
+            let (result, _) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                tokio::join!(
+                    request_agent_round(
+                        &provider,
+                        request(),
+                        "ws",
+                        "thread",
+                        "turn",
+                        "item",
+                        force_non_stream,
+                        ProviderTimeoutPolicy::default(),
+                        &hub,
+                    ),
+                    acknowledge_round_events(&hub),
+                )
+            })
+            .await
+            .expect("provider round and durable acknowledgements must finish");
+            if force_non_stream {
+                assert_eq!(non_stream_attempts.load(Ordering::SeqCst), 1);
+                assert_eq!(stream_attempts.load(Ordering::SeqCst), 0);
+                // chat deliberately fails in this fixture; the failure must
+                // still describe the actual NonStream call, without fallback.
+                let Err(ChatTurnError::ProviderFailure { failure, .. }) = result else {
+                    panic!("expected the fixture's non-stream failure");
+                };
+                assert_eq!(failure.transport, ProviderTransportKind::NonStream);
+            } else {
+                assert!(result.is_ok());
+                assert_eq!(stream_attempts.load(Ordering::SeqCst), 1);
+                assert_eq!(non_stream_attempts.load(Ordering::SeqCst), 0);
+            }
+        }
     }
 }
 

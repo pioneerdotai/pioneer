@@ -209,38 +209,31 @@ mod tests {
 
     #[test]
     fn ffi_result_serialization_contains_no_content_or_credentials() {
-        let result = ClientMemberAvatarCacheResult {
-            cached_image_path: "/owned/cache/avatar".to_owned(),
-            principal_id: PrincipalId::new("P00000000000000000001").unwrap(),
-            avatar_revision: "a".repeat(64),
-            media_type: ProfileAvatarMediaType::Png,
-            source: AvatarCacheSource::Revalidated,
-        };
-        let value = serde_json::to_value(result).unwrap();
-        assert!(value.get("cached_image_path").is_some());
-        for forbidden in ["content", "content_base64", "access_token", "authorization"] {
-            assert!(
-                value.get(forbidden).is_none(),
-                "forbidden FFI field {forbidden}"
-            );
-        }
-    }
-
-    #[test]
-    fn agent_ffi_result_serialization_contains_no_content_or_credentials() {
-        let result = ClientAgentAvatarCacheResult {
-            cached_image_path: "/owned/cache/agent-avatar".to_owned(),
-            avatar_revision: "a".repeat(64),
-            media_type: ProfileAvatarMediaType::Jpeg,
-            source: AvatarCacheSource::Downloaded,
-        };
-        let value = serde_json::to_value(result).unwrap();
-        assert!(value.get("cached_image_path").is_some());
-        for forbidden in ["content", "content_base64", "access_token", "authorization"] {
-            assert!(
-                value.get(forbidden).is_none(),
-                "forbidden FFI field {forbidden}"
-            );
+        let values = [
+            serde_json::to_value(ClientMemberAvatarCacheResult {
+                cached_image_path: "/owned/cache/avatar".to_owned(),
+                principal_id: PrincipalId::new("P00000000000000000001").unwrap(),
+                avatar_revision: "a".repeat(64),
+                media_type: ProfileAvatarMediaType::Png,
+                source: AvatarCacheSource::Revalidated,
+            })
+            .unwrap(),
+            serde_json::to_value(ClientAgentAvatarCacheResult {
+                cached_image_path: "/owned/cache/agent-avatar".to_owned(),
+                avatar_revision: "a".repeat(64),
+                media_type: ProfileAvatarMediaType::Jpeg,
+                source: AvatarCacheSource::Downloaded,
+            })
+            .unwrap(),
+        ];
+        for value in values {
+            assert!(value.get("cached_image_path").is_some());
+            for forbidden in ["content", "content_base64", "access_token", "authorization"] {
+                assert!(
+                    value.get(forbidden).is_none(),
+                    "forbidden FFI field {forbidden}"
+                );
+            }
         }
     }
 

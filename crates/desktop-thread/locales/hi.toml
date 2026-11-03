@@ -358,3 +358,4 @@
 "plugins.select" = "प्लगइन चुनें"
 "plugins.unavailable" = "अनुपलब्ध"
 "plugins.updating" = "अपडेट हो रहा है…"
+"chat.composer.preparing_send" = "संदेश तैयार हो रहा है"

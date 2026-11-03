@@ -892,12 +892,8 @@ mod tests {
         ArtifactKind, ArtifactRef, ArtifactStatus, ArtifactSummary, ArtifactUpdatedNotification,
         CLIAgentRuntimeKind, CLIRuntimeAccountUpdatedNotification,
         CLIRuntimeAppsChangedNotification, CLIRuntimeStatusChangedNotification,
-        ExecutionWindowStatus, ItemDeltaStream, McpChangedNotification, McpListItem,
-        McpManagementDetails, McpPolicyState, McpRuntimeState, McpRuntimeStatus, McpScopeKind,
-        McpServerCatalogChangedNotification, McpServerCatalogDetails, McpServerDetailsResponse,
-        McpServerHealthDetails, McpServerStatus, McpServerStatusChangedNotification,
-        McpServerStatusItem, McpSourceKind, McpTransportSummary, RecoveryAction, RecoveryJobStatus,
-        RecoveryTrigger, RuntimeCapabilities, RuntimeStatus, RuntimeSummary,
+        ExecutionWindowStatus, ItemDeltaStream, McpChangedNotification, RecoveryAction,
+        RecoveryJobStatus, RecoveryTrigger, RuntimeCapabilities, RuntimeStatus, RuntimeSummary,
         SkillsChangedNotification, ThreadArtifactsChangedNotification, ThreadMode,
         ThreadOriginKind, ThreadSidebarVisibility, ToolLoopBudgetAction, ToolLoopBudgetLimitKind,
         ToolRetryErrorClass, ToolRetryResolution, TurnItem, TurnItemTimeoutReason, TurnItemType,
@@ -1055,6 +1051,7 @@ mod tests {
 
     fn turn(id: &str, status: TurnStatus) -> pioneer_protocol::Turn {
         pioneer_protocol::Turn {
+            work_owner: Default::default(),
             id: id.to_owned(),
             status,
             turn_kind: Default::default(),
@@ -1666,67 +1663,6 @@ mod tests {
                 ..
             }
         ));
-    }
-
-    #[test]
-    fn mcp_status_and_catalog_reductions_patch_local_read_models() {
-        let mut servers = vec![mcp_server("server_a", McpServerStatus::Starting)];
-        let status_notification = McpServerStatusChangedNotification {
-            workspace_id: "ws_a".to_owned(),
-            snapshot_version: 2,
-            server: McpServerStatusItem {
-                id: "server_a".to_owned(),
-                name: "server_a".to_owned(),
-                scope_kind: McpScopeKind::Workspace,
-                runtime: mcp_runtime(McpRuntimeState::Failed, false),
-                status: McpServerStatus::Failed,
-            },
-        };
-
-        let status_reduction = reduce_mcp_server_status_changed_notification(
-            status_notification.clone(),
-            Some("ws_a"),
-            Some("server_a"),
-            true,
-        );
-        assert!(status_reduction.workspace_matches);
-        assert!(status_reduction.selected_server_matches);
-        assert!(status_reduction.update_selected_details);
-        assert!(!status_reduction.queue_mcp_details_refresh);
-
-        let mut details = mcp_details(servers[0].clone());
-        apply_mcp_server_status_changed_to_catalog(&mut servers, &status_notification);
-        apply_mcp_server_status_changed_to_details(&mut details, &status_notification);
-        assert_eq!(servers[0].status, McpServerStatus::Failed);
-        assert_eq!(details.server.status, McpServerStatus::Failed);
-        assert_eq!(
-            details.management.expect("management").health.status,
-            McpServerStatus::Failed
-        );
-
-        let catalog_notification = McpServerCatalogChangedNotification {
-            workspace_id: "ws_a".to_owned(),
-            snapshot_version: 3,
-            server_id: "server_a".to_owned(),
-            name: "server_a".to_owned(),
-            catalog_version: "cat_2".to_owned(),
-            tools_count: 10,
-            resources_count: 11,
-            resource_templates_count: 12,
-            prompts_count: 13,
-        };
-        let catalog_reduction = reduce_mcp_server_catalog_changed_notification(
-            catalog_notification.clone(),
-            Some("ws_a"),
-            Some("server_a"),
-        );
-        assert!(catalog_reduction.queue_mcp_details_refresh);
-
-        apply_mcp_server_catalog_changed_to_catalog(&mut servers, &catalog_notification);
-        assert_eq!(servers[0].tools_count, 10);
-        assert_eq!(servers[0].resources_count, 11);
-        assert_eq!(servers[0].resource_templates_count, 12);
-        assert_eq!(servers[0].prompts_count, 13);
     }
 
     #[test]

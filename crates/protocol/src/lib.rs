@@ -43,8 +43,8 @@ mod provider;
 mod public_error;
 mod recovery_diagnostic;
 pub use recovery_diagnostic::{
-    ProviderErrorReason, ProviderRequestId, RecoveryDiagnostic, RecoveryProviderFailure,
-    RecoveryStopReason,
+    ProviderErrorReason, ProviderErrorResponse, ProviderRequestId, RecoveryDiagnostic,
+    RecoveryProviderFailure, RecoveryStopReason,
 };
 mod plugins;
 mod schema;
@@ -66,7 +66,6 @@ mod thread_file;
 mod timeline;
 mod turn;
 mod turn_permissions;
-mod versioned_contract;
 mod voice;
 pub mod voice_contract;
 mod workspace;
@@ -115,13 +114,14 @@ pub use agent_tools::{
     AgentIdentityModelsToolInput, AgentIdentityModelsToolResult, AgentModelToolCatalogEntry,
     AgentModelToolName, AgentPublicOutcome, AgentResultToolInput, AgentReviewTaskToolInput,
     AgentScheduleTaskToolInput, AgentSendMessageToolInput, AgentStartOptionsToolInput,
-    AgentStartOptionsToolResult, AgentStartToolInput, AgentTaskToolInput, AgentToolBackendKind,
-    AgentToolCapability, AgentToolExecutorModels, AgentToolIdentityChoice, AgentToolIdentityOption,
-    AgentToolLaunchSelection, AgentToolModelOption, AgentToolOptionsProjection,
-    AgentToolProfileChoice, AgentToolProfileOption, AgentToolResultStatus, AgentToolSafeResult,
-    AgentToolTargetOption, AgentToolThreadCreationOption, AgentWaitToolInput,
-    agent_identity_models_catalog_entry, agent_start_options_catalog_entry,
-    agent_turn_start_catalog_entry, project_agent_model_tool_catalog,
+    AgentStartOptionsToolResult, AgentStartToolInput, AgentTaskToolInput, AgentThreadActionResult,
+    AgentToolBackendKind, AgentToolCapability, AgentToolExecutorModels, AgentToolIdentityChoice,
+    AgentToolIdentityOption, AgentToolLaunchSelection, AgentToolModelOption,
+    AgentToolOptionsProjection, AgentToolProfileChoice, AgentToolProfileOption,
+    AgentToolResultStatus, AgentToolSafeResult, AgentToolTargetOption,
+    AgentToolThreadCreationOption, AgentWaitToolInput, agent_identity_models_catalog_entry,
+    agent_start_options_catalog_entry, agent_turn_start_catalog_entry,
+    project_agent_model_tool_catalog,
 };
 pub use app_url::{
     PIONEER_DEVELOPMENT_URL_SCHEME, PIONEER_PRODUCTION_URL_SCHEME, PioneerAppUrlScheme,
@@ -550,8 +550,8 @@ pub use turn::{
     TurnShellPolicy, TurnSkillCapabilitySummary, TurnSkillPackCapabilitySummary,
     TurnSkillPackPresentationSummary, TurnStartParams, TurnStartResponse, TurnStartedNotification,
     TurnStatus, TurnStatusChangedNotification, TurnTmpMode, TurnTmpPolicy,
-    TurnToolLoopBudgetExceededNotification, UserInput, UserMessageAttachment, WebFetchLink,
-    WebSearchResultItem, build_execution_checkpoint_original_request_summary,
+    TurnToolLoopBudgetExceededNotification, TurnWorkOwner, UserInput, UserMessageAttachment,
+    WebFetchLink, WebSearchResultItem, build_execution_checkpoint_original_request_summary,
     build_execution_checkpoint_payload, build_execution_checkpoint_provider_budget_summary,
     build_execution_checkpoint_tool_summary, collect_execution_checkpoint_strict_obligations,
     context_compaction_status, mcp_server_capability_key, mcp_tool_capability_key,
@@ -574,8 +574,8 @@ pub use voice::{
     VOICE_AUDIO_TARGET_CHANNELS, VOICE_AUDIO_TARGET_CHUNK_BYTES,
     VOICE_AUDIO_TARGET_CHUNK_DURATION_MS, VOICE_AUDIO_TARGET_SAMPLE_RATE_HZ,
     VOICE_CHUNK_FRAME_MAGIC, VoiceAudioEncoding, VoiceAudioFormat, VoiceAudioFormatValidationError,
-    VoiceChunkAckNotification, VoiceChunkFrameHeader, VoiceError, VoiceErrorKind,
-    VoiceFrameDecodeError, VoiceFrameEncodeError, VoiceSessionCancelParams,
+    VoiceAudioIntegrity, VoiceChunkAckNotification, VoiceChunkFrameHeader, VoiceError,
+    VoiceErrorKind, VoiceFrameDecodeError, VoiceFrameEncodeError, VoiceSessionCancelParams,
     VoiceSessionCancelResponse, VoiceSessionFinalizeParams, VoiceSessionFinalizeResponse,
     VoiceSessionOutcome, VoiceSessionResultNotification, VoiceSessionStartContext,
     VoiceSessionStartParams, VoiceSessionStartResponse, VoiceStatus, VoiceStatusParams,

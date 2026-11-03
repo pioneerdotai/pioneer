@@ -1165,6 +1165,179 @@ async fn durable_runner_manifest_candidate_and_state_commit_together() {
     verify_runner_commit_dependency(false).await;
 }
 #[tokio::test]
+async fn durable_runner_admission_preserves_overflow_and_ordinary_allowances() {
+    use pioneer_compaction::runner::{AttemptObservation, FailureKind, RunnerPhase, RunnerState};
+    let store = store().await;
+    pioneer_sqlite::apply_sqlite_pragmas(&store.database_connection())
+        .await
+        .unwrap();
+    let source = source(&store, "retry-source", 1, "retained source").await;
+    candidate_admission_fixture(
+        &store,
+        "retry-runner",
+        None,
+        &source,
+        Default::default(),
+        true,
+    )
+    .await;
+    let deadline = u64::try_from(
+        store
+            .compaction_operation("retry-runner")
+            .await
+            .unwrap()
+            .unwrap()
+            .deadline_ms,
+    )
+    .unwrap();
+    let initial =
+        RunnerState::new(deadline, &ModelBudget::new(None, None, None), 1000, None).unwrap();
+    for (overflow, ceiling) in [(1, None), (0, Some(0)), (0, Some(8500))] {
+        let mut invalid = initial.clone();
+        invalid.overflow_rejections = overflow;
+        invalid.overflow_input_ceiling = ceiling;
+        assert!(
+            store
+                .compaction_activate_runner("retry-runner", &invalid)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("invalid initial runner state")
+        );
+        assert!(
+            store
+                .compaction_runner_state("retry-runner")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+    // Decode a pre-estimation JSON shape at the actual activation boundary.
+    let mut legacy = serde_json::to_value(initial).unwrap();
+    for field in [
+        "portion_attempts",
+        "overflow_rejections",
+        "overflow_input_ceiling",
+    ] {
+        legacy.as_object_mut().unwrap().remove(field);
+    }
+    let initial: RunnerState = serde_json::from_value(legacy).unwrap();
+    assert_eq!(initial.portion_attempts, 0);
+    assert_eq!(initial.overflow_rejections, 0);
+    assert_eq!(initial.overflow_input_ceiling, None);
+    store
+        .compaction_activate_runner("retry-runner", &initial)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .compaction_runner_state("retry-runner")
+            .await
+            .unwrap()
+            .unwrap(),
+        initial
+    );
+
+    // Independent invalid storage proposals. Total<=7 alone would admit the
+    // first four; no saturating subtraction may accept overflow>portion.
+    for (portion, overflow, retries, corrections) in [
+        (4, 0, 0, 0),
+        (7, 3, 0, 0),
+        (5, 5, 0, 0),
+        (1, 2, 0, 0),
+        (1, 0, 3, 0),
+        (1, 0, 0, 2),
+    ] {
+        let mut invalid = initial.claim(1).unwrap();
+        invalid.portion_attempts = portion;
+        invalid.overflow_rejections = overflow;
+        invalid.retries = retries;
+        invalid.corrections = corrections;
+        assert!(
+            store
+                .compaction_runner_transition("retry-runner", initial.generation, &invalid, None)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("invalid state transition")
+        );
+        assert_eq!(
+            store
+                .compaction_runner_state("retry-runner")
+                .await
+                .unwrap()
+                .unwrap(),
+            initial
+        );
+    }
+
+    // Exercise one mixed execution through the real persistence owner. The
+    // shrink arithmetic itself is covered by the pure runner; here every claim
+    // and failure must survive a new CrudStore handle and reload, including 4..7.
+    let mut current = initial;
+    let mut now = 1_u64;
+    for kind in [
+        FailureKind::InputOverflow,
+        FailureKind::Transient,
+        FailureKind::InputOverflow,
+        FailureKind::InvalidCompletion,
+        FailureKind::InputOverflow,
+        FailureKind::InputOverflow,
+        FailureKind::Permanent,
+    ] {
+        if let RunnerPhase::Backoff { not_before_ms, .. } = current.phase {
+            now = now.max(not_before_ms);
+        }
+        let mut claim = current.claim(now).unwrap();
+        claim.observation = Some(AttemptObservation {
+            number: claim.attempts,
+            started_ms: now,
+            finished_ms: None,
+            estimated_input_tokens: claim.input_ceiling().unwrap_or(10_000),
+            output_cap: claim.target_tokens,
+            input_tokens: None,
+            output_tokens: None,
+            completion: None,
+            failure: None,
+            diagnostic: None,
+        });
+        assert!(
+            store
+                .compaction_runner_transition("retry-runner", current.generation, &claim, None)
+                .await
+                .unwrap()
+        );
+        let reloaded = CrudStore::new(store.database_connection()).with_maintenance_access();
+        let saved_claim = reloaded
+            .compaction_runner_state("retry-runner")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved_claim, claim);
+        let failed = saved_claim.attempt_failed(kind, now + 1, None).unwrap();
+        assert!(
+            reloaded
+                .compaction_runner_transition("retry-runner", saved_claim.generation, &failed, None)
+                .await
+                .unwrap()
+        );
+        current = store
+            .compaction_runner_state("retry-runner")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current, failed);
+        now += 2;
+    }
+    assert_eq!(current.attempts, 7);
+    assert_eq!(current.portion_attempts, 7);
+    assert_eq!(current.overflow_rejections, 4);
+    assert!(current.overflow_input_ceiling.is_some());
+    assert_eq!(current.retries, 1);
+    assert_eq!(current.cursor, Default::default());
+    assert_eq!(current.previous_checkpoint, None);
+}
+#[tokio::test]
 async fn selected_source_edit_does_not_invalidate_completed_runner_summary() {
     verify_runner_commit_dependency(true).await;
 }
@@ -9418,6 +9591,8 @@ async fn deadline_saved_ready_candidate_commit_expiry_refuses_resume_without_cha
             attempts: 1,
             retries: 0,
             portion_attempts: 0,
+            overflow_rejections: 0,
+            overflow_input_ceiling: None,
             corrections: 0,
             target_tokens: 10,
             source_text_projection_version: 0,

@@ -1,25 +1,24 @@
-mod classifier_fallback;
 mod descriptors;
 mod eligibility;
-mod episodic_recall;
+mod policy;
 mod policy_basics;
-mod policy_classifier;
 mod post_turn;
 mod prompt_dto;
-mod recall_prompt;
 mod tool_bundle;
 
 use super::*;
 use pioneer_hooks::{
     HookContext, HookInput, HookPhaseRequest, HookPromptContextLimits, HookPromptContextSet,
     HookRegistry, HookRuntime, HookRuntimeBuilder, HookSubscriptionRegistry, HookThreadId,
-    HookToolName, HookTurnId, HookWorkspaceId, TurnPostPreflightPromptContextHookInput,
+    HookToolName, HookTurnId, HookWorkspaceId, PromptContextContribution,
     TurnPrePromptCompileHookInput, TurnPrePromptContextHookInput,
     TurnPreToolMaterializationHookInput,
 };
 use pioneer_protocol::{MemoryAttribute, MemoryCanonicalKey, MemoryRecord, MemorySubject};
 use pioneer_tools::{ConfiguredToolSpec, ExecutionClass, PayloadKind, ToolSpec};
 use serde_json::json;
+
+struct PanickingToolHandler;
 
 #[derive(Default)]
 struct TestToolBundleArtifactStore;
@@ -45,8 +44,6 @@ fn install_memory_hook_package_for_test(
     memory_provider: Arc<dyn AgentMemoryProvider>,
     memory_write_provider: Option<Arc<dyn AgentMemoryWriteProvider>>,
     post_turn_extractor_provider: Option<Arc<dyn AgentMemoryPostTurnExtractorProvider>>,
-    policy_provider: Option<Arc<dyn AgentMemoryTurnPolicyProvider>>,
-    episodic_recall_provider: Option<Arc<dyn AgentEpisodicRecallProvider>>,
     tool_bundle_artifacts: Arc<dyn MemoryToolBundleArtifactStore>,
     memory_config: MemoryLoopConfig,
 ) -> Result<(), HookRegistryError> {
@@ -55,8 +52,6 @@ fn install_memory_hook_package_for_test(
             memory_provider,
             memory_write_provider,
             post_turn_extractor_provider,
-            policy_provider,
-            episodic_recall_provider,
             tool_bundle_artifacts,
             memory_config,
         ))?
@@ -106,7 +101,7 @@ fn user_scope() -> MemoryScope {
 
 fn test_policy_hook_request(metadata: HookMetadata) -> HookHandlerRequest {
     HookHandlerRequest {
-        hook_id: HookId::new(MEMORY_POLICY_CLASSIFIER_HOOK_ID).expect("static hook id is valid"),
+        hook_id: HookId::new(MEMORY_POLICY_HOOK_ID).expect("static hook id is valid"),
         phase: HookPhase::TurnPrePolicy,
         context: HookContext {
             workspace_id: Some(HookWorkspaceId::new("ws").expect("valid workspace id")),
@@ -143,52 +138,6 @@ fn test_tool_bundle_hook_request(
         ),
         policy_set,
         prompt_context_set: HookPromptContextSet::default(),
-    }
-}
-
-fn test_prompt_context_hook_request(policy_set: HookPolicySet) -> HookHandlerRequest {
-    HookHandlerRequest {
-        hook_id: HookId::new(MEMORY_DETERMINISTIC_RECALL_HOOK_ID).expect("static hook id is valid"),
-        phase: HookPhase::TurnPrePromptContext,
-        context: HookContext {
-            workspace_id: Some(HookWorkspaceId::new("ws").expect("valid workspace id")),
-            thread_id: Some(HookThreadId::new("thr").expect("valid thread id")),
-            turn_id: Some(HookTurnId::new("turn").expect("valid turn id")),
-            ..HookContext::default()
-        },
-        input: HookInput::turn_pre_prompt_context(TurnPrePromptContextHookInput::from_parts(
-            "what do you remember about my city?",
-            Some("test-model"),
-            Some("test-provider"),
-        )),
-        policy_set,
-        prompt_context_set: HookPromptContextSet::default(),
-    }
-}
-
-fn test_active_prompt_context_hook_request(
-    policy_set: HookPolicySet,
-    prompt_context_set: HookPromptContextSet,
-    input_text: &str,
-) -> HookHandlerRequest {
-    HookHandlerRequest {
-        hook_id: HookId::new(MEMORY_ACTIVE_RECALL_HOOK_ID).expect("static hook id is valid"),
-        phase: HookPhase::TurnPostPreflightPromptContext,
-        context: HookContext {
-            workspace_id: Some(HookWorkspaceId::new("ws").expect("valid workspace id")),
-            thread_id: Some(HookThreadId::new("thr").expect("valid thread id")),
-            turn_id: Some(HookTurnId::new("turn").expect("valid turn id")),
-            ..HookContext::default()
-        },
-        input: HookInput::turn_post_preflight_prompt_context(
-            TurnPostPreflightPromptContextHookInput::from_parts(
-                input_text,
-                Some("test-model"),
-                Some("test-provider"),
-            ),
-        ),
-        policy_set,
-        prompt_context_set,
     }
 }
 
@@ -302,38 +251,6 @@ fn malformed_memory_policy_set() -> HookPolicySet {
     }])
 }
 
-fn recalled_city_snapshot() -> MemoryRecallSnapshot {
-    MemoryRecallSnapshot {
-        items: vec![MemoryRecallItem {
-            memory_id: "mem_city".to_owned(),
-            scope: user_scope(),
-            category: MemoryCategory::Preference,
-            key: Some("city".to_owned()),
-            content: "User likes Porto.".to_owned(),
-            score: Some(0.91),
-            updated_at: 1_714_867_200,
-        }],
-        diagnostics: Vec::new(),
-        truncated: false,
-    }
-}
-
-fn active_project_snapshot() -> MemoryRecallSnapshot {
-    MemoryRecallSnapshot {
-        items: vec![MemoryRecallItem {
-            memory_id: "mem_active_project".to_owned(),
-            scope: user_scope(),
-            category: MemoryCategory::ProjectDecision,
-            key: Some("hooks".to_owned()),
-            content: "Use hooks for memory domains.".to_owned(),
-            score: Some(0.88),
-            updated_at: 1_714_867_200,
-        }],
-        diagnostics: Vec::new(),
-        truncated: false,
-    }
-}
-
 fn valid_post_turn_extractor_json() -> String {
     serde_json::json!({
         "facts": [{
@@ -424,13 +341,6 @@ fn implicit_post_turn_extractor_json() -> String {
     .to_string()
 }
 
-fn prompt_context_set_from_response(response: HookHandlerResponse) -> HookPromptContextSet {
-    HookPromptContextSet::aggregate_hook_contributions(
-        response.contributions,
-        HookPromptContextLimits::default(),
-    )
-}
-
 fn prompt_context_contributions(response: &HookHandlerResponse) -> Vec<&PromptContextContribution> {
     response
         .contributions
@@ -448,61 +358,6 @@ fn assert_no_prompt_context_contributions(response: &HookHandlerResponse) {
         "expected no prompt context contributions, got {:?}",
         response.contributions
     );
-}
-
-fn assert_has_memory_recall_audit(response: &HookHandlerResponse, event_kind: &str) {
-    assert!(
-        response.contributions.iter().any(|contribution| {
-            matches!(
-                contribution,
-                HookContribution::Audit(audit) if audit.event_kind.as_str() == event_kind
-            )
-        }),
-        "expected memory recall audit contribution `{event_kind}`, got {:?}",
-        response.contributions
-    );
-}
-
-fn prompt_context_set_from_prompt_context_contribution(
-    contribution: PromptContextContribution,
-) -> HookPromptContextSet {
-    HookPromptContextSet::aggregate_contributions(
-        [contribution],
-        HookPromptContextLimits::default(),
-    )
-}
-
-fn memory_source_ref(memory_id: &str) -> HookSourceRef {
-    HookSourceRef {
-        kind: HookSourceKind::Custom("memory".to_owned()),
-        id: HookSourceId::new(memory_id.to_owned()).expect("valid memory source id"),
-        label: None,
-    }
-}
-
-fn prompt_section_content(response: HookHandlerResponse) -> Option<String> {
-    response.contributions.into_iter().find_map(|contribution| {
-        let HookContribution::PromptSection(section) = contribution else {
-            return None;
-        };
-        Some(section.content.as_str().to_owned())
-    })
-}
-
-fn prompt_section_contents(response: HookHandlerResponse) -> Vec<(String, String)> {
-    response
-        .contributions
-        .into_iter()
-        .filter_map(|contribution| {
-            let HookContribution::PromptSection(section) = contribution else {
-                return None;
-            };
-            Some((
-                section.section_id.as_str().to_owned(),
-                section.content.as_str().to_owned(),
-            ))
-        })
-        .collect()
 }
 
 fn test_memory_turn_context() -> MemoryTurnContext {
@@ -914,111 +769,8 @@ impl TestMemoryProvider {
     }
 }
 
-struct TestRecallMemoryProvider {
-    recall_result: Result<MemoryRecallSnapshot, String>,
-    recall_calls: Arc<Mutex<usize>>,
-    recall_requests: Arc<Mutex<Vec<MemoryRecallRequest>>>,
-    mode_recall_requests: Arc<Mutex<Vec<MemoryModeRecallParams>>>,
-    materialize_calls: Arc<Mutex<usize>>,
-}
-
-impl TestRecallMemoryProvider {
-    fn with_recall(recall_result: MemoryRecallSnapshot) -> Self {
-        Self {
-            recall_result: Ok(recall_result),
-            recall_calls: Arc::new(Mutex::new(0)),
-            recall_requests: Arc::new(Mutex::new(Vec::new())),
-            mode_recall_requests: Arc::new(Mutex::new(Vec::new())),
-            materialize_calls: Arc::new(Mutex::new(0)),
-        }
-    }
-
-    fn failing_recall(error: impl Into<String>) -> Self {
-        Self {
-            recall_result: Err(error.into()),
-            recall_calls: Arc::new(Mutex::new(0)),
-            recall_requests: Arc::new(Mutex::new(Vec::new())),
-            mode_recall_requests: Arc::new(Mutex::new(Vec::new())),
-            materialize_calls: Arc::new(Mutex::new(0)),
-        }
-    }
-
-    fn recall_call_count(&self) -> usize {
-        *self.recall_calls.lock().expect("recall lock poisoned")
-    }
-
-    fn materialize_call_count(&self) -> usize {
-        *self
-            .materialize_calls
-            .lock()
-            .expect("materialize lock poisoned")
-    }
-
-    fn recall_requests(&self) -> Vec<MemoryRecallRequest> {
-        self.recall_requests
-            .lock()
-            .expect("recall request lock poisoned")
-            .clone()
-    }
-
-    fn mode_recall_requests(&self) -> Vec<MemoryModeRecallParams> {
-        self.mode_recall_requests
-            .lock()
-            .expect("mode recall request lock poisoned")
-            .clone()
-    }
-}
-
-#[async_trait::async_trait]
-impl AgentMemoryProvider for TestRecallMemoryProvider {
-    async fn recall_memory(
-        &self,
-        _context: MemoryTurnContext,
-        request: MemoryRecallRequest,
-    ) -> Result<MemoryRecallSnapshot, String> {
-        *self.recall_calls.lock().expect("recall lock poisoned") += 1;
-        self.recall_requests
-            .lock()
-            .expect("recall request lock poisoned")
-            .push(request);
-        self.recall_result.clone()
-    }
-
-    async fn recall_memory_mode(
-        &self,
-        _context: MemoryTurnContext,
-        request: MemoryModeRecallParams,
-    ) -> Result<MemoryRecallSnapshot, String> {
-        *self.recall_calls.lock().expect("recall lock poisoned") += 1;
-        self.mode_recall_requests
-            .lock()
-            .expect("mode recall request lock poisoned")
-            .push(request);
-        self.recall_result.clone()
-    }
-
-    async fn materialize_memory_tools(
-        &self,
-        _context: MemoryTurnContext,
-    ) -> Result<MemoryToolMaterialization, String> {
-        *self
-            .materialize_calls
-            .lock()
-            .expect("materialize lock poisoned") += 1;
-        Ok(empty_tool_materialization())
-    }
-}
-
 #[async_trait::async_trait]
 impl AgentMemoryProvider for TestMemoryProvider {
-    async fn recall_memory(
-        &self,
-        _context: MemoryTurnContext,
-        _request: MemoryRecallRequest,
-    ) -> Result<MemoryRecallSnapshot, String> {
-        Ok(MemoryRecallSnapshot::empty())
-    }
-
     async fn materialize_memory_tools(
         &self,
         _context: MemoryTurnContext,
@@ -1030,38 +782,6 @@ impl AgentMemoryProvider for TestMemoryProvider {
         self.materialization.clone()
     }
 }
-
-struct SlowRecallMemoryProvider;
-
-#[async_trait::async_trait]
-impl AgentMemoryProvider for SlowRecallMemoryProvider {
-    async fn recall_memory(
-        &self,
-        _context: MemoryTurnContext,
-        _request: MemoryRecallRequest,
-    ) -> Result<MemoryRecallSnapshot, String> {
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        Ok(active_project_snapshot())
-    }
-
-    async fn recall_memory_mode(
-        &self,
-        _context: MemoryTurnContext,
-        _request: MemoryModeRecallParams,
-    ) -> Result<MemoryRecallSnapshot, String> {
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        Ok(active_project_snapshot())
-    }
-
-    async fn materialize_memory_tools(
-        &self,
-        _context: MemoryTurnContext,
-    ) -> Result<MemoryToolMaterialization, String> {
-        panic!("active memory recall timeout test must not materialize tools")
-    }
-}
-
-struct PanickingToolHandler;
 
 #[async_trait::async_trait]
 impl pioneer_tools::ToolHandler for PanickingToolHandler {

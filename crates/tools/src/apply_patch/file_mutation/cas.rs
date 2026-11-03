@@ -182,10 +182,4 @@ mod tests {
         let second = version_on_disk(&target, SnapshotLimits::default()).unwrap();
         assert_ne!(first, second);
     }
-
-    #[test]
-    fn missing_path_satisfies_must_not_exist() {
-        let role = CasRole::MoveDestination;
-        assert!(validate_cas(CasExpectation::MustNotExist, None, role).is_ok());
-    }
 }

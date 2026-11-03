@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use anyhow::{Context, Result};
 use pioneer_crud::{
     CrudStore, PersistedCapabilityScopeKind, PersistedThreadAccessClass,
@@ -31,6 +33,32 @@ pub(crate) struct CapabilityThreadFacts {
     pub(crate) access: ThreadAccessFacts,
     pub(crate) internal_child: bool,
     pub(crate) parent_execution_actions: Option<Vec<String>>,
+}
+
+/// Stage-local authoritative classification. Only a validated persisted
+/// workspace/private scope can enter the shared evaluator. Missing resources
+/// can authorize only an exact runtime draft, never fabricated ordinary facts.
+pub(crate) struct ThreadNotificationScope {
+    scope: Option<pioneer_crud::ThreadAuthorizationScope>,
+}
+
+impl ThreadNotificationScope {
+    pub(crate) fn is_internal(&self) -> bool {
+        self.scope
+            .as_ref()
+            .is_some_and(|scope| scope.access_class == PersistedThreadAccessClass::Internal)
+    }
+
+    pub(crate) fn is_missing(&self) -> bool {
+        self.scope.is_none()
+    }
+}
+
+pub(crate) struct ThreadNotificationMemberships<'a> {
+    scope: &'a pioneer_crud::ThreadAuthorizationScope,
+    requested: HashSet<PrincipalId>,
+    workspace_members: HashSet<String>,
+    thread_members: HashSet<String>,
 }
 
 #[derive(Clone)]
@@ -518,6 +546,85 @@ impl AuthorizationResolver {
                 proof.collaboration_root_thread_id = collaboration_root_thread_id;
                 AuthorizedThread(proof)
             }))
+    }
+
+    pub(crate) async fn load_thread_notification_scope(
+        &self,
+        thread_id: &str,
+    ) -> Result<ThreadNotificationScope> {
+        let scope =
+            resolve_thread_authorization_scope(&self.store.database_connection(), thread_id, None)
+                .await?;
+        Ok(ThreadNotificationScope { scope })
+    }
+
+    pub(crate) async fn load_thread_notification_memberships<'a>(
+        &self,
+        scope: &'a ThreadNotificationScope,
+        principal_ids: &[PrincipalId],
+    ) -> Result<ThreadNotificationMemberships<'a>> {
+        let scope = scope
+            .scope
+            .as_ref()
+            .filter(|scope| scope.access_class != PersistedThreadAccessClass::Internal)
+            .context("ordinary notification requires a persisted workspace/private scope")?;
+        let workspace_members = pioneer_crud::load_workspace_membership_principal_ids(
+            &self.store.database_connection(),
+            &scope.workspace_id,
+            principal_ids,
+        )
+        .await?;
+        let thread_members = pioneer_crud::load_thread_membership_principal_ids(
+            &self.store.database_connection(),
+            &scope.thread_id,
+            principal_ids,
+        )
+        .await?;
+        // Both bounded materializations have released their physical readers.
+        Ok(ThreadNotificationMemberships {
+            scope,
+            requested: principal_ids.iter().cloned().collect(),
+            workspace_members: workspace_members.into_iter().collect(),
+            thread_members: thread_members.into_iter().collect(),
+        })
+    }
+
+    pub(crate) fn authorize_thread_notification(
+        &self,
+        principal: &AuthenticatedSessionPrincipal,
+        action_gate: &ActionGateDecision,
+        memberships: &ThreadNotificationMemberships<'_>,
+    ) -> ProofResolution<AuthorizedThread> {
+        let action = ResourceAction::ThreadRead;
+        if let Some(denied) = self.preflight(action_gate, action) {
+            return ProofResolution::Denied(denied);
+        }
+        if !action_gate.is_final_allow() && !memberships.requested.contains(&principal.principal_id)
+        {
+            return ProofResolution::Denied(missing_resource());
+        }
+        let scope = memberships.scope;
+        let Some(resource) = thread_resource(&scope.workspace_id, &scope.thread_id) else {
+            return ProofResolution::Denied(missing_resource());
+        };
+        let facts = self.thread_facts_from_memberships(
+            principal,
+            scope,
+            memberships
+                .workspace_members
+                .contains(principal.principal_id.as_str()),
+            memberships
+                .thread_members
+                .contains(principal.principal_id.as_str()),
+        );
+        self.finish(
+            principal,
+            action_gate,
+            action,
+            resource,
+            ResolvedResourceAccess::Thread(facts),
+        )
+        .map(AuthorizedThread)
     }
 
     /// Authorizes an exact connection-owned draft without pretending that it
@@ -1401,17 +1508,41 @@ impl AuthorizationResolver {
             .context("failed to resolve thread authorization membership")?
             .is_some(),
         };
-        Ok(ThreadAccessFacts {
-            workspace,
+        Ok(self.thread_facts_from_memberships(
+            principal,
+            scope,
+            workspace.workspace_member,
+            thread_member,
+        ))
+    }
+
+    /// Fact assembly is shared by the single and bounded notification loaders;
+    /// `finish` / AuthorizationService remain the only ACL evaluator.
+    fn thread_facts_from_memberships(
+        &self,
+        principal: &AuthenticatedSessionPrincipal,
+        scope: &pioneer_crud::ThreadAuthorizationScope,
+        workspace_member: bool,
+        thread_member: bool,
+    ) -> ThreadAccessFacts {
+        let scoped = self
+            .service
+            .runtime_principal_policy(principal.kind, principal.role_key.as_ref())
+            == Some(super::RuntimePrincipalPolicy::ScopedCollaboration);
+        ThreadAccessFacts {
+            workspace: WorkspaceAccessFacts {
+                workspace_active: scope.workspace_is_active,
+                workspace_member: scoped && workspace_member,
+            },
             access_class: match scope.access_class {
                 PersistedThreadAccessClass::Private => ThreadAccessClass::Private,
                 PersistedThreadAccessClass::Workspace => ThreadAccessClass::Workspace,
                 PersistedThreadAccessClass::Internal => ThreadAccessClass::Internal,
             },
             resource_class: ThreadResourceClass::Root,
-            thread_member,
+            thread_member: scoped && thread_member,
             thread_creator: scope.creator_principal_id.as_ref() == Some(&principal.principal_id),
-        })
+        }
     }
 
     fn finish(
@@ -1909,7 +2040,7 @@ mod tests {
                     turn_kind,origin,initiated_by_actor_kind,initiated_by_actor_id\
                  ) VALUES(\
                     'U0000000000000000000A','T0000000000000000000A','completed','{}',\
-                    CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,'chat','user','principal',\
+                    CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,'conversation','user','principal',\
                     'P0000000000000000000A'),(\
                     'U0000000000000000000I','T0000000000000000000I','completed','{}',\
                     CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,'agent','task','system',NULL\
@@ -1979,66 +2110,6 @@ mod tests {
             .expect("parent authority should persist");
         let resolver = AuthorizationResolver::new(store);
         (harness, resolver)
-    }
-
-    #[tokio::test]
-    async fn workspace_resolution_uses_member_join_and_superuser_absolute_access() {
-        let (_harness, resolver) = resolver_fixture().await;
-        let service = AuthorizationService::new();
-        let member = principal(MEMBER_A_ID, PrincipalKind::User);
-        let superuser = principal("P00000000000000000001", PrincipalKind::Superuser);
-        let member_gate = service.authorize_action(
-            member.kind,
-            member.role_key.as_ref(),
-            ResourceAction::WorkspaceRead,
-        );
-        let superuser_gate = service.authorize_action(
-            superuser.kind,
-            superuser.role_key.as_ref(),
-            ResourceAction::WorkspaceRead,
-        );
-
-        let member_proof = resolver
-            .authorize_workspace(
-                &member,
-                &member_gate,
-                ResourceAction::WorkspaceRead,
-                WORKSPACE_ID,
-            )
-            .await
-            .expect("resolve Member workspace")
-            .into_authorized()
-            .expect("Member has persisted workspace membership");
-        assert_eq!(member_proof.workspace_id(), WORKSPACE_ID);
-
-        assert!(
-            resolver
-                .authorize_workspace(
-                    &member,
-                    &member_gate,
-                    ResourceAction::WorkspaceRead,
-                    WORKSPACE_GREEN_ID,
-                )
-                .await
-                .expect("resolve ungranted workspace")
-                .into_authorized()
-                .is_none(),
-            "ordinary-principal resolution must use the membership-scoped SQL path"
-        );
-        assert!(
-            resolver
-                .authorize_workspace(
-                    &superuser,
-                    &superuser_gate,
-                    ResourceAction::WorkspaceRead,
-                    WORKSPACE_GREEN_ID,
-                )
-                .await
-                .expect("resolve Superuser workspace")
-                .into_authorized()
-                .is_some(),
-            "Superuser must not require membership rows"
-        );
     }
 
     #[tokio::test]
@@ -2154,10 +2225,7 @@ mod tests {
 
     #[tokio::test]
     async fn persisted_two_member_three_workspace_thread_matrix_is_exact_and_fail_closed() {
-        let harness = IsolatedEpic4Harness::new()
-            .await
-            .expect("isolated Epic 4 harness");
-        let resolver = AuthorizationResolver::new(CrudStore::new(harness.database.clone()));
+        let (_harness, resolver) = resolver_fixture().await;
         let service = AuthorizationService::new();
         let member_a = principal(MEMBER_A_ID, PrincipalKind::User);
         let member_b = principal(MEMBER_B_ID, PrincipalKind::User);
@@ -2181,19 +2249,18 @@ mod tests {
                 ResourceAction::WorkspaceRead,
             );
             for workspace_id in allowed {
-                assert!(
-                    resolver
-                        .authorize_workspace(
-                            principal,
-                            &gate,
-                            ResourceAction::WorkspaceRead,
-                            workspace_id,
-                        )
-                        .await
-                        .expect("resolve granted workspace")
-                        .into_authorized()
-                        .is_some()
-                );
+                let proof = resolver
+                    .authorize_workspace(
+                        principal,
+                        &gate,
+                        ResourceAction::WorkspaceRead,
+                        workspace_id,
+                    )
+                    .await
+                    .expect("resolve granted workspace")
+                    .into_authorized()
+                    .expect("persisted workspace membership");
+                assert_eq!(proof.workspace_id(), workspace_id);
             }
             assert_eq!(
                 resolver
@@ -2207,6 +2274,26 @@ mod tests {
                 })
             );
         }
+
+        let superuser_workspace_gate = service.authorize_action(
+            superuser.kind,
+            superuser.role_key.as_ref(),
+            ResourceAction::WorkspaceRead,
+        );
+        assert!(
+            resolver
+                .authorize_workspace(
+                    &superuser,
+                    &superuser_workspace_gate,
+                    ResourceAction::WorkspaceRead,
+                    WORKSPACE_GREEN_ID,
+                )
+                .await
+                .expect("resolve Superuser workspace")
+                .into_authorized()
+                .is_some(),
+            "Superuser must not require membership rows"
+        );
 
         let member_cases = [
             (
@@ -2294,7 +2381,22 @@ mod tests {
                 principal.role_key.as_ref(),
                 ResourceAction::ThreadRead,
             );
+            assert!(
+                resolver
+                    .authorize_thread(
+                        principal,
+                        &gate,
+                        ResourceAction::ThreadRead,
+                        PRIVATE_THREAD_ID,
+                        Some(WORKSPACE_ID),
+                    )
+                    .await
+                    .expect("resolve exact persisted parent before mismatch")
+                    .into_authorized()
+                    .is_some()
+            );
             for (thread_id, workspace_id) in [
+                (PRIVATE_THREAD_ID, "W00000000000000000002"),
                 (THREAD_RED_PRIVATE_A_ID, WORKSPACE_GREEN_ID),
                 ("T00000000000000000099", WORKSPACE_RED_ID),
             ] {
@@ -2527,44 +2629,6 @@ mod tests {
                 .is_none(),
             "participant access must not transfer creator management"
         );
-    }
-
-    #[tokio::test]
-    async fn parent_mismatch_denies_member_and_superuser_before_proof_construction() {
-        let (_harness, resolver) = resolver_fixture().await;
-        let service = AuthorizationService::new();
-        let member = principal(MEMBER_A_ID, PrincipalKind::User);
-        let superuser = principal("P00000000000000000001", PrincipalKind::Superuser);
-        let member_gate = service.authorize_action(
-            member.kind,
-            member.role_key.as_ref(),
-            ResourceAction::ThreadRead,
-        );
-        let superuser_gate = service.authorize_action(
-            superuser.kind,
-            superuser.role_key.as_ref(),
-            ResourceAction::ThreadRead,
-        );
-
-        for (principal, gate) in [(&member, &member_gate), (&superuser, &superuser_gate)] {
-            let denied = resolver
-                .authorize_thread(
-                    principal,
-                    gate,
-                    ResourceAction::ThreadRead,
-                    PRIVATE_THREAD_ID,
-                    Some("W00000000000000000002"),
-                )
-                .await
-                .expect("resolve mismatched thread");
-            assert_eq!(
-                denied.denial(),
-                Some(&AuthorizationDecision::Deny {
-                    reason: DenyReason::MissingAuthoritativeResource,
-                    disclosure: DisclosurePolicy::NotFound,
-                })
-            );
-        }
     }
 
     #[tokio::test]

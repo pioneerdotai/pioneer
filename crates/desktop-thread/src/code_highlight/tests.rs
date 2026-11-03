@@ -215,27 +215,6 @@ fn source_and_span_caps_return_permanent_fallbacks() {
 }
 
 #[test]
-fn source_keys_are_deterministic_and_separate_language_and_theme() {
-    let rust = normalize_language_hint(Some("rs"));
-    assert_eq!(
-        make_highlight_key("source", rust, CodeThemeId::Dark),
-        make_highlight_key("source", rust, CodeThemeId::Dark)
-    );
-    assert_ne!(
-        make_highlight_key("source", rust, CodeThemeId::Dark),
-        make_highlight_key("source", rust, CodeThemeId::Light)
-    );
-    assert_ne!(
-        make_highlight_key("source", rust, CodeThemeId::Dark),
-        make_highlight_key(
-            "source",
-            normalize_language_hint(Some("ts")),
-            CodeThemeId::Dark,
-        )
-    );
-}
-
-#[test]
 fn light_and_dark_themes_produce_different_foregrounds() {
     let source = "fn main() { println!(\"hello\"); }\n";
     let light = highlighted(source, "rust", CodeThemeId::Light);

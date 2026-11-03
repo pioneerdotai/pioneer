@@ -57,18 +57,14 @@ pub use hooks::{
 use hooks::{AgentToolBundleArtifactStore, DurablePostTurnHookRuntimeSnapshot};
 use manager_recovery::apply_recovery_adjustments;
 pub use pioneer_memory::hooks::{
-    AgentEpisodicRecallProvider, AgentMemoryPostTurnExtractorProvider, AgentMemoryProvider,
-    AgentMemoryTurnPolicyProvider, AgentMemoryWriteProvider, MemoryActiveContextPolicy,
-    MemoryActiveRecallConfig, MemoryActiveRecallDecisionContext, MemoryActiveRecallDecisionRequest,
-    MemoryActiveRecallMode, MemoryActiveRecallPlannerConfig,
-    MemoryActiveRecallPlannerFallbackPolicy, MemoryClassifierFallbackPolicy,
-    MemoryExtractionPolicy, MemoryLoopConfig, MemoryManifest, MemoryManifestActiveItem,
-    MemoryManifestCandidateItem, MemoryManifestRequest, MemoryMutationToolPolicy,
-    MemoryPolicyReasonCode, MemoryPolicySource, MemoryPostTurnExtractorConfig,
-    MemoryPostTurnExtractorContext, MemoryPostTurnExtractorRequest, MemoryPromptPolicy,
-    MemoryReadToolPolicy, MemoryRecallItem, MemoryRecallPolicy, MemoryRecallRequest,
-    MemoryRecallSnapshot, MemoryToolMaterialization, MemoryTurnContext, MemoryTurnPolicy,
-    MemoryTurnPolicyContext, MemoryTurnPolicyOverride, MemoryTurnPolicyRequest,
+    AgentMemoryPostTurnExtractorProvider, AgentMemoryProvider, AgentMemoryWriteProvider,
+    MemoryActiveContextPolicy, MemoryExtractionPolicy, MemoryLoopConfig, MemoryManifest,
+    MemoryManifestActiveItem, MemoryManifestCandidateItem, MemoryManifestRequest,
+    MemoryMutationToolPolicy, MemoryPolicyReasonCode, MemoryPolicySource,
+    MemoryPostTurnExtractorConfig, MemoryPostTurnExtractorContext, MemoryPostTurnExtractorRequest,
+    MemoryPromptPolicy, MemoryReadToolPolicy, MemoryRecallPolicy, MemoryToolMaterialization,
+    MemoryTurnContext, MemoryTurnPolicy, MemoryTurnPolicyContext, MemoryTurnPolicyOverride,
+    MemoryTurnPolicyRequest,
 };
 use pioneer_tools::{
     ComputerUseToolsConfig, ExecutionWindowsConfig, PermissionApprovalBroker,
@@ -103,7 +99,6 @@ const MAX_CONTROL_ACK_TIMEOUT: Duration = Duration::from_secs(120);
 #[derive(Debug, Clone)]
 pub struct ToolLoopConfig {
     pub provider: ProviderTimeoutPolicy,
-    pub preflight: PreflightLoopConfig,
     pub web: WebToolsConfig,
     pub computer_use: ComputerUseToolsConfig,
     pub skills: SkillsLoopConfig,
@@ -111,25 +106,6 @@ pub struct ToolLoopConfig {
     pub budget: ToolLoopBudgetConfig,
     pub execution_windows: ExecutionWindowsConfig,
     pub retry: ToolRetryBudgetConfig,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct PreflightLoopConfig {
-    pub provider_name: Option<String>,
-    pub model: Option<String>,
-    pub timeout_ms: Option<u64>,
-    pub max_output_chars: Option<usize>,
-}
-
-impl PreflightLoopConfig {
-    pub fn normalized(&self) -> Self {
-        Self {
-            provider_name: normalized_optional_config_text(self.provider_name.as_deref()),
-            model: normalized_optional_config_text(self.model.as_deref()),
-            timeout_ms: self.timeout_ms,
-            max_output_chars: self.max_output_chars,
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -643,7 +619,6 @@ impl ToolLoopConfig {
     pub fn normalized(&self) -> Self {
         Self {
             provider: self.provider,
-            preflight: self.preflight.normalized(),
             web: self.web.normalized(),
             computer_use: self.computer_use.normalized(),
             skills: self.skills.normalized(),
@@ -653,14 +628,6 @@ impl ToolLoopConfig {
             retry: self.retry.normalized(),
         }
     }
-}
-
-fn normalized_optional_config_text(value: Option<&str>) -> Option<String> {
-    let value = value?.trim();
-    if value.is_empty() {
-        return None;
-    }
-    Some(value.to_owned())
 }
 
 #[cfg(test)]
@@ -1971,6 +1938,7 @@ enum AgentCommand {
         resolved_artifacts: Vec<ResolvedArtifactInput>,
         runtime_environment: HashMap<String, String>,
         history: Vec<ChatMessage>,
+        retained_provider_history: Vec<RetainedProviderHistoryMessage>,
         execution_checkpoint_context: Option<ExecutionCheckpointContext>,
         permission_profile: TurnPermissionProfileSnapshot,
         execution_security_snapshot: Option<TurnExecutionSecuritySnapshot>,
@@ -2756,8 +2724,6 @@ struct NativeRuntimeDependencyState {
     memory_provider: Option<Arc<dyn AgentMemoryProvider>>,
     memory_write_provider: Option<Arc<dyn AgentMemoryWriteProvider>>,
     memory_post_turn_extractor_provider: Option<Arc<dyn AgentMemoryPostTurnExtractorProvider>>,
-    memory_turn_policy_provider: Option<Arc<dyn AgentMemoryTurnPolicyProvider>>,
-    memory_episodic_recall_provider: Option<Arc<dyn AgentEpisodicRecallProvider>>,
     hook_runtime: Option<Arc<HookRuntime>>,
     post_turn_hook_dispatch_policy: AgentPostTurnHookDispatchPolicy,
     permission_approval_broker: Arc<dyn PermissionApprovalBroker>,
@@ -2804,8 +2770,6 @@ impl NativeRuntimeDependencies {
                 memory_provider,
                 memory_write_provider: None,
                 memory_post_turn_extractor_provider: None,
-                memory_turn_policy_provider: None,
-                memory_episodic_recall_provider: None,
                 hook_runtime: None,
                 post_turn_hook_dispatch_policy: AgentPostTurnHookDispatchPolicy::default(),
                 permission_approval_broker: Arc::new(StaticPermissionApprovalBroker::default()),
@@ -3273,26 +3237,6 @@ impl AgentManager {
             .await;
     }
 
-    pub async fn set_memory_turn_policy_provider(
-        &self,
-        provider: Option<Arc<dyn AgentMemoryTurnPolicyProvider>>,
-    ) {
-        self.runtime_dependencies
-            .update_hook_builder_input(move |state| state.memory_turn_policy_provider = provider)
-            .await;
-    }
-
-    pub async fn set_memory_episodic_recall_provider(
-        &self,
-        provider: Option<Arc<dyn AgentEpisodicRecallProvider>>,
-    ) {
-        self.runtime_dependencies
-            .update_hook_builder_input(move |state| {
-                state.memory_episodic_recall_provider = provider
-            })
-            .await;
-    }
-
     pub async fn set_hook_runtime(&self, runtime: Option<Arc<HookRuntime>>) {
         self.runtime_dependencies
             .update(move |state| state.hook_runtime = runtime)
@@ -3521,6 +3465,7 @@ impl AgentManager {
             resolved_artifacts,
             runtime_environment,
             history,
+            Vec::new(),
             None,
             reasoning,
             permission_profile,
@@ -3604,6 +3549,7 @@ impl AgentManager {
             resolved_artifacts,
             runtime_environment,
             history,
+            Vec::new(),
             None,
             permission_profile,
             execution_security_snapshot,
@@ -3690,6 +3636,7 @@ impl AgentManager {
             resolved_artifacts,
             runtime_environment,
             history,
+            Vec::new(),
             None,
             reasoning,
             permission_profile,
@@ -3733,6 +3680,7 @@ impl AgentManager {
             resolved_artifacts,
             runtime_environment,
             history,
+            Vec::new(),
             execution_checkpoint_context,
             permission_profile,
             execution_security_snapshot,
@@ -3757,6 +3705,7 @@ impl AgentManager {
         resolved_artifacts: Vec<ResolvedArtifactInput>,
         runtime_environment: HashMap<String, String>,
         history: Vec<ChatMessage>,
+        retained_provider_history: Vec<RetainedProviderHistoryMessage>,
         execution_checkpoint_context: Option<ExecutionCheckpointContext>,
         permission_profile: TurnPermissionProfileSnapshot,
         execution_security_snapshot: TurnExecutionSecuritySnapshot,
@@ -3776,6 +3725,7 @@ impl AgentManager {
             resolved_artifacts,
             runtime_environment,
             history,
+            retained_provider_history,
             execution_checkpoint_context,
             None,
             permission_profile,
@@ -3801,6 +3751,7 @@ impl AgentManager {
         resolved_artifacts: Vec<ResolvedArtifactInput>,
         runtime_environment: HashMap<String, String>,
         history: Vec<ChatMessage>,
+        retained_provider_history: Vec<RetainedProviderHistoryMessage>,
         execution_checkpoint_context: Option<ExecutionCheckpointContext>,
         reasoning: Option<ReasoningConfig>,
         permission_profile: TurnPermissionProfileSnapshot,
@@ -3855,6 +3806,7 @@ impl AgentManager {
             resolved_artifacts,
             runtime_environment,
             history,
+            retained_provider_history,
             execution_checkpoint_context,
             permission_profile,
             execution_security_snapshot,
@@ -5313,65 +5265,6 @@ mod event_class_tests {
             markdown: None,
             markdown_version: None,
         }
-    }
-
-    #[tokio::test]
-    async fn durable_lane_applies_backpressure_when_full() {
-        let hub = Arc::new(AgentEventHub::with_capacity(1, 1));
-        let mut durable_rx = hub
-            .take_durable_receiver()
-            .await
-            .expect("durable receiver should be available once");
-
-        hub.publish_durable(durable_turn_completed("turn_1"))
-            .await
-            .expect("first event should enqueue");
-
-        let pending_hub = hub.clone();
-        let pending = tokio::spawn(async move {
-            pending_hub
-                .publish_durable(durable_turn_completed("turn_2"))
-                .await
-        });
-
-        sleep(Duration::from_millis(25)).await;
-        assert!(
-            !pending.is_finished(),
-            "full durable queue must apply backpressure instead of dropping"
-        );
-
-        assert!(durable_rx.recv().await.is_some());
-        pending
-            .await
-            .expect("publish task should complete")
-            .expect("second event should enqueue after capacity is freed");
-        assert!(matches!(
-            durable_rx.recv().await,
-            Some(AgentDurableEvent::TurnCompleted { turn_id, .. }) if turn_id == "turn_2"
-        ));
-    }
-
-    #[tokio::test]
-    async fn dropped_durable_listener_can_be_replaced_without_losing_the_lane() {
-        let hub = AgentEventHub::with_capacity(1, 1);
-        let durable_rx = hub
-            .take_durable_receiver()
-            .await
-            .expect("durable receiver should be available once");
-        drop(durable_rx);
-
-        hub.publish_durable(durable_turn_completed("turn_1"))
-            .await
-            .expect("hub must retain queued events while no listener owns the receiver");
-
-        let mut replacement = hub
-            .take_durable_receiver()
-            .await
-            .expect("replacement listener should lease the retained receiver");
-        assert!(matches!(
-            replacement.recv().await,
-            Some(AgentDurableEvent::TurnCompleted { turn_id, .. }) if turn_id == "turn_1"
-        ));
     }
 
     #[tokio::test]

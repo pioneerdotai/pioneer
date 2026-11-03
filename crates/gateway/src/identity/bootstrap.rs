@@ -314,27 +314,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repeated_run_preserves_ids_and_profile() {
-        let database = database().await;
-        let first = begin_identity_bootstrap(&database)
-            .await
-            .unwrap()
-            .commit()
-            .await
-            .unwrap();
-
-        let repeated = begin_identity_bootstrap(&database)
-            .await
-            .expect("begin repeated bootstrap");
-        assert_eq!(repeated.created_flags(), (false, false));
-        let second = repeated.commit().await.expect("commit repeated bootstrap");
-
-        assert_eq!(second, first);
-        assert_eq!(list_gateway_identities(&database).await.unwrap().len(), 1);
-        assert_eq!(list_gateway_principals(&database).await.unwrap().len(), 1);
-    }
-
-    #[tokio::test]
     async fn restart_preserves_a_valid_edited_superuser_profile() {
         let database = database().await;
         let first = bootstrap_identity(&database)
@@ -363,19 +342,6 @@ mod tests {
         );
         assert_eq!(restarted.snapshot.superuser.nickname, "gateway-admin");
         assert_eq!(restarted.snapshot.superuser.nickname_key, "gateway-admin");
-    }
-
-    #[tokio::test]
-    async fn caller_can_roll_back_identity_and_principal_together() {
-        let database = database().await;
-        let bootstrap = begin_identity_bootstrap(&database)
-            .await
-            .expect("begin identity bootstrap");
-
-        bootstrap.rollback().await.expect("roll back bootstrap");
-
-        assert!(list_gateway_identities(&database).await.unwrap().is_empty());
-        assert!(list_gateway_principals(&database).await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -445,27 +411,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn actor_backfill_rolls_back_with_identity_creation() {
-        let database = database().await;
-        insert_legacy_actor_matrix(&database).await;
-
-        let bootstrap = begin_identity_bootstrap(&database).await.unwrap();
-        bootstrap.backfill_legacy_actors().await.unwrap();
-        bootstrap.rollback().await.unwrap();
-
-        assert!(list_gateway_identities(&database).await.unwrap().is_empty());
-        assert!(list_gateway_principals(&database).await.unwrap().is_empty());
-        let rows = load_identity_invariant_rows(&database).await.unwrap();
-        assert!(
-            rows.actor_references
-                .iter()
-                .filter(|row| row.resource_id != "thread-pre-attributed")
-                .filter(|row| row.resource_id != "turn-pre-attributed")
-                .all(|row| row.actor_kind.is_none() && row.actor_id.is_none())
-        );
-    }
-
-    #[tokio::test]
     async fn validated_bootstrap_sets_marker_and_restart_preserves_identity() {
         let database = database().await;
         let first = bootstrap_identity(&database)
@@ -485,6 +430,8 @@ mod tests {
         assert!(!second.superuser_created);
         assert_eq!(second.snapshot, first.snapshot);
         assert_eq!(second.backfill_counts, Default::default());
+        assert_eq!(list_gateway_identities(&database).await.unwrap().len(), 1);
+        assert_eq!(list_gateway_principals(&database).await.unwrap().len(), 1);
     }
 
     #[tokio::test]

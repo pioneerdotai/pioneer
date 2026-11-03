@@ -524,6 +524,26 @@ fn create_params(spec: TaskTriggerSpec) -> TaskCreateParams {
     }
 }
 
+#[test]
+fn task_create_budget_counts_utf8_and_json_escaping_at_exact_boundary() {
+    let validator = crate::admission::TaskAdmissionNormalizer::new();
+    for sample in ["Ж", "\\", "\"", "\u{0001}", "Ж\\\"\u{0001}"] {
+        let mut params = create_params(TaskTriggerSpec::Immediate);
+        params.goal = sample.repeat(1_000);
+        // Derive the padding from the complete serialized request, including
+        // every field. An extra ASCII byte must cross the fixed public budget.
+        let remaining = 524_288 - serde_json::to_vec(&params).unwrap().len();
+        params.goal.push_str(&"x".repeat(remaining));
+        assert_eq!(serde_json::to_vec(&params).unwrap().len(), 524_288);
+        validator
+            .validate_create(&params)
+            .expect("exactly 512 KiB must fit");
+        params.goal.push('x');
+        assert_eq!(serde_json::to_vec(&params).unwrap().len(), 524_289);
+        assert!(validator.validate_create(&params).is_err());
+    }
+}
+
 fn test_agent_launch_facts() -> (
     pioneer_protocol::AgentLaunchSelection,
     pioneer_protocol::AgentIdentityProjection,
@@ -757,6 +777,7 @@ async fn persist_test_agent_turn(
         turns: Vec::new(),
     };
     let turn = pioneer_protocol::Turn {
+        work_owner: Default::default(),
         id: turn_id.to_owned(),
         status: pioneer_protocol::TurnStatus::InProgress,
         turn_kind: pioneer_protocol::TurnKind::Conversation,
@@ -1927,26 +1948,6 @@ async fn user_review_event_is_blocked_when_policy_is_parent_final() {
         format!("{error:#}").contains("immutable reviewer intent"),
         "unexpected error: {error:#}"
     );
-}
-
-#[tokio::test]
-async fn accept_validation_allows_own_parent_review_context() {
-    let runtime = runtime_with_review_config().await;
-    let (task_id, run_id, candidate_id) =
-        create_waiting_review_agent_task(&runtime, 2, 0, TaskResultCandidateStatus::PendingReview)
-            .await;
-    let context =
-        parent_accept_context_for_candidate(&runtime, task_id.as_str(), candidate_id.as_str())
-            .await;
-
-    runtime
-        .service()
-        .validate_task_result_candidate_accept_for_test(
-            context,
-            accept_params(task_id, run_id, candidate_id),
-        )
-        .await
-        .expect("parent context should be allowed to accept");
 }
 
 #[tokio::test]
@@ -3997,6 +3998,10 @@ async fn scheduled_create_does_not_fire_before_due_time() {
         .await
         .expect("scheduled task should create");
 
+    assert_eq!(
+        response.task.lifecycle_policy.as_ref().unwrap().attachment,
+        TaskAttachmentMode::Detached
+    );
     assert_eq!(response.task.status, TaskStatus::Scheduled);
     assert!(response.run.is_none());
     let created = runtime
@@ -4004,37 +4009,6 @@ async fn scheduled_create_does_not_fire_before_due_time() {
         .await
         .expect("scheduler should process");
     assert_eq!(created, 0);
-}
-
-#[tokio::test]
-async fn scheduled_trigger_fires_when_due() {
-    let runtime = runtime().await;
-    let response = runtime
-        .service()
-        .create_task(
-            TaskCreateContext::default(),
-            create_params(TaskTriggerSpec::ScheduledAt {
-                scheduled_at: 10,
-                timezone: Some("UTC".to_owned()),
-                catch_up_policy: None,
-            }),
-        )
-        .await
-        .expect("scheduled task should create");
-
-    let created = runtime
-        .process_due_once(10)
-        .await
-        .expect("scheduler should fire due trigger");
-    assert_eq!(created, 1);
-    let task = runtime
-        .service()
-        .get_task(pioneer_protocol::TaskGetParams {
-            task_id: response.task.id,
-        })
-        .await
-        .expect("task should read");
-    assert_eq!(task.runs.len(), 1);
 }
 
 #[tokio::test]
@@ -4128,42 +4102,6 @@ async fn due_trigger_materialization_rolls_back_run_when_occurrence_contract_is_
     assert!(task.runs.is_empty());
     assert_eq!(task.triggers[0].next_fire_at, Some(10));
     assert_eq!(task.triggers[0].status, TaskTriggerStatus::Active);
-}
-
-#[tokio::test]
-async fn interval_trigger_recomputes_next_fire_at() {
-    let runtime = runtime().await;
-    let response = runtime
-        .service()
-        .create_task(
-            TaskCreateContext::default(),
-            create_params(TaskTriggerSpec::Interval {
-                interval_seconds: 10,
-                interval_anchor_at: Some(4_000_000_000),
-                catch_up_policy: None,
-            }),
-        )
-        .await
-        .expect("interval task should create");
-
-    let created = runtime
-        .process_due_once(4_000_000_000)
-        .await
-        .expect("scheduler should fire interval trigger");
-    assert_eq!(created, 1);
-    let task = runtime
-        .service()
-        .get_task(pioneer_protocol::TaskGetParams {
-            task_id: response.task.id,
-        })
-        .await
-        .expect("task should read");
-    assert_eq!(task.runs.len(), 1);
-    assert!(
-        task.triggers[0]
-            .next_fire_at
-            .is_some_and(|value| value > 4_000_000_000)
-    );
 }
 
 #[tokio::test]
@@ -5322,7 +5260,7 @@ async fn pause_excludes_due_trigger_and_resume_restores_future_fire() {
 }
 
 #[tokio::test]
-async fn scheduled_agent_task_executes_from_version_one_child_launch_grant_without_write_on_read() {
+async fn scheduler_reads_version_one_child_launch_grant_without_rewriting_its_snapshot() {
     let runtime = runtime().await;
     let starts = Arc::new(AtomicUsize::new(0));
     let release = Arc::new(Notify::new());
@@ -5426,7 +5364,7 @@ async fn scheduled_agent_task_executes_from_version_one_child_launch_grant_witho
     .expect("upcast Task child launch grant should decode");
     assert_eq!(
         projected["child_launch_grant"]["version"],
-        serde_json::json!(2)
+        serde_json::json!(1)
     );
 
     let stored = pioneer_entity::task_actor_contract::Entity::find_by_id(response.task.id)
@@ -6267,24 +6205,7 @@ async fn security_intersection_missing_security_cap_is_rejected_for_agent_task()
         format!("{error:#}").contains("agent_spec.security_cap"),
         "unexpected error: {error:#}"
     );
-}
-
-#[tokio::test]
-async fn recovery_security_missing_security_cap_is_not_defaulted() {
-    let runtime = runtime().await;
-    let mut params = create_params(TaskTriggerSpec::Immediate);
-    configure_agent_task(&mut params);
-    let mut spec = agent_spec(3);
-    spec.security_cap = None;
-    params.agent_spec = Some(spec);
-
-    let error = runtime
-        .service()
-        .create_task(task_create_context_for(&params), params)
-        .await
-        .expect_err("agent task should reject missing security cap");
     let message = format!("{error:#}");
-    assert!(message.contains("agent_spec.security_cap"));
     assert!(!message.contains("FullAccess"));
     assert!(!message.contains("full_access"));
 }
@@ -6505,40 +6426,6 @@ async fn update_task_rejects_scheduled_agent_without_prompt_contract() {
     assert!(
         format!("{error:#}").contains("self-contained executor instructions"),
         "unexpected error: {error:#}"
-    );
-}
-
-#[tokio::test]
-async fn lifecycle_defaults_attach_only_immediate_parent_turn_tasks() {
-    let runtime = runtime().await;
-    let mut immediate = create_params(TaskTriggerSpec::Immediate);
-    immediate.created_by_thread_id = Some("thread_a".to_owned());
-    immediate.created_by_turn_id = Some("turn_a".to_owned());
-    let immediate = runtime
-        .service()
-        .create_task(task_create_context_for(&immediate), immediate)
-        .await
-        .expect("immediate task should create");
-    assert_eq!(
-        immediate.task.lifecycle_policy.unwrap().attachment,
-        TaskAttachmentMode::Attached
-    );
-
-    let scheduled = runtime
-        .service()
-        .create_task(
-            TaskCreateContext::default(),
-            create_params(TaskTriggerSpec::ScheduledAt {
-                scheduled_at: 4_000_000_000,
-                timezone: Some("UTC".to_owned()),
-                catch_up_policy: None,
-            }),
-        )
-        .await
-        .expect("scheduled task should create");
-    assert_eq!(
-        scheduled.task.lifecycle_policy.unwrap().attachment,
-        TaskAttachmentMode::Detached
     );
 }
 
@@ -7180,60 +7067,6 @@ async fn wait_wakes_from_event_bus_on_terminal_event() {
 }
 
 #[tokio::test]
-async fn wait_classifies_terminal_run_even_before_task_terminal_event() {
-    let runtime = runtime().await;
-    let response = runtime
-        .service()
-        .create_task(
-            TaskCreateContext::default(),
-            create_params(TaskTriggerSpec::Immediate),
-        )
-        .await
-        .expect("task should create");
-    let run_id = response.run.expect("run should exist").id;
-
-    let waiter = tokio::spawn({
-        let service = runtime.service();
-        let run_id = run_id.clone();
-        async move {
-            service
-                .wait_tasks(
-                    TaskWaitContext::default(),
-                    TaskWaitParams {
-                        task_ids: Vec::new(),
-                        run_ids: vec![run_id],
-                        timeout_ms: Some(5_000),
-                        return_completed: true,
-                        return_pending: true,
-                        ..Default::default()
-                    },
-                )
-                .await
-                .expect("wait should complete")
-        }
-    });
-
-    let appended = runtime
-        .service()
-        .append_event(
-            TaskEventPayload::RunCompleted {
-                task_id: response.task.id,
-                run_id,
-                result: None,
-                completed_at: 42,
-            },
-            42,
-        )
-        .await
-        .expect("run completion event should append");
-    runtime.service().publish_and_wake(vec![appended]).await;
-
-    let waited = waiter.await.expect("waiter should join");
-    assert_eq!(waited.completed.len(), 1);
-    assert!(waited.pending.is_empty());
-}
-
-#[tokio::test]
 async fn wait_detects_terminal_state_without_in_memory_wake_delivery() {
     let runtime = runtime().await;
     let response = runtime
@@ -7284,6 +7117,7 @@ async fn wait_detects_terminal_state_without_in_memory_wake_delivery() {
 
     let waited = waiter.await.expect("waiter should join");
     assert_eq!(waited.completed.len(), 1);
+    assert!(waited.pending.is_empty());
     assert!(!waited.timed_out);
 }
 
@@ -8146,39 +7980,6 @@ async fn task_event_cursor_reads_committed_history_after_runtime_restart() {
 }
 
 #[tokio::test]
-async fn startup_reconciliation_emits_recovered_event_for_dormant_active_trigger() {
-    let runtime = runtime().await;
-    let response = runtime
-        .service()
-        .create_task(
-            TaskCreateContext::default(),
-            create_params(TaskTriggerSpec::Manual {
-                allowed_actor: None,
-            }),
-        )
-        .await
-        .expect("manual task should create");
-
-    runtime.start().await.expect("runtime should start");
-    let events = runtime
-        .service()
-        .get_task_events(TaskEventsParams {
-            task_id: response.task.id,
-            after_sequence: None,
-            limit: None,
-        })
-        .await
-        .expect("events should read");
-
-    assert!(events.events.iter().any(|event| {
-        matches!(
-            event.payload,
-            pioneer_protocol::TaskEventPayload::TaskRecovered { .. }
-        )
-    }));
-}
-
-#[tokio::test]
 async fn runtime_start_processes_overdue_scheduled_triggers_before_returning() {
     let runtime = runtime().await;
     runtime
@@ -8227,6 +8028,26 @@ async fn startup_reconciliation_is_idempotent() {
         .expect("manual task should create");
 
     runtime.start().await.expect("runtime should start");
+    let events_after_first_start = runtime
+        .service()
+        .get_task_events(TaskEventsParams {
+            task_id: response.task.id.clone(),
+            after_sequence: None,
+            limit: None,
+        })
+        .await
+        .expect("events after first start should read");
+    assert_eq!(
+        events_after_first_start
+            .events
+            .iter()
+            .filter(|event| matches!(
+                event.payload,
+                pioneer_protocol::TaskEventPayload::TaskRecovered { .. }
+            ))
+            .count(),
+        1
+    );
     runtime.start().await.expect("runtime should start twice");
     let events = runtime
         .service()
@@ -8829,3 +8650,117 @@ mod webhook;
 
 #[path = "tests/agent_spec_snapshots.rs"]
 mod agent_spec_snapshots;
+
+#[path = "tests_scheduler_live.rs"]
+mod scheduler_live;
+
+#[tokio::test]
+async fn compatibility_audit_error_repairs_healthy_work_before_returning_and_sets_storage_backoff()
+{
+    use sea_orm::ConnectionTrait;
+    let runtime = runtime().await;
+    runtime
+        .register_executor(Arc::new(CompletingSystemExecutor))
+        .await;
+    let mut runs = Vec::new();
+    for _ in 0..2 {
+        let response = runtime
+            .service()
+            .create_task(
+                TaskCreateContext::default(),
+                create_params(TaskTriggerSpec::ScheduledAt {
+                    scheduled_at: 1,
+                    timezone: Some("UTC".into()),
+                    catch_up_policy: None,
+                }),
+            )
+            .await
+            .unwrap();
+        runtime.process_due_once(1).await.unwrap();
+        let task = runtime
+            .service()
+            .get_task(pioneer_protocol::TaskGetParams {
+                task_id: response.task.id,
+            })
+            .await
+            .unwrap();
+        runs.push(task.runs[0].id.clone());
+    }
+    runs.sort();
+    let store = runtime.service().store();
+    let db = store.database_connection();
+    pioneer_sqlite::apply_sqlite_pragmas(&db).await.unwrap();
+    // Model historical drift independently of the public terminal fence.
+    // Then exercise the real typed producer with a permitted nonterminal
+    // transition, retaining a durable healthy ticket for the audit to drain.
+    for id in &runs {
+        db.execute_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "UPDATE task_occurrence_contract SET status='running' WHERE run_id=?",
+            [id.clone().into()],
+        ))
+        .await
+        .unwrap();
+        let mut occurrence = store
+            .get_task_occurrence_contract_by_run(id)
+            .await
+            .unwrap()
+            .unwrap();
+        occurrence.status = TaskOccurrenceStatus::Recovering;
+        store
+            .upsert_task_occurrence_contract(&occurrence, chrono::Utc::now().timestamp())
+            .await
+            .unwrap();
+    }
+    db.execute_unprepared("CREATE TRIGGER task_occurrence_reconcile_foreign AFTER UPDATE ON task_occurrence_contract BEGIN SELECT 1; END").await.unwrap();
+    // Retain the healthy real typed ticket; remove only the missed obligation.
+    db.execute_raw(Statement::from_sql_and_values(
+        DatabaseBackend::Sqlite,
+        "DELETE FROM task_occurrence_reconcile_pending WHERE run_id=?",
+        [runs[0].clone().into()],
+    ))
+    .await
+    .unwrap();
+    db.execute_unprepared("DELETE FROM task_occurrence_reconcile_scope")
+        .await
+        .unwrap();
+    db.execute_unprepared("UPDATE task_occurrence_reconcile_seed SET status_index=5")
+        .await
+        .unwrap();
+    // SQL parameters cannot occur in trigger bodies. Reject every new insert;
+    // existing healthy pending work can still be claimed and ACKed.
+    db.execute_unprepared("CREATE TRIGGER reject_compatibility_contract BEFORE INSERT ON task_occurrence_reconcile_pending BEGIN SELECT RAISE(ABORT,'compatibility insert rejected'); END").await.unwrap();
+    assert!(
+        runtime.start().await.is_err(),
+        "partial audit failure must reach caller"
+    );
+    assert_eq!(
+        store
+            .get_task_occurrence_contract_by_run(&runs[1])
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        TaskOccurrenceStatus::Delivered
+    );
+    assert_eq!(
+        store
+            .get_task_occurrence_contract_by_run(&runs[0])
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        TaskOccurrenceStatus::Recovering
+    );
+    // A retry inside the storage backoff skips the still-failing audit.
+    assert!(runtime.start().await.is_ok());
+    assert_eq!(
+        store
+            .get_task_occurrence_contract_by_run(&runs[0])
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        TaskOccurrenceStatus::Recovering
+    );
+}

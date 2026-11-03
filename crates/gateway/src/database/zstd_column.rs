@@ -3539,6 +3539,18 @@ mod tests {
         assert_eq!(turn_item_view, 1);
         assert_eq!(turn_event_rows, 120);
         assert_eq!(turn_item_rows, 120);
+        let event_pending = query_i64(
+            &connection,
+            "SELECT COUNT(*) AS value FROM _turn_event_zstd WHERE _payload_dict IS NULL",
+        )
+        .await;
+        let item_pending = query_i64(
+            &connection,
+            "SELECT COUNT(*) AS value FROM _turn_item_zstd WHERE _payload_dict IS NULL",
+        )
+        .await;
+        assert_eq!(event_pending, 0);
+        assert_eq!(item_pending, 0);
     }
 
     #[tokio::test]
@@ -3596,56 +3608,6 @@ mod tests {
             .expect("queued periodic maintenance should succeed");
         assert!(!outcome.deferred);
         assert!(!outcome.summaries.is_empty());
-    }
-
-    #[tokio::test]
-    async fn startup_compression_enables_all_payload_columns_in_same_database() {
-        pioneer_sqlite::zstd::register_auto_extension_once()
-            .expect("sqlite-zstd auto-extension should register");
-        let connection = Database::connect("sqlite::memory:")
-            .await
-            .expect("must connect sqlite memory");
-        Migrator::up(&connection, None)
-            .await
-            .expect("migrations must succeed");
-
-        insert_turn_events(&connection, 120).await;
-        insert_turn_items(&connection, 120).await;
-
-        let store = CrudStore::new(connection.clone());
-        for config in ZSTD_PAYLOAD_COLUMNS {
-            let summary = run_startup_once(&store, *config, None, 1.0)
-                .await
-                .expect("payload compression should enable for all configured columns");
-            assert!(summary.enabled_now);
-            assert_eq!(summary.pending_after, 0);
-        }
-
-        let turn_event_view = query_i64(
-            &connection,
-            "SELECT COUNT(*) AS value FROM sqlite_master WHERE type = 'view' AND name = 'turn_event'",
-        )
-        .await;
-        let turn_item_view = query_i64(
-            &connection,
-            "SELECT COUNT(*) AS value FROM sqlite_master WHERE type = 'view' AND name = 'turn_item'",
-        )
-        .await;
-        let turn_event_pending = query_i64(
-            &connection,
-            "SELECT COUNT(*) AS value FROM _turn_event_zstd WHERE _payload_dict IS NULL",
-        )
-        .await;
-        let turn_item_pending = query_i64(
-            &connection,
-            "SELECT COUNT(*) AS value FROM _turn_item_zstd WHERE _payload_dict IS NULL",
-        )
-        .await;
-
-        assert_eq!(turn_event_view, 1);
-        assert_eq!(turn_item_view, 1);
-        assert_eq!(turn_event_pending, 0);
-        assert_eq!(turn_item_pending, 0);
     }
 
     async fn insert_turn_events(connection: &DatabaseConnection, count: i64) {

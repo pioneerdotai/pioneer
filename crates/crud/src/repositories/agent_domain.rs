@@ -54,7 +54,9 @@ pub const AGENT_ACTION_OUTBOX_MAX_ATTEMPTS: i64 = 8;
 const _: () = assert!(AGENT_ACTION_OUTBOX_MAX_ATTEMPTS == 8);
 const AGENT_ACTION_OUTBOX_BATCH_LIMIT: u64 = 64;
 const AGENT_ACTION_OUTBOX_RANGE_LIMIT: u64 = 32;
-const AGENT_ACTION_OUTBOX_IMMEDIATE_SQL: &str = "SELECT id FROM agent_action_outbox WHERE next_attempt_at IS NULL AND status IN ('pending','failed') AND attempts<8 AND (status='pending' OR last_error IS NULL OR last_error NOT IN ('outbox_start_integrity_rejected','outbox_start_authority_denied','outbox_start_runtime_unavailable','outbox_foreground_conflict','outbox_start_outcome_unknown')) ORDER BY created_at,id LIMIT ?";
+// Keep the existing partial-index predicate intact; the additional exclusion
+// closes corrupt detached bindings without ACKing or retrying them forever.
+const AGENT_ACTION_OUTBOX_IMMEDIATE_SQL: &str = "SELECT id FROM agent_action_outbox WHERE next_attempt_at IS NULL AND status IN ('pending','failed') AND attempts<8 AND (status='pending' OR last_error IS NULL OR last_error NOT IN ('outbox_start_integrity_rejected','outbox_start_authority_denied','outbox_start_runtime_unavailable','outbox_foreground_conflict','outbox_start_outcome_unknown')) AND (status!='failed' OR COALESCE(last_error,'')!='outbox_detached_binding_rejected') ORDER BY created_at,id LIMIT ?";
 const AGENT_ACTION_OUTBOX_TIMED_SQL: &str = "SELECT id FROM agent_action_outbox WHERE next_attempt_at IS NOT NULL AND (status='pending' OR (status='failed' AND attempts<8)) AND next_attempt_at<=? ORDER BY next_attempt_at,created_at,id LIMIT ?";
 const AGENT_ACTION_OUTBOX_FAILURE_CLASS: &str = "outbox_delivery_failed";
 // An exhausted StartAgent still owes outcome reconciliation, never delivery.
@@ -65,9 +67,10 @@ pub const AGENT_START_RECONCILIATION_REQUIRED: &str = "outbox_start_reconciliati
 // terminal generation/resources and never redelivers an exhausted model start.
 // The immutable payload kind narrows the index; missing/invalid kind remains a
 // candidate. The action join remains authoritative, never payload authorization.
-const AGENT_START_RECONCILIATION_SQL: &str = "SELECT o.id FROM agent_action_outbox o JOIN agent_action a ON a.id=o.action_id WHERE a.action_kind='start_agent' AND o.status IN ('pending','failed') AND o.attempts=8 AND COALESCE(CASE WHEN json_valid(payload_json) THEN json_extract(payload_json,'$.kind') END,'start_agent')='start_agent' AND (o.next_attempt_at IS NULL OR o.next_attempt_at<=?) ORDER BY o.next_attempt_at,o.created_at,o.id LIMIT ?";
+const AGENT_START_RECONCILIATION_SQL: &str = "SELECT o.id FROM agent_action_outbox o JOIN agent_action a ON a.id=o.action_id WHERE a.action_kind='start_agent' AND o.status IN ('pending','failed') AND o.attempts=8 AND NOT (o.status='failed' AND o.next_attempt_at IS NULL AND COALESCE(o.last_error,'')='outbox_detached_binding_rejected') AND COALESCE(CASE WHEN json_valid(payload_json) THEN json_extract(payload_json,'$.kind') END,'start_agent')='start_agent' AND (o.next_attempt_at IS NULL OR o.next_attempt_at<=?) ORDER BY o.next_attempt_at,o.created_at,o.id LIMIT ?";
 
-const AGENT_START_TERMINAL_FAILURE_CLASSES: [&str; 5] = [
+const AGENT_START_TERMINAL_FAILURE_CLASSES: [&str; 6] = [
+    "outbox_detached_binding_rejected",
     "outbox_start_integrity_rejected",
     "outbox_start_authority_denied",
     "outbox_start_runtime_unavailable",
@@ -1033,6 +1036,10 @@ pub async fn insert_agent_execution<C: ConnectionTrait>(
     if input.execution_generation < 1 {
         bail!("execution generation must be positive");
     }
+    let occurrence_old_agent = agent_execution::Entity::find_by_id(&input.id)
+        .lock_exclusive()
+        .one(db)
+        .await?;
     agent_execution::Entity::insert(agent_execution::ActiveModel {
         id: Set(input.id.clone()),
         workspace_id: Set(input.workspace_id.clone()),
@@ -1065,6 +1072,7 @@ pub async fn insert_agent_execution<C: ConnectionTrait>(
     .await
     .context("failed to persist agent execution")?;
     let execution = agent_execution::Entity::find_by_id(input.id.clone())
+        .lock_exclusive()
         .one(db)
         .await
         .context("failed to reload agent execution")?
@@ -1088,6 +1096,12 @@ pub async fn insert_agent_execution<C: ConnectionTrait>(
     {
         bail!("agent execution id was reused with different immutable execution facts");
     }
+    super::task_occurrence_producers::agent_change(
+        db,
+        occurrence_old_agent.as_ref(),
+        Some(&execution),
+    )
+    .await?;
     Ok(execution)
 }
 
@@ -2380,6 +2394,9 @@ pub async fn insert_agent_execution_grant<C: ConnectionTrait>(
 ) -> Result<agent_execution_grant::Model> {
     let (identity, profile, child_launch_grant) =
         parse_agent_execution_launch_grant(input.grant_json.as_str())?;
+    child_launch_grant.validate_for_execution().map_err(|_| {
+        anyhow::anyhow!("historical child launch ceiling cannot authorize a new execution")
+    })?;
     if input.grant_fingerprint != agent_execution_grant_fingerprint(input.grant_json.as_str())?
         || !agent_execution_launch_grant_matches_child_identity(
             &identity,
@@ -2413,7 +2430,7 @@ pub async fn insert_agent_execution_grant<C: ConnectionTrait>(
         .context("failed to reload agent execution grant")?
         .context("agent execution grant disappeared after idempotent insert")?;
     let grant = upgrade_agent_execution_grant_model_to_current(grant)
-        .context("failed to upcast reloaded agent execution grant")?;
+        .context("failed to validate reloaded agent execution grant")?;
     if grant.execution_id != input.execution_id
         || grant.parent_execution_id != input.parent_execution_id
         || grant.child_identity_id != input.child_identity_id
@@ -2436,24 +2453,17 @@ pub fn agent_execution_grant_fingerprint(grant_json: &str) -> Result<String> {
     Ok(hex::encode(digest.finalize()))
 }
 
-/// Verifies an immutable AgentExecution grant in its stored representation,
-/// then upcasts only its embedded child-launch ceiling for current readers.
-/// The returned model is an in-memory projection; background maintenance owns
-/// durable rewrites so ordinary reads never acquire a write dependency.
+/// Verifies the original outer and nested snapshots. Neither the bytes nor
+/// either fingerprint may be rewritten by a reader.
 pub fn upgrade_agent_execution_grant_model_to_current(
-    mut grant: agent_execution_grant::Model,
+    grant: agent_execution_grant::Model,
 ) -> Result<agent_execution_grant::Model> {
     let stored_fingerprint = agent_execution_grant_fingerprint(grant.grant_json.as_str())?;
     if grant.grant_fingerprint != stored_fingerprint {
         bail!("agent execution grant fingerprint does not match its stored JSON");
     }
-
-    let migrated = pioneer_protocol::migrate_embedded_child_launch_grant_json_to_current(
-        grant.grant_json.as_str(),
-    )
-    .context("failed to upcast agent execution child launch ceiling")?;
     let (identity, profile, child_launch_grant) =
-        parse_agent_execution_launch_grant(migrated.as_str())?;
+        parse_agent_execution_launch_grant(grant.grant_json.as_str())?;
     if !agent_execution_launch_grant_matches_child_identity(
         &identity,
         &profile,
@@ -2461,11 +2471,6 @@ pub fn upgrade_agent_execution_grant_model_to_current(
         grant.child_identity_id.as_str(),
     ) {
         bail!("agent execution grant identity/profile is outside its child launch ceiling");
-    }
-
-    if migrated != grant.grant_json {
-        grant.grant_fingerprint = agent_execution_grant_fingerprint(migrated.as_str())?;
-        grant.grant_json = migrated;
     }
     Ok(grant)
 }
@@ -2477,12 +2482,9 @@ fn agent_execution_launch_grant_matches_child_identity(
     child_identity_id: &str,
 ) -> bool {
     identity.id.as_str() == child_identity_id
-        && pioneer_protocol::validate_selected_agent_launch_profile(
-            identity,
-            profile,
-            &child_launch_grant.identities,
-        )
-        .is_ok()
+        && child_launch_grant
+            .validate_selected_profile(identity, profile)
+            .is_ok()
 }
 
 fn parse_agent_execution_launch_grant(
@@ -2532,7 +2534,7 @@ pub async fn load_agent_execution_grant<C: ConnectionTrait>(
         .context("failed to load agent execution grant")?
         .map(upgrade_agent_execution_grant_model_to_current)
         .transpose()
-        .context("failed to upcast loaded agent execution grant")
+        .context("failed to validate loaded agent execution grant")
 }
 
 pub async fn insert_agent_turn_response<C: ConnectionTrait>(
@@ -4959,7 +4961,7 @@ where
                 let compacted = agent_action_compaction_marker(
                     AGENT_ACTION_COMPACTION_FORMAT,
                     original,
-                    serde_json::Map::new(),
+                    retained_thread_action_result(original),
                 );
                 released = released.saturating_add(compacted_bytes(original, &compacted));
                 (original.to_owned(), compacted)
@@ -4974,7 +4976,7 @@ where
                 let compacted = agent_action_compaction_marker(
                     AGENT_ACTION_RECEIPT_COMPACTION_FORMAT,
                     original,
-                    serde_json::Map::new(),
+                    retained_thread_action_result(original),
                 );
                 released = released.saturating_add(compacted_bytes(original, &compacted));
                 (original.to_owned(), compacted)
@@ -5084,7 +5086,23 @@ fn compacted_agent_action_outbox_payload(
             spawned_execution_id.clone(),
         );
     }
-    if action.action_kind == "start_agent" {
+    if original
+        .get("execution_mode")
+        .and_then(serde_json::Value::as_str)
+        == Some("detached_task")
+    {
+        // Preserve the accepted execution strategy and Task binding. Replaying
+        // this action must never reinterpret it as a direct model launch.
+        for field in ["execution_mode", "task_id", "thread_id", "turn_id"] {
+            retained.insert(
+                field.to_owned(),
+                original
+                    .get(field)
+                    .context("detached action binding is missing")?
+                    .clone(),
+            );
+        }
+    } else if action.action_kind == "start_agent" {
         // Keep only the immutable binding required for terminal reconciliation;
         // input, launch parameters and the runtime dispatch payload are released.
         let turn_id = original
@@ -5110,6 +5128,19 @@ fn compacted_agent_action_outbox_payload(
         outbox.payload_json.as_str(),
         retained,
     ))
+}
+
+fn retained_thread_action_result(original: &str) -> serde_json::Map<String, serde_json::Value> {
+    let mut retained = serde_json::Map::new();
+    if let Some(result) = serde_json::from_str::<serde_json::Value>(original)
+        .ok()
+        .and_then(|response| response.get("threadResult").cloned())
+    {
+        // Small immutable navigation references must outlive bulky response
+        // material. Keep the exact issued value, without later enrichment.
+        retained.insert("threadResult".to_owned(), result);
+    }
+    retained
 }
 
 fn agent_action_compaction_marker(
@@ -5428,6 +5459,13 @@ async fn transition_agent_action_outbox<C: ConnectionTrait>(
     {
         return Ok(false);
     }
+    if candidate.status == "failed"
+        && candidate.next_attempt_at.is_none()
+        && candidate.last_error.as_deref()
+            == Some(AgentActionOutboxFailure::InvalidDetachedBinding.safe_name())
+    {
+        return Ok(false);
+    }
     let exhausted = candidate.attempts >= AGENT_ACTION_OUTBOX_MAX_ATTEMPTS;
     let reconcile_start = exhausted
         && agent_action::Entity::find_by_id(candidate.action_id.clone())
@@ -5547,6 +5585,7 @@ pub enum AgentActionOutboxFailure {
     DeliveryFailed,
     StorageUnavailable,
     InvalidStart,
+    InvalidDetachedBinding,
     AuthorityDenied,
     RuntimeUnavailable,
     PreparationUnavailable,
@@ -5560,6 +5599,7 @@ impl AgentActionOutboxFailure {
             Self::DeliveryFailed => "outbox_delivery_failed",
             Self::StorageUnavailable => "outbox_storage_unavailable",
             Self::InvalidStart => "outbox_start_integrity_rejected",
+            Self::InvalidDetachedBinding => "outbox_detached_binding_rejected",
             Self::AuthorityDenied => "outbox_start_authority_denied",
             Self::RuntimeUnavailable => "outbox_start_runtime_unavailable",
             Self::PreparationUnavailable => "outbox_start_preparation_unavailable",
@@ -5919,7 +5959,13 @@ pub async fn commit_agent_execution_graph(
     }
     let (grant_identity, grant_profile, child_launch_grant) =
         parse_agent_execution_launch_grant(input.grant.grant_json.as_str())?;
-    let existing = load_agent_execution(db, &input.child_execution.id).await?;
+    child_launch_grant.validate_for_execution().map_err(|_| {
+        anyhow::anyhow!("historical child launch ceiling cannot authorize a new execution")
+    })?;
+    let existing = agent_execution::Entity::find_by_id(&input.child_execution.id)
+        .lock_exclusive()
+        .one(db)
+        .await?;
     let identity = ensure_agent_identity(db, &input.identity).await?;
     if identity.workspace_id != input.child_execution.workspace_id
         || agent_identity_source_kind(&identity.source_kind)? != grant_identity.source_kind
@@ -6087,6 +6133,7 @@ pub async fn commit_agent_execution_graph(
         insert_agent_execution(db, root_execution).await?
     } else {
         agent_execution::Entity::find_by_id(input.root_execution_id.clone())
+            .lock_exclusive()
             .one(db)
             .await
             .context("failed to load inherited work-graph root")?
@@ -6134,6 +6181,7 @@ pub async fn commit_agent_execution_graph(
         .or(source_grant.source_execution_id.as_deref());
     if let Some(parent_execution_id) = launch_source {
         let parent = agent_execution::Entity::find_by_id(parent_execution_id.to_owned())
+            .lock_exclusive()
             .one(db)
             .await
             .context("failed to load exact parent execution")?
@@ -6149,6 +6197,9 @@ pub async fn commit_agent_execution_graph(
             .context("exact parent execution has no immutable launch grant")?;
         let (_, _, parent_launch_grant) =
             parse_agent_execution_launch_grant(parent_grant.grant_json.as_str())?;
+        parent_launch_grant.validate_for_execution().map_err(|_| {
+            anyhow::anyhow!("historical parent launch ceiling cannot authorize a new execution")
+        })?;
         let ephemeral_child =
             grant_identity.source_kind == pioneer_protocol::AgentIdentitySourceKind::Ephemeral;
         let identity_ceiling_is_monotonic = child_launch_grant.identities.iter().all(|candidate| {
@@ -6456,6 +6507,10 @@ pub async fn commit_agent_execution_graph(
             },
         )
         .await?;
+        let occurrence_old_agent = agent_execution::Entity::find_by_id(execution_id)
+            .lock_exclusive()
+            .one(db)
+            .await?;
         let execution_result = agent_execution::Entity::update_many()
             .col_expr(
                 agent_execution::Column::Status,
@@ -6470,6 +6525,16 @@ pub async fn commit_agent_execution_graph(
             .exec(db)
             .await
             .context("failed to mark fair queued task agent execution")?;
+        let occurrence_new_agent = agent_execution::Entity::find_by_id(execution_id)
+            .lock_exclusive()
+            .one(db)
+            .await?;
+        super::task_occurrence_producers::agent_change(
+            db,
+            occurrence_old_agent.as_ref(),
+            occurrence_new_agent.as_ref(),
+        )
+        .await?;
         if execution_result.rows_affected != 1 {
             bail!("fair queued task agent execution changed concurrently");
         }
@@ -6566,6 +6631,10 @@ pub async fn commit_agent_execution_graph(
         },
     )
     .await?;
+    let occurrence_old_agent = agent_execution::Entity::find_by_id(execution_id)
+        .lock_exclusive()
+        .one(db)
+        .await?;
     let execution_result = agent_execution::Entity::update_many()
         .col_expr(
             agent_execution::Column::Status,
@@ -6580,6 +6649,16 @@ pub async fn commit_agent_execution_graph(
         .exec(db)
         .await
         .context("failed to mark queued task agent execution")?;
+    let occurrence_new_agent = agent_execution::Entity::find_by_id(execution_id)
+        .lock_exclusive()
+        .one(db)
+        .await?;
+    super::task_occurrence_producers::agent_change(
+        db,
+        occurrence_old_agent.as_ref(),
+        occurrence_new_agent.as_ref(),
+    )
+    .await?;
     if execution_result.rows_affected != 1 {
         bail!("queued task agent execution changed concurrently");
     }
@@ -6743,6 +6822,7 @@ pub async fn finalize_agent_execution<C: ConnectionTrait>(
     };
 
     let execution = agent_execution::Entity::find_by_id(execution_id.to_owned())
+        .lock_exclusive()
         .one(db)
         .await
         .context("failed to load agent execution for finalization")?
@@ -6774,6 +6854,16 @@ pub async fn finalize_agent_execution<C: ConnectionTrait>(
         .exec(db)
         .await
         .context("failed to finalize agent execution")?;
+    let occurrence_new_agent = agent_execution::Entity::find_by_id(execution_id)
+        .lock_exclusive()
+        .one(db)
+        .await?;
+    super::task_occurrence_producers::agent_change(
+        db,
+        Some(&execution),
+        occurrence_new_agent.as_ref(),
+    )
+    .await?;
 
     let states = agent_execution_resource_state::Entity::find()
         .filter(agent_execution_resource_state::Column::ExecutionId.eq(execution_id.to_owned()))
@@ -6872,6 +6962,7 @@ pub async fn reopen_agent_execution_for_retry<C: ConnectionTrait>(
     reopened_at: DateTimeWithTimeZone,
 ) -> Result<bool> {
     let execution = agent_execution::Entity::find_by_id(execution_id.to_owned())
+        .lock_exclusive()
         .one(db)
         .await
         .context("failed to load AgentExecution for retry")?
@@ -6939,6 +7030,16 @@ pub async fn reopen_agent_execution_for_retry<C: ConnectionTrait>(
         .exec(db)
         .await
         .context("failed to reopen AgentExecution for retry")?;
+    let occurrence_new_agent = agent_execution::Entity::find_by_id(execution_id)
+        .lock_exclusive()
+        .one(db)
+        .await?;
+    super::task_occurrence_producers::agent_change(
+        db,
+        Some(&execution),
+        occurrence_new_agent.as_ref(),
+    )
+    .await?;
     Ok(reopened.rows_affected == 1)
 }
 
@@ -6975,6 +7076,7 @@ async fn cancel_agent_work_graph_targets(
     collect_owners: bool,
 ) -> Result<Vec<AgentWorkGraphCancellationTarget>> {
     let root = agent_execution::Entity::find_by_id(root_execution_id.to_owned())
+        .lock_exclusive()
         .one(db)
         .await
         .context("failed to load Agent work-graph root for cancellation")?
@@ -7010,6 +7112,7 @@ async fn cancel_agent_work_graph_targets(
     let executions = agent_execution::Entity::find()
         .filter(agent_execution::Column::WorkGraphRootExecutionId.eq(root_execution_id.to_owned()))
         .limit(graph_row_limit)
+        .lock_exclusive()
         .all(db)
         .await
         .context("failed to load Agent work graph for cancellation")?;
@@ -7164,6 +7267,24 @@ async fn cancel_agent_work_graph_targets(
             .collect()
     };
 
+    let occurrence_old_executions = task_run_execution::Entity::find()
+        .filter(task_run_execution::Column::Id.is_in(active_ids.clone()))
+        .limit(graph_row_limit)
+        .lock_exclusive()
+        .all(db)
+        .await?;
+    let occurrence_old_contracts = task_occurrence_contract::Entity::find()
+        .filter(
+            task_occurrence_contract::Column::WorkGraphRootExecutionId
+                .eq(root_execution_id.to_owned()),
+        )
+        .limit(graph_row_limit)
+        .lock_exclusive()
+        .all(db)
+        .await?;
+    if occurrence_old_contracts.len() >= usize::try_from(graph_row_limit).unwrap_or(usize::MAX) {
+        bail!("Task occurrence graph exceeds bounded cancellation policy");
+    }
     if !active_ids.is_empty() {
         agent_execution::Entity::update_many()
             .col_expr(
@@ -7342,6 +7463,27 @@ async fn cancel_agent_work_graph_targets(
         .exec(db)
         .await
         .context("failed to close cancelled Agent work-graph scope")?;
+    for old in &executions {
+        let new = agent_execution::Entity::find_by_id(&old.id)
+            .lock_exclusive()
+            .one(db)
+            .await?;
+        super::task_occurrence_producers::agent_change(db, Some(old), new.as_ref()).await?;
+    }
+    for old in &occurrence_old_executions {
+        let new = task_run_execution::Entity::find_by_id(old.id.clone())
+            .lock_exclusive()
+            .one(db)
+            .await?;
+        super::task_occurrence_producers::execution_change(db, Some(old), new.as_ref()).await?;
+    }
+    for old in &occurrence_old_contracts {
+        let new = task_occurrence_contract::Entity::find_by_id(old.occurrence_id.clone())
+            .lock_exclusive()
+            .one(db)
+            .await?;
+        super::task_occurrence_producers::contract_change(db, Some(old), new.as_ref()).await?;
+    }
     Ok(targets)
 }
 
@@ -7649,6 +7791,10 @@ async fn bind_running_state<C: ConnectionTrait>(
             "agent execution resource state `{state_id}` was not found for execution `{execution_id}`"
         );
     }
+    let occurrence_old_agent = agent_execution::Entity::find_by_id(execution_id)
+        .lock_exclusive()
+        .one(db)
+        .await?;
     let execution_result = agent_execution::Entity::update_many()
         .col_expr(
             agent_execution::Column::Status,
@@ -7668,6 +7814,16 @@ async fn bind_running_state<C: ConnectionTrait>(
         .exec(db)
         .await
         .context("failed to mark task agent execution running")?;
+    let occurrence_new_agent = agent_execution::Entity::find_by_id(execution_id)
+        .lock_exclusive()
+        .one(db)
+        .await?;
+    super::task_occurrence_producers::agent_change(
+        db,
+        occurrence_old_agent.as_ref(),
+        occurrence_new_agent.as_ref(),
+    )
+    .await?;
     if execution_result.rows_affected != 1 {
         bail!(
             "agent execution `{execution_id}` was not in a bindable state while acquiring permit `{permit_id}`"
@@ -7696,7 +7852,7 @@ mod tests {
     use migration::{Migrator, MigratorTrait};
     use sea_orm::{Database, DatabaseBackend, TransactionTrait};
 
-    fn version_one_child_launch_grant() -> serde_json::Value {
+    pub(super) fn version_one_child_launch_grant() -> serde_json::Value {
         serde_json::json!({
             "version": 1,
             "identities": [{
@@ -7747,7 +7903,7 @@ mod tests {
     }
 
     #[test]
-    fn execution_grant_read_projection_verifies_v1_before_upcasting_and_rehashing_outer_json() {
+    fn execution_grant_history_verifies_v1_and_preserves_both_original_checksums() {
         let child = version_one_child_launch_grant();
         let grant_json = serde_json::json!({
             "kind": "test",
@@ -7774,10 +7930,30 @@ mod tests {
             serde_json::from_str(upgraded.grant_json.as_str()).expect("upgraded grant JSON");
         assert_eq!(
             upgraded_json["child_launch_grant"]["version"],
-            serde_json::json!(2)
+            serde_json::json!(1)
         );
-        assert_ne!(upgraded.grant_json, model.grant_json);
-        assert_ne!(upgraded.grant_fingerprint, stored_fingerprint);
+        assert_eq!(upgraded.grant_json, model.grant_json);
+        assert_eq!(upgraded.grant_fingerprint, stored_fingerprint);
+        let (_, _, child) = parse_agent_execution_launch_grant(&upgraded.grant_json).unwrap();
+        assert!(child.validate_for_execution().is_err());
+        let mut widened_profile = model.clone();
+        let mut outer: serde_json::Value =
+            serde_json::from_str(&widened_profile.grant_json).unwrap();
+        outer["profile"]["modelId"] = serde_json::json!("not-in-historical-ceiling");
+        widened_profile.grant_json = outer.to_string();
+        widened_profile.grant_fingerprint =
+            agent_execution_grant_fingerprint(&widened_profile.grant_json).unwrap();
+        assert!(upgrade_agent_execution_grant_model_to_current(widened_profile).is_err());
+        let mut broken_child = model.clone();
+        let mut outer: serde_json::Value = serde_json::from_str(&broken_child.grant_json).unwrap();
+        outer["child_launch_grant"]["allowServerDerivedEphemeral"] = serde_json::json!(true);
+        broken_child.grant_json = outer.to_string();
+        broken_child.grant_fingerprint =
+            agent_execution_grant_fingerprint(&broken_child.grant_json).unwrap();
+        assert!(
+            upgrade_agent_execution_grant_model_to_current(broken_child).is_err(),
+            "a valid outer checksum cannot replace the nested integrity check"
+        );
         assert_eq!(
             upgraded.grant_fingerprint,
             agent_execution_grant_fingerprint(upgraded.grant_json.as_str())
@@ -7830,16 +8006,6 @@ mod tests {
         let mut foreign = model;
         foreign.child_identity_id = "Z00000000000000000001".into();
         assert!(upgrade_agent_execution_grant_model_to_current(foreign).is_err());
-    }
-
-    #[test]
-    fn nickname_rules_are_explicit_and_lowercase() {
-        assert!(
-            "agent-1".chars().all(|c| c.is_ascii_lowercase()
-                || c.is_ascii_digit()
-                || matches!(c, '-' | '_' | '.'))
-        );
-        assert!(!"Agent".chars().all(|c| c.is_ascii_lowercase()));
     }
 
     #[test]
@@ -8664,7 +8830,13 @@ mod tests {
         let now = utc_now();
         let old = now.clone() - Duration::days(AGENT_ACTION_LEDGER_PAYLOAD_RETENTION_DAYS + 1);
         let recent = now.clone() - Duration::days(AGENT_ACTION_LEDGER_PAYLOAD_RETENTION_DAYS - 1);
-        let old_response = serde_json::json!({"result": "x".repeat(4096)}).to_string();
+        let issued_result = serde_json::json!({
+            "workspaceId":"workspace-old", "threadId":"thread-old",
+            "turnId":"turn-old", "executionId":"spawned-old",
+        });
+        let old_response =
+            serde_json::json!({"result": "x".repeat(4096), "threadResult":issued_result})
+                .to_string();
         let old_payload = serde_json::json!({
             "action_id": "action-old",
             "execution_id": "execution-old",
@@ -8776,6 +8948,14 @@ mod tests {
             Some(old_response.as_str()),
             AGENT_ACTION_RECEIPT_COMPACTION_FORMAT,
         ));
+        for response in [
+            action.response_json.as_deref(),
+            receipt.response_json.as_deref(),
+        ] {
+            let response: serde_json::Value = serde_json::from_str(response.unwrap()).unwrap();
+            assert_eq!(response["threadResult"], issued_result);
+            assert!(response.get("result").is_none());
+        }
         assert!(compacted_agent_action_value_matches(
             Some(outbox.payload_json.as_str()),
             Some(old_payload.as_str()),
@@ -8817,6 +8997,54 @@ mod tests {
                 .contains("_pioneer_compacted"),
             false
         );
+        let detached_payload = serde_json::json!({
+            "action_id":"action-detached", "execution_id":"execution-detached", "kind":"start_agent",
+            "execution_mode":"detached_task", "task_id":"task-detached", "thread_id":"thread-detached", "turn_id":"turn-detached",
+            "launch_request_fingerprint":"b".repeat(64), "normalized":{"input":"z".repeat(4096)},
+        }).to_string();
+        let detached_result = serde_json::json!({
+            "workspaceId":"workspace-detached", "threadId":"thread-detached",
+            "turnId":"turn-detached", "taskId":"task-detached",
+        });
+        insert_compaction_test_tuple(
+            &db,
+            "detached",
+            "delivered",
+            1,
+            utc_now() - Duration::days(AGENT_ACTION_LEDGER_PAYLOAD_RETENTION_DAYS + 1),
+            Some(utc_now() - Duration::days(AGENT_ACTION_LEDGER_PAYLOAD_RETENTION_DAYS + 1)),
+            serde_json::json!({"taskCreation":{"taskId":"task-detached"},"threadResult":detached_result}).to_string(),
+            detached_payload.clone(),
+        )
+        .await;
+        assert_eq!(
+            compact_terminal_agent_action_ledger(&db, utc_now(), 1)
+                .await
+                .unwrap()
+                .compacted_rows,
+            1
+        );
+        let detached = load_agent_action_outbox(&db, "action-detached")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(compacted_agent_action_value_matches(
+            Some(&detached.payload_json),
+            Some(&detached_payload),
+            AGENT_ACTION_OUTBOX_COMPACTION_FORMAT
+        ));
+        let retained: serde_json::Value = serde_json::from_str(&detached.payload_json).unwrap();
+        assert_eq!(retained["execution_mode"], "detached_task");
+        assert_eq!(retained["task_id"], "task-detached");
+        assert_eq!(retained["turn_id"], "turn-detached");
+        assert!(retained.get("dispatch").is_none());
+        let receipt = load_agent_action_receipt(&db, "action-detached")
+            .await
+            .unwrap()
+            .unwrap();
+        let response: serde_json::Value =
+            serde_json::from_str(receipt.response_json.as_deref().unwrap()).unwrap();
+        assert_eq!(response["threadResult"], detached_result);
     }
 
     async fn insert_compaction_test_tuple(
@@ -8955,3 +9183,7 @@ mod tests {
 #[cfg(test)]
 #[path = "agent_domain/action_outbox_tests.rs"]
 mod action_outbox_tests;
+
+#[cfg(test)]
+#[path = "grant_json_compat_tests.rs"]
+mod grant_json_compat_tests;

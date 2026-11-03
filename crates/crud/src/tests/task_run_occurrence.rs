@@ -13,8 +13,10 @@ use sea_orm::sea_query::{ExprTrait, Query};
 const NOW: i64 = 4_000_000_000;
 const MIGRATION: &str = "m20261002_000001_task_run_occurrence_reconcile";
 
-// Keep rollback aimed at the tracker through the cancellation schema prefix;
-// current projector metadata is added separately by the legacy fixture helper.
+// Event-driven fixture creation needs the cancellation marker columns. Use
+// that prefix with the shared helper's orthogonal TaskEvent storage projection.
+// Storage precedes the tracker, so tracker_rollback_steps still removes only
+// the tracker and its historical successors, without irreversible migrations.
 struct TrackerFixtureMigrator;
 
 impl MigratorTrait for TrackerFixtureMigrator {
@@ -32,6 +34,49 @@ fn tracker_rollback_steps() -> u32 {
         + 1)
     .try_into()
     .unwrap()
+}
+
+// Only event-driven fixtures need today's terminal timeline projector. Pure
+// migration tests retain the tracker schema and its exact rollback boundary.
+async fn tracker_projector_store() -> CrudStore {
+    let store = test_store_with_workspace_migrator::<TrackerFixtureMigrator>("ws_task").await;
+    add_inbox_runtime_fields_to_legacy_projector_fixture(&store).await;
+    add_thread_unread_column_to_legacy_fixture(&store).await;
+    let transaction = store.connection.begin().await.unwrap();
+    let schema = migration::SchemaManager::new(&*transaction);
+    schema
+        .alter_table(
+            migration::Table::alter()
+                .table(sea_orm::sea_query::Alias::new("turn_cli_runtime_binding"))
+                .add_column(
+                    migration::ColumnDef::new(sea_orm::sea_query::Alias::new("frozen_manifest_id"))
+                        .text()
+                        .null(),
+                )
+                .to_owned(),
+        )
+        .await
+        .unwrap();
+    // The shared migration helper already installed portable_payload. Install
+    // only the CLI projection without adding a later migration receipt.
+    let projection = Migrator::migrations()
+        .into_iter()
+        .find(|migration| migration.name() == "m20261027_000003_portable_cli_mapping")
+        .unwrap();
+    projection.up(&schema).await.unwrap();
+    transaction.commit().await.unwrap();
+    store
+}
+
+// The existing status/null/generation matrix remains the legacy trigger owner.
+async fn terminal_task_run_occurrence_fixture(
+    kind: Option<TurnKind>,
+) -> (CrudStore, Thread, TaskRun) {
+    // Install legacy producers before the domain births, so this trigger suite
+    // does not inherit conservative tickets from the current typed producers.
+    let store = test_store_with_workspace("ws_task").await;
+    restore_legacy_occurrence_tracking(&store).await;
+    super::terminal_task_run_occurrence_fixture_with_store(store, kind).await
 }
 
 async fn row(store: &CrudStore, id: &str) -> Option<pending::Model> {
@@ -669,9 +714,7 @@ async fn ordinary_event_driven_repair_can_overtake_claimed_background_work() {
 
 #[tokio::test]
 async fn migration_accepts_history_tracks_later_old_updates_and_down_removes_objects() {
-    let store = test_store_with_workspace_migrator::<TrackerFixtureMigrator>("ws_task").await;
-    add_inbox_runtime_fields_to_legacy_projector_fixture(&store).await;
-    add_thread_unread_column_to_legacy_fixture(&store).await;
+    let store = tracker_projector_store().await;
     let (store, _, run) =
         terminal_task_run_occurrence_fixture_with_store(store, Some(TurnKind::TaskRun)).await;
     let maintenance = store.with_maintenance_access();
@@ -855,16 +898,6 @@ async fn due_plan_empty_deferred_and_due_backlog_use_covering_index_without_sort
             if phase == "backlog" { 64 } else { 0 }
         );
     }
-}
-
-#[test]
-fn backoff_is_exponential_bounded_and_attempt_counter_has_finite_policy() {
-    assert_eq!(
-        (1..=8).map(queue::retry_delay).collect::<Vec<_>>(),
-        vec![5, 10, 20, 40, 80, 160, 300, 300]
-    );
-    assert_eq!(queue::retry_delay(16), 300);
-    assert_eq!(queue::retry_delay(i64::MAX), 300);
 }
 
 #[tokio::test]
@@ -1711,9 +1744,12 @@ async fn attempt_count_saturates_but_poison_row_stays_retryable_forever() {
             .unwrap()
             .unwrap();
         assert_eq!(claim.attempt_count, std::cmp::min(attempt, 16));
-        assert_eq!(claim.next_attempt_at, now + queue::retry_delay(attempt));
+        let expected_delay = [5, 10, 20, 40, 80, 160, 300][(attempt as usize - 1).min(6)];
+        assert_eq!(claim.next_attempt_at, now + expected_delay);
+        let stored = row(&store, &run.id).await.unwrap();
+        assert_eq!(stored.next_attempt_at, now + expected_delay);
         assert_eq!(
-            row(&store, &run.id).await.unwrap().claim_token.as_deref(),
+            stored.claim_token.as_deref(),
             Some(claim.claim_token.as_str())
         );
         now = claim.next_attempt_at;
@@ -1722,9 +1758,7 @@ async fn attempt_count_saturates_but_poison_row_stays_retryable_forever() {
 
 #[tokio::test]
 async fn recovery_completed_at_write_tracks_preinstall_run_without_history_discovery() {
-    let store = test_store_with_workspace_migrator::<TrackerFixtureMigrator>("ws_task").await;
-    add_inbox_runtime_fields_to_legacy_projector_fixture(&store).await;
-    add_thread_unread_column_to_legacy_fixture(&store).await;
+    let store = tracker_projector_store().await;
     let (store, _, run) =
         terminal_task_run_occurrence_fixture_with_store(store, Some(TurnKind::TaskRun)).await;
     runs::Entity::update_many()

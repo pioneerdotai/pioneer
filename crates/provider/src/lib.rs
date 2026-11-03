@@ -16,13 +16,14 @@ mod generation;
 pub mod history;
 mod http;
 pub mod messages;
+pub mod prompt_cache;
 pub use messages::{
     ProviderMessage, ProviderMessageBoundary, ProviderMessageCollector, ProviderMessageId,
     ProviderMessageMetadata, ProviderRoundUiCopy, ProviderRoundUiCopyKind,
 };
 pub mod providers;
-pub mod reasoning_registry;
 pub mod registry;
+pub mod selection;
 pub mod tools;
 pub mod traits;
 pub mod types;

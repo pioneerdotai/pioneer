@@ -22,6 +22,11 @@ pub struct Model {
     pub created_at: DateTimeWithTimeZone,
     #[sea_orm(unique_key = "uidx_task_event_task_idempotency_key")]
     pub idempotency_key: Option<String>,
+    pub portable_revision: i64,
+    #[sea_orm(column_type = "Text")]
+    pub portable_identity: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub payload_json_payload_id: Option<String>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

@@ -2,7 +2,9 @@ use anyhow::{Context, Result};
 use pioneer_entity::task_run_turn;
 use pioneer_protocol::{TaskRunTurnKind, TaskRunTurnStatus};
 use sea_orm::sea_query::{Expr, OnConflict};
-use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, Set};
+use sea_orm::{
+    ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set,
+};
 
 use crate::convention::{task_run_turn_kind_to_db, task_run_turn_status_to_db};
 use crate::util::unix_to_datetime;
@@ -27,6 +29,11 @@ pub struct NewTaskRunTurn {
 }
 
 pub async fn upsert_turn<C: ConnectionTrait>(db: &C, turn: NewTaskRunTurn) -> Result<()> {
+    let id = turn.id.clone();
+    let old = task_run_turn::Entity::find_by_id(&id)
+        .lock_exclusive()
+        .one(db)
+        .await?;
     task_run_turn::Entity::insert(active_model_from_new_turn(turn)?)
         .on_conflict(
             OnConflict::column(task_run_turn::Column::Id)
@@ -51,6 +58,11 @@ pub async fn upsert_turn<C: ConnectionTrait>(db: &C, turn: NewTaskRunTurn) -> Re
         .exec(db)
         .await
         .context("failed to upsert task run turn")?;
+    let new = task_run_turn::Entity::find_by_id(&id)
+        .lock_exclusive()
+        .one(db)
+        .await?;
+    super::task_child_producers::link_change(db, old.as_ref(), new.as_ref()).await?;
     Ok(())
 }
 
@@ -109,6 +121,10 @@ pub async fn update_turn_status<C: ConnectionTrait>(
     status: TaskRunTurnStatus,
     completed_at: Option<i64>,
 ) -> Result<Option<task_run_turn::Model>> {
+    let old = task_run_turn::Entity::find_by_id(id)
+        .lock_exclusive()
+        .one(db)
+        .await?;
     let mut update = task_run_turn::Entity::update_many()
         .filter(task_run_turn::Column::Id.eq(id.to_owned()))
         .col_expr(
@@ -128,7 +144,12 @@ pub async fn update_turn_status<C: ConnectionTrait>(
     if result.rows_affected == 0 {
         return Ok(None);
     }
-    find_turn_by_id(db, id).await
+    let new = task_run_turn::Entity::find_by_id(id)
+        .lock_exclusive()
+        .one(db)
+        .await?;
+    super::task_child_producers::link_change(db, old.as_ref(), new.as_ref()).await?;
+    Ok(new)
 }
 
 fn active_model_from_new_turn(turn: NewTaskRunTurn) -> Result<task_run_turn::ActiveModel> {

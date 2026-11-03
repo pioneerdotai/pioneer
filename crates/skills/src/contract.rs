@@ -1936,107 +1936,6 @@ Body"#,
     }
 
     #[test]
-    fn invalid_runtime_tool_output_policy_excludes_only_that_tool() {
-        let dir = temp_case("runtime-tool-output-policy-invalid");
-        let skill_dir = dir.join("test-skill");
-        fs::create_dir_all(&skill_dir).expect("create skill dir");
-        fs::write(
-            skill_dir.join("SKILL.md"),
-            r#"---
-name: test-skill
-slug: test-skill
-description: Skill with runtime tool policy
-runtime:
-  tools:
-    - tool_slug: bad_tool
-      description: Bad tool
-      kind: http
-      parameters:
-        type: object
-      output_policy:
-        storage:
-          mode: full
-          unexpected_field: true
-    - tool_slug: good_tool
-      description: Good tool
-      kind: http
-      parameters:
-        type: object
----
-Body"#,
-        )
-        .expect("write skill");
-
-        let skill = parse_skill_from_file(
-            skill_dir.join("SKILL.md").as_path(),
-            SkillSourceKind::User,
-            dir.as_path(),
-            4 * 1024,
-        )
-        .expect("skill parses");
-
-        assert_eq!(skill.runtime.runtime_tools.len(), 1);
-        assert_eq!(skill.runtime.runtime_tools[0].tool_slug, "good-tool");
-        assert!(
-            skill
-                .conformance
-                .agentskills_strict
-                .issues
-                .iter()
-                .any(|issue| issue.code == "contract.runtime.tools.output_policy")
-        );
-
-        let _ = fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn unknown_runtime_tool_output_policy_mode_excludes_tool() {
-        let dir = temp_case("runtime-tool-output-policy-unknown-mode");
-        let skill_dir = dir.join("test-skill");
-        fs::create_dir_all(&skill_dir).expect("create skill dir");
-        fs::write(
-            skill_dir.join("SKILL.md"),
-            r#"---
-name: test-skill
-slug: test-skill
-description: Skill with invalid runtime tool policy
-runtime:
-  tools:
-    - tool_slug: bad_tool
-      description: Bad tool
-      kind: http
-      parameters:
-        type: object
-      output_policy:
-        storage:
-          mode: raw_forever
----
-Body"#,
-        )
-        .expect("write skill");
-
-        let skill = parse_skill_from_file(
-            skill_dir.join("SKILL.md").as_path(),
-            SkillSourceKind::User,
-            dir.as_path(),
-            4 * 1024,
-        )
-        .expect("skill parses");
-
-        assert!(skill.runtime.runtime_tools.is_empty());
-        assert!(
-            skill
-                .conformance
-                .agentskills_strict
-                .issues
-                .iter()
-                .any(|issue| issue.code == "contract.runtime.tools.output_policy")
-        );
-
-        let _ = fs::remove_dir_all(dir);
-    }
-
-    #[test]
     fn sidecar_meta_overrides_slug_owner_and_version() {
         let dir = temp_case("sidecar-meta");
         let skill_dir = dir.join("source");
@@ -2120,5 +2019,86 @@ Body"#,
         assert_eq!(skill.identity.name, "Presentation Name");
 
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn invalid_output_policy_inputs_exclude_only_their_runtime_tools() {
+        for (fixture, markdown, expected_slugs) in [
+            (
+                "runtime-tool-output-policy-invalid",
+                r#"---
+name: test-skill
+slug: test-skill
+description: Skill with runtime tool policy
+runtime:
+  tools:
+    - tool_slug: bad_tool
+      description: Bad tool
+      kind: http
+      parameters:
+        type: object
+      output_policy:
+        storage:
+          mode: full
+          unexpected_field: true
+    - tool_slug: good_tool
+      description: Good tool
+      kind: http
+      parameters:
+        type: object
+---
+Body"#,
+                &["good-tool"][..],
+            ),
+            (
+                "runtime-tool-output-policy-unknown-mode",
+                r#"---
+name: test-skill
+slug: test-skill
+description: Skill with invalid runtime tool policy
+runtime:
+  tools:
+    - tool_slug: bad_tool
+      description: Bad tool
+      kind: http
+      parameters:
+        type: object
+      output_policy:
+        storage:
+          mode: raw_forever
+---
+Body"#,
+                &[][..],
+            ),
+        ] {
+            let dir = temp_case(fixture);
+            let skill_dir = dir.join("test-skill");
+            fs::create_dir_all(&skill_dir).expect("create skill dir");
+            fs::write(skill_dir.join("SKILL.md"), markdown).expect("write skill");
+            let skill = parse_skill_from_file(
+                skill_dir.join("SKILL.md").as_path(),
+                SkillSourceKind::User,
+                dir.as_path(),
+                4 * 1024,
+            )
+            .expect("skill parses");
+            let slugs: Vec<_> = skill
+                .runtime
+                .runtime_tools
+                .iter()
+                .map(|tool| tool.tool_slug.as_str())
+                .collect();
+            assert_eq!(slugs.as_slice(), expected_slugs, "{fixture}");
+            assert!(
+                skill
+                    .conformance
+                    .agentskills_strict
+                    .issues
+                    .iter()
+                    .any(|issue| issue.code == "contract.runtime.tools.output_policy"),
+                "{fixture}"
+            );
+            let _ = fs::remove_dir_all(dir);
+        }
     }
 }

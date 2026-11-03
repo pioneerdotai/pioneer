@@ -267,8 +267,9 @@ async fn filtered_engine_pages_fill_results_and_disclosure_rechecks_source_and_a
     let temp = tempfile::tempdir().unwrap();
     let c = capsule(&p, &format!("file://{}", temp.path().display())).await;
     // More than one engine quantum of inaccessible candidates must not hide a later own source.
-    for n in 0..105 {
-        seed(
+    let mut source_ids = Vec::new();
+    for n in 0..140 {
+        let seeded = seed(
             &p,
             &c,
             THREAD_RED_PRIVATE_B_ID,
@@ -276,6 +277,7 @@ async fn filtered_engine_pages_fill_results_and_disclosure_rechecks_source_and_a
             "searchneedle saved decision",
         )
         .await;
+        source_ids.push(seeded.id);
     }
     let item = seed(
         &p,
@@ -285,6 +287,29 @@ async fn filtered_engine_pages_fill_results_and_disclosure_rechecks_source_and_a
         "searchneedle saved decision",
     )
     .await;
+    source_ids.push(item.id.clone());
+    // Exercise real repository quanta; capacity limits portions, never corpus.
+    let mut fetched = std::collections::BTreeSet::new();
+    for portion in source_ids.chunks(128) {
+        for (row, canonical, _) in p
+            .crud_store
+            .thread_search_source_batch(WORKSPACE_RED_ID, portion)
+            .await
+            .unwrap()
+        {
+            assert!(canonical.committed);
+            assert_eq!(canonical.item.item_id(), row.item_id);
+            fetched.insert(row.id);
+        }
+    }
+    assert_eq!(fetched, source_ids.iter().cloned().collect());
+    assert!(
+        p.crud_store
+            .thread_search_source_batch("another-workspace", &source_ids[..128])
+            .await
+            .unwrap()
+            .is_empty()
+    );
     let a = authority(MEMBER_A_ID, THREAD_RED_PRIVATE_A_ID, true);
     let (found, more, incomplete) = search(&p, &a, 0, 3).await;
     assert_eq!(found.len(), 1);
@@ -321,6 +346,70 @@ async fn filtered_engine_pages_fill_results_and_disclosure_rechecks_source_and_a
         .unwrap();
     assert!(!p.search_response_readable(&a, &response).await.unwrap());
     assert!(search(&p, &a, 0, 3).await.0.is_empty());
+    assert!(
+        p.crud_store
+            .thread_search_source_batch(WORKSPACE_RED_ID, &["search-index-readable".into()])
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let deleted = seed(
+        &p,
+        &c,
+        THREAD_RED_PRIVATE_A_ID,
+        "deleted-after-batch",
+        "searchneedle deleted after preliminary read",
+    )
+    .await;
+    let (found, _, _) = search(&p, &a, 0, 3).await;
+    assert_eq!(found.len(), 1);
+    let response = search_response(&found, None, true, false);
+    p.crud_store
+        .tombstone_thread_episodic_items_for_item(
+            WORKSPACE_RED_ID,
+            &deleted.thread_id,
+            &deleted.turn_id,
+            &deleted.item_id,
+            1_800_000_004,
+        )
+        .await
+        .unwrap();
+    assert!(!p.search_response_readable(&a, &response).await.unwrap());
+    assert!(search(&p, &a, 0, 3).await.0.is_empty());
+    let changed = seed(
+        &p,
+        &c,
+        THREAD_RED_PRIVATE_A_ID,
+        "changed-after-batch",
+        "searchneedle original canonical version",
+    )
+    .await;
+    let (found, _, _) = search(&p, &a, 0, 3).await;
+    assert_eq!(found.len(), 1);
+    let response = search_response(&found, None, true, false);
+    p.crud_store
+        .materialize_item_completed(
+            ItemCompletedNotification {
+                workspace_id: WORKSPACE_RED_ID.into(),
+                thread_id: changed.thread_id.clone().into(),
+                turn_id: changed.turn_id.clone(),
+                item: TurnItem::AgentMessage {
+                    id: changed.item_id.clone(),
+                    text: "searchneedle changed canonical version".into(),
+                    phase: Default::default(),
+                    markdown: None,
+                    markdown_version: None,
+                },
+            },
+            1_800_000_005,
+        )
+        .await
+        .unwrap();
+    assert!(!p.search_response_readable(&a, &response).await.unwrap());
+    assert!(
+        search(&p, &a, 0, 3).await.0.is_empty(),
+        "old index text cannot replace a changed canonical source"
+    );
 }
 
 #[tokio::test]
@@ -417,9 +506,8 @@ async fn oversized_card_preserves_full_unicode_title_and_rejects_deleted_source_
 }
 
 #[tokio::test]
-async fn production_bound_recall_provider_uses_indexed_sources_and_trusted_execution_identity() {
+async fn indexed_search_uses_authorized_sources_and_trusted_execution_identity() {
     use crate::message::thread_read_tools::tests::member;
-    use pioneer_memory::hooks::{AgentEpisodicRecallProvider, MemoryCurrentThreadRecallRequest};
     let (_h, p) = fixture().await;
     let temp = tempfile::tempdir().unwrap();
     let c = capsule(&p, &format!("file://{}", temp.path().display())).await;
@@ -476,39 +564,6 @@ async fn production_bound_recall_provider_uses_indexed_sources_and_trusted_execu
             )
             .await
             .unwrap()
-    );
-    let p = Arc::new(p);
-    p.bind_memory_bridge().await;
-    let provider = p
-        .memory_bridge_providers
-        .read()
-        .await
-        .as_ref()
-        .unwrap()
-        .episodic_provider
-        .clone();
-    let output = provider
-        .recall_current_thread(MemoryCurrentThreadRecallRequest {
-            workspace_id: WORKSPACE_RED_ID.into(),
-            thread_id: THREAD_RED_PRIVATE_A_ID.into(),
-            turn_id: turn.into(),
-            principal_id: Some(crate::tests::authorization::MEMBER_B_ID.into()),
-            query: "searchneedle".into(),
-            targets: Vec::new(),
-            top_k: 10,
-            max_chars: 1000,
-        })
-        .await
-        .unwrap();
-    assert_eq!(output.items.len(), 1);
-    assert!(output.items[0].content.contains("saved decision"));
-    assert_eq!(
-        output.items[0].provenance.item_id.as_deref(),
-        Some("recall-source")
-    );
-    assert_eq!(
-        output.items[0].provenance.thread_id.as_deref(),
-        Some(THREAD_RED_PRIVATE_A_ID)
     );
     let tool = p
         .search_threads_page(

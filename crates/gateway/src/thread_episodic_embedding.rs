@@ -17,7 +17,7 @@ use pioneer_provider::{
     providers::{LocalEmbeddingModelInfo, local_embedding_model_info},
 };
 use reqwest::blocking::{Client as BlockingClient, Response as BlockingResponse};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt::{Debug, Formatter};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
@@ -25,7 +25,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
-use tiktoken_rs::cl100k_base_singleton;
 use tokenizers::Tokenizer;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
@@ -41,10 +40,10 @@ const LOCAL_EMBEDDING_MODEL_REMOVE_RETRY_INTERVAL: Duration = Duration::from_mil
 const LOCAL_EMBEDDING_MODEL_REMOVE_MAX_ATTEMPTS: usize = 50;
 const OPENAI_EMBEDDING_MAX_INPUT_TOKENS: usize = 8191;
 const OPENROUTER_FALLBACK_EMBEDDING_MAX_INPUT_TOKENS: usize = 8192;
-const EMBEDDING_INPUT_TOKEN_BUDGET_NUMERATOR: usize = 3;
-const EMBEDDING_INPUT_TOKEN_BUDGET_DENOMINATOR: usize = 4;
+const EMBEDDING_INPUT_TOKEN_BUDGET_NUMERATOR: usize = 100;
+const EMBEDDING_INPUT_TOKEN_BUDGET_DENOMINATOR: usize = 115;
 const EMBEDDING_INPUT_SPECIAL_TOKEN_RESERVE: usize = 16;
-const DOCUMENT_EMBEDDING_PIPELINE_VERSION: &str = "bounded_weighted_pool_v1";
+const DOCUMENT_EMBEDDING_PIPELINE_VERSION: &str = "utf16_content_weighted_pool_v2";
 pub(crate) const CHUNKED_EMBEDDING_INPUT_ERROR_MARKER: &str = "chunked_embedding_input_v1";
 const THREAD_EPISODIC_PERSONAL_ASSISTANT_QUERY_INSTRUCTION: &str = concat!(
     "Given the user's current message in an ongoing personal assistant conversation, ",
@@ -213,6 +212,45 @@ struct PreparedEmbeddingInput {
     weights: Vec<usize>,
 }
 
+fn validate_embedding_batch_source(texts: &[&str]) -> Result<(), String> {
+    if texts.len() > EMBEDDING_PREPARATION_MAX_CHUNKS
+        || texts
+            .iter()
+            .try_fold(0_usize, |sum, text| sum.checked_add(text.len()))
+            .is_none_or(|bytes| bytes > EMBEDDING_PREPARATION_MAX_CONTENT_BYTES)
+    {
+        return Err("embedding preparation exceeds bounded document/byte capacity".to_owned());
+    }
+    Ok(())
+}
+
+/// Bound retained preparation while accumulating, before transport or inference.
+/// A rejected candidate is at most one already bounded document; subsequent
+/// documents are never prepared after the aggregate chunk capacity is reached.
+fn prepare_embedding_batch(
+    texts: &[&str],
+    mut prepare: impl FnMut(&str) -> Result<PreparedEmbeddingInput, String>,
+) -> Result<Vec<PreparedEmbeddingInput>, String> {
+    validate_embedding_batch_source(texts)?;
+    let mut prepared = Vec::with_capacity(texts.len());
+    let mut chunks = 0_usize;
+    for text in texts {
+        if chunks == EMBEDDING_PREPARATION_MAX_CHUNKS {
+            return Err("embedding preparation exceeds bounded chunk capacity".to_owned());
+        }
+        let input = prepare(text)?;
+        if input.chunks.is_empty() || input.chunks.len() != input.weights.len() {
+            return Err("invalid prepared embedding chunk/weight set".to_owned());
+        }
+        chunks = chunks
+            .checked_add(input.chunks.len())
+            .filter(|count| *count <= EMBEDDING_PREPARATION_MAX_CHUNKS)
+            .ok_or("embedding preparation exceeds bounded chunk capacity")?;
+        prepared.push(input);
+    }
+    Ok(prepared)
+}
+
 fn load_local_preparation_tokenizer(path: &Path) -> Result<Tokenizer, String> {
     let mut tokenizer = Tokenizer::from_file(path)
         .map_err(|error| format!("failed to read installed embedding tokenizer: {error}"))?;
@@ -244,15 +282,27 @@ fn prepare_local_embedding_input(
     use_search_instructions: bool,
     tokenizer: Option<&Tokenizer>,
 ) -> Result<PreparedEmbeddingInput, String> {
-    let Some(prefix) = model.retrieval_prefix(query) else {
-        // Preserve the existing BGE/GTE preparation and instruction semantics.
-        return prepare_embedding_input(text, model.max_tokens, query && use_search_instructions);
+    if text.len() > EMBEDDING_PREPARATION_MAX_CONTENT_BYTES {
+        return Err("local embedding preparation exceeds bounded byte capacity".to_owned());
+    }
+    let prefix = model.retrieval_prefix(query).unwrap_or("");
+    let tokenizer = tokenizer.ok_or("local preparation requires its installed model tokenizer")?;
+    let content = if prefix.is_empty() {
+        text
+    } else {
+        strip_retrieval_prefixes(text)
     };
-    let tokenizer = tokenizer.ok_or("Nomic preparation requires its installed tokenizer")?;
-    let content = strip_retrieval_prefixes(text);
     let instruction = query && use_search_instructions;
+    let instruction_prefix = apply_search_instruction_to_query("");
+    let content = if instruction {
+        content
+            .strip_prefix(instruction_prefix.as_str())
+            .unwrap_or(content)
+    } else {
+        content
+    };
     let decorate = |chunk: &str| {
-        let chunk = if instruction && !chunk.starts_with(&apply_search_instruction_to_query("")) {
+        let chunk = if instruction {
             apply_search_instruction_to_query(chunk)
         } else {
             chunk.to_owned()
@@ -271,19 +321,22 @@ fn prepare_local_embedding_input(
     while let Some(chunk) = pending.pop() {
         let prepared = decorate(chunk);
         if token_count(&prepared, true)? <= model.max_tokens {
-            weights.push(token_count(chunk, false)?.max(1));
+            weights.push(content_weight(chunk));
             chunks.push(prepared);
             continue;
         }
         // Split on UTF-8 boundaries, retaining every byte of document content.
         // Token counts need not be monotonic, so measure every resulting chunk.
-        let chars = chunk.chars().count();
-        let Some((boundary, _)) = chunk.char_indices().nth(chars / 2).filter(|(i, _)| *i > 0)
-        else {
+        let Some(boundary) = unicode_midpoint(chunk) else {
             return Err(
                 "local embedding task prefix/instruction leaves no usable token budget".to_owned(),
             );
         };
+        if chunks.len().saturating_add(pending.len()).saturating_add(2)
+            > EMBEDDING_PREPARATION_MAX_CHUNKS
+        {
+            return Err("local embedding preparation exceeds bounded chunk capacity".to_owned());
+        }
         let (left, right) = chunk.split_at(boundary);
         pending.push(right);
         pending.push(left);
@@ -296,56 +349,66 @@ fn prepare_embedding_input(
     max_input_tokens: usize,
     query_instruction: bool,
 ) -> Result<PreparedEmbeddingInput, String> {
-    let tokenizer = cl100k_base_singleton();
-    let instruction_tokens = query_instruction
-        .then(|| {
-            tokenizer
-                .encode_ordinary(apply_search_instruction_to_query("").as_str())
-                .len()
-        })
-        .unwrap_or_default();
-    let usable_tokens = max_input_tokens
-        .saturating_mul(EMBEDDING_INPUT_TOKEN_BUDGET_NUMERATOR)
-        .checked_div(EMBEDDING_INPUT_TOKEN_BUDGET_DENOMINATOR)
-        .unwrap_or_default()
-        .saturating_sub(instruction_tokens)
-        .saturating_sub(EMBEDDING_INPUT_SPECIAL_TOKEN_RESERVE);
-    if usable_tokens == 0 {
+    if text.len() > EMBEDDING_PREPARATION_MAX_CONTENT_BYTES {
+        return Err("embedding preparation exceeds bounded byte capacity".to_owned());
+    }
+    let prefix = if query_instruction {
+        apply_search_instruction_to_query("")
+    } else {
+        String::new()
+    };
+    let allowance =
+        pioneer_provider::providers::embedding::estimated_token_budget(max_input_tokens);
+    // Budget in UTF-16 units before rounding; prefix is charged in every chunk.
+    // A separate small framing allowance does not change the pure estimator.
+    let units = (allowance.saturating_sub(EMBEDDING_INPUT_SPECIAL_TOKEN_RESERVE) as u64)
+        .saturating_mul(4)
+        .saturating_sub(pioneer_compaction::estimator::utf16_units(&prefix));
+    if units < 2 {
         return Err(format!(
-            "embedding input limit {max_input_tokens} leaves no usable document tokens"
+            "embedding input limit {max_input_tokens} leaves no usable document capacity"
         ));
     }
-
-    let tokens = tokenizer.encode_ordinary(text);
-    let conservative_token_estimate = tokens.len().max(text.chars().count().div_ceil(4));
-    let chunk_count = conservative_token_estimate.div_ceil(usable_tokens).max(1);
-    let tokens_per_chunk = tokens.len().div_ceil(chunk_count).max(1);
-    let mut chunks = Vec::with_capacity(chunk_count);
-    let mut weights = Vec::with_capacity(chunk_count);
-
-    if tokens.is_empty() {
-        chunks.push(if query_instruction {
-            apply_search_instruction_to_query("")
-        } else {
-            String::new()
-        });
-        weights.push(1);
-        return Ok(PreparedEmbeddingInput { chunks, weights });
+    let mut chunks = Vec::new();
+    let mut weights = Vec::new();
+    let mut start = 0;
+    let mut used = 0_u64;
+    for (offset, ch) in text.char_indices() {
+        let size = ch.len_utf16() as u64;
+        if used.saturating_add(size) > units && offset > start {
+            let content = &text[start..offset];
+            chunks.push(format!("{prefix}{content}"));
+            weights.push(content_weight(content));
+            if chunks.len() >= EMBEDDING_PREPARATION_MAX_CHUNKS {
+                return Err("embedding preparation exceeds bounded chunk capacity".to_owned());
+            }
+            start = offset;
+            used = 0;
+        }
+        used = used.saturating_add(size);
     }
-
-    for token_chunk in tokens.chunks(tokens_per_chunk.min(usable_tokens)) {
-        let chunk = tokenizer
-            .decode(token_chunk)
-            .map_err(|error| format!("failed to decode bounded embedding input: {error}"))?;
-        chunks.push(if query_instruction {
-            apply_search_instruction_to_query(chunk.as_str())
-        } else {
-            chunk
-        });
-        weights.push(token_chunk.len().max(1));
-    }
-
+    let content = &text[start..];
+    chunks.push(format!("{prefix}{content}"));
+    weights.push(content_weight(content));
     Ok(PreparedEmbeddingInput { chunks, weights })
+}
+
+/// Positive content mass for pooling, excluding all service prefixes. Unlike
+/// rounded tokens this is additive across Unicode chunk boundaries.
+fn content_weight(text: &str) -> usize {
+    usize::try_from(pioneer_compaction::estimator::utf16_units(text))
+        .unwrap_or(usize::MAX)
+        .max(1)
+}
+
+/// Split content without dropping bytes or dividing a UTF-8 scalar. A single
+/// scalar has no smaller valid representation and must fail honestly.
+fn unicode_midpoint(text: &str) -> Option<usize> {
+    let middle = text.len() / 2;
+    text.char_indices()
+        .map(|(offset, _)| offset)
+        .filter(|offset| *offset > 0)
+        .min_by_key(|offset| offset.abs_diff(middle))
 }
 
 fn resolve_prepared_embeddings<F>(
@@ -1501,6 +1564,14 @@ impl LocalEmbeddingProvider {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
+        // Reject aggregate source capacity before loading even the tokenizer.
+        validate_embedding_batch_source(texts).map_err(|message| {
+            ThreadEpisodicEmbeddingError::non_retryable_provider_failure(
+                self.provider_id(),
+                self.model(),
+                message,
+            )
+        })?;
         let files = self.files();
         if !files.model_path.exists() || !files.tokenizer_path.exists() {
             return Err(ThreadEpisodicEmbeddingError::missing_model(
@@ -1508,40 +1579,31 @@ impl LocalEmbeddingProvider {
                 self.model(),
             ));
         }
-        let tokenizer = if self.model_info.preparation_version().is_some() {
-            Some(
-                load_local_preparation_tokenizer(files.tokenizer_path.as_path()).map_err(
-                    |message| {
-                        ThreadEpisodicEmbeddingError::non_retryable_provider_failure(
-                            self.provider_id(),
-                            self.model(),
-                            message,
-                        )
-                    },
-                )?,
-            )
-        } else {
-            None
-        };
-        let prepared = texts
-            .iter()
-            .map(|text| {
-                prepare_local_embedding_input(
-                    text,
-                    self.model_info,
-                    query,
-                    self.use_search_instructions,
-                    tokenizer.as_ref(),
+        let tokenizer = load_local_preparation_tokenizer(files.tokenizer_path.as_path()).map_err(
+            |message| {
+                ThreadEpisodicEmbeddingError::non_retryable_provider_failure(
+                    self.provider_id(),
+                    self.model(),
+                    message,
                 )
-                .map_err(|message| {
-                    ThreadEpisodicEmbeddingError::non_retryable_provider_failure(
-                        self.provider_id(),
-                        self.model(),
-                        message,
-                    )
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+            },
+        )?;
+        let prepared = prepare_embedding_batch(texts, |text| {
+            prepare_local_embedding_input(
+                text,
+                self.model_info,
+                query,
+                self.use_search_instructions,
+                Some(&tokenizer),
+            )
+        })
+        .map_err(|message| {
+            ThreadEpisodicEmbeddingError::non_retryable_provider_failure(
+                self.provider_id(),
+                self.model(),
+                message,
+            )
+        })?;
         let runtime = self.ensure_runtime()?;
         let identity = self.identity();
         resolve_prepared_embeddings(prepared, &identity, |inputs| runtime.embed_batch(inputs))
@@ -1560,6 +1622,33 @@ pub(crate) struct RemoteEmbeddingProvider {
     use_search_instructions: bool,
     provider: Arc<dyn Provider>,
 }
+
+/// Keep adapter overflow evidence private until the bounded preparation owner
+/// handles it. Public memory errors intentionally retain only safe diagnostics.
+struct EmbeddingAttemptFailure {
+    error: ThreadEpisodicEmbeddingError,
+    overflow: bool,
+}
+impl From<ThreadEpisodicEmbeddingError> for EmbeddingAttemptFailure {
+    fn from(error: ThreadEpisodicEmbeddingError) -> Self {
+        Self {
+            error,
+            overflow: false,
+        }
+    }
+}
+
+struct RemoteEmbeddingChunk {
+    document: usize,
+    content: String,
+    weight: usize,
+    depth: usize,
+}
+const REMOTE_EMBEDDING_MAX_ATTEMPTS: usize = 4096;
+const EMBEDDING_PREPARATION_MAX_CHUNKS: usize = 4096;
+const REMOTE_EMBEDDING_MAX_SPLIT_DEPTH: usize = 8;
+const EMBEDDING_PREPARATION_MAX_CONTENT_BYTES: usize = 64 * 1024 * 1024;
+const REMOTE_EMBEDDING_MAX_SENT_BYTES: usize = 256 * 1024 * 1024;
 
 impl RemoteEmbeddingProvider {
     pub(crate) fn openai(
@@ -1721,8 +1810,8 @@ impl RemoteEmbeddingProvider {
     fn embed_via_provider(
         &self,
         request: EmbeddingRequest,
-    ) -> Result<pioneer_provider::EmbeddingResponse, ThreadEpisodicEmbeddingError> {
-        Self::embed_request_via_provider(
+    ) -> Result<pioneer_provider::EmbeddingResponse, EmbeddingAttemptFailure> {
+        Self::embed_request_attempt(
             self.provider_id(),
             self.model(),
             self.provider.as_ref(),
@@ -1736,6 +1825,16 @@ impl RemoteEmbeddingProvider {
         provider: &dyn Provider,
         request: EmbeddingRequest,
     ) -> Result<pioneer_provider::EmbeddingResponse, ThreadEpisodicEmbeddingError> {
+        Self::embed_request_attempt(provider_id, model, provider, request)
+            .map_err(|failure| failure.error)
+    }
+
+    fn embed_request_attempt(
+        provider_id: &str,
+        model: &str,
+        provider: &dyn Provider,
+        request: EmbeddingRequest,
+    ) -> Result<pioneer_provider::EmbeddingResponse, EmbeddingAttemptFailure> {
         let result = if let Ok(handle) = tokio::runtime::Handle::try_current() {
             tokio::task::block_in_place(|| handle.block_on(provider.embed(request)))
         } else {
@@ -1756,7 +1855,19 @@ impl RemoteEmbeddingProvider {
             _runtime_observer.block_on(&runtime, provider.embed(request))
         };
 
-        result.map_err(|error| Self::map_provider_error(provider_id, model, provider, error))
+        result.map_err(|error| {
+            let overflow = provider.classify_failure(&error).is_some_and(|failure| {
+                matches!(
+                    failure.class,
+                    pioneer_protocol::ProviderFailureClass::ContextTooLarge
+                        | pioneer_protocol::ProviderFailureClass::PromptTooLong
+                )
+            });
+            EmbeddingAttemptFailure {
+                overflow,
+                error: Self::map_provider_error(provider_id, model, provider, error),
+            }
+        })
     }
 
     fn probe_embedding_dimension(
@@ -1802,14 +1913,19 @@ impl RemoteEmbeddingProvider {
         let retryable = classification.as_ref().map_or_else(
             || provider_embedding_error_is_retryable(&error),
             |failure| {
-                matches!(
-                    failure.class,
-                    pioneer_protocol::ProviderFailureClass::NetworkTransient
-                        | pioneer_protocol::ProviderFailureClass::RateLimit
-                        | pioneer_protocol::ProviderFailureClass::Provider5xx
-                )
+                // HTTP 403 uses the durable worker budget even for permanent classes.
+                failure.http_status == Some(403)
+                    || matches!(
+                        failure.class,
+                        pioneer_protocol::ProviderFailureClass::NetworkTransient
+                            | pioneer_protocol::ProviderFailureClass::RateLimit
+                            | pioneer_protocol::ProviderFailureClass::Provider5xx
+                    )
             },
         );
+        let retry_after_ms = classification
+            .as_ref()
+            .and_then(|failure| failure.retry_after_ms);
         let message = classification.map_or_else(
             || "embedding provider request failed (unclassified transport)".to_owned(),
             |failure| format!(
@@ -1817,7 +1933,7 @@ impl RemoteEmbeddingProvider {
                 failure.class, failure.http_status, failure.retry_after_ms
             ),
         );
-        if retryable {
+        let mut mapped = if retryable {
             ThreadEpisodicEmbeddingError::retryable_provider_failure(provider_id, model, message)
         } else {
             ThreadEpisodicEmbeddingError::non_retryable_provider_failure(
@@ -1825,7 +1941,9 @@ impl RemoteEmbeddingProvider {
                 model,
                 message,
             )
-        }
+        };
+        mapped.retry_after_ms = retry_after_ms;
+        mapped
     }
 }
 
@@ -1839,7 +1957,8 @@ fn provider_embedding_error_is_retryable(error: &anyhow::Error) -> bool {
                 || error.status().is_some_and(|status| {
                     matches!(
                         status,
-                        reqwest::StatusCode::REQUEST_TIMEOUT
+                        reqwest::StatusCode::FORBIDDEN
+                            | reqwest::StatusCode::REQUEST_TIMEOUT
                             | reqwest::StatusCode::TOO_EARLY
                             | reqwest::StatusCode::TOO_MANY_REQUESTS
                     ) || status.is_server_error()
@@ -1960,82 +2079,203 @@ impl RemoteEmbeddingProvider {
         texts: &[&str],
         query_instruction: bool,
     ) -> Result<Vec<Vec<f32>>, ThreadEpisodicEmbeddingError> {
-        let prepared = texts
-            .iter()
-            .map(|text| {
-                prepare_embedding_input(text, self.max_input_tokens, query_instruction).map_err(
-                    |message| {
-                        ThreadEpisodicEmbeddingError::non_retryable_provider_failure(
-                            self.provider_id(),
-                            self.model(),
-                            message,
-                        )
-                    },
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let identity = self.identity();
-        resolve_prepared_embeddings(prepared, &identity, |inputs| {
-            self.embed_input_batch(inputs.iter().map(|input| (*input).to_owned()).collect())
+        let prepared = prepare_embedding_batch(texts, |text| {
+            prepare_embedding_input(text, self.max_input_tokens, query_instruction)
         })
+        .map_err(|message| {
+            ThreadEpisodicEmbeddingError::non_retryable_provider_failure(
+                self.provider_id(),
+                self.model(),
+                message,
+            )
+        })?;
+        let prefix = if query_instruction {
+            apply_search_instruction_to_query("")
+        } else {
+            String::new()
+        };
+        self.embed_prepared_inputs(prepared, &prefix)
     }
 
     fn embed_input_batch(
         &self,
         inputs: Vec<String>,
     ) -> Result<Vec<Vec<f32>>, ThreadEpisodicEmbeddingError> {
-        if inputs.is_empty() {
+        self.embed_prepared_inputs(
+            inputs
+                .into_iter()
+                .map(|input| PreparedEmbeddingInput {
+                    weights: vec![content_weight(&input)],
+                    chunks: vec![input],
+                })
+                .collect(),
+            "",
+        )
+    }
+
+    /// One owner for batch reduction and singleton subdivision. A successful
+    /// chunk is never resent. All leaves are pooled together once per original
+    /// document, avoiding normalization at intermediate split nodes.
+    fn embed_prepared_inputs(
+        &self,
+        prepared: Vec<PreparedEmbeddingInput>,
+        prefix: &str,
+    ) -> Result<Vec<Vec<f32>>, ThreadEpisodicEmbeddingError> {
+        let fail = |message: &str| {
+            ThreadEpisodicEmbeddingError::non_retryable_provider_failure(
+                self.provider_id(),
+                self.model(),
+                message,
+            )
+        };
+        if prepared.is_empty() {
             return Ok(Vec::new());
         }
-
-        let mut embeddings = Vec::with_capacity(inputs.len());
-        let limits = pioneer_provider::providers::embedding::EmbeddingBatchLimits::for_model(
-            self.provider_id(),
-            self.model(),
-            Some(self.dimension),
-            Some(self.max_input_tokens),
-            Some(self.max_batch_size),
-        )
-        .map_err(|error| {
-            ThreadEpisodicEmbeddingError::non_retryable_provider_failure(
+        let mut chunked = prepared.iter().any(|input| input.chunks.len() > 1);
+        let result = (|| {
+            let mut chunks = Vec::new();
+            let mut content_bytes = 0_usize;
+            for (document, input) in prepared.iter().enumerate() {
+                if input.chunks.is_empty() || input.chunks.len() != input.weights.len() {
+                    return Err(fail("invalid prepared embedding chunk/weight set"));
+                }
+                for (text, weight) in input.chunks.iter().zip(&input.weights) {
+                    let content = text
+                        .strip_prefix(prefix)
+                        .ok_or_else(|| fail("embedding preparation lost its instruction prefix"))?;
+                    content_bytes = content_bytes
+                        .checked_add(content.len())
+                        .ok_or_else(|| fail("embedding preparation byte budget overflow"))?;
+                    if content_bytes > EMBEDDING_PREPARATION_MAX_CONTENT_BYTES
+                        || chunks.len() >= EMBEDDING_PREPARATION_MAX_CHUNKS
+                    {
+                        return Err(fail(
+                            "embedding preparation exceeds bounded chunk/byte capacity",
+                        ));
+                    }
+                    chunks.push(RemoteEmbeddingChunk {
+                        document,
+                        content: content.to_owned(),
+                        weight: *weight,
+                        depth: 0,
+                    });
+                }
+            }
+            let limits = pioneer_provider::providers::embedding::EmbeddingBatchLimits::for_model(
                 self.provider_id(),
                 self.model(),
-                error.to_string(),
+                Some(self.dimension),
+                Some(self.max_input_tokens),
+                Some(self.max_batch_size),
             )
-        })?;
-        let batches = limits.plan(&inputs).map_err(|error| {
-            ThreadEpisodicEmbeddingError::non_retryable_provider_failure(
-                self.provider_id(),
-                self.model(),
-                error.to_string(),
-            )
-        })?;
-        for range in batches {
-            let chunk = &inputs[range];
-            let response =
-                self.embed_via_provider(EmbeddingRequest::new(self.model(), chunk.to_vec()))?;
-            if response.embeddings.len() != chunk.len() {
-                return Err(
-                    ThreadEpisodicEmbeddingError::non_retryable_provider_failure(
-                        self.provider_id(),
-                        self.model(),
-                        format!(
-                            "{} embedding response returned {} embeddings for {} inputs",
-                            self.provider_id(),
-                            response.embeddings.len(),
-                            chunk.len()
-                        ),
-                    ),
-                );
+            .map_err(|error| fail(&error.to_string()))?;
+            let inputs: Vec<_> = chunks
+                .iter()
+                .map(|chunk| format!("{prefix}{}", chunk.content))
+                .collect();
+            let batches = limits
+                .plan(&inputs)
+                .map_err(|error| fail(&error.to_string()))?;
+            let document_count = prepared.len();
+            let mut total_chunks = chunks.len();
+            drop(prepared);
+            let mut chunks = chunks.into_iter();
+            let mut pending = VecDeque::new();
+            for range in batches {
+                pending.push_back(chunks.by_ref().take(range.len()).collect::<Vec<_>>());
             }
-
-            for embedding in response.embeddings {
-                self.identity().validate_embedding(embedding.len())?;
-                embeddings.push(embedding);
+            // Release the initial decorated copies before transport/recovery.
+            drop(inputs);
+            let mut vectors: Vec<Vec<Vec<f32>>> = vec![Vec::new(); document_count];
+            let mut weights: Vec<Vec<usize>> = vec![Vec::new(); document_count];
+            let mut attempts = 0;
+            let mut sent_bytes = 0_usize;
+            while let Some(mut batch) = pending.pop_front() {
+                if attempts == REMOTE_EMBEDDING_MAX_ATTEMPTS {
+                    return Err(fail(
+                        "embedding overflow recovery exhausted its attempt capacity",
+                    ));
+                }
+                attempts += 1;
+                let input: Vec<_> = batch
+                    .iter()
+                    .map(|chunk| format!("{prefix}{}", chunk.content))
+                    .collect();
+                sent_bytes = input
+                    .iter()
+                    .try_fold(sent_bytes, |sum, text| sum.checked_add(text.len()))
+                    .ok_or_else(|| fail("embedding recovery byte budget overflow"))?;
+                if sent_bytes > REMOTE_EMBEDDING_MAX_SENT_BYTES {
+                    return Err(fail(
+                        "embedding recovery exhausted its transmitted byte capacity",
+                    ));
+                }
+                match self.embed_via_provider(EmbeddingRequest::new(self.model(), input)) {
+                    Ok(response) => {
+                        if response.embeddings.len() != batch.len() {
+                            return Err(fail(
+                                "embedding response count differs from bounded inputs",
+                            ));
+                        }
+                        for (chunk, vector) in batch.into_iter().zip(response.embeddings) {
+                            self.identity().validate_embedding(vector.len())?;
+                            if vector.iter().any(|value| !value.is_finite()) {
+                                return Err(fail("embedding response contains non-finite values"));
+                            }
+                            weights[chunk.document].push(chunk.weight);
+                            vectors[chunk.document].push(vector);
+                        }
+                    }
+                    Err(failure) if failure.overflow => {
+                        if batch.len() > 1 {
+                            // Aggregate/payload rejection: try strictly fewer items
+                            // before interpreting any individual input as too long.
+                            let right = batch.split_off(batch.len() / 2);
+                            pending.push_front(right);
+                            pending.push_front(batch);
+                            continue;
+                        }
+                        let chunk = batch
+                            .pop()
+                            .ok_or_else(|| fail("empty embedding recovery batch"))?;
+                        if chunk.depth >= REMOTE_EMBEDDING_MAX_SPLIT_DEPTH
+                            || total_chunks >= EMBEDDING_PREPARATION_MAX_CHUNKS
+                        {
+                            return Err(failure.error);
+                        }
+                        let Some(boundary) = unicode_midpoint(&chunk.content) else {
+                            return Err(failure.error);
+                        };
+                        let right = chunk.content[boundary..].to_owned();
+                        let left = chunk.content[..boundary].to_owned();
+                        total_chunks += 1;
+                        chunked = true;
+                        let child = |content: String| RemoteEmbeddingChunk {
+                            document: chunk.document,
+                            weight: content_weight(&content),
+                            content,
+                            depth: chunk.depth + 1,
+                        };
+                        pending.push_front(vec![child(right)]);
+                        pending.push_front(vec![child(left)]);
+                    }
+                    Err(failure) => return Err(failure.error),
+                }
             }
-        }
-
-        Ok(embeddings)
+            let identity = self.identity();
+            vectors
+                .iter()
+                .zip(&weights)
+                .map(|(vectors, weights)| pool_embedding_chunks(&identity, vectors, weights))
+                .collect()
+        })();
+        result.map_err(|mut error| {
+            if chunked {
+                error.message =
+                    format!("{CHUNKED_EMBEDDING_INPUT_ERROR_MARKER}: {}", error.message);
+            }
+            error
+        })
     }
 }
 
@@ -2045,6 +2285,90 @@ mod tests {
     use memvid_core::types::ask::VecEmbedder;
     use std::io::Cursor;
     use std::sync::Mutex;
+
+    #[test]
+    fn batch_preparation_bounds_sources_and_stops_chunk_accumulation_in_order() {
+        let too_many = vec!["a"; EMBEDDING_PREPARATION_MAX_CHUNKS + 1];
+        assert!(
+            prepare_embedding_batch(&too_many, |_| panic!("source count must reject first"))
+                .unwrap_err()
+                .contains("document/byte capacity")
+        );
+        // Reuse one small allocation: the source slice exceeds the byte budget,
+        // without creating a 64 MiB fixture or invoking any preparation.
+        let shared = "a".repeat(16_385);
+        let too_large = vec![shared.as_str(); 4096];
+        assert!(
+            prepare_embedding_batch(&too_large, |_| panic!("source bytes must reject first"))
+                .unwrap_err()
+                .contains("document/byte capacity")
+        );
+        assert_eq!(
+            prepare_embedding_input("abcdefgh", 20, false)
+                .unwrap()
+                .chunks
+                .len(),
+            2
+        );
+        let texts = vec!["abcdefgh"; 2050];
+        let mut prepared_documents = 0;
+        let error = prepare_embedding_batch(&texts, |text| {
+            prepared_documents += 1;
+            prepare_embedding_input(text, 20, false)
+        })
+        .unwrap_err();
+        assert!(error.contains("chunk capacity"));
+        assert_eq!(prepared_documents, 2048);
+        assert!(prepared_documents < texts.len());
+
+        let sources = ["ab🌍漢", " e\u{301}"];
+        let accepted =
+            prepare_embedding_batch(&sources, |text| prepare_embedding_input(text, 20, false))
+                .unwrap();
+        assert_eq!(accepted.len(), sources.len());
+        for ((input, source), expected_weight) in accepted.iter().zip(sources).zip([5, 3]) {
+            assert_eq!(input.chunks.concat(), source);
+            assert_eq!(input.chunks.len(), input.weights.len());
+            assert_eq!(input.weights.iter().sum::<usize>(), expected_weight);
+        }
+
+        // Exercise both real owner boundaries. Local source rejection precedes
+        // even missing-model/tokenizer lookup, and remote rejection sends nothing.
+        let directory = tempfile::tempdir().unwrap();
+        let local = LocalEmbeddingProvider::from_runtime_home(
+            directory.path(),
+            "bge-small-en-v1.5",
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(
+            local
+                .embed_batch(&too_many)
+                .unwrap_err()
+                .message
+                .contains("document/byte capacity")
+        );
+        assert!(!local.runtime_initialized());
+        let fake = Arc::new(FakeRemoteProvider::with_responses("openrouter", vec![]));
+        let remote = RemoteEmbeddingProvider::openrouter_with_max_input_tokens(
+            "vendor/custom",
+            Some(2),
+            Some(20),
+            false,
+            false,
+            fake.clone(),
+        )
+        .unwrap();
+        assert!(
+            remote
+                .embed_batch(&texts)
+                .unwrap_err()
+                .message
+                .contains("chunk capacity")
+        );
+        assert!(fake.requests().is_empty());
+    }
 
     // Synthetic tokenizer, no downloaded models and no ONNX/session creation.
     fn synthetic_local_tokenizer() -> Tokenizer {
@@ -2068,38 +2392,6 @@ mod tests {
                 .unwrap(),
         ));
         tokenizer
-    }
-
-    #[test]
-    fn auxiliary_pooling_shape_fixtures_distinguish_tokens_from_pooled_output() {
-        let fixture: serde_json::Value = serde_json::from_str(include_str!(
-            "../tests/fixtures/g09_embedding_output_shapes.json"
-        ))
-        .unwrap();
-        let tokens = &fixture["token_output"];
-        assert_eq!(tokens["shape"], serde_json::json!([1, 3, 2]));
-        let values = tokens["values"].as_array().unwrap();
-        let mask = tokens["attention_mask"].as_array().unwrap();
-        let mut mean = vec![0.0; 2];
-        let mut count = 0.0;
-        for (row, active) in values.chunks(2).zip(mask) {
-            let weight = active.as_f64().unwrap();
-            count += weight;
-            for (sum, value) in mean.iter_mut().zip(row) {
-                *sum += value.as_f64().unwrap() * weight;
-            }
-        }
-        for value in &mut mean {
-            *value /= count;
-        }
-        assert_eq!(serde_json::json!(mean), tokens["masked_mean"]);
-        assert_eq!(serde_json::json!(&values[..2]), tokens["cls"]);
-        assert_ne!(tokens["cls"], tokens["masked_mean"]);
-        let pooled = &fixture["pooled_output"];
-        assert_eq!(pooled["shape"], serde_json::json!([1, 2]));
-        assert_eq!(pooled["values"], pooled["expected_without_token_pooling"]);
-        // The pinned runtime already extracts pooled [1,D] intact. Do not apply
-        // a token mean to it based solely on the brand/model name.
     }
 
     #[test]
@@ -2242,16 +2534,75 @@ mod tests {
     }
 
     #[test]
-    fn local_preparation_preserves_other_model_semantics_and_identity() {
+    fn local_preparation_preserves_other_model_prefix_semantics() {
         for id in ["bge-small-en-v1.5", "bge-base-en-v1.5", "gte-large"] {
             let model = local_embedding_model_info(id).unwrap();
             assert_eq!(model.preparation_version(), None);
             for query in [false, true] {
                 assert_eq!(
-                    prepare_local_embedding_input("one two", model, query, true, None).unwrap(),
-                    prepare_embedding_input("one two", model.max_tokens, query).unwrap()
+                    prepare_local_embedding_input(
+                        "one two",
+                        model,
+                        query,
+                        true,
+                        Some(&synthetic_local_tokenizer())
+                    )
+                    .unwrap()
+                    .chunks,
+                    vec![if query {
+                        apply_search_instruction_to_query("one two")
+                    } else {
+                        "one two".to_owned()
+                    }]
                 );
             }
+        }
+    }
+
+    #[test]
+    fn unicode_preparation_preserves_content_prefix_and_additive_pooling_mass() {
+        let text = "a🌍漢字e\u{301}\n\"\\кириллица ".repeat(100);
+        let prefix = apply_search_instruction_to_query("");
+        let prepared = prepare_embedding_input(&text, 128, true).unwrap();
+        assert!(prepared.chunks.len() > 1);
+        assert_eq!(
+            prepared
+                .chunks
+                .iter()
+                .map(|chunk| chunk.strip_prefix(prefix.as_str()).unwrap())
+                .collect::<String>(),
+            text
+        );
+        assert_eq!(
+            prepared.weights.iter().sum::<usize>(),
+            text.encode_utf16().count()
+        );
+        let allowance = pioneer_provider::providers::embedding::estimated_token_budget(128);
+        for chunk in &prepared.chunks {
+            assert!(pioneer_compaction::text_tokens(chunk) <= allowance as u64);
+        }
+        assert!(prepare_embedding_input("protected content", 16, true).is_err());
+        let old = "pipeline=bounded_weighted_pool_v1\n";
+        assert!(!document_embedding_pipeline_identity("p", "m", 2, true, 128).contains(old));
+    }
+
+    #[test]
+    fn every_local_model_checks_actual_special_tokens_before_inference() {
+        let tokenizer = synthetic_local_tokenizer();
+        for id in ["bge-small-en-v1.5", "bge-base-en-v1.5", "gte-large"] {
+            let mut model = *local_embedding_model_info(id).unwrap();
+            model.max_tokens = 4;
+            let text = "one two three four five six";
+            let prepared =
+                prepare_local_embedding_input(text, &model, false, false, Some(&tokenizer))
+                    .unwrap();
+            assert!(prepared.chunks.len() > 1);
+            assert_eq!(prepared.chunks.concat(), text);
+            assert_eq!(prepared.weights.iter().sum::<usize>(), text.len());
+            for chunk in prepared.chunks {
+                assert!(tokenizer.encode(chunk, true).unwrap().len() <= 4);
+            }
+            assert!(prepare_local_embedding_input(text, &model, false, false, None).is_err());
         }
     }
 
@@ -2274,25 +2625,6 @@ mod tests {
         ] {
             assert!(pool_embedding_chunks(&identity, &vectors, &vec![1; vectors.len()]).is_err());
         }
-    }
-
-    #[test]
-    fn remote_embedding_retryability_covers_observed_transient_response_failures() {
-        assert!(provider_embedding_error_message_is_retryable(
-            "error decoding response body: request or response body error: operation timed out"
-        ));
-        assert!(provider_embedding_error_message_is_retryable(
-            "error decoding response body: missing field `data` at line 1 column 82"
-        ));
-        assert!(provider_embedding_error_message_is_retryable(
-            "embedding API error (503 Service Unavailable)"
-        ));
-        assert!(!provider_embedding_error_message_is_retryable(
-            "embedding API error (401 Unauthorized)"
-        ));
-        assert!(!provider_embedding_error_message_is_retryable(
-            "embedding dimension mismatch: expected 1536, got 3072"
-        ));
     }
 
     #[derive(Debug)]
@@ -2491,7 +2823,7 @@ mod tests {
             );
             // One long document goes through production preparation, flattening,
             // batch planning, response decoding and document chunk aggregation.
-            let text = " a".repeat(390_000);
+            let text = "abcd".repeat(390_000);
             provider.embed_query(&text).unwrap();
             let limits = pioneer_provider::providers::embedding::EmbeddingBatchLimits::for_model(
                 endpoint,
@@ -2523,10 +2855,8 @@ mod tests {
                 query_batches
                     .iter()
                     .flat_map(|request| &request.input)
-                    .map(|text| tiktoken_rs::cl100k_base_singleton()
-                        .encode_ordinary(text)
-                        .len())
-                    .sum::<usize>()
+                    .map(|text| pioneer_compaction::text_tokens(text))
+                    .sum::<u64>()
                     > 300_000,
                 true
             );
@@ -2561,24 +2891,6 @@ mod tests {
             usage: None,
             embeddings: vectors,
         }
-    }
-
-    #[test]
-    fn auxiliary_remote_model_dimension_gate_rejects_wrong_model_vectors() {
-        let fake = Arc::new(FakeRemoteProvider::with_responses(
-            OPENAI_PROVIDER_ID,
-            vec![Ok(embedding_response(vec![vec![1.0, 2.0]]))],
-        ));
-        let provider =
-            RemoteEmbeddingProvider::openai("text-embedding-3-small", true, false, fake).unwrap();
-        let error = provider.embed_text("fixture").unwrap_err();
-        assert_eq!(
-            error.kind,
-            pioneer_memory::ThreadEpisodicEmbeddingErrorKind::DimensionMismatch {
-                expected: 1536,
-                actual: 2
-            }
-        );
     }
 
     #[test]
@@ -2635,6 +2947,142 @@ mod tests {
         assert!(batch.iter().all(|embedding| embedding.len() == 1536));
     }
 
+    fn overflow_response() -> anyhow::Result<pioneer_provider::EmbeddingResponse> {
+        Err(
+            OpaqueEmbeddingFailure(pioneer_provider::ProviderFailureClassification::new(
+                pioneer_protocol::ProviderFailureClass::ContextTooLarge,
+            ))
+            .into(),
+        )
+    }
+
+    #[test]
+    fn confirmed_remote_overflow_reduces_batch_before_splitting_content() {
+        let fake = Arc::new(FakeRemoteProvider::with_responses(
+            "openai",
+            vec![
+                overflow_response(),
+                Ok(embedding_response(vec![vec![1.0; 1536]])),
+                Ok(embedding_response(vec![vec![2.0; 1536]])),
+            ],
+        ));
+        let provider =
+            RemoteEmbeddingProvider::openai("text-embedding-3-small", false, false, fake.clone())
+                .unwrap();
+        let vectors = provider
+            .embed_batch(&["first document", "second document"])
+            .unwrap();
+        assert_eq!(
+            vectors.iter().map(|v| v[0]).collect::<Vec<_>>(),
+            vec![1.0, 2.0]
+        );
+        let requests = fake.requests();
+        assert_eq!(
+            requests.iter().map(|r| r.input.len()).collect::<Vec<_>>(),
+            vec![2, 1, 1]
+        );
+        assert_eq!(requests[1].input, vec!["first document"]);
+        assert_eq!(requests[2].input, vec!["second document"]);
+    }
+
+    #[test]
+    fn singleton_overflow_preserves_unicode_and_instructions_and_pools_once() {
+        let fake = Arc::new(FakeRemoteProvider::with_responses(
+            "openrouter",
+            vec![
+                overflow_response(),
+                overflow_response(),
+                Ok(embedding_response(vec![vec![4.0, 0.0]])),
+                Ok(embedding_response(vec![vec![0.0, 4.0]])),
+                Ok(embedding_response(vec![vec![1.0, 2.0]])),
+            ],
+        ));
+        let provider =
+            RemoteEmbeddingProvider::openrouter("vendor/custom", Some(2), true, true, fake.clone())
+                .unwrap();
+        let vector = provider.embed_query("ab🌍cd🌍").unwrap();
+        assert_eq!(vector, vec![0.6, 0.8]);
+        let requests = fake.requests();
+        let prefix = apply_search_instruction_to_query("");
+        assert_eq!(requests.len(), 5);
+        assert_eq!(
+            requests[2..]
+                .iter()
+                .map(|r| r.input[0].strip_prefix(prefix.as_str()).unwrap())
+                .collect::<String>(),
+            "ab🌍cd🌍"
+        );
+        assert!(
+            requests[2..]
+                .iter()
+                .all(|r| r.input[0].len() < requests[0].input[0].len())
+        );
+    }
+
+    #[test]
+    fn remote_overflow_is_finite_and_unrelated_failures_do_not_subdivide() {
+        let fake = Arc::new(FakeRemoteProvider::with_responses(
+            "openrouter",
+            (0..REMOTE_EMBEDDING_MAX_SPLIT_DEPTH + 1)
+                .map(|_| overflow_response())
+                .collect(),
+        ));
+        let provider = RemoteEmbeddingProvider::openrouter(
+            "vendor/custom",
+            Some(2),
+            false,
+            false,
+            fake.clone(),
+        )
+        .unwrap();
+        assert!(provider.embed_text(&"a".repeat(1024)).is_err());
+        let requests = fake.requests();
+        assert_eq!(requests.len(), REMOTE_EMBEDDING_MAX_SPLIT_DEPTH + 1);
+        assert!(
+            requests
+                .windows(2)
+                .all(|pair| pair[1].input[0].len() < pair[0].input[0].len())
+        );
+        for class in [
+            pioneer_protocol::ProviderFailureClass::AuthOrPermission,
+            pioneer_protocol::ProviderFailureClass::InvalidRequest,
+            pioneer_protocol::ProviderFailureClass::NetworkTransient,
+            pioneer_protocol::ProviderFailureClass::RateLimit,
+        ] {
+            let fake = Arc::new(FakeRemoteProvider::with_responses(
+                "openrouter",
+                vec![Err(OpaqueEmbeddingFailure(
+                    pioneer_provider::ProviderFailureClassification::new(class),
+                )
+                .into())],
+            ));
+            let provider = RemoteEmbeddingProvider::openrouter(
+                "vendor/custom",
+                Some(2),
+                false,
+                false,
+                fake.clone(),
+            )
+            .unwrap();
+            assert!(provider.embed_text("protected original input").is_err());
+            assert_eq!(fake.requests().len(), 1);
+        }
+        let fake = Arc::new(FakeRemoteProvider::with_responses(
+            "openrouter",
+            vec![overflow_response()],
+        ));
+        let provider = RemoteEmbeddingProvider::openrouter(
+            "vendor/custom",
+            Some(2),
+            false,
+            false,
+            fake.clone(),
+        )
+        .unwrap();
+        assert!(provider.embed_text("🌍").is_err());
+        assert_eq!(fake.requests().len(), 1);
+    }
+
     #[test]
     fn remote_embedding_provider_classifies_retryable_and_non_retryable_failures() {
         let rate_limited = RemoteEmbeddingProvider::openai(
@@ -2679,35 +3127,77 @@ mod tests {
     #[test]
     fn embedding_adapter_classification_overrides_opaque_or_misleading_display() {
         use pioneer_protocol::ProviderFailureClass as Class;
-        let provider = FakeRemoteProvider::with_responses("openrouter", vec![]);
-        for (class, status, retryable) in [
-            (Class::AuthOrPermission, 403, false),
-            (Class::RateLimit, 429, true),
-            (Class::Provider5xx, 503, true),
-            (Class::Unknown, 400, false),
-        ] {
-            let mut facts = pioneer_provider::ProviderFailureClassification::new(class);
-            facts.http_status = Some(status);
-            facts.retry_after_ms = Some(1200);
-            let error = RemoteEmbeddingProvider::map_provider_error(
-                "openrouter",
+        for provider_id in ["openai", "openrouter", "vercel-ai-gateway"] {
+            let provider = FakeRemoteProvider::with_responses(provider_id, vec![]);
+            for class in [
+                Class::AuthOrPermission,
+                Class::PermissionDenied,
+                Class::Unknown,
+                Class::ProviderRejected,
+                Class::RateLimit,
+                Class::Provider5xx,
+            ] {
+                for status in [Some(403), Some(401), Some(400), None] {
+                    let mut facts = pioneer_provider::ProviderFailureClassification::new(class);
+                    facts.http_status = status;
+                    facts.retry_after_ms = Some(1200);
+                    let error = RemoteEmbeddingProvider::map_provider_error(
+                        provider_id,
+                        "fixture",
+                        &provider,
+                        OpaqueEmbeddingFailure(facts).into(),
+                    );
+                    assert_eq!(
+                        error.is_retryable(),
+                        status == Some(403)
+                            || matches!(class, Class::RateLimit | Class::Provider5xx)
+                    );
+                    assert_eq!(error.retry_after_ms, Some(1200));
+                    assert!(error.message.contains(&format!("class={class:?},")));
+                    assert!(!error.message.contains("NetworkTransient"));
+                    assert_eq!(error.provider_id, provider_id);
+                    assert_eq!(error.model, "fixture");
+                }
+            }
+            let unknown = RemoteEmbeddingProvider::map_provider_error(
+                provider_id,
                 "fixture",
                 &provider,
-                OpaqueEmbeddingFailure(facts).into(),
+                anyhow::anyhow!("HTTP 403 timeout rate limit retry_after_ms=1200"),
             );
-            assert_eq!(error.is_retryable(), retryable);
-            assert!(error.message.contains(&status.to_string()));
-            assert!(error.message.contains("1200"));
-            assert_eq!(error.provider_id, "openrouter");
-            assert_eq!(error.model, "fixture");
+            assert!(!unknown.is_retryable());
+            assert_eq!(unknown.retry_after_ms, None);
         }
-        let unknown = RemoteEmbeddingProvider::map_provider_error(
-            "openrouter",
-            "fixture",
-            &provider,
-            anyhow::anyhow!("timeout rate limit 503"),
-        );
-        assert!(!unknown.is_retryable());
+    }
+
+    #[test]
+    fn embedding_unclassified_http_status_uses_transport_facts() {
+        let provider = FakeRemoteProvider::with_responses("openai", vec![]);
+        for (status, retryable) in [
+            (403, true),
+            (401, false),
+            (400, false),
+            (408, true),
+            (425, true),
+            (429, true),
+            (503, true),
+        ] {
+            let response = reqwest::Response::from(
+                axum::http::Response::builder()
+                    .status(status)
+                    .body("")
+                    .unwrap(),
+            );
+            let error = response.error_for_status().unwrap_err();
+            let mapped = RemoteEmbeddingProvider::map_provider_error(
+                "openai",
+                "fixture",
+                &provider,
+                error.into(),
+            );
+            assert_eq!(mapped.is_retryable(), retryable);
+            assert_eq!(mapped.retry_after_ms, None);
+        }
     }
 
     #[test]
@@ -2862,7 +3352,7 @@ mod tests {
     #[test]
     fn remote_embedding_provider_marks_chunked_failures_and_instructs_each_query_chunk() {
         let text = "large query context ".repeat(100);
-        let prepared = prepare_embedding_input(text.as_str(), 96, true)
+        let prepared = prepare_embedding_input(text.as_str(), 160, true)
             .expect("oversized query should be chunkable");
         assert!(prepared.chunks.len() > 2);
         let fake = Arc::new(FakeRemoteProvider::with_responses(
@@ -2881,7 +3371,7 @@ mod tests {
         let provider = RemoteEmbeddingProvider::openrouter_with_max_input_tokens(
             "vendor/custom-embed",
             Some(2),
-            Some(96),
+            Some(160),
             true,
             true,
             fake.clone(),
@@ -2953,31 +3443,6 @@ mod tests {
         let requests = fake.requests();
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].input, vec!["find my travel plans".to_owned()]);
-    }
-
-    #[test]
-    fn local_embedding_model_registry_resolves_supported_models() {
-        let small = local_embedding_model_info("bge-small-en-v1.5").expect("small model");
-        assert_eq!(small.display_name, "BGE Small EN v1.5");
-        assert_eq!(small.dimension, 384);
-        assert_eq!(small.max_tokens, 512);
-        assert!(small.default);
-        assert!(small.model_url.contains("model.onnx"));
-        assert!(small.tokenizer_url.contains("tokenizer.json"));
-
-        assert_eq!(
-            local_embedding_model_info("bge-base-en-v1.5").map(|info| info.dimension),
-            Some(768)
-        );
-        assert_eq!(
-            local_embedding_model_info("nomic-embed-text-v1.5").map(|info| info.dimension),
-            Some(768)
-        );
-        assert_eq!(
-            local_embedding_model_info("gte-large").map(|info| info.dimension),
-            Some(1024)
-        );
-        assert!(local_embedding_model_info("unknown").is_none());
     }
 
     #[test]
@@ -3356,133 +3821,6 @@ mod tests {
         assert!(error.contains("unknown local embedding model"));
     }
 
-    #[test]
-    fn embedding_diagnostics_report_readiness_from_settings() {
-        let disabled = GatewayThreadEpisodicVectorSearchSettings::default();
-        let disabled_readiness = embedding_provider_readiness_from_settings(&disabled);
-        assert_eq!(
-            disabled_readiness.state,
-            EmbeddingProviderReadinessState::Disabled
-        );
-        assert!(!disabled_readiness.is_ready());
-
-        let missing_key = GatewayThreadEpisodicVectorSearchSettings {
-            enabled: true,
-            provider: Some(GatewayThreadEpisodicVectorProvider::OpenAi),
-            model: Some("text-embedding-3-small".to_owned()),
-            embedding_dimension: Some(1536),
-            provider_key: pioneer_protocol::GatewayThreadEpisodicVectorProviderKeyStatus {
-                required: true,
-                present: false,
-            },
-            ..GatewayThreadEpisodicVectorSearchSettings::default()
-        };
-        let missing_key_readiness = embedding_provider_readiness_from_settings(&missing_key);
-        assert_eq!(
-            missing_key_readiness.state,
-            EmbeddingProviderReadinessState::MissingConfiguration
-        );
-        assert!(!missing_key_readiness.retryable);
-        assert_eq!(missing_key_readiness.provider_id, OPENAI_PROVIDER_ID);
-
-        let downloading_local = GatewayThreadEpisodicVectorSearchSettings {
-            enabled: true,
-            provider: Some(GatewayThreadEpisodicVectorProvider::Local),
-            local_model: Some("bge-small-en-v1.5".to_owned()),
-            embedding_dimension: Some(384),
-            local_model_status: GatewayThreadEpisodicVectorLocalModelStatus::Downloading,
-            ..GatewayThreadEpisodicVectorSearchSettings::default()
-        };
-        let downloading_readiness = embedding_provider_readiness_from_settings(&downloading_local);
-        assert_eq!(
-            downloading_readiness.state,
-            EmbeddingProviderReadinessState::LocalModelDownloading
-        );
-        assert!(downloading_readiness.retryable);
-
-        let ready_local = GatewayThreadEpisodicVectorSearchSettings {
-            local_model_status: GatewayThreadEpisodicVectorLocalModelStatus::Installed,
-            ..downloading_local
-        };
-        let ready = embedding_provider_readiness_from_settings(&ready_local);
-        assert_eq!(ready.state, EmbeddingProviderReadinessState::Ready);
-        assert!(ready.is_ready());
-
-        let openrouter_dynamic = GatewayThreadEpisodicVectorSearchSettings {
-            enabled: true,
-            provider: Some(GatewayThreadEpisodicVectorProvider::OpenRouter),
-            model: Some("qwen/qwen3-embedding-8b".to_owned()),
-            provider_key: pioneer_protocol::GatewayThreadEpisodicVectorProviderKeyStatus {
-                required: true,
-                present: true,
-            },
-            ..GatewayThreadEpisodicVectorSearchSettings::default()
-        };
-        let openrouter_readiness = embedding_provider_readiness_from_settings(&openrouter_dynamic);
-        assert_eq!(
-            openrouter_readiness.state,
-            EmbeddingProviderReadinessState::Ready
-        );
-        assert!(openrouter_readiness.is_ready());
-    }
-
-    #[test]
-    fn embedding_diagnostics_map_embedding_errors_to_readiness() {
-        let missing =
-            ThreadEpisodicEmbeddingError::missing_key(OPENAI_PROVIDER_ID, "text-embedding-3-small");
-        let missing_diagnostic = embedding_provider_readiness_from_error(&missing);
-        assert_eq!(
-            missing_diagnostic.state,
-            EmbeddingProviderReadinessState::MissingConfiguration
-        );
-        assert!(!missing_diagnostic.retryable);
-
-        let retryable = ThreadEpisodicEmbeddingError::retryable_provider_failure(
-            OPENROUTER_PROVIDER_ID,
-            "openai/text-embedding-3-small",
-            "rate limited",
-        );
-        let retryable_diagnostic = embedding_provider_readiness_from_error(&retryable);
-        assert_eq!(
-            retryable_diagnostic.state,
-            EmbeddingProviderReadinessState::RetryableProviderFailure
-        );
-        assert!(retryable_diagnostic.retryable);
-
-        let dimension = ThreadEpisodicEmbeddingError::dimension_mismatch(
-            OPENAI_PROVIDER_ID,
-            "text-embedding-3-large",
-            3072,
-            1536,
-        );
-        let dimension_diagnostic = embedding_provider_readiness_from_error(&dimension);
-        assert_eq!(
-            dimension_diagnostic.state,
-            EmbeddingProviderReadinessState::DimensionMismatch
-        );
-        assert!(!dimension_diagnostic.retryable);
-    }
-
-    #[test]
-    fn embedding_diagnostics_safe_log_fields_do_not_include_payload_or_key_material() {
-        let error = ThreadEpisodicEmbeddingError::non_retryable_provider_failure(
-            OPENAI_PROVIDER_ID,
-            "text-embedding-3-small",
-            "provider rejected sk-secret while embedding private text",
-        );
-
-        let fields = error.safe_log_fields();
-        assert_eq!(fields.provider_id, OPENAI_PROVIDER_ID);
-        assert_eq!(fields.model, "text-embedding-3-small");
-        assert_eq!(
-            fields.failure_class,
-            ThreadEpisodicEmbeddingFailureClass::PermanentProviderFailure
-        );
-        let serialized = serde_json::to_string(&fields).expect("serialize fields");
-        assert!(!serialized.contains("sk-secret"));
-        assert!(!serialized.contains("private text"));
-    }
-
     #[derive(Debug)]
     struct FakeLocalEmbeddingRuntime {
         dimension: usize,
@@ -3556,7 +3894,9 @@ mod tests {
         let files = local_embedding_model_files(runtime_home, model).expect("model files");
         std::fs::create_dir_all(files.models_dir.as_path()).expect("create models dir");
         std::fs::write(files.model_path.as_path(), b"model").expect("write model");
-        std::fs::write(files.tokenizer_path.as_path(), b"tokenizer").expect("write tokenizer");
+        synthetic_local_tokenizer()
+            .save(&files.tokenizer_path, false)
+            .expect("write tokenizer");
         files
     }
 

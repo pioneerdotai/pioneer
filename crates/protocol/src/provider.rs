@@ -94,7 +94,6 @@ pub struct ProviderModelLimits {
 pub enum ReasoningCapabilitySource {
     ProviderMetadata,
     CliMetadata,
-    StaticRegistry,
     ConfigOverride,
     Unknown,
 }
@@ -122,6 +121,16 @@ pub struct ProviderModelReasoningCapabilities {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct ProviderModelCapabilities {
+    /// Authority-native proof of conversational API support, consumed before
+    /// publishing picker lists. This is not a wire capability or a runtime gate.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub chat: Option<bool>,
+    /// Native support for the adapter's chat operation; text modalities must
+    /// still be established independently before offering conversational use.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub chat_operation: Option<bool>,
     pub vision: Option<bool>,
     pub tool_calling: Option<bool>,
     pub json_output: Option<bool>,

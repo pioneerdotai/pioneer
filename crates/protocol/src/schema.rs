@@ -294,7 +294,7 @@ use crate::{
     TurnShellPolicy, TurnSkillCapabilitySummary, TurnSkillPackCapabilitySummary,
     TurnSkillPackPresentationSummary, TurnStartParams, TurnStartResponse, TurnStartedNotification,
     TurnStatus, TurnStatusChangedNotification, TurnTmpMode, TurnTmpPolicy,
-    TurnToolLoopBudgetExceededNotification, UnknownGatewayNotification, UserInput,
+    TurnToolLoopBudgetExceededNotification, TurnWorkOwner, UnknownGatewayNotification, UserInput,
     VoiceAudioEncoding, VoiceAudioFormat, VoiceChunkAckNotification, VoiceChunkFrameHeader,
     VoiceError, VoiceErrorKind, VoiceSessionCancelParams, VoiceSessionCancelResponse,
     VoiceSessionFinalizeParams, VoiceSessionFinalizeResponse, VoiceSessionOutcome,
@@ -673,6 +673,10 @@ pub fn protocol_schema_documents() -> Vec<SchemaDocument> {
         schema_doc!("agent_tool_result_status.json", AgentToolResultStatus),
         schema_doc!("agent_public_outcome.json", AgentPublicOutcome),
         schema_doc!("agent_tool_safe_result.json", AgentToolSafeResult),
+        schema_doc!(
+            "agent_thread_action_result.json",
+            crate::AgentThreadActionResult
+        ),
         schema_doc!("normalized_agent_action.json", NormalizedAgentAction),
         schema_doc!("administrative_actor_ref.json", AdministrativeActorRef),
         schema_doc!("authorization_subject_ref.json", AuthorizationSubjectRef),
@@ -2024,6 +2028,7 @@ pub fn protocol_schema_documents() -> Vec<SchemaDocument> {
             TurnWorkStateChangedNotification
         ),
         schema_doc!("turn_kind.json", TurnKind),
+        schema_doc!("turn_work_owner.json", TurnWorkOwner),
         schema_doc!("turn_origin.json", TurnOrigin),
         schema_doc!("agent_message_phase.json", AgentMessagePhase),
         schema_doc!("turn_item.json", TurnItem),

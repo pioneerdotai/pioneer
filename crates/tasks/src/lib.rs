@@ -21,7 +21,7 @@ mod wait;
 mod tests;
 
 pub use actor_contract::{build_occurrence_contract, build_task_actor_contract};
-pub use error::{TaskOperationError, TaskRuntimeError, TaskRuntimeResult};
+pub use error::{PartialTaskStartup, TaskOperationError, TaskRuntimeError, TaskRuntimeResult};
 pub use event_bus::{
     TaskEventBus, TaskEventFilter, TaskEventSubscription, TaskEventWake, TaskEventWakeDelivery,
 };
@@ -52,8 +52,8 @@ pub use review::{
 };
 pub use scheduler::{TASK_EXECUTION_LEASE_SECONDS, TaskScheduler, TaskSchedulerHandle};
 pub use service::{
-    TaskDeliveryRecoveryResult, TaskReviewRuntimeConfig, TaskRuntime, TaskRuntimeConfig,
-    TaskService, WriteLockDecision,
+    PreparedComposerTask, TaskDeliveryRecoveryResult, TaskReviewRuntimeConfig, TaskRuntime,
+    TaskRuntimeConfig, TaskService, WriteLockDecision,
 };
 pub use trigger::TaskTriggerCalculator;
 

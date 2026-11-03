@@ -503,12 +503,27 @@ pub struct VoiceSessionStartParams {
 pub struct VoiceSessionStartResponse {
     pub session_id: String,
     pub status: VoiceStatus,
+    /// Version 1 verifies the ordered PCM ingress at finalize, before publication.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_integrity_version: Option<u32>,
+}
+
+/// Counts normalized mono 16 kHz PCM before VAD, never ASR speech or padding.
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct VoiceAudioIntegrity {
+    /// Number of packets, equivalently the sequence immediately after the tail.
+    pub next_sequence: u64,
+    pub normalized_samples: u64,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
 pub struct VoiceSessionFinalizeParams {
     pub session_id: String,
     pub context: VoiceTurnContext,
+    /// Optional on the wire for decoding legacy clients; servers fail closed
+    /// when absent. A new client requires version 1 in the start response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_integrity: Option<VoiceAudioIntegrity>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
@@ -745,6 +760,7 @@ mod tests {
         let finalize = VoiceSessionFinalizeParams {
             session_id: "voice_session_1".to_owned(),
             context,
+            audio_integrity: Some(VoiceAudioIntegrity::default()),
         };
         let finalize_round_trip: VoiceSessionFinalizeParams =
             serde_json::from_value(serde_json::to_value(&finalize).expect("serialize finalize"))

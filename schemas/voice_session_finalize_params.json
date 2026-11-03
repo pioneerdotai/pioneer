@@ -3,6 +3,13 @@
   "title": "VoiceSessionFinalizeParams",
   "type": "object",
   "properties": {
+    "audio_integrity": {
+      "description": "Optional on the wire for decoding legacy clients; servers fail closed\nwhen absent. A new client requires version 1 in the start response.",
+      "anyOf": [
+        { "$ref": "#/$defs/VoiceAudioIntegrity" },
+        { "type": "null" }
+      ]
+    },
     "context": {
       "$ref": "#/$defs/VoiceTurnContext"
     },
@@ -15,6 +22,24 @@
     "context"
   ],
   "$defs": {
+    "VoiceAudioIntegrity": {
+      "description": "Counts normalized mono 16 kHz PCM before VAD, never ASR speech or padding.",
+      "type": "object",
+      "properties": {
+        "next_sequence": {
+          "description": "Number of packets, equivalently the sequence immediately after the tail.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "normalized_samples": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": ["next_sequence", "normalized_samples"]
+    },
     "AgentExecutionBackend": {
       "oneOf": [
         {

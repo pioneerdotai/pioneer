@@ -1,11 +1,11 @@
 use opentelemetry::KeyValue;
-use opentelemetry::metrics::{Counter, Histogram, Meter};
+use opentelemetry::metrics::{BoundCounter, BoundHistogram, Counter, Histogram, Meter};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{OnceLock, RwLock};
 use std::time::Duration;
 use tracing::field::{Field, Visit};
 use tracing::{Event, Subscriber};
 use tracing_subscriber::layer::{Context as TracingContext, Layer};
-use tracing_subscriber::registry::LookupSpan;
 
 static NATIVE_LIFECYCLE_DEPTH_VALUES: [AtomicU64; 5] = [
     AtomicU64::new(0),
@@ -132,27 +132,167 @@ pub struct DatabaseReadAdmissionMetric {
     pub held: Option<Duration>,
 }
 
+// Drains in-flight DB records before a closed-consent discard. The exclusive
+// barrier is released before SDK collection/export. Recorders check their source
+// epoch both before taking the read side (fast off/stale skip) and under it.
+pub(crate) static DB_RECORD_GATE: RwLock<()> = RwLock::new(());
+
+fn finite_series_index(attributes: &[KeyValue]) -> Option<usize> {
+    let mut index = 0usize;
+    for attribute in attributes {
+        let values: &[&str] = match attribute.key.as_str() {
+            "db.system.name" => &["sqlite"],
+            "db.pool.role" => &["reader", "writer"],
+            "db.scheduling.class" | "db.admission.class" | "db.admission.queue.class" => {
+                &["critical", "interactive", "maintenance"]
+            }
+            "db.admission.event" => &["enqueued", "acquired", "released", "cancelled"],
+            "db.admission.reason" => &[
+                "none",
+                "uncontended",
+                "only_class",
+                "priority",
+                "interactive_fairness",
+                "maintenance_fairness",
+            ],
+            "outcome" => &["ok", "error", "cancelled"],
+            "gateway.load.bucket" => &[
+                "idle",
+                "client_connected",
+                "agent_active",
+                "recovery",
+                "mixed",
+            ],
+            "gateway.database_size.bucket" => &[
+                "unknown",
+                "under_256_mib",
+                "256_mib_1_gib",
+                "1_4_gib",
+                "4_16_gib",
+                "16_gib_plus",
+            ],
+            "db.workload.anomaly.reason" => {
+                &["error", "query_amplification", "database_time", "latency"]
+            }
+            "db.workload.name" => {
+                let opentelemetry::Value::String(value) = &attribute.value else {
+                    return None;
+                };
+                index = index * crate::DatabaseWorkload::CARDINALITY
+                    + crate::database_workload::workload_metric_index(value.as_str())?;
+                continue;
+            }
+            _ => return None,
+        };
+        let opentelemetry::Value::String(value) = &attribute.value else {
+            return None;
+        };
+        index = index * values.len()
+            + values
+                .iter()
+                .position(|candidate| *candidate == value.as_str())?;
+    }
+    Some(index)
+}
+
+// These are instrument handles, not aggregators. All observations still update
+// the SDK tracker individually. Slot tables are lazy and bounded by the finite
+// label catalog; no SDK registration occurs for unobserved combinations.
+macro_rules! finite_db_instrument {
+    ($name:ident, $plain:ident, $bound:ident, $method:ident) => {
+        pub(crate) struct $name<T> {
+            instrument: $plain<T>,
+            slots: Box<[OnceLock<$bound<T>>]>,
+        }
+        impl<T> $name<T> {
+            fn new(instrument: $plain<T>, capacity: usize) -> Self {
+                Self {
+                    instrument,
+                    slots: (0..capacity).map(|_| OnceLock::new()).collect(),
+                }
+            }
+            pub(crate) fn $method(&self, value: T, attributes: &[KeyValue]) {
+                if let Some(slot) =
+                    finite_series_index(attributes).and_then(|index| self.slots.get(index))
+                {
+                    slot.get_or_init(|| self.instrument.bind(attributes))
+                        .$method(value);
+                } else {
+                    // Preserve the public metric API for non-catalog callers,
+                    // without retaining arbitrary strings in a new cache.
+                    self.instrument.$method(value, attributes);
+                }
+            }
+        }
+    };
+}
+finite_db_instrument!(DbCounter, Counter, BoundCounter, add);
+finite_db_instrument!(DbHistogram, Histogram, BoundHistogram, record);
+
+/// Owned by one admitted SQL metric-series identity in the Gateway limiter.
+/// Binding runs after that limiter's mutex is released. The process provider is
+/// immutable; handles live no longer than this bounded owner and its callbacks.
+#[derive(Debug, Default)]
+pub struct DatabaseOperationSeries {
+    handles: OnceLock<(BoundCounter<u64>, BoundHistogram<f64>)>,
+}
+
+impl DatabaseOperationSeries {
+    pub fn record(&self, metric: DatabaseOperationMetric) {
+        let (enabled, generation) = super::telemetry_consent_snapshot();
+        self.record_for_consent(metric, enabled.then_some(generation));
+    }
+
+    /// Carries the callback's consent epoch across fingerprint admission.
+    pub fn record_for_consent(&self, metric: DatabaseOperationMetric, generation: Option<u64>) {
+        if !super::telemetry_sample_allowed(generation) {
+            return;
+        }
+        let _write = DB_RECORD_GATE
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !super::telemetry_sample_allowed(generation) {
+            return;
+        }
+        let Some(metrics) =
+            super::telemetry::state().and_then(|state| state.gateway_metrics.as_ref())
+        else {
+            return;
+        };
+        let (count, duration) = self.handles.get_or_init(|| {
+            let attributes = database_operation_attributes(metric);
+            (
+                metrics.database_operations.bind(&attributes),
+                metrics.database_operation_duration.bind(&attributes),
+            )
+        });
+        count.add(1);
+        duration.record(metric.elapsed.as_secs_f64() * 1_000.0);
+    }
+}
+
 pub(crate) struct GatewayMetrics {
+    pub(crate) portable_payload: crate::portable_payload::Metrics,
     pub(crate) meter: Meter,
     pub(crate) database_operations: Counter<u64>,
     pub(crate) database_operation_duration: Histogram<f64>,
-    pub(crate) database_pool_acquire_duration: Histogram<f64>,
-    pub(crate) database_read_operations: Counter<u64>,
-    pub(crate) database_read_duration: Histogram<f64>,
-    pub(crate) database_read_admission_events: Counter<u64>,
-    pub(crate) database_read_admission_wait_duration: Histogram<f64>,
-    pub(crate) database_read_admission_hold_duration: Histogram<f64>,
-    pub(crate) database_read_admission_queue_depth: Histogram<u64>,
-    pub(crate) database_read_admission_active: Histogram<u64>,
-    pub(crate) database_admission_events: Counter<u64>,
-    pub(crate) database_admission_wait_duration: Histogram<f64>,
-    pub(crate) database_admission_quantum_duration: Histogram<f64>,
-    pub(crate) database_admission_queue_depth: Histogram<u64>,
-    pub(crate) database_workload_operations: Counter<u64>,
-    pub(crate) database_workload_duration: Histogram<f64>,
-    pub(crate) database_workload_query_count: Histogram<u64>,
-    pub(crate) database_workload_query_duration: Histogram<f64>,
-    pub(crate) database_workload_anomalies: Counter<u64>,
+    pub(crate) database_pool_acquire_duration: DbHistogram<f64>,
+    pub(crate) database_read_operations: DbCounter<u64>,
+    pub(crate) database_read_duration: DbHistogram<f64>,
+    pub(crate) database_read_admission_events: DbCounter<u64>,
+    pub(crate) database_read_admission_wait_duration: DbHistogram<f64>,
+    pub(crate) database_read_admission_hold_duration: DbHistogram<f64>,
+    pub(crate) database_read_admission_queue_depth: DbHistogram<u64>,
+    pub(crate) database_read_admission_active: DbHistogram<u64>,
+    pub(crate) database_admission_events: DbCounter<u64>,
+    pub(crate) database_admission_wait_duration: DbHistogram<f64>,
+    pub(crate) database_admission_quantum_duration: DbHistogram<f64>,
+    pub(crate) database_admission_queue_depth: DbHistogram<u64>,
+    pub(crate) database_workload_operations: DbCounter<u64>,
+    pub(crate) database_workload_duration: DbHistogram<f64>,
+    pub(crate) database_workload_query_count: DbHistogram<u64>,
+    pub(crate) database_workload_query_duration: DbHistogram<f64>,
+    pub(crate) database_workload_anomalies: DbCounter<u64>,
     pub(crate) provider_warmup_duration: Histogram<f64>,
     pub(crate) provider_warmup_stage_duration: Histogram<f64>,
     pub(crate) provider_warmup_failures: Counter<u64>,
@@ -411,26 +551,45 @@ impl GatewayMetrics {
             .build();
         register_patch_telemetry_observables(&meter);
         Self {
+            portable_payload: crate::portable_payload::Metrics::new(&meter),
             meter,
             database_operations,
             database_operation_duration,
-            database_pool_acquire_duration,
-            database_read_operations,
-            database_read_duration,
-            database_read_admission_events,
-            database_read_admission_wait_duration,
-            database_read_admission_hold_duration,
-            database_read_admission_queue_depth,
-            database_read_admission_active,
-            database_admission_events,
-            database_admission_wait_duration,
-            database_admission_quantum_duration,
-            database_admission_queue_depth,
-            database_workload_operations,
-            database_workload_duration,
-            database_workload_query_count,
-            database_workload_query_duration,
-            database_workload_anomalies,
+            database_pool_acquire_duration: DbHistogram::new(database_pool_acquire_duration, 6),
+            database_read_operations: DbCounter::new(database_read_operations, 18),
+            database_read_duration: DbHistogram::new(database_read_duration, 18),
+            database_read_admission_events: DbCounter::new(database_read_admission_events, 24),
+            database_read_admission_wait_duration: DbHistogram::new(
+                database_read_admission_wait_duration,
+                24,
+            ),
+            database_read_admission_hold_duration: DbHistogram::new(
+                database_read_admission_hold_duration,
+                24,
+            ),
+            database_read_admission_queue_depth: DbHistogram::new(
+                database_read_admission_queue_depth,
+                24,
+            ),
+            database_read_admission_active: DbHistogram::new(database_read_admission_active, 24),
+            database_admission_events: DbCounter::new(database_admission_events, 144),
+            database_admission_wait_duration: DbHistogram::new(
+                database_admission_wait_duration,
+                144,
+            ),
+            database_admission_quantum_duration: DbHistogram::new(
+                database_admission_quantum_duration,
+                144,
+            ),
+            database_admission_queue_depth: DbHistogram::new(database_admission_queue_depth, 24),
+            database_workload_operations: DbCounter::new(database_workload_operations, 1980),
+            database_workload_duration: DbHistogram::new(database_workload_duration, 1980),
+            database_workload_query_count: DbHistogram::new(database_workload_query_count, 1980),
+            database_workload_query_duration: DbHistogram::new(
+                database_workload_query_duration,
+                1980,
+            ),
+            database_workload_anomalies: DbCounter::new(database_workload_anomalies, 440),
             provider_warmup_duration,
             provider_warmup_stage_duration,
             provider_warmup_failures,
@@ -1132,43 +1291,18 @@ fn register_patch_telemetry_observables(meter: &Meter) {
         .build();
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct DatabasePoolContext {
-    role: DatabaseRole,
-    class: &'static str,
-}
-
-impl DatabasePoolContext {
-    fn from_span_name(name: &str) -> Option<Self> {
-        Some(match name {
-            "pioneer.sqlite.reader.interactive" => Self {
-                role: DatabaseRole::Reader,
-                class: "interactive",
-            },
-            "pioneer.sqlite.reader.maintenance" => Self {
-                role: DatabaseRole::Reader,
-                class: "maintenance",
-            },
-            "pioneer.sqlite.writer.critical" => Self {
-                role: DatabaseRole::Writer,
-                class: "critical",
-            },
-            "pioneer.sqlite.writer.interactive" => Self {
-                role: DatabaseRole::Writer,
-                class: "interactive",
-            },
-            "pioneer.sqlite.writer.maintenance" => Self {
-                role: DatabaseRole::Writer,
-                class: "maintenance",
-            },
-            _ => return None,
-        })
-    }
-}
+use crate::pool_context::PoolContext as DatabasePoolContext;
 
 fn record_database_pool_acquire(context: DatabasePoolContext, elapsed: Duration) {
     crate::turn_startup::record_current_duration(crate::turn_startup::Stage::DbAcquire, elapsed);
-    if !super::telemetry_enabled() {
+    let (enabled, generation) = super::telemetry_consent_snapshot();
+    if !super::telemetry_sample_allowed(enabled.then_some(generation)) {
+        return;
+    }
+    let _write = DB_RECORD_GATE
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !super::telemetry_sample_allowed(enabled.then_some(generation)) {
         return;
     }
     let Some(state) = super::telemetry::state() else {
@@ -1181,8 +1315,8 @@ fn record_database_pool_acquire(context: DatabasePoolContext, elapsed: Duration)
         elapsed.as_secs_f64() * 1_000.0,
         &[
             KeyValue::new("db.system.name", "sqlite"),
-            KeyValue::new("db.pool.role", context.role.as_str()),
-            KeyValue::new("db.scheduling.class", context.class),
+            KeyValue::new("db.pool.role", context.role().as_str()),
+            KeyValue::new("db.scheduling.class", context.class()),
         ],
     );
 }
@@ -1194,9 +1328,9 @@ pub(crate) struct DatabasePoolAcquireMetricsLayer;
 
 impl<S> Layer<S> for DatabasePoolAcquireMetricsLayer
 where
-    S: Subscriber + for<'lookup> LookupSpan<'lookup>,
+    S: Subscriber,
 {
-    fn on_event(&self, event: &Event<'_>, ctx: TracingContext<'_, S>) {
+    fn on_event(&self, event: &Event<'_>, _ctx: TracingContext<'_, S>) {
         let mut visitor = PoolAcquireEventVisitor::default();
         event.record(&mut visitor);
         let Some(seconds) = visitor
@@ -1205,25 +1339,11 @@ where
         else {
             return;
         };
-        let Some(context) = database_pool_context_from_event(event, &ctx) else {
+        let Some(context) = crate::pool_context::current() else {
             return;
         };
         record_database_pool_acquire(context, Duration::from_secs_f64(seconds.max(0.0)));
     }
-}
-
-fn database_pool_context_from_event<S>(
-    event: &Event<'_>,
-    ctx: &TracingContext<'_, S>,
-) -> Option<DatabasePoolContext>
-where
-    S: Subscriber + for<'lookup> LookupSpan<'lookup>,
-{
-    ctx.event_scope(event).and_then(|scope| {
-        scope
-            .into_iter()
-            .find_map(|span| DatabasePoolContext::from_span_name(span.metadata().name()))
-    })
 }
 
 #[derive(Default)]
@@ -1241,14 +1361,8 @@ impl Visit for PoolAcquireEventVisitor {
     fn record_debug(&mut self, _field: &Field, _value: &dyn std::fmt::Debug) {}
 }
 
-pub fn record_database_operation(metric: DatabaseOperationMetric) {
-    if !super::telemetry_enabled() {
-        return;
-    }
-    let Some(state) = super::telemetry::state() else {
-        return;
-    };
-    let attributes = [
+fn database_operation_attributes(metric: DatabaseOperationMetric) -> [KeyValue; 7] {
+    [
         KeyValue::new("db.system.name", "sqlite"),
         KeyValue::new("db.pool.role", metric.role.as_str()),
         KeyValue::new("db.operation.name", metric.operation.as_str()),
@@ -1259,7 +1373,24 @@ pub fn record_database_operation(metric: DatabaseOperationMetric) {
             crate::database_workload::fingerprint_attribute_value(metric.query_fingerprint),
         ),
         KeyValue::new("outcome", if metric.failed { "error" } else { "ok" }),
-    ];
+    ]
+}
+
+pub fn record_database_operation(metric: DatabaseOperationMetric) {
+    let (enabled, generation) = super::telemetry_consent_snapshot();
+    if !super::telemetry_sample_allowed(enabled.then_some(generation)) {
+        return;
+    }
+    let _write = DB_RECORD_GATE
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !super::telemetry_sample_allowed(enabled.then_some(generation)) {
+        return;
+    }
+    let Some(state) = super::telemetry::state() else {
+        return;
+    };
+    let attributes = database_operation_attributes(metric);
     let Some(metrics) = state.gateway_metrics.as_ref() else {
         return;
     };
@@ -1398,7 +1529,19 @@ const fn database_size_bucket(value: u64) -> &'static str {
 }
 
 pub fn record_database_read(metric: DatabaseReadMetric) {
-    if !super::telemetry_enabled() {
+    let (enabled, generation) = super::telemetry_consent_snapshot();
+    record_database_read_for_consent(metric, enabled.then_some(generation));
+}
+
+/// Carries the reader observer's entry epoch through delayed callback delivery.
+pub fn record_database_read_for_consent(metric: DatabaseReadMetric, generation: Option<u64>) {
+    if !super::telemetry_sample_allowed(generation) {
+        return;
+    }
+    let _write = DB_RECORD_GATE
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !super::telemetry_sample_allowed(generation) {
         return;
     }
     let Some(state) = super::telemetry::state() else {
@@ -1420,7 +1563,22 @@ pub fn record_database_read(metric: DatabaseReadMetric) {
 }
 
 pub fn record_database_read_admission(metric: DatabaseReadAdmissionMetric) {
-    if !super::telemetry_enabled() {
+    let (enabled, generation) = super::telemetry_consent_snapshot();
+    record_database_read_admission_for_consent(metric, enabled.then_some(generation));
+}
+
+/// Preserves the native transition's epoch through delayed observer delivery.
+pub fn record_database_read_admission_for_consent(
+    metric: DatabaseReadAdmissionMetric,
+    generation: Option<u64>,
+) {
+    if !super::telemetry_sample_allowed(generation) {
+        return;
+    }
+    let _write = DB_RECORD_GATE
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !super::telemetry_sample_allowed(generation) {
         return;
     }
     let Some(state) = super::telemetry::state() else {
@@ -1455,7 +1613,22 @@ pub fn record_database_read_admission(metric: DatabaseReadAdmissionMetric) {
 }
 
 pub fn record_database_admission(metric: DatabaseAdmissionMetric) {
-    if !super::telemetry_enabled() {
+    let (enabled, generation) = super::telemetry_consent_snapshot();
+    record_database_admission_for_consent(metric, enabled.then_some(generation));
+}
+
+/// Preserves the native transition's epoch through delayed observer delivery.
+pub fn record_database_admission_for_consent(
+    metric: DatabaseAdmissionMetric,
+    generation: Option<u64>,
+) {
+    if !super::telemetry_sample_allowed(generation) {
+        return;
+    }
+    let _write = DB_RECORD_GATE
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !super::telemetry_sample_allowed(generation) {
         return;
     }
     let Some(state) = super::telemetry::state() else {
@@ -1613,14 +1786,14 @@ mod tests {
 
     impl<S> Layer<S> for PoolContextCaptureLayer
     where
-        S: Subscriber + for<'lookup> LookupSpan<'lookup>,
+        S: Subscriber,
     {
-        fn on_event(&self, event: &Event<'_>, ctx: TracingContext<'_, S>) {
+        fn on_event(&self, event: &Event<'_>, _ctx: TracingContext<'_, S>) {
             if event.metadata().target() == "sqlx::pool::acquire" {
                 self.0
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .push(database_pool_context_from_event(event, &ctx));
+                    .push(crate::pool_context::current());
             }
         }
     }
@@ -1630,32 +1803,20 @@ mod tests {
         let contexts = Arc::new(Mutex::new(Vec::new()));
         let database_metrics_filter = Targets::new()
             .with_default(LevelFilter::OFF)
-            .with_target("sqlx::pool::acquire", LevelFilter::TRACE)
-            .with_target("pioneer_sqlite::pool", LevelFilter::TRACE);
+            .with_target("sqlx::pool::acquire", LevelFilter::TRACE);
         let subscriber = tracing_subscriber::registry()
             .with(PoolContextCaptureLayer(contexts.clone()).with_filter(database_metrics_filter));
 
         tracing::subscriber::with_default(subscriber, || {
-            record_test_pool_acquire(tracing::trace_span!(
-                target: "pioneer_sqlite::pool",
-                "pioneer.sqlite.reader.interactive"
-            ));
-            record_test_pool_acquire(tracing::trace_span!(
-                target: "pioneer_sqlite::pool",
-                "pioneer.sqlite.reader.maintenance"
-            ));
-            record_test_pool_acquire(tracing::trace_span!(
-                target: "pioneer_sqlite::pool",
-                "pioneer.sqlite.writer.critical"
-            ));
-            record_test_pool_acquire(tracing::trace_span!(
-                target: "pioneer_sqlite::pool",
-                "pioneer.sqlite.writer.interactive"
-            ));
-            record_test_pool_acquire(tracing::trace_span!(
-                target: "pioneer_sqlite::pool",
-                "pioneer.sqlite.writer.maintenance"
-            ));
+            for context in [
+                DatabasePoolContext::ReaderInteractive,
+                DatabasePoolContext::ReaderMaintenance,
+                DatabasePoolContext::WriterCritical,
+                DatabasePoolContext::WriterInteractive,
+                DatabasePoolContext::WriterMaintenance,
+            ] {
+                record_test_pool_acquire(context);
+            }
             tracing::trace!(
                 target: "sqlx::pool::acquire",
                 acquired_after_secs = 0.5_f64,
@@ -1668,33 +1829,18 @@ mod tests {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
             vec![
-                Some(DatabasePoolContext {
-                    role: DatabaseRole::Reader,
-                    class: "interactive",
-                }),
-                Some(DatabasePoolContext {
-                    role: DatabaseRole::Reader,
-                    class: "maintenance",
-                }),
-                Some(DatabasePoolContext {
-                    role: DatabaseRole::Writer,
-                    class: "critical",
-                }),
-                Some(DatabasePoolContext {
-                    role: DatabaseRole::Writer,
-                    class: "interactive",
-                }),
-                Some(DatabasePoolContext {
-                    role: DatabaseRole::Writer,
-                    class: "maintenance",
-                }),
+                Some(DatabasePoolContext::ReaderInteractive),
+                Some(DatabasePoolContext::ReaderMaintenance),
+                Some(DatabasePoolContext::WriterCritical),
+                Some(DatabasePoolContext::WriterInteractive),
+                Some(DatabasePoolContext::WriterMaintenance),
                 None,
             ]
         );
     }
 
-    fn record_test_pool_acquire(span: tracing::Span) {
-        let _guard = span.enter();
+    fn record_test_pool_acquire(context: DatabasePoolContext) {
+        let _guard = context.enter();
         tracing::trace!(
             target: "sqlx::pool::acquire",
             acquired_after_secs = 0.25_f64,
@@ -1722,5 +1868,580 @@ mod tests {
                 "unresolved_terminal_effects",
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod bound_db_regressions {
+    use super::*;
+    use opentelemetry::metrics::MeterProvider;
+    use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData, ResourceMetrics};
+    use opentelemetry_sdk::metrics::exporter::PushMetricExporter;
+    use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider, Temporality};
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex};
+
+    struct ConsentReset(bool);
+    impl Drop for ConsentReset {
+        fn drop(&mut self) {
+            crate::set_telemetry_enabled(self.0);
+        }
+    }
+
+    #[derive(Clone, Debug, PartialEq)]
+    enum Observation {
+        F64Histogram {
+            bounds: Vec<f64>,
+            buckets: Vec<u64>,
+            count: u64,
+            sum: f64,
+            min: Option<f64>,
+            max: Option<f64>,
+        },
+        U64Histogram {
+            bounds: Vec<f64>,
+            buckets: Vec<u64>,
+            count: u64,
+            sum: u64,
+            min: Option<u64>,
+            max: Option<u64>,
+        },
+        Counter(u64),
+    }
+    #[derive(Clone, Debug, PartialEq)]
+    struct Sample {
+        unit: String,
+        temporality: Temporality,
+        attributes: Vec<(String, opentelemetry::Value)>,
+        observation: Observation,
+    }
+    fn sorted_attributes<'a>(
+        values: impl Iterator<Item = &'a KeyValue>,
+    ) -> Vec<(String, opentelemetry::Value)> {
+        let mut values: Vec<_> = values
+            .map(|kv| (kv.key.to_string(), kv.value.clone()))
+            .collect();
+        values.sort_by(|a, b| a.0.cmp(&b.0));
+        values
+    }
+    // Keep collection rounds separate: order within a collection is unspecified,
+    // while order across Delta collections is meaningful.
+    type Samples = BTreeMap<String, Vec<Vec<Sample>>>;
+    #[derive(Clone, Debug)]
+    struct Sink(Arc<Mutex<Samples>>, &'static [&'static str]);
+    impl Sink {
+        fn new(names: &'static [&'static str]) -> Self {
+            Self(Arc::new(Mutex::new(BTreeMap::new())), names)
+        }
+    }
+    impl PushMetricExporter for Sink {
+        async fn export(
+            &self,
+            metrics: &ResourceMetrics,
+        ) -> opentelemetry_sdk::error::OTelSdkResult {
+            let mut samples = self.0.lock().unwrap();
+            for metric in metrics.scope_metrics().flat_map(|scope| scope.metrics()) {
+                // GatewayMetrics also registers observable gauges. Only collect
+                // this scenario's instruments; keep type checks strict for them.
+                if !self.1.contains(&metric.name()) {
+                    continue;
+                }
+                let mut rows = Vec::new();
+                match metric.data() {
+                    AggregatedMetrics::F64(MetricData::Histogram(histogram)) => {
+                        for point in histogram.data_points() {
+                            rows.push(Sample {
+                                unit: metric.unit().to_owned(),
+                                temporality: histogram.temporality(),
+                                attributes: sorted_attributes(point.attributes()),
+                                observation: Observation::F64Histogram {
+                                    bounds: point.bounds().collect(),
+                                    buckets: point.bucket_counts().collect(),
+                                    count: point.count(),
+                                    sum: point.sum(),
+                                    min: point.min(),
+                                    max: point.max(),
+                                },
+                            });
+                        }
+                    }
+                    AggregatedMetrics::U64(MetricData::Histogram(histogram)) => {
+                        for point in histogram.data_points() {
+                            rows.push(Sample {
+                                unit: metric.unit().to_owned(),
+                                temporality: histogram.temporality(),
+                                attributes: sorted_attributes(point.attributes()),
+                                observation: Observation::U64Histogram {
+                                    bounds: point.bounds().collect(),
+                                    buckets: point.bucket_counts().collect(),
+                                    count: point.count(),
+                                    sum: point.sum(),
+                                    min: point.min(),
+                                    max: point.max(),
+                                },
+                            });
+                        }
+                    }
+                    AggregatedMetrics::U64(MetricData::Sum(sum)) => {
+                        for point in sum.data_points() {
+                            rows.push(Sample {
+                                unit: metric.unit().to_owned(),
+                                temporality: sum.temporality(),
+                                attributes: sorted_attributes(point.attributes()),
+                                observation: Observation::Counter(point.value()),
+                            });
+                        }
+                    }
+                    _ => panic!("unexpected aggregation"),
+                }
+                rows.sort_by_key(|row| format!("{:?}", row.attributes));
+                if !rows.is_empty() {
+                    samples
+                        .entry(metric.name().to_owned())
+                        .or_default()
+                        .push(rows);
+                }
+            }
+            Ok(())
+        }
+        fn force_flush(&self) -> opentelemetry_sdk::error::OTelSdkResult {
+            Ok(())
+        }
+        fn shutdown_with_timeout(&self, _: Duration) -> opentelemetry_sdk::error::OTelSdkResult {
+            Ok(())
+        }
+        fn temporality(&self) -> Temporality {
+            Temporality::Delta
+        }
+    }
+
+    // Protects the actual SDK wire observations, including bound tracker reuse
+    // after empty Delta collections and owner drop/rebind. Concurrent cold
+    // registration must neither split a series nor lose a measurement.
+    #[test]
+    fn bound_db_series_preserve_sdk_outputs_across_delta_and_rebind() {
+        let sink = Sink::new(&[
+            "plain.duration",
+            "bound.duration",
+            "plain.count",
+            "bound.count",
+        ]);
+        let reader = PeriodicReader::builder(sink.clone())
+            .with_interval(Duration::from_secs(86400))
+            .build();
+        let provider = SdkMeterProvider::builder().with_reader(reader).build();
+        let meter = provider.meter("bound-db-regression");
+        let plain_hist = meter
+            .f64_histogram("plain.duration")
+            .with_unit("ms")
+            .with_boundaries(vec![0.5, 1.5, 3.0])
+            .build();
+        let bound_hist = meter
+            .f64_histogram("bound.duration")
+            .with_unit("ms")
+            .with_boundaries(vec![0.5, 1.5, 3.0])
+            .build();
+        let plain_count = meter
+            .u64_counter("plain.count")
+            .with_unit("{operation}")
+            .build();
+        let bound_count = meter
+            .u64_counter("bound.count")
+            .with_unit("{operation}")
+            .build();
+        let attributes = [
+            KeyValue::new("db.system.name", "sqlite"),
+            KeyValue::new("db.pool.role", "reader"),
+            KeyValue::new("db.scheduling.class", "maintenance"),
+        ];
+        for round in 0..2 {
+            let hist = Arc::new(DbHistogram::new(bound_hist.clone(), 6));
+            let count = Arc::new(DbCounter::new(bound_count.clone(), 6));
+            std::thread::scope(|scope| {
+                for value in [0.25, 1.0, 2.0, 4.0, 0.25, 1.0, 2.0, 4.0] {
+                    let hist = hist.clone();
+                    let count = count.clone();
+                    let attributes = &attributes;
+                    let plain_hist = &plain_hist;
+                    let plain_count = &plain_count;
+                    scope.spawn(move || {
+                        plain_hist.record(value, attributes);
+                        plain_count.add(1, attributes);
+                        hist.record(value, attributes);
+                        count.add(1, attributes);
+                    });
+                }
+            });
+            provider.force_flush().unwrap();
+            {
+                let samples = sink.0.lock().unwrap();
+                assert_eq!(samples["plain.duration"], samples["bound.duration"]);
+                assert_eq!(samples["plain.count"], samples["bound.count"]);
+                assert_eq!(samples["bound.duration"].len(), round + 1);
+                assert_eq!(
+                    samples["bound.duration"][round],
+                    vec![Sample {
+                        unit: "ms".into(),
+                        temporality: Temporality::Delta,
+                        attributes: sorted_attributes(attributes.iter()),
+                        observation: Observation::F64Histogram {
+                            bounds: vec![0.5, 1.5, 3.0],
+                            buckets: vec![2, 2, 2, 2],
+                            count: 8,
+                            sum: 14.5,
+                            min: Some(0.25),
+                            max: Some(4.0),
+                        },
+                    }]
+                );
+                assert_eq!(
+                    samples["bound.count"][round],
+                    vec![Sample {
+                        unit: "{operation}".into(),
+                        temporality: Temporality::Delta,
+                        attributes: sorted_attributes(attributes.iter()),
+                        observation: Observation::Counter(8),
+                    }]
+                );
+            }
+            // Empty collection must emit no synthetic zero for a bound series.
+            provider.force_flush().unwrap();
+            assert_eq!(sink.0.lock().unwrap()["bound.duration"].len(), round + 1);
+            drop(hist);
+            drop(count);
+            provider.force_flush().unwrap();
+        }
+        provider.shutdown().unwrap();
+    }
+    // Exercises actual Gateway instrument construction, U64 aggregation and
+    // independent finite slots, rather than an artificial F64-only instrument.
+    #[test]
+    fn admission_u64_cohorts_keep_representation_across_warm_delta_rounds() {
+        let _lock = crate::telemetry::tests::TELEMETRY_TEST_LOCK.lock().unwrap();
+        let _reset = ConsentReset(crate::telemetry_enabled());
+        crate::set_telemetry_enabled(true);
+        let sink = Sink::new(&[
+            "pioneer.gateway.db.read.admission.queue.depth",
+            "pioneer.gateway.db.read.admission.active",
+            "pioneer.gateway.db.read.admission.events",
+        ]);
+        let reader = PeriodicReader::builder(sink.clone())
+            .with_interval(Duration::from_secs(86400))
+            .build();
+        let provider = SdkMeterProvider::builder().with_reader(reader).build();
+        let state = crate::telemetry::tests::gateway_test_state(provider.clone());
+        let labels = |event| {
+            [
+                KeyValue::new("db.system.name", "sqlite"),
+                KeyValue::new("db.pool.role", "reader"),
+                KeyValue::new("db.admission.event", event),
+                KeyValue::new("db.admission.class", "maintenance"),
+            ]
+        };
+        for round in 0..2 {
+            // Two different event cohorts on each instrument, cold then warm.
+            for (event, depths, active) in
+                [("enqueued", [1, 4], [0, 1]), ("acquired", [0, 2], [1, 1])]
+            {
+                for (depth, active) in depths.into_iter().zip(active) {
+                    crate::telemetry::tests::with_test_state(state, || {
+                        record_database_read_admission(DatabaseReadAdmissionMetric {
+                            event,
+                            class: "maintenance",
+                            queue_depth: depth,
+                            active,
+                            waited: None,
+                            held: None,
+                        })
+                    });
+                }
+            }
+            provider.force_flush().unwrap();
+            let samples = sink.0.lock().unwrap();
+            let expected = |event, bounds, buckets, sum, min, max| Sample {
+                unit: "{request}".into(),
+                temporality: Temporality::Delta,
+                attributes: sorted_attributes(labels(event).iter()),
+                observation: Observation::U64Histogram {
+                    bounds,
+                    buckets,
+                    count: 2,
+                    sum,
+                    min: Some(min),
+                    max: Some(max),
+                },
+            };
+            let depth = &samples["pioneer.gateway.db.read.admission.queue.depth"];
+            let active = &samples["pioneer.gateway.db.read.admission.active"];
+            assert_eq!(depth.len(), round + 1);
+            assert_eq!(active.len(), round + 1);
+            let bounds = vec![
+                0.0, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1024.0,
+            ];
+            assert_eq!(
+                depth[round],
+                vec![
+                    expected(
+                        "acquired",
+                        bounds.clone(),
+                        vec![1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                        2,
+                        0,
+                        2
+                    ),
+                    expected(
+                        "enqueued",
+                        bounds,
+                        vec![0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                        5,
+                        1,
+                        4
+                    ),
+                ]
+            );
+            assert_eq!(
+                active[round],
+                vec![
+                    expected("acquired", vec![0.0, 1.0], vec![0, 2, 0], 2, 1, 1),
+                    expected("enqueued", vec![0.0, 1.0], vec![1, 1, 0], 1, 0, 1),
+                ]
+            );
+            assert_eq!(
+                samples["pioneer.gateway.db.read.admission.events"][round],
+                vec![
+                    Sample {
+                        unit: "{event}".into(),
+                        temporality: Temporality::Delta,
+                        attributes: sorted_attributes(labels("acquired").iter()),
+                        observation: Observation::Counter(2)
+                    },
+                    Sample {
+                        unit: "{event}".into(),
+                        temporality: Temporality::Delta,
+                        attributes: sorted_attributes(labels("enqueued").iter()),
+                        observation: Observation::Counter(2)
+                    },
+                ]
+            );
+            drop(samples);
+            provider.force_flush().unwrap();
+            assert_eq!(
+                sink.0.lock().unwrap()["pioneer.gateway.db.read.admission.active"].len(),
+                round + 1
+            );
+        }
+        provider.force_flush().unwrap();
+        provider.shutdown().unwrap();
+    }
+
+    #[test]
+    fn sdk_exhausted_bound_owner_stays_overflow_until_drop_and_rebind() {
+        use opentelemetry_sdk::metrics::Stream;
+        let sink = Sink::new(&["bounded.count"]);
+        let reader = PeriodicReader::builder(sink.clone())
+            .with_interval(Duration::from_secs(86400))
+            .build();
+        let provider = SdkMeterProvider::builder()
+            .with_reader(reader)
+            .with_view(|_: &opentelemetry_sdk::metrics::Instrument| {
+                Stream::builder().with_cardinality_limit(1).build().ok()
+            })
+            .build();
+        let instrument = provider
+            .meter("bound-lifetime")
+            .u64_counter("bounded.count")
+            .with_unit("{operation}")
+            .build();
+        let a = [KeyValue::new("cohort", "a")];
+        let b = [KeyValue::new("cohort", "b")];
+        let first = instrument.bind(&a);
+        let rejected = instrument.bind(&b);
+        first.add(1);
+        rejected.add(2);
+        provider.force_flush().unwrap();
+        let expected = |attributes, value| Sample {
+            unit: "{operation}".into(),
+            temporality: Temporality::Delta,
+            attributes,
+            observation: Observation::Counter(value),
+        };
+        let overflow = vec![(
+            "otel.metric.overflow".into(),
+            opentelemetry::Value::Bool(true),
+        )];
+        assert_eq!(
+            sink.0.lock().unwrap()["bounded.count"][0],
+            vec![
+                expected(sorted_attributes(a.iter()), 1),
+                expected(overflow.clone(), 2),
+            ]
+        );
+        drop(first);
+        // Evict the now-unbound stale A tracker. B's owner still points to overflow.
+        provider.force_flush().unwrap();
+        rejected.add(3);
+        provider.force_flush().unwrap();
+        assert_eq!(
+            sink.0.lock().unwrap()["bounded.count"][1],
+            vec![expected(overflow, 3)]
+        );
+        drop(rejected);
+        provider.force_flush().unwrap();
+        let rebound = instrument.bind(&b);
+        rebound.add(4);
+        provider.force_flush().unwrap();
+        assert_eq!(
+            sink.0.lock().unwrap()["bounded.count"][2],
+            vec![expected(sorted_attributes(b.iter()), 4)]
+        );
+        drop(rebound);
+        provider.force_flush().unwrap();
+        assert_eq!(sink.0.lock().unwrap()["bounded.count"].len(), 3);
+        provider.shutdown().unwrap();
+    }
+
+    #[test]
+    fn sql_limiter_bound_owners_export_admitted_and_metric_overflow_identities() {
+        let _lock = crate::telemetry::tests::TELEMETRY_TEST_LOCK.lock().unwrap();
+        let _reset = ConsentReset(crate::telemetry_enabled());
+        crate::set_telemetry_enabled(true);
+        let sink = Sink::new(&[
+            "pioneer.gateway.db.operations",
+            "pioneer.gateway.db.operation.duration",
+        ]);
+        let reader = PeriodicReader::builder(sink.clone())
+            .with_interval(Duration::from_secs(86400))
+            .build();
+        let provider = SdkMeterProvider::builder().with_reader(reader).build();
+        let state = crate::telemetry::tests::gateway_test_state(provider.clone());
+        use crate::query_fingerprint_fixture::{QueryFingerprintLimiter, QueryFingerprintState};
+        let limiter = QueryFingerprintLimiter {
+            max_raw_query_cache_entries: 4,
+            max_fingerprints: 4,
+            max_metric_series: 1,
+            state: Mutex::new(QueryFingerprintState::default()),
+        };
+        let lookup = |sql| {
+            limiter.metric_fingerprint(
+                sql,
+                DatabaseRole::Reader,
+                DatabaseOperation::Select,
+                crate::DatabaseWorkload::TimelinePage,
+                false,
+            )
+        };
+        let admitted = lookup("SELECT admitted FROM fixture");
+        let overflow = lookup("SELECT overflow FROM fixture");
+        assert!(
+            admitted
+                .canonical
+                .is_some_and(|fingerprint| fingerprint != 0)
+        );
+        assert_eq!(Some(admitted.metric), admitted.canonical);
+        assert!(
+            overflow
+                .canonical
+                .is_some_and(|fingerprint| fingerprint != 0)
+        );
+        assert_ne!(overflow.canonical, admitted.canonical);
+        assert_eq!(
+            overflow.metric, 0,
+            "metric budget overflow must not erase canonical CPU identity"
+        );
+        let admitted_label = admitted.metric.to_string();
+        let admitted_owner = Arc::downgrade(&admitted.series);
+        let overflow_owner = Arc::downgrade(&overflow.series);
+        for round in 0..2 {
+            crate::telemetry::tests::with_test_state(state, || {
+                for sql in [
+                    "SELECT admitted FROM fixture",
+                    "SELECT overflow FROM fixture",
+                ] {
+                    // The same production limiter lookup supplies the metric identity
+                    // and the bound owner; SDK bind runs after its lock is released.
+                    let identity = lookup(sql);
+                    for elapsed in [Duration::from_micros(250), Duration::from_millis(2)] {
+                        identity.series.record(DatabaseOperationMetric {
+                            role: DatabaseRole::Reader,
+                            operation: DatabaseOperation::Select,
+                            workload: crate::DatabaseWorkload::TimelinePage,
+                            query_fingerprint: identity.metric,
+                            elapsed,
+                            failed: false,
+                        });
+                    }
+                }
+            });
+            provider.force_flush().unwrap();
+            let samples = sink.0.lock().unwrap();
+            for (name, unit) in [
+                ("pioneer.gateway.db.operations", "{operation}"),
+                ("pioneer.gateway.db.operation.duration", "ms"),
+            ] {
+                let rows = &samples[name];
+                assert_eq!(rows.len(), round + 1);
+                assert_eq!(rows[round].len(), 2);
+                for (sample, fingerprint) in rows[round].iter().zip(["0", admitted_label.as_str()])
+                {
+                    assert_eq!(sample.unit, unit);
+                    assert_eq!(sample.temporality, Temporality::Delta);
+                    let mut labels = vec![
+                        ("db.system.name", "sqlite"),
+                        ("db.pool.role", "reader"),
+                        ("db.operation.name", "select"),
+                        ("db.operation.type", "read"),
+                        ("db.workload.name", "timeline.page"),
+                        ("db.query.fingerprint", fingerprint),
+                        ("outcome", "ok"),
+                    ];
+                    labels.sort();
+                    assert_eq!(
+                        sample.attributes,
+                        labels
+                            .into_iter()
+                            .map(|(k, v)| (
+                                k.to_owned(),
+                                if k == "db.query.fingerprint" {
+                                    opentelemetry::Value::I64(v.parse().unwrap())
+                                } else {
+                                    opentelemetry::Value::String(v.to_owned().into())
+                                }
+                            ))
+                            .collect::<Vec<_>>()
+                    );
+                    assert_eq!(
+                        sample.observation,
+                        if name.ends_with("operations") {
+                            Observation::Counter(2)
+                        } else {
+                            Observation::F64Histogram {
+                                bounds: vec![
+                                    0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0,
+                                    500.0, 1000.0, 2500.0, 5000.0,
+                                ],
+                                buckets: vec![0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                                count: 2,
+                                sum: 2.25,
+                                min: Some(0.25),
+                                max: Some(2.0),
+                            }
+                        }
+                    );
+                }
+            }
+            drop(samples);
+            provider.force_flush().unwrap();
+            assert_eq!(
+                sink.0.lock().unwrap()["pioneer.gateway.db.operations"].len(),
+                round + 1
+            );
+        }
+        drop(limiter);
+        drop(admitted);
+        drop(overflow);
+        assert!(admitted_owner.upgrade().is_none());
+        assert!(overflow_owner.upgrade().is_none());
+        provider.force_flush().unwrap();
+        provider.shutdown().unwrap();
     }
 }

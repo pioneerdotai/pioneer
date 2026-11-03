@@ -977,6 +977,20 @@ mod tests {
             released: AtomicUsize::new(0),
         });
         core.set_mcp_oauth_shell(browser.clone());
+        // Bound OAuth requests need the same live socket as the notification
+        // fixture. Keep setup transport events out of the dispatcher scenario.
+        core.transport_runtime().inject_test_event(
+            crate::transport::ws::GatewayWsEvent::Connected {
+                connection_id: 7,
+                endpoint_id: "endpoint".into(),
+                endpoint_name: "Synthetic".into(),
+                gateway_base_url: pioneer_protocol::GatewayBaseUrl::parse_presentation(
+                    "https://synthetic.invalid",
+                )
+                .unwrap(),
+            },
+        );
+        core.transport_runtime().drain_ws_events();
         core.start_gateway_event_dispatcher();
         core.start_mcp_operation_controller();
         let transport = Arc::new(CancelTransport(AtomicUsize::new(0)));
@@ -1228,6 +1242,7 @@ mod tests {
         assert_eq!(shell.open.load(Ordering::SeqCst), 0);
         core.stop_mcp_oauth();
     }
+
     #[test]
     fn manual_browser_retry_requires_live_operation_and_updates_failure_projection() {
         let core = crate::catalog_test_support::client();
@@ -1400,6 +1415,21 @@ mod tests {
     }
     #[test]
     fn current_cleanup_replaces_old_denied_but_not_new_consent() {
+        for pending in [
+            McpOAuthState::Preparing,
+            McpOAuthState::AwaitingCallback,
+            McpOAuthState::Exchanging,
+            McpOAuthState::Resolving,
+        ] {
+            assert_eq!(
+                effective_oauth_management_state(
+                    Some(pending),
+                    Some(McpOAuthState::CleanupRequired),
+                    false
+                ),
+                Some(pending)
+            );
+        }
         let core = crate::catalog_test_support::client();
         let shell = Arc::new(Shell::default());
         core.set_mcp_oauth_shell(shell.clone());
@@ -1471,7 +1501,11 @@ mod tests {
         let shell = Arc::new(Shell::default());
         core.set_mcp_oauth_shell(shell.clone());
         let pending = event(McpOAuthState::AwaitingCallback);
-        core.observe_mcp_oauth_notification(&GatewayNotification::McpOAuthChanged(pending.clone()));
+        assert!(
+            core.observe_mcp_oauth_notification(&GatewayNotification::McpOAuthChanged(
+                pending.clone(),
+            ))
+        );
         for _ in 0..2 {
             core.observe_mcp_oauth_notification(&GatewayNotification::McpChanged(
                 pioneer_protocol::McpChangedNotification {
@@ -1484,14 +1518,19 @@ mod tests {
                     }],
                 },
             ));
-            core.observe_mcp_oauth_notification(&GatewayNotification::McpOAuthChanged(
-                pending.clone(),
-            ));
+            assert!(
+                core.observe_mcp_oauth_notification(&GatewayNotification::McpOAuthChanged(
+                    pending.clone(),
+                ))
+            );
         }
         assert_eq!(shell.release.load(Ordering::SeqCst), 0);
         wait_browser(&core);
         assert_eq!(shell.open.load(Ordering::SeqCst), 1);
-        assert!(core.mcp_oauth_presentation("workspace", "server").is_some());
+        let (presentation, failed_browser) =
+            core.mcp_oauth_presentation("workspace", "server").unwrap();
+        assert!(failed_browser);
+        assert!(presentation.authorization_url.is_some());
         core.stop_mcp_oauth();
     }
     #[test]

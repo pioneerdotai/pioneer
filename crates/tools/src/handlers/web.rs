@@ -1504,87 +1504,64 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_overwrite_download_preserves_existing_destination() {
-        let root = tempfile::tempdir().expect("download root");
-        let destination = root.path().join("existing.bin");
-        std::fs::write(destination.as_path(), b"original").expect("existing destination");
-        let target = secure_download_target(root.path(), destination.as_path());
-        let capability = secure_download_capability(destination.as_path());
-        let (url, server) = one_response_server(
-            b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-        )
-        .await;
-        let snapshot = TurnExecutionSecuritySnapshot::unrestricted_full_access(
-            root.path().to_string_lossy(),
-            1,
-        );
+    async fn overwrite_download_failures_preserve_existing_destination() {
+        let cases: [(&str, &'static [u8], usize, &str, &str); 2] = [
+            (
+                "HTTP failure",
+                b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                1024,
+                "HTTP 500",
+                "HTTP failure must not publish the staged download",
+            ),
+            (
+                "oversized response",
+                b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\n12345678",
+                4,
+                "exceeds max_bytes",
+                "oversized response must not publish the staged download",
+            ),
+        ];
+        for (case, response, max_bytes, expected_error, failure_message) in cases {
+            let root = tempfile::tempdir().expect("download root");
+            let destination = root.path().join("existing.bin");
+            std::fs::write(destination.as_path(), b"original").expect("existing destination");
+            let target = secure_download_target(root.path(), destination.as_path());
+            let capability = secure_download_capability(destination.as_path());
+            let (url, server) = one_response_server(response).await;
+            let snapshot = TurnExecutionSecuritySnapshot::unrestricted_full_access(
+                root.path().to_string_lossy(),
+                1,
+            );
 
-        let error = download_to_file(
-            url.as_str(),
-            &target,
-            FetchSettings {
-                timeout_ms: 2_000,
-                max_bytes: 1024,
-                follow_redirects: false,
-                include_headers: false,
-            },
-            true,
-            true,
-            "pioneer-test",
-            Some(&snapshot),
-            &capability,
-        )
-        .await
-        .expect_err("HTTP failure must not publish the staged download");
+            let error = download_to_file(
+                url.as_str(),
+                &target,
+                FetchSettings {
+                    timeout_ms: 2_000,
+                    max_bytes,
+                    follow_redirects: false,
+                    include_headers: false,
+                },
+                true,
+                true,
+                "pioneer-test",
+                Some(&snapshot),
+                &capability,
+            )
+            .await
+            .expect_err(failure_message);
 
-        assert!(error.to_string().contains("HTTP 500"));
-        assert_eq!(
-            std::fs::read(destination).expect("preserved destination"),
-            b"original"
-        );
-        server.await.expect("download server");
-    }
-
-    #[tokio::test]
-    async fn oversized_overwrite_download_preserves_existing_destination() {
-        let root = tempfile::tempdir().expect("download root");
-        let destination = root.path().join("existing.bin");
-        std::fs::write(destination.as_path(), b"original").expect("existing destination");
-        let target = secure_download_target(root.path(), destination.as_path());
-        let capability = secure_download_capability(destination.as_path());
-        let (url, server) = one_response_server(
-            b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\n12345678",
-        )
-        .await;
-        let snapshot = TurnExecutionSecuritySnapshot::unrestricted_full_access(
-            root.path().to_string_lossy(),
-            1,
-        );
-
-        let error = download_to_file(
-            url.as_str(),
-            &target,
-            FetchSettings {
-                timeout_ms: 2_000,
-                max_bytes: 4,
-                follow_redirects: false,
-                include_headers: false,
-            },
-            true,
-            true,
-            "pioneer-test",
-            Some(&snapshot),
-            &capability,
-        )
-        .await
-        .expect_err("oversized response must not publish the staged download");
-
-        assert!(error.to_string().contains("exceeds max_bytes"));
-        assert_eq!(
-            std::fs::read(destination).expect("preserved destination"),
-            b"original"
-        );
-        server.await.expect("download server");
+            assert!(
+                error.to_string().contains(expected_error),
+                "{case}: {error}"
+            );
+            assert_eq!(
+                std::fs::read(destination).expect("preserved destination"),
+                b"original",
+                "{case}"
+            );
+            server.await.expect("download server");
+        }
     }
 
     #[cfg(unix)]

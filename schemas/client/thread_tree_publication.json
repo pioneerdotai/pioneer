@@ -316,7 +316,6 @@
       "type": "string",
       "enum": [
         "turn_pre_prompt_context",
-        "turn_post_preflight_prompt_context",
         "turn_pre_prompt_compile",
         "runtime_turn_pre_context"
       ]
@@ -1036,6 +1035,11 @@
         "turn_kind": {
           "$ref": "#/$defs/TurnKind",
           "default": "conversation"
+        },
+        "work_owner": {
+          "description": "Immutable owner of the admitted work; absent historical wire values own their turn.",
+          "$ref": "#/$defs/TurnWorkOwner",
+          "default": "turn"
         }
       },
       "required": [
@@ -1176,6 +1180,14 @@
         "Failed",
         "Interrupted",
         "Blocked"
+      ]
+    },
+    "TurnWorkOwner": {
+      "description": "Canonical work ownership, persisted at admission independently of authorship.",
+      "type": "string",
+      "enum": [
+        "turn",
+        "detached_task"
       ]
     }
   }

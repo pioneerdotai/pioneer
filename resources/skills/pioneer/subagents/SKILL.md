@@ -30,6 +30,12 @@ Use this skill for immediate delegation only:
 
 Do not use this skill for scheduled, recurring, future, or long-running background work. For durable future/background tasks, read `system:pioneer/tasks`.
 
+## Communication Boundary
+
+Inter-agent chat is not currently supported. Do not use `thread_message_send`, `threads_turn_start`, or equivalent conversation writes to exchange instructions, progress, questions, blockers, or results between parent, child, or sibling agents.
+
+A child returns its result and any blockers in its final answer in its own execution thread; the runtime creates the review candidate. The parent uses `task_wait` / `task_result` to read it and `task_accept` / `task_revise` to respond. Do not send an additional message to announce or duplicate the result.
+
 ## Quick Start
 
 Before delegating, decide whether attached subagents improve the current answer.

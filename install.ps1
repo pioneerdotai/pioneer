@@ -112,7 +112,97 @@ function Parse-Checksum {
     Fail "checksum for $AssetName not found in $ChecksumsPath"
 }
 
-function Run-BootstrapInstaller {
+function Expand-GatewayPackage {
+    param([string]$AssetPath, [string]$Destination)
+
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $archive = [System.IO.Compression.ZipFile]::OpenRead($AssetPath)
+    try {
+        $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        $files = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        $total = [long]0
+        foreach ($entry in $archive.Entries) {
+            $directory = $entry.FullName.EndsWith('/')
+            $name = if ($directory) { $entry.FullName.Substring(0, $entry.FullName.Length - 1) } else { $entry.FullName }
+            $parts = $name.Split('/')
+            $mode = (($entry.ExternalAttributes -shr 16) -band 0xffff)
+            $kind = $mode -band 0xf000
+            $expectedKind = if ($directory) { 0x4000 } else { 0x8000 }
+            if ([string]::IsNullOrEmpty($name) -or $name.Contains('\') -or $name.Contains(':') -or
+                $name -match '\p{Cc}' -or $kind -notin @(0, 0x8000, 0x4000) -or
+                ($kind -ne 0 -and $kind -ne $expectedKind) -or
+                -not $seen.Add($name)) {
+                Fail "unsafe or duplicate Gateway archive member: $($entry.FullName)"
+            }
+            foreach ($part in $parts) {
+                if ([string]::IsNullOrEmpty($part) -or $part -eq '.' -or $part -eq '..' -or
+                    $part.EndsWith('.') -or $part.EndsWith(' ') -or
+                    $part -match '^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(\.|$)') {
+                    Fail "unsafe Gateway archive path: $($entry.FullName)"
+                }
+            }
+            $total += $entry.Length
+            if ($entry.Length -lt 0 -or $entry.Length -gt 512MB -or $total -gt 2GB -or
+                $seen.Count -gt 10000 -or ($directory -and $entry.Length -ne 0)) {
+                Fail "Gateway archive exceeds extraction budget"
+            }
+            if (-not $directory) { [void]$files.Add($name) }
+        }
+        foreach ($name in $seen) {
+            $parent = $name
+            while ($parent.Contains('/')) {
+                $parent = $parent.Substring(0, $parent.LastIndexOf('/'))
+                if ($files.Contains($parent)) { Fail "Gateway archive member conflicts with a parent file" }
+            }
+        }
+        foreach ($entry in $archive.Entries) {
+            if ($entry.FullName.EndsWith('/')) { continue }
+            $outputPath = Join-Path $Destination $entry.FullName
+            [void][System.IO.Directory]::CreateDirectory([System.IO.Path]::GetDirectoryName($outputPath))
+            $source = $entry.Open()
+            try {
+                $output = [System.IO.File]::Open($outputPath, [System.IO.FileMode]::CreateNew)
+                try {
+                    $buffer = [byte[]]::new(1048576)
+                    $written = [long]0
+                    while (($count = $source.Read($buffer, 0, $buffer.Length)) -gt 0) {
+                        $written += $count
+                        if ($written -gt $entry.Length -or $written -gt 512MB) {
+                            Fail "Gateway archive member exceeds declared size"
+                        }
+                        $output.Write($buffer, 0, $count)
+                    }
+                }
+                finally { $output.Dispose() }
+            }
+            finally { $source.Dispose() }
+            if ((Get-Item -LiteralPath $outputPath).Length -ne $entry.Length) {
+                Fail "Gateway archive member size mismatch"
+            }
+        }
+    }
+    finally { $archive.Dispose() }
+}
+
+function Assert-GatewayArchitecture {
+    param([string]$Binary, [string]$Architecture)
+    $stream = [System.IO.File]::OpenRead($Binary)
+    $reader = [System.IO.BinaryReader]::new($stream)
+    try {
+        if ($stream.Length -lt 64 -or $reader.ReadUInt16() -ne 0x5a4d) { Fail "invalid Gateway PE executable" }
+        $stream.Position = 0x3c
+        $offset = $reader.ReadUInt32()
+        if ($offset -gt $stream.Length - 6) { Fail "invalid Gateway PE header" }
+        $stream.Position = $offset
+        $expected = if ($Architecture -eq 'aarch64') { 0xaa64 } else { 0x8664 }
+        if ($reader.ReadUInt32() -ne 0x00004550 -or $reader.ReadUInt16() -ne $expected) {
+            Fail "Gateway executable does not match this OS and architecture"
+        }
+    }
+    finally { $reader.Dispose() }
+}
+
+function Run-PackageInstaller {
     param(
         [string]$InstallerBinary,
         [string]$AssetPath,
@@ -134,6 +224,7 @@ function Run-BootstrapInstaller {
     }
 
     & $InstallerBinary @args
+    if ($LASTEXITCODE -ne 0) { Fail "Gateway installer exited with code $LASTEXITCODE" }
 }
 
 $repo = if ($env:PIONEER_RELEASE_REPO) { $env:PIONEER_RELEASE_REPO } else { "pioneerdotai/pioneer" }
@@ -197,6 +288,14 @@ try {
         $assetPath = $effectiveLocalAssetFile
         $checksumsPath = $effectiveLocalChecksumsFile
         $assetName = [System.IO.Path]::GetFileName($assetPath)
+        $inputsDir = Join-Path $tempDir 'inputs'
+        [void][System.IO.Directory]::CreateDirectory($inputsDir)
+        $snapshotAsset = Join-Path $inputsDir $assetName
+        $snapshotChecksums = Join-Path $inputsDir 'SHA256SUMS'
+        Copy-Item -LiteralPath $assetPath -Destination $snapshotAsset
+        Copy-Item -LiteralPath $checksumsPath -Destination $snapshotChecksums
+        $assetPath = $snapshotAsset
+        $checksumsPath = $snapshotChecksums
         Write-Log "using local bundled asset $assetName"
     }
     else {
@@ -221,14 +320,15 @@ try {
 
     $extractDir = Join-Path $tempDir "extract"
     New-Item -ItemType Directory -Path $extractDir | Out-Null
-    Expand-Archive -Path $assetPath -DestinationPath $extractDir -Force
+    Expand-GatewayPackage -AssetPath $assetPath -Destination $extractDir
 
     $installerBinary = Join-Path $extractDir "pioneer.exe"
     if (-not (Test-Path -Path $installerBinary -PathType Leaf)) {
         Fail "downloaded archive does not contain pioneer.exe"
     }
 
-    Run-BootstrapInstaller -InstallerBinary $installerBinary -AssetPath $assetPath -ChecksumsPath $checksumsPath
+    Assert-GatewayArchitecture -Binary $installerBinary -Architecture $arch
+    Run-PackageInstaller -InstallerBinary $installerBinary -AssetPath $assetPath -ChecksumsPath $checksumsPath
 }
 finally {
     Remove-Item -Path $tempDir -Recurse -Force -ErrorAction SilentlyContinue

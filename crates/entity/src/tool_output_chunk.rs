@@ -7,6 +7,13 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "tool_output_chunk")]
 pub struct Model {
+    pub portable_revision: i64,
+    #[sea_orm(column_type = "Text")]
+    pub portable_identity: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub text_payload_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub metadata_payload_id: Option<String>,
     #[sea_orm(primary_key)]
     pub ordinal: i64,
     #[sea_orm(column_type = "Text", unique)]

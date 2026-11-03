@@ -116,13 +116,18 @@ impl MessageProcessor {
             }
         }
 
-        self.notify_semantic_timeline_blocks_changed(
-            workspace_id,
-            thread_id,
-            changed_block_ids,
-            removed_block_ids,
-        )
-        .await;
+        let owns_work = self
+            .notify_semantic_timeline_blocks_changed_for_turn(
+                workspace_id,
+                thread_id,
+                turn_id,
+                changed_block_ids,
+                removed_block_ids,
+            )
+            .await;
+        if owns_work == Some(false) {
+            notify_work_state = true;
+        }
         if !changed_work_item_ids.is_empty() || !removed_work_item_ids.is_empty() {
             self.notify_semantic_turn_work_items_changed(
                 workspace_id,
@@ -233,13 +238,15 @@ impl MessageProcessor {
         } else {
             (vec![work_block_id(turn_id)], vec![approval_block_id])
         };
-        self.notify_semantic_timeline_blocks_changed(
-            request.workspace_id.as_str(),
-            request.thread_id.as_str(),
-            changed_block_ids,
-            removed_block_ids,
-        )
-        .await;
+        let _ = self
+            .notify_semantic_timeline_blocks_changed_for_turn(
+                request.workspace_id.as_str(),
+                request.thread_id.as_str(),
+                turn_id,
+                changed_block_ids,
+                removed_block_ids,
+            )
+            .await;
         self.notify_semantic_turn_work_state_after_block_change(
             request.workspace_id.as_str(),
             request.thread_id.as_str(),
@@ -271,13 +278,15 @@ impl MessageProcessor {
                 vec![approval_block_id.clone()],
             )
         };
-        self.notify_semantic_timeline_blocks_changed(
-            request.workspace_id.as_str(),
-            request.thread_id.as_str(),
-            changed_block_ids,
-            removed_block_ids,
-        )
-        .await;
+        let _ = self
+            .notify_semantic_timeline_blocks_changed_for_turn(
+                request.workspace_id.as_str(),
+                request.thread_id.as_str(),
+                request.turn_id.as_str(),
+                changed_block_ids,
+                removed_block_ids,
+            )
+            .await;
         self.notify_semantic_turn_work_state_after_block_change(
             request.workspace_id.as_str(),
             request.thread_id.as_str(),
@@ -368,6 +377,62 @@ impl MessageProcessor {
         ancestor_thread_ids
     }
 
+    // Ownership belongs to the requested Turn, independently of task-run kind
+    // or terminal status. A failed lookup must not advertise unverified Work.
+    async fn semantic_turn_owns_work(
+        &self,
+        workspace_id: &str,
+        thread_id: &str,
+        turn_id: &str,
+    ) -> Option<bool> {
+        match self
+            .crud_store
+            .get_turn_work_owner(workspace_id, thread_id, turn_id)
+            .await
+        {
+            Ok(Some(owner)) => Some(owner == pioneer_crud::TurnWorkOwner::Turn),
+            Ok(None) => {
+                warn!(
+                    failure_class = "turn_work_notification_scope_missing",
+                    "cannot resolve Work notification ownership"
+                );
+                None
+            }
+            Err(_) => {
+                warn!(
+                    failure_class = "turn_work_notification_owner_read_failed",
+                    "cannot resolve Work notification ownership"
+                );
+                None
+            }
+        }
+    }
+
+    async fn notify_semantic_timeline_blocks_changed_for_turn(
+        &self,
+        workspace_id: &str,
+        thread_id: &str,
+        turn_id: &str,
+        mut changed_block_ids: Vec<String>,
+        removed_block_ids: Vec<String>,
+    ) -> Option<bool> {
+        let owns_work = self
+            .semantic_turn_owns_work(workspace_id, thread_id, turn_id)
+            .await;
+        if owns_work != Some(true) {
+            let work_id = work_block_id(turn_id);
+            changed_block_ids.retain(|id| id != &work_id);
+        }
+        self.notify_semantic_timeline_blocks_changed(
+            workspace_id,
+            thread_id,
+            changed_block_ids,
+            removed_block_ids,
+        )
+        .await;
+        owns_work
+    }
+
     pub(super) async fn notify_semantic_timeline_blocks_changed(
         &self,
         workspace_id: &str,
@@ -430,6 +495,17 @@ impl MessageProcessor {
         mut changed_work_item_ids: Vec<String>,
         mut removed_work_item_ids: Vec<String>,
     ) {
+        match self
+            .semantic_turn_owns_work(workspace_id, thread_id, turn_id)
+            .await
+        {
+            Some(true) => {}
+            Some(false) => removed_work_item_ids.append(&mut changed_work_item_ids),
+            None => changed_work_item_ids.clear(),
+        }
+        if changed_work_item_ids.is_empty() && removed_work_item_ids.is_empty() {
+            return;
+        }
         changed_work_item_ids.sort();
         changed_work_item_ids.dedup();
         removed_work_item_ids.sort();
@@ -506,9 +582,18 @@ impl MessageProcessor {
         thread_id: &str,
         turn_id: &str,
     ) {
-        let _ = self
+        if self
             .notify_semantic_turn_work_state_changed_inner(workspace_id, thread_id, turn_id, true)
-            .await;
+            .await
+            == TurnWorkProjectionAvailability::Absent
+            && self
+                .semantic_turn_owns_work(workspace_id, thread_id, turn_id)
+                .await
+                == Some(false)
+        {
+            self.notify_semantic_turn_work_removed(workspace_id, thread_id, turn_id)
+                .await;
+        }
     }
 
     async fn notify_semantic_turn_work_state_after_block_change(
@@ -534,6 +619,14 @@ impl MessageProcessor {
         turn_id: &str,
         notify_block_change: bool,
     ) -> TurnWorkProjectionAvailability {
+        match self
+            .semantic_turn_owns_work(workspace_id, thread_id, turn_id)
+            .await
+        {
+            Some(false) => return TurnWorkProjectionAvailability::Absent,
+            None => return TurnWorkProjectionAvailability::Failed,
+            Some(true) => {}
+        }
         let projection = match self.crud_store.get_turn_work_projection(turn_id).await {
             Ok(Some(projection)) => projection,
             Ok(None) => return TurnWorkProjectionAvailability::Absent,
@@ -595,30 +688,55 @@ impl MessageProcessor {
         thread_id: &str,
         turn_id: &str,
     ) {
-        let stream_state = match self
-            .crud_store
-            .get_turn_event_projection_stream_state(turn_id)
+        let revision = match self
+            .semantic_turn_owns_work(workspace_id, thread_id, turn_id)
             .await
         {
-            Ok(state) => state,
-            Err(error) => {
-                warn!(
-                    thread_id,
-                    turn_id,
-                    error = %format!("{error:#}"),
-                    "failed to load turn work tombstone revision"
-                );
-                return;
-            }
+            Some(false) => match self
+                .crud_store
+                .get_detached_turn_work_tombstone(workspace_id, thread_id, turn_id)
+                .await
+            {
+                Ok(Some(revision)) => revision,
+                Ok(None) => {
+                    warn!(
+                        failure_class = "detached_work_absence_unconfirmed",
+                        "cannot publish unconfirmed Work tombstone"
+                    );
+                    return;
+                }
+                Err(_) => {
+                    warn!(
+                        failure_class = "turn_work_tombstone_read_failed",
+                        "failed to load Work tombstone revision"
+                    );
+                    return;
+                }
+            },
+            Some(true) => match self
+                .crud_store
+                .get_turn_event_projection_stream_state(turn_id)
+                .await
+            {
+                Ok(state) => state
+                    .map(|state| {
+                        (
+                            state.projected_through_sequence,
+                            state.updated_at_unix_micros,
+                        )
+                    })
+                    .unwrap_or_default(),
+                Err(_) => {
+                    warn!(
+                        failure_class = "turn_work_tombstone_read_failed",
+                        "failed to load Work tombstone revision"
+                    );
+                    return;
+                }
+            },
+            None => return,
         };
-        let (source_high_watermark, projection_updated_at_unix_micros) = stream_state
-            .map(|state| {
-                (
-                    state.projected_through_sequence,
-                    state.updated_at_unix_micros,
-                )
-            })
-            .unwrap_or_default();
+        let (source_high_watermark, projection_updated_at_unix_micros) = revision;
         let block_id = work_block_id(turn_id);
         self.notify_semantic_timeline_blocks_changed_with_tombstones(
             workspace_id,

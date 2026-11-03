@@ -178,20 +178,15 @@ mod tests {
 
     #[test]
     fn load_projection_preserves_docs_and_initial_buffer() {
-        let projection = agents_doc_load_projection(get_response(Some(payload("local"))));
-
-        assert_eq!(projection.buffer, "local");
-        assert!(projection.explicit_doc.is_some());
-        assert!(projection.effective_doc.is_some());
-    }
-
-    #[test]
-    fn load_projection_uses_effective_content_without_explicit_doc() {
-        let projection = agents_doc_load_projection(get_response(None));
-
-        assert_eq!(projection.buffer, "effective");
-        assert!(projection.explicit_doc.is_none());
-        assert!(projection.effective_doc.is_some());
+        for (explicit, expected_buffer, expected_explicit) in [
+            (Some(payload("local")), "local", true),
+            (None, "effective", false),
+        ] {
+            let projection = agents_doc_load_projection(get_response(explicit));
+            assert_eq!(projection.buffer, expected_buffer);
+            assert_eq!(projection.explicit_doc.is_some(), expected_explicit);
+            assert!(projection.effective_doc.is_some());
+        }
     }
 
     #[test]

@@ -6,7 +6,9 @@ use pioneer_entity::{
     task, task_execution_admission, task_run, thread, thread_lineage, turn, workspace,
 };
 use pioneer_protocol::{PersistedActorRef, PrincipalId};
-use sea_orm::{ColumnTrait, Condition, ConnectionTrait, EntityName, EntityTrait, QueryFilter};
+use sea_orm::{
+    ColumnTrait, Condition, ConnectionTrait, EntityName, EntityTrait, QueryFilter, QuerySelect,
+};
 
 use super::identity::actor_ref_from_db;
 use super::membership::{PersistedThreadAccessClass, persisted_thread_access_class_from_db};
@@ -145,26 +147,28 @@ pub async fn resolve_turn_authorization_scope<C: ConnectionTrait>(
     expected_workspace_id: Option<&str>,
     expected_thread_id: Option<&str>,
 ) -> Result<Option<TurnAuthorizationScope>> {
-    let Some(model) = turn::Entity::find_by_id(turn_id.to_owned())
+    let Some((id, thread_id)) = turn::Entity::find_by_id(turn_id.to_owned())
+        .select_only()
+        .columns([turn::Column::Id, turn::Column::ThreadId])
+        .into_tuple::<(String, String)>()
         .one(db)
         .await
         .context("failed to resolve turn authorization scope")?
     else {
         return Ok(None);
     };
-    if expected_thread_id.is_some_and(|expected| expected != model.thread_id.as_str()) {
+    if expected_thread_id.is_some_and(|expected| expected != thread_id.as_str()) {
         return Ok(None);
     }
     let Some(thread) =
-        resolve_thread_authorization_scope(db, model.thread_id.as_str(), expected_workspace_id)
-            .await?
+        resolve_thread_authorization_scope(db, thread_id.as_str(), expected_workspace_id).await?
     else {
         return Ok(None);
     };
     Ok(Some(TurnAuthorizationScope {
         workspace_id: thread.workspace_id.clone(),
         thread_id: thread.thread_id.clone(),
-        turn_id: model.id,
+        turn_id: id,
         thread,
     }))
 }

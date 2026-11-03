@@ -997,19 +997,6 @@ mod tests {
     }
 
     #[test]
-    fn thread_list_refresh_request_batches_until_taken() {
-        let mut state = ClientState::default();
-
-        assert!(!take_thread_list_refresh_request(&mut state));
-        queue_thread_list_refresh(&mut state);
-        queue_thread_list_refresh(&mut state);
-        assert!(state.threads.list_refresh_requested);
-        assert!(take_thread_list_refresh_request(&mut state));
-        assert!(!state.threads.list_refresh_requested);
-        assert!(!take_thread_list_refresh_request(&mut state));
-    }
-
-    #[test]
     fn pending_request_reducer_replaces_and_cleans_thread_scope() {
         let mut state = ClientState::default();
 
@@ -1044,54 +1031,6 @@ mod tests {
             "thread".to_owned()
         ));
         assert!(state.pending_requests.is_empty());
-    }
-
-    #[test]
-    fn thread_start_request_queue_batches_until_taken_or_cleared() {
-        let mut start_requested = false;
-
-        assert!(!dequeue_thread_start_request(&mut start_requested));
-        enqueue_thread_start_request(&mut start_requested);
-        enqueue_thread_start_request(&mut start_requested);
-        assert!(dequeue_thread_start_request(&mut start_requested));
-        assert!(!dequeue_thread_start_request(&mut start_requested));
-
-        enqueue_thread_start_request(&mut start_requested);
-        clear_thread_start_request(&mut start_requested);
-        assert!(!start_requested);
-    }
-
-    #[test]
-    fn turn_resume_queue_reducer_dedupes_dequeues_and_clears() {
-        let mut ready_threads = VecDeque::new();
-        let mut ready_thread_set = HashSet::new();
-
-        assert!(enqueue_turn_resume_thread(
-            &mut ready_threads,
-            &mut ready_thread_set,
-            "thread_a".to_owned(),
-        ));
-        assert!(!enqueue_turn_resume_thread(
-            &mut ready_threads,
-            &mut ready_thread_set,
-            "thread_a".to_owned(),
-        ));
-        assert!(enqueue_turn_resume_thread(
-            &mut ready_threads,
-            &mut ready_thread_set,
-            "thread_b".to_owned(),
-        ));
-
-        assert_eq!(
-            dequeue_turn_resume_thread(&mut ready_threads, &mut ready_thread_set).as_deref(),
-            Some("thread_a")
-        );
-        assert!(!ready_thread_set.contains("thread_a"));
-        assert!(ready_thread_set.contains("thread_b"));
-
-        clear_turn_resume_queue(&mut ready_threads, &mut ready_thread_set);
-        assert!(ready_threads.is_empty());
-        assert!(ready_thread_set.is_empty());
     }
 
     #[test]

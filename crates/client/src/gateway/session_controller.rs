@@ -300,6 +300,7 @@ impl crate::core::ClientCore {
             .checked_add(1)
             .expect("Gateway refresh generation exhausted");
         owner.refresh_in_flight = false;
+        self.notify_send_readiness();
         for connection in owner.connections.values_mut() {
             connection.cancel_pending_request();
         }
@@ -333,6 +334,7 @@ impl crate::core::ClientCore {
             .refresh_generation
             .checked_add(1)
             .expect("Gateway refresh generation exhausted");
+        self.notify_send_readiness();
         Some(owner.refresh_generation)
     }
 
@@ -345,6 +347,7 @@ impl crate::core::ClientCore {
             return false;
         }
         owner.refresh_in_flight = true;
+        self.notify_send_readiness();
         true
     }
 
@@ -357,6 +360,7 @@ impl crate::core::ClientCore {
             return false;
         }
         owner.refresh_in_flight = false;
+        self.notify_send_readiness();
         true
     }
 
@@ -373,6 +377,7 @@ impl crate::core::ClientCore {
             .checked_add(1)
             .expect("Gateway refresh generation exhausted");
         owner.refresh_in_flight = false;
+        self.notify_send_readiness();
     }
 }
 

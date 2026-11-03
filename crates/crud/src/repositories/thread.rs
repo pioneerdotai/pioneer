@@ -349,6 +349,7 @@ pub async fn insert_user_thread_with_creator<C: ConnectionTrait>(
     .await
     .context("failed to insert user thread")?;
 
+    super::task_child_producers::thread(db, &thread_model.id).await?;
     Ok(())
 }
 
@@ -386,6 +387,13 @@ async fn upsert_thread_with_actor_columns_prepared<C: ConnectionTrait>(
     created_at: DateTimeWithTimeZone,
     updated_at: DateTimeWithTimeZone,
 ) -> Result<()> {
+    let old_workspace = thread::Entity::find_by_id(&thread_model.id)
+        .select_only()
+        .column(thread::Column::WorkspaceId)
+        .lock_exclusive()
+        .into_tuple::<String>()
+        .one(db)
+        .await?;
     thread::Entity::insert(thread::ActiveModel {
         workspace_unread_started_at: sea_orm::NotSet,
         id: Set(thread_model.id.clone()),
@@ -451,6 +459,9 @@ async fn upsert_thread_with_actor_columns_prepared<C: ConnectionTrait>(
     .await
     .context("failed to upsert thread")?;
 
+    if old_workspace.as_ref() != Some(&thread_model.workspace_id) {
+        super::task_child_producers::thread(db, &thread_model.id).await?;
+    }
     Ok(())
 }
 
@@ -625,15 +636,56 @@ pub async fn update_user_thread_management(
     }))
 }
 
-/// Raw observation candidates, including hidden and archived (Closed) threads.
-/// Authorization belongs to the caller. Advance by the last *candidate* ID,
+/// Exact storage sort key, independent of the public second-resolution dates.
+/// Keep SQLite's timestamp text intact: parsing/reformatting it can change the
+/// equality boundary (including fractional precision and timezone spelling).
+#[derive(
+    Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, sea_orm::FromQueryResult,
+)]
+#[serde(deny_unknown_fields)]
+pub struct ThreadReadPosition {
+    pub created_at: String,
+    pub id: String,
+}
+
+// Same ordinary-conversation boundary as user management: visibility and
+// origin/access semantics, independent of creator, lineage, archive state or ACL.
+fn list_conversation_condition() -> sea_orm::Condition {
+    sea_orm::Condition::all()
+        .add(thread::Column::SidebarVisibility.eq("visible"))
+        .add(thread::Column::AccessClass.is_in(["private", "workspace"]))
+        .add(thread::Column::OriginKind.is_not_in(["task_run", "taskRun", "system"]))
+}
+
+/// Revalidate list membership independently of read authorization, including
+/// when resuming metadata fragments and before disclosing a completed page.
+pub async fn is_list_conversation<C: ConnectionTrait>(
+    db: &C,
+    workspace_id: &str,
+    thread_id: &str,
+) -> Result<bool> {
+    Ok(thread::Entity::find_by_id(thread_id.to_owned())
+        .select_only()
+        .column(thread::Column::Id)
+        .column(thread::Column::CreatedAt)
+        .filter(thread::Column::WorkspaceId.eq(workspace_id.to_owned()))
+        .filter(list_conversation_condition())
+        .into_model::<ThreadReadPosition>()
+        .one(db)
+        .await
+        .context("failed to revalidate thread list membership")?
+        .is_some())
+}
+
+/// Ordinary visible conversation candidates, including archived conversations.
+/// Authorization belongs to the caller. Advance by the last *candidate* key,
 /// including rows the caller cannot disclose; a filtered empty page is not EOF.
 pub async fn list_read_candidates_page<C: ConnectionTrait>(
     db: &C,
     workspace_id: &str,
-    after_thread_id: Option<&str>,
+    after: Option<&ThreadReadPosition>,
     limit: u64,
-) -> Result<Vec<String>> {
+) -> Result<Vec<ThreadReadPosition>> {
     anyhow::ensure!(
         (1..=200).contains(&limit),
         "thread candidate page limit must be 1..=200"
@@ -641,14 +693,29 @@ pub async fn list_read_candidates_page<C: ConnectionTrait>(
     let mut query = thread::Entity::find()
         .select_only()
         .column(thread::Column::Id)
-        .filter(thread::Column::WorkspaceId.eq(workspace_id.to_owned()));
-    if let Some(after) = after_thread_id {
-        query = query.filter(thread::Column::Id.gt(after.to_owned()));
+        .column(thread::Column::CreatedAt)
+        .filter(thread::Column::WorkspaceId.eq(workspace_id.to_owned()))
+        .filter(list_conversation_condition());
+    if let Some(after) = after {
+        query = query
+            // Give the workspace/creation index an explicit range as well as
+            // the lexicographic tie-break predicate.
+            .filter(thread::Column::CreatedAt.lte(after.created_at.clone()))
+            .filter(
+                sea_orm::Condition::any()
+                    .add(thread::Column::CreatedAt.lt(after.created_at.clone()))
+                    .add(
+                        sea_orm::Condition::all()
+                            .add(thread::Column::CreatedAt.eq(after.created_at.clone()))
+                            .add(thread::Column::Id.lt(after.id.clone())),
+                    ),
+            );
     }
     query
-        .order_by_asc(thread::Column::Id)
+        .order_by_desc(thread::Column::CreatedAt)
+        .order_by_desc(thread::Column::Id)
         .limit(limit)
-        .into_tuple::<String>()
+        .into_model::<ThreadReadPosition>()
         .all(db)
         .await
         .context("failed to list thread read candidates")

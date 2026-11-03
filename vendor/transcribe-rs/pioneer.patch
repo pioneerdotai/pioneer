@@ -1,0 +1,738 @@
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -117,6 +117,22 @@
+ pub use remote::RemoteTranscriptionEngine;
+ 
+ use std::path::Path;
++
++/// Why an autoregressive decode stopped. Unknown is deliberately not EOS.
++#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
++pub enum DecodingCompletion {
++    #[default]
++    Unknown,
++    Normal,
++    BudgetExhausted,
++    RepetitionGuard,
++}
++
++/// Additive metadata API; legacy result-only methods retain their signature.
++pub struct CompletedTranscription {
++    pub result: TranscriptionResult,
++    pub completion: DecodingCompletion,
++}
+ 
+ /// Describes the capabilities of a speech model.
+ #[derive(Debug, Clone)]
+--- a/src/decode/greedy.rs
++++ b/src/decode/greedy.rs
+@@ -13,6 +13,7 @@
+     max_consecutive_repeats: usize,
+     last_token: i64,
+     consecutive_count: usize,
++    completion: Option<crate::DecodingCompletion>,
+ }
+ 
+ impl GreedyDecoder {
+@@ -22,6 +23,7 @@
+             max_consecutive_repeats: DEFAULT_MAX_CONSECUTIVE_REPEATS,
+             last_token: -1,
+             consecutive_count: 0,
++            completion: None,
+         }
+     }
+ 
+@@ -38,12 +40,14 @@
+         let token = argmax(logits) as i64;
+ 
+         if token == self.eos_id {
++            self.completion = Some(crate::DecodingCompletion::Normal);
+             return None;
+         }
+ 
+         if token == self.last_token {
+             self.consecutive_count += 1;
+             if self.consecutive_count > self.max_consecutive_repeats {
++                self.completion = Some(crate::DecodingCompletion::RepetitionGuard);
+                 log::warn!(
+                     "Greedy decode: token {} repeated {} consecutive times, stopping",
+                     token,
+@@ -57,6 +61,13 @@
+ 
+         self.last_token = token;
+         Some(token)
++    }
++
++    /// Call after the bounded generation loop. Exhaustion without a stop token
++    /// is not a complete transcript, even when the returned text is nonempty.
++    pub fn completion(&self) -> crate::DecodingCompletion {
++        self.completion
++            .unwrap_or(crate::DecodingCompletion::BudgetExhausted)
+     }
+ }
+ 
+@@ -88,6 +99,7 @@
+         let mut dec = GreedyDecoder::new(2);
+         // logits where token 2 (EOS) wins
+         assert_eq!(dec.next_token(&[0.0, 0.0, 10.0, 0.0]), None);
++        assert_eq!(dec.completion(), crate::DecodingCompletion::Normal);
+     }
+ 
+     #[test]
+@@ -104,6 +116,21 @@
+         assert_eq!(dec.next_token(&logits), Some(1)); // count=2
+         assert_eq!(dec.next_token(&logits), Some(1)); // count=3
+         assert_eq!(dec.next_token(&logits), None); // count=4 > 3 → stop
++        assert_eq!(dec.completion(), crate::DecodingCompletion::RepetitionGuard);
++    }
++
++    #[test]
++    fn bounded_loop_without_eos_reports_budget_even_with_text() {
++        let mut decoder = GreedyDecoder::new(2);
++        let mut tokens = Vec::new();
++        for logits in [[0.0, 10.0, 0.0], [10.0, 0.0, 0.0]] {
++            tokens.push(decoder.next_token(&logits).unwrap());
++        }
++        assert_eq!(tokens, [1, 0]);
++        assert_eq!(
++            decoder.completion(),
++            crate::DecodingCompletion::BudgetExhausted
++        );
+     }
+ 
+     #[test]
+--- a/src/onnx/moonshine/mod.rs
++++ b/src/onnx/moonshine/mod.rs
+@@ -2,7 +2,10 @@
+ mod streaming;
+ 
+ pub use model::{MoonshineModel, MoonshineParams};
+-pub use streaming::{MoonshineStreamingParams, StreamingConfig, StreamingModel, StreamingState};
++pub use streaming::{
++    MoonshineStreamingParams, StreamingConfig, StreamingModel, StreamingSession, StreamingState,
++    MAX_SESSION_SAMPLES,
++};
+ 
+ pub const SAMPLE_RATE: u32 = 16000;
+ 
+--- a/src/onnx/moonshine/model.rs
++++ b/src/onnx/moonshine/model.rs
+@@ -107,6 +107,19 @@
+         self.infer(samples, max_length)
+     }
+ 
++    /// Result plus the observed decoder stop reason.
++    pub fn transcribe_with_completion(
++        &mut self,
++        samples: &[f32],
++        params: &MoonshineParams,
++    ) -> Result<crate::CompletedTranscription, TranscribeError> {
++        let max_length = params.max_length.unwrap_or_else(|| {
++            (samples.len() as f64 / SAMPLE_RATE as f64 * self.variant.token_rate() as f64).ceil()
++                as usize
++        });
++        self.infer_with_completion(samples, max_length)
++    }
++
+     fn infer(
+         &mut self,
+         samples: &[f32],
+@@ -119,12 +132,24 @@
+             max_length
+         );
+ 
+-        let tokens = self.generate(samples, max_length)?;
++        self.infer_with_completion(samples, max_length)
++            .map(|output| output.result)
++    }
++
++    fn infer_with_completion(
++        &mut self,
++        samples: &[f32],
++        max_length: usize,
++    ) -> Result<crate::CompletedTranscription, TranscribeError> {
++        let (tokens, completion) = self.generate(samples, max_length)?;
+         let text = self.decode_tokens(&tokens)?;
+ 
+-        Ok(TranscriptionResult {
+-            text,
+-            segments: None,
++        Ok(crate::CompletedTranscription {
++            result: TranscriptionResult {
++                text,
++                segments: None,
++            },
++            completion,
+         })
+     }
+ 
+@@ -166,7 +191,7 @@
+         &mut self,
+         samples: &[f32],
+         max_length: usize,
+-    ) -> Result<Vec<i64>, TranscribeError> {
++    ) -> Result<(Vec<i64>, crate::DecodingCompletion), TranscribeError> {
+         let audio_duration = samples.len() as f32 / SAMPLE_RATE as f32;
+         if audio_duration < 0.1 || audio_duration > 64.0 {
+             return Err(TranscribeError::Inference(format!(
+@@ -246,7 +271,7 @@
+             cache.update_from_outputs(&outputs, use_cache_branch)?;
+         }
+ 
+-        Ok(tokens)
++        Ok((tokens, greedy.completion()))
+     }
+ 
+     fn decode_tokens(&self, tokens: &[i64]) -> Result<String, TranscribeError> {
+--- a/src/onnx/moonshine/streaming.rs
++++ b/src/onnx/moonshine/streaming.rs
+@@ -1,3 +1,6 @@
++mod session_api;
++pub use session_api::{StreamingSession, MAX_SESSION_SAMPLES};
++
+ use ndarray::{ArrayD, ArrayViewD, IxDyn};
+ use ort::inputs;
+ use ort::session::Session;
+@@ -278,6 +281,8 @@
+     decoder_kv: Session,
+     tokenizer: BinTokenizer,
+     config: StreamingConfig,
++    // Only sessions created by this exact loaded model may be used with it.
++    session_owner: std::sync::Arc<()>,
+ }
+ 
+ impl StreamingModel {
+@@ -341,6 +346,7 @@
+             decoder_kv,
+             tokenizer,
+             config,
++            session_owner: std::sync::Arc::new(()),
+         })
+     }
+ 
+@@ -350,12 +356,25 @@
+         samples: &[f32],
+         params: &MoonshineStreamingParams,
+     ) -> Result<TranscriptionResult, TranscribeError> {
+-        let tokens = self.generate(samples, 6.5, params.max_length)?;
++        self.transcribe_with_completion(samples, params)
++            .map(|output| output.result)
++    }
++
++    /// Result plus the observed decoder stop reason.
++    pub fn transcribe_with_completion(
++        &mut self,
++        samples: &[f32],
++        params: &MoonshineStreamingParams,
++    ) -> Result<crate::CompletedTranscription, TranscribeError> {
++        let (tokens, completion) = self.generate(samples, 6.5, params.max_length)?;
+         let text = self.tokenizer.decode(&tokens)?;
+ 
+-        Ok(TranscriptionResult {
+-            text,
+-            segments: None,
++        Ok(crate::CompletedTranscription {
++            result: TranscriptionResult {
++                text,
++                segments: None,
++            },
++            completion,
+         })
+     }
+ 
+@@ -738,7 +757,7 @@
+         samples: &[f32],
+         max_tokens_per_second: f32,
+         max_tokens_override: Option<usize>,
+-    ) -> Result<Vec<i64>, TranscribeError> {
++    ) -> Result<(Vec<i64>, crate::DecodingCompletion), TranscribeError> {
+         let mut state = self.create_state();
+ 
+         for chunk in samples.chunks(CHUNK_SIZE) {
+@@ -748,7 +767,7 @@
+         self.encode_streaming(&mut state, true)?;
+ 
+         if state.memory_len == 0 {
+-            return Ok(Vec::new());
++            return Ok((Vec::new(), crate::DecodingCompletion::Unknown));
+         }
+ 
+         self.compute_cross_kv(&mut state)?;
+@@ -778,7 +797,7 @@
+             current_token = next_token;
+         }
+ 
+-        Ok(tokens)
++        Ok((tokens, greedy.completion()))
+     }
+ }
+ 
+@@ -792,7 +811,7 @@
+         samples: &[f32],
+         _options: &TranscribeOptions,
+     ) -> Result<TranscriptionResult, TranscribeError> {
+-        let tokens = self.generate(samples, 6.5, None)?;
++        let (tokens, _) = self.generate(samples, 6.5, None)?;
+         let text = self.tokenizer.decode(&tokens)?;
+ 
+         Ok(TranscriptionResult {
+--- /dev/null
++++ b/src/onnx/moonshine/streaming/session_api.rs
+@@ -0,0 +1,294 @@
++//! Recording/segment state without a borrow or lock on the shared ONNX model.
++//! No VAD, endpoint detector, audio replay or implicit restart lives here.
++use super::*;
++use crate::{CompletedTranscription, DecodingCompletion};
++use std::sync::Arc;
++
++/// Engineering bound shared with the gateway's existing 18 s speech window.
++pub const MAX_SESSION_SAMPLES: usize = 18 * SAMPLE_RATE as usize;
++const MAX_STATE_BYTES: usize = 256 * 1024 * 1024;
++
++pub struct StreamingSession {
++    owner: Arc<()>,
++    state: StreamingState,
++    pending: Vec<f32>,
++    real_samples: usize,
++    padding_samples: usize,
++    unavailable: bool,
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    // Deferred real-SDK coverage: must be explicitly admitted by the external
++    // reviewer. This is not fake evidence for the acoustic model/export.
++    #[test]
++    #[ignore = "requires Moonshine Streaming export and a 16 kHz mono speech WAV; inference admission required"]
++    fn real_export_preserves_acoustic_state_across_feed_partitions_and_final_tail() {
++        let model_dir =
++            std::env::var_os("PIONEER_MOONSHINE_STREAMING_MODEL").expect("model directory");
++        let wav = std::env::var_os("PIONEER_VOICE_SPEECH_WAV").expect("speech WAV");
++        let mut model =
++            StreamingModel::load(Path::new(&model_dir), 1, &Quantization::Int8).unwrap();
++        let audio = crate::audio::read_wav_samples(Path::new(&wav)).unwrap();
++        assert!(
++            audio.len() >= 3 * 16000 + 137,
++            "provide at least 3.01 s speech"
++        );
++        let samples = &audio[..3 * 16000 + 137];
++        let mut reference = None;
++        for partition in [73, 1280, 4097, samples.len()] {
++            let mut session = model.begin_session().unwrap();
++            for chunk in samples.chunks(partition) {
++                model.feed_session(&mut session, chunk).unwrap();
++            }
++            assert_eq!(session.real_samples(), samples.len());
++            assert_eq!(session.pending.len(), samples.len() % 1280);
++            // Preview re-decodes must not change frontend/encoder state.
++            let features = session.state.accumulated_features.clone();
++            let memory = session.state.memory.clone();
++            let _ = model.session_hypothesis(&mut session).unwrap();
++            assert_eq!(session.state.accumulated_features, features);
++            assert_eq!(session.state.memory, memory);
++            let result = model.finish_session(&mut session).unwrap();
++            assert_eq!(session.padding_samples(), 1280 - samples.len() % 1280);
++            assert!(session.pending.is_empty());
++            assert_eq!(
++                session.state.encoder_frames_emitted,
++                session.state.accumulated_feature_count
++            );
++            assert!(session.state.cache_seq_len as usize <= model.config.max_seq_len);
++            assert!(model.feed_session(&mut session, &[0.5]).is_err());
++            assert!(model.finish_session(&mut session).is_err());
++            let current = (
++                result.result.text,
++                result.completion,
++                session.state.memory.clone(),
++            );
++            if let Some(expected) = &reference {
++                assert_eq!(&current, expected);
++            } else {
++                reference = Some(current);
++            }
++        }
++        let fresh = model.begin_session().unwrap();
++        assert_eq!(fresh.real_samples(), 0);
++        assert!(fresh.state.memory.is_empty());
++        assert_eq!(fresh.state.cache_seq_len, 0);
++        let mut oversized = model.begin_session().unwrap();
++        assert!(model
++            .feed_session(&mut oversized, &vec![0.0; MAX_SESSION_SAMPLES + 1])
++            .is_err());
++        assert_eq!(oversized.real_samples(), 0);
++        assert!(model.feed_session(&mut oversized, &[0.5; 1280]).is_err());
++        let mut other =
++            StreamingModel::load(Path::new(&model_dir), 1, &Quantization::Int8).unwrap();
++        let mut wrong_owner = fresh;
++        assert!(other.feed_session(&mut wrong_owner, &[0.5; 1280]).is_err());
++    }
++}
++
++impl StreamingSession {
++    pub fn real_samples(&self) -> usize {
++        self.real_samples
++    }
++    pub fn padding_samples(&self) -> usize {
++        self.padding_samples
++    }
++}
++
++impl StreamingModel {
++    /// Begin one bounded acoustic segment. Retains no lock/model borrow.
++    pub fn begin_session(&self) -> Result<StreamingSession, TranscribeError> {
++        self.validate_session_config()?;
++        let frames = MAX_SESSION_SAMPLES.div_ceil(320) + CHUNK_SIZE / 320;
++        let mut state = self.create_state();
++        // Reserve the bounded persistent tensors once. Geometric Vec growth
++        // must not silently double the configuration's state estimate.
++        state.accumulated_features = Vec::with_capacity(frames * self.config.encoder_dim);
++        state.memory = Vec::with_capacity(frames * self.config.decoder_dim);
++        let self_kv =
++            self.config.depth * self.config.nheads * self.config.head_dim * self.config.max_seq_len;
++        state.k_self = Vec::with_capacity(self_kv);
++        state.v_self = Vec::with_capacity(self_kv);
++        Ok(StreamingSession {
++            owner: self.session_owner.clone(),
++            state,
++            pending: Vec::with_capacity(CHUNK_SIZE),
++            real_samples: 0,
++            padding_samples: 0,
++            unavailable: false,
++        })
++    }
++
++    fn validate_session_config(&self) -> Result<(), TranscribeError> {
++        let c = &self.config;
++        // The upstream frontend carries 79 samples and downsamples 4 x 80
++        // samples per encoder frame. Do not silently apply that contract to a
++        // different export. Bound all persistent tensors before allocation.
++        if c.frame_len != 80
++            || c.encoder_dim == 0
++            || c.decoder_dim == 0
++            || c.depth == 0
++            || c.nheads == 0
++            || c.head_dim == 0
++            || c.d_model_frontend == 0
++            || c.c1 == 0
++            || c.max_seq_len == 0
++            || c.max_seq_len > 8192
++            || c.total_lookahead > 1024
++        {
++            return Err(TranscribeError::Config(
++                "Unsupported streaming session config".into(),
++            ));
++        }
++        let frames = MAX_SESSION_SAMPLES.div_ceil(320) + CHUNK_SIZE / 320;
++        let estimate = (|| {
++            let acoustic = frames.checked_mul(c.encoder_dim.checked_add(c.decoder_dim)?)?;
++            let kv = c
++                .depth
++                .checked_mul(c.nheads)?
++                .checked_mul(c.head_dim)?
++                .checked_mul(frames.checked_add(c.max_seq_len)?)?
++                .checked_mul(2)?;
++            let frontend = c.d_model_frontend.checked_add(c.c1)?.checked_mul(4)?;
++            acoustic
++                .checked_add(kv)?
++                .checked_add(frontend)?
++                .checked_mul(4)
++        })();
++        if estimate.is_none_or(|bytes| bytes > MAX_STATE_BYTES) {
++            return Err(TranscribeError::Config(
++                "Streaming session state exceeds memory limit".into(),
++            ));
++        }
++        Ok(())
++    }
++
++    fn check_session(&self, session: &StreamingSession) -> Result<(), TranscribeError> {
++        if session.unavailable || !Arc::ptr_eq(&session.owner, &self.session_owner) {
++            return Err(TranscribeError::Inference(
++                "Streaming session closed or belongs to another model".into(),
++            ));
++        }
++        Ok(())
++    }
++
++    /// Feed ordered, new prepared PCM exactly once. A partial chunk is retained
++    /// until more audio or finish. Encoder lookahead remains un-emitted.
++    pub fn feed_session(
++        &mut self,
++        session: &mut StreamingSession,
++        samples: &[f32],
++    ) -> Result<(), TranscribeError> {
++        self.check_session(session)?;
++        // Any failed operation poisons this session; no partial retry is safe.
++        session.unavailable = true;
++        let total = session
++            .real_samples
++            .checked_add(samples.len())
++            .filter(|total| *total <= MAX_SESSION_SAMPLES)
++            .ok_or_else(|| {
++                TranscribeError::Inference("Streaming segment sample limit exceeded".into())
++            })?;
++        if samples.iter().any(|s| !s.is_finite()) {
++            return Err(TranscribeError::Inference(
++                "Non-finite streaming PCM".into(),
++            ));
++        }
++        for slice in samples.chunks(CHUNK_SIZE) {
++            let mut rest = slice;
++            while !rest.is_empty() {
++                let take = rest.len().min(CHUNK_SIZE - session.pending.len());
++                session.pending.extend_from_slice(&rest[..take]);
++                rest = &rest[take..];
++                if session.pending.len() == CHUNK_SIZE {
++                    self.process_audio_chunk(&mut session.state, &session.pending)?;
++                    session.pending.clear();
++                    self.encode_streaming(&mut session.state, false)?;
++                }
++            }
++        }
++        session.real_samples = total;
++        session.unavailable = false;
++        Ok(())
++    }
++
++    /// Tentative decode only. EOS here does not finalize the acoustic segment.
++    pub fn session_hypothesis(
++        &mut self,
++        session: &mut StreamingSession,
++    ) -> Result<CompletedTranscription, TranscribeError> {
++        self.check_session(session)?;
++        session.unavailable = true;
++        let result = self.decode_session(session)?;
++        session.unavailable = false;
++        Ok(result)
++    }
++
++    /// Close the segment, flush the retained PCM (native padding is counted
++    /// separately), release encoder lookahead, then decode against final memory.
++    pub fn finish_session(
++        &mut self,
++        session: &mut StreamingSession,
++    ) -> Result<CompletedTranscription, TranscribeError> {
++        self.check_session(session)?;
++        session.unavailable = true;
++        if !session.pending.is_empty() {
++            session.padding_samples = CHUNK_SIZE - session.pending.len();
++            session.pending.resize(CHUNK_SIZE, 0.0);
++            self.process_audio_chunk(&mut session.state, &session.pending)?;
++            session.pending.clear();
++        }
++        self.encode_streaming(&mut session.state, true)?;
++        self.decode_session(session)
++    }
++
++    fn decode_session(
++        &mut self,
++        session: &mut StreamingSession,
++    ) -> Result<CompletedTranscription, TranscribeError> {
++        let state = &mut session.state;
++        // Self KV was conditioned on the previous acoustic memory. Continuing
++        // that cache with new memory is not valid. Re-decode from BOS; retain
++        // frontend/encoder/adapter state and recompute cross KV when invalidated.
++        state.k_self.clear();
++        state.v_self.clear();
++        state.cache_seq_len = 0;
++        let mut greedy = GreedyDecoder::new(self.config.eos_id);
++        let mut tokens = Vec::new();
++        if state.memory_len == 0 {
++            return Ok(CompletedTranscription {
++                result: TranscriptionResult {
++                    text: String::new(),
++                    segments: None,
++                },
++                completion: DecodingCompletion::Unknown,
++            });
++        }
++        // The BOS occupies the first decoder input position; each call consumes
++        // one position and predicts the next token, including the EOS attempt.
++        // Count real prepared PCM, never native padding or gateway source gaps.
++        let budget = ((session.real_samples as f64 / SAMPLE_RATE as f64 * 6.5).ceil() as usize)
++            .min(self.config.max_seq_len);
++        let mut token = self.config.bos_id;
++        for _ in 0..budget {
++            let logits = self.decode_step_logits(state, token)?;
++            match greedy.next_token(&logits) {
++                Some(next) => {
++                    tokens.push(next);
++                    token = next;
++                }
++                None => break,
++            }
++        }
++        Ok(CompletedTranscription {
++            result: TranscriptionResult {
++                text: self.tokenizer.decode(&tokens)?,
++                segments: None,
++            },
++            completion: greedy.completion(),
++        })
++    }
++}
+--- a/src/onnx/cohere/mod.rs
++++ b/src/onnx/cohere/mod.rs
+@@ -111,6 +111,16 @@
+         samples: &[f32],
+         params: &CohereParams,
+     ) -> Result<TranscriptionResult, TranscribeError> {
++        self.transcribe_with_completion(samples, params)
++            .map(|output| output.result)
++    }
++
++    /// Result plus the observed decoder stop reason.
++    pub fn transcribe_with_completion(
++        &mut self,
++        samples: &[f32],
++        params: &CohereParams,
++    ) -> Result<crate::CompletedTranscription, TranscribeError> {
+         if params.translate {
+             log::warn!(
+                 "Cohere ONNX export does not support local translation; ignoring translate=true"
+@@ -118,9 +128,12 @@
+         }
+ 
+         if samples.is_empty() {
+-            return Ok(TranscriptionResult {
+-                text: String::new(),
+-                segments: None,
++            return Ok(crate::CompletedTranscription {
++                result: TranscriptionResult {
++                    text: String::new(),
++                    segments: None,
++                },
++                completion: crate::DecodingCompletion::Unknown,
+             });
+         }
+ 
+@@ -130,11 +143,14 @@
+             .unwrap_or(DEFAULT_MAX_NEW_TOKENS)
+             .min(MAX_SEQ_LEN.saturating_sub(prompt_ids.len()));
+ 
+-        let text = self.transcribe_chunk(samples, &prompt_ids, max_new_tokens)?;
+-
+-        Ok(TranscriptionResult {
+-            text,
+-            segments: None,
++        let (text, completion) = self.transcribe_chunk(samples, &prompt_ids, max_new_tokens)?;
++
++        Ok(crate::CompletedTranscription {
++            result: TranscriptionResult {
++                text,
++                segments: None,
++            },
++            completion,
+         })
+     }
+ 
+@@ -143,7 +159,7 @@
+         samples: &[f32],
+         prompt_ids: &[i64],
+         max_new_tokens: usize,
+-    ) -> Result<String, TranscribeError> {
++    ) -> Result<(String, crate::DecodingCompletion), TranscribeError> {
+         let audio = Array2::from_shape_vec((1, samples.len()), samples.to_vec())?.into_dyn();
+         let (cross_k, cross_v) = {
+             let mut encoder_outputs = self.encoder.run(vec![(
+@@ -254,7 +270,7 @@
+             self_v_cache = remove_output(&mut decoder_outputs, "out_n_layer_self_v_cache")?;
+         }
+ 
+-        Ok(self.decode_ids(&generated_ids))
++        Ok((self.decode_ids(&generated_ids), greedy.completion()))
+     }
+ 
+     fn build_prompt_ids(&self, language: Option<&str>) -> Vec<i64> {
+--- a/src/onnx/canary/mod.rs
++++ b/src/onnx/canary/mod.rs
+@@ -158,6 +158,16 @@
+         samples: &[f32],
+         params: &CanaryParams,
+     ) -> Result<TranscriptionResult, TranscribeError> {
++        self.transcribe_with_completion(samples, params)
++            .map(|output| output.result)
++    }
++
++    /// Result plus the observed decoder stop reason.
++    pub fn transcribe_with_completion(
++        &mut self,
++        samples: &[f32],
++        params: &CanaryParams,
++    ) -> Result<crate::CompletedTranscription, TranscribeError> {
+         let src_lang = params.language.as_deref().unwrap_or("en");
+         let tgt_lang = params.target_language.as_deref().unwrap_or(src_lang);
+ 
+@@ -235,7 +245,7 @@
+         // --- Step 4: Autoregressive decoding ---
+         let decode_start = Instant::now();
+ 
+-        let text = decode_autoregressive(
++        let (text, completion) = decode_autoregressive(
+             &mut self.decoder,
+             &encoder_embeddings,
+             &encoder_mask,
+@@ -251,9 +261,12 @@
+             text
+         );
+ 
+-        Ok(TranscriptionResult {
+-            text,
+-            segments: None,
++        Ok(crate::CompletedTranscription {
++            result: TranscriptionResult {
++                text,
++                segments: None,
++            },
++            completion,
+         })
+     }
+ }
+--- a/src/onnx/canary/decoder.rs
++++ b/src/onnx/canary/decoder.rs
+@@ -14,7 +14,7 @@
+     prompt_tokens: Vec<i64>,
+     vocab: &Vocab,
+     max_sequence_length: usize,
+-) -> Result<String, TranscribeError> {
++) -> Result<(String, crate::DecodingCompletion), TranscribeError> {
+     let (num_layers, hidden_dim) = extract_decoder_mems_shape(decoder)?;
+ 
+     log::debug!(
+@@ -32,7 +32,7 @@
+ 
+     // Limit decode steps so total tokens (prompt + generated) stays within
+     // the model's position embedding table (typically 1024).
+-    let max_steps = max_sequence_length.saturating_sub(all_tokens.len());
++    let max_steps = max_decode_steps(max_sequence_length, all_tokens.len());
+ 
+     log::debug!(
+         "Starting autoregressive decode with {} prompt tokens, max_steps={}",
+@@ -92,7 +92,25 @@
+     }
+ 
+     let text = vocab.decode_tokens(&all_tokens);
+-    Ok(text)
++    Ok((text, greedy.completion()))
++}
++
++fn max_decode_steps(requested_total: usize, prompt_tokens: usize) -> usize {
++    // This export's position table admits 1024 total decoder input positions.
++    requested_total.min(1024).saturating_sub(prompt_tokens)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::max_decode_steps;
++
++    #[test]
++    fn prompt_and_requested_budget_stay_inside_export_context() {
++        assert_eq!(max_decode_steps(usize::MAX, 8), 1016);
++        assert_eq!(max_decode_steps(16, 8), 8);
++        assert_eq!(max_decode_steps(1024, 1024), 0);
++        assert_eq!(max_decode_steps(1, 8), 0);
++    }
+ }
+ 
+ fn extract_decoder_mems_shape(decoder: &Session) -> Result<(usize, usize), TranscribeError> {

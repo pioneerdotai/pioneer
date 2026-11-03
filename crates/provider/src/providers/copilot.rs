@@ -309,6 +309,17 @@ struct ApiModelEntry {
     created: Option<i64>,
     #[serde(default)]
     owned_by: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_present_endpoints")]
+    supported_endpoints: Option<serde_json::Value>,
+    #[serde(default)]
+    capabilities: serde_json::Value,
+}
+
+// Preserve missing versus explicit null: only absence has the CAPI default.
+fn deserialize_present_endpoints<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> std::result::Result<Option<serde_json::Value>, D::Error> {
+    Ok(Some(serde::Deserialize::deserialize(d)?))
 }
 
 // ── Implementation ──────────────────────────────────────────────────────────
@@ -551,18 +562,7 @@ impl CopilotProvider {
     }
 
     async fn api_error(response: reqwest::Response) -> anyhow::Error {
-        let status = response.status();
-        let body = match crate::http::read_response_text_bounded(
-            response,
-            16 * 1024,
-            "provider_error_body",
-        )
-        .await
-        {
-            Ok(body) => body,
-            Err(error) => return error,
-        };
-        anyhow!("Copilot API error ({status}): {body}")
+        crate::http::provider_api_error(response, "Copilot").await
     }
 }
 
@@ -944,7 +944,21 @@ impl crate::traits::Provider for CopilotProvider {
                 provider: "copilot".to_owned(),
                 owned_by: m.owned_by.or(Some("github".to_owned())),
                 limits: ProviderModelLimits::default(),
-                capabilities: ProviderModelCapabilities::default(),
+                capabilities: ProviderModelCapabilities {
+                    chat: match m.capabilities["type"].as_str() {
+                        Some("embeddings" | "completion") => Some(false),
+                        _ => match m.supported_endpoints.as_ref() {
+                            Some(endpoints) => crate::catalog::tool_support_from_marker_list(
+                                endpoints,
+                                "/chat/completions",
+                            ),
+                            None => {
+                                (m.capabilities["type"].as_str() == Some("chat")).then_some(true)
+                            }
+                        },
+                    },
+                    ..Default::default()
+                },
                 transcription: None,
                 pricing: None,
                 active: Some(true),
@@ -994,15 +1008,6 @@ mod tests {
     }
 
     #[test]
-    fn chat_completions_url_built_correctly() {
-        let provider = CopilotProvider::new("key");
-        assert_eq!(
-            provider.chat_completions_url(),
-            "https://api.githubcopilot.com/chat/completions"
-        );
-    }
-
-    #[test]
     fn custom_gateway_prefix_routes_chat_and_models() {
         let provider = CopilotProvider::with_base_url_and_timeout_policy(
             "key",
@@ -1046,17 +1051,19 @@ mod tests {
     }
 
     #[test]
-    fn provider_name() {
+    fn provider_defaults_preserve_identity_capabilities_and_chat_url() {
         let provider = CopilotProvider::new("key");
-        assert_eq!(provider.name(), "copilot");
-    }
 
-    #[test]
-    fn provider_capabilities() {
-        let provider = CopilotProvider::new("key");
+        assert_eq!(provider.name(), "copilot");
+
         let caps = provider.capabilities();
         assert!(caps.streaming);
         assert!(caps.vision);
+
+        assert_eq!(
+            provider.chat_completions_url(),
+            "https://api.githubcopilot.com/chat/completions"
+        );
     }
 }
 

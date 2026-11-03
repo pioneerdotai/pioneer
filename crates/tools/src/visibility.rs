@@ -1,6 +1,6 @@
 use crate::domain::builtin_tool_domain_map;
 use crate::spec::ToolSpec;
-use crate::tool_index::PREFLIGHT_CORE_TOOL_NAMES;
+use crate::tool_index::CORE_TOOL_NAMES;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -9,7 +9,6 @@ use tokio::sync::RwLock;
 pub enum ToolVisibilitySource {
     Core,
     CurrentTurn,
-    Preflight,
     Dynamic,
 }
 
@@ -18,7 +17,6 @@ impl ToolVisibilitySource {
         match self {
             Self::Core => "core",
             Self::CurrentTurn => "current_turn",
-            Self::Preflight => "preflight",
             Self::Dynamic => "dynamic",
         }
     }
@@ -43,7 +41,6 @@ pub struct ToolVisibilityDiagnostic {
 pub struct FinalToolVisibilityInput {
     pub core_tools: Vec<String>,
     pub current_visible_tools: Vec<String>,
-    pub preflight_visible_tools: Vec<String>,
     pub dynamic_tool_names: Vec<String>,
     pub registered_tool_names: Vec<String>,
     pub available_tool_names: Vec<String>,
@@ -93,16 +90,6 @@ pub fn compute_final_tool_visibility(input: FinalToolVisibilityInput) -> FinalTo
     append_visible_tools(
         &mut result,
         &mut visible,
-        input.preflight_visible_tools,
-        ToolVisibilitySource::Preflight,
-        true,
-        &registered,
-        &available,
-        &blocked,
-    );
-    append_visible_tools(
-        &mut result,
-        &mut visible,
         input.dynamic_tool_names,
         ToolVisibilitySource::Dynamic,
         true,
@@ -119,7 +106,7 @@ pub fn materialized_dynamic_extension_tool_names(
     core_tool_names: impl IntoIterator<Item = String>,
 ) -> Vec<String> {
     let core = normalized_set(core_tool_names);
-    let static_core = PREFLIGHT_CORE_TOOL_NAMES
+    let static_core = CORE_TOOL_NAMES
         .iter()
         .copied()
         .map(str::to_owned)
@@ -273,13 +260,13 @@ fn default_visible_specs(all_specs: &[ToolSpec]) -> Vec<ToolSpec> {
         .iter()
         .map(|spec| spec.name.clone())
         .collect::<Vec<_>>();
-    let default_visible_names = PREFLIGHT_CORE_TOOL_NAMES
+    let default_visible_names = CORE_TOOL_NAMES
         .iter()
         .copied()
         .map(str::to_owned)
         .chain(materialized_dynamic_extension_tool_names(
             all_tool_names,
-            PREFLIGHT_CORE_TOOL_NAMES.iter().copied().map(str::to_owned),
+            CORE_TOOL_NAMES.iter().copied().map(str::to_owned),
         ))
         .collect::<HashSet<_>>();
 
@@ -438,7 +425,6 @@ mod tests {
         FinalToolVisibilityInput {
             core_tools: vec!["exec_command".to_owned(), "request_tools".to_owned()],
             current_visible_tools: Vec::new(),
-            preflight_visible_tools: Vec::new(),
             dynamic_tool_names: Vec::new(),
             registered_tool_names: vec![
                 "exec_command".to_owned(),
@@ -463,57 +449,9 @@ mod tests {
     }
 
     #[test]
-    fn final_visibility_includes_core_only_by_default() {
-        let result = compute_final_tool_visibility(visibility_input());
-
-        assert_eq!(
-            result.visible_tools,
-            vec!["exec_command".to_owned(), "request_tools".to_owned()]
-        );
-        assert!(result.diagnostics.is_empty());
-    }
-
-    #[test]
-    fn final_visibility_adds_preflight_optional_tools_when_available() {
-        let mut input = visibility_input();
-        input.preflight_visible_tools = vec!["memory_get".to_owned(), "memory_search".to_owned()];
-
-        let result = compute_final_tool_visibility(input);
-
-        assert_eq!(
-            result.visible_tools,
-            vec![
-                "exec_command".to_owned(),
-                "request_tools".to_owned(),
-                "memory_get".to_owned(),
-                "memory_search".to_owned()
-            ]
-        );
-        assert!(result.diagnostics.is_empty());
-    }
-
-    #[test]
-    fn final_visibility_preserves_current_turn_expansion() {
-        let mut input = visibility_input();
-        input.current_visible_tools = vec!["artifact_prepare".to_owned()];
-
-        let result = compute_final_tool_visibility(input);
-
-        assert_eq!(
-            result.visible_tools,
-            vec![
-                "exec_command".to_owned(),
-                "request_tools".to_owned(),
-                "artifact_prepare".to_owned()
-            ]
-        );
-        assert!(result.diagnostics.is_empty());
-    }
-
-    #[test]
     fn final_visibility_drops_unknown_unavailable_and_blocked_tools() {
         let mut input = visibility_input();
-        input.preflight_visible_tools = vec![
+        input.current_visible_tools = vec![
             "memory_search".to_owned(),
             "missing_tool".to_owned(),
             "task_create".to_owned(),
@@ -541,7 +479,7 @@ mod tests {
         assert!(result.diagnostics.iter().any(|diagnostic| {
             diagnostic.code == ToolVisibilityDiagnosticCode::UnknownToolDropped
                 && diagnostic.tool_name == "missing_tool"
-                && diagnostic.source == ToolVisibilitySource::Preflight
+                && diagnostic.source == ToolVisibilitySource::CurrentTurn
         }));
         assert!(result.diagnostics.iter().any(|diagnostic| {
             diagnostic.code == ToolVisibilityDiagnosticCode::UnavailableToolDropped
@@ -551,24 +489,6 @@ mod tests {
             diagnostic.code == ToolVisibilityDiagnosticCode::PolicyBlockedToolDropped
                 && diagnostic.tool_name == "memory_get"
         }));
-    }
-
-    #[test]
-    fn final_visibility_preserves_dynamic_extensions_independent_of_preflight() {
-        let mut input = visibility_input();
-        input.dynamic_tool_names = vec!["skill.weather".to_owned()];
-
-        let result = compute_final_tool_visibility(input);
-
-        assert_eq!(
-            result.visible_tools,
-            vec![
-                "exec_command".to_owned(),
-                "request_tools".to_owned(),
-                "skill.weather".to_owned()
-            ]
-        );
-        assert!(result.diagnostics.is_empty());
     }
 
     #[test]
@@ -592,5 +512,49 @@ mod tests {
             dynamic,
             vec!["skill.weather".to_owned(), "mcp.browser.open".to_owned()]
         );
+    }
+
+    #[test]
+    fn final_visibility_preserves_available_source_expansions() {
+        for (case, current, dynamic, expected) in [
+            (
+                "core_only",
+                vec![],
+                vec![],
+                vec!["exec_command", "request_tools"],
+            ),
+            (
+                "restored_memory",
+                vec!["memory_get", "memory_search"],
+                vec![],
+                vec![
+                    "exec_command",
+                    "request_tools",
+                    "memory_get",
+                    "memory_search",
+                ],
+            ),
+            (
+                "current_turn",
+                vec!["artifact_prepare"],
+                vec![],
+                vec!["exec_command", "request_tools", "artifact_prepare"],
+            ),
+            (
+                "dynamic",
+                vec![],
+                vec!["skill.weather"],
+                vec!["exec_command", "request_tools", "skill.weather"],
+            ),
+        ] {
+            let mut input = visibility_input();
+            input.current_visible_tools = current.into_iter().map(str::to_owned).collect();
+            input.dynamic_tool_names = dynamic.into_iter().map(str::to_owned).collect();
+
+            let result = compute_final_tool_visibility(input);
+
+            assert_eq!(result.visible_tools, expected, "{case}");
+            assert!(result.diagnostics.is_empty(), "{case}");
+        }
     }
 }

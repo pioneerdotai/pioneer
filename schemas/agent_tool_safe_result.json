@@ -40,6 +40,17 @@
       "items": {
         "$ref": "#/$defs/AgentToolTargetOption"
       }
+    },
+    "threadResult": {
+      "description": "Durable references from a committed thread action. IDs do not grant access.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/AgentThreadActionResult"
+        },
+        {
+          "type": "null"
+        }
+      ]
     }
   },
   "additionalProperties": false,
@@ -47,6 +58,45 @@
     "status"
   ],
   "$defs": {
+    "AgentThreadActionResult": {
+      "description": "References fixed at the thread action commit, preserved on replay.",
+      "type": "object",
+      "properties": {
+        "executionId": {
+          "description": "Execution committed for turnId in threadId by foreground admission.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "taskId": {
+          "description": "Task atomically created by the shared detached launch mechanism.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "threadId": {
+          "description": "Created conversation or the target conversation of send/start.",
+          "type": "string"
+        },
+        "turnId": {
+          "description": "Saved message or admitted turn in threadId. For a detached launch this\nis the parent admission, never the executing child turn.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "workspaceId": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "workspaceId",
+        "threadId"
+      ]
+    },
     "AgentPublicOutcome": {
       "description": "Stable, non-disclosing public outcomes for agent domain operations.\nInternal diagnostics may be more precise, but public adapters use only\nthese bounded codes and never turn target failures into an existence oracle.",
       "type": "string",
@@ -85,7 +135,7 @@
       ]
     },
     "AgentToolTargetOption": {
-      "description": "Opaque action target projected by the server. The model never receives a\nthread, route, workspace, capsule or Gateway identifier and therefore\ncannot turn guessed infrastructure IDs into an existence oracle.",
+      "description": "Opaque action target projected by the server. Returned navigation IDs do\nnot replace this option or grant authority to write or launch.",
       "type": "object",
       "properties": {
         "id": {

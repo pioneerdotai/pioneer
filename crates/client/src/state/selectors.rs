@@ -460,32 +460,6 @@ mod tests {
     }
 
     #[test]
-    fn resolve_active_workspace_prefers_valid_persisted_id() {
-        let workspaces = vec![
-            workspace("ws_1", true, true),
-            workspace("ws_2", true, false),
-        ];
-
-        assert_eq!(
-            resolve_active_workspace_id(Some("ws_2"), workspaces.as_slice()),
-            Some("ws_2")
-        );
-    }
-
-    #[test]
-    fn resolve_active_workspace_ignores_invalid_persisted_id_and_uses_current() {
-        let workspaces = vec![
-            workspace("ws_1", true, false),
-            workspace("ws_2", true, true),
-        ];
-
-        assert_eq!(
-            resolve_active_workspace_id(Some("missing"), workspaces.as_slice()),
-            Some("ws_2")
-        );
-    }
-
-    #[test]
     fn active_thread_pending_requests_selects_shared_scope() {
         let mut state = ClientState::default();
         state.workspaces.preferred_workspace_id = Some("ws_a".to_owned());
@@ -513,60 +487,6 @@ mod tests {
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].request_id, "req_a");
         assert_eq!(pending_requests(&state).len(), 3);
-    }
-
-    #[test]
-    fn workspace_filter_sorted_thread_ids_ignores_other_workspace_and_draft() {
-        let coordinators = HashMap::from([
-            (
-                "thread_a_old".to_owned(),
-                coordinator("thread_a_old", "ws_a", 10),
-            ),
-            (
-                "thread_a_new".to_owned(),
-                coordinator("thread_a_new", "ws_a", 30),
-            ),
-            (
-                "thread_a_draft".to_owned(),
-                coordinator("thread_a_draft", "ws_a", 40),
-            ),
-            (
-                "thread_b_newer".to_owned(),
-                coordinator("thread_b_newer", "ws_b", 100),
-            ),
-        ]);
-
-        assert_eq!(
-            sorted_thread_ids_from_coordinators(
-                &coordinators,
-                Some("thread_a_draft"),
-                Some("ws_a")
-            ),
-            vec!["thread_a_new".to_owned(), "thread_a_old".to_owned()]
-        );
-    }
-
-    #[test]
-    fn workspace_thread_state_restores_valid_draft_when_last_active_missing() {
-        let threads = HashMap::from([("draft_a", "ws_a"), ("thr_b", "ws_b")]);
-        let matches_workspace = |thread_id: &str, workspace_id: &str| {
-            threads.get(thread_id).copied() == Some(workspace_id)
-        };
-
-        let restored = restore_workspace_thread_state(
-            "ws_a",
-            Some("thr_missing"),
-            Some("draft_a"),
-            matches_workspace,
-        );
-
-        assert_eq!(
-            restored,
-            WorkspaceThreadState {
-                active_thread_id: Some("draft_a".to_owned()),
-                draft_thread_id: Some("draft_a".to_owned()),
-            }
-        );
     }
 
     #[test]

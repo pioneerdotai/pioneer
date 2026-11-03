@@ -558,6 +558,8 @@ fn provider_model_from_runtime_model(
             context_window: model.max_input_tokens,
         },
         capabilities: ProviderModelCapabilities {
+            chat: None,
+            chat_operation: None,
             vision: model.supports_vision,
             tool_calling: None,
             json_output: None,
@@ -793,6 +795,25 @@ mod tests {
         assert!(provider_list_refresh_matches_connection(7, Some(7)));
         assert!(!provider_list_refresh_matches_connection(7, Some(8)));
         assert!(!provider_list_refresh_matches_connection(7, None));
+    }
+
+    #[test]
+    fn empty_purpose_list_preserves_saved_selection_without_adding_it_as_an_option() {
+        let mut state =
+            ProviderModelSelectorState::new(Some("openai".into()), Some("saved".into()));
+        for _ in 0..2 {
+            state.preload_selected_provider_models();
+            state.apply_provider_models_success(ProviderListModelsResponse {
+                provider: "openai".into(),
+                models: vec![],
+            });
+            assert_eq!(state.selected_model(), Some("saved"));
+            assert!(state.models().is_empty());
+            assert!(
+                super::super::presentation::filter_model_selector_models(state.models(), "saved")
+                    .is_empty()
+            );
+        }
     }
 
     #[test]

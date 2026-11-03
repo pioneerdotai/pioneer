@@ -84,9 +84,9 @@ async fn idle_cleanup_preserves_real_admission_silent_turn_terminal_effects_and_
     })
     .await
     .expect("real admission must persist its running binding");
-    // The running binding precedes the execution-window commit. Wait for the
-    // admission transition to finish before advancing the runtime clock, or
-    // the jump can expire an in-flight SQLite authorization query.
+    // The running binding precedes the execution-window commit and MCP
+    // activation. Let admission release its transition gate before advancing
+    // Tokio's clock, or pending SQLite waits can expire during the jump.
     let key = CLIAgentRuntimeSessionKey::new(
         &harness.workspace_id,
         "codex",
@@ -94,11 +94,20 @@ async fn idle_cleanup_preserves_real_admission_silent_turn_terminal_effects_and_
     )
     .unwrap();
     let transition = processor.cli_runtime_session_transition_mutex(&key).await;
-    drop(
-        timeout(Duration::from_secs(10), transition.lock())
+    let admitted = timeout(Duration::from_secs(10), transition.lock())
+        .await
+        .expect("real admission must finish before simulating silent work");
+    assert_eq!(
+        harness
+            .crud_store
+            .latest_turn_execution_window(turn)
             .await
-            .expect("real admission must finish before the idle clock advances"),
+            .unwrap()
+            .expect("real admission must persist its execution window")
+            .status,
+        pioneer_protocol::ExecutionWindowStatus::Running
     );
+    drop(admitted);
     // No event, token, approval response or activity heartbeat is required to
     // keep this real admitted Turn alive through a wait longer than its TTL.
     elapse(Duration::from_secs(601)).await;

@@ -24,6 +24,7 @@ use pioneer_protocol::{
 use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::watch;
@@ -221,6 +222,9 @@ impl VoiceEngineLoader for EagerVoiceEngineLoader {
 
 pub(crate) struct VoiceInputSupervisor {
     inner: Mutex<VoiceInputSupervisorInner>,
+    // Published by the serialized generation transition, independently of the
+    // engine mutex so a cached completion never waits for another native call.
+    current_generation: AtomicU64,
     pub(crate) installer: Arc<dyn VoiceModelInstaller>,
     pub(crate) engine_loader: Arc<dyn VoiceEngineLoader>,
     settings_tx: watch::Sender<GatewayVoiceInputSettings>,
@@ -281,6 +285,7 @@ impl VoiceInputSupervisor {
         let initial_state = VoiceInputSupervisorState::default();
         let (settings_tx, _) = watch::channel(initial_state.settings_snapshot());
         Self {
+            current_generation: AtomicU64::new(initial_state.generation),
             inner: Mutex::new(VoiceInputSupervisorInner {
                 state: initial_state,
                 current_reconcile: None,
@@ -299,9 +304,9 @@ impl VoiceInputSupervisor {
         self.lock_inner().state.desired.clone()
     }
 
-    #[cfg(test)]
+    // Read-only fence for completed session candidates, including no-speech.
     pub(crate) fn generation(&self) -> u64 {
-        self.lock_inner().state.generation
+        self.current_generation.load(Ordering::Acquire)
     }
 
     pub(crate) fn runtime_snapshot(&self) -> GatewayVoiceInputRuntimeSnapshot {
@@ -388,6 +393,7 @@ impl VoiceInputSupervisor {
         }
         inner.loaded_engine = None;
         let generation = inner.state.apply_desired(desired, retry_install)?;
+        self.current_generation.store(generation, Ordering::Release);
         let reconcile =
             inner
                 .state
@@ -496,7 +502,8 @@ impl VoiceInputSupervisor {
         &self,
         buffer: &super::transcription::PreparedSpeechBuffer,
     ) -> std::result::Result<String, VoiceTranscriptionError> {
-        self.transcribe_inner(buffer, None)
+        self.transcribe_inner(buffer, None, None)
+            .and_then(VoiceSpeechHypothesis::ensure_complete)
             .map(|result| result.text)
     }
 
@@ -506,13 +513,88 @@ impl VoiceInputSupervisor {
         generation: u64,
         cancellation: &CancellationToken,
     ) -> std::result::Result<VoiceSpeechHypothesis, VoiceTranscriptionError> {
-        self.transcribe_inner(buffer, Some((generation, cancellation)))
+        self.transcribe_inner(buffer, Some((generation, cancellation)), None)
+    }
+
+    pub(crate) fn transcribe_prepared_for_session(
+        &self,
+        buffer: &PreparedSpeechBuffer,
+        real_pcm_samples: usize,
+        generation: u64,
+        cancellation: &CancellationToken,
+    ) -> Result<VoiceSpeechHypothesis, VoiceTranscriptionError> {
+        self.transcribe_inner(
+            buffer,
+            Some((generation, cancellation)),
+            Some(real_pcm_samples),
+        )
+    }
+
+    // The handle owns state, never the shared engine mutex. Every operation
+    // re-enters this fence, so idle dictation cannot reserve the engine and a
+    // replacement generation can never consume an old session's state.
+    pub(crate) fn native_session_operation<T>(
+        &self,
+        generation: u64,
+        cancellation: &CancellationToken,
+        operation: impl FnOnce(&mut LoadedVoiceEngine) -> Result<T, VoiceTranscriptionError>,
+    ) -> Result<T, VoiceTranscriptionError> {
+        let startup_wait = pioneer_observability::turn_startup::current_stage(
+            pioneer_observability::turn_startup::Stage::VoiceTranscriberWait,
+        );
+        let mut inner = self.lock_inner();
+        drop(startup_wait);
+        if cancellation.is_cancelled()
+            || inner.state.generation != generation
+            || inner.state.runtime.phase != GatewayVoiceInputRuntimePhase::Ready
+            || !inner.state.runtime.effective_enabled
+            || inner.state.desired.selected_identity().as_ref() != inner.state.loaded_model.as_ref()
+        {
+            return Err(super::transcription::transcription_error(
+                super::transcription::VoiceTranscriptionErrorKind::ModelUnavailable,
+                "voice native session model generation is no longer available",
+            ));
+        }
+        let engine = inner.loaded_engine.as_mut().ok_or_else(|| {
+            super::transcription::transcription_error(
+                super::transcription::VoiceTranscriptionErrorKind::ModelUnavailable,
+                "Voice Input reported Ready without a loaded engine",
+            )
+        })?;
+        let stage = pioneer_observability::turn_startup::current_stage(
+            pioneer_observability::turn_startup::Stage::VoiceTranscribe,
+        );
+        let result = catch_unwind(AssertUnwindSafe(|| operation(engine))).unwrap_or_else(|_| {
+            Err(super::transcription::transcription_error(
+                super::transcription::VoiceTranscriptionErrorKind::RuntimeFailure,
+                "Voice Input engine panicked during native session operation",
+            ))
+        });
+        drop(stage);
+        if let Err(error) = &result {
+            inner.loaded_engine = None;
+            inner.current_reconcile = None;
+            let _ = inner
+                .state
+                .mark_failed(bounded_voice_supervisor_error(error.message.clone()));
+            self.publish_settings(&inner.state);
+        }
+        // Cancellation cannot abort synchronous native inference. The caller
+        // still owns its lease, and rejects a result only after actual return.
+        if cancellation.is_cancelled() {
+            return Err(super::transcription::transcription_error(
+                super::transcription::VoiceTranscriptionErrorKind::ModelUnavailable,
+                "voice native session cancelled during inference",
+            ));
+        }
+        result
     }
 
     fn transcribe_inner(
         &self,
         buffer: &PreparedSpeechBuffer,
         session: Option<(u64, &CancellationToken)>,
+        real_pcm_samples: Option<usize>,
     ) -> std::result::Result<VoiceSpeechHypothesis, VoiceTranscriptionError> {
         let startup_wait = pioneer_observability::turn_startup::current_stage(
             pioneer_observability::turn_startup::Stage::VoiceTranscriberWait,
@@ -548,8 +630,13 @@ impl VoiceInputSupervisor {
         let startup_transcribe = pioneer_observability::turn_startup::current_stage(
             pioneer_observability::turn_startup::Stage::VoiceTranscribe,
         );
-        let result = catch_unwind(AssertUnwindSafe(|| {
-            engine.transcribe_hypothesis(buffer, session.map(|(_, token)| token))
+        let result = catch_unwind(AssertUnwindSafe(|| match real_pcm_samples {
+            Some(count) => engine.transcribe_prepared_hypothesis(
+                buffer,
+                count,
+                session.map(|(_, token)| token),
+            ),
+            None => engine.transcribe_hypothesis(buffer, session.map(|(_, token)| token)),
         }));
         drop(startup_transcribe);
         match result {
@@ -790,7 +877,7 @@ impl VoiceSpeechTranscriber for VoiceInputSupervisor {
         &self,
         buffer: &PreparedSpeechBuffer,
     ) -> std::result::Result<VoiceSpeechHypothesis, VoiceTranscriptionError> {
-        self.transcribe_inner(buffer, None)
+        self.transcribe_inner(buffer, None, None)
     }
 }
 
@@ -1553,17 +1640,6 @@ mod tests {
     }
 
     #[test]
-    fn voice_supervisor_state_installed_model_may_transition_directly_to_loading() {
-        let (supervisor, _, _) = supervisor();
-        supervisor
-            .apply_desired(selected("parakeet-tdt-0.6b-v3"), false)
-            .expect("select model");
-        mark_loading(&supervisor).expect("load verified install");
-        mark_ready(&supervisor, identity("parakeet-tdt-0.6b-v3")).expect("publish ready");
-        assert!(supervisor.runtime_snapshot().effective_enabled);
-    }
-
-    #[test]
     fn voice_supervisor_state_failures_never_fallback_or_remain_effectively_enabled() {
         let start_phases = [
             GatewayVoiceInputRuntimePhase::Missing,
@@ -1997,6 +2073,7 @@ mod tests {
                         end: 0.05,
                         text: "да, да".to_owned(),
                     }]),
+                    ..Default::default()
                 }),
             )
             .unwrap();

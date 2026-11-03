@@ -104,6 +104,7 @@ pub trait Provider: Send + Sync {
     /// shared provider-neutral fallback before endpoint errors are redacted.
     fn classify_failure(&self, error: &anyhow::Error) -> Option<ProviderFailureClassification> {
         crate::failure::classify_stream_error(error)
+            .or_else(|| crate::failure::classify_http_error(error))
     }
 
     /// Materialize and locally budget the media that this request will send.
@@ -165,6 +166,28 @@ pub trait Provider: Send + Sync {
             "provider '{}' does not support listing transcription models",
             self.name()
         )
+    }
+
+    /// Purpose-filtered picker list. Raw discovery methods retain their existing
+    /// execution/catalog semantics. Registry wrappers add only scoped fallback.
+    async fn list_models_for_selection(
+        &self,
+        purpose: crate::selection::ModelPurpose,
+    ) -> Result<Vec<ProviderModelInfo>> {
+        use crate::selection::ModelPurpose;
+        let models = match purpose {
+            ModelPurpose::Chat => self.list_models().await?,
+            ModelPurpose::Embeddings => self.list_embedding_models().await?,
+            ModelPurpose::Transcription => self.list_transcription_models().await?,
+        };
+        Ok(crate::selection::filter_models(
+            self.name(),
+            self.usage_api(),
+            &self.capabilities(),
+            purpose,
+            models,
+            None,
+        ))
     }
 
     /// Create embeddings for one or more input texts.
@@ -243,20 +266,6 @@ mod tests {
     }
 
     #[test]
-    fn mock_provider_name() {
-        let provider = MockProvider;
-        assert_eq!(provider.name(), "mock");
-    }
-
-    #[test]
-    fn mock_provider_capabilities() {
-        let provider = MockProvider;
-        let caps = provider.capabilities();
-        assert!(caps.streaming);
-        assert!(!caps.vision);
-    }
-
-    #[test]
     fn provider_failure_classification_is_optional_and_conservative() {
         let provider = MockProvider;
         let error = anyhow::anyhow!("opaque provider rejection");
@@ -283,35 +292,6 @@ mod tests {
         let response = provider.chat(request).await.unwrap();
         assert_eq!(response.text, "mock response");
         assert_eq!(response.usage.as_ref().unwrap().input_tokens, Some(10));
-    }
-
-    #[tokio::test]
-    async fn mock_provider_stream() {
-        let provider = MockProvider;
-        let request = ChatRequest {
-            model: "test-model".into(),
-            messages: vec![ChatMessage::user("hello")],
-            temperature: None,
-            max_tokens: None,
-            tools: None,
-            tool_choice: None,
-            parallel_tool_calls: None,
-            reasoning: None,
-            compiled_prompt: None,
-        };
-
-        let mut stream = provider.stream_chat(request).await.unwrap();
-
-        let chunk1 = stream.next().await.unwrap().unwrap();
-        assert_eq!(chunk1.delta, "hello ");
-        assert!(!chunk1.is_final);
-
-        let chunk2 = stream.next().await.unwrap().unwrap();
-        assert_eq!(chunk2.delta, "world");
-        assert!(!chunk2.is_final);
-
-        let chunk3 = stream.next().await.unwrap().unwrap();
-        assert!(chunk3.is_final);
     }
 
     #[tokio::test]

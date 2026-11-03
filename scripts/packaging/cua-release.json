@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "repository": "https://github.com/trycua/cua",
+  "tag": "cua-driver-rs-v0.38.0",
+  "version": "0.38.0",
+  "revision": "85e2b1318bd77ccf3cfa88ccdf875a4bb7eaed19",
+  "assets": {
+    "darwin-universal": {
+      "name": "cua-driver-rs-0.38.0-darwin-universal-binary.tar.gz",
+      "sha256": "2bb8dc4a7e69185ffd04c4a9c0eab590bd2c54b72c2c1be13ab675be4f487732"
+    },
+    "linux-arm64": {
+      "name": "cua-driver-rs-0.38.0-linux-arm64-binary.tar.gz",
+      "sha256": "80c9ae66bc7322052dd426c6133c96086b33894bf06c972bca8215384400b33d"
+    },
+    "linux-x86_64": {
+      "name": "cua-driver-rs-0.38.0-linux-x86_64-binary.tar.gz",
+      "sha256": "31ab9709dd91ce73677e49b9f3e75c6f0d3e4d9625c286c9e58262bfbea698dd"
+    },
+    "windows-arm64": {
+      "name": "cua-driver-rs-0.38.0-windows-arm64-binary.zip",
+      "sha256": "d25c8ebfffb34e4c095ea170baf47b87c35dc0d1116f42e46b39df2bcbff8700"
+    },
+    "windows-x86_64": {
+      "name": "cua-driver-rs-0.38.0-windows-x86_64-binary.zip",
+      "sha256": "5edaa74d0afa1b55a9668dbc4f32736507bd2bd4d75b18ca1dc8881bb12402b5"
+    }
+  },
+  "resources": {
+    "LICENSE.cua-driver.md": {
+      "path": "LICENSE.md",
+      "sha256": "c0779290c1d4783169aa3dbfb55feb505e563ef8a004bbf55298ceffcfbda8d9"
+    },
+    "THIRD_PARTY_NOTICES.md": {
+      "path": "libs/cua-driver/rust/THIRD_PARTY_NOTICES.md",
+      "sha256": "82470c85cb48dd084fccbf192d4a9f0b9d0afe614ab9b63e0fceac0eb315f412"
+    }
+  }
+}

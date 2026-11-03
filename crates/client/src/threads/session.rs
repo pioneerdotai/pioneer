@@ -196,7 +196,7 @@ mod tests {
 
     #[test]
     fn stale_workspace_thread_marker_is_cleared_when_thread_is_missing() {
-        let mut remembered = HashMap::new();
+        let mut remembered = HashMap::from([("ws_b".to_owned(), "thread_foreign".to_owned())]);
         remember_thread_for_workspace(&mut remembered, "ws_a", Some("thread_a".to_owned()));
 
         assert_eq!(
@@ -204,6 +204,10 @@ mod tests {
             None
         );
         assert_eq!(remembered_thread_for_workspace(&remembered, "ws_a"), None);
+        assert_eq!(
+            remembered_thread_for_workspace(&remembered, "ws_b"),
+            Some("thread_foreign")
+        );
 
         remember_thread_for_workspace(&mut remembered, "ws_a", Some("thread_b".to_owned()));
         assert_eq!(

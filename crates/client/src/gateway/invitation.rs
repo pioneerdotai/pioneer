@@ -684,7 +684,7 @@ mod tests {
     use pioneer_protocol::{
         AuthDeviceSnapshot, AuthGatewaySnapshot, AuthPrincipalSnapshot, AuthSessionSnapshot,
         AuthSessionStatus, ClientKind, CredentialStorageOrder, DeviceStatus, InvitationCredential,
-        InvitationErrorReason, InvitationPresentation, RoleKey,
+        InvitationPresentation, RoleKey,
     };
 
     use super::*;
@@ -815,14 +815,6 @@ mod tests {
         ] {
             assert!(InvitationQrPresentation::parse(&invalid).is_err());
         }
-    }
-
-    #[test]
-    fn gateway_mismatch_is_the_generic_corrective_error() {
-        assert_eq!(
-            presentation().verify_gateway_id(&GatewayId::new("G00000000000000000002").unwrap()),
-            Err(InvitationErrorReason::InvitationUnavailable)
-        );
     }
 
     #[test]

@@ -322,6 +322,7 @@ mod tests {
         fs::create_dir_all(staging_dir.join("v0.26.0-123")).unwrap();
         fs::write(downloads_dir.join("v0.26.0").join("asset.zip"), b"asset").unwrap();
         fs::write(staging_dir.join("v0.26.0-123").join("plan.json"), b"plan").unwrap();
+        assert!(!desktop_current_version().is_empty());
         write_ready_state(temp_dir.path(), desktop_current_version());
 
         let ui_state = ready_ui_state_from_persisted(temp_dir.path(), 1_789_200_100);

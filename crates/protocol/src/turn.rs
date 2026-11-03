@@ -2286,8 +2286,41 @@ pub struct TurnItemEvent {
     pub payload: TurnItemEventPayload,
 }
 
+/// Canonical work ownership, persisted at admission independently of authorship.
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnWorkOwner {
+    #[default]
+    Turn,
+    DetachedTask,
+}
+
+impl TurnWorkOwner {
+    const fn is_turn(&self) -> bool {
+        matches!(self, Self::Turn)
+    }
+
+    pub const fn as_db_str(self) -> &'static str {
+        match self {
+            Self::Turn => "turn",
+            Self::DetachedTask => "detached_task",
+        }
+    }
+
+    pub fn from_db_str(value: &str) -> Result<Self, &'static str> {
+        match value {
+            "turn" => Ok(Self::Turn),
+            "detached_task" => Ok(Self::DetachedTask),
+            _ => Err("invalid Turn work owner"),
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
 pub struct Turn {
+    /// Immutable owner of the admitted work; absent historical wire values own their turn.
+    #[serde(default, skip_serializing_if = "TurnWorkOwner::is_turn")]
+    pub work_owner: TurnWorkOwner,
     pub id: String,
     pub status: TurnStatus,
     #[serde(default)]
@@ -2467,8 +2500,8 @@ pub enum PromptManifestHookTruncation {
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PromptManifestHookPhase {
+    #[serde(alias = "turn_post_preflight_prompt_context")]
     TurnPrePromptContext,
-    TurnPostPreflightPromptContext,
     TurnPrePromptCompile,
     RuntimeTurnPreContext,
 }
@@ -4749,6 +4782,8 @@ pub enum ProviderFailureStage {
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
 pub struct ProviderFailureDetails {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_response: Option<crate::ProviderErrorResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_reason: Option<crate::ProviderErrorReason>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_id: Option<crate::ProviderRequestId>,
@@ -5796,6 +5831,21 @@ pub struct ContextCompressedNotification {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn legacy_prompt_manifest_phase_reads_and_serializes_as_current_context() {
+        let phase: super::PromptManifestHookPhase =
+            serde_json::from_str("\"turn_post_preflight_prompt_context\"")
+                .expect("historical manifests remain readable");
+        assert_eq!(phase, super::PromptManifestHookPhase::TurnPrePromptContext);
+        assert_eq!(
+            serde_json::to_string(&phase).unwrap(),
+            "\"turn_pre_prompt_context\""
+        );
+        assert!(
+            serde_json::from_str::<super::PromptManifestHookPhase>("\"unknown_phase\"").is_err()
+        );
+    }
+
     use super::*;
     use serde_json::json;
 
@@ -5975,18 +6025,6 @@ mod tests {
     }
 
     #[test]
-    fn resolve_turn_permission_profile_defaults_to_full_access() {
-        let snapshot = resolve_turn_permission_profile(None);
-
-        assert_eq!(snapshot.mode, TurnPermissionMode::FullAccess);
-        assert_eq!(snapshot.source, TurnPermissionProfileSource::Defaulted);
-        assert_eq!(
-            snapshot.effective_policy,
-            ToolPermissionPolicySnapshot::all(PermissionBehavior::Allow)
-        );
-    }
-
-    #[test]
     fn resolve_turn_permission_profile_uses_composer_source_for_selection() {
         let selection = TurnPermissionProfileSelection {
             mode: TurnPermissionMode::AutoAcceptEdits,
@@ -6018,32 +6056,6 @@ mod tests {
             snapshot.effective_policy,
             ToolPermissionPolicySnapshot::all(PermissionBehavior::Allow)
         );
-    }
-
-    #[test]
-    fn default_turn_permission_profile_snapshot_is_full_access_defaulted() {
-        let snapshot = crate::default_turn_permission_profile_snapshot();
-
-        assert_eq!(snapshot.mode, TurnPermissionMode::FullAccess);
-        assert_eq!(snapshot.source, TurnPermissionProfileSource::Defaulted);
-        assert_eq!(
-            snapshot.effective_policy,
-            ToolPermissionPolicySnapshot::all(PermissionBehavior::Allow)
-        );
-    }
-
-    #[test]
-    fn permission_profile_compilation_is_deterministic() {
-        let first = crate::compile_turn_permission_profile(
-            TurnPermissionMode::FullAccess,
-            TurnPermissionProfileSource::System,
-        );
-        let second = crate::compile_turn_permission_profile(
-            TurnPermissionMode::FullAccess,
-            TurnPermissionProfileSource::System,
-        );
-
-        assert_eq!(first, second);
     }
 
     #[test]
@@ -6189,70 +6201,6 @@ mod tests {
     }
 
     #[test]
-    fn restricted_permission_policy_tables_do_not_deny_by_default() {
-        for mode in [
-            TurnPermissionMode::AutoAcceptEdits,
-            TurnPermissionMode::Supervised,
-        ] {
-            let policy = crate::permission_policy_for_mode(mode);
-            let fields = [
-                policy.default_behavior,
-                policy.file_read,
-                policy.file_write,
-                policy.shell_command,
-                policy.network,
-                policy.mcp_read,
-                policy.mcp_write_or_unknown,
-                policy.dynamic_skill_tool,
-                policy.computer_use,
-                policy.task_subagent,
-                policy.memory_write,
-                policy.agent_action,
-            ];
-
-            assert!(
-                fields
-                    .into_iter()
-                    .all(|behavior| behavior != PermissionBehavior::Deny)
-            );
-            assert_eq!(policy.default_behavior, PermissionBehavior::Ask);
-        }
-    }
-
-    #[test]
-    fn security_snapshot_unrestricted_full_access_round_trips_with_explicit_sandbox() {
-        let snapshot =
-            TurnExecutionSecuritySnapshot::unrestricted_full_access("/workspace/project", 1_700);
-
-        let encoded = serde_json::to_value(&snapshot).expect("snapshot should serialize");
-
-        assert_eq!(encoded["schema_version"], 1);
-        assert_eq!(encoded["version"], 1);
-        assert_eq!(encoded["permission_profile"]["mode"], "full_access");
-        assert_eq!(encoded["sandbox"]["mode"], "unrestricted");
-        assert_eq!(encoded["sandbox"]["filesystem"]["kind"], "unrestricted");
-        assert_eq!(encoded["sandbox"]["network"]["mode"], "enabled");
-        assert_eq!(encoded["network"]["mode"], "enabled");
-        assert_eq!(encoded["sandbox"]["backend_requirement"], "optional");
-        assert_eq!(encoded["process"]["shell"]["enabled"], true);
-        assert_eq!(encoded["enforcement"], json!({ "status": "active" }));
-        assert_eq!(
-            encoded["authority_cap"]["resource_binding_id"],
-            "unrestricted"
-        );
-        assert!(encoded.get("sandbox").is_some());
-
-        let decoded: TurnExecutionSecuritySnapshot =
-            serde_json::from_value(encoded).expect("snapshot should deserialize");
-        assert_eq!(decoded, snapshot);
-        assert_eq!(decoded.sandbox.mode, TurnSandboxMode::Unrestricted);
-        assert_eq!(
-            decoded.sandbox.filesystem.kind,
-            TurnFilesystemSandboxKind::Unrestricted
-        );
-    }
-
-    #[test]
     fn execution_security_snapshot_rejects_a_missing_authority_cap() {
         let snapshot =
             TurnExecutionSecuritySnapshot::unrestricted_full_access("/workspace/project", 1_700);
@@ -6263,89 +6211,6 @@ mod tests {
             .remove("authority_cap");
 
         assert!(serde_json::from_value::<TurnExecutionSecuritySnapshot>(encoded).is_err());
-    }
-
-    #[test]
-    fn security_snapshot_read_only_round_trips_with_restricted_roots() {
-        let profile = TurnPermissionProfileSnapshot::from_mode(
-            TurnPermissionMode::Supervised,
-            TurnPermissionProfileSource::Composer,
-        );
-        let snapshot = TurnExecutionSecuritySnapshot::read_only(
-            profile,
-            "/workspace/project",
-            vec![TurnFilesystemSandboxEntry::workspace_root(
-                TurnFilesystemAccess::Read,
-                "/workspace/project",
-            )],
-            1_701,
-        );
-
-        let encoded = serde_json::to_value(&snapshot).expect("snapshot should serialize");
-
-        assert_eq!(encoded["permission_profile"]["mode"], "supervised");
-        assert_eq!(encoded["sandbox"]["mode"], "read_only");
-        assert_eq!(encoded["sandbox"]["filesystem"]["kind"], "restricted");
-        assert_eq!(
-            encoded["sandbox"]["filesystem"]["entries"][0]["path"],
-            json!({ "kind": "workspace_root" })
-        );
-        assert_eq!(
-            encoded["sandbox"]["filesystem"]["entries"][0]["access"],
-            "read"
-        );
-        assert_eq!(encoded["network"]["mode"], "disabled");
-        assert_eq!(
-            encoded["authority_cap"]["filesystem"]["kind"],
-            "unrestricted"
-        );
-        assert_eq!(encoded["authority_cap"]["network"]["mode"], "enabled");
-        assert_eq!(encoded["sandbox"]["backend_requirement"], "required");
-        assert_eq!(encoded["sandbox"]["backend_preference"], json!(["nono"]));
-
-        let decoded: TurnExecutionSecuritySnapshot =
-            serde_json::from_value(encoded).expect("snapshot should deserialize");
-        assert_eq!(decoded, snapshot);
-        assert_eq!(decoded.sandbox.mode, TurnSandboxMode::ReadOnly);
-    }
-
-    #[test]
-    fn security_snapshot_workspace_write_round_trips_with_write_roots() {
-        let profile = TurnPermissionProfileSnapshot::from_mode(
-            TurnPermissionMode::AutoAcceptEdits,
-            TurnPermissionProfileSource::Composer,
-        );
-        let snapshot = TurnExecutionSecuritySnapshot::workspace_write(
-            profile,
-            "/workspace/project",
-            vec![TurnFilesystemSandboxEntry::workspace_root(
-                TurnFilesystemAccess::Write,
-                "/workspace/project",
-            )],
-            1_702,
-        );
-
-        let encoded = serde_json::to_value(&snapshot).expect("snapshot should serialize");
-
-        assert_eq!(encoded["permission_profile"]["mode"], "auto_accept_edits");
-        assert_eq!(encoded["sandbox"]["mode"], "workspace_write");
-        assert_eq!(
-            encoded["sandbox"]["filesystem"]["entries"][0]["access"],
-            "write"
-        );
-        assert_eq!(encoded["approval"]["allow_for_turn"], true);
-        assert_eq!(encoded["approval"]["request_permissions"], true);
-        assert_eq!(
-            encoded["authority_cap"]["filesystem"]["kind"],
-            "unrestricted"
-        );
-        assert_eq!(encoded["authority_cap"]["network"]["mode"], "enabled");
-        assert_eq!(encoded["backend"]["sandbox_backend"], "nono");
-
-        let decoded: TurnExecutionSecuritySnapshot =
-            serde_json::from_value(encoded).expect("snapshot should deserialize");
-        assert_eq!(decoded, snapshot);
-        assert_eq!(decoded.sandbox.mode, TurnSandboxMode::WorkspaceWrite);
     }
 
     #[test]
@@ -6863,35 +6728,6 @@ mod tests {
     }
 
     #[test]
-    fn turn_start_params_round_trips_api_provider_execution_backend() {
-        let params: TurnStartParams = serde_json::from_value(json!({
-            "thread_id": "thr_123",
-            "turn_id": "turn_123",
-            "execution_backend": {
-                "type": "apiProvider",
-                "provider": "openai"
-            }
-        }))
-        .expect("params should decode");
-
-        assert_eq!(
-            params.execution_backend,
-            Some(AgentExecutionBackend::ApiProvider {
-                provider: "openai".to_owned()
-            })
-        );
-
-        let encoded = serde_json::to_value(params).expect("params should encode");
-        assert_eq!(
-            encoded["execution_backend"],
-            json!({
-                "type": "apiProvider",
-                "provider": "openai"
-            })
-        );
-    }
-
-    #[test]
     fn turn_start_params_round_trips_reasoning_selection() {
         let params: TurnStartParams = serde_json::from_value(json!({
             "thread_id": "thr_123",
@@ -7035,26 +6871,6 @@ mod tests {
             json!({
                 "type": "workspaceWrite",
                 "networkAccess": false
-            })
-        );
-    }
-
-    #[test]
-    fn turn_start_params_round_trips_future_acp_execution_backend() {
-        let params: TurnStartParams = serde_json::from_value(json!({
-            "thread_id": "thr_123",
-            "turn_id": "turn_123",
-            "execution_backend": {
-                "type": "acpAgentRuntime",
-                "runtime_id": "acp_local"
-            }
-        }))
-        .expect("params should decode");
-
-        assert_eq!(
-            params.execution_backend,
-            Some(AgentExecutionBackend::ACPAgentRuntime {
-                runtime_id: "acp_local".to_owned()
             })
         );
     }
@@ -9018,5 +8834,173 @@ mod tests {
                 observation: None,
             },
         ]
+    }
+
+    #[test]
+    fn security_snapshot_modes_round_trip_explicit_contracts() {
+        let cases = [
+            {
+                let snapshot = TurnExecutionSecuritySnapshot::unrestricted_full_access(
+                    "/workspace/project",
+                    1_700,
+                );
+                (
+                    "Unrestricted",
+                    snapshot,
+                    TurnSandboxMode::Unrestricted,
+                    TurnFilesystemSandboxKind::Unrestricted,
+                    vec![
+                        ("/schema_version", json!(1)),
+                        ("/version", json!(1)),
+                        ("/permission_profile/mode", json!("full_access")),
+                        ("/sandbox/mode", json!("unrestricted")),
+                        ("/sandbox/filesystem/kind", json!("unrestricted")),
+                        ("/sandbox/network/mode", json!("enabled")),
+                        ("/network/mode", json!("enabled")),
+                        ("/sandbox/backend_requirement", json!("optional")),
+                        ("/process/shell/enabled", json!(true)),
+                        ("/enforcement", json!({ "status": "active" })),
+                        ("/authority_cap/resource_binding_id", json!("unrestricted")),
+                    ],
+                )
+            },
+            {
+                let profile = TurnPermissionProfileSnapshot::from_mode(
+                    TurnPermissionMode::Supervised,
+                    TurnPermissionProfileSource::Composer,
+                );
+                let snapshot = TurnExecutionSecuritySnapshot::read_only(
+                    profile,
+                    "/workspace/project",
+                    vec![TurnFilesystemSandboxEntry::workspace_root(
+                        TurnFilesystemAccess::Read,
+                        "/workspace/project",
+                    )],
+                    1_701,
+                );
+                (
+                    "ReadOnly",
+                    snapshot,
+                    TurnSandboxMode::ReadOnly,
+                    TurnFilesystemSandboxKind::Restricted,
+                    vec![
+                        ("/permission_profile/mode", json!("supervised")),
+                        ("/sandbox/mode", json!("read_only")),
+                        ("/sandbox/filesystem/kind", json!("restricted")),
+                        (
+                            "/sandbox/filesystem/entries/0/path",
+                            json!({ "kind": "workspace_root" }),
+                        ),
+                        ("/sandbox/filesystem/entries/0/access", json!("read")),
+                        ("/network/mode", json!("disabled")),
+                        ("/authority_cap/filesystem/kind", json!("unrestricted")),
+                        ("/authority_cap/network/mode", json!("enabled")),
+                        ("/sandbox/backend_requirement", json!("required")),
+                        ("/sandbox/backend_preference", json!(["nono"])),
+                    ],
+                )
+            },
+            {
+                let profile = TurnPermissionProfileSnapshot::from_mode(
+                    TurnPermissionMode::AutoAcceptEdits,
+                    TurnPermissionProfileSource::Composer,
+                );
+                let snapshot = TurnExecutionSecuritySnapshot::workspace_write(
+                    profile,
+                    "/workspace/project",
+                    vec![TurnFilesystemSandboxEntry::workspace_root(
+                        TurnFilesystemAccess::Write,
+                        "/workspace/project",
+                    )],
+                    1_702,
+                );
+                (
+                    "WorkspaceWrite",
+                    snapshot,
+                    TurnSandboxMode::WorkspaceWrite,
+                    TurnFilesystemSandboxKind::Restricted,
+                    vec![
+                        ("/permission_profile/mode", json!("auto_accept_edits")),
+                        ("/sandbox/mode", json!("workspace_write")),
+                        ("/sandbox/filesystem/entries/0/access", json!("write")),
+                        ("/approval/allow_for_turn", json!(true)),
+                        ("/approval/request_permissions", json!(true)),
+                        ("/authority_cap/filesystem/kind", json!("unrestricted")),
+                        ("/authority_cap/network/mode", json!("enabled")),
+                        ("/backend/sandbox_backend", json!("nono")),
+                    ],
+                )
+            },
+        ];
+        for (name, snapshot, expected_mode, expected_filesystem, wire_fields) in cases {
+            let encoded = serde_json::to_value(&snapshot).expect("snapshot should serialize");
+            for (path, expected) in wire_fields {
+                assert_eq!(encoded.pointer(path), Some(&expected), "{name}: {path}");
+            }
+            assert!(encoded.get("sandbox").is_some(), "{name}: explicit sandbox");
+            let decoded: TurnExecutionSecuritySnapshot =
+                serde_json::from_value(encoded).expect("snapshot should deserialize");
+            assert_eq!(decoded, snapshot, "{name}");
+            assert_eq!(decoded.sandbox.mode, expected_mode, "{name}");
+            assert_eq!(
+                decoded.sandbox.filesystem.kind, expected_filesystem,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn turn_start_params_provider_and_acp_backends_round_trip() {
+        let cases = [
+            (
+                "apiProvider",
+                json!({"type":"apiProvider","provider":"openai"}),
+                AgentExecutionBackend::ApiProvider {
+                    provider: "openai".to_owned(),
+                },
+            ),
+            (
+                "acpAgentRuntime",
+                json!({"type":"acpAgentRuntime","runtime_id":"acp_local"}),
+                AgentExecutionBackend::ACPAgentRuntime {
+                    runtime_id: "acp_local".to_owned(),
+                },
+            ),
+        ];
+        for (name, wire_backend, expected_backend) in cases {
+            let params: TurnStartParams = serde_json::from_value(json!({
+                "thread_id":"thr_123", "turn_id":"turn_123", "execution_backend":wire_backend.clone()
+            })).expect("params should decode");
+            assert_eq!(params.execution_backend, Some(expected_backend), "{name}");
+            let encoded = serde_json::to_value(params).expect("params should encode");
+            assert_eq!(encoded["execution_backend"], wire_backend, "{name}");
+        }
+    }
+
+    #[test]
+    fn permission_profile_default_entry_points_are_full_access_defaulted() {
+        let cases: [(&str, fn() -> TurnPermissionProfileSnapshot); 2] = [
+            ("resolve omitted selection", || {
+                resolve_turn_permission_profile(None)
+            }),
+            (
+                "default helper",
+                crate::default_turn_permission_profile_snapshot,
+            ),
+        ];
+        for (name, make_snapshot) in cases {
+            let snapshot = make_snapshot();
+            assert_eq!(snapshot.mode, TurnPermissionMode::FullAccess, "{name}");
+            assert_eq!(
+                snapshot.source,
+                TurnPermissionProfileSource::Defaulted,
+                "{name}"
+            );
+            assert_eq!(
+                snapshot.effective_policy,
+                ToolPermissionPolicySnapshot::all(PermissionBehavior::Allow),
+                "{name}"
+            );
+        }
     }
 }

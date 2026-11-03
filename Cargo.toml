@@ -1,5 +1,6 @@
 [workspace]
 resolver = "3"
+exclude = ["vendor/transcribe-rs/patched"]
 members = [
   "crates/agent",
   "crates/compaction",
@@ -47,7 +48,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.66.0"
+version = "0.67.0"
 edition = "2024"
 license = "MIT"
 authors = ["Pioneer Contributors"]
@@ -105,7 +106,7 @@ same-file = "=1.0.6"
 async-stream = "0.3"
 
 # Computer use
-cua-driver-sdk = { git = "https://github.com/trycua/cua" }
+cua-driver-sdk = { git = "https://github.com/trycua/cua", tag = "cua-driver-rs-v0.38.0" }
 
 # Error handling
 anyhow = "1"
@@ -146,7 +147,6 @@ terminal = { path = "crates/terminal" }
 markdown = "1"
 
 # Tokenization
-tiktoken-rs = "0.12"
 syntect = { version = "5.3", default-features = false, features = ["parsing", "default-syntaxes", "default-themes", "regex-onig", "dump-load"] }
 two-face = { version = "=0.5.1", default-features = false, features = ["syntect-onig"] }
 unicode-width = "0.2"
@@ -180,7 +180,7 @@ tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
 transcribe-rs = { version = "0.3.11", features = ["onnx", "whisper-cpp"] }
 
 # Agent memory capsule store
-memvid-core = { git = "https://github.com/pioneerdotai/memory", tag = "v4.0.1", default-features = false, features = ["lex", "temporal_track", "simd", "vec"] }
+memvid-core = { git = "https://github.com/pioneerdotai/memory", tag = "v4.1.0", default-features = false, features = ["lex", "temporal_track", "simd", "vec"] }
 
 # Embed
 rust-embed = "8"
@@ -225,6 +225,7 @@ rmcp = { version = "3.5", default-features = false, features = ["auth", "client"
 process-wrap = { version = "10", features = ["tokio1"] }
 
 [patch.crates-io]
+transcribe-rs = { path = "vendor/transcribe-rs/patched" }
 gpui-fast-macos = { git = "https://github.com/pioneerdotai/gpui-fast", rev = "b870cdb1dbc60bf2cb09b04f287aa8ca778ca3d2" }
 gpui-fast-windows = { git = "https://github.com/pioneerdotai/gpui-fast", rev = "b870cdb1dbc60bf2cb09b04f287aa8ca778ca3d2" }
 gpui-fast-linux = { git = "https://github.com/pioneerdotai/gpui-fast", rev = "b870cdb1dbc60bf2cb09b04f287aa8ca778ca3d2" }

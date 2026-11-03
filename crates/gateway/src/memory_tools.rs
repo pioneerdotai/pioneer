@@ -10,13 +10,12 @@ use pioneer_memory::hooks::{
     AgentMemoryPostTurnExtractorProvider, AgentMemoryProvider, AgentMemoryWriteProvider,
     MemoryManifest, MemoryManifestActiveItem, MemoryManifestCandidateItem, MemoryManifestRequest,
     MemoryPostTurnExtractorContext, MemoryPostTurnExtractorRequest,
-    MemoryPostTurnResponseFormatError, MemoryRecallItem as AgentMemoryRecallItem,
-    MemoryRecallRequest, MemoryRecallSnapshot, MemoryToolMaterialization, MemoryTurnContext,
+    MemoryPostTurnResponseFormatError, MemoryToolMaterialization, MemoryTurnContext,
     validate_memory_post_turn_response_format,
 };
 use pioneer_memory::{
     MemoryManifestFailure, MemoryManifestFailureClass, MemoryManifestFailureStage,
-    MemoryModeRecallParams, MemoryOperationContext, MemoryRecallParams,
+    MemoryOperationContext,
 };
 use pioneer_protocol::{
     MemoryActor, MemoryActorKind, MemoryCandidateStatus, MemoryCandidatesListParams,
@@ -394,77 +393,6 @@ async fn authorize_post_turn_memory_upsert_execution(
 
 #[async_trait]
 impl AgentMemoryProvider for GatewayMemoryProvider {
-    async fn recall_memory(
-        &self,
-        context: MemoryTurnContext,
-        request: MemoryRecallRequest,
-    ) -> Result<MemoryRecallSnapshot, String> {
-        let processor = self.processor()?;
-        if !processor.memory_loop_config().deterministic_recall_enabled {
-            return Ok(MemoryRecallSnapshot {
-                items: Vec::new(),
-                diagnostics: vec![
-                    "memory deterministic recall disabled by runtime settings".into(),
-                ],
-                truncated: false,
-            });
-        }
-        let runtime = processor.memory_runtime();
-        if let Err(error) = runtime.ensure_enabled() {
-            return Ok(MemoryRecallSnapshot {
-                items: Vec::new(),
-                diagnostics: vec![format!("memory runtime unavailable: {error:#}")],
-                truncated: false,
-            });
-        }
-        let boundary = authorize_memory_execution(
-            processor.as_ref(),
-            context.workspace_id.as_str(),
-            context.thread_id.as_str(),
-            context.turn_id.as_str(),
-            context.principal_id.as_deref(),
-            MemoryExecutionAccess::Read,
-        )
-        .await?;
-
-        let response = runtime
-            .service()
-            .recall_for_prompt(
-                runtime.operation_context_for_authorized_turn(
-                    &context,
-                    None,
-                    boundary.scoped_collaboration,
-                ),
-                MemoryRecallParams {
-                    query: request.query,
-                    scopes: Vec::new(),
-                    categories: request.categories,
-                    top_k: request.top_k,
-                    max_chars: request.max_chars,
-                },
-            )
-            .await
-            .map_err(|error| format!("{error:#}"))?;
-
-        Ok(MemoryRecallSnapshot {
-            items: response
-                .items
-                .into_iter()
-                .map(|item| AgentMemoryRecallItem {
-                    memory_id: item.memory_id,
-                    scope: item.scope,
-                    category: item.category,
-                    key: item.key,
-                    content: item.content,
-                    score: item.score,
-                    updated_at: item.updated_at,
-                })
-                .collect(),
-            diagnostics: response.diagnostics,
-            truncated: false,
-        })
-    }
-
     async fn materialize_memory_tools(
         &self,
         context: MemoryTurnContext,
@@ -546,69 +474,6 @@ impl AgentMemoryProvider for GatewayMemoryProvider {
                 .into_iter()
                 .collect(),
             diagnostics: Vec::new(),
-        })
-    }
-
-    async fn recall_memory_mode(
-        &self,
-        context: MemoryTurnContext,
-        request: MemoryModeRecallParams,
-    ) -> Result<MemoryRecallSnapshot, String> {
-        let processor = self.processor()?;
-        let runtime = processor.memory_runtime();
-        if let Err(error) = runtime.ensure_enabled() {
-            return Ok(MemoryRecallSnapshot {
-                items: Vec::new(),
-                diagnostics: vec![format!("memory runtime unavailable: {error:#}")],
-                truncated: false,
-            });
-        }
-        let boundary = authorize_memory_execution(
-            processor.as_ref(),
-            context.workspace_id.as_str(),
-            context.thread_id.as_str(),
-            context.turn_id.as_str(),
-            context.principal_id.as_deref(),
-            MemoryExecutionAccess::Read,
-        )
-        .await?;
-
-        let response = runtime
-            .service()
-            .recall_mode_for_prompt(
-                runtime.operation_context_for_authorized_turn(
-                    &context,
-                    None,
-                    boundary.scoped_collaboration,
-                ),
-                request,
-            )
-            .await
-            .map_err(|error| format!("{error:#}"))?;
-
-        let mut diagnostics = response.diagnostics;
-        if let Some(skipped_reason) = response.skipped_reason {
-            diagnostics.push(format!(
-                "memory.active_recall.mode_skipped:{skipped_reason}"
-            ));
-        }
-
-        Ok(MemoryRecallSnapshot {
-            items: response
-                .items
-                .into_iter()
-                .map(|item| AgentMemoryRecallItem {
-                    memory_id: item.memory_id,
-                    scope: item.scope,
-                    category: item.category,
-                    key: item.key,
-                    content: item.content,
-                    score: item.score,
-                    updated_at: item.updated_at,
-                })
-                .collect(),
-            diagnostics,
-            truncated: response.truncated,
         })
     }
 }
@@ -1381,7 +1246,7 @@ fn classified_memory_provider_error(
     classification: ProviderFailureClassification,
 ) -> HookError {
     let class_name = memory_provider_failure_class_name(classification.class);
-    let retryable = memory_provider_failure_is_retryable(classification.class);
+    let retryable = memory_provider_failure_is_retryable(&classification);
     let mut metadata = provider_model_metadata(provider, model, stage_name);
     insert_hook_text_metadata(&mut metadata, "failure_class", class_name);
     insert_hook_text_metadata(
@@ -1417,7 +1282,9 @@ fn classified_memory_provider_error(
     memory_extractor_hook_error(
         format!(
             "memory.post_turn_extractor.provider_{}",
-            if classification.class == ProviderFailureClass::Provider5xx {
+            if classification.http_status == Some(403) {
+                "http_403"
+            } else if classification.class == ProviderFailureClass::Provider5xx {
                 "5xx"
             } else {
                 class_name
@@ -1469,9 +1336,14 @@ fn bounded_diagnostic(value: &str, max_chars: usize) -> String {
     value.trim().chars().take(max_chars).collect()
 }
 
-fn memory_provider_failure_is_retryable(class: ProviderFailureClass) -> bool {
+fn memory_provider_failure_is_retryable(classification: &ProviderFailureClassification) -> bool {
+    // A concrete transport 403 gets the existing durable budget regardless of
+    // the adapter's class. Its distinct code must stay outside unresolved reopen.
+    if classification.http_status == Some(403) {
+        return true;
+    }
     matches!(
-        class,
+        classification.class,
         ProviderFailureClass::NetworkTransient
             | ProviderFailureClass::RateLimit
             | ProviderFailureClass::Provider5xx
@@ -2847,7 +2719,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn post_turn_provider_failure_policy_retries_only_transient_classes() {
+    fn post_turn_provider_failure_policy_retries_transient_classes_and_actual_http_403() {
         for class in [
             ProviderFailureClass::NetworkTransient,
             ProviderFailureClass::RateLimit,
@@ -2855,22 +2727,32 @@ mod tests {
             ProviderFailureClass::StreamStall,
             ProviderFailureClass::StreamTruncated,
         ] {
-            let error = classified_memory_provider_error(
-                "openrouter",
-                "test-model",
-                "provider_stream_item",
-                ProviderFailureStage::MidStream,
-                ProviderFailureClassification::new(class),
-            );
-            assert!(error.retryable, "{class:?} should retry");
-            assert_eq!(
-                error
-                    .metadata
-                    .iter()
-                    .find(|(key, _)| key.as_str() == "provider")
-                    .map(|(_, value)| value.as_str()),
-                Some("openrouter")
-            );
+            for status in [None, Some(403)] {
+                let mut classification = ProviderFailureClassification::new(class);
+                classification.http_status = status;
+                let error = classified_memory_provider_error(
+                    "openrouter",
+                    "test-model",
+                    "provider_stream_item",
+                    ProviderFailureStage::MidStream,
+                    classification,
+                );
+                assert!(error.retryable, "{class:?} should retry");
+                if status == Some(403) {
+                    assert_eq!(
+                        error.code.as_str(),
+                        "memory.post_turn_extractor.provider_http_403"
+                    );
+                }
+                assert_eq!(
+                    error
+                        .metadata
+                        .iter()
+                        .find(|(key, _)| key.as_str() == "provider")
+                        .map(|(_, value)| value.as_str()),
+                    Some("openrouter")
+                );
+            }
         }
         for class in [
             ProviderFailureClass::AuthExpired,
@@ -2881,22 +2763,42 @@ mod tests {
             ProviderFailureClass::InvalidRequest,
             ProviderFailureClass::Unknown,
         ] {
-            let error = classified_memory_provider_error(
-                "openrouter",
-                "test-model",
-                "provider_stream_start",
-                ProviderFailureStage::Connect,
-                ProviderFailureClassification::new(class),
-            );
-            assert!(!error.retryable, "{class:?} must be terminal");
+            for status in [None, Some(401), Some(403)] {
+                let mut classification = ProviderFailureClassification::new(class);
+                classification.http_status = status;
+                for provider in ["openrouter", "openai", "other"] {
+                    let error = classified_memory_provider_error(
+                        provider,
+                        "test-model",
+                        "provider_stream_start",
+                        ProviderFailureStage::Connect,
+                        classification.clone(),
+                    );
+                    assert_eq!(
+                        error.retryable,
+                        status == Some(403),
+                        "{provider}/{class:?}/{status:?}"
+                    );
+                    let suffix = if status == Some(403) {
+                        "http_403"
+                    } else {
+                        memory_provider_failure_class_name(class)
+                    };
+                    assert_eq!(
+                        error.code.as_str(),
+                        format!("memory.post_turn_extractor.provider_{suffix}")
+                    );
+                }
+            }
         }
     }
 
     #[test]
-    fn memory_denial_preserves_allowlisted_reason_and_request_without_retry() {
+    fn memory_http_403_preserves_class_stages_cooldown_and_allowlisted_diagnostics() {
         let mut classification =
             ProviderFailureClassification::new(ProviderFailureClass::AuthOrPermission);
         classification.http_status = Some(403);
+        classification.retry_after_ms = Some(30_001);
         classification.error_reason = Some(pioneer_protocol::ProviderErrorReason::PermissionDenied);
         classification.request_id = Some(
             pioneer_protocol::ProviderRequestId::try_from("req-denial_fixture".to_owned()).unwrap(),
@@ -2908,9 +2810,17 @@ mod tests {
             ProviderFailureStage::Connect,
             classification,
         );
-        assert!(!error.retryable);
+        assert!(error.retryable);
+        assert_eq!(
+            error.code.as_str(),
+            "memory.post_turn_extractor.provider_http_403"
+        );
         for (key, expected) in [
+            ("failure_class", "auth_or_permission"),
+            ("failure_stage", "provider_stream_start"),
+            ("provider_stage", "connect"),
             ("http_status", "403"),
+            ("retry_after_ms", "30001"),
             ("provider_error_reason", "permission_denied"),
             ("provider_request_id", "req-denial_fixture"),
         ] {

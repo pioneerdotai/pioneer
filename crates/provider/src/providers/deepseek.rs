@@ -332,7 +332,7 @@ mod tests {
             Some(ReasoningConfig::Effort(ReasoningEffort::None)),
             Some(ReasoningConfig::Effort(ReasoningEffort::High)),
         ] {
-            let off = crate::generation::selected_off(reasoning);
+            let thinking = reasoning.is_some() && !crate::generation::selected_off(reasoning);
             for stream in [false, true] {
                 let mut request = request_with(messages.clone());
                 request.model = "deepseek-v4-flash".into();
@@ -343,18 +343,16 @@ mod tests {
                     parameters: serde_json::json!({"type":"object"}),
                 }]);
                 let prepared = provider.prepare_request(request).unwrap();
-                assert_eq!(prepared.messages[0].tool_calls.is_some(), off);
+                assert_eq!(prepared.messages[0].tool_calls.is_some(), !thinking);
                 let wire = crate::attachments::runtime::with_async_authority_scope(
                     "deepseek-default-mode-fixture".into(),
-                    provider
-                        .transport
-                        .render_chat_request_async_for_test(prepared, stream),
+                    render_locally(&provider, prepared, stream),
                 )
                 .await
                 .unwrap();
                 assert_eq!(wire["stream"], stream);
                 assert!(wire.to_string().contains("observed result"));
-                assert_eq!(wire["messages"][0].get("tool_calls").is_some(), off);
+                assert_eq!(wire["messages"][0].get("tool_calls").is_some(), !thinking);
                 assert_eq!(serde_json::to_string(&messages).unwrap(), canonical_bytes);
             }
         }
@@ -392,6 +390,7 @@ mod tests {
             }
             let mut request = request_with(active);
             request.model = "deepseek-v4-flash".into();
+            request.reasoning = Some(ReasoningConfig::Effort(ReasoningEffort::High));
             assert!(provider.prepare_request(request).is_err());
         }
     }
@@ -497,7 +496,8 @@ mod tests {
                             admission.clone(),
                             crate::attachments::runtime::with_async_authority_scope(
                                 "deepseek-mixed-media-fixture".into(),
-                                provider.transport.render_chat_request_async_for_test(
+                                render_locally(
+                                    &provider,
                                     provider.prepare_request(request.clone()).unwrap(),
                                     stream,
                                 ),
@@ -531,9 +531,7 @@ mod tests {
                     let prepared = provider.prepare_request(budgeted.request.clone()).unwrap();
                     let wire = crate::attachments::runtime::with_async_authority_scope(
                         "deepseek-mixed-final-fixture".into(),
-                        provider
-                            .transport
-                            .render_chat_request_async_for_test(prepared, stream),
+                        render_locally(&provider, prepared, stream),
                     )
                     .await
                     .unwrap();
@@ -541,7 +539,8 @@ mod tests {
                     // preparation must not change the final history representation.
                     let direct = crate::attachments::runtime::with_async_authority_scope(
                         "deepseek-mixed-direct-fixture".into(),
-                        provider.transport.render_chat_request_async_for_test(
+                        render_locally(
+                            &provider,
                             provider.prepare_request(request.clone()).unwrap(),
                             stream,
                         ),
@@ -585,9 +584,7 @@ mod tests {
                         if off {
                             let wire = crate::attachments::runtime::with_async_authority_scope(
                                 "deepseek-active-off-fixture".into(),
-                                provider
-                                    .transport
-                                    .render_chat_request_async_for_test(prepared.unwrap(), stream),
+                                render_locally(&provider, prepared.unwrap(), stream),
                             )
                             .await
                             .unwrap();
@@ -725,6 +722,8 @@ mod tests {
         }
     }
 
+    // Replay fixtures select thinking explicitly; omission/off scenarios override
+    // this field instead of deriving a default from the model name.
     fn request_with(messages: Vec<ChatMessage>) -> ChatRequest {
         ChatRequest {
             model: "deepseek-reasoner".into(),
@@ -734,47 +733,89 @@ mod tests {
             tools: None,
             tool_choice: None,
             parallel_tool_calls: None,
-            reasoning: None,
+            reasoning: Some(ReasoningConfig::Effort(ReasoningEffort::High)),
             compiled_prompt: None,
         }
     }
 
-    fn prepare_locally(
+    async fn with_explicit_reasoning_controls<T>(
+        model: &str,
+        future: impl std::future::Future<Output = T>,
+    ) -> T {
+        // These fixture facts certify explicit high/off controls for this one
+        // model. They supply no native default and make no family inference.
+        let native = std::collections::BTreeMap::from([
+            ("reasoning.supported".into(), Some(true)),
+            ("effort.high".into(), Some(true)),
+            ("effort.none".into(), Some(true)),
+        ]);
+        crate::generation::with_native_reasoning(
+            "deepseek",
+            true,
+            std::collections::BTreeMap::from([(model.into(), native)]),
+            future,
+        )
+        .await
+    }
+
+    async fn render_locally(
+        provider: &DeepSeekProvider,
+        request: ChatRequest,
+        stream: bool,
+    ) -> Result<serde_json::Value> {
+        let model = request.model.clone();
+        with_explicit_reasoning_controls(
+            &model,
+            provider
+                .transport
+                .render_chat_request_async_for_test(request, stream),
+        )
+        .await
+    }
+
+    async fn prepare_locally(
         provider: &DeepSeekProvider,
         request: ChatRequest,
     ) -> Result<(ChatRequest, serde_json::Value)> {
-        let request = provider.prepare_request(request)?;
-        let wire = provider
-            .transport
-            .render_chat_request_for_test(request.clone())?;
-        Ok((request, wire))
+        let model = request.model.clone();
+        with_explicit_reasoning_controls(&model, async {
+            let request = provider.prepare_request(request)?;
+            let wire = provider
+                .transport
+                .render_chat_request_for_test(request.clone())?;
+            Ok((request, wire))
+        })
+        .await
     }
 
     #[tokio::test]
-    async fn explicit_off_reaches_wire_while_thinking_on_keeps_missing_replay_guard() {
+    async fn omitted_and_explicit_off_preserve_history_while_selected_thinking_requires_replay() {
         let provider = DeepSeekProvider::new("key");
-        for off in [
-            ReasoningConfig::Disabled,
-            ReasoningConfig::Effort(ReasoningEffort::None),
+        for reasoning in [
+            None,
+            Some(ReasoningConfig::Disabled),
+            Some(ReasoningConfig::Effort(ReasoningEffort::None)),
         ] {
             let mut request = replay_request("deepseek-v4-flash", None);
             request
                 .messages
                 .push(ChatMessage::tool_result("call_1", "read_file", "observed"));
-            request.reasoning = Some(off);
+            request.reasoning = reasoning;
             request.max_tokens = Some(1024);
             assert!(!provider.thinking_replay_required(&request));
             let prepared = provider.prepare_request(request).unwrap();
             for stream in [false, true] {
                 let wire = crate::attachments::runtime::with_async_authority_scope(
                     "deepseek-off-integration-fixture".into(),
-                    provider
-                        .transport
-                        .render_chat_request_async_for_test(prepared.clone(), stream),
+                    render_locally(&provider, prepared.clone(), stream),
                 )
                 .await
                 .unwrap();
-                assert_eq!(wire["thinking"]["type"], "disabled");
+                if reasoning.is_none() {
+                    assert!(wire.get("thinking").is_none());
+                } else {
+                    assert_eq!(wire["thinking"]["type"], "disabled");
+                }
                 assert!(wire.get("reasoning_effort").is_none());
                 assert_eq!(wire["messages"][0]["tool_calls"][0]["id"], "call_1");
                 assert_eq!(wire["messages"][1]["role"], "tool");
@@ -784,24 +825,44 @@ mod tests {
                 assert_eq!(wire["max_tokens"], 1024);
             }
         }
-        for reasoning in [None, Some(ReasoningConfig::effort(ReasoningEffort::High))] {
-            let mut request = replay_request("deepseek-v4-flash", None);
-            request
-                .messages
-                .push(ChatMessage::tool_result("call_1", "read_file", "observed"));
-            request.reasoning = reasoning;
-            assert!(provider.thinking_replay_required(&request));
-            let error = provider.prepare_request(request).unwrap_err();
-            assert!(
-                error
-                    .downcast_ref::<MissingDeepSeekReasoningReplay>()
-                    .is_some()
-            );
-        }
+        let mut request = replay_request("deepseek-v4-flash", None);
+        request
+            .messages
+            .push(ChatMessage::tool_result("call_1", "read_file", "observed"));
+        request.reasoning = Some(ReasoningConfig::Effort(ReasoningEffort::High));
+        assert!(provider.thinking_replay_required(&request));
+        let error = provider.prepare_request(request.clone()).unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<MissingDeepSeekReasoningReplay>()
+                .is_some()
+        );
+
+        // A confirmed native default also requires replay, even when the caller
+        // omits reasoning. The unscoped omission case above has no such fact.
+        request.reasoning = None;
+        crate::generation::with_native_reasoning(
+            "deepseek",
+            false,
+            std::collections::BTreeMap::from([(
+                request.model.clone(),
+                std::collections::BTreeMap::from([("default_enabled".into(), Some(true))]),
+            )]),
+            async {
+                assert!(provider.thinking_replay_required(&request));
+                let error = provider.prepare_request(request).unwrap_err();
+                assert!(
+                    error
+                        .downcast_ref::<MissingDeepSeekReasoningReplay>()
+                        .is_some()
+                );
+            },
+        )
+        .await;
     }
 
-    #[test]
-    fn two_tool_rounds_and_final_response_replay_every_native_reasoning_field() {
+    #[tokio::test]
+    async fn two_tool_rounds_and_final_response_replay_every_native_reasoning_field() {
         let provider = DeepSeekProvider::new("key");
         let mut messages = vec![ChatMessage::user("start")];
         for (index, reasoning) in ["first native reasoning", ""].into_iter().enumerate() {
@@ -839,7 +900,7 @@ mod tests {
         let mut request = request_with(stored);
         request.model = "deepseek-v4-flash".into();
         request.reasoning = Some(ReasoningConfig::effort(ReasoningEffort::High));
-        let (_, wire) = prepare_locally(&provider, request).unwrap();
+        let (_, wire) = prepare_locally(&provider, request).await.unwrap();
         assert_eq!(wire["messages"].as_array().unwrap().len(), 6);
         assert_eq!(
             wire["messages"][1]["reasoning_content"],
@@ -856,8 +917,10 @@ mod tests {
     #[test]
     fn rejects_incomplete_thinking_history_before_transport() {
         let provider = DeepSeekProvider::new("key");
+        let mut request = replay_request("deepseek-v4-flash", None);
+        request.reasoning = Some(ReasoningConfig::Effort(ReasoningEffort::High));
         let error = provider
-            .validate_request_replay(&replay_request("deepseek-reasoner", None))
+            .validate_request_replay(&request)
             .expect_err("incomplete DeepSeek replay must fail locally");
 
         assert!(
@@ -874,8 +937,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn accepts_provider_owned_empty_reasoning_field() {
+    #[tokio::test]
+    async fn accepts_provider_owned_empty_reasoning_field() {
         let provider = DeepSeekProvider::new("key");
         let calls = vec![tool_call()];
         let mut state = ChatCompletionsApiCompatibleProvider::assistant_replay_state(
@@ -907,6 +970,7 @@ mod tests {
 
         let original_state = request.messages[0].provider_replay_state.clone();
         let (prepared, wire) = prepare_locally(&provider, request)
+            .await
             .expect("field presence, including an empty value, is replayable");
         assert_eq!(
             prepared.messages[0].provider_replay_state, original_state,
@@ -916,8 +980,8 @@ mod tests {
         assert_eq!(wire["messages"][1]["tool_call_id"], "call_1");
     }
 
-    #[test]
-    fn completed_foreign_round_with_reasoning_reaches_deepseek_wire() {
+    #[tokio::test]
+    async fn completed_foreign_round_with_reasoning_reaches_deepseek_wire() {
         let calls = vec![tool_call()];
         let mut messages = vec![
             ChatMessage::assistant_tool_calls_with_provider_state(
@@ -937,7 +1001,9 @@ mod tests {
         complete_round(&mut messages);
 
         let (projected, wire) =
-            prepare_locally(&DeepSeekProvider::new("key"), request_with(messages)).unwrap();
+            prepare_locally(&DeepSeekProvider::new("key"), request_with(messages))
+                .await
+                .unwrap();
 
         assert_eq!(projected.messages.len(), 2);
         assert_eq!(
@@ -949,8 +1015,8 @@ mod tests {
         assert!(wire.to_string().contains("file contents"));
     }
 
-    #[test]
-    fn completed_foreign_round_without_reasoning_is_a_non_executable_transcript() {
+    #[tokio::test]
+    async fn completed_foreign_round_without_reasoning_is_a_non_executable_transcript() {
         let mut messages = vec![
             ChatMessage::assistant_tool_calls_with_provider_state(
                 None::<String>,
@@ -967,7 +1033,9 @@ mod tests {
         complete_round(&mut messages);
 
         let (projected, wire) =
-            prepare_locally(&DeepSeekProvider::new("key"), request_with(messages)).unwrap();
+            prepare_locally(&DeepSeekProvider::new("key"), request_with(messages))
+                .await
+                .unwrap();
 
         assert_eq!(projected.messages.len(), 2);
         assert!(
@@ -995,8 +1063,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn legacy_unit_with_mixed_rounds_preserves_reasoning_and_compatible_replay() {
+    #[tokio::test]
+    async fn legacy_unit_with_mixed_rounds_preserves_reasoning_and_compatible_replay() {
         let provider = DeepSeekProvider::new("key");
         let plain_call = tool_call();
         let reasoned_call = ProviderToolCall {
@@ -1058,7 +1126,9 @@ mod tests {
             origin.inherited = true;
         }
         let canonical = messages.clone();
-        let (projected, wire) = prepare_locally(&provider, request_with(messages.clone())).unwrap();
+        let (projected, wire) = prepare_locally(&provider, request_with(messages.clone()))
+            .await
+            .unwrap();
         assert_eq!(projected.messages.len(), 7);
         assert_eq!(projected.messages[0].role, Role::User);
         assert_eq!(
@@ -1109,8 +1179,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn encrypted_only_foreign_replay_is_not_exposed_as_reasoning() {
+    #[tokio::test]
+    async fn encrypted_only_foreign_replay_is_not_exposed_as_reasoning() {
         let mut messages = vec![
             ChatMessage::assistant_tool_calls_with_provider_state(
                 None::<String>,
@@ -1128,14 +1198,15 @@ mod tests {
         ];
         complete_round(&mut messages);
 
-        let (_, wire) =
-            prepare_locally(&DeepSeekProvider::new("key"), request_with(messages)).unwrap();
+        let (_, wire) = prepare_locally(&DeepSeekProvider::new("key"), request_with(messages))
+            .await
+            .unwrap();
         assert!(!wire.to_string().contains("opaque-secret"));
         assert!(wire.to_string().contains("file contents"));
     }
 
-    #[test]
-    fn unfinished_foreign_replay_fails_before_deepseek_rendering() {
+    #[tokio::test]
+    async fn unfinished_foreign_replay_fails_before_deepseek_rendering() {
         let mut message = ChatMessage::assistant_tool_calls_with_provider_state(
             None::<String>,
             None::<String>,
@@ -1148,6 +1219,7 @@ mod tests {
         );
         message.provenance = None;
         let error = prepare_locally(&DeepSeekProvider::new("key"), request_with(vec![message]))
+            .await
             .expect_err("an active foreign continuation must fail before wire rendering");
         assert!(
             error
@@ -1156,8 +1228,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn compatible_empty_replay_triggers_projection_for_mixed_non_reasoner_history() {
+    #[tokio::test]
+    async fn compatible_empty_replay_triggers_projection_for_mixed_non_reasoner_history() {
         let provider = DeepSeekProvider::new("key");
         let calls = vec![tool_call()];
         let mut compatible = ChatCompletionsApiCompatibleProvider::assistant_replay_state(
@@ -1209,7 +1281,8 @@ mod tests {
         }
         let mut request = request_with(messages);
         request.model = "deepseek-chat".into();
-        let (projected, wire) = prepare_locally(&provider, request).unwrap();
+        request.reasoning = None;
+        let (projected, wire) = prepare_locally(&provider, request).await.unwrap();
         assert_eq!(
             projected.messages[0].provider_replay_state.as_ref(),
             Some(&compatible)
@@ -1224,8 +1297,8 @@ mod tests {
         assert!(wire.to_string().contains("third result"));
     }
 
-    #[test]
-    fn completed_same_model_non_thinking_round_is_portable_in_thinking_request() {
+    #[tokio::test]
+    async fn completed_same_model_non_thinking_round_is_portable_in_thinking_request() {
         let provider = DeepSeekProvider::new("key");
         for reasoning_field in [None, Some(serde_json::Value::Null)] {
             let mut replay = ChatCompletionsApiCompatibleProvider::assistant_replay_state(
@@ -1257,7 +1330,7 @@ mod tests {
             let mut request = request_with(messages);
             request.model = "deepseek-v4-flash".into();
             request.reasoning = Some(ReasoningConfig::effort(ReasoningEffort::High));
-            let (projected, wire) = prepare_locally(&provider, request).unwrap();
+            let (projected, wire) = prepare_locally(&provider, request).await.unwrap();
             assert_eq!(projected.messages.len(), 2);
             assert_eq!(projected.messages[0].role, Role::User);
             assert!(
@@ -1290,7 +1363,7 @@ mod tests {
         mixed.push(reasoned);
         let mut request = request_with(mixed);
         request.model = "deepseek-v4-flash".into();
-        let (projected, wire) = prepare_locally(&provider, request).unwrap();
+        let (projected, wire) = prepare_locally(&provider, request).await.unwrap();
         assert_eq!(projected.messages[0].role, Role::User);
         assert!(wire.to_string().contains("mixed result"));
 
@@ -1308,14 +1381,19 @@ mod tests {
         let mut request = request_with(vec![active]);
         request.model = "deepseek-v4-flash".into();
         request.reasoning = Some(ReasoningConfig::effort(ReasoningEffort::High));
-        assert!(prepare_locally(&provider, request).is_err());
+        assert!(prepare_locally(&provider, request).await.is_err());
     }
 
     #[test]
     fn non_thinking_chat_does_not_require_reasoning_replay() {
-        DeepSeekProvider::new("key")
-            .validate_request_replay(&replay_request("deepseek-chat", None))
-            .expect("non-thinking DeepSeek replay remains supported");
+        let provider = DeepSeekProvider::new("key");
+        for id in ["deepseek-chat", "unlisted-reasoner-973"] {
+            let mut request = replay_request(id, None);
+            request.reasoning = None;
+            provider.prepare_request(request).expect(
+                "unknown native defaults do not require reasoning replay from a model name",
+            );
+        }
     }
 
     #[tokio::test]

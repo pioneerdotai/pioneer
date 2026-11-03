@@ -16,9 +16,11 @@ Use Threads for conversation discovery, source reading, and permitted conversati
 
 - `thread_create` creates a thread; it does not run a model.
 - `thread_message_send` adds a message; it does not run a model.
-- `threads_turn_start` starts a turn at a permitted destination with agent-authored input. It does not create a durable Task or enter the attached-subagent protocol.
+- `threads_turn_start` starts a turn at a permitted destination with agent-authored input. It follows the target thread’s execution rules: Collaborative conversations use an internal detached Task; an executable TaskRun child continues in that same child thread. This does not enter the attached-subagent protocol.
 
 Tasks and attached subagents have separate skills, `system:pioneer/tasks` and `system:pioneer/subagents`. Do not apply their wait, review, or accept protocol to a thread turn.
+
+Thread writes and launches are conversation actions, not an inter-agent communication channel. Do not use them for parent/child/sibling coordination, progress reports, questions, blockers, or task-result handoffs. Use the Tasks/Subagents result and review flow instead. Ordinary user-requested conversation actions remain available within their granted permissions.
 
 ## Tool Discovery And Authority
 
@@ -46,7 +48,7 @@ Read access is scoped to the initiating user's current permissions, workspace, a
 
 ## Listing And Search
 
-`threads_list` returns pages of accessible workspace threads, including accessible hidden internal and archived conversations, ordered by immutable thread ID. Follow `nextCursor` until `eof`, including empty nonterminal pages. Metadata can be fragmented rather than shortened.
+`threads_list` returns pages of accessible standalone workspace conversations, including archived conversations. Internal execution children are excluded; open them selectively through history `childReference` or `threads_children_list`. Conversations are ordered by creation time newest first (`created_at DESC, id DESC` for ties), not by latest activity. Follow `nextCursor` until `eof`, including empty nonterminal pages. Continuation retains the full creation date and ID of the last examined candidate, including candidates that cannot be disclosed. Unrelated metadata edits and activity do not reset it; new threads before the current position appear on a fresh first page. Access is checked on every page. Metadata can be fragmented rather than shortened; finish the same card before interpreting it. Changes to that continued card invalidate its fragments. An invalid, incompatible, or old-format cursor requires restarting the list with the original parameters; never edit it or silently substitute a first page.
 
 `threads_search` takes `query`, `limit`, and optional `cursor`. The server chooses lexical/hybrid retrieval automatically; do not send a mode or embeddings. Search considers all accessible indexed threads and their associated indexes. A page contains up to 100 matching fragments and 2 MiB; these are page sizes, not limits on the threads, index files, or candidates considered. `nextCursor` requests the next results page, not an unfinished scan of remaining files. Keep `query` and `limit` unchanged during continuation.
 
@@ -82,4 +84,4 @@ Send/start `input` is `AgentAuthoredInput`: a JSON array of clean `UserInput` en
 
 Omit `launch` to inherit the current identity, executor/provider, model, and reasoning under server rules. This needs no preliminary identity/model lookup, but **does not remove the required `targetOptionId`**. For explicit selection, use `threads_identity_models_list` for an admitted identity and choose actual returned provider/model IDs or a compatible exact profile. `launch.useDefaultReasoning:true` chooses the selected model's native default and cannot coexist with explicit `launch.reasoning`. Omission, false, and legacy `reasoning:null` retain inheritance. Unknown reasoning metadata proves neither support nor lack of support; never invent models, defaults, or effort levels.
 
-Action results use `status`, optional `outcome`, `receiptId`, `outboxId`, `publicMessage`, and refreshed `targetOptions`. Accepted or queued work is not proof the model finished. Preserve existing runtime call identity and ledger/outbox replay after a lost response. These payloads have no JSON `idempotencyKey`; do not add one or repeat uncertain mutations as a new operation.
+Action results use `status`, optional `outcome`, `receiptId`, `outboxId`, `publicMessage`, `threadResult`, and refreshed `targetOptions`. Successful create returns `threadResult.workspaceId/threadId`; send also returns the saved `turnId`. Open that history directly with `threadId` and `anchor:{turnId}`; no list or search is needed. Start returns the target thread and admitted turn. For Collaborative, that turn is the parent admission and `taskId` identifies its detached Task; follow parent history for the later child reference. For foreground, `executionId` identifies execution of the returned turn in the same thread. Never treat a parent admission as a child execution turn. References describe committed objects and do not replace opaque write/start options or grant read access. Accepted or queued work is not proof the model finished. Preserve existing runtime call identity and ledger/outbox replay after a lost response; recovered `threadResult` keeps the original references. These payloads have no JSON `idempotencyKey`; do not add one or repeat uncertain mutations as a new operation.

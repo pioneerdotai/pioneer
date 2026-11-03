@@ -704,13 +704,13 @@ impl MessageProcessor {
         if !cli_runtime_ready_for_model_discovery(&runtime_snapshot.summary) {
             self.send_error(
                 connection_id,
-                cli_runtime_discovery_error(
+                crate::public_error::expected_agent_rpc_error(
                     Some(request_id),
                     INVALID_REQUEST_CODE,
-                    format!(
-                        "CLI runtime `{}` is not ready to list models",
-                        params.runtime_id
-                    ),
+                    pioneer_protocol::PublicErrorCode::Unavailable,
+                    pioneer_protocol::PublicErrorStage::Discovery,
+                    "cli_runtime_list_models",
+                    "runtime_disabled",
                 ),
             )
             .await;
@@ -6407,6 +6407,7 @@ impl MessageProcessor {
                     "runtime:provider_failure".to_owned(),
                     pioneer_protocol::TurnItemType::SystemEvent,
                     pioneer_protocol::ProviderFailureDetails {
+                        raw_response: None,
                         error_reason: None,
                         request_id: None,
                         provider: turn_binding.runtime_kind.clone(),

@@ -39,7 +39,7 @@ Gateway переносит контекст в task executor по исходно
 
 - Client: синхронный JS bridge call (duration/event на JS-часах, отдельной очереди у этого вызова нет), ожидание worker, подготовку, readiness/session refresh, подготовку/загрузку вложений, очередь отправки, socket write, очередь первого модельного события и его обработку в Rust. Если child не открыт, обработка уведомления не означает применение к видимому состоянию.
 - Gateway: dispatch, admission, сохранение терна; отдельно DB admission, SQLx pool acquire, execution и commit. Scheduling classes и границы транзакций остаются прежними.
-- Native: history, artifacts, skills, security, environment, context; preflight и отдельные фазы hooks; ожидание compaction coordinator и выполнение compaction; provider connect и ожидание первого вывода.
+- Native: history, artifacts, skills, security, environment, context; отдельные фазы hooks; ожидание compaction coordinator и выполнение compaction; provider connect и ожидание первого вывода.
 - CLI: ожидание session lock/lease, получение сессии, process spawn, initialize handshake, thread start/resume, readiness и MCP, dispatch и ожидание первого модельного события. `session.state` различает `new`, `reused`, `replaced` на gateway.
 - Voice: finalize, извлечение аудиобуфера, VAD, ожидание transcriber mutex, inference и преобразование transcript в input. В версии 0.57 распознавание запускается через `spawn_blocking`; `voice.worker.wait` измеряет фактическое ожидание первого запуска blocking worker. `gateway.worker.wait` отдельно измеряет ожидание owned async worker.
 - Delivery: projection/persistence, fanout, outbound queue именно соединения-инициатора, socket write; затем Rust event queue/apply и наблюдения JS/GPUI/React.
@@ -61,7 +61,7 @@ Gateway переносит контекст в task executor по исходно
 | CLI admission и materialization | `task.cli.prepare`, `cli.prepare`, `cli.admission`, `cli.turn.prepare`, `cli.materialize`, `cli.persist`, `cli.transition.wait` |
 | CLI preflight | `cli.preflight`, `cli.mcp.resolve`, `cli.skills.plan`, `cli.skills.install`, `cli.security` |
 | CLI context и continuation | `cli.history.capture`, `cli.history.compact`, `cli.context.delivery_plan`, `cli.context.build`, `cli.context.validate`, `cli.context.revalidate`, `cli.continuation.prepare`, `cli.continuation.fork` |
-| Общие helpers и native | `turn.skills.normalize`, `turn.security.resolve`, `history.artifacts.materialize`, `native.preflight.provider` |
+| Общие helpers и native | `turn.skills.normalize`, `turn.security.resolve`, `history.artifacts.materialize` |
 
 Фазы вложены по фактическому вызову. Owned async worker сохраняет текущий parent span даже при переходе с parent key на delegated child alias. Контекст устанавливается на каждый poll и снимается перед `Pending`; параллельные терны не наследуют чужую фазу. Runtime уточняется по выбранному backend до подготовки child history. У стадий, начавшихся раньше выбора backend, допустим `runtime.kind=unknown`.
 

@@ -1475,32 +1475,45 @@ mod tests {
         }
 
         #[test]
-        fn invalid_timeline_stage_action_pair_is_replaced_by_a_consistency_event() {
-            let _serial = TEST_CAPTURE
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            reset_capture();
-            let isolation = isolation();
-            start_qualification_capture(
-                &isolation,
-                QualificationScenario::CounterReconciliation,
-                CaptureLimits {
-                    max_records: 1,
-                    max_duration_ms: MAX_CAPTURE_DURATION_MS,
-                },
-            )
-            .expect("start capture");
+        fn invalid_timeline_actions_emit_the_specific_consistency_error() {
+            for (action, max_records, expected_kind) in [
+                (
+                    DiagnosticAction::Hit,
+                    1,
+                    ConsistencyErrorKind::InvalidTimelineActionForStage,
+                ),
+                (
+                    DiagnosticAction::Scheduled,
+                    2,
+                    ConsistencyErrorKind::InvalidActionForSeries,
+                ),
+            ] {
+                let _serial = TEST_CAPTURE
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                reset_capture();
+                let isolation = isolation();
+                start_qualification_capture(
+                    &isolation,
+                    QualificationScenario::CounterReconciliation,
+                    CaptureLimits {
+                        max_records,
+                        max_duration_ms: MAX_CAPTURE_DURATION_MS,
+                    },
+                )
+                .expect("start capture");
 
-            record_timeline(TimelineStage::RowBuild, DiagnosticAction::Hit, 1);
+                record_timeline(TimelineStage::RowBuild, action, 1);
 
-            let snapshot = stop_qualification_capture(&isolation).expect("stop capture");
-            assert_eq!(snapshot.records.len(), 1);
-            assert_eq!(
-                snapshot.records[0].event,
-                DiagnosticEventKey::ConsistencyError {
-                    kind: ConsistencyErrorKind::InvalidTimelineActionForStage,
-                }
-            );
+                let snapshot = stop_qualification_capture(&isolation).expect("stop capture");
+                assert_eq!(snapshot.records.len(), 1);
+                assert_eq!(
+                    snapshot.records[0].event,
+                    DiagnosticEventKey::ConsistencyError {
+                        kind: expected_kind,
+                    }
+                );
+            }
         }
 
         #[test]
@@ -1534,35 +1547,6 @@ mod tests {
                 snapshot.records[0].event,
                 DiagnosticEventKey::ConsistencyError {
                     kind: ConsistencyErrorKind::InvalidPresentationOwnerHostPair,
-                }
-            );
-        }
-
-        #[test]
-        fn invalid_actions_are_replaced_by_a_consistency_event() {
-            let _serial = TEST_CAPTURE
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            reset_capture();
-            let isolation = isolation();
-            start_qualification_capture(
-                &isolation,
-                QualificationScenario::CounterReconciliation,
-                CaptureLimits {
-                    max_records: 2,
-                    max_duration_ms: MAX_CAPTURE_DURATION_MS,
-                },
-            )
-            .expect("start capture");
-
-            record_timeline(TimelineStage::RowBuild, DiagnosticAction::Scheduled, 1);
-
-            let snapshot = stop_qualification_capture(&isolation).expect("stop capture");
-            assert_eq!(snapshot.records.len(), 1);
-            assert_eq!(
-                snapshot.records[0].event,
-                DiagnosticEventKey::ConsistencyError {
-                    kind: ConsistencyErrorKind::InvalidActionForSeries,
                 }
             );
         }

@@ -56,6 +56,12 @@ pub enum WorkState {
 }
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct ActiveWork {
+    /// Fixed portable payload operation detail; absent for other work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub portable_payload: Option<crate::portable_payload::LiveOperation>,
+    /// Last pre-scope hold refusal on this caller; not a completed payload read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub portable_hold_rejection: Option<crate::portable_payload::Family>,
     #[serde(skip)]
     pending_outcome: Option<Outcome>,
     #[serde(skip)]
@@ -271,6 +277,8 @@ impl WorkGuard {
                 return false;
             }
             let entry = ActiveWork {
+                portable_payload: None,
+                portable_hold_rejection: None,
                 pending_outcome: None,
                 wait_stack: [None; 4],
                 wait_overflow: 0,
@@ -376,6 +384,37 @@ pub fn progress(stage: Stage) {
                 let entry = *entry;
                 record_work(state, entry, now);
             }
+        }
+    });
+}
+/// Uses the existing bounded work registry/journal. Callers aggregate hot-loop
+/// phases locally and throttle these updates rather than recording each block.
+pub(crate) fn portable_progress(
+    context: Option<WorkContext>,
+    detail: crate::portable_payload::LiveOperation,
+) {
+    let Some(context) = context else { return };
+    let now = monotonic_ms();
+    with_store(context.consent_generation, |state| {
+        if let Some(entry) = state.active.get_mut(&context.token) {
+            entry.portable_payload = Some(detail);
+            entry.last_progress_ms = now;
+            let entry = *entry;
+            record_work(state, entry, now);
+        }
+    });
+}
+pub(crate) fn portable_hold_rejected(
+    context: Option<WorkContext>,
+    family: crate::portable_payload::Family,
+) {
+    let Some(context) = context else { return };
+    let now = monotonic_ms();
+    with_store(context.consent_generation, |state| {
+        if let Some(entry) = state.active.get_mut(&context.token) {
+            entry.portable_hold_rejection = Some(family);
+            let entry = *entry;
+            record_work(state, entry, now);
         }
     });
 }
@@ -488,15 +527,19 @@ pub async fn sleeping<F: std::future::Future>(
     );
     future.await
 }
+fn resource_record_bytes(resources: &crate::resources::ResourceSnapshot) -> usize {
+    resources
+        .additional_heap_bytes()
+        .and_then(|heap| {
+            heap.checked_add(std::mem::size_of::<crate::resources::ResourceSnapshot>())
+        })
+        .and_then(|boxed| boxed.checked_add(std::mem::size_of::<JournalRecord>()))
+        .unwrap_or(usize::MAX)
+}
 pub(crate) fn sample_resources(resources: crate::resources::ResourceSnapshot) {
     let epoch = resources.consent_generation;
     let now = monotonic_ms();
-    // Sampler-side serialization is outside all hot paths/DB/UI and used only to
-    // account the bounded snapshot's retained cost (including owned strings).
-    let cost = serde_json::to_vec(&resources)
-        .map(|b| b.len().saturating_mul(2))
-        .unwrap_or(MAX_BYTES + 1)
-        .saturating_add(std::mem::size_of::<JournalRecord>());
+    let cost = resource_record_bytes(&resources);
     with_store(epoch, |state| {
         state.sweep(now);
         state.append(JournalPayload::Resources(Box::new(resources)), cost, now);
@@ -554,15 +597,71 @@ static METRICS: OnceLock<LiveMetrics> = OnceLock::new();
 pub(crate) fn init(meter: &opentelemetry::metrics::Meter) {
     let _=METRICS.set(LiveMetrics{active:meter.u64_gauge("pioneer.work.active").with_unit("{work}").build(),age:meter.f64_gauge("pioneer.work.oldest.age").with_unit("s").build(),queue:meter.u64_gauge("pioneer.queue.current").with_description("Current aggregate per closed lane; field specifies elements/capacity/bytes/coverage, never admission histograms").build(),queue_age:meter.f64_gauge("pioneer.queue.oldest.age").with_unit("s").build(),loss:meter.u64_gauge("pioneer.observation.loss.snapshot").with_description("Local epoch lifetime snapshot, gauge NOT a cumulative sum submitted under Delta").build(),runtime:meter.u64_gauge("pioneer.runtime.current").with_description("Stable aggregate counters by closed runtime role; no per-task/thread labels").build()});
 }
-pub(crate) fn emit_current() {
-    crate::work::emit_pending();
-    crate::queues::emit_pending();
-    use opentelemetry::KeyValue;
-    let Some(metrics) = METRICS.get() else { return };
-    let Some(snapshot) = snapshot() else { return };
-    let mut active: BTreeMap<(&'static str, &'static str), (u64, u64)> = BTreeMap::new();
-    // Emit closed catalog combinations including observed zero, so stale gauges
-    // cannot survive a finished work unit. Oldest is meaningful with active >0.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct QueueLane {
+    count: u64,
+    depth: u64,
+    capacity: u64,
+    bytes: u64,
+    oldest: Option<u64>,
+    known: bool,
+    complete_heads: bool,
+    bytes_known: bool,
+}
+impl QueueLane {
+    fn empty() -> Self {
+        Self {
+            count: 0,
+            depth: 0,
+            capacity: 0,
+            bytes: 0,
+            oldest: None,
+            known: false,
+            complete_heads: true,
+            bytes_known: false,
+        }
+    }
+    fn add(&mut self, queue: crate::queues::QueueNumbers) {
+        if self.count == 0 {
+            self.known = true;
+            self.bytes_known = true;
+        }
+        self.count += 1;
+        self.depth = self.depth.saturating_add(queue.depth);
+        self.capacity = self
+            .capacity
+            .saturating_add(queue.capacity.unwrap_or(0) as u64);
+        self.bytes = self.bytes.saturating_add(queue.bytes);
+        self.oldest = self.oldest.into_iter().chain(queue.oldest_age_ms).max();
+        self.known &= queue.initial_depth_known;
+        self.complete_heads &= queue.depth == 0 || queue.oldest_age_ms.is_some();
+        self.bytes_known &= queue.bytes_known;
+    }
+    fn oldest(&self) -> Option<u64> {
+        self.oldest.filter(|_| self.known && self.complete_heads)
+    }
+    fn fields(&self) -> [(&'static str, Option<u64>); 7] {
+        let observed = self.known && self.count > 0;
+        [
+            ("registered_queues", Some(self.count)),
+            ("depth_elements", observed.then_some(self.depth)),
+            ("known_capacity_elements", Some(self.capacity)),
+            ("accounted_payload_bytes", observed.then_some(self.bytes)),
+            ("depth_known", Some(u64::from(self.known))),
+            ("oldest_available", Some(u64::from(self.oldest().is_some()))),
+            ("bytes_known", Some(u64::from(self.bytes_known))),
+        ]
+    }
+}
+#[derive(Debug, PartialEq, Eq)]
+struct CurrentNumbers {
+    active: BTreeMap<(&'static str, &'static str), (u64, u64)>,
+    queues: BTreeMap<&'static str, QueueLane>,
+    loss: [u64; 5],
+}
+fn current_numbers(state: &mut LiveStore, now: u64) -> CurrentNumbers {
+    state.sweep(now);
+    let mut active = BTreeMap::new();
     for kind in [
         crate::work::WorkKind::WorkerLifecycle,
         crate::work::WorkKind::Database,
@@ -586,8 +685,8 @@ pub(crate) fn emit_current() {
             active.insert((kind.label(), state), (0, 0));
         }
     }
-    for entry in &snapshot.active {
-        let state = match entry.state {
+    for entry in state.active.values() {
+        let status = match entry.state {
             WorkState::Queued => "queued",
             WorkState::Running => "running",
             WorkState::Waiting(_) => "waiting",
@@ -595,13 +694,55 @@ pub(crate) fn emit_current() {
             WorkState::Terminal(_) => continue,
         };
         let value = active
-            .entry((entry.context.kind.label(), state))
-            .or_default();
+            .get_mut(&(entry.context.kind.label(), status))
+            .expect("closed work catalog");
         value.0 += 1;
-        value.1 = value
-            .1
-            .max(snapshot.snapshot_ms.saturating_sub(entry.last_progress_ms));
+        value.1 = value.1.max(now.saturating_sub(entry.last_progress_ms));
     }
+    let mut queues: BTreeMap<_, _> = crate::queues::QueueKind::ALL
+        .into_iter()
+        .map(|kind| (kind.label(), QueueLane::empty()))
+        .collect();
+    for queue in state.queues.values() {
+        let numbers = queue.current_numbers(now);
+        queues
+            .get_mut(numbers.kind.label())
+            .expect("closed queue catalog")
+            .add(numbers);
+    }
+    CurrentNumbers {
+        active,
+        queues,
+        loss: [
+            state.overflow,
+            state.abandoned,
+            state.overwritten,
+            state.lost,
+            state.queue_overflow,
+        ],
+    }
+}
+
+pub(crate) fn emit_current() {
+    crate::work::emit_pending();
+    crate::queues::emit_pending();
+    use opentelemetry::KeyValue;
+    let Some(metrics) = METRICS.get() else { return };
+    // The sampler caller holds record_in_epoch across projection AND recording.
+    // Do not acquire that non-reentrant consent guard again here.
+    let (enabled, epoch) = crate::telemetry_consent_snapshot();
+    if !enabled {
+        return;
+    }
+    let Some(current) = with_store(epoch, |state| current_numbers(state, monotonic_ms())) else {
+        return;
+    };
+    // LIVE lock is released before SDK recording or runtime registry access.
+    let CurrentNumbers {
+        active,
+        queues,
+        loss,
+    } = current;
     for ((kind, state), (count, age)) in active {
         let attrs = [KeyValue::new("kind", kind), KeyValue::new("state", state)];
         metrics.active.record(count, &attrs);
@@ -610,86 +751,32 @@ pub(crate) fn emit_current() {
         }
     }
     for (reason, value) in [
-        ("active_overflow", snapshot.active_overflow),
-        ("abandoned", snapshot.abandoned),
-        ("journal_overwritten", snapshot.overwritten),
-        ("journal_lost", snapshot.lost),
-        ("queue_overflow", snapshot.queue_overflow),
-    ] {
+        "active_overflow",
+        "abandoned",
+        "journal_overwritten",
+        "journal_lost",
+        "queue_overflow",
+    ]
+    .into_iter()
+    .zip(loss)
+    {
         metrics
             .loss
             .record(value, &[KeyValue::new("reason", reason)]);
     }
-    let mut queues: BTreeMap<&str, (u64, u64, u64, u64, Option<u64>, bool)> = BTreeMap::new();
-    for kind in crate::queues::QueueKind::ALL {
-        queues.insert(kind.label(), (0, 0, 0, 0, None, false));
-    }
-    for queue in &snapshot.queues {
-        let value = queues
-            .entry(queue.kind.label())
-            .or_insert((0, 0, 0, 0, None, true));
-        if value.0 == 0 {
-            value.5 = true;
-        }
-        value.0 += 1;
-        value.1 = value.1.saturating_add(queue.depth);
-        value.2 = value.2.saturating_add(queue.capacity.unwrap_or(0) as u64);
-        value.3 = value.3.saturating_add(queue.bytes);
-        value.4 = value
-            .4
-            .zip(queue.oldest_age_ms)
-            .map(|(a, b)| a.max(b))
-            .or(value.4)
-            .or(queue.oldest_age_ms);
-        value.5 &= queue.initial_depth_known;
-    }
-    for (kind, (count, depth, capacity, bytes, oldest, known)) in queues {
-        // A maximum over only the known subset is not the oldest of this lane.
-        // Preserve native per-owner detail locally; omit the aggregate on gaps.
-        let complete_heads = known
-            && snapshot
-                .queues
-                .iter()
-                .filter(|q| q.kind.label() == kind)
-                .all(|q| q.depth == 0 || q.oldest_age_ms.is_some());
-        let oldest = oldest.filter(|_| complete_heads);
-        for (field, value) in [
-            ("registered_queues", count),
-            ("depth_elements", depth),
-            ("known_capacity_elements", capacity),
-            ("accounted_payload_bytes", bytes),
-            ("depth_known", u64::from(known)),
-            ("oldest_available", u64::from(oldest.is_some())),
-            (
-                "bytes_known",
-                u64::from(
-                    count > 0
-                        && snapshot
-                            .queues
-                            .iter()
-                            .filter(|q| q.kind.label() == kind)
-                            .all(|q| q.byte_quality == "known_payload_bytes"),
-                ),
-            ),
-        ] {
-            if (field == "depth_elements" || field == "accounted_payload_bytes")
-                && (!known || count == 0)
-            {
-                continue;
+    for (kind, lane) in queues {
+        for (field, value) in lane.fields() {
+            if let Some(value) = value {
+                metrics.queue.record(
+                    value,
+                    &[KeyValue::new("queue", kind), KeyValue::new("field", field)],
+                );
             }
-            metrics.queue.record(
-                value,
-                &[
-                    KeyValue::new("queue", kind.to_owned()),
-                    KeyValue::new("field", field),
-                ],
-            );
         }
-        if let Some(age) = oldest {
-            metrics.queue_age.record(
-                age as f64 / 1000.0,
-                &[KeyValue::new("queue", kind.to_owned())],
-            );
+        if let Some(age) = lane.oldest() {
+            metrics
+                .queue_age
+                .record(age as f64 / 1000.0, &[KeyValue::new("queue", kind)]);
         }
     }
     if let Some(runtime) = crate::runtime::snapshot() {
@@ -746,6 +833,8 @@ impl QueuedWork {
                 return None;
             }
             let entry = ActiveWork {
+                portable_payload: None,
+                portable_hold_rejection: None,
                 pending_outcome: None,
                 wait_stack: [None; 4],
                 wait_overflow: 0,
@@ -799,28 +888,38 @@ pub fn admission_wait(enter: bool) {
     };
     let now = monotonic_ms();
     with_store(context.consent_generation, |state| {
-        if let Some(entry) = state.active.get_mut(&context.token) {
-            if enter {
-                if let Some(slot) = entry.wait_stack.iter_mut().find(|s| s.is_none()) {
-                    *slot = Some((entry.state, entry.stage));
-                    entry.state = WorkState::Waiting(WaitKind::DatabaseAdmission);
-                    entry.stage = Stage::Admission;
-                } else {
-                    entry.wait_overflow = entry.wait_overflow.saturating_add(1);
-                }
-            } else if entry.wait_overflow > 0 {
-                entry.wait_overflow -= 1;
-            } else if let Some(slot) = entry.wait_stack.iter_mut().rev().find(|s| s.is_some()) {
-                let (previous, stage) = slot.take().unwrap();
-                entry.state = previous;
-                entry.stage = stage;
-            }
-            entry.state_since_ms = now;
-            entry.last_progress_ms = now;
-            let entry = *entry;
-            record_work(state, entry, now);
-        }
+        admission_wait_in_store(state, context, enter, now);
     });
+}
+
+/// Shares the admission transition registry visit; never acquires STORE itself.
+pub(crate) fn admission_wait_in_store(
+    state: &mut LiveStore,
+    context: crate::work::WorkContext,
+    enter: bool,
+    now: u64,
+) {
+    if let Some(entry) = state.active.get_mut(&context.token) {
+        if enter {
+            if let Some(slot) = entry.wait_stack.iter_mut().find(|s| s.is_none()) {
+                *slot = Some((entry.state, entry.stage));
+                entry.state = WorkState::Waiting(WaitKind::DatabaseAdmission);
+                entry.stage = Stage::Admission;
+            } else {
+                entry.wait_overflow = entry.wait_overflow.saturating_add(1);
+            }
+        } else if entry.wait_overflow > 0 {
+            entry.wait_overflow -= 1;
+        } else if let Some(slot) = entry.wait_stack.iter_mut().rev().find(|s| s.is_some()) {
+            let (previous, stage) = slot.take().unwrap();
+            entry.state = previous;
+            entry.stage = stage;
+        }
+        entry.state_since_ms = now;
+        entry.last_progress_ms = now;
+        let entry = *entry;
+        record_work(state, entry, now);
+    }
 }
 
 #[cfg(test)]
@@ -1050,3 +1149,7 @@ mod model_tests {
         crate::set_telemetry_enabled(old);
     }
 }
+
+#[cfg(test)]
+#[path = "live_cpu_tests.rs"]
+mod cpu_tests;

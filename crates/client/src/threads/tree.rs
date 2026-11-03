@@ -1848,30 +1848,6 @@ mod tests {
     }
 
     #[test]
-    fn remembered_thread_map_insert_remove_and_lookup_are_workspace_scoped() {
-        let mut remembered = HashMap::new();
-
-        remember_thread_for_workspace(&mut remembered, "ws_a", Some("thread_a".to_owned()));
-        remember_thread_for_workspace(&mut remembered, "ws_b", Some("thread_b".to_owned()));
-
-        assert_eq!(
-            remembered_thread_for_workspace(&remembered, "ws_a"),
-            Some("thread_a")
-        );
-        assert_eq!(
-            remembered_thread_for_workspace(&remembered, "ws_b"),
-            Some("thread_b")
-        );
-
-        remember_thread_for_workspace(&mut remembered, "ws_a", None);
-        assert_eq!(remembered_thread_for_workspace(&remembered, "ws_a"), None);
-        assert_eq!(
-            remembered_thread_for_workspace(&remembered, "ws_b"),
-            Some("thread_b")
-        );
-    }
-
-    #[test]
     fn workspace_thread_state_remembers_only_matching_threads_and_pending_draft() {
         let threads = HashMap::from([("thread_a", "ws_a"), ("draft_b", "ws_b")]);
         let matches_workspace = |thread_id: &str, workspace_id: &str| {

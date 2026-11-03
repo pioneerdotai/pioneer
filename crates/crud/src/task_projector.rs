@@ -18,7 +18,7 @@ use crate::repositories::{
     task_result_review_event, task_run, task_run_execution, task_run_thread_binding, task_run_turn,
     task_trigger, task_write_lock, thread_lineage,
 };
-use crate::task_events::{AppendedTaskEvent, TaskEventPayload};
+use crate::task_events::{DeferredAppendedTaskEvent, TaskEventPayload};
 use crate::util::unix_to_datetime;
 
 type ProjectFuture<'a> = Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
@@ -292,10 +292,10 @@ impl TaskProjector {
         Self
     }
 
-    pub async fn project<C: ConnectionTrait + Sync>(
+    pub(crate) async fn project<C: ConnectionTrait + Sync>(
         &self,
         db: &C,
-        event: &AppendedTaskEvent,
+        event: &DeferredAppendedTaskEvent,
     ) -> Result<()> {
         let created_at = event.created_at;
         let candidate_gate_resolution = event.candidate_gate_resolution.clone();
@@ -315,7 +315,7 @@ impl TaskProjector {
         let task_error_status = event.projection.task_error_status;
         let delivery_projection = event.projection.delivery.clone();
         let delivery_attempt_projection = event.projection.delivery_attempt.clone();
-        let future: ProjectFuture<'_> = match &event.payload {
+        let future: ProjectFuture<'_> = match event.payload.as_ref() {
             TaskEventPayload::TaskCreated { task: task_model } => project_future(async move {
                 task::upsert_prepared_task(
                     db,

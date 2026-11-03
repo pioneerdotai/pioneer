@@ -306,6 +306,7 @@ impl MessageProcessor {
         let response_payload = VoiceSessionStartResponse {
             session_id,
             status: VoiceStatus::Recording,
+            audio_integrity_version: Some(1),
         };
         self.send_voice_result(
             connection_id,
@@ -442,7 +443,7 @@ impl MessageProcessor {
                     pioneer_observability::turn_startup::Stage::VoiceFinish,
                 );
                 self.voice_session_buffers
-                    .finish_processing(&session.session_id)
+                    .finish_processing_verified(&session.session_id, params.audio_integrity)
             };
             self.send_voice_result(
                 connection_id,

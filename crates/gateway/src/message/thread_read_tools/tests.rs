@@ -34,6 +34,7 @@ pub(in crate::message) fn authority(
         workspace_id: WORKSPACE_RED_ID.into(),
         root_thread_id: root.into(),
         current_thread_id: root.into(),
+        current_turn_id: "read-root-turn".into(),
         observe_children: true,
         observe_workspace,
     }
@@ -122,6 +123,9 @@ async fn list_filters_private_metadata_and_rechecks_acl_on_cursor_continuation()
     );
     // A broader user ACL does not widen a capsule-restricted execution.
     let capsule_only = authority(MEMBER_A_ID, THREAD_RED_PRIVATE_A_ID, false);
+    let restricted_rows = list_all(&processor, &capsule_only).await;
+    assert_eq!(restricted_rows.as_array().unwrap().len(), 1);
+    assert_eq!(restricted_rows[0]["threadId"], THREAD_RED_PRIVATE_A_ID);
     assert!(
         !processor
             .thread_source_readable(&capsule_only, THREAD_RED_WORKSPACE_ID)
@@ -208,6 +212,16 @@ async fn add_thread(processor: &MessageProcessor, id: &str, parent: Option<&str>
             "INSERT INTO thread_lineage(child_thread_id,parent_thread_id,root_thread_id,depth,created_at,created_by_thread_id,created_by_turn_id) VALUES (?,?,?,1,CURRENT_TIMESTAMP,?,'read-root-turn')",
             [id.into(), parent.into(), THREAD_RED_WORKSPACE_ID.into(), THREAD_RED_WORKSPACE_ID.into()])).await.unwrap();
     }
+}
+
+// List-specific fixtures are ordinary visible conversations. Child traversal
+// fixtures above retain their real hidden/system semantics.
+async fn make_conversation(processor: &MessageProcessor, id: &str) {
+    processor.crud_store.database_connection().execute_raw(Statement::from_sql_and_values(
+        DatabaseBackend::Sqlite,
+        "UPDATE thread SET origin_kind='user',sidebar_visibility='visible',access_class='workspace' WHERE id=?",
+        [id.into()],
+    )).await.unwrap();
 }
 
 #[tokio::test]
@@ -473,10 +487,39 @@ async fn internal_child_requires_authorized_root_and_parent_history_cursor_is_in
         )
         .await
         .unwrap();
+    assert!(
+        !list_all(&processor, &a)
+            .await
+            .to_string()
+            .contains("internal-child")
+    );
+    let children = processor
+        .thread_children_page(
+            &a,
+            ThreadsChildrenListParams {
+                thread_id: THREAD_RED_WORKSPACE_ID.into(),
+                recursive: false,
+                limit: 100,
+                cursor: None,
+            },
+            &processor.thread_read_cursor_codec().unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        children["threads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["threadId"] == "internal-child")
+    );
     assert!(!first.eof);
     let parent_cursor = first.next_cursor.clone().unwrap();
+    let reference = first.events[0]["childReference"]["threadId"]
+        .as_str()
+        .unwrap();
     let child = processor
-        .read_saved_thread_history(WORKSPACE_RED_ID, "internal-child", 1, None, |_| async {
+        .read_saved_thread_history(WORKSPACE_RED_ID, reference, 1, None, |_| async {
             Ok(false)
         })
         .await
@@ -1252,6 +1295,7 @@ async fn metadata_returns_full_titles_and_explicit_preview_truncation_across_pag
     assert_eq!(metadata["previewTruncated"], true);
     for index in 0..205 {
         add_thread(&processor, &format!("list-{index:03}"), None, false).await;
+        make_conversation(&processor, &format!("list-{index:03}")).await;
     }
     let codec = processor.thread_read_cursor_codec().unwrap();
     let mut cursor = None;
@@ -1291,20 +1335,20 @@ async fn metadata_returns_full_titles_and_explicit_preview_truncation_across_pag
         ))
         .await
         .unwrap();
-    assert!(
-        processor
-            .thread_list_page(
-                &a,
-                ThreadsListParams {
-                    limit: 1,
-                    cursor: Some(first["nextCursor"].as_str().unwrap().to_owned())
-                },
-                &codec
-            )
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("stale")
+    let continued = processor
+        .thread_list_page(
+            &a,
+            ThreadsListParams {
+                limit: 1,
+                cursor: Some(first["nextCursor"].as_str().unwrap().to_owned()),
+            },
+            &codec,
+        )
+        .await
+        .unwrap();
+    assert_ne!(
+        continued["threads"][0]["threadId"],
+        first["threads"][0]["threadId"]
     );
 }
 
@@ -1351,4 +1395,479 @@ async fn oversized_title_reconstructs_without_losing_metadata_or_continuation() 
         serde_json::from_str::<Value>(&restored).unwrap()["title"],
         title
     );
+}
+
+#[tokio::test]
+async fn list_creation_key_survives_skips_activity_insertions_deletion_and_access_loss() {
+    let (harness, processor) = fixture().await;
+    for (id, date) in [
+        ("z-old", "2050-01-01 00:00:00.123456000+00:00"),
+        ("a-new", "2050-01-01 00:00:01+00:00"),
+        ("b-tie", "2050-01-01 00:00:00.123456789+00:00"),
+        ("c-tie", "2050-01-01 00:00:00.123456789+00:00"),
+        ("d-fraction", "2050-01-01 00:00:00.123456788+00:00"),
+    ] {
+        add_thread(&processor, id, None, false).await;
+        make_conversation(&processor, id).await;
+        harness
+            .database
+            .execute_raw(Statement::from_sql_and_values(
+                DatabaseBackend::Sqlite,
+                "UPDATE thread SET created_at=? WHERE id=?",
+                [date.into(), id.into()],
+            ))
+            .await
+            .unwrap();
+    }
+    // More than one candidate quantum must be skipped without disclosing IDs
+    // or mistaking the empty first response for EOF.
+    for index in 0..205 {
+        let id = format!("denied-{index:03}");
+        add_thread(&processor, &id, None, true).await;
+        make_conversation(&processor, &id).await;
+        harness
+            .database
+            .execute_raw(Statement::from_sql_and_values(
+                DatabaseBackend::Sqlite,
+                "UPDATE thread SET access_class='private' WHERE id=?",
+                [id.clone().into()],
+            ))
+            .await
+            .unwrap();
+        harness
+            .database
+            .execute_raw(Statement::from_sql_and_values(
+                DatabaseBackend::Sqlite,
+                "UPDATE thread SET created_at='2051-01-01 00:00:00+00:00' WHERE id=?",
+                [id.into()],
+            ))
+            .await
+            .unwrap();
+    }
+    let a = authority(MEMBER_A_ID, THREAD_RED_PRIVATE_A_ID, true);
+    let codec = processor.thread_read_cursor_codec().unwrap();
+    let first = processor
+        .thread_list_page(
+            &a,
+            ThreadsListParams {
+                limit: 1,
+                cursor: None,
+            },
+            &codec,
+        )
+        .await
+        .unwrap();
+    assert_eq!(first["threads"], json!([]));
+    assert_eq!(first["eof"], false);
+    let newest = processor
+        .thread_list_page(
+            &a,
+            ThreadsListParams {
+                limit: 1,
+                cursor: Some(first["nextCursor"].as_str().unwrap().into()),
+            },
+            &codec,
+        )
+        .await
+        .unwrap();
+    assert_eq!(newest["threads"][0]["threadId"], "a-new");
+
+    harness.database.execute_raw(Statement::from_sql_and_values(
+        DatabaseBackend::Sqlite,
+        "UPDATE thread SET name='unrelated',preview='activity',status='running',updated_at='2060-01-01 00:00:00+00:00' WHERE id=?",
+        [THREAD_RED_PRIVATE_B_ID.into()],
+    )).await.unwrap();
+    harness
+        .database
+        .execute_unprepared("DELETE FROM thread WHERE id='a-new'")
+        .await
+        .unwrap();
+    add_thread(&processor, "0-latest", None, false).await;
+    make_conversation(&processor, "0-latest").await;
+    harness
+        .database
+        .execute_unprepared(
+            "UPDATE thread SET created_at='2052-01-01 00:00:00+00:00' WHERE id='0-latest'",
+        )
+        .await
+        .unwrap();
+
+    let mut cursor = Some(newest["nextCursor"].as_str().unwrap().to_owned());
+    let mut found = Vec::new();
+    loop {
+        let page = processor
+            .thread_list_page(&a, ThreadsListParams { limit: 1, cursor }, &codec)
+            .await
+            .unwrap();
+        for row in page["threads"].as_array().unwrap() {
+            let id = row["threadId"].as_str().unwrap().to_owned();
+            assert!(!found.contains(&id), "a candidate was revisited");
+            found.push(id);
+        }
+        if page["eof"] == true {
+            break;
+        }
+        cursor = Some(page["nextCursor"].as_str().unwrap().to_owned());
+    }
+    assert_eq!(&found[..4], ["c-tie", "b-tie", "d-fraction", "z-old"]);
+    assert!(
+        !found
+            .iter()
+            .any(|id| id == "0-latest" || id.starts_with("denied-"))
+    );
+
+    let restart = processor
+        .thread_list_page(
+            &a,
+            ThreadsListParams {
+                limit: 1,
+                cursor: None,
+            },
+            &codec,
+        )
+        .await
+        .unwrap();
+    assert_eq!(restart["threads"][0]["threadId"], "0-latest");
+    // Revoke only a candidate's access, preserving authority to read the root.
+    // The next page must skip it and still reach all remaining available rows.
+    harness
+        .database
+        .execute_unprepared("UPDATE thread SET access_class='private' WHERE id='c-tie'")
+        .await
+        .unwrap();
+    assert!(!processor.thread_source_readable(&a, "c-tie").await.unwrap());
+    let mut cursor = Some(restart["nextCursor"].as_str().unwrap().to_owned());
+    let mut after_revocation = Vec::new();
+    loop {
+        let page = processor
+            .thread_list_page(&a, ThreadsListParams { limit: 1, cursor }, &codec)
+            .await
+            .unwrap();
+        after_revocation.extend(
+            page["threads"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| row["threadId"].as_str().unwrap().to_owned()),
+        );
+        if page["eof"] == true {
+            break;
+        }
+        cursor = Some(page["nextCursor"].as_str().unwrap().to_owned());
+    }
+    found.remove(0);
+    assert_eq!(after_revocation, found);
+}
+
+#[tokio::test]
+async fn list_rejects_legacy_tampered_and_cross_scope_cursors_with_public_errors() {
+    use base64::Engine as _;
+    let (_harness, processor) = fixture().await;
+    let a = authority(MEMBER_A_ID, THREAD_RED_PRIVATE_A_ID, true);
+    let codec = processor.thread_read_cursor_codec().unwrap();
+    let first = processor
+        .thread_list_page(
+            &a,
+            ThreadsListParams {
+                limit: 1,
+                cursor: None,
+            },
+            &codec,
+        )
+        .await
+        .unwrap();
+    let current = first["nextCursor"].as_str().unwrap();
+    let mut tampered = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(current)
+        .unwrap();
+    *tampered.last_mut().unwrap() ^= 1;
+    let legacy = codec
+        .encode(
+            &json!({"revision":"old", "after":"old-id", "fragment":null}),
+            &a.scope("list", "", false, 1),
+        )
+        .unwrap();
+    let incompatible = codec
+        .encode(
+            &json!({"revision":"old", "after":"old-id", "fragment":null}),
+            &a.list_scope(1),
+        )
+        .unwrap();
+    for cursor in [
+        legacy,
+        incompatible,
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(tampered),
+    ] {
+        let error = processor
+            .thread_list_page(
+                &a,
+                ThreadsListParams {
+                    limit: 1,
+                    cursor: Some(cursor),
+                },
+                &codec,
+            )
+            .await
+            .unwrap_err();
+        let public = safe_read_error(&error);
+        assert_eq!(public_read_error(&public).1, "read_cursor_incompatible");
+    }
+    let mut other_workspace = authority(MEMBER_A_ID, THREAD_RED_PRIVATE_A_ID, true);
+    other_workspace.workspace_id = "other-workspace".into();
+    let mut other_execution = authority(MEMBER_A_ID, THREAD_RED_PRIVATE_A_ID, true);
+    other_execution.current_thread_id = "other-execution-thread".into();
+    let mut other_turn = authority(MEMBER_A_ID, THREAD_RED_PRIVATE_A_ID, true);
+    other_turn.current_turn_id = "other-execution-turn".into();
+    for other in [
+        authority(MEMBER_B_ID, THREAD_RED_PRIVATE_A_ID, true),
+        authority(MEMBER_A_ID, THREAD_RED_WORKSPACE_ID, true),
+        authority(MEMBER_A_ID, THREAD_RED_PRIVATE_A_ID, false),
+        other_workspace,
+        other_execution,
+        other_turn,
+    ] {
+        let error = processor
+            .thread_list_page(
+                &other,
+                ThreadsListParams {
+                    limit: 1,
+                    cursor: Some(current.into()),
+                },
+                &codec,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            public_read_error(&safe_read_error(&error)).1,
+            "read_cursor_incompatible"
+        );
+    }
+}
+
+#[tokio::test]
+async fn list_fragment_pins_only_its_source_and_reports_change_disappearance_or_denial() {
+    let (harness, processor) = fixture().await;
+    add_thread(&processor, "pending-card", None, false).await;
+    make_conversation(&processor, "pending-card").await;
+    let title = "🌍\"\n".repeat(450_000);
+    harness.database.execute_raw(Statement::from_sql_and_values(
+        DatabaseBackend::Sqlite,
+        "UPDATE thread SET name=?,created_at='2050-01-01 00:00:00.123456789+00:00' WHERE id='pending-card'",
+        [title.clone().into()],
+    )).await.unwrap();
+    let a = authority(MEMBER_A_ID, THREAD_RED_PRIVATE_A_ID, true);
+    let codec = processor.thread_read_cursor_codec().unwrap();
+    let first = processor
+        .thread_list_page(
+            &a,
+            ThreadsListParams {
+                limit: 1,
+                cursor: None,
+            },
+            &codec,
+        )
+        .await
+        .unwrap();
+    let fragment = &first["threads"][0]["fragment"];
+    assert_eq!(fragment["eof"], false);
+    let continuation = ThreadsListParams {
+        limit: 1,
+        cursor: Some(first["nextCursor"].as_str().unwrap().to_owned()),
+    };
+    add_thread(&processor, "new-before-pending", None, false).await;
+    make_conversation(&processor, "new-before-pending").await;
+    harness.database.execute_unprepared("UPDATE thread SET created_at='2051-01-01 00:00:00+00:00' WHERE id='new-before-pending'; UPDATE thread SET name='unrelated change',preview='activity',updated_at='2060-01-01 00:00:00+00:00' WHERE id='T00000000000000000002'").await.unwrap();
+    let second = processor
+        .thread_list_page(&a, continuation.clone(), &codec)
+        .await
+        .unwrap();
+    assert_eq!(second["threads"][0]["threadId"], "pending-card");
+    assert_eq!(
+        second["threads"][0]["fragment"]["offset"],
+        fragment["nextOffset"]
+    );
+    assert_eq!(
+        second["threads"][0]["fragment"]["version"],
+        fragment["version"]
+    );
+    for change in [
+        "sidebar_visibility='hidden'",
+        "origin_kind='task_run'",
+        "access_class='internal'",
+    ] {
+        harness
+            .database
+            .execute_unprepared(&format!(
+                "UPDATE thread SET {change} WHERE id='pending-card'"
+            ))
+            .await
+            .unwrap();
+        let error = processor
+            .thread_list_page(&a, continuation.clone(), &codec)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            public_read_error(&safe_read_error(&error)).1,
+            "read_source_unavailable"
+        );
+        make_conversation(&processor, "pending-card").await;
+    }
+    harness
+        .database
+        .execute_unprepared("UPDATE thread SET name='changed source' WHERE id='pending-card'")
+        .await
+        .unwrap();
+    let error = processor
+        .thread_list_page(&a, continuation.clone(), &codec)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        public_read_error(&safe_read_error(&error)).1,
+        "read_source_changed"
+    );
+    harness
+        .database
+        .execute_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "UPDATE thread SET name=?,access_class='private' WHERE id='pending-card'",
+            [title.into()],
+        ))
+        .await
+        .unwrap();
+    let error = processor
+        .thread_list_page(&a, continuation.clone(), &codec)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        public_read_error(&safe_read_error(&error)).1,
+        "read_source_unavailable"
+    );
+    harness
+        .database
+        .execute_unprepared("DELETE FROM thread WHERE id='pending-card'")
+        .await
+        .unwrap();
+    let error = processor
+        .thread_list_page(&a, continuation, &codec)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        public_read_error(&safe_read_error(&error)).1,
+        "read_source_unavailable"
+    );
+}
+
+#[tokio::test]
+async fn list_conversation_boundary_excludes_internal_quanta_but_keeps_visible_agent_roots() {
+    let (harness, processor) = fixture().await;
+    for (id, origin) in [
+        ("root-collaborative", "collaborative"),
+        ("root-dm", "direct_message"),
+        ("root-legacy", "user"),
+    ] {
+        add_thread(&processor, id, Some(THREAD_RED_WORKSPACE_ID), false).await;
+        make_conversation(&processor, id).await;
+        harness.database.execute_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "UPDATE thread SET origin_kind=?,created_by_actor_kind='agent_execution',created_by_actor_id='E00000000000000000001',created_at='2050-01-01 00:00:00+00:00' WHERE id=?",
+            [origin.into(), id.into()],
+        )).await.unwrap();
+    }
+    // More than a processing quantum, interleaved between new and old roots.
+    // Includes readable hidden children, nested descendants and inconsistent
+    // combinations to exercise each independent part of the list predicate.
+    for index in 0..205 {
+        let id = format!("internal-{index:03}");
+        let parent = if index == 0 {
+            THREAD_RED_WORKSPACE_ID
+        } else {
+            "internal-000"
+        };
+        add_thread(&processor, &id, Some(parent), false).await;
+        let (origin, visibility, access) = match index % 5 {
+            0 => ("task_run", "visible", "workspace"),
+            1 => ("user", "hidden", "workspace"),
+            2 => ("user", "visible", "internal"),
+            3 => ("system", "visible", "workspace"),
+            _ => ("task_run", "hidden", "internal"),
+        };
+        harness.database.execute_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "UPDATE thread SET origin_kind=?,sidebar_visibility=?,access_class=?,created_at='2040-01-01 00:00:00+00:00' WHERE id=?",
+            [origin.into(), visibility.into(), access.into(), id.into()],
+        )).await.unwrap();
+    }
+    let a = authority(MEMBER_A_ID, THREAD_RED_WORKSPACE_ID, true);
+    let rows = list_all(&processor, &a).await;
+    let ids = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["threadId"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(&ids[..3], &["root-legacy", "root-dm", "root-collaborative"]);
+    assert!(ids.contains(&THREAD_RED_PRIVATE_A_ID));
+    assert!(ids.contains(&THREAD_RED_WORKSPACE_ID));
+    assert!(!ids.contains(&THREAD_RED_PRIVATE_B_ID));
+    assert!(!ids.iter().any(|id| id.starts_with("internal-")));
+    assert_eq!(ids.len(), 5);
+    for row in rows.as_array().unwrap().iter().take(3) {
+        assert_eq!(row["archived"], true);
+    }
+}
+
+#[tokio::test]
+async fn list_rejects_previous_candidate_scope_even_for_pending_readable_child_fragments() {
+    let (_harness, processor) = fixture().await;
+    add_thread(&processor, "old-hidden-card", None, false).await;
+    let a = authority(MEMBER_A_ID, THREAD_RED_PRIVATE_A_ID, true);
+    let codec = processor.thread_read_cursor_codec().unwrap();
+    let metadata = processor
+        .thread_read_metadata(&a, "old-hidden-card")
+        .await
+        .unwrap();
+    let digest = hex::encode(Sha256::digest(
+        serde_json::to_string(&metadata).unwrap().as_bytes(),
+    ));
+    let old_scope = json!([
+        a.scope("list-created-desc-v1", "", false, 1),
+        a.current_turn_id
+    ])
+    .to_string();
+    for fragment in [
+        None,
+        Some(MetadataFragment {
+            thread_id: "old-hidden-card".into(),
+            digest,
+            offset: 1,
+        }),
+    ] {
+        let cursor = codec
+            .encode(
+                &ListCursor {
+                    after: Some(pioneer_crud::ThreadReadPosition {
+                        created_at: "2050-01-01 00:00:00+00:00".into(),
+                        id: "old-hidden-card".into(),
+                    }),
+                    fragment,
+                },
+                &old_scope,
+            )
+            .unwrap();
+        let error = processor
+            .thread_list_page(
+                &a,
+                ThreadsListParams {
+                    limit: 1,
+                    cursor: Some(cursor),
+                },
+                &codec,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            public_read_error(&safe_read_error(&error)).1,
+            "read_cursor_incompatible"
+        );
+    }
 }

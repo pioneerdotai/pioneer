@@ -140,6 +140,9 @@ impl ThreadAudioPort for DesktopThreadAudioPort {
             .expect("native captures poisoned")
             .insert(Self::key(&request), slot.clone());
         let client = self.client.clone();
+        // Session-owned startup deadline, independent of global model readiness.
+        // GPUI timer + oneshot suspend this future without blocking a UI thread.
+        let executor = cx.background_executor().clone();
         cx.background_spawn(async move {
             if slot.cancelled.load(Ordering::Acquire) {
                 return Ok(ThreadAudioCompletion::Cancelled);
@@ -164,12 +167,34 @@ impl ThreadAudioPort for DesktopThreadAudioPort {
             let mut flow = DesktopVoiceCaptureFlow::new(PlatformDesktopAudioInputBackend, gateway);
             flow.start(&gate, DesktopVoiceCaptureConfig::default(), context)
                 .map_err(capture_error)?;
-            if client
-                .composer_operation_plan(&request.plan().identity)
-                .is_none()
-                || !slot.keep(flow)
-            {
+            let session_id = flow
+                .session_id()
+                .expect("started capture session")
+                .to_owned();
+            let ready = flow.take_readiness().expect("started capture readiness");
+            if !slot.keep(flow) {
                 return Ok(ThreadAudioCompletion::Cancelled);
+            }
+            let result =
+                wait_for_first_audio(ready, executor.timer(std::time::Duration::from_secs(5)))
+                    .await;
+            if slot.cancelled.load(Ordering::Acquire)
+                || (result.is_ok()
+                    && !client
+                        .composer_voice_session_matches(&request.plan().identity, &session_id))
+            {
+                slot.cancel();
+                return Ok(ThreadAudioCompletion::Cancelled);
+            }
+            if let Err(error) = result {
+                client.complete_composer_operation(
+                    request.plan().identity.clone(),
+                    pioneer_client::composer::store::ComposerOperationCompletion::Failed {
+                        message: error.composer_message().into(),
+                    },
+                );
+                slot.cancel();
+                return Err(capture_error(error));
             }
             Ok(ThreadAudioCompletion::CaptureReady)
         })
@@ -188,6 +213,9 @@ impl ThreadAudioPort for DesktopThreadAudioPort {
         let Some(mut flow) = slot.take() else {
             return Ok(ThreadAudioCompletion::Cancelled);
         };
+        // This UI-facing method fences/pauses native capture only. The FIFO
+        // keeps draining on its own worker; finalize_capture owns its join and
+        // tail-delivery barrier after composer preparation.
         flow.stop_recording().map_err(capture_error)?;
         Ok(if slot.keep(flow) {
             ThreadAudioCompletion::RecordingStopped
@@ -250,6 +278,19 @@ impl ThreadAudioPort for DesktopThreadAudioPort {
     }
 }
 
+async fn wait_for_first_audio(
+    ready: super::capture::CaptureReadiness,
+    deadline: impl std::future::Future<Output = ()>,
+) -> Result<(), DesktopVoiceCaptureError> {
+    match futures_util::future::select(Box::pin(ready), Box::pin(deadline)).await {
+        futures_util::future::Either::Left((Ok(result), _)) => result,
+        _ => Err(DesktopVoiceCaptureError::new(
+            DesktopVoiceCaptureErrorKind::DeviceInterrupted,
+            t!("chat.composer.voice.microphone_not_ready").to_string(),
+        )),
+    }
+}
+
 fn capture_error(error: DesktopVoiceCaptureError) -> ThreadAudioError {
     use DesktopVoiceCaptureErrorKind as Native;
     use ThreadAudioErrorKind as Port;
@@ -270,6 +311,19 @@ fn capture_error(error: DesktopVoiceCaptureError) -> ThreadAudioError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn missing_first_audio_expires_and_rejects_late_readiness() {
+        let (ready, received) = tokio::sync::oneshot::channel();
+        let error = wait_for_first_audio(received, std::future::ready(()))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, DesktopVoiceCaptureErrorKind::DeviceInterrupted);
+        assert!(
+            ready.send(Ok(())).is_err(),
+            "expired operation cannot become ready"
+        );
+    }
+
     #[test]
     fn retiring_a_mount_cancels_pending_callbacks_without_retiring_other_mounts() {
         let slots = CaptureSlots::default();

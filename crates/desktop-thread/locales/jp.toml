@@ -358,3 +358,4 @@
 "plugins.select" = "プラグインを選択"
 "plugins.unavailable" = "利用不可"
 "plugins.updating" = "更新中…"
+"chat.composer.preparing_send" = "メッセージを準備中"

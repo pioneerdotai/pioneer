@@ -473,6 +473,18 @@ mod tests {
             .collect::<Vec<_>>();
             let native_count = definitions.len();
             let projection = projection.with_native_tools(definitions, limits).unwrap();
+            assert!(
+                projection
+                    .tools
+                    .iter()
+                    .any(|tool| tool.canonical_callable_name == "html_preview")
+            );
+            assert!(
+                projection
+                    .tools
+                    .iter()
+                    .any(|tool| tool.canonical_callable_name == "html_render")
+            );
             assert_eq!(projection.native_tool_count(), native_count);
             let budget =
                 crate::cli_runtime::mcp::limits::CliMcpFacadeProjectionLimits::transport_bounded(

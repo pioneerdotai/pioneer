@@ -25,6 +25,19 @@ impl crate::rpc::JsonRpcRequestTransport for GatewayWsCommandSender {
         if let Some(transport) = self.test_requests.lock().unwrap().clone() {
             return transport.send_json_rpc_request(request_id, payload, response_tx);
         }
+        if is_turn_cancel(&payload) {
+            let Some(receipt) = self.socket.lock().unwrap().clone() else {
+                let message = "websocket Cancel socket unavailable";
+                let _ = response_tx.send(Err(crate::rpc::JsonRpcResponseError::transport(message)));
+                return Err(message.into());
+            };
+            if self.connection_generations.lock().unwrap().active != Some(receipt.scope.connection)
+            {
+                response_tx.cancel();
+                return Err("websocket Cancel route retired".into());
+            }
+            return receipt.admit_cancel(request_id, payload, response_tx);
+        }
         self.command_tx
             .send(GatewayWsCommand::Request {
                 expected_connection: None,
@@ -218,22 +231,25 @@ impl GatewayWsCommandSender {
             "connection renewal retired"
         );
         let access = http_access_from_spec(&spec, connection_id);
+        let deadline = std::time::Instant::now() + crate::rpc::RPC_REQUEST_TIMEOUT;
         let (response_tx, response_rx) = mpsc::channel();
+        let response_tx = crate::rpc::JsonRpcResponseSender::new(response_tx, deadline);
+        let _request_guard = response_tx.retire_on_drop();
         self.command_tx
             .send(GatewayWsCommand::RenewAccess {
                 connection_id,
                 spec,
                 refresh_generation,
-                deadline: tokio::time::Instant::now() + crate::rpc::RPC_REQUEST_TIMEOUT,
+                deadline: deadline.into(),
                 response_tx,
             })
             .map_err(|_| anyhow!("websocket worker is not available"))?;
         let _wait = pioneer_observability::live::WaitGuard::with_timeout(
             pioneer_observability::live::WaitKind::Reply,
-            crate::rpc::RPC_REQUEST_TIMEOUT + Duration::from_secs(1),
+            deadline.saturating_duration_since(std::time::Instant::now()),
         );
         response_rx
-            .recv_timeout(crate::rpc::RPC_REQUEST_TIMEOUT + Duration::from_secs(1))
+            .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
             .map_err(|_| anyhow!("connection renewal unavailable"))?
             .map_err(anyhow::Error::new)?;
         let generations = self
@@ -260,11 +276,24 @@ impl GatewayWsCommandSender {
     }
 
     pub fn shutdown(&self) -> Result<()> {
-        *self
-            .connection_generations
-            .lock()
-            .map_err(|_| anyhow!("Gateway connection owner poisoned"))? =
-            GatewayConnectionGenerations::default();
+        {
+            // Cancel bypasses queued lifecycle commands. Fence the current
+            // physical socket while route admission is locked; a socket published
+            // after this gate cannot admit a Cancel under the retired route.
+            let mut generations = self
+                .connection_generations
+                .lock()
+                .map_err(|_| anyhow!("Gateway connection owner poisoned"))?;
+            *generations = GatewayConnectionGenerations::default();
+            if let Some(receipt) = self.socket.lock().unwrap().as_ref() {
+                receipt.retire();
+            }
+        }
+        #[cfg(test)]
+        {
+            let owner = self.test_cancels.lock().unwrap().take();
+            drop(owner);
+        }
         self.replace_http_session_access(None)?;
         self.command_tx
             .send(GatewayWsCommand::Shutdown)
@@ -279,6 +308,14 @@ impl GatewayWsCommandSender {
                 .map_err(|_| anyhow!("Gateway connection owner poisoned"))?;
             generations.retiring = generations.active.take();
             generations.pending = None;
+            if let Some(receipt) = self.socket.lock().unwrap().as_ref() {
+                receipt.retire();
+            }
+        }
+        #[cfg(test)]
+        {
+            let owner = self.test_cancels.lock().unwrap().take();
+            drop(owner);
         }
         self.replace_http_session_access(None)?;
         self.command_tx
@@ -288,6 +325,8 @@ impl GatewayWsCommandSender {
 
     /// Retire only the named connection, preserving a newer active or pending attempt.
     pub(crate) fn disconnect_connection(&self, connection_id: u64) -> Result<()> {
+        #[cfg(test)]
+        let mut test_owner = None;
         let mut generations = self
             .connection_generations
             .lock()
@@ -297,6 +336,19 @@ impl GatewayWsCommandSender {
         }
         if generations.pending == Some(connection_id) {
             generations.pending = None;
+        }
+        if let Some(receipt) = self
+            .socket
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|receipt| receipt.scope.connection == connection_id)
+        {
+            receipt.retire();
+            #[cfg(test)]
+            {
+                test_owner = self.test_cancels.lock().unwrap().take();
+            }
         }
         {
             let mut access = self
@@ -310,9 +362,14 @@ impl GatewayWsCommandSender {
                 *access = None;
             }
         }
-        self.command_tx
+        let sent = self
+            .command_tx
             .send(GatewayWsCommand::DisconnectConnection { connection_id })
-            .map_err(|_| anyhow!("websocket worker is not available"))
+            .map_err(|_| anyhow!("websocket worker is not available"));
+        drop(generations);
+        #[cfg(test)]
+        drop(test_owner);
+        sent
     }
 
     pub fn current_gateway_http_access(
@@ -1060,32 +1117,61 @@ impl GatewayWsCommandSender {
         offset: u64,
         chunk: Vec<u8>,
     ) -> Result<ArtifactUploadChunkAckNotification> {
+        self.artifact_chunk(None, None, None, workspace_id, upload_id, offset, chunk)
+    }
+
+    fn artifact_chunk(
+        &self,
+        receipt: Option<&SocketReceipt>,
+        subscription: Option<&Arc<Mutex<bool>>>,
+        budget: Option<&crate::rpc::RequestBudget>,
+        workspace_id: String,
+        upload_id: String,
+        offset: u64,
+        chunk: Vec<u8>,
+    ) -> Result<ArtifactUploadChunkAckNotification> {
+        let deadline = std::time::Instant::now() + UPLOAD_CHUNK_ACK_TIMEOUT;
         let payload = crate::transport::ws::frames::encode_artifact_upload_chunk_frame(
             workspace_id,
             upload_id.clone(),
             offset,
-            chunk.as_slice(),
+            &chunk,
         )?;
-
         let (response_tx, response_rx) = mpsc::channel();
+        let response = crate::rpc::JsonRpcResponseSender::new(response_tx, deadline);
+        let _guard = response.retire_on_drop();
+        if let Some(budget) = budget {
+            budget.register(&response)?;
+        }
+        if let Some(receipt) = receipt {
+            anyhow::ensure!(receipt.is_current(), "artifact upload socket retired");
+            receipt.bind_request(&response);
+        }
+        if let Some(subscription) = subscription {
+            response.bind_subscription(subscription.clone());
+        }
+        anyhow::ensure!(response.is_active(), "artifact upload request retired");
         self.command_tx
             .send(GatewayWsCommand::ArtifactBinaryUploadChunk {
+                expected_connection: receipt.map(|receipt| receipt.scope.connection),
                 upload_id,
                 offset,
                 payload,
-                response_tx,
+                response_tx: response.clone(),
             })
             .map_err(|_| anyhow!("websocket worker is not available"))?;
-
+        let remaining = response
+            .deadline()
+            .saturating_duration_since(std::time::Instant::now());
+        drop(response);
         let _wait = pioneer_observability::live::WaitGuard::with_timeout(
             pioneer_observability::live::WaitKind::Reply,
-            UPLOAD_CHUNK_ACK_TIMEOUT,
+            remaining,
         );
         let response = response_rx
-            .recv_timeout(UPLOAD_CHUNK_ACK_TIMEOUT)
-            .map_err(|_| anyhow!("timed out waiting for artifact upload chunk ack"))?;
-
-        response.map_err(anyhow::Error::msg)
+            .recv_timeout(remaining)
+            .map_err(|_| anyhow!("timed out waiting for artifact upload chunk ack"))??;
+        crate::rpc::deserialize_json_rpc_result("artifact upload chunk ack", response)
     }
 
     pub(crate) fn send_voice_audio_chunk_for_connection(
@@ -1106,6 +1192,7 @@ impl GatewayWsCommandSender {
             duration_ms,
             &pcm_chunk,
         )?;
+        let payload = self.voice_budget.admit(payload)?;
         self.command_tx
             .send(GatewayWsCommand::VoiceBinaryChunk {
                 expected_connection: Some(connection),
@@ -1131,7 +1218,7 @@ impl GatewayWsCommandSender {
             duration_ms,
             pcm_chunk.as_slice(),
         )?;
-
+        let payload = self.voice_budget.admit(payload)?;
         self.command_tx
             .send(GatewayWsCommand::VoiceBinaryChunk {
                 expected_connection: None,
@@ -1264,6 +1351,57 @@ fn http_access_from_spec(
 #[cfg(test)]
 mod connection_generation_tests {
     use super::*;
+    #[tokio::test]
+    async fn typed_turn_cancel_uses_exact_socket_admission_for_bound_and_unbound_callers() {
+        for bound in [false, true] {
+            let client = GatewayWsClient::new();
+            let sender = client.command_sender();
+            let (receipt, mut owner) = SocketReceipt::new(7);
+            *sender.socket.lock().unwrap() = Some(receipt.clone());
+            sender.connection_generations.lock().unwrap().active = Some(7);
+            let transport: Box<dyn crate::rpc::JsonRpcRequestTransport + Send + Sync> = if bound {
+                Box::new(sender.requests_for_connection(7))
+            } else {
+                Box::new(sender)
+            };
+            let typed = pioneer_observability::work::spawn_blocking(move || {
+                client_ws_commands::turn_cancel(
+                    transport.as_ref(),
+                    TurnCancelParams {
+                        thread_id: "exact-thread".into(),
+                        turn_id: "exact-turn".into(),
+                        reason: Some("stop".into()),
+                    },
+                )
+            });
+            let request = tokio::time::timeout(Duration::from_secs(3), owner.receiver.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let value: pioneer_protocol::JsonRpcRequest =
+                serde_json::from_str(&request.payload).unwrap();
+            assert_eq!(
+                value.method,
+                pioneer_protocol::constants::methods::TURN_CANCEL
+            );
+            assert_eq!(value.id.as_str(), request.request_id);
+            assert_eq!(value.params.unwrap()["turn_id"], "exact-turn");
+            let retained = request.response.clone();
+            request
+                .response
+                .send(Err(crate::rpc::JsonRpcResponseError::server(
+                    Some(-32004),
+                    "not found",
+                    None,
+                )))
+                .unwrap();
+            assert!(typed.await.unwrap().is_err());
+            assert!(!retained.is_active());
+            drop(owner);
+            assert!(!receipt.is_current());
+        }
+    }
+
     fn event(id: u64) -> GatewayWsEvent {
         GatewayWsEvent::Connecting {
             connection_id: id,
@@ -1272,6 +1410,310 @@ mod connection_generation_tests {
             endpoint_kind: crate::gateway::types::GatewayEndpointKind::Remote,
         }
     }
+    #[test]
+    #[ignore = "opens a real listener; excluded from the hermetic test suite"]
+    fn automatic_reconnect_rejects_old_receipt_after_drain_during_backoff() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let (close, closed) = mpsc::channel();
+        let (permit_second, permitted) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            tokio::runtime::Runtime::new().unwrap().block_on(async move {
+                let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut first = tokio_tungstenite::accept_async(stream).await.unwrap();
+                pioneer_observability::work::spawn_blocking(move || closed.recv_timeout(Duration::from_secs(5)).unwrap()).await.unwrap();
+                first.close(None).await.unwrap();
+                drop(first);
+                let (stream, _) = listener.accept().await.unwrap();
+                pioneer_observability::work::spawn_blocking(move || permitted.recv_timeout(Duration::from_secs(5)).unwrap()).await.unwrap();
+                let mut second = tokio_tungstenite::accept_async(stream).await.unwrap();
+                loop {
+                    match tokio::time::timeout(Duration::from_secs(5), second.next()).await.unwrap().unwrap().unwrap() {
+                        Message::Text(text) => {
+                            let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+                            assert_eq!(value["method"], "synthetic/current-marker", "old receipt must never reach replacement socket");
+                            second.send(Message::Text(serde_json::json!({"jsonrpc":"2.0", "id":value["id"], "result":true}).to_string().into())).await.unwrap();
+                            break;
+                        }
+                        Message::Ping(payload) => second.send(Message::Pong(payload)).await.unwrap(),
+                        _ => {}
+                    }
+                }
+            });
+        });
+        let client = GatewayWsClient::new();
+        let sender = client.command_sender();
+        let connection = sender
+            .connect_and_wait(GatewayWsConnectSpec {
+                endpoint_id: "scope-regression".into(),
+                endpoint_name: "Scope regression".into(),
+                endpoint_kind: crate::gateway::types::GatewayEndpointKind::Local,
+                gateway_base_url: crate::gateway::endpoint::GatewayBaseUrl::parse_presentation(
+                    &format!("http://{address}"),
+                )
+                .unwrap(),
+                auth_token: None,
+                session: None,
+                timings: crate::gateway::timings::GatewayWsTimings::from_millis(
+                    2_000, 10_000, 20_000, 400, 400, 0,
+                )
+                .unwrap(),
+            })
+            .unwrap();
+        let old = sender.requests_for_connection(connection);
+        assert!(old.is_current());
+        close.send(()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        // No core dispatcher consumes these transport events. Its disconnect
+        // state can therefore lag the monitor throughout this regression.
+        loop {
+            if client
+                .drain_events()
+                .iter()
+                .any(|event| matches!(&event.value, GatewayWsEvent::Disconnected { .. }))
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "old monitor must stop"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(!old.is_current());
+        let missing = sender.requests_for_connection(connection);
+        assert!(!missing.is_current(), "backoff has no live socket");
+        let request =
+            crate::rpc::build_json_rpc_request_payload("synthetic/stale", serde_json::Value::Null)
+                .unwrap();
+        let (tx, rx) = mpsc::channel();
+        let response = crate::rpc::JsonRpcResponseSender::new(
+            tx,
+            std::time::Instant::now() + crate::rpc::RPC_REQUEST_TIMEOUT,
+        );
+        old.receipt.as_ref().unwrap().bind_request(&response);
+        sender
+            .command_tx
+            .send(GatewayWsCommand::Request {
+                expected_connection: Some(connection),
+                request_id: request.request_id,
+                payload: request.payload,
+                response_tx: response,
+            })
+            .unwrap();
+        assert!(rx.recv_timeout(Duration::from_secs(1)).unwrap().is_err());
+        permit_second.send(()).unwrap();
+        let current = loop {
+            let current = sender.requests_for_connection(connection);
+            if current.is_current() {
+                break current;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "replacement socket must connect"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        assert_ne!(old.scope(), current.scope());
+        assert!(
+            !missing.is_current(),
+            "a missing capture must not rebind on reconnect"
+        );
+        assert_eq!(
+            crate::rpc::send_json_rpc_request_value(
+                &current,
+                "synthetic/current-marker",
+                serde_json::Value::Null,
+                crate::rpc::RPC_REQUEST_TIMEOUT
+            )
+            .unwrap(),
+            serde_json::json!(true)
+        );
+        sender.shutdown().unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn bound_transport_never_rebinds_missing_or_retired_socket_even_with_fixture_transport() {
+        struct Reply;
+        impl crate::rpc::JsonRpcRequestTransport for Reply {
+            fn send_json_rpc_request(
+                &self,
+                _: String,
+                _: String,
+                response: crate::rpc::JsonRpcResponseSender,
+            ) -> std::result::Result<(), String> {
+                response.send(Ok(serde_json::Value::Null)).unwrap();
+                Ok(())
+            }
+        }
+        let client = GatewayWsClient::new();
+        let sender = client.command_sender();
+        *sender.test_requests.lock().unwrap() = Some(Arc::new(Reply));
+        let missing = sender.requests_for_connection(7);
+        let (first, _first_cancels) = SocketReceipt::new(7);
+        *sender.socket.lock().unwrap() = Some(first.clone());
+        let old = sender.requests_for_connection(7);
+        let call = |transport: &ConnectionRequestTransport| {
+            crate::rpc::send_json_rpc_request_value(
+                transport,
+                "synthetic/bound",
+                serde_json::Value::Null,
+                crate::rpc::RPC_REQUEST_TIMEOUT,
+            )
+        };
+        assert!(
+            call(&missing).is_err(),
+            "capturing without a socket must fail closed forever"
+        );
+        assert!(call(&old).is_ok());
+        let subscription = Arc::new(Mutex::new(true));
+        let scoped = old.with_subscription_scope(subscription.clone());
+        assert!(call(&scoped).is_ok());
+        *subscription.lock().unwrap() = false;
+        assert!(!scoped.is_current());
+        assert!(
+            call(&scoped).is_err(),
+            "fixture cannot bypass same-socket subscription retirement"
+        );
+        let retry = scoped.with_subscription_scope(Arc::new(Mutex::new(true)));
+        assert_eq!(
+            retry.scope(),
+            scoped.scope(),
+            "retry retains captured physical socket"
+        );
+        assert!(call(&retry).is_ok());
+        assert!(
+            !scoped.is_current(),
+            "replacing retry proof cannot revive old receipt"
+        );
+        first.retire();
+        assert!(
+            !retry.is_current(),
+            "new subscription cannot revive physical socket"
+        );
+        let (new_socket, _new_cancels) = SocketReceipt::new(7);
+        *sender.socket.lock().unwrap() = Some(new_socket);
+        let current = sender.requests_for_connection(7);
+        assert_ne!(old.scope(), current.scope());
+        assert!(
+            call(&old).is_err(),
+            "fixture must not bypass physical scope admission"
+        );
+        assert!(call(&current).is_ok());
+    }
+
+    #[test]
+    fn cancelled_send_allows_upload_abort_only_within_original_deadline_and_live_scope() {
+        struct AbortReply {
+            original: crate::rpc::RequestBudget,
+            calls: std::sync::atomic::AtomicUsize,
+            pending: Mutex<crate::rpc::PendingJsonRpcRequests>,
+        }
+        impl crate::rpc::JsonRpcRequestTransport for AbortReply {
+            fn send_json_rpc_request(
+                &self,
+                request_id: String,
+                payload: String,
+                response: crate::rpc::JsonRpcResponseSender,
+            ) -> std::result::Result<(), String> {
+                let request: pioneer_protocol::JsonRpcRequest =
+                    serde_json::from_str(&payload).unwrap();
+                assert_eq!(request.method, "artifact/upload/abort");
+                assert_eq!(
+                    request.params,
+                    Some(serde_json::json!({
+                        "workspace_id": "workspace", "upload_id": "exact-upload",
+                    }))
+                );
+                assert_eq!(
+                    response.deadline(),
+                    self.original.deadline(),
+                    "cleanup cannot extend the operation"
+                );
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.pending
+                    .lock()
+                    .unwrap()
+                    .insert(request_id, response.clone());
+                // Cancellation after cleanup admission still belongs to Send;
+                // cleanup uses its own canonical response/write lifetime.
+                self.original.cancel();
+                assert!(response.try_start_write());
+                response
+                    .send(Ok(serde_json::json!({
+                        "upload_id": "exact-upload", "status": "aborted",
+                    })))
+                    .unwrap();
+                assert!(self.pending.lock().unwrap().is_empty());
+                Ok(())
+            }
+        }
+        let client = GatewayWsClient::new();
+        let sender = client.command_sender();
+        let (socket, _cancels) = SocketReceipt::new(7);
+        *sender.socket.lock().unwrap() = Some(socket.clone());
+        let subscription = Arc::new(Mutex::new(true));
+        let captured = sender
+            .requests_for_connection(7)
+            .with_subscription_scope(subscription.clone());
+        let original =
+            crate::rpc::RequestBudget::new(std::time::Instant::now() + Duration::from_secs(5));
+        let reply = Arc::new(AbortReply {
+            original: original.clone(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            pending: Mutex::default(),
+        });
+        *sender.test_requests.lock().unwrap() = Some(reply.clone());
+        let params = || ArtifactUploadAbortParams {
+            workspace_id: "workspace".into(),
+            upload_id: "exact-upload".into(),
+        };
+        original.cancel();
+        let transport = original.bind(captured.clone());
+        let response = transport
+            .artifact_upload_abort(params())
+            .expect("exact cleanup survives individual cancel");
+        assert_eq!(response.upload_id, "exact-upload");
+        assert_eq!(response.status, "aborted");
+        assert!(original.check().is_err(), "cleanup cannot revive Send");
+
+        let expired = crate::rpc::RequestBudget::new(std::time::Instant::now());
+        expired.cancel();
+        assert!(
+            expired
+                .bind(captured)
+                .artifact_upload_abort(params())
+                .is_err()
+        );
+        *subscription.lock().unwrap() = false;
+        assert!(
+            transport.artifact_upload_abort(params()).is_err(),
+            "cleanup cannot reuse revoked subscription"
+        );
+        let next_subscription = transport
+            .transport
+            .with_subscription_scope(Arc::new(Mutex::new(true)));
+        socket.retire();
+        assert!(
+            original
+                .bind(next_subscription)
+                .artifact_upload_abort(params())
+                .is_err(),
+            "cleanup cannot reuse retired socket"
+        );
+        assert_eq!(
+            reply.calls.load(Ordering::SeqCst),
+            1,
+            "denied cleanup never reaches the reply port"
+        );
+        assert!(reply.pending.lock().unwrap().is_empty());
+    }
+
     #[test]
     fn typed_ingress_reduces_owned_settings_once_and_routes_only_unported_features() {
         use crate::core::{ClientCore, ClientScope};
@@ -1428,9 +1870,32 @@ mod connection_generation_tests {
 }
 
 // Connection-bound commands are rejected by the worker after a route replacement.
+#[derive(Clone)]
 pub(crate) struct ConnectionRequestTransport {
     sender: GatewayWsCommandSender,
     connection: u64,
+    receipt: Option<SocketReceipt>,
+    subscription_live: Option<Arc<Mutex<bool>>>,
+}
+impl ConnectionRequestTransport {
+    pub(crate) fn scope(&self) -> Option<ConnectionScope> {
+        self.receipt.as_ref().map(|receipt| receipt.scope)
+    }
+    pub(crate) fn is_current(&self) -> bool {
+        self.receipt.as_ref().is_some_and(SocketReceipt::is_current)
+            && self
+                .subscription_live
+                .as_ref()
+                .is_none_or(|live| *live.lock().unwrap())
+    }
+
+    /// Keep the captured socket, replacing only the subscription proof on retry.
+    pub(crate) fn with_subscription_scope(&self, live: Arc<Mutex<bool>>) -> Self {
+        Self {
+            subscription_live: Some(live),
+            ..self.clone()
+        }
+    }
 }
 impl crate::rpc::JsonRpcRequestTransport for ConnectionRequestTransport {
     fn send_json_rpc_request(
@@ -1439,9 +1904,34 @@ impl crate::rpc::JsonRpcRequestTransport for ConnectionRequestTransport {
         payload: String,
         response_tx: crate::rpc::JsonRpcResponseSender,
     ) -> std::result::Result<(), String> {
+        if !self.is_current() {
+            return Err("websocket request socket retired".into());
+        }
+        self.receipt
+            .as_ref()
+            .expect("current socket")
+            .bind_request(&response_tx);
+        if let Some(live) = &self.subscription_live {
+            response_tx.bind_subscription(live.clone());
+        }
+        if !response_tx.is_active() {
+            response_tx.cancel();
+            return Err("websocket request retired".into());
+        }
         #[cfg(test)]
         if let Some(transport) = self.sender.test_requests.lock().unwrap().clone() {
             return transport.send_json_rpc_request(request_id, payload, response_tx);
+        }
+        if is_turn_cancel(&payload) {
+            if self.sender.connection_generations.lock().unwrap().active != Some(self.connection) {
+                response_tx.cancel();
+                return Err("websocket Cancel route retired".into());
+            }
+            return self.receipt.as_ref().expect("current socket").admit_cancel(
+                request_id,
+                payload,
+                response_tx,
+            );
         }
         self.sender
             .command_tx
@@ -1455,13 +1945,73 @@ impl crate::rpc::JsonRpcRequestTransport for ConnectionRequestTransport {
     }
 }
 impl GatewayWsCommandSender {
-    pub(crate) fn requests_for_connection(
-        &self,
-        connection: u64,
-    ) -> impl crate::rpc::JsonRpcRequestTransport + use<> {
+    pub(crate) fn requests_for_connection(&self, connection: u64) -> ConnectionRequestTransport {
         ConnectionRequestTransport {
             sender: self.clone(),
             connection,
+            subscription_live: None,
+            receipt: self
+                .socket
+                .lock()
+                .unwrap()
+                .as_ref()
+                .filter(|receipt| receipt.scope.connection == connection && receipt.is_current())
+                .cloned(),
         }
+    }
+}
+
+impl ArtifactUploadTransport for crate::rpc::BudgetedTransport<ConnectionRequestTransport> {
+    fn artifact_upload_start(
+        &self,
+        params: ArtifactUploadStartParams,
+    ) -> Result<ArtifactUploadStartResponse> {
+        client_ws_commands::artifact_upload_start(self, params)
+    }
+    fn artifact_upload_finish(
+        &self,
+        params: ArtifactUploadFinishParams,
+    ) -> Result<ArtifactUploadFinishResponse> {
+        client_ws_commands::artifact_upload_finish(self, params)
+    }
+    fn artifact_upload_abort(
+        &self,
+        params: ArtifactUploadAbortParams,
+    ) -> Result<ArtifactUploadAbortResponse> {
+        // Exact-upload cleanup survives Send cancellation, within the same
+        // absolute deadline and captured subscription/socket scope.
+        let cleanup = crate::rpc::RequestBudget::new(self.budget.deadline());
+        client_ws_commands::artifact_upload_abort(&cleanup.bind(self.transport.clone()), params)
+    }
+    fn send_artifact_upload_chunk(
+        &self,
+        workspace_id: String,
+        upload_id: String,
+        offset: u64,
+        chunk: Vec<u8>,
+    ) -> Result<ArtifactUploadChunkAckNotification> {
+        anyhow::ensure!(
+            self.transport.is_current(),
+            "artifact upload socket retired"
+        );
+        self.transport.sender.artifact_chunk(
+            self.transport.receipt.as_ref(),
+            self.transport.subscription_live.as_ref(),
+            Some(&self.budget),
+            workspace_id,
+            upload_id,
+            offset,
+            chunk,
+        )
+    }
+}
+impl client_composer_turn_prepare::ComposerTurnPrepareTransport
+    for crate::rpc::BudgetedTransport<ConnectionRequestTransport>
+{
+    fn artifact_capabilities(
+        &self,
+        params: ArtifactCapabilitiesParams,
+    ) -> Result<ArtifactCapabilitiesResponse> {
+        client_ws_commands::artifact_capabilities(self, params)
     }
 }

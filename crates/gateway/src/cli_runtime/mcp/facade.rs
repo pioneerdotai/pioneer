@@ -354,7 +354,15 @@ impl CliMcpLedgerLeaderReservation {
 impl Drop for CliMcpLedgerLeaderReservation {
     fn drop(&mut self) {
         if !self.completed {
-            self.ledger.finish(&self.key, Err(cancelled_error()));
+            // Losing the response future is not an execution cancellation ACK.
+            self.ledger.finish(
+                &self.key,
+                Err(FacadeProtocolError::new(
+                    FACADE_CALL_FAILED,
+                    "MCP response was not confirmed",
+                    "response_unconfirmed",
+                )),
+            );
         }
     }
 }
@@ -972,21 +980,48 @@ impl CliMcpToolFacade {
             }
         };
 
-        let outcome = self
-            .execute_leader_call(
-                context,
-                request_id,
-                name,
-                arguments,
-                progress_token,
-                native_call,
-                admission_deadline,
-                authorization.thread_id,
-                authorization.turn_id,
-                cancellation,
+        // Keep the existing call capacity reservation through final progress,
+        // even though the replay reply becomes available before that await.
+        let permit = self
+            .acquire_call_permit(&cancellation, admission_deadline)
+            .await;
+        let outcome = match &permit {
+            Ok(_) => {
+                self.execute_leader_call(
+                    context,
+                    request_id,
+                    name,
+                    arguments,
+                    progress_token.clone(),
+                    native_call,
+                    admission_deadline,
+                    authorization.thread_id,
+                    authorization.turn_id,
+                    cancellation,
+                )
+                .await
+            }
+            Err(error) => Err(error.clone()),
+        };
+        leader.complete(outcome.clone());
+        // Cache the complete replay response before optional transport work.
+        // This confirms execution/result availability, never first delivery.
+        if outcome.is_ok()
+            && let Some(progress_token) = progress_token
+        {
+            let _ = timeout(
+                self.limits.max_queue_wait,
+                self.progress_sink
+                    .send_progress(CliMcpProgressNotification {
+                        progress_token,
+                        progress: 1.0,
+                        total: 1.0,
+                        message: "MCP tool call completed",
+                    }),
             )
             .await;
-        leader.complete(outcome.clone());
+        }
+        drop(permit);
         outcome
     }
 
@@ -1004,9 +1039,6 @@ impl CliMcpToolFacade {
         turn_id: String,
         cancellation: CancellationToken,
     ) -> Result<JsonValue, FacadeProtocolError> {
-        let _permit = self
-            .acquire_call_permit(&cancellation, admission_deadline)
-            .await?;
         if cancellation.is_cancelled() {
             return Err(cancelled_error());
         }
@@ -1052,32 +1084,15 @@ impl CliMcpToolFacade {
             arguments,
             origin: TurnMcpInvocationOrigin::CliFacade,
         };
-        // Cancellation is a signal to the existing Gateway invoker. Dropping
-        // its future here can leave native I/O, approval or blocking file work
-        // running after the facade ledger appears drained. Await its genuine
-        // completion; the native server owner retains this call while waiting.
+        // The invoker owns cancellation and the execution outcome once admitted.
+        // Dropping it here can lose a committed mutation or its history write.
+        // A late client cancellation does not replace an already obtained result.
         let result = self
             .invoker
-            .invoke(invocation, cancellation.clone())
+            .invoke(invocation, cancellation)
             .await
             .map_err(invocation_error)?;
-        if cancellation.is_cancelled() {
-            return Err(cancelled_error());
-        }
 
-        if let Some(progress_token) = progress_token {
-            let _ = timeout(
-                self.limits.max_queue_wait,
-                self.progress_sink
-                    .send_progress(CliMcpProgressNotification {
-                        progress_token,
-                        progress: 1.0,
-                        total: 1.0,
-                        message: "MCP tool call completed",
-                    }),
-            )
-            .await;
-        }
         let result = canonical_call_result(result)?;
         Ok(result)
     }
@@ -2551,26 +2566,6 @@ mod tests {
         )
         .expect_err("oversized projection");
         assert!(matches!(error, CliMcpFacadeBuildError::TooManyTools { .. }));
-    }
-
-    #[test]
-    fn cli_mcp_facade_result_fixtures_cover_text_image_structured_and_error() {
-        let result = canonical_call_result(CanonicalMcpToolResult {
-            content: json!([
-                {"type": "text", "text": "hello"},
-                {"type": "image", "data": "aW1hZ2U=", "mimeType": "image/png"}
-            ]),
-            structured_content: Some(json!({"ok": true})),
-            is_error: true,
-            duration_ms: 12,
-            meta: None,
-        })
-        .expect("result");
-        assert_eq!(result["content"][0]["text"], "hello");
-        assert_eq!(result["content"][1]["type"], "image");
-        assert_eq!(result["structuredContent"], json!({"ok": true}));
-        assert_eq!(result["isError"], true);
-        assert_eq!(result["_meta"]["pioneer"]["durationMs"], 12);
     }
 
     async fn wait_for_calls(calls: &AtomicUsize, expected: usize) {

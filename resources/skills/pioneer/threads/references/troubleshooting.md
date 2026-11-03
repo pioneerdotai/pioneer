@@ -14,6 +14,8 @@ Keep history, list, children, search, model/options, and result-reader cursors s
 
 Source edits/deletion, changed authorization, or stale authenticated tokens can invalidate continuation. Restart the relevant read within current access when appropriate. Do not splice text from different source versions or claim an uninterrupted complete read after invalidation.
 
+For `threads_list`, unrelated metadata/activity does not invalidate continuation, and deleting a completed candidate does not require finding that row again. New threads before the creation-time position appear when starting a fresh list. A fragmented card remains tied to its own source and version. Native and CLI reads preserve these safe reasons: `invalid or incompatible cursor; restart reading with the same resource and parameters`, `cursor is stale; restart reading from the first page`, `invalid read parameters` (or the explicit limit range), and `source unavailable or access denied`. Restart incompatible/old-format cursors or changed-source fragments when appropriate; do not infer whether an unavailable source exists. JSON-RPC protocol errors remain protocol errors.
+
 ## Incomplete Search Coverage Or Missing Index
 
 Inspect `coverageIncomplete` and `warnings`. Index/semantic unavailability can reduce coverage; unindexed history remains history. Empty matches do not prove absence. Use an accessible known source or threads_list plus selective history reading when the user's request requires it. Do not describe nextCursor as scanning leftover files, impose an artificial corpus limit, or claim a fixed ANN order.
@@ -27,6 +29,8 @@ A short native working-context excerpt is not the full search page. Read its sav
 ## Mutation Outcome Unknown
 
 Creation, message append, and turn start have effects. An interrupted transport or missing response does not prove failure. Preserve the existing logical call identity and use the runtime's Agent action ledger/outbox replay; inspect the recovered result before deciding whether another distinct operation is necessary. Do not invent a JSON idempotencyKey, issue fresh create/send/start merely to see if the previous one worked, or claim completion without confirmation.
+
+Recovered `threadResult` retains the committed workspace/thread/turn and Task or execution references. Open the returned thread directly, anchoring history at `turnId` when present; do not search by title or guess the newest object. Collaborative start identifies the parent admission and Task, not a speculative executing child. Follow its saved parent history for later child references. Old receipts without saved references do not acquire invented IDs on replay.
 
 `status:denied` and an authorization outcome differ from `status:failed` or an execution/runtime-integrity failure. `accepted`/`queued` acknowledge admission or queued work; they do not prove execution or a final model answer. Outcomes such as agent_route_required, agent_route_revoked, agent_route_expired, agent_destination_unavailable, agent_execution_stale, agent_action_conflict, and agent_runtime_integrity_lost should be reported according to the actual safe result. Public unavailable outcomes may intentionally combine source disappearance and access loss; do not infer hidden existence.
 

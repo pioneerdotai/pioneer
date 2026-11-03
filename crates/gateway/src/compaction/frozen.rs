@@ -661,14 +661,6 @@ fn verified_model_candidate(
             anyhow::anyhow!("frozen source no longer renders the captured model message")
         })
 }
-#[cfg(test)]
-fn verified_model_message(
-    wire_sha256: &str,
-    candidates: Vec<FrozenModelCandidate>,
-) -> Result<ChatMessage> {
-    Ok(verified_model_candidate(wire_sha256, candidates)?.model)
-}
-
 fn source(reference: &MessageSourceRef) -> SourceRef {
     SourceRef {
         scope: reference.scope.clone(),
@@ -2547,25 +2539,15 @@ async fn compose_frozen_basis_with_resolver(
     .await
 }
 
-/// An admitted ancestor is always the prefix of the child's own line. The
-/// end-of-second rule may admit a parent row dated after the child's first
-/// input within that same second; dates must not interleave those two lines.
+/// Admission bounds which ancestor sources are available; it does not grant
+/// permission to move them ahead of earlier child messages. Use original
+/// source dates across both lines, just as accepted Task execution does.
 pub(super) async fn order_conversation_history(
     store: &CrudStore,
     workspace: &str,
     messages: &mut Vec<ChatMessage>,
 ) -> Result<()> {
-    let (mut inherited, mut own): (Vec<_>, Vec<_>) =
-        std::mem::take(messages).into_iter().partition(|message| {
-            message
-                .provenance
-                .as_ref()
-                .is_some_and(|origin| origin.inherited)
-        });
-    order_history_by_creation(store, workspace, &mut own).await?;
-    inherited.extend(own);
-    *messages = inherited;
-    Ok(())
+    order_history_by_creation(store, workspace, messages).await
 }
 
 /// Order messages by the creation time of their original rows.
@@ -6258,13 +6240,41 @@ pub(crate) async fn prepare_html_preview_archive_witness(
     store: &CrudStore,
     witness: &pioneer_crud::HtmlPreviewArchiveWitness,
 ) -> Result<()> {
+    let hash = prepare_html_preview_archive_witness_hash(store, witness).await?;
+    store
+        .record_html_preview_archive_witness(witness, &hash)
+        .await
+}
+
+#[derive(Debug)]
+pub(crate) struct InvalidHtmlPreviewArchiveWitness;
+impl std::fmt::Display for InvalidHtmlPreviewArchiveWitness {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("invalid immutable HTML preview archive provenance")
+    }
+}
+impl std::error::Error for InvalidHtmlPreviewArchiveWitness {}
+
+// A deterministic observation at the actual digest boundary, compiled only
+// for tests. It does not add production observers or alter database semantics.
+#[cfg(test)]
+tokio::task_local! {
+    pub(super) static HTML_PREVIEW_HASH_CAPACITY_AUDIT: std::sync::Arc<dyn Fn() + Send + Sync>;
+}
+
+/// Prepare outside writer capacity; queue consumers publish with their claim
+/// and the authoritative source CAS in one transaction.
+pub(crate) async fn prepare_html_preview_archive_witness_hash(
+    store: &CrudStore,
+    witness: &pioneer_crud::HtmlPreviewArchiveWitness,
+) -> Result<String> {
     let reference = &witness.reference;
     ensure!(
         reference.tool_name.as_deref() == Some("html_preview")
             && reference.source_aliases.is_empty()
             && reference.ambiguous_input_aliases.is_empty()
             && !reference.protected_input,
-        "unsupported preview archive provenance"
+        InvalidHtmlPreviewArchiveWitness
     );
     // An accepted import keeps its canonical source thread while its context
     // belongs to the receiving manifest. Admit only that persisted owner, not
@@ -6278,7 +6288,8 @@ pub(crate) async fn prepare_html_preview_archive_witness(
         &witness.workspace,
         &allowed,
         &reference_metadata_provenance(&witness.workspace, reference),
-    )?;
+    )
+    .map_err(|_| InvalidHtmlPreviewArchiveWitness)?;
     let original = restore_entry(
         store,
         &witness.workspace,
@@ -6302,6 +6313,8 @@ pub(crate) async fn prepare_html_preview_archive_witness(
         anyhow::bail!("invalid preview archive");
     };
     let message: ChatMessage = serde_json::from_value(value)?;
+    #[cfg(test)]
+    let _ = HTML_PREVIEW_HASH_CAPACITY_AUDIT.try_with(|audit| audit());
     let hash = wire_digest(&message)?;
     let source = reference
         .replay_source
@@ -6311,7 +6324,8 @@ pub(crate) async fn prepare_html_preview_archive_witness(
     // Verify the other direction too: archival transformation must commute
     // with this exact retained-tool rendering. Unsupported legacy/budget forms
     // keep their media instead of leaving a hash that cannot be replayed.
-    let canonical = pioneer_crud::archive_html_preview_result(&witness.payload)?;
+    let canonical = pioneer_crud::archive_html_preview_result(&witness.payload)
+        .map_err(|_| InvalidHtmlPreviewArchiveWitness)?;
     verified_preview_diagnostic(
         store,
         &witness.workspace,
@@ -6321,9 +6335,7 @@ pub(crate) async fn prepare_html_preview_archive_witness(
         &hash,
     )
     .await?;
-    store
-        .record_html_preview_archive_witness(witness, &hash)
-        .await
+    Ok(hash)
 }
 
 async fn verified_preview_diagnostic(
@@ -6484,6 +6496,92 @@ async fn restore_entry(
             }
         }
         return Ok(restored);
+    }
+    // A prepared user projection owns both its exact context bytes and the
+    // original input references. Keep both dependencies for coverage/revision
+    // checks, but restore the bytes from the canonical projection only.
+    if reference.sources.len() > 1 {
+        let contexts = reference
+            .sources
+            .iter()
+            .filter(|source| source.scope.starts_with("context:"))
+            .collect::<Vec<_>>();
+        if let [source] = contexts.as_slice() {
+            let turn = source
+                .scope
+                .strip_prefix("context:")
+                .expect("context scope");
+            ensure!(
+                reference.sources.iter().all(|candidate| {
+                    candidate == *source || candidate.scope == format!("input:{turn}")
+                }),
+                "unsupported composite frozen projection"
+            );
+            let expected = store
+                .compaction_context_reference_for_item(
+                    workspace,
+                    &reference.source_thread,
+                    turn,
+                    "turn-input-projection",
+                    "turn_input_projection_v1",
+                )
+                .await?;
+            ensure!(
+                expected.as_ref() == Some(*source),
+                "invalid frozen input projection source"
+            );
+            ensure!(
+                store
+                    .compaction_references_current(
+                        workspace,
+                        &reference.source_thread,
+                        &reference.sources,
+                    )
+                    .await?,
+                "frozen input projection dependencies changed"
+            );
+            let payload = super::history::reference_payload(
+                store,
+                workspace,
+                &reference.source_thread,
+                source,
+            )
+            .await?;
+            let view: pioneer_tools::ToolResultView = serde_json::from_str(&payload)?;
+            let pioneer_tools::ToolResultView::Json {
+                value,
+                truncated: false,
+            } = view
+            else {
+                anyhow::bail!("incomplete frozen input projection")
+            };
+            let message: ChatMessage = serde_json::from_value(value)?;
+            ensure!(
+                message.role == pioneer_provider::Role::User
+                    && message
+                        .application_context
+                        .as_ref()
+                        .and_then(|metadata| metadata.get("kind"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some("turn_input"),
+                "invalid frozen input projection payload"
+            );
+            let restored = finish_restored_entry(
+                store,
+                workspace,
+                reference,
+                vec![FrozenModelCandidate::exact(message.clone())],
+                projection,
+                Some(Some(message)),
+            )
+            .await?;
+            if projection == FrozenRestoreProjection::Execution {
+                state
+                    .authoritative_inputs
+                    .insert((reference.source_thread.clone(), turn.to_owned()));
+            }
+            return Ok(restored);
+        }
     }
     ensure!(
         reference.sources.len() == 1,
@@ -7317,155 +7415,6 @@ mod policy_tests {
         preview.sources[0] = preview.replay_source.take().unwrap();
         assert!(!frozen_payload_batchable(&preview));
         assert_eq!(bounded_preparation_group(&[preview]).unwrap(), (0, vec![]));
-    }
-
-    #[test]
-    fn legacy_frozen_command_hash_is_verified_before_model_upgrade() {
-        let item = pioneer_protocol::TurnItem::CommandExecution {
-            id: "command".into(),
-            tool_name: "exec_command".into(),
-            arguments: serde_json::json!({"command":["true"]}),
-            status: pioneer_protocol::ToolCallStatus::Completed,
-            recovery_policy: None,
-            output_policy: pioneer_protocol::ToolOutputPolicySnapshot::for_tool_name(
-                "exec_command",
-            ),
-            display: pioneer_protocol::ToolDisplayPayload::Shell {
-                stdout: Some("frozen-unique-output".into()),
-                stderr: None,
-                aggregated_output: Some("frozen-unique-output".into()),
-                exit_code: Some(0),
-                duration_ms: None,
-                timed_out: Some(false),
-                truncated: false,
-            },
-            storage: pioneer_protocol::ToolStoragePayload::Shell {
-                stdout: Some("frozen-unique-output".into()),
-                stderr: None,
-                aggregated_output: Some("frozen-unique-output".into()),
-                exit_code: Some(0),
-                duration_ms: None,
-                timed_out: Some(false),
-                truncated: false,
-            },
-            recovery: None,
-            command: vec!["true".into()],
-            cwd: None,
-            success: Some(true),
-            outcome: None,
-            observation: None,
-        };
-        let legacy = ChatMessage::user(format!(
-            "Recorded historical event:\n{}",
-            serde_json::to_string(&item).unwrap()
-        ));
-        let current =
-            super::history::event_message(pioneer_crud::CanonicalTurnEventPayload::ItemCompleted(
-                pioneer_protocol::ItemCompletedNotification {
-                    workspace_id: "ws".into(),
-                    thread_id: "thread".into(),
-                    turn_id: "turn".into(),
-                    item: item.clone(),
-                },
-            ))
-            .unwrap()
-            .unwrap();
-        let hash = wire_digest(&legacy).unwrap();
-        let projected = verified_model_message(
-            &hash,
-            vec![FrozenModelCandidate::upgraded(legacy, current.clone())],
-        )
-        .unwrap();
-        assert_eq!(projected.content.matches("frozen-unique-output").count(), 1);
-        assert!(
-            verified_model_message(&"0".repeat(64), vec![FrozenModelCandidate::exact(current)])
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn legacy_frozen_provider_observation_verifies_old_wire_before_portable_model() {
-        let mut message = ChatMessage::assistant("partial answer");
-        message.reasoning_content = Some("common reason".into());
-        message.provider_replay_state = Some(pioneer_provider::ProviderReplayState::for_model(
-            "openrouter",
-            "source-model",
-            serde_json::json!({"reasoning_details":[
-                {"type":"reasoning.encrypted","data":"opaque-secret"},
-                {"type":"reasoning.summary","summary":"readable reason"}
-            ]}),
-        ));
-        let payload = serde_json::to_string(&pioneer_provider::CanonicalProviderRoundEnvelope {
-            ui_copies: None,
-            version: 1,
-            round_id: "failed".into(),
-            termination: pioneer_provider::ProviderTermination::ProviderError,
-            message,
-            calls: vec![],
-        })
-        .unwrap();
-        let legacy = super::history::legacy_provider_observation(&payload).unwrap();
-        let portable = super::history::provider_observation(&payload).unwrap();
-        assert!(legacy.content.contains("opaque-secret"));
-        assert!(!portable.content.contains("opaque-secret"));
-        assert!(portable.content.contains("readable reason"));
-        let hash = wire_digest(&legacy).unwrap();
-        let restored = verified_model_message(
-            &hash,
-            vec![
-                FrozenModelCandidate::upgraded(legacy, portable.clone()),
-                FrozenModelCandidate::exact(portable),
-            ],
-        )
-        .unwrap();
-        assert!(!restored.content.contains("opaque-secret"));
-        assert!(
-            verified_model_message(&"0".repeat(64), vec![FrozenModelCandidate::exact(restored)])
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn verified_non_event_text_is_never_upgraded_by_prefix() {
-        let item = pioneer_protocol::TurnItem::CommandExecution {
-            id: "pasted-command".into(),
-            tool_name: "exec_command".into(),
-            arguments: serde_json::json!({}),
-            status: pioneer_protocol::ToolCallStatus::Completed,
-            recovery_policy: None,
-            output_policy: pioneer_protocol::ToolOutputPolicySnapshot::for_tool_name(
-                "exec_command",
-            ),
-            display: pioneer_protocol::ToolDisplayPayload::Hidden,
-            storage: pioneer_protocol::ToolStoragePayload::None,
-            recovery: None,
-            command: vec!["true".into()],
-            cwd: None,
-            success: Some(true),
-            outcome: None,
-            observation: None,
-        };
-        let pasted = ChatMessage::user(format!(
-            "Recorded historical event:\n{}",
-            serde_json::to_string(&item).unwrap()
-        ));
-        let hash = wire_digest(&pasted).unwrap();
-        assert_eq!(
-            verified_model_message(&hash, vec![FrozenModelCandidate::exact(pasted.clone())])
-                .unwrap(),
-            pasted
-        );
-
-        let assistant = ChatMessage::assistant(format!(
-            "Recorded historical event:\n{}",
-            serde_json::to_string(&item).unwrap()
-        ));
-        let hash = wire_digest(&assistant).unwrap();
-        assert_eq!(
-            verified_model_message(&hash, vec![FrozenModelCandidate::exact(assistant.clone())])
-                .unwrap(),
-            assistant
-        );
     }
 
     #[test]

@@ -116,6 +116,7 @@ impl VercelAiGatewayProvider {
             client.clone(),
             inputs,
         )
+        .with_gateway_caching()
         .with_provisional_messages(true);
         Self {
             adapter,
@@ -205,6 +206,13 @@ impl VercelAiGatewayProvider {
             .expect("Vercel model snapshot")
             .entries
             .clone();
+        let reasoning = models
+            .iter()
+            .map(|(id, model)| {
+                let raw = model.metadata.get("sourceMetadata").unwrap_or(&Value::Null);
+                (id.clone(), native_reasoning(raw))
+            })
+            .collect();
         let tools = models
             .iter()
             .filter_map(|(id, model)| {
@@ -219,11 +227,28 @@ impl VercelAiGatewayProvider {
             NAME,
             false,
             tools,
-            crate::generation::with_native_models(NAME, self.root == BASE_URL, models, future),
+            crate::generation::with_native_models(
+                NAME,
+                self.root == BASE_URL,
+                models,
+                crate::generation::with_native_reasoning(
+                    NAME,
+                    self.root == BASE_URL,
+                    reasoning,
+                    future,
+                ),
+            ),
         )
         .await
     }
     async fn send(&self, builder: reqwest::RequestBuilder) -> Result<reqwest::Response> {
+        self.send_for_operation(builder, false).await
+    }
+    async fn send_for_operation(
+        &self,
+        builder: reqwest::RequestBuilder,
+        embedding: bool,
+    ) -> Result<reqwest::Response> {
         let response = crate::http::non_stream_request(builder.bearer_auth(&self.key), self.policy)
             .send()
             .await
@@ -249,7 +274,9 @@ impl VercelAiGatewayProvider {
             crate::http::read_response_text_bounded(response, 16 * 1024, "provider_error_body")
                 .await
                 .unwrap_or_default();
-        let class = if matches!(status, 408 | 425) {
+        let class = if embedding {
+            super::embedding::classify_input_failure(status, &body)
+        } else if matches!(status, 408 | 425) {
             pioneer_protocol::ProviderFailureClass::NetworkTransient
         } else {
             crate::failure::classify_provider_failure_class(
@@ -294,6 +321,9 @@ impl VercelAiGatewayProvider {
             let Some(mut model) = crate::catalog::generator::vercel_model(raw) else {
                 continue;
             };
+            // Preserve raw generation facts separately from the generator's
+            // runtime shape. Its inferred map is not provider metadata.
+            apply_native_generation(raw, &mut model);
             model.base_url = self.root.clone();
             if let Some(source) = model
                 .metadata
@@ -323,6 +353,14 @@ impl VercelAiGatewayProvider {
             };
             if eligible {
                 let mut info = model_info(raw, &model);
+                // Eligibility was established by the existing operation-specific
+                // native discovery above, including the actual Responses route.
+                info.capabilities.chat = Some(!embeddings);
+                if self.root == BASE_URL
+                    && let Ok(catalog) = crate::catalog::model_catalog()
+                {
+                    enrich_reasoning(&catalog, &mut info);
+                }
                 if account_status(&value) == Some("unavailable") {
                     info.active = Some(false);
                 }
@@ -352,6 +390,119 @@ fn account_status(value: &Value) -> Option<&str> {
 fn http_ineligible(raw: &Value) -> bool {
     raw["model_eligibility"]["evaluated_runtime"] == "http"
         && raw["model_eligibility"]["status"] == "ineligible"
+}
+
+/// These facts come directly from the selected endpoint's Models response.
+fn native_reasoning(raw: &Value) -> crate::generation::NativeReasoning {
+    let mut facts = BTreeMap::new();
+    let support = crate::catalog::tool_support_from_marker_list(&raw["tags"], "reasoning");
+    if let Some(temperature) = raw.get("temperature") {
+        facts.insert("temperature.supported".into(), temperature.as_bool());
+    }
+    if let Some(options) = raw.get("reasoning_options") {
+        let complete = options.as_array().is_some_and(|options| {
+            options.iter().all(|option| {
+                option["type"].is_string()
+                    && (option["type"] != "effort"
+                        || option["values"]
+                            .as_array()
+                            .is_some_and(|values| values.iter().all(Value::is_string)))
+            })
+        });
+        facts.insert("effort.enum".into(), complete.then_some(true));
+        if let Some(options) = options.as_array().filter(|_| complete) {
+            for option in options {
+                if option["type"] == "toggle" {
+                    facts.insert("thinking.types.disabled".into(), Some(true));
+                }
+                if option["type"] == "effort"
+                    && let Some(values) = option["values"]
+                        .as_array()
+                        .filter(|values| values.iter().all(Value::is_string))
+                {
+                    for effort in values
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .filter_map(crate::ReasoningEffort::canonical_value)
+                    {
+                        facts.insert(format!("effort.{effort}"), Some(true));
+                    }
+                }
+            }
+        }
+    }
+    // Tags and the real controls are alternative evidence for reasoning.
+    // A missing marker cannot veto a positive control list. Unknown options
+    // also prevent a missing marker from becoming an aggregate denial.
+    let complete_options = raw["reasoning_options"]
+        .as_array()
+        .filter(|_| facts.get("effort.enum") == Some(&Some(true)));
+    let aggregate =
+        if support == Some(true) || complete_options.is_some_and(|options| !options.is_empty()) {
+            Some(true)
+        } else if support == Some(false) && complete_options.is_some_and(Vec::is_empty) {
+            Some(false)
+        } else {
+            None
+        };
+    if raw.get("tags").is_some() || raw.get("reasoning_options").is_some() {
+        facts.insert("reasoning.supported".into(), aggregate);
+    }
+    facts
+}
+
+fn apply_native_generation(raw: &Value, model: &mut crate::catalog::CatalogModel) {
+    let facts = native_reasoning(raw);
+    model.reasoning = facts
+        .get("reasoning.supported")
+        .copied()
+        .flatten()
+        .unwrap_or(false);
+    model.metadata.remove("thinkingLevelMap");
+    if facts.get("effort.enum") != Some(&Some(true)) {
+        // Malformed/absent selector fields are unknown, not a closed native
+        // array. The original response remains intact in sourceMetadata.
+        if let Some(source) = model.metadata.get_mut("sourceGeneration") {
+            source["reasoningOptions"] = Value::Null;
+        }
+    }
+    if let Some(compat) = model
+        .metadata
+        .get_mut("compat")
+        .and_then(Value::as_object_mut)
+    {
+        for key in [
+            "supportsReasoningEffort",
+            "forceAdaptiveThinking",
+            "supportsTemperature",
+        ] {
+            compat.remove(key);
+        }
+    }
+    if let Some(supported) = raw["temperature"].as_bool() {
+        let compat = model
+            .metadata
+            .entry("compat".into())
+            .or_insert_with(|| json!({}));
+        compat["supportsTemperature"] = json!(supported);
+    }
+    if let Some(resolved) = crate::generation::reasoning_model(NAME, Some(model), &facts) {
+        *model = resolved;
+    }
+}
+
+// The public catalog may fill only reasoning fields here. Native limits,
+// modalities and tariffs retain their existing authority boundary.
+fn enrich_reasoning(catalog: &crate::catalog::ModelCatalog, model: &mut ProviderModelInfo) {
+    let mut enriched = [model.clone()];
+    catalog.enrich(NAME, &mut enriched);
+    if enriched[0].capabilities.reasoning != model.capabilities.reasoning
+        && let Some(reasoning) = enriched[0].capabilities.reasoning.as_mut()
+    {
+        reasoning.source = Some(pioneer_protocol::ReasoningCapabilitySource::Unknown);
+    }
+    model.capabilities.reasoning = enriched[0].capabilities.reasoning.take();
+    model.capabilities.thinking = enriched[0].capabilities.thinking;
 }
 
 fn model_info(raw: &Value, model: &crate::catalog::CatalogModel) -> ProviderModelInfo {
@@ -395,31 +546,41 @@ fn model_info(raw: &Value, model: &crate::catalog::CatalogModel) -> ProviderMode
             .and_then(|v| serde_json::from_value(v.clone()).ok()),
         ..Default::default()
     };
-    if raw["reasoning_options"].is_array() {
-        let efforts = [
-            crate::ReasoningEffort::None,
-            crate::ReasoningEffort::Minimal,
-            crate::ReasoningEffort::Low,
-            crate::ReasoningEffort::Medium,
-            crate::ReasoningEffort::High,
-            crate::ReasoningEffort::XHigh,
-            crate::ReasoningEffort::Max,
-        ]
-        .into_iter()
-        .filter(|effort| {
-            crate::generation::effort_supported_for_profile(NAME, &model.id, Some(model), *effort)
-        })
-        .map(|effort| effort.as_str().to_owned())
-        .collect();
+    let facts = native_reasoning(raw);
+    capabilities.thinking = facts.get("reasoning.supported").copied().flatten();
+    if !facts.is_empty() {
+        let mut effort_options: Vec<String> = facts
+            .iter()
+            .filter_map(|(key, value)| {
+                key.strip_prefix("effort.")
+                    .filter(|effort| {
+                        *value == Some(true) && crate::ReasoningEffort::from_str(effort).is_some()
+                    })
+                    .map(str::to_owned)
+            })
+            .collect();
+        if facts.get("thinking.types.disabled") == Some(&Some(true)) {
+            effort_options.push("none".into());
+        }
+        effort_options.retain(|effort| {
+            crate::ReasoningEffort::from_str(effort).is_some_and(|effort| {
+                crate::generation::effort_supported_with_native(
+                    NAME,
+                    &model.id,
+                    Some(model),
+                    effort,
+                    &facts,
+                )
+            })
+        });
         capabilities.reasoning = Some(pioneer_protocol::ProviderModelReasoningCapabilities {
-            supported: Some(model.reasoning),
-            effort_options: efforts,
-            supports_token_budget: Some(false),
+            supported: facts.get("reasoning.supported").copied().flatten(),
+            effort_options,
+            native: facts,
             source: Some(pioneer_protocol::ReasoningCapabilitySource::ProviderMetadata),
             ..Default::default()
         });
     }
-    capabilities.thinking = model.reasoning.then_some(true);
     capabilities.vision = match model.input_capability(crate::InputContentType::Image) {
         crate::catalog::InputCapabilityState::Supported => Some(true),
         crate::catalog::InputCapabilityState::Unsupported => Some(false),
@@ -592,10 +753,11 @@ impl Provider for VercelAiGatewayProvider {
         let count = request.input.len();
         let body = json!({"model":request.model,"input":request.input,"encoding_format":"float"});
         let response = self
-            .send(
+            .send_for_operation(
                 self.client
                     .post(format!("{}/embeddings", self.root))
                     .json(&body),
+                true,
             )
             .await?;
         let request_id = crate::usage::native_id(
@@ -641,6 +803,209 @@ impl Provider for VercelAiGatewayProvider {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn raw_control_lists_reach_ui_preparation_and_both_responses_wires() {
+        use crate::attachments::{admission::AdmissionState, regression::scoped};
+        use crate::{ReasoningConfig, ReasoningEffort};
+        let id = "quartz-vercel-903";
+        let catalog = std::sync::Arc::new(crate::catalog::ModelCatalog::parse(
+            &json!({NAME:{id:{"id":id,"name":id,"provider":NAME,"api":"openai-responses","baseUrl":BASE_URL,
+                "contextWindow":64000,"maxTokens":8192,"reasoning":true,"input":["text"],"cost":{"input":27,"output":29},
+                "compat":{"supportsTemperature":false},"sourceGeneration":{"temperature":false},
+                "thinkingLevelMap":{"low":"low","high":"high","off":"none"}}}}).to_string(),
+            &json!({NAME:{id:{"contextWindow":{"kind":"source","expression":"synthetic"},"maxTokens":{"kind":"source","expression":"synthetic"}}}}).to_string(),
+        ).unwrap());
+        let state = std::sync::Arc::new(AdmissionState::for_test(catalog.clone()));
+        for public in [false, true] {
+            for (options, expected) in [
+                (Value::Null, vec!["none", "low", "high"]),
+                (json!("malformed"), vec!["none", "low", "high"]),
+                (
+                    json!([{"type":"effort","values":null}]),
+                    vec!["none", "low", "high"],
+                ),
+                (json!([]), vec![]),
+                (json!([{"type":"effort","values":["high"]}]), vec!["high"]),
+                (json!([{"type":"toggle"}]), vec!["none"]),
+            ] {
+                let provider = VercelAiGatewayProvider::with_base_url(
+                    "fixture",
+                    if public {
+                        BASE_URL
+                    } else {
+                        "https://fixture.invalid/v1"
+                    },
+                );
+                let raw = json!({"id":id,"type":"language","tags":["tool-use"],
+                    "modalities":{"input":["text"],"output":["text"]},"context_window":32000,"max_tokens":4096,
+                    "reasoning_options":options,"temperature":true});
+                let mut discovered = provider
+                    .apply_snapshot(&json!({"catalog_status":"complete","data":[raw]}), false)
+                    .await
+                    .unwrap();
+                if public {
+                    enrich_reasoning(&catalog, &mut discovered[0]);
+                }
+                let native = discovered[0]
+                    .capabilities
+                    .reasoning
+                    .as_ref()
+                    .unwrap()
+                    .native
+                    .clone();
+                let known = native.get("effort.enum") == Some(&Some(true));
+                let expected = if !public && !known { vec![] } else { expected };
+                assert_eq!(
+                    discovered[0]
+                        .capabilities
+                        .reasoning
+                        .as_ref()
+                        .unwrap()
+                        .effort_options,
+                    expected
+                );
+                assert!(discovered[0].pricing.is_none());
+                assert_eq!(discovered[0].limits.context_window, Some(32000));
+                assert_eq!(discovered[0].limits.max_output_tokens, Some(4096));
+                scoped(
+                    state.clone(),
+                    provider.scoped(async {
+                        for effort in [
+                            None,
+                            Some(ReasoningEffort::None),
+                            Some(ReasoningEffort::Low),
+                            Some(ReasoningEffort::High),
+                        ] {
+                            let mut request = crate::generation::test_request(id);
+                            request.reasoning = effort.map(ReasoningConfig::Effort);
+                            request.temperature = Some(0.5);
+                            let confirmed = effort.is_none()
+                                || effort.is_some_and(|effort| expected.contains(&effort.as_str()));
+                            assert_eq!(
+                                provider.prepare_input_budget(request.clone()).await.is_ok(),
+                                confirmed
+                            );
+                            let prepared = provider
+                                .adapter
+                                .prepare(request, &provider.capabilities())
+                                .await;
+                            assert_eq!(prepared.is_ok(), confirmed);
+                            if let Ok(prepared) = prepared {
+                                for stream in [false, true] {
+                                    let body = provider.adapter.render(&prepared, stream).unwrap();
+                                    assert_eq!(body["temperature"], 0.5);
+                                    if let Some(effort) = effort {
+                                        assert_eq!(body["reasoning"]["effort"], effort.as_str());
+                                    } else {
+                                        assert!(body.get("reasoning").is_none());
+                                    }
+                                    assert_eq!(body["stream"], stream);
+                                }
+                            }
+                        }
+                    }),
+                )
+                .await;
+            }
+        }
+        // A native sampling veto must survive a positive catalog field.
+        let mut sampling_row = serde_json::to_value(catalog.model(NAME, id).unwrap()).unwrap();
+        sampling_row["compat"]["supportsTemperature"] = json!(true);
+        sampling_row["sourceGeneration"]["temperature"] = json!(true);
+        let sampling_catalog = std::sync::Arc::new(crate::catalog::ModelCatalog::parse(
+            &json!({NAME:{id:sampling_row}}).to_string(),
+            &json!({NAME:{id:{"contextWindow":{"kind":"source","expression":"synthetic"},"maxTokens":{"kind":"source","expression":"synthetic"}}}}).to_string(),
+        ).unwrap());
+        let provider = VercelAiGatewayProvider::new("fixture");
+        provider.apply_snapshot(&json!({"data":[{"id":id,"type":"language","tags":["tool-use","reasoning"],
+            "modalities":{"input":["text"],"output":["text"]},"context_window":32000,"max_tokens":4096,
+            "reasoning_options":[{"type":"effort","values":["high"]}],"temperature":false}]}),false).await.unwrap();
+        scoped(
+            std::sync::Arc::new(AdmissionState::for_test(sampling_catalog)),
+            provider.scoped(async {
+                let mut request = crate::generation::test_request(id);
+                request.reasoning = Some(ReasoningConfig::Effort(ReasoningEffort::High));
+                assert!(
+                    provider
+                        .adapter
+                        .prepare(request.clone(), &provider.capabilities())
+                        .await
+                        .is_ok()
+                );
+                request.temperature = Some(0.5);
+                assert!(
+                    provider
+                        .prepare_input_budget(request.clone())
+                        .await
+                        .is_err()
+                );
+                assert!(
+                    provider
+                        .adapter
+                        .prepare(request, &provider.capabilities())
+                        .await
+                        .is_err()
+                );
+            }),
+        )
+        .await;
+    }
+
+    #[test]
+    fn real_controls_confirm_reasoning_independently_of_optional_tags() {
+        for (tags, unknown_support, empty_support) in [
+            (None, None, None),
+            (Some(Value::Null), None, None),
+            (Some(json!({})), None, None),
+            (Some(json!([])), None, Some(false)),
+            (Some(json!(["tool-use"])), None, Some(false)),
+            (
+                Some(json!(["tool-use", "reasoning"])),
+                Some(true),
+                Some(true),
+            ),
+        ] {
+            for (options, expected, efforts) in [
+                (None, unknown_support, vec![]),
+                (Some(Value::Null), unknown_support, vec![]),
+                (Some(json!({})), unknown_support, vec![]),
+                (Some(json!([])), empty_support, vec![]),
+                (
+                    Some(json!([{"type":"effort","values":[]}])),
+                    Some(true),
+                    vec![],
+                ),
+                (
+                    Some(json!([{"type":"effort","values":["high"]}])),
+                    Some(true),
+                    vec!["high".to_owned()],
+                ),
+            ] {
+                let mut raw = json!({"id":"quartz-tag-independent-906","type":"language"});
+                if let Some(tags) = &tags {
+                    raw["tags"] = tags.clone();
+                }
+                if let Some(options) = options {
+                    raw["reasoning_options"] = options;
+                }
+                let mut model = crate::catalog::generator::vercel_model(&raw).unwrap();
+                apply_native_generation(&raw, &mut model);
+                let info = model_info(&raw, &model);
+                let reasoning = info.capabilities.reasoning.as_ref();
+                assert_eq!(
+                    reasoning.and_then(|reasoning| reasoning.supported),
+                    expected
+                );
+                assert_eq!(
+                    reasoning
+                        .map(|reasoning| reasoning.effort_options.as_slice())
+                        .unwrap_or_default(),
+                    efforts.as_slice()
+                );
+            }
+        }
+    }
+
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -687,6 +1052,34 @@ mod tests {
             requests
         });
         (root, task)
+    }
+
+    #[tokio::test]
+    async fn embedding_http_classification_prioritizes_status_and_structured_codes() {
+        for &(status, body, expected) in super::super::embedding::HTTP_FAILURE_CASES {
+            let (root, task) = server(vec![(status, body)]).await;
+            let provider = VercelAiGatewayProvider::with_base_url("fixture-key", root);
+            provider
+                .apply_snapshot(
+                    &json!({"catalog_status":"complete","data":[{
+                        "id":"private/embed","type":"embedding",
+                        "modalities":{"input":["text"],"output":["embedding"]}
+                    }]}),
+                    true,
+                )
+                .await
+                .unwrap();
+            let error = provider
+                .embed(EmbeddingRequest::new("private/embed", vec!["one".into()]))
+                .await
+                .unwrap_err();
+            let facts = provider.classify_failure(&error).unwrap();
+            assert_eq!(facts.class, expected, "{status} {body}");
+            assert_eq!(facts.http_status, Some(status));
+            let requests = task.await.unwrap();
+            assert_eq!(requests.len(), 1);
+            assert!(requests[0].starts_with("POST /v1/embeddings "));
+        }
     }
 
     #[tokio::test]
@@ -1012,8 +1405,149 @@ mod tests {
         assert_eq!(body["model"], "private/agent");
         assert_eq!(body["max_output_tokens"], 200);
         assert_eq!(body["temperature"], 0.5);
-        assert_eq!(body["store"], false);
+        assert_eq!(body["store"], true);
         assert!(body.get("reasoning").is_none());
+    }
+
+    #[tokio::test]
+    async fn automatic_caching_and_affinity_reach_both_wires_without_leaking_to_other_providers() {
+        use futures_util::StreamExt;
+        let replies = (0..9)
+            .map(|index| {
+                let response = json!({"id":format!("resp_gateway_cache_{index}"),"status":"completed",
+                    "output":[{"id":"message-fixture","type":"message","role":"assistant","phase":"final_answer",
+                        "content":[{"type":"output_text","text":"reply"}]}]});
+                let (kind, body) = if index == 1 {
+                    ("text/event-stream", format!("data: {}\n\n", json!({"type":"response.completed","response":response})))
+                } else {
+                    ("application/json", response.to_string())
+                };
+                format!("HTTP/1.1 200 OK\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
+            })
+            .collect();
+        let (root, server) = server_frames(replies).await;
+        for index in 0..9 {
+            // Reconstruct the provider between requests; identity belongs to
+            // the conversation, not a provider instance or latest response ID.
+            let provider = VercelAiGatewayProvider::with_base_url(
+                if index == 6 { "other-key" } else { "fixture" },
+                &root,
+            );
+            let models = ["private/agent", "private/other"].map(|id| {
+                json!({"id":id,"type":"language","tags":["tool-use"],
+                    "modalities":{"input":["text"],"output":["text"]},
+                    "context_window":16000,"max_tokens":1000,
+                    "model_eligibility":{"status":"eligible","evaluated_runtime":"http"}})
+            });
+            provider
+                .apply_snapshot(&json!({"data":models}), false)
+                .await
+                .unwrap();
+            let request = ChatRequest {
+                model: if index == 1 {
+                    "private/other"
+                } else {
+                    "private/agent"
+                }
+                .into(),
+                messages: vec![crate::ChatMessage::user("cache contract")],
+                temperature: None,
+                max_tokens: Some(100),
+                tools: None,
+                tool_choice: None,
+                parallel_tool_calls: None,
+                reasoning: None,
+                compiled_prompt: None,
+            };
+            let operation = async {
+                if index == 7 {
+                    // Even the same name/URL does not opt the generic adapter
+                    // into a wrapper's gateway-specific policy.
+                    let plain = ResponsesApiCompatibleProvider::new(
+                        NAME,
+                        &root,
+                        "fixture",
+                        AuthStyle::Bearer,
+                    );
+                    assert_eq!(plain.chat(request).await.unwrap().text, "reply");
+                } else if index == 1 {
+                    let mut stream = provider.stream_chat(request).await.unwrap();
+                    while let Some(chunk) = stream.next().await {
+                        chunk.unwrap();
+                    }
+                } else {
+                    assert_eq!(provider.chat(request).await.unwrap().text, "reply");
+                }
+            };
+            let operation = crate::attachments::runtime::with_async_authority_scope(
+                provider.authority_fingerprint().unwrap().to_owned(),
+                operation,
+            );
+            if index == 8 {
+                // No trustworthy execution identity: use gateway fingerprinting
+                // rather than inventing one shared header for unrelated calls.
+                operation.await;
+            } else {
+                let workspace = if index == 4 {
+                    format!("{root}-other")
+                } else {
+                    root.clone()
+                };
+                let execution = format!("execution-{index}");
+                crate::prompt_cache::conversation_scope(
+                    workspace.clone(),
+                    if index == 2 {
+                        "attached-child"
+                    } else {
+                        "conversation"
+                    }
+                    .into(),
+                    crate::prompt_cache::scope(
+                        &workspace,
+                        &execution,
+                        if index == 3 { "preflight" } else { "main" },
+                        operation,
+                    ),
+                )
+                .await;
+            }
+        }
+        let mut keys = Vec::new();
+        for (index, request) in server.await.unwrap().into_iter().enumerate() {
+            assert!(request.starts_with("POST /v1/responses HTTP/1.1"));
+            let (head, body) = request.split_once("\r\n\r\n").unwrap();
+            let body: Value = serde_json::from_str(body).unwrap();
+            assert_eq!(
+                body.get("caching"),
+                (index != 7).then(|| json!("auto")).as_ref()
+            );
+            assert!(body.get("cache_ttl").is_none());
+            assert!(body.get("cache_anchor_items").is_none());
+            assert_eq!(body["input"][0]["content"][0]["text"], "cache contract");
+            let key = head.lines().find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("x-session-affinity")
+                    .then(|| value.trim().to_owned())
+            });
+            if index >= 7 {
+                assert!(key.is_none());
+            } else {
+                let key = key.as_ref().unwrap();
+                assert_eq!(key.len(), 64);
+                assert!(key.bytes().all(|b| b.is_ascii_hexdigit()));
+            }
+            keys.push(key);
+        }
+        assert_eq!(keys[0], keys[1]); // changed model + JSON -> SSE
+        assert_eq!(keys[0], keys[5]); // later execution and provider instance
+        assert_eq!(
+            [0, 2, 3, 4, 6]
+                .into_iter()
+                .map(|i| keys[i].as_ref().unwrap())
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            5,
+        ); // owner, purpose, workspace and credential remain isolated
     }
 
     #[tokio::test]

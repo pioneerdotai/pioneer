@@ -106,6 +106,10 @@ async fn durable_lane_backpressures_instead_of_dropping() {
     assert!(!publisher.is_finished());
     assert!(receiver.recv().await.is_some());
     publisher.await.expect("publisher task").expect("second");
+    assert!(matches!(
+        receiver.recv().await,
+        Some(AgentDurableEvent::TurnCompleted { turn_id, .. }) if turn_id == "turn_2"
+    ));
 }
 
 #[tokio::test]

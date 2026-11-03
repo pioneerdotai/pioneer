@@ -34,6 +34,7 @@ mod scoped_push;
 pub(crate) mod skills;
 mod summary;
 mod task_agent_executor;
+pub(crate) use task_agent_executor::task_cache_routing_context;
 mod task_artifacts;
 mod task_completion_inbox;
 mod task_delivery;
@@ -158,7 +159,6 @@ use crate::thread_episodic::{
     ThreadEpisodicIndexExecutor, ThreadEpisodicIngestor, ThreadEpisodicRecallService,
     ThreadEpisodicRuntimeConfig,
 };
-use crate::thread_episodic_hooks::ThreadEpisodicMemoryRecallProvider;
 use anyhow::Context as AnyhowContext;
 use futures_util::FutureExt;
 use pioneer_agent::MemoryLoopConfig;
@@ -369,7 +369,7 @@ where
     Box::pin(future)
 }
 
-struct AbortOnDropMessageTask<T> {
+pub(crate) struct AbortOnDropMessageTask<T> {
     handle: Option<JoinHandle<T>>,
 }
 
@@ -380,7 +380,7 @@ impl<T> AbortOnDropMessageTask<T> {
         }
     }
 
-    async fn join(mut self) -> Result<T, tokio::task::JoinError> {
+    pub(crate) async fn join(&mut self) -> Result<T, tokio::task::JoinError> {
         let result = self
             .handle
             .as_mut()
@@ -388,6 +388,13 @@ impl<T> AbortOnDropMessageTask<T> {
             .await;
         self.handle = None;
         result
+    }
+
+    pub(crate) async fn abort_and_join(&mut self) {
+        if let Some(handle) = self.handle.as_ref() {
+            handle.abort();
+            let _ = self.join().await;
+        }
     }
 }
 
@@ -403,6 +410,14 @@ impl<T> Drop for AbortOnDropMessageTask<T> {
 
 // Heavy CRUD/projection calls otherwise inherit a deeply nested message-handler poll stack.
 pub(crate) async fn message_fresh_task<F, T>(future: F) -> Result<T, tokio::task::JoinError>
+where
+    F: Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    spawn_message_task(future).join().await
+}
+
+fn spawn_message_task<F, T>(future: F) -> AbortOnDropMessageTask<T>
 where
     F: Future<Output = T> + Send + 'static,
     T: Send + 'static,
@@ -437,8 +452,6 @@ where
         future,
     );
     AbortOnDropMessageTask::new(tokio::spawn(future))
-        .join()
-        .await
 }
 
 const RESILIENCE_WORKER_POLL_INTERVAL_SECONDS: u64 = 2;
@@ -596,6 +609,8 @@ pub struct MessageProcessor {
     gateway_listen_addr: Arc<std::sync::RwLock<Option<std::net::SocketAddr>>>,
     summary_config: Arc<summary::SummaryConfig>,
     compaction_settings: Arc<StdRwLock<pioneer_compaction::CompactionSettings>>,
+    task_child_point_cursor: Arc<Mutex<tasks::ChildDiscoveryPass<(i64, String)>>>,
+    task_child_scope_cursor: Arc<Mutex<tasks::ChildDiscoveryPass<(i64, String, String)>>>,
     completed_history_checks: Arc<Mutex<HashMap<(String, String), compaction_background::OwnedHistoryCheck>>>,
     compaction_lifecycle_not_before: Arc<StdRwLock<Option<tokio::time::Instant>>>,
     #[cfg(test)]
@@ -603,6 +618,9 @@ pub struct MessageProcessor {
         Arc<compaction_background::CompletedHistoryPreparationBarrier>,
     #[cfg(test)]
     turn_execution_heartbeat_barrier:
+        Arc<compaction_background::CompletedHistoryPreparationBarrier>,
+    #[cfg(test)]
+    recovery_due_wait_barrier:
         Arc<compaction_background::CompletedHistoryPreparationBarrier>,
     #[cfg(test)]
     task_history_preparation_failure: Arc<std::sync::Mutex<Option<anyhow::Error>>>,
@@ -691,7 +709,7 @@ pub struct MessageProcessor {
     thread_title_publication_attempted: Arc<tokio::sync::Notify>,
     timeout_supervisor: Arc<TimeoutSupervisor>,
     recovery_coordinator: Arc<RecoveryCoordinator>,
-    native_turn_event_delivery_kick_running: Arc<AtomicBool>,
+    native_turn_event_delivery_workers: Arc<agent_runtime::NativeTurnEventDeliveryWorkers>,
     native_terminal_effect_kick_running: Arc<AtomicBool>,
     native_terminal_effect_kick_pending: Arc<AtomicBool>,
     native_lifecycle_readiness: Arc<native_health::NativeLifecycleReadinessState>,
@@ -963,9 +981,7 @@ impl AgentMarkdownBufferStats {
 
 #[derive(Clone)]
 struct MemoryBridgeProviders {
-    episodic_provider: Arc<ThreadEpisodicMemoryRecallProvider>,
     memory_provider: Arc<crate::memory_tools::GatewayMemoryProvider>,
-    memory_policy_provider: Arc<crate::memory_policy::GatewayMemoryTurnPolicyProvider>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -1257,12 +1273,16 @@ impl MessageProcessor {
                 pioneer_protocol::GatewayBaseUrl::parse_presentation("http://127.0.0.1:17878")
                     .expect("static Gateway base URL is valid"),
             ),
+            task_child_point_cursor: Arc::new(Mutex::new(Default::default())),
+            task_child_scope_cursor: Arc::new(Mutex::new(Default::default())),
             completed_history_checks: Arc::new(Mutex::new(HashMap::new())),
             compaction_lifecycle_not_before: Arc::new(StdRwLock::new(None)),
             #[cfg(test)]
             completed_history_preparation_barrier: Arc::new(Default::default()),
             #[cfg(test)]
             turn_execution_heartbeat_barrier: Arc::new(Default::default()),
+            #[cfg(test)]
+            recovery_due_wait_barrier: Arc::new(Default::default()),
             #[cfg(test)]
             task_history_preparation_failure: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
@@ -1360,7 +1380,7 @@ impl MessageProcessor {
             thread_title_publication_attempted: Arc::new(tokio::sync::Notify::new()),
             timeout_supervisor,
             recovery_coordinator,
-            native_turn_event_delivery_kick_running: Arc::new(AtomicBool::new(false)),
+            native_turn_event_delivery_workers: Arc::new(Default::default()),
             native_terminal_effect_kick_running: Arc::new(AtomicBool::new(false)),
             native_terminal_effect_kick_pending: Arc::new(AtomicBool::new(false)),
             native_lifecycle_readiness: Arc::new(
@@ -2099,10 +2119,6 @@ impl MessageProcessor {
         let memory_provider = Arc::new(crate::memory_tools::GatewayMemoryProvider::new(
             Arc::downgrade(self),
         ));
-        let memory_policy_provider =
-            Arc::new(crate::memory_policy::GatewayMemoryTurnPolicyProvider::new(
-                self.provider_registry.clone(),
-            ));
         self.agent_manager
             .set_memory_provider(Some(memory_provider.clone()))
             .await;
@@ -2112,17 +2128,8 @@ impl MessageProcessor {
         self.agent_manager
             .set_memory_post_turn_extractor_provider(Some(memory_provider.clone()))
             .await;
-        self.agent_manager
-            .set_memory_turn_policy_provider(Some(memory_policy_provider.clone()))
-            .await;
 
-        let bridge = MemoryBridgeProviders {
-            episodic_provider: Arc::new(ThreadEpisodicMemoryRecallProvider::new(Arc::downgrade(
-                self,
-            ))),
-            memory_provider,
-            memory_policy_provider,
-        };
+        let bridge = MemoryBridgeProviders { memory_provider };
         *self.memory_bridge_providers.write().await = Some(bridge.clone());
         self.install_memory_hook_runtime(bridge).await;
     }
@@ -2134,8 +2141,6 @@ impl MessageProcessor {
                 bridge.memory_provider.clone(),
                 Some(bridge.memory_provider.clone()),
                 Some(bridge.memory_provider.clone()),
-                Some(bridge.memory_policy_provider),
-                Some(bridge.episodic_provider),
                 self.agent_manager.memory_tool_bundle_artifact_store(),
                 self.memory_loop_config(),
             ))
@@ -2455,17 +2460,18 @@ impl MessageProcessor {
             };
             let store = this.crud_store.with_maintenance_reads_and_critical_writes();
             let owner = this.turn_execution_owner_id.clone();
+            let notification = store.turn_execution_heartbeat_notification(owner.as_ref());
             #[cfg(test)]
             let barrier = this.turn_execution_heartbeat_barrier.clone();
             // Keep only the DB scope and owner identity during I/O, retry and
             // sleep. The heartbeat must not keep MessageProcessor alive.
             drop(this);
             let cycle = AssertUnwindSafe(async {
-                if let Err(error) = crate::database::attribution::scope_database_workload_result(
+                match crate::database::attribution::scope_database_workload_result(
                     pioneer_observability::DatabaseWorkload::ExecutionSupervision,
                     pioneer_observability::DatabaseOperationSite::ExecutionOwnerHeartbeat,
                     retry_transient_storage_access(|| {
-                        store.heartbeat_turn_executions_owned_by(
+                        store.supervise_turn_execution_heartbeat(
                             owner.as_ref(),
                             TURN_EXECUTION_OWNER_LEASE_SECONDS,
                         )
@@ -2473,11 +2479,15 @@ impl MessageProcessor {
                 )
                 .await
                 {
-                    record_resilience_worker_error(
-                        "Turn execution owner heartbeat",
-                        &error,
-                        ResilienceWorkerFailureImpact::CriticalPoll,
-                    );
+                    Ok(parked) => parked,
+                    Err(error) => {
+                        record_resilience_worker_error(
+                            "Turn execution owner heartbeat",
+                            &error,
+                            ResilienceWorkerFailureImpact::CriticalPoll,
+                        );
+                        false
+                    }
                 }
             })
             .catch_unwind()
@@ -2494,7 +2504,77 @@ impl MessageProcessor {
                 .await;
             // Retries are bounded by the existing storage policy; subsequent
             // polls remain serial and use the existing short service interval.
-            sleep(Duration::from_secs(RESILIENCE_WORKER_POLL_INTERVAL_SECONDS)).await;
+            // Drop the scoped DB handle before waiting; neither branch retains
+            // MessageProcessor. notify_one retains a permit across the final
+            // empty check and waiter registration (including admission races).
+            drop(store);
+            if matches!(cycle, Ok(true)) {
+                notification.notified().await;
+            } else {
+                tokio::select! {
+                    _ = notification.notified() => {},
+                    _ = sleep(Duration::from_secs(RESILIENCE_WORKER_POLL_INTERVAL_SECONDS)) => {},
+                }
+            }
+        }
+    }
+
+    async fn run_recovery_due_worker(processor: Weak<Self>) {
+        loop {
+            let Some(original) = processor.upgrade() else {
+                break;
+            };
+            let this = original.for_background_reconciliation();
+            drop(original);
+            #[cfg(test)]
+            let wait_barrier = this.recovery_due_wait_barrier.clone();
+            let wake = this.recovery_coordinator.due_wake();
+            let mut transient_storage_poll_failed = false;
+            let cycle = AssertUnwindSafe(async {
+                let now = now_timestamp_secs();
+                match crate::database::attribution::scope_database_workload_result(
+                    pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                    pioneer_observability::DatabaseOperationSite::RecoveryJobs,
+                    retry_transient_storage_access(|| {
+                        this.recovery_coordinator.run_due_jobs(now, 64)
+                    }),
+                )
+                .await
+                {
+                    Ok(events) => {
+                        for event in events {
+                            this.handle_recovery_event(event, now).await;
+                        }
+                    }
+                    Err(error) => record_resilience_worker_poll_error(
+                        "recovery due jobs",
+                        &error,
+                        &mut transient_storage_poll_failed,
+                    ),
+                }
+            })
+            .catch_unwind()
+            .await;
+            if cycle.is_err() {
+                error!("contained panic in recovery due worker");
+            }
+            // notify_one retains a permit across the drain/wait boundary. No
+            // processor or database resource is held during the fallback wait.
+            drop(this);
+            #[cfg(test)]
+            wait_barrier
+                .wait_if_armed(
+                    "__recovery_due_before_wait__",
+                    &tokio_util::sync::CancellationToken::new(),
+                )
+                .await;
+            if sleep_after_transient_storage_poll_failure(transient_storage_poll_failed).await {
+                continue;
+            }
+            tokio::select! {
+                _ = wake.notified() => {},
+                _ = sleep(Duration::from_secs(RESILIENCE_WORKER_POLL_INTERVAL_SECONDS)) => {},
+            }
         }
     }
 
@@ -2546,7 +2626,7 @@ impl MessageProcessor {
                     }),
                 )
                 .await;
-                finalization_reporting.observe(&result, Instant::now());
+                finalization_reporting.observe_finalizations(&result, Instant::now());
                 match result {
                     Ok(summary) => {
                         let committed = summary.committed_count();
@@ -2573,26 +2653,24 @@ impl MessageProcessor {
                     Err(_) => {}
                 }
 
-                if let Err(error) = crate::database::attribution::scope_database_workload_result(
-                    pioneer_observability::DatabaseWorkload::EventDelivery,
-                    pioneer_observability::DatabaseOperationSite::NativeEventDelivery,
-                    retry_transient_storage_access(|| {
-                        this.process_due_native_turn_event_deliveries(now, 64)
-                    }),
-                )
-                .await
-                {
-                    error!(
-                        error = %format!("{error:#}"),
-                        "native turn-event optional delivery worker failed"
-                    );
-                }
+                #[cfg(test)]
+                this.completed_history_preparation_barrier
+                    .wait_if_armed(
+                        "__event_delivery_recovery_before_kick__",
+                        &this.cli_history_shutdown,
+                    )
+                    .await;
+                // Periodic recovery shares the same consumer owners as commit
+                // kicks; a slow episodic effect cannot hold the next LIVE batch.
+                this.kick_native_turn_event_deliveries();
             })
             .catch_unwind()
             .await;
             if cycle.is_err() {
                 error!("contained panic in projection/delivery resilience worker");
             }
+            // Fixed fallback also discovers foreign writes and restored streams.
+            // No second deadline SELECT and no acceleration of shared callbacks.
             sleep(Duration::from_secs(RESILIENCE_WORKER_POLL_INTERVAL_SECONDS)).await;
         }
     }
@@ -2796,14 +2874,25 @@ impl MessageProcessor {
 
         let task_runtime_stage =
             trace.stage(pioneer_observability::GatewayOperationStage::ResilienceTaskRuntimeStart);
-        if let Err(error) = self.task_runtime.start().await {
-            drop(task_runtime_stage);
-            error!(error = %format!("{error:#}"), "failed to start task runtime");
-            trace.finish_failure();
-            return Err(error).context("failed to start task runtime");
-        } else {
-            task_runtime_stage.succeed();
-        }
+        let partial_startup = match self.task_runtime.start().await {
+            Ok(()) => {
+                task_runtime_stage.succeed();
+                None
+            }
+            Err(error) => {
+                drop(task_runtime_stage);
+                error!(error = %format!("{error:#}"), "failed to start task runtime");
+                if error
+                    .downcast_ref::<pioneer_tasks::PartialTaskStartup>()
+                    .is_some()
+                {
+                    Some(error)
+                } else {
+                    trace.finish_failure();
+                    return Err(error).context("failed to start task runtime");
+                }
+            }
+        };
 
         let task_events_stage = trace
             .stage(pioneer_observability::GatewayOperationStage::ResilienceTaskEventListenerStart);
@@ -2815,7 +2904,13 @@ impl MessageProcessor {
         self.start_hook_recovery_worker().await;
         hook_recovery_stage.succeed();
 
-        trace.finish_success();
+        if partial_startup.is_some() {
+            // Keep explicit failure diagnostics/trace, but do not trap Gateway
+            // initialization in a retry loop on classified row-local poison.
+            trace.finish_failure();
+        } else {
+            trace.finish_success();
+        }
         Ok(())
     }
 
@@ -2913,6 +3008,7 @@ impl MessageProcessor {
                 tokio::spawn(Self::run_turn_execution_owner_heartbeat_worker(
                     processor.clone(),
                 )),
+                tokio::spawn(Self::run_recovery_due_worker(processor.clone())),
                 tokio::spawn(Self::run_projection_delivery_resilience_worker(
                     processor.clone(),
                 )),
@@ -3280,7 +3376,7 @@ impl MessageProcessor {
                     pioneer_observability::DatabaseWorkload::ExecutionSupervision,
                     pioneer_observability::DatabaseOperationSite::RecoveryJobs,
                     retry_transient_storage_access(|| {
-                        this.recovery_coordinator.run_ready_jobs(now, 64)
+                        this.recovery_coordinator.run_supervision_audits(now, 64)
                     }),
                 )
                 .await
@@ -3333,6 +3429,16 @@ impl MessageProcessor {
 
     pub(crate) async fn shutdown_resilience_workers(&self) {
         self.cli_history_shutdown.cancel();
+        {
+            let workers = &self.native_turn_event_delivery_workers;
+            let _admission = workers
+                .admission
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            workers.shutdown.cancel();
+            workers.tasks.close();
+        }
+        self.native_turn_event_delivery_workers.tasks.wait().await;
         for worker in [
             &self.resilience_worker,
             &self.task_event_listener_worker,
@@ -4155,74 +4261,6 @@ fn first_user_text(input: &[pioneer_protocol::UserInput]) -> Option<String> {
     })
 }
 
-#[cfg(test)]
-fn user_message_payload_from_input(
-    input: &[pioneer_protocol::UserInput],
-) -> Option<(String, Vec<pioneer_protocol::UserMessageAttachment>)> {
-    let mut text_parts = Vec::new();
-    let mut attachments = Vec::new();
-
-    for value in input {
-        match value {
-            pioneer_protocol::UserInput::Text { text, .. } => {
-                let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
-                if !normalized.is_empty() {
-                    text_parts.push(normalized);
-                }
-            }
-            pioneer_protocol::UserInput::Image { url } => {
-                attachments
-                    .push(pioneer_protocol::UserMessageAttachment::Image { url: url.clone() });
-            }
-            pioneer_protocol::UserInput::LocalImage { path } => {
-                attachments.push(pioneer_protocol::UserMessageAttachment::LocalImage {
-                    path: path.clone(),
-                });
-            }
-            pioneer_protocol::UserInput::File { url } => {
-                attachments
-                    .push(pioneer_protocol::UserMessageAttachment::File { url: url.clone() });
-            }
-            pioneer_protocol::UserInput::LocalFile { path } => {
-                attachments.push(pioneer_protocol::UserMessageAttachment::LocalFile {
-                    path: path.clone(),
-                });
-            }
-            pioneer_protocol::UserInput::Audio { url } => {
-                attachments
-                    .push(pioneer_protocol::UserMessageAttachment::Audio { url: url.clone() });
-            }
-            pioneer_protocol::UserInput::LocalAudio { path } => {
-                attachments.push(pioneer_protocol::UserMessageAttachment::LocalAudio {
-                    path: path.clone(),
-                });
-            }
-            pioneer_protocol::UserInput::Video { url } => {
-                attachments
-                    .push(pioneer_protocol::UserMessageAttachment::Video { url: url.clone() });
-            }
-            pioneer_protocol::UserInput::LocalVideo { path } => {
-                attachments.push(pioneer_protocol::UserMessageAttachment::LocalVideo {
-                    path: path.clone(),
-                });
-            }
-            pioneer_protocol::UserInput::Mention { name, .. } => {
-                text_parts.push(format!("mention: {name}"));
-            }
-            pioneer_protocol::UserInput::Artifact { artifact_id, .. } => {
-                text_parts.push(format!("artifact: {artifact_id}"));
-            }
-        }
-    }
-
-    let text = text_parts.join("\n");
-    if text.is_empty() && attachments.is_empty() {
-        None
-    } else {
-        Some((text, attachments))
-    }
-}
-
 impl MessageProcessor {
     /// Validates user-authored Turn attachments as exact, immutable artifact
     /// versions scoped to the already-authorized target thread. The persisted
@@ -4838,7 +4876,6 @@ impl MessageProcessor {
         ));
         let normalized_tool_loop_config = ToolLoopConfig {
             provider: pioneer_provider::ProviderTimeoutPolicy::default(),
-            preflight: pioneer_agent::PreflightLoopConfig::default(),
             web: pioneer_tools::WebToolsConfig {
                 default_timeout_ms: web.default_timeout_ms,
                 hard_max_timeout_ms: web.hard_max_timeout_ms,
@@ -4908,13 +4945,7 @@ impl MessageProcessor {
                     allow_function_proxy_tools: true,
                 },
             },
-            memory: pioneer_memory::hooks::MemoryLoopConfig {
-                active_recall: pioneer_memory::hooks::MemoryActiveRecallConfig {
-                    mode: pioneer_memory::hooks::MemoryActiveRecallMode::DeterministicOnly,
-                    ..pioneer_memory::hooks::MemoryActiveRecallConfig::default()
-                },
-                ..pioneer_memory::hooks::MemoryLoopConfig::default()
-            },
+            memory: pioneer_memory::hooks::MemoryLoopConfig::default(),
             budget: pioneer_tools::ToolLoopBudgetConfig::default(),
             execution_windows: pioneer_tools::ExecutionWindowsConfig::default(),
             retry: pioneer_tools::ToolRetryBudgetConfig::default(),
@@ -5007,12 +5038,16 @@ impl MessageProcessor {
                 pioneer_protocol::GatewayBaseUrl::parse_presentation("http://127.0.0.1:17878")
                     .expect("static Gateway base URL is valid"),
             ),
+            task_child_point_cursor: Arc::new(Mutex::new(Default::default())),
+            task_child_scope_cursor: Arc::new(Mutex::new(Default::default())),
             completed_history_checks: Arc::new(Mutex::new(HashMap::new())),
             compaction_lifecycle_not_before: Arc::new(StdRwLock::new(None)),
             #[cfg(test)]
             completed_history_preparation_barrier: Arc::new(Default::default()),
             #[cfg(test)]
             turn_execution_heartbeat_barrier: Arc::new(Default::default()),
+            #[cfg(test)]
+            recovery_due_wait_barrier: Arc::new(Default::default()),
             #[cfg(test)]
             task_history_preparation_failure: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
@@ -5105,7 +5140,7 @@ impl MessageProcessor {
             thread_title_publication_attempted: Arc::new(tokio::sync::Notify::new()),
             timeout_supervisor,
             recovery_coordinator,
-            native_turn_event_delivery_kick_running: Arc::new(AtomicBool::new(false)),
+            native_turn_event_delivery_workers: Arc::new(Default::default()),
             native_terminal_effect_kick_running: Arc::new(AtomicBool::new(false)),
             native_terminal_effect_kick_pending: Arc::new(AtomicBool::new(false)),
             native_lifecycle_readiness: Arc::new(

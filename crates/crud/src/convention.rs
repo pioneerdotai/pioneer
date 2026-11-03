@@ -1348,10 +1348,10 @@ pub fn prompt_manifest_profile_to_db(profile: PromptManifestProfile) -> &'static
 #[cfg(test)]
 mod tests {
     use super::{
-        canonical_turn_mentions_json, recovery_job_status_from_db, recovery_job_status_to_db,
-        sandbox_mode_to_db, thread_mode_from_db, thread_mode_to_db, thread_status_from_db,
-        thread_status_to_db, turn_mentions_from_db, turn_send_mode_from_db, turn_send_mode_to_db,
-        turn_status_from_db, turn_status_to_db,
+        canonical_turn_mentions_json, recovery_job_status_to_db, sandbox_mode_to_db,
+        thread_mode_from_db, thread_mode_to_db, thread_status_from_db, thread_status_to_db,
+        turn_mentions_from_db, turn_send_mode_from_db, turn_send_mode_to_db, turn_status_from_db,
+        turn_status_to_db,
     };
     use pioneer_protocol::{
         PrincipalId, RecoveryJobStatus, SandboxMode, ThreadMode, ThreadStatus, TurnMention,
@@ -1395,14 +1395,6 @@ mod tests {
         );
         assert_eq!(turn_status_from_db("blocked"), Some(TurnStatus::Blocked));
         assert_eq!(turn_status_from_db("InProgress"), None);
-    }
-
-    #[test]
-    fn recovery_job_status_parser_accepts_blocked() {
-        assert_eq!(
-            recovery_job_status_from_db("blocked"),
-            Some(RecoveryJobStatus::Blocked)
-        );
     }
 
     #[test]

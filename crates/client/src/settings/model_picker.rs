@@ -581,20 +581,21 @@ impl ClientCore {
                     }
                 }
             }
-            let valid = next
+            let invalid = next
                 .selector
                 .models()
                 .iter()
                 .find(|row| Some(row.id.as_str()) == next.selector.selected_model())
                 .is_some_and(|row| {
-                    presentation::reasoning_effort_rows_for_model(
-                        row,
-                        next.selected_reasoning_effort.as_deref(),
-                    )
-                    .iter()
-                    .any(|row| row.selected)
+                    next.selected_reasoning_effort.is_some()
+                        && !presentation::reasoning_effort_rows_for_model(
+                            row,
+                            next.selected_reasoning_effort.as_deref(),
+                        )
+                        .iter()
+                        .any(|row| row.selected)
                 });
-            if !valid {
+            if invalid {
                 next.selected_reasoning_effort = None;
             }
         } else {
@@ -810,6 +811,67 @@ mod tests {
             )),
         );
     }
+    #[test]
+    fn filtered_response_preserves_saved_effort_but_found_metadata_and_user_changes_validate_it() {
+        for ids in [vec![], vec!["next"], vec!["baseline", "next"]] {
+            let (core, mut requests) = fixture();
+            core.settings_model_picker_intent(SettingsModelPickerIntent::Open {
+                picker_id: "picker".into(),
+                workspace_id: "workspace".into(),
+                mode: ProviderModelSelectorMode::Chat,
+                selection: ModelSelectorSelection {
+                    provider: Some("openai".into()),
+                    model: Some("baseline".into()),
+                    selected_reasoning_effort: Some("high".into()),
+                },
+            });
+            let catalog = requests.try_recv().unwrap();
+            complete(&core, catalog);
+            let work = requests.try_recv().unwrap();
+            let rows = ids.iter().map(|id| serde_json::from_value(serde_json::json!({"id":id,"provider":"openai","limits":{},"capabilities":{}})).unwrap()).collect();
+            core.complete_settings_model_picker(
+                work.clone(),
+                Ok(ProviderCollectionPublication::for_test(
+                    work.key,
+                    vec![],
+                    rows,
+                )),
+            );
+            let picker = core.settings_model_picker("picker").unwrap();
+            assert_eq!(picker.selector.selected_provider(), Some("openai"));
+            assert_eq!(picker.selector.selected_model(), Some("baseline"));
+            assert_eq!(
+                picker.selected_reasoning_effort.as_deref(),
+                if ids.contains(&"baseline") {
+                    None
+                } else {
+                    Some("high")
+                }
+            );
+            if !ids.contains(&"baseline") {
+                assert!(
+                    picker
+                        .selector
+                        .models()
+                        .iter()
+                        .all(|row| row.id != "baseline")
+                );
+            }
+            if ids.contains(&"next") {
+                core.settings_model_picker_intent(SettingsModelPickerIntent::SelectModel {
+                    picker_id: "picker".into(),
+                    expected_owner: picker.owner_generation,
+                    model: "next".into(),
+                });
+                let selection = core
+                    .settings_model_picker_selection("picker", picker.owner_generation)
+                    .unwrap();
+                assert_eq!(selection.model.as_deref(), Some("next"));
+                assert!(selection.selected_reasoning_effort.is_none());
+            }
+        }
+    }
+
     #[test]
     fn model_picker_displays_the_failed_collection_cause() {
         let (core, mut requests) = fixture();

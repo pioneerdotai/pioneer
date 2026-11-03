@@ -1016,36 +1016,7 @@ mod dynamic_pricing_regressions {
     fn pinned() -> SourceSnapshot {
         serde_json::from_str(include_str!("../../tests/fixtures/catalog/sources.json")).unwrap()
     }
-    #[test]
-    fn jev_router_unknown_tariff_does_not_poison_other_providers() {
-        let mut source = pinned();
-        let entries = source.sources.get_mut(SOURCE_URLS[1]).unwrap().body["data"]
-            .as_array_mut()
-            .unwrap();
-        let mut router = entries
-            .iter()
-            .find(|model| model["id"] == "openrouter/auto")
-            .unwrap()
-            .clone();
-        router["id"] = json!("typesafe/jev-router");
-        router["name"] = json!("Jev Router");
-        // Actual outage shape: a new router with -1 input/output tariffs.
-        entries.push(router);
-        let output = generate(&source, false).unwrap();
-        output.validate().unwrap();
-        assert!(output.models["openai"].contains_key("gpt-5-nano"));
-        assert!(!output.models["deepseek"].is_empty());
-        assert!(output.models["openrouter"].contains_key("openrouter/auto"));
-        assert!(!output.models["openrouter"].contains_key("typesafe/jev-router"));
-        assert!(
-            output
-                .diagnostics
-                .iter()
-                .any(|d| d.model.as_deref() == Some("typesafe/jev-router")
-                    && d.code == "invalid_model_record")
-        );
-        assert!(generate(&source, true).is_err());
-    }
+
     #[test]
     fn full_pinned_generation_accepts_documented_auto_unknown_at_both_strictness_levels() {
         let strict_output = generate(&pinned(), true).unwrap();
@@ -1115,12 +1086,16 @@ mod dynamic_pricing_regressions {
                 assert!(generate(&source, true).is_err());
             } else {
                 let output = generate(&source, false).unwrap();
+                assert!(output.models["openai"].contains_key("gpt-5-nano"));
+                assert!(!output.models["deepseek"].is_empty());
+                assert!(output.models["openrouter"].contains_key("openrouter/auto"));
                 assert!(!output.models["openrouter"].contains_key("fixture/unknown-sentinel"));
                 assert!(
                     output
                         .diagnostics
                         .iter()
-                        .any(|d| d.model.as_deref() == Some("fixture/unknown-sentinel"))
+                        .any(|d| d.model.as_deref() == Some("fixture/unknown-sentinel")
+                            && d.code == "invalid_model_record")
                 );
             }
         }

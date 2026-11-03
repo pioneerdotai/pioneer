@@ -1,4 +1,4 @@
-//! Indexed conversation search shared by the tool and production episodic recall.
+//! Authorized indexed conversation search for the Threads tool.
 use super::{MessageProcessor, thread_read_tools::ThreadReadAuthority};
 use anyhow::{Result, anyhow, ensure};
 use async_trait::async_trait;
@@ -81,95 +81,6 @@ struct CardFragmentCursor {
 }
 
 impl MessageProcessor {
-    pub(crate) fn thread_search_recall_enabled(&self) -> bool {
-        self.thread_episodic_runtime_config
-            .read()
-            .map(|c| c.enabled && c.recall_enabled)
-            .unwrap_or(false)
-    }
-
-    pub(crate) async fn recall_thread_search(
-        &self,
-        request: pioneer_memory::hooks::MemoryCurrentThreadRecallRequest,
-    ) -> Result<pioneer_memory::hooks::MemoryEpisodicRecallResponse> {
-        use pioneer_memory::hooks::*;
-        if !self.thread_search_recall_enabled() || request.query.trim().is_empty() {
-            return Ok(MemoryEpisodicRecallResponse::default());
-        }
-        // These IDs come from the hook context. The principal and admitted
-        // grants are independently resolved from the persisted execution.
-        let context = TurnToolContext {
-            workspace_id: request.workspace_id,
-            thread_id: request.thread_id,
-            turn_id: request.turn_id,
-        };
-        let authority = self.thread_read_authority(&context).await?;
-        let (found, has_more, incomplete) = self
-            .search_thread_sources(
-                &authority,
-                ThreadSearchRequest {
-                    query: &request.query,
-                    position: 0,
-                    limit: request.top_k.max(1) as usize,
-                },
-            )
-            .await?;
-        let current = self.thread_read_authority(&context).await?;
-        let mut remaining = request.max_chars;
-        let mut items = Vec::new();
-        let mut truncated = has_more;
-        for found in found {
-            ensure!(
-                self.search_fragment_readable(&current, &found.fragment)
-                    .await?,
-                "source unavailable or access denied"
-            );
-            let source = &found.fragment["source"];
-            let text = found.fragment["text"].as_str().unwrap_or_default();
-            let content = text.chars().take(remaining).collect::<String>();
-            truncated |= content.len() < text.len();
-            remaining = remaining.saturating_sub(content.chars().count());
-            if content.is_empty() {
-                truncated = true;
-                break;
-            }
-            items.push(MemoryEpisodicRecallItem {
-                id: serde_json::to_string(&found.canonical_key)?,
-                content,
-                title: found.title,
-                provenance: MemoryEpisodicRecallProvenance {
-                    workspace_id: authority.workspace_id.clone(),
-                    thread_id: Some(found.thread_id.clone()),
-                    turn_id: source["turnId"].as_str().map(str::to_owned),
-                    item_id: source["itemId"].as_str().map(str::to_owned),
-                    index_item_id: source["indexItemId"].as_str().map(str::to_owned),
-                    source_kind: source["sourceKind"].as_str().map(str::to_owned),
-                    task_id: None,
-                    timestamp_unix: None,
-                    source: if found.thread_id == context.thread_id {
-                        MemoryEpisodicRecallSourceKind::CurrentThread
-                    } else {
-                        MemoryEpisodicRecallSourceKind::WorkspaceThread
-                    },
-                    retrieval_score: Some(found.score),
-                    boundary: MemoryEpisodicRecallBoundary::Snippet,
-                },
-                score: Some(found.score),
-                updated_at_unix: None,
-                visibility: MemoryEpisodicRecallVisibility::Public,
-            });
-        }
-        Ok(MemoryEpisodicRecallResponse {
-            items,
-            diagnostics: if incomplete {
-                vec!["memory.episodic_recall.coverage_incomplete".into()]
-            } else {
-                Vec::new()
-            },
-            truncated,
-        })
-    }
-
     pub(crate) fn thread_search_tools(
         self: &Arc<Self>,
         context: TurnToolContext,
@@ -283,27 +194,38 @@ impl MessageProcessor {
                     };
                     incomplete |=
                         !page.unavailable_segment_ids.is_empty() || !page.warnings.is_empty();
+                    let sources = service
+                        .resolve_thread_search_sources(&authority.workspace_id, &page.hits)
+                        .await?;
+                    // Request-local, bounded to this retrieval portion. Never reused by
+                    // the final disclosure check or by another request.
+                    let mut readable = BTreeMap::new();
                     for hit in page.hits {
-                        if !self
-                            .thread_source_readable(authority, &hit.thread_id)
-                            .await?
+                        let Some((item, title)) = sources.get(&hit.index_item_id) else {
+                            continue;
+                        };
+                        if hit.workspace_id != authority.workspace_id
+                            || item.thread_id != hit.thread_id
+                            || item.turn_id != hit.turn_id
+                            || item.item_id != hit.item_id
+                            || hit.metadata.get("pioneer.thread_episodic.source_text_hash")
+                                != Some(&item.source_text_hash)
                         {
                             continue;
                         }
-                        let Some(item) = service
-                            .resolve_thread_search_source(&authority.workspace_id, &hit)
-                            .await?
-                        else {
-                            continue;
+                        let allowed = match readable.get(&item.thread_id) {
+                            Some(allowed) => *allowed,
+                            None => {
+                                let allowed = self
+                                    .thread_source_readable(authority, &item.thread_id)
+                                    .await?;
+                                readable.insert(item.thread_id.clone(), allowed);
+                                allowed
+                            }
                         };
-                        let Some(thread) = self
-                            .crud_store
-                            .get_thread_by_id(&item.thread_id)
-                            .await?
-                            .filter(|t| t.workspace_id == authority.workspace_id)
-                        else {
+                        if !allowed {
                             continue;
-                        };
+                        }
                         let key = (
                             item.thread_id.clone(),
                             item.turn_id.clone(),
@@ -318,7 +240,7 @@ impl MessageProcessor {
                             .unwrap_or_default();
                         let found = FoundSource {
                             thread_id: item.thread_id.clone(),
-                            title: thread.name,
+                            title: title.clone(),
                             fragment: json!({"text":hit.text,"score":score,"source":{
                                 "workspaceId":item.workspace_id,"threadId":item.thread_id,
                                 "turnId":item.turn_id,"itemId":item.item_id,"indexItemId":item.id,

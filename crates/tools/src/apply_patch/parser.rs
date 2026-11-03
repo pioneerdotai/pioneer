@@ -930,26 +930,6 @@ mod tests {
     }
 
     #[test]
-    fn valid_add_update_move_and_delete_still_parse() {
-        let patch = "*** Begin Patch\n*** Add File: add.txt\n+new\n*** Update File: update.txt\n@@\n-old\n+new\n*** Update File: from.txt\n*** Move to: to.txt\n*** Delete File: gone.txt\n*** End Patch";
-        let document = parse_validated(&request(patch), PatchLimits::default()).unwrap();
-        assert_eq!(
-            document
-                .operations
-                .iter()
-                .map(|op| op.kind)
-                .collect::<Vec<_>>(),
-            vec![
-                OperationKind::Add,
-                OperationKind::Update,
-                OperationKind::Update,
-                OperationKind::Delete,
-            ]
-        );
-        assert_eq!(document.operations[2].move_to.as_deref(), Some("to.txt"));
-    }
-
-    #[test]
     fn distinct_operation_bodies_report_independent_codes() {
         let patch = "*** Begin Patch\n*** Add File: a.txt\nwrong\n*** Update File: b.txt\n@@\nwrong\n*** Delete File: c.txt\nstray\n*** End Patch";
         let failure = parse_validated(&request(patch), PatchLimits::default()).unwrap_err();
@@ -981,10 +961,16 @@ mod tests {
         let patch = "*** Begin Patch\n*** Add File: a.txt\nwrong\n*** Unknown: x\nnoise\n*** Add File: b.txt\nwrong\n*** End Patch";
         let failure = parse_validated(&request(patch), PatchLimits::default()).unwrap_err();
         assert_eq!(failure.diagnostics.len(), 2);
-        assert_eq!(failure.diagnostics[0].line, 3);
         assert_eq!(
-            failure.diagnostics[1].code,
-            ParseErrorCode::UnknownDirective
+            failure
+                .diagnostics
+                .iter()
+                .map(|diagnostic| (diagnostic.code, diagnostic.line))
+                .collect::<Vec<_>>(),
+            vec![
+                (ParseErrorCode::MissingAddPrefix, 3),
+                (ParseErrorCode::UnknownDirective, 4),
+            ]
         );
         assert_eq!(failure.unchecked_from_line, Some(4));
         assert_eq!(
@@ -1074,25 +1060,6 @@ mod tests {
             end_of_file.operations[0].body,
             OperationBody::Update(_)
         ));
-    }
-
-    #[test]
-    fn errors_read_before_an_unknown_boundary_are_preserved() {
-        let patch =
-            "*** Begin Patch\n*** Add File: a.txt\nwrong\n*** Unknown: x\n+content\n*** End Patch";
-        let failure = parse_validated(&request(patch), PatchLimits::default()).unwrap_err();
-        assert_eq!(
-            failure
-                .diagnostics
-                .iter()
-                .map(|error| (error.code, error.line))
-                .collect::<Vec<_>>(),
-            vec![
-                (ParseErrorCode::MissingAddPrefix, 3),
-                (ParseErrorCode::UnknownDirective, 4)
-            ]
-        );
-        assert_eq!(failure.unchecked_from_line, Some(4));
     }
 
     #[test]
@@ -1296,45 +1263,6 @@ mod tests {
     }
 
     #[test]
-    fn enforces_operation_and_hunk_limits() {
-        let limits = PatchLimits {
-            max_operations: 1,
-            ..PatchLimits::default()
-        };
-        let error = parse(
-            &request("*** Begin Patch\n*** Add File: a\n+x\n*** Add File: b\n+y\n*** End Patch"),
-            limits,
-        )
-        .unwrap_err();
-        assert_eq!(error.code, ParseErrorCode::TooManyOperations);
-
-        let limits = PatchLimits {
-            max_total_hunks: 1,
-            ..PatchLimits::default()
-        };
-        let error = parse(
-            &request("*** Begin Patch\n*** Update File: a\n@@\n-a\n+b\n@@\n+b\n+c\n*** End Patch"),
-            limits,
-        )
-        .unwrap_err();
-        assert_eq!(error.code, ParseErrorCode::TooManyHunks);
-    }
-
-    #[test]
-    fn rejects_overlong_paths_during_parsing() {
-        let limits = PatchLimits {
-            max_path_bytes: 3,
-            ..PatchLimits::default()
-        };
-        let error = parse(
-            &request("*** Begin Patch\n*** Add File: long.txt\n+x\n*** End Patch"),
-            limits,
-        )
-        .unwrap_err();
-        assert_eq!(error.code, ParseErrorCode::PathTooLong);
-    }
-
-    #[test]
     fn parser_is_json_round_trippable() {
         let document = parse(
             &request("*** Begin Patch\n*** Add File: a\n+x\n*** End Patch"),
@@ -1414,5 +1342,42 @@ mod tests {
             parse(&oversized, limits).unwrap_err().code,
             ParseErrorCode::InputTooLarge
         );
+    }
+
+    #[test]
+    fn configured_parse_limits_report_their_own_error_codes() {
+        let cases = [
+            (
+                "operation count",
+                PatchLimits {
+                    max_operations: 1,
+                    ..PatchLimits::default()
+                },
+                "*** Begin Patch\n*** Add File: a\n+x\n*** Add File: b\n+y\n*** End Patch",
+                ParseErrorCode::TooManyOperations,
+            ),
+            (
+                "total hunks",
+                PatchLimits {
+                    max_total_hunks: 1,
+                    ..PatchLimits::default()
+                },
+                "*** Begin Patch\n*** Update File: a\n@@\n-a\n+b\n@@\n+b\n+c\n*** End Patch",
+                ParseErrorCode::TooManyHunks,
+            ),
+            (
+                "path bytes",
+                PatchLimits {
+                    max_path_bytes: 3,
+                    ..PatchLimits::default()
+                },
+                "*** Begin Patch\n*** Add File: long.txt\n+x\n*** End Patch",
+                ParseErrorCode::PathTooLong,
+            ),
+        ];
+        for (case, limits, patch, expected) in cases {
+            let error = parse(&request(patch), limits).unwrap_err();
+            assert_eq!(error.code, expected, "{case}");
+        }
     }
 }

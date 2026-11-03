@@ -204,7 +204,10 @@ async fn anthropic_stream_merges_start_cache_input_and_cumulative_output() {
     assert!(terminal);
     assert_eq!(usage.input_tokens, Some(130));
     assert_eq!(usage.output_tokens, Some(8));
-    server.await.unwrap();
+    let sent = server.await.unwrap();
+    assert_eq!(sent["stream"], true);
+    assert!(sent.get("temperature").is_none());
+    assert!(sent.get("system").is_none());
 }
 
 #[tokio::test]
@@ -325,17 +328,30 @@ async fn compatible_stream_usage_opt_in_is_profile_specific_and_terminal_is_cumu
         .await
         .unwrap();
         let mut usage = TokenUsage::default();
+        let mut detailed_usage_observed = false;
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.unwrap();
             if let Some(snapshot) = chunk.usage {
+                if snapshot.reasoning_tokens.is_some() {
+                    detailed_usage_observed = true;
+                    assert_eq!(snapshot.input_tokens, Some(140));
+                    assert_eq!(snapshot.output_tokens, Some(19));
+                    assert_eq!(snapshot.reasoning_tokens, Some(10));
+                    assert_eq!(snapshot.uncached_input_tokens, Some(20));
+                }
                 usage.update(&snapshot);
             }
         }
+        assert!(
+            detailed_usage_observed,
+            "missing detailed usage for {profile}"
+        );
         assert_eq!(usage.input_tokens, Some(140));
         assert_eq!(usage.output_tokens, Some(19));
         assert_eq!(usage.cache_read_input_tokens, Some(100));
         assert_eq!(usage.cache_write_input_tokens, Some(20));
         assert_eq!(usage.reasoning_tokens, Some(10));
+        assert_eq!(usage.uncached_input_tokens, Some(20));
         assert_eq!(usage.generation_id.as_deref(), Some("chat-native-1"));
         assert_eq!(usage.reported_model.as_deref(), Some("reported-model"));
         let request = server.await.unwrap();
@@ -357,6 +373,7 @@ async fn groq_request_id_is_distinct_and_profile_specific() {
         )
         .await
         .unwrap();
+        assert_eq!(response.text, "answer");
         let usage = response.usage.unwrap();
         assert_eq!(usage.generation_id.as_deref(), Some("chatcmpl-completion"));
         assert_eq!(
@@ -515,6 +532,7 @@ async fn anthropic_returned_model_survives_nonstream_and_message_start_without_u
         assert_eq!(usage.reported_model.as_deref(), Some("claude-returned"));
         assert_eq!(usage.generation_id.as_deref(), Some("msg-native"));
         assert_eq!(usage.input_tokens, None);
+        assert_eq!(usage.output_tokens, None);
         server.await.unwrap();
     }
 }

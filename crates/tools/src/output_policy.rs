@@ -130,6 +130,7 @@ impl ToolResultEnvelope {
         if !parts.is_empty() {
             let content = serde_json::to_string(&payload).unwrap_or_else(|_| payload.to_string());
             return ModelInputItem::message(ChatMessage {
+                application_context: None,
                 provenance: None,
                 role: Role::Tool,
                 content,

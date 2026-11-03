@@ -128,9 +128,7 @@ async fn prepare_with_profile(
 }
 
 fn text_tokens(text: &str) -> u64 {
-    tiktoken_rs::cl100k_base_singleton()
-        .encode_with_special_tokens(text)
-        .len() as u64
+    pioneer_compaction::text_tokens(text)
 }
 
 fn estimate(provider: &str, model: &str, attachment: &PreparedAttachment) -> Result<u64> {
@@ -271,7 +269,7 @@ pub fn image_tokens(provider: &str, model: &str, width: u32, height: u32) -> Res
     };
     // Count original patches without assuming an undocumented resizing cap.
     // Other vision models use this explicit local approximation; provider
-    // overflow recovery remains necessary, as for text tokenization.
+    // overflow recovery remains necessary, as for text estimation.
     Ok(u64::from(width.div_ceil(32))
         .saturating_mul(u64::from(height.div_ceil(32)))
         .saturating_mul(multiplier)

@@ -177,152 +177,6 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_success_payload() {
-        let json = payload_json(ExecPayloadInput {
-            exit_code: Some(0),
-            timed_out: false,
-            duration_ms: 12,
-            stdout: "ok\n".to_owned(),
-            stderr: String::new(),
-            session_id: None,
-            command: vec!["/bin/sh".to_owned(), "-c".to_owned(), "echo ok".to_owned()],
-            max_output_tokens: None,
-            force_truncated_stdout: false,
-            force_truncated_stderr: false,
-        });
-        assert_json_eq(
-            json.as_str(),
-            r#"{
-            "exit_code": 0,
-            "timed_out": false,
-            "duration_ms": 12,
-            "stdout": "ok\n",
-            "stderr": "",
-            "aggregated_output": "ok\n",
-            "truncated": {
-                "stdout": false,
-                "stderr": false,
-                "aggregated_output": false
-            },
-            "command": [
-                "/bin/sh",
-                "-c",
-                "echo ok"
-            ]
-            }"#,
-        );
-    }
-
-    #[test]
-    fn snapshot_non_zero_payload() {
-        let json = payload_json(ExecPayloadInput {
-            exit_code: Some(2),
-            timed_out: false,
-            duration_ms: 44,
-            stdout: String::new(),
-            stderr: "boom".to_owned(),
-            session_id: None,
-            command: vec!["sh".to_owned(), "-c".to_owned(), "exit 2".to_owned()],
-            max_output_tokens: None,
-            force_truncated_stdout: false,
-            force_truncated_stderr: false,
-        });
-        assert_json_eq(
-            json.as_str(),
-            r#"{
-            "exit_code": 2,
-            "timed_out": false,
-            "duration_ms": 44,
-            "stdout": "",
-            "stderr": "boom",
-            "aggregated_output": "boom",
-            "truncated": {
-                "stdout": false,
-                "stderr": false,
-                "aggregated_output": false
-            },
-            "command": [
-                "sh",
-                "-c",
-                "exit 2"
-            ]
-            }"#,
-        );
-    }
-
-    #[test]
-    fn snapshot_signal_payload() {
-        let json = payload_json(ExecPayloadInput {
-            exit_code: None,
-            timed_out: false,
-            duration_ms: 30,
-            stdout: String::new(),
-            stderr: "terminated by signal".to_owned(),
-            session_id: None,
-            command: vec!["sh".to_owned(), "-c".to_owned(), "kill -TERM $$".to_owned()],
-            max_output_tokens: None,
-            force_truncated_stdout: false,
-            force_truncated_stderr: false,
-        });
-        assert_json_eq(
-            json.as_str(),
-            r#"{
-            "timed_out": false,
-            "duration_ms": 30,
-            "stdout": "",
-            "stderr": "terminated by signal",
-            "aggregated_output": "terminated by signal",
-            "truncated": {
-                "stdout": false,
-                "stderr": false,
-                "aggregated_output": false
-            },
-            "command": [
-                "sh",
-                "-c",
-                "kill -TERM $$"
-            ]
-            }"#,
-        );
-    }
-
-    #[test]
-    fn snapshot_timeout_payload() {
-        let json = payload_json(ExecPayloadInput {
-            exit_code: None,
-            timed_out: true,
-            duration_ms: 1_000,
-            stdout: String::new(),
-            stderr: "command timed out".to_owned(),
-            session_id: None,
-            command: vec!["sh".to_owned(), "-c".to_owned(), "sleep 5".to_owned()],
-            max_output_tokens: None,
-            force_truncated_stdout: false,
-            force_truncated_stderr: false,
-        });
-        assert_json_eq(
-            json.as_str(),
-            r#"{
-            "timed_out": true,
-            "duration_ms": 1000,
-            "stdout": "",
-            "stderr": "command timed out",
-            "aggregated_output": "command timed out",
-            "truncated": {
-                "stdout": false,
-                "stderr": false,
-                "aggregated_output": false
-            },
-            "command": [
-                "sh",
-                "-c",
-                "sleep 5"
-            ]
-            }"#,
-        );
-    }
-
-    #[test]
     fn snapshot_huge_output_payload() {
         let json = payload_json(ExecPayloadInput {
             exit_code: Some(0),
@@ -426,5 +280,132 @@ mod tests {
             ]
             }"#,
         );
+    }
+
+    #[test]
+    fn shell_exit_states_preserve_exact_json_payloads() {
+        let cases = [
+            // snapshot_success_payload
+            (
+                Some(0),
+                false,
+                12,
+                "ok\n".to_owned(),
+                String::new(),
+                vec!["/bin/sh".to_owned(), "-c".to_owned(), "echo ok".to_owned()],
+                r#"{
+            "exit_code": 0,
+            "timed_out": false,
+            "duration_ms": 12,
+            "stdout": "ok\n",
+            "stderr": "",
+            "aggregated_output": "ok\n",
+            "truncated": {
+                "stdout": false,
+                "stderr": false,
+                "aggregated_output": false
+            },
+            "command": [
+                "/bin/sh",
+                "-c",
+                "echo ok"
+            ]
+            }"#,
+            ),
+            // snapshot_non_zero_payload
+            (
+                Some(2),
+                false,
+                44,
+                String::new(),
+                "boom".to_owned(),
+                vec!["sh".to_owned(), "-c".to_owned(), "exit 2".to_owned()],
+                r#"{
+            "exit_code": 2,
+            "timed_out": false,
+            "duration_ms": 44,
+            "stdout": "",
+            "stderr": "boom",
+            "aggregated_output": "boom",
+            "truncated": {
+                "stdout": false,
+                "stderr": false,
+                "aggregated_output": false
+            },
+            "command": [
+                "sh",
+                "-c",
+                "exit 2"
+            ]
+            }"#,
+            ),
+            // snapshot_signal_payload
+            (
+                None,
+                false,
+                30,
+                String::new(),
+                "terminated by signal".to_owned(),
+                vec!["sh".to_owned(), "-c".to_owned(), "kill -TERM $$".to_owned()],
+                r#"{
+            "timed_out": false,
+            "duration_ms": 30,
+            "stdout": "",
+            "stderr": "terminated by signal",
+            "aggregated_output": "terminated by signal",
+            "truncated": {
+                "stdout": false,
+                "stderr": false,
+                "aggregated_output": false
+            },
+            "command": [
+                "sh",
+                "-c",
+                "kill -TERM $$"
+            ]
+            }"#,
+            ),
+            // snapshot_timeout_payload
+            (
+                None,
+                true,
+                1_000,
+                String::new(),
+                "command timed out".to_owned(),
+                vec!["sh".to_owned(), "-c".to_owned(), "sleep 5".to_owned()],
+                r#"{
+            "timed_out": true,
+            "duration_ms": 1000,
+            "stdout": "",
+            "stderr": "command timed out",
+            "aggregated_output": "command timed out",
+            "truncated": {
+                "stdout": false,
+                "stderr": false,
+                "aggregated_output": false
+            },
+            "command": [
+                "sh",
+                "-c",
+                "sleep 5"
+            ]
+            }"#,
+            ),
+        ];
+        for (exit_code, timed_out, duration_ms, stdout, stderr, command, expected) in cases {
+            let json = payload_json(ExecPayloadInput {
+                exit_code,
+                timed_out,
+                duration_ms,
+                stdout,
+                stderr,
+                session_id: None,
+                command,
+                max_output_tokens: None,
+                force_truncated_stdout: false,
+                force_truncated_stderr: false,
+            });
+            assert_json_eq(json.as_str(), expected);
+        }
     }
 }

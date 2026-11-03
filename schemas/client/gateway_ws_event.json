@@ -5947,7 +5947,6 @@
       "type": "string",
       "enum": [
         "turn_pre_prompt_context",
-        "turn_post_preflight_prompt_context",
         "turn_pre_prompt_compile",
         "runtime_turn_pre_context"
       ]
@@ -6043,13 +6042,19 @@
       ]
     },
     "ProviderErrorReason": {
-      "description": "Allowlisted OpenRouter Chat Completions metadata.error_type values.\nDiagnostic only: these values must not drive recovery policy.",
+      "description": "Allowlisted provider error reasons, never raw provider messages or values.\nDiagnostic only: these values must not drive recovery policy.",
       "type": "string",
       "enum": [
         "context_length_exceeded",
         "max_tokens_exceeded",
         "token_limit_exceeded",
         "string_too_long",
+        "missing_required_parameter",
+        "unsupported_parameter",
+        "invalid_parameter_value",
+        "invalid_parameter_type",
+        "responses_missing_required_item",
+        "responses_unpaired_tool_call",
         "authentication",
         "permission_denied",
         "payment_required",
@@ -6073,6 +6078,35 @@
         "server",
         "timeout",
         "unmapped"
+      ]
+    },
+    "ProviderErrorResponse": {
+      "description": "Original provider error response, bounded by the transport limit for local storage.\nDebug output deliberately omits all payloads; public prose never uses them.",
+      "type": "object",
+      "properties": {
+        "body": {
+          "type": "string"
+        },
+        "processingError": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "streamContext": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "truncated": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "body",
+        "truncated"
       ]
     },
     "ProviderFailureClass": {
@@ -6402,6 +6436,16 @@
           "format": "uint16",
           "maximum": 65535,
           "minimum": 0
+        },
+        "rawResponse": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProviderErrorResponse"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "requestId": {
           "anyOf": [
@@ -9237,6 +9281,13 @@
         "run"
       ]
     },
+    "TaskRunInputEncoding": {
+      "type": "string",
+      "enum": [
+        "utf8",
+        "base64"
+      ]
+    },
     "TaskRunStartedNotification": {
       "type": "object",
       "properties": {
@@ -9265,6 +9316,27 @@
         "blocked",
         "cancelled",
         "timed_out"
+      ]
+    },
+    "TaskRunTriggerInput": {
+      "type": "object",
+      "properties": {
+        "body": {
+          "type": "string"
+        },
+        "contentType": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "encoding": {
+          "$ref": "#/$defs/TaskRunInputEncoding"
+        }
+      },
+      "required": [
+        "encoding",
+        "body"
       ]
     },
     "TaskScheduledNotification": {
@@ -11423,6 +11495,11 @@
         "turn_kind": {
           "$ref": "#/$defs/TurnKind",
           "default": "conversation"
+        },
+        "work_owner": {
+          "description": "Immutable owner of the admitted work; absent historical wire values own their turn.",
+          "$ref": "#/$defs/TurnWorkOwner",
+          "default": "turn"
         }
       },
       "required": [
@@ -14176,6 +14253,14 @@
         "reason"
       ]
     },
+    "TurnWorkOwner": {
+      "description": "Canonical work ownership, persisted at admission independently of authorship.",
+      "type": "string",
+      "enum": [
+        "turn",
+        "detached_task"
+      ]
+    },
     "TurnWorkPresentation": {
       "type": "string",
       "enum": [
@@ -14931,34 +15016,6 @@
       "required": [
         "revision",
         "workspace_id"
-      ]
-    },
-    "TaskRunTriggerInput": {
-      "type": "object",
-      "properties": {
-        "body": {
-          "type": "string"
-        },
-        "contentType": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "encoding": {
-          "$ref": "#/$defs/TaskRunInputEncoding"
-        }
-      },
-      "required": [
-        "encoding",
-        "body"
-      ]
-    },
-    "TaskRunInputEncoding": {
-      "type": "string",
-      "enum": [
-        "utf8",
-        "base64"
       ]
     }
   }

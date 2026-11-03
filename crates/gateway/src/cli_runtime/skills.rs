@@ -2394,21 +2394,6 @@ mod tests {
     }
 
     #[test]
-    fn cli_runtime_codex_skill_input_builder_is_noop_for_zero_skills() {
-        let mut mapping = pioneer_cli_agent_runtime::input::CLIRuntimeTurnInputMapping {
-            input: vec![
-                pioneer_cli_agent_runtime::input::CLIRuntimeTurnInputItem::Text {
-                    text: "user request".to_owned(),
-                },
-            ],
-            diagnostics: Vec::new(),
-        };
-        let before = mapping.clone();
-        prepend_installed_skill_items(&[], &mut mapping);
-        assert_eq!(mapping, before);
-    }
-
-    #[test]
     fn cli_runtime_codex_skill_input_builder_prepends_only_structured_items() {
         let mut mapping = pioneer_cli_agent_runtime::input::CLIRuntimeTurnInputMapping {
             input: vec![
@@ -2418,6 +2403,9 @@ mod tests {
             ],
             diagnostics: Vec::new(),
         };
+        let before = mapping.clone();
+        prepend_installed_skill_items(&[], &mut mapping);
+        assert_eq!(mapping, before);
         prepend_installed_skill_items(
             &[
                 installed_skill("pdf", "/native/skills/pdf"),

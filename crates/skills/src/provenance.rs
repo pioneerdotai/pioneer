@@ -445,7 +445,7 @@ mod tests {
         let path = temp_file("convert-path-first");
         fs::write(
             path.as_path(),
-            "version = 1\n[[entries]]\nowner='registry'\nslug='alpha'\nsource_kind='registry'\nsource_ref='old'\ninstall_path='/old/b'\nversion='1.0.0'\ntrust_level='verified'\nfingerprint='old-fp'\ninstalled_at=7\n[[entries]]\nowner='registry'\nslug='alpha'\nsource_kind='registry'\nsource_ref='stale'\ninstall_path='/missing'\ntrust_level='verified'\nfingerprint='stale'\ninstalled_at=8\n",
+            "version = 1\n[[entries]]\nowner='registry'\nslug='alpha'\nsource_kind='registry'\nsource_ref='old'\ninstall_path='/old/b'\nversion='1.0.0'\ntrust_level='community'\nfingerprint='old-fp'\ninstalled_at=7\n[[entries]]\nowner='registry'\nslug='alpha'\nsource_kind='registry'\nsource_ref='stale'\ninstall_path='/missing'\ntrust_level='verified'\nfingerprint='stale'\ninstalled_at=8\n",
         )
         .unwrap();
         let candidates = [

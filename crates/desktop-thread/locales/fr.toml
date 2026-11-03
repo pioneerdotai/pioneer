@@ -358,3 +358,4 @@
 "plugins.select" = "Sélectionner des plugins"
 "plugins.unavailable" = "Indisponible"
 "plugins.updating" = "Mise à jour…"
+"chat.composer.preparing_send" = "Préparation du message"

@@ -111,6 +111,21 @@ pub(super) async fn resolve_message_origin_locators(
                         )
                         .await?
                 }
+                "pending-turn-input-projection" | "pending-runtime-context" => {
+                    store
+                        .compaction_context_reference_for_item(
+                            workspace,
+                            &origin.thread_id,
+                            turn,
+                            &source.id,
+                            if kind == "pending-turn-input-projection" {
+                                "turn_input_projection_v1"
+                            } else {
+                                "runtime_context_v1"
+                            },
+                        )
+                        .await?
+                }
                 "pending-item" => {
                     store
                         .compaction_tool_item_reference(

@@ -358,3 +358,4 @@
 "plugins.select" = "选择插件"
 "plugins.unavailable" = "不可用"
 "plugins.updating" = "正在更新…"
+"chat.composer.preparing_send" = "正在准备消息"

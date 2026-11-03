@@ -13,3 +13,5 @@ pub use request::{
     new_request_id, request_timeout_message, send_json_rpc_request_typed,
     send_json_rpc_request_value,
 };
+
+pub(crate) use request::{BudgetedTransport, RequestBudget};

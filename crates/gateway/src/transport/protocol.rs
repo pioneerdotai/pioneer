@@ -26,6 +26,8 @@ mod tests {
 
     #[test]
     fn native_protocol_version_is_exact_single_and_header_only() {
+        assert_eq!(PIONEER_PROTOCOL_VERSION_HEADER, "Pioneer-Protocol-Version");
+        assert_eq!(PIONEER_PROTOCOL_VERSION, "1");
         let mut headers = HeaderMap::new();
         headers.insert(
             PIONEER_PROTOCOL_VERSION_HEADER,

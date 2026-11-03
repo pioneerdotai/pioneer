@@ -71,45 +71,25 @@ pub enum TaskDerivedChildLaunchGrant {
     },
 }
 
-/// Migrates the nested child-launch contract through every registered adjacent
-/// version and returns a JSON document that current runtime code can consume.
+/// Validates the saved snapshot without changing the original JSON. The
+/// durable child deserializer authenticates first and projects for the reader.
 pub fn migrate_task_derived_child_launch_grant_json_to_current(
     json: &str,
 ) -> Result<String, TaskDerivedChildLaunchGrantMigrationError> {
     if json.len() > TASK_DERIVED_CHILD_LAUNCH_GRANT_MAX_BYTES {
         return Err(
-            TaskDerivedChildLaunchGrantMigrationError::InvalidCurrentContract(format!(
-                "task launch contract exceeds {} bytes",
-                TASK_DERIVED_CHILD_LAUNCH_GRANT_MAX_BYTES
-            )),
+            TaskDerivedChildLaunchGrantMigrationError::InvalidCurrentContract(
+                "task launch contract exceeds its byte limit".to_owned(),
+            ),
         );
     }
-    let migrated = crate::migrate_embedded_child_launch_grant_json_to_current(json)
-        .map_err(TaskDerivedChildLaunchGrantMigrationError::ChildGrant)?;
-    let current =
-        serde_json::from_str::<TaskDerivedChildLaunchGrant>(&migrated).map_err(|error| {
-            TaskDerivedChildLaunchGrantMigrationError::InvalidCurrentContract(error.to_string())
-        })?;
+    let current: TaskDerivedChildLaunchGrant = serde_json::from_str(json).map_err(|error| {
+        TaskDerivedChildLaunchGrantMigrationError::InvalidCurrentContract(error.to_string())
+    })?;
     current.validate_embedded().map_err(|error| {
         TaskDerivedChildLaunchGrantMigrationError::InvalidCurrentContract(format!("{error:?}"))
     })?;
-    // Task actor contracts compare their immutable JSON on idempotent insert.
-    // Re-encode through the current typed outer contract so an upcast V1 row
-    // has exactly the same representation as a newly produced V2 row. The
-    // generic embedded migrator cannot do this because AgentExecution grants
-    // intentionally have a different, open outer document.
-    let encoded = serde_json::to_string(&current).map_err(|error| {
-        TaskDerivedChildLaunchGrantMigrationError::InvalidCurrentContract(error.to_string())
-    })?;
-    if encoded.len() > TASK_DERIVED_CHILD_LAUNCH_GRANT_MAX_BYTES {
-        return Err(
-            TaskDerivedChildLaunchGrantMigrationError::InvalidCurrentContract(format!(
-                "migrated task launch contract exceeds {} bytes",
-                TASK_DERIVED_CHILD_LAUNCH_GRANT_MAX_BYTES
-            )),
-        );
-    }
-    Ok(encoded)
+    Ok(json.to_owned())
 }
 
 #[derive(Debug)]
@@ -158,12 +138,9 @@ impl TaskDerivedChildLaunchGrant {
         child_launch_grant
             .validate()
             .map_err(|_| TaskActorContractError::InvalidResolvedLaunchGrant)?;
-        crate::validate_selected_agent_launch_profile(
-            identity,
-            profile,
-            &child_launch_grant.identities,
-        )
-        .map_err(|_| TaskActorContractError::ResolvedLaunchGrantMismatch)?;
+        child_launch_grant
+            .validate_selected_profile(identity, profile)
+            .map_err(|_| TaskActorContractError::ResolvedLaunchGrantMismatch)?;
         let mut unique_actions = allowed_actions.clone();
         unique_actions.sort();
         unique_actions.dedup();
@@ -802,48 +779,6 @@ mod tests {
     }
 
     #[test]
-    fn contract_requires_a_destination() {
-        let mut value = contract();
-        value.delivery.destination_thread_id = None;
-        assert_eq!(
-            value.validate(),
-            Err(TaskActorContractError::MissingDeliveryDestination)
-        );
-    }
-
-    #[test]
-    fn contract_accepts_one_exact_webhook_fingerprint() {
-        let mut value = contract();
-        value.delivery.destination_thread_id = None;
-        value.delivery.destination_webhook_url_fingerprint = Some("a".repeat(64));
-        assert!(value.validate().is_ok());
-
-        value.delivery.destination_user_id = Some("USER1234567890123456".to_owned());
-        assert_eq!(
-            value.validate(),
-            Err(TaskActorContractError::ConflictingDeliveryDestinations)
-        );
-    }
-
-    #[test]
-    fn delivery_route_supports_thread_or_user_notification_but_not_webhook() {
-        let mut value = contract();
-        value.delivery.destination_thread_id = None;
-        value.delivery.destination_user_id = Some("USER1234567890123456".to_owned());
-        value.delivery.route_id = Some("ROUTE123456789012345".to_owned());
-        value.delivery.route_receipt_json =
-            Some(route_receipt("ROUTE123456789012345", "deliver_result"));
-        assert!(value.validate().is_ok());
-
-        value.delivery.destination_user_id = None;
-        value.delivery.destination_webhook_url_fingerprint = Some("a".repeat(64));
-        assert_eq!(
-            value.validate(),
-            Err(TaskActorContractError::InvalidDeliveryDestination)
-        );
-    }
-
-    #[test]
     fn execution_route_requires_exact_destination_and_receipt() {
         let mut value = contract();
         value.execution_route_id = Some("ROUTE123456789012345".to_owned());
@@ -1089,5 +1024,45 @@ mod tests {
             ),
             Err(TaskActorContractError::GenerationOverflow)
         );
+    }
+
+    #[test]
+    fn delivery_destination_validation_preserves_webhook_and_route_boundaries() {
+        for (user, webhook, route_id, expected) in [
+            (
+                None,
+                None,
+                None,
+                Err(TaskActorContractError::MissingDeliveryDestination),
+            ),
+            (None, Some("a".repeat(64)), None, Ok(())),
+            (
+                Some("USER1234567890123456"),
+                Some("a".repeat(64)),
+                None,
+                Err(TaskActorContractError::ConflictingDeliveryDestinations),
+            ),
+            (
+                Some("USER1234567890123456"),
+                None,
+                Some("ROUTE123456789012345"),
+                Ok(()),
+            ),
+            (
+                None,
+                Some("a".repeat(64)),
+                Some("ROUTE123456789012345"),
+                Err(TaskActorContractError::InvalidDeliveryDestination),
+            ),
+        ] {
+            let mut value = contract();
+            value.delivery.destination_thread_id = None;
+            value.delivery.destination_user_id = user.map(str::to_owned);
+            value.delivery.destination_webhook_url_fingerprint = webhook;
+            value.delivery.route_id = route_id.map(str::to_owned);
+            value.delivery.route_receipt_json =
+                route_id.map(|id| route_receipt(id, "deliver_result"));
+            assert_eq!(value.validate(), expected);
+        }
     }
 }

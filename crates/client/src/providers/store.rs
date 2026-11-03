@@ -1300,15 +1300,19 @@ mod tests {
         let a = ProviderCollectionKey::models("one", "openai", ProviderModelKind::Chat);
         let b = ProviderCollectionKey::models("one", "openai", ProviderModelKind::Embeddings);
         let c = ProviderCollectionKey::models("two", "openai", ProviderModelKind::Chat);
-        let reads = [a.clone(), b.clone(), c.clone()]
+        let d = ProviderCollectionKey::models("one", "openai", ProviderModelKind::Transcription);
+        let e = ProviderCollectionKey::models("one", "anthropic", ProviderModelKind::Chat);
+        let reads = [a.clone(), b.clone(), c.clone(), d.clone(), e.clone()]
             .map(|key| core.read_provider_collection(key, false).unwrap());
-        for _ in 0..3 {
-            core.complete_provider_collection(
-                requests.try_recv().unwrap(),
-                Ok(models("openai", &["model"])),
-            );
+        for _ in 0..5 {
+            let request = requests.try_recv().unwrap();
+            let ProviderCollection::Models { provider, .. } = &request.key.collection else {
+                panic!("expected model request");
+            };
+            let response = models(provider, &["model"]);
+            core.complete_provider_collection(request, Ok(response));
         }
-        let [ar, br, cr] = reads.map(|r| r.wait().unwrap());
+        let [ar, br, cr, dr, er] = reads.map(|r| r.wait().unwrap());
         let refresh = core.read_provider_collection(a, true).unwrap();
         core.complete_provider_collection(
             requests.try_recv().unwrap(),
@@ -1326,6 +1330,49 @@ mod tests {
             &cr,
             &core.provider_collection_snapshot(&c).unwrap()
         ));
+        assert!(Arc::ptr_eq(
+            &dr,
+            &core.provider_collection_snapshot(&d).unwrap()
+        ));
+        assert!(Arc::ptr_eq(
+            &er,
+            &core.provider_collection_snapshot(&e).unwrap()
+        ));
+    }
+    #[test]
+    fn connection_change_fences_all_purposes_and_empty_selection_stays_cached() {
+        let (core, requests) = fixture();
+        let authorization = core.authorization_snapshot(None, None).unwrap();
+        let chat = ProviderCollectionKey::models("workspace", "openai", ProviderModelKind::Chat);
+        let embeddings =
+            ProviderCollectionKey::models("workspace", "openai", ProviderModelKind::Embeddings);
+        let reads = [chat.clone(), embeddings.clone()]
+            .map(|key| core.read_provider_collection(key, false).unwrap());
+        let stale = [requests.try_recv().unwrap(), requests.try_recv().unwrap()];
+        core.begin_authorization_epoch(Some(("replacement".into(), 2)));
+        for read in reads {
+            assert_eq!(read.wait().unwrap().request(), ProviderLoadState::Cancelled);
+        }
+        for request in stale {
+            core.complete_provider_collection(request, Ok(models("openai", &["old-connection"])));
+        }
+        core.accept_authorization_projection_for_connection("replacement", 2, authorization);
+        let read = core.read_provider_collection(chat.clone(), false).unwrap();
+        core.complete_provider_collection(requests.try_recv().unwrap(), Ok(models("openai", &[])));
+        assert!(read.wait().unwrap().models().is_empty());
+        assert!(
+            core.read_provider_collection(chat, false)
+                .unwrap()
+                .wait()
+                .unwrap()
+                .models()
+                .is_empty()
+        );
+        assert!(requests.try_recv().is_err());
+        assert!(
+            core.provider_collection_snapshot(&embeddings)
+                .is_none_or(|p| p.models().is_empty())
+        );
     }
     #[test]
     fn access_fence_wakes_waiters_and_rejects_late_success() {

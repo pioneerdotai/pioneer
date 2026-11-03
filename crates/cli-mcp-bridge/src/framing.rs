@@ -354,6 +354,15 @@ mod tests {
                 max: 128,
             })
         );
+
+        oversized[8..12].copy_from_slice(&1025_u32.to_be_bytes());
+        assert_eq!(
+            decode_frame_with_limit(&oversized, 1024),
+            Err(BridgeFrameError::PayloadTooLarge {
+                declared: 1025,
+                max: 1024,
+            })
+        );
     }
 
     #[test]

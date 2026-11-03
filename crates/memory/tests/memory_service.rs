@@ -6,9 +6,8 @@ use pioneer_crud::{
 use pioneer_memory::{
     BackendDeleteRequest, BackendDeleteResult, BackendGetRequest, BackendPayload,
     BackendPutRequest, BackendPutResult, BackendSearchHit, BackendSearchRequest,
-    InMemoryMemoryBackend, MemoryBackend, MemoryModeRecallParams, MemoryOperationContext,
-    MemoryQuarantineRequest, MemoryReadPolicy, MemoryRecallMode, MemoryRecallParams,
-    MemoryRecallTarget, MemoryRestoreRequest, MemoryService, MemoryServiceConfig,
+    InMemoryMemoryBackend, MemoryBackend, MemoryOperationContext, MemoryQuarantineRequest,
+    MemoryReadPolicy, MemoryRestoreRequest, MemoryService, MemoryServiceConfig,
     MemorySourceAccessPolicy,
 };
 use pioneer_protocol::{
@@ -1173,26 +1172,6 @@ async fn addressed_semantic_corrections_preserve_legacy_keys_and_follow_the_link
             .record
             .unwrap();
         assert_eq!(by_identity.id, direct_new.id);
-        let recalled = service
-            .recall_mode_for_prompt(
-                user_context(105),
-                MemoryModeRecallParams {
-                    mode: MemoryRecallMode::ExactCanonical,
-                    targets: vec![MemoryRecallTarget {
-                        scope_kind: Some(MemoryScopeKind::User),
-                        category: Some(MemoryCategory::Identity),
-                        subject: Some(MemorySubject::CurrentUser),
-                        attribute: Some(MemoryAttribute::Name),
-                        ..Default::default()
-                    }],
-                    top_k: Some(5),
-                    max_chars: Some(1000),
-                },
-            )
-            .await
-            .unwrap();
-        assert_eq!(recalled.items.len(), 1);
-        assert_eq!(recalled.items[0].memory_id, direct_new.id);
         let via_alias = service
             .remember(
                 user_context(106),
@@ -1339,6 +1318,8 @@ async fn semantic_identity_writes_share_canonical_key_and_merge_evidence() {
         )
         .await
         .expect("duplicate semantic write");
+    assert_eq!(second.canonical_key.key, "user/global:identity:self:name");
+    assert_eq!(second.semantic_fingerprint, first.semantic_fingerprint);
     assert_eq!(second.relation, MemoryWriteRelation::Duplicate);
     assert!(!second.created);
     assert!(second.evidence_merged);
@@ -2072,7 +2053,7 @@ async fn semantic_write_extractor_ontology_proposal_is_advisory_only() {
 
 #[tokio::test]
 async fn semantic_thread_episodic_route_response_carries_deferred_refs() {
-    let (_store, _backend, service) = setup_service().await;
+    let (store, _backend, service) = setup_service().await;
     let turn_id = "turn_thread_episodic_route_info";
     let response = service
         .write_semantic_memory(
@@ -2115,6 +2096,27 @@ async fn semantic_thread_episodic_route_response_carries_deferred_refs() {
         route.canonical_key.as_deref(),
         Some("user/default:todo:self:custom_4de127d381235b26")
     );
+
+    let decisions = store
+        .list_agent_memory_quality_decisions_for_thread("thread_semantic", 20)
+        .await
+        .expect("quality decisions");
+    assert!(decisions.iter().any(|decision| {
+        decision.turn_id.as_deref() == Some(turn_id)
+            && decision.action == MemoryQualityAction::RouteToThreadEpisodic
+    }));
+
+    let search = service
+        .search(
+            user_context(385),
+            MemorySearchParams {
+                query: "revisit active debugging branch".to_owned(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("deferred fact is not searchable");
+    assert!(search.hits.is_empty());
 }
 
 #[tokio::test]
@@ -2161,18 +2163,6 @@ async fn semantic_generated_summary_routes_to_thread_episodic_deferral() {
             .await
             .expect("search");
         assert!(search.hits.is_empty(), "{query}");
-
-        let recall = service
-            .recall_for_prompt(
-                user_context(387),
-                MemoryRecallParams {
-                    query: query.to_owned(),
-                    ..Default::default()
-                },
-            )
-            .await
-            .expect("recall");
-        assert!(recall.items.is_empty(), "{query}");
     }
 }
 
@@ -2316,17 +2306,17 @@ async fn semantic_domain_state_routes_are_deferred_and_not_memory() {
         "OpenRouter request took 118 seconds",
         "provider latency temporarily elevated",
     ] {
-        let recall = service
-            .recall_for_prompt(
+        let search = service
+            .search(
                 workspace_context("ws_route_domain", 392),
-                MemoryRecallParams {
+                MemorySearchParams {
                     query: query.to_owned(),
                     ..Default::default()
                 },
             )
             .await
-            .expect("recall");
-        assert!(recall.items.is_empty(), "{query}");
+            .expect("domain runtime state is not searchable");
+        assert!(search.hits.is_empty(), "{query}");
     }
 }
 
@@ -2467,7 +2457,7 @@ async fn semantic_force_reject_response_is_rejected_terminal_route() {
 
 #[tokio::test]
 async fn semantic_quarantine_response_is_audit_only_terminal_route() {
-    let (_store, _backend, service) = setup_service().await;
+    let (store, _backend, service) = setup_service().await;
     let response = service
         .write_semantic_memory(
             user_context(395),
@@ -2494,17 +2484,28 @@ async fn semantic_quarantine_response_is_audit_only_terminal_route() {
     );
     assert!(route.quality_decision_id.is_some());
 
-    let recall = service
-        .recall_for_prompt(
+    let decisions = store
+        .list_agent_memory_quality_decisions_for_thread("thread_semantic", 20)
+        .await
+        .expect("quality decisions");
+    assert!(decisions.iter().any(|decision| {
+        decision.turn_id.as_deref() == Some("turn_quarantine_audit_only_route")
+            && decision.action == MemoryQualityAction::Quarantine
+            && decision
+                .reason_codes
+                .contains(&MemoryQualityReasonCode::UnknownFactClass)
+    }));
+    let search = service
+        .search(
             user_context(396),
-            MemoryRecallParams {
+            MemorySearchParams {
                 query: "unknown custom fact".to_owned(),
                 ..Default::default()
             },
         )
         .await
-        .expect("recall");
-    assert!(recall.items.is_empty());
+        .expect("audit-only fact is not searchable");
+    assert!(search.hits.is_empty());
 }
 
 #[tokio::test]
@@ -2577,128 +2578,6 @@ async fn semantic_weak_evidence_and_unknown_lifetime_do_not_create_review_candid
         decision.turn_id.as_deref() == Some("turn_unknown_lifetime_quarantine")
             && decision.action == MemoryQualityAction::Quarantine
     }));
-}
-
-#[tokio::test]
-async fn semantic_quality_gate_routes_and_quarantines_without_exposing_memory() {
-    let (store, _backend, service) = setup_service().await;
-    let routed_thread = service
-        .write_semantic_memory(
-            user_context(370),
-            semantic_write_params(
-                thread_local_todo_semantic(),
-                "Thread-only follow-up should stay out of durable memory.",
-                "thread-only follow-up",
-                MemorySemanticWriteDisposition::RouteToCandidatePolicy,
-                "turn_quality_route_thread",
-            ),
-        )
-        .await
-        .expect("thread route write");
-    assert!(routed_thread.record.is_none());
-    assert!(routed_thread.candidate.is_none());
-
-    let mut task_params = semantic_write_params(
-        task_lifecycle_semantic(),
-        "Task runtime state should stay out of durable memory.",
-        "task runtime state",
-        MemorySemanticWriteDisposition::RouteToCandidatePolicy,
-        "turn_quality_route_task",
-    );
-    task_params.source_context_kind = Some(MemorySourceContextKind::TaskRuntime);
-    let routed_task = service
-        .write_semantic_memory(workspace_context("ws_quality", 371), task_params)
-        .await
-        .expect("task route write");
-    assert!(routed_task.record.is_none());
-    assert!(routed_task.candidate.is_none());
-
-    let mut tool_params = semantic_write_params(
-        tool_result_semantic(),
-        "Tool observation should stay out of durable memory.",
-        "tool observation",
-        MemorySemanticWriteDisposition::RouteToCandidatePolicy,
-        "turn_quality_route_tool",
-    );
-    tool_params.scope = scope(MemoryScopeKind::Workspace, "ws_quality");
-    tool_params.source_context_kind = Some(MemorySourceContextKind::ToolResult);
-    let routed_tool = service
-        .write_semantic_memory(workspace_context("ws_quality", 372), tool_params)
-        .await
-        .expect("tool route write");
-    assert!(routed_tool.record.is_none());
-    assert!(routed_tool.candidate.is_none());
-
-    let quarantined = service
-        .write_semantic_memory(
-            user_context(373),
-            semantic_write_params(
-                unknown_custom_semantic(),
-                "Unknown custom fact should be quarantined.",
-                "unknown custom fact",
-                MemorySemanticWriteDisposition::RouteToCandidatePolicy,
-                "turn_quality_quarantine_unknown",
-            ),
-        )
-        .await
-        .expect("quarantine write");
-    assert!(quarantined.record.is_none());
-    assert!(quarantined.candidate.is_none());
-
-    let decisions = store
-        .list_agent_memory_quality_decisions_for_thread("thread_semantic", 20)
-        .await
-        .expect("quality decisions");
-    assert!(decisions.iter().any(|decision| {
-        decision.turn_id.as_deref() == Some("turn_quality_route_thread")
-            && decision.action == MemoryQualityAction::RouteToThreadEpisodic
-    }));
-    assert!(decisions.iter().any(|decision| {
-        decision.turn_id.as_deref() == Some("turn_quality_route_task")
-            && decision.action == MemoryQualityAction::RouteToTaskState
-    }));
-    assert!(decisions.iter().any(|decision| {
-        decision.turn_id.as_deref() == Some("turn_quality_route_tool")
-            && decision.action == MemoryQualityAction::RouteToDomainState
-    }));
-    assert!(decisions.iter().any(|decision| {
-        decision.turn_id.as_deref() == Some("turn_quality_quarantine_unknown")
-            && decision.action == MemoryQualityAction::Quarantine
-            && decision
-                .reason_codes
-                .contains(&MemoryQualityReasonCode::UnknownFactClass)
-    }));
-
-    for query in [
-        "thread-only follow-up",
-        "task runtime state",
-        "tool observation",
-        "unknown custom fact",
-    ] {
-        let search = service
-            .search(
-                workspace_context("ws_quality", 374),
-                MemorySearchParams {
-                    query: query.to_owned(),
-                    ..Default::default()
-                },
-            )
-            .await
-            .expect("search");
-        assert!(search.hits.is_empty(), "{query}");
-
-        let recall = service
-            .recall_for_prompt(
-                workspace_context("ws_quality", 375),
-                MemoryRecallParams {
-                    query: query.to_owned(),
-                    ..Default::default()
-                },
-            )
-            .await
-            .expect("recall");
-        assert!(recall.items.is_empty(), "{query}");
-    }
 }
 
 #[tokio::test]
@@ -3846,102 +3725,6 @@ async fn recall_visibility_suppresses_polluted_search_and_prompt_records() {
         .map(|hit| hit.record.id.as_str())
         .collect::<Vec<_>>();
     assert_eq!(search_ids, vec![clean.record.id.as_str()]);
-
-    let prompt_recall = service
-        .recall_for_prompt(
-            user_context(461),
-            MemoryRecallParams {
-                query: "phase13".to_owned(),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("prompt recall");
-    assert_eq!(prompt_recall.items.len(), 1);
-    assert_eq!(prompt_recall.items[0].memory_id, clean.record.id);
-    assert!(prompt_recall.diagnostics.iter().any(|diagnostic| {
-        diagnostic.starts_with("memory.recall_visibility.suppressed_count:")
-    }));
-    assert!(prompt_recall.diagnostics.iter().all(|diagnostic| {
-        !diagnostic.contains("polluted memory") && !diagnostic.contains("clean durable")
-    }));
-}
-
-#[tokio::test]
-async fn recall_visibility_suppresses_mode_and_exact_canonical_records() {
-    let (store, _backend, service) = setup_service().await;
-    let mut clean_project_params = remember_params(
-        scope(MemoryScopeKind::Workspace, "ws_phase13"),
-        Some("phase13.project.clean"),
-        "phase13 clean project decision",
-    );
-    clean_project_params.category = MemoryCategory::ProjectDecision;
-    let clean_project = service
-        .remember(workspace_context("ws_phase13", 470), clean_project_params)
-        .await
-        .expect("clean project remember");
-    let mut bad_project_params = remember_params(
-        scope(MemoryScopeKind::Workspace, "ws_phase13"),
-        Some("phase13.project.bad"),
-        "phase13 bad project decision",
-    );
-    bad_project_params.category = MemoryCategory::ProjectDecision;
-    let bad_project = service
-        .remember(workspace_context("ws_phase13", 471), bad_project_params)
-        .await
-        .expect("bad project remember");
-    attach_quality_decision(
-        &store,
-        bad_project.record.id.as_str(),
-        MemoryQualityAction::Quarantine,
-        MemoryOwnershipClass::AuditOnly,
-        MemorySourceContextKind::DirectUserConversation,
-        MemoryFactClass::ProjectDecision,
-        MemoryLifetimeClass::ProjectLifetime,
-        MemoryOwnershipClass::DurableWorkspaceMemory,
-        MemoryEvidenceClass::DirectUserAssertion,
-        MemoryWriteRelation::Novel,
-        vec![MemoryQualityReasonCode::NoQualityAllowRule],
-        472,
-    )
-    .await;
-
-    let project_recall = service
-        .recall_mode_for_prompt(
-            workspace_context("ws_phase13", 473),
-            MemoryModeRecallParams {
-                mode: MemoryRecallMode::Project,
-                targets: Vec::new(),
-                top_k: Some(10),
-                max_chars: None,
-            },
-        )
-        .await
-        .expect("project mode recall");
-    assert_eq!(project_recall.items.len(), 1);
-    assert_eq!(project_recall.items[0].memory_id, clean_project.record.id);
-    assert!(project_recall.diagnostics.iter().any(|diagnostic| {
-        diagnostic
-            .contains("memory.recall_visibility.suppressed:suppress_quarantined_or_audit_only")
-    }));
-
-    let exact_bad = service
-        .recall_mode_for_prompt(
-            workspace_context("ws_phase13", 474),
-            MemoryModeRecallParams {
-                mode: MemoryRecallMode::ExactCanonical,
-                targets: vec![MemoryRecallTarget {
-                    scope_kind: Some(MemoryScopeKind::Workspace),
-                    canonical_key: Some("phase13.project.bad".to_owned()),
-                    ..Default::default()
-                }],
-                top_k: Some(10),
-                max_chars: None,
-            },
-        )
-        .await
-        .expect("exact bad recall");
-    assert!(exact_bad.items.is_empty());
 }
 
 #[tokio::test]
@@ -4436,329 +4219,6 @@ async fn search_backend_limit_overfetches_before_final_ranking_limit() {
         .expect("search");
     assert!(search.hits.is_empty());
     assert_eq!(backend.search_limits().await, vec![12]);
-}
-
-#[tokio::test]
-async fn recall_for_prompt_uses_prompt_top_k_and_char_budgets() {
-    let mut config = MemoryServiceConfig::default();
-    config.recall.prompt_top_k = 2;
-    config.recall.max_item_chars = 18;
-    config.recall.max_prompt_chars = 30;
-    let (_store, _backend, service) = setup_service_with_config(config).await;
-
-    for index in 0..3 {
-        service
-            .remember(
-                user_context(700 + index),
-                remember_params(
-                    scope(MemoryScopeKind::User, "default"),
-                    Some(format!("recall.prompt.{index}").as_str()),
-                    format!("Recall prompt shared token with    extra whitespace line {index}.")
-                        .as_str(),
-                ),
-            )
-            .await
-            .expect("remember");
-    }
-
-    let recall = service
-        .recall_for_prompt(
-            user_context(710),
-            MemoryRecallParams {
-                query: "Recall prompt shared token".to_owned(),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("recall");
-
-    assert_eq!(recall.items.len(), 2);
-    assert!(
-        recall
-            .items
-            .iter()
-            .all(|item| item.content.chars().count() <= 18)
-    );
-    let total_chars = recall
-        .items
-        .iter()
-        .map(|item| item.content.chars().count())
-        .sum::<usize>();
-    assert!(total_chars <= 30);
-    assert!(
-        recall
-            .items
-            .iter()
-            .all(|item| !item.content.contains("  ") && !item.content.contains('\n'))
-    );
-}
-
-#[tokio::test]
-async fn recall_for_prompt_generic_active_query_can_find_profile_identity_memory() {
-    let (_store, _backend, service) = setup_service().await;
-    service
-        .remember(
-            user_context(720),
-            remember_params(
-                scope(MemoryScopeKind::User, "default"),
-                Some("user/global:identity:self:name"),
-                "Имя пользователя — Александр.",
-            ),
-        )
-        .await
-        .expect("remember identity");
-
-    let recall = service
-        .recall_for_prompt(
-            user_context(721),
-            MemoryRecallParams {
-                query: "durable user identity preferences biography communication style recurring instructions project facts project decisions procedures constraints todos ongoing tasks"
-                    .to_owned(),
-                top_k: Some(5),
-                max_chars: Some(1_500),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("recall");
-
-    assert!(
-        recall
-            .items
-            .iter()
-            .any(|item| item.content.contains("Александр")),
-        "generic active recall query should be able to surface stable identity memory"
-    );
-}
-
-#[tokio::test]
-async fn recall_mode_for_prompt_profile_project_and_durable_are_scoped() {
-    let (_store, _backend, service) = setup_service().await;
-    service
-        .remember(
-            user_context(730),
-            remember_params(
-                scope(MemoryScopeKind::User, "default"),
-                Some("user/global:identity:self:name"),
-                "Имя пользователя — Александр.",
-            ),
-        )
-        .await
-        .expect("remember profile");
-
-    let mut project_params = remember_params(
-        scope(MemoryScopeKind::Workspace, "ws_mode_a"),
-        Some("workspace/ws_mode_a:project_decision:self:phase_naming"),
-        "Project decision: phases keep the `phase` name.",
-    );
-    project_params.category = MemoryCategory::ProjectDecision;
-    service
-        .remember(workspace_context("ws_mode_a", 731), project_params)
-        .await
-        .expect("remember project");
-
-    let mut other_workspace_params = remember_params(
-        scope(MemoryScopeKind::Workspace, "ws_mode_b"),
-        Some("workspace/ws_mode_b:project_decision:self:phase_naming"),
-        "Other workspace decision must stay isolated.",
-    );
-    other_workspace_params.category = MemoryCategory::ProjectDecision;
-    service
-        .remember(workspace_context("ws_mode_b", 732), other_workspace_params)
-        .await
-        .expect("remember other workspace");
-
-    let context = MemoryOperationContext {
-        allow_global_user: true,
-        ..workspace_context("ws_mode_a", 733)
-    };
-
-    let profile = service
-        .recall_mode_for_prompt(
-            context.clone(),
-            MemoryModeRecallParams {
-                mode: MemoryRecallMode::Profile,
-                targets: Vec::new(),
-                top_k: Some(5),
-                max_chars: Some(1_500),
-            },
-        )
-        .await
-        .expect("profile recall");
-    assert_eq!(profile.items.len(), 1);
-    assert!(profile.items[0].content.contains("Александр"));
-
-    let project = service
-        .recall_mode_for_prompt(
-            context.clone(),
-            MemoryModeRecallParams {
-                mode: MemoryRecallMode::Project,
-                targets: Vec::new(),
-                top_k: Some(5),
-                max_chars: Some(1_500),
-            },
-        )
-        .await
-        .expect("project recall");
-    assert_eq!(project.items.len(), 1);
-    assert!(project.items[0].content.contains("phase"));
-    assert!(!project.items[0].content.contains("Other workspace"));
-
-    let durable = service
-        .recall_mode_for_prompt(
-            context,
-            MemoryModeRecallParams {
-                mode: MemoryRecallMode::Durable,
-                targets: Vec::new(),
-                top_k: Some(5),
-                max_chars: Some(1_500),
-            },
-        )
-        .await
-        .expect("durable recall");
-    assert_eq!(durable.items.len(), 2);
-    assert!(
-        durable
-            .items
-            .iter()
-            .any(|item| item.content.contains("Александр"))
-    );
-    assert!(
-        durable
-            .items
-            .iter()
-            .any(|item| item.content.contains("phase"))
-    );
-}
-
-#[tokio::test]
-async fn recall_mode_for_prompt_exact_canonical_uses_key_lookup_without_search() {
-    let (_store, backend, service) = setup_service_with_recording_backend().await;
-    service
-        .remember(
-            user_context(740),
-            remember_params(
-                scope(MemoryScopeKind::User, "default"),
-                Some("user/global:identity:self:name"),
-                "Имя пользователя — Александр.",
-            ),
-        )
-        .await
-        .expect("remember identity");
-
-    let by_key = service
-        .recall_mode_for_prompt(
-            user_context(741),
-            MemoryModeRecallParams {
-                mode: MemoryRecallMode::ExactCanonical,
-                targets: vec![MemoryRecallTarget {
-                    scope_kind: Some(MemoryScopeKind::User),
-                    category: Some(MemoryCategory::Identity),
-                    canonical_key: Some("user/global:identity:self:name".to_owned()),
-                    ..MemoryRecallTarget::default()
-                }],
-                top_k: Some(5),
-                max_chars: Some(1_500),
-            },
-        )
-        .await
-        .expect("exact by key recall");
-    assert_eq!(by_key.items.len(), 1);
-    assert!(by_key.items[0].content.contains("Александр"));
-
-    let by_typed_target = service
-        .recall_mode_for_prompt(
-            user_context(742),
-            MemoryModeRecallParams {
-                mode: MemoryRecallMode::ExactCanonical,
-                targets: vec![MemoryRecallTarget {
-                    scope_kind: Some(MemoryScopeKind::User),
-                    category: Some(MemoryCategory::Identity),
-                    subject: Some(MemorySubject::CurrentUser),
-                    attribute: Some(MemoryAttribute::Name),
-                    ..MemoryRecallTarget::default()
-                }],
-                top_k: Some(5),
-                max_chars: Some(1_500),
-            },
-        )
-        .await
-        .expect("exact by typed target recall");
-    assert_eq!(by_typed_target.items.len(), 1);
-    assert!(by_typed_target.items[0].content.contains("Александр"));
-    assert!(
-        backend.search_limits().await.is_empty(),
-        "exact canonical recall must not call broad backend search"
-    );
-}
-
-#[tokio::test]
-async fn recall_mode_for_prompt_thread_and_task_context_require_native_provider() {
-    let (_store, _backend, service) = setup_service().await;
-    let thread = service
-        .recall_mode_for_prompt(
-            MemoryOperationContext {
-                thread_id: Some("thr_mode_a".to_owned()),
-                now_unix: Some(752),
-                ..MemoryOperationContext::default()
-            },
-            MemoryModeRecallParams {
-                mode: MemoryRecallMode::ThreadEpisodic,
-                targets: Vec::new(),
-                top_k: Some(5),
-                max_chars: Some(1_500),
-            },
-        )
-        .await
-        .expect("thread recall");
-    assert_eq!(
-        thread.skipped_reason.as_deref(),
-        Some("thread_episodic_native_provider_required")
-    );
-    assert!(thread.diagnostics.iter().any(|diagnostic| {
-        diagnostic.contains("memory.active_recall.mode_native_provider_required:thread_episodic")
-    }));
-
-    let task = service
-        .recall_mode_for_prompt(
-            MemoryOperationContext {
-                task_id: Some("task_mode_a".to_owned()),
-                now_unix: Some(753),
-                ..MemoryOperationContext::default()
-            },
-            MemoryModeRecallParams {
-                mode: MemoryRecallMode::TaskContext,
-                targets: Vec::new(),
-                top_k: Some(5),
-                max_chars: Some(1_500),
-            },
-        )
-        .await
-        .expect("task recall");
-    assert_eq!(
-        task.skipped_reason.as_deref(),
-        Some("task_context_native_provider_required")
-    );
-    assert!(task.diagnostics.iter().any(|diagnostic| {
-        diagnostic.contains("memory.active_recall.mode_native_provider_required:task_context")
-    }));
-
-    let missing_task = service
-        .recall_mode_for_prompt(
-            user_context(754),
-            MemoryModeRecallParams {
-                mode: MemoryRecallMode::TaskContext,
-                targets: Vec::new(),
-                top_k: Some(5),
-                max_chars: Some(1_500),
-            },
-        )
-        .await
-        .expect("missing task recall");
-    assert_eq!(
-        missing_task.skipped_reason.as_deref(),
-        Some("task_context_native_provider_required")
-    );
 }
 
 #[tokio::test]
@@ -5288,46 +4748,6 @@ async fn quarantine_hides_memory_from_product_recall_and_restore_reenables_it() 
         .await
         .expect("search");
     assert!(search.hits.is_empty());
-
-    let prompt = service
-        .recall_for_prompt(
-            user_context(1303),
-            MemoryRecallParams {
-                query: "Александр".to_owned(),
-                scopes: vec![scope(MemoryScopeKind::User, "default")],
-                categories: vec![MemoryCategory::Identity],
-                top_k: Some(5),
-                max_chars: Some(500),
-            },
-        )
-        .await
-        .expect("prompt recall");
-    assert!(prompt.items.is_empty());
-    assert!(
-        prompt
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.contains("suppress_quarantined"))
-    );
-
-    let exact = service
-        .recall_mode_for_prompt(
-            user_context(1304),
-            MemoryModeRecallParams {
-                mode: MemoryRecallMode::ExactCanonical,
-                targets: vec![MemoryRecallTarget {
-                    scope_kind: Some(MemoryScopeKind::User),
-                    category: Some(MemoryCategory::Identity),
-                    canonical_key: Some("quarantine.identity".to_owned()),
-                    ..Default::default()
-                }],
-                top_k: Some(5),
-                max_chars: Some(500),
-            },
-        )
-        .await
-        .expect("exact recall");
-    assert!(exact.items.is_empty());
 
     let repeated = service
         .quarantine_memory(

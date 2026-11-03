@@ -91,7 +91,8 @@ def export(args):
             archive.add(path, arcname=name, recursive=False)
     commit = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
     metadata = dict(schema_version=1, commit=commit,
-                    run_id=os.environ["GITHUB_RUN_ID"], target=args.target,
+                    run_id=os.environ["GITHUB_RUN_ID"],
+                    run_attempt=os.environ.get("GITHUB_RUN_ATTEMPT", "1"), target=args.target,
                     catalog_sha256=(digest(Path(os.environ["PIONEER_BUNDLED_MODEL_CATALOG"]))
                                     if os.environ.get("PIONEER_BUNDLED_MODEL_CATALOG") else None),
                     binaries=binaries, files=records)
@@ -111,16 +112,16 @@ def record(args):
     args.ledger.write_text(json.dumps(rows, indent=2) + "\n")
 
 
-def process(args, expected_run_id=None, packaged_override=None, inventory_name="release-inputs.json"):
+def process(args):
     metadata = json.loads((args.inputs / "inputs.json").read_text())
     if metadata["commit"] != os.environ["SYMBOL_SOURCE_SHA"]:
         raise ValueError("symbol inputs are from a different source commit")
-    if str(metadata["run_id"]) != (expected_run_id or os.environ["SYMBOL_SOURCE_RUN_ID"]):
+    if str(metadata["run_id"]) != os.environ["SYMBOL_SOURCE_RUN_ID"]:
         raise ValueError("symbol inputs are from a different workflow run")
     if metadata["target"] != os.environ["SYMBOL_TARGET"]:
         raise ValueError("symbol inputs are for a different target")
     expected_variant = os.environ.get("SYMBOL_VARIANT", "")
-    if expected_run_id is None and metadata.get("variant") is not None and metadata["variant"] != expected_variant:
+    if metadata.get("variant") is not None and metadata["variant"] != expected_variant:
         raise ValueError("symbol inputs are for a different Gateway variant")
     records = {row["path"]: row for row in metadata["files"]}
     args.work.mkdir(parents=True, exist_ok=False)
@@ -150,8 +151,7 @@ def process(args, expected_run_id=None, packaged_override=None, inventory_name="
             raise ValueError("missing symbol input archive member")
     # Only this job's downloaded archive; release inputs remain in Actions storage.
     (args.inputs / "inputs.tar.gz").unlink()
-    packaged = (packaged_override if packaged_override is not None
-                else json.loads((args.inputs / "packaged.json").read_text()))
+    packaged = json.loads((args.inputs / "packaged.json").read_text())
     env = os.environ.copy()
     for key in ("MallocStackLogging", "MallocStackLoggingNoCompact", "MallocStackLoggingDirectory"):
         env.pop(key, None)
@@ -179,37 +179,7 @@ def process(args, expected_run_id=None, packaged_override=None, inventory_name="
                      packaged_binary_sha256s=[row["binary_sha256"] for row in matches],
                      packaged_module_validated=True)
         manifest.write_text(json.dumps(value, indent=2) + "\n")
-    gateway = args.inputs / "gateway"
-    if gateway.exists():
-        if expected_run_id is not None:
-            raise ValueError("nested Gateway reuse is not supported")
-        receipt = json.loads((gateway / "reuse.json").read_text())
-        original = json.loads((gateway / "inputs.json").read_text())
-        if (receipt.get("schema_version") != 1
-                or (original.get("variant") is not None and
-                    (original["variant"] != "computer-use" or receipt.get("variant") != "computer-use"))
-                or receipt.get("commit") != metadata["commit"] or receipt.get("target") != metadata["target"]
-                or str(receipt.get("run_id")) != str(original["run_id"])
-                or len(original["binaries"]) != 1
-                or original.get("catalog_sha256") != metadata.get("catalog_sha256")
-                or receipt.get("module_id") != original["binaries"][0]["module_id"]
-                or receipt.get("binary_sha256") != original["binaries"][0]["sha256"]):
-            raise ValueError("reused Gateway provenance mismatch")
-        child = argparse.Namespace(inputs=gateway, work=args.work / "gateway", out=args.out)
-        process(child, str(receipt["run_id"]), packaged, "gateway-release-inputs.json")
-        metadata["reused_gateway"] = receipt
-    compatibility = args.inputs / "compatibility"
-    if expected_run_id is None and compatibility.exists():
-        bridge = json.loads((compatibility / "inputs.json").read_text())
-        if (metadata.get("variant") != "computer-use" or bridge.get("variant") != "computer-use"
-                or any(bridge.get(key) != metadata.get(key)
-                       for key in ("commit", "run_id", "target", "catalog_sha256"))
-                or [row["filename"] for row in bridge["binaries"]] not in
-                   (["pioneer-cu-update"], ["pioneer-cu-update.exe"])):
-            raise ValueError("compatibility bridge provenance mismatch")
-        child = argparse.Namespace(inputs=compatibility, work=args.work / "compatibility", out=args.out)
-        process(child, str(metadata["run_id"]), inventory_name="compatibility-release-inputs.json")
-    (args.out / inventory_name).write_text(json.dumps(metadata, indent=2) + "\n")
+    (args.out / "release-inputs.json").write_text(json.dumps(metadata, indent=2) + "\n")
 
 
 def main():

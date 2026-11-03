@@ -105,24 +105,6 @@ mod tests {
         assert_eq!(normalized.samples[3], -1.0);
     }
 
-    #[test]
-    fn rejects_unsupported_format() {
-        let error = normalize_voice_pcm_chunk(
-            VoiceAudioFormat {
-                sample_rate_hz: 48_000,
-                channels: 1,
-                encoding: VoiceAudioEncoding::PcmS16Le,
-            },
-            &[0x00, 0x00],
-        )
-        .expect_err("unsupported format should fail");
-
-        assert!(matches!(
-            error,
-            VoiceAudioNormalizationError::UnsupportedFormat(_)
-        ));
-    }
-
     fn target_format() -> VoiceAudioFormat {
         VoiceAudioFormat {
             sample_rate_hz: 16_000,

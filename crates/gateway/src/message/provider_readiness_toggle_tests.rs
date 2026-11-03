@@ -617,6 +617,37 @@ impl Harness {
             .unwrap();
     }
 
+    async fn list_models_error(&mut self, runtime_id: &str) -> JsonRpcErrorResponse {
+        let request_id = RequestId::new("R".repeat(21)).unwrap();
+        self.processor
+            .cli_runtime_list_models(
+                &self.context,
+                request_id.clone(),
+                pioneer_protocol::CLIRuntimeListModelsParams {
+                    workspace_id: self.workspace.clone(),
+                    runtime_id: runtime_id.into(),
+                },
+            )
+            .await;
+        let error = tokio::time::timeout(Duration::from_secs(2), async {
+            while let Some(message) = self._notifications.recv().await {
+                let axum::extract::ws::Message::Text(text) = message else {
+                    continue;
+                };
+                let payload: serde_json::Value = serde_json::from_str(&text).unwrap();
+                if payload["id"] == serde_json::json!(request_id) {
+                    return serde_json::from_value::<JsonRpcErrorResponse>(payload).unwrap();
+                }
+            }
+            panic!("fixture connection closed")
+        })
+        .await
+        .expect("list_models must reply");
+        assert_eq!(error.id, Some(request_id));
+        assert_eq!(error.error.code, INVALID_REQUEST_CODE);
+        error
+    }
+
     async fn baseline(&self) {
         let mut scheduler = ProviderProbeScheduler::new(Arc::downgrade(&self.processor));
         scheduler
@@ -687,7 +718,7 @@ async fn drain(
 
 #[tokio::test]
 async fn saved_toggles_probe_only_the_changed_instance_across_workspaces_and_kinds() {
-    let h = Harness::new().await;
+    let mut h = Harness::new().await;
     h.baseline().await;
     for target in ["codex", "claude", "opencode", "codex_two"] {
         let before = h
@@ -738,6 +769,43 @@ async fn saved_toggles_probe_only_the_changed_instance_across_workspaces_and_kin
             h.counts.lock().unwrap().is_empty(),
             "disabled runtime must not reach fake live probe"
         );
+        // A request from another client (or already in flight at disable) must
+        // retain the public refusal without registering an ERROR incident.
+        let (error, events) = crate::public_error::test_support::capture_events_async(async {
+            let error = h.list_models_error(target).await;
+            // Flush the scoped WARN breadcrumb into one explicitly synthetic
+            // event; the refusal itself must not contribute an event.
+            tracing::error!("fixture breadcrumb capture");
+            error
+        })
+        .await;
+        let public: pioneer_protocol::PublicError =
+            serde_json::from_value(error.error.data.unwrap()["public_error"].clone()).unwrap();
+        assert_eq!(public.code, pioneer_protocol::PublicErrorCode::Unavailable);
+        assert_eq!(public.stage, pioneer_protocol::PublicErrorStage::Discovery);
+        assert!(public.retryable);
+        assert_eq!(
+            events.len(),
+            1,
+            "only the fixture flush may report an ERROR"
+        );
+        assert_eq!(
+            events[0].message.as_deref(),
+            Some("fixture breadcrumb capture")
+        );
+        let refusal = events[0]
+            .breadcrumbs
+            .iter()
+            .find(|breadcrumb| {
+                breadcrumb.message.as_deref() == Some("agent-domain operation refused")
+            })
+            .expect("expected failure remains observable as a breadcrumb");
+        assert_eq!(refusal.level, sentry::Level::Warning);
+        assert_eq!(refusal.data["operation"], "cli_runtime_list_models");
+        assert_eq!(refusal.data["failure_class"], "runtime_disabled");
+        assert_eq!(refusal.data["correlation_id"], public.correlation_id);
+        assert!(h.counts.lock().unwrap().is_empty());
+        assert!(h.commands().is_empty(), "refusal must not enqueue a warmup");
         let mut settings = h.runtimes();
         settings
             .instances
@@ -761,6 +829,59 @@ async fn saved_toggles_probe_only_the_changed_instance_across_workspaces_and_kin
             assert_preserved(&before, &after, &other.runtime_id);
         }
         h.counts.lock().unwrap().clear();
+    }
+}
+
+#[tokio::test]
+async fn model_discovery_read_and_processing_errors_still_report_incidents() {
+    for read_failure in [true, false] {
+        let mut h = Harness::new().await;
+        if read_failure {
+            // No readiness seed exists: the real settings read must fail.
+            std::fs::write(h.settings_path(), b"invalid fixture settings").unwrap();
+        } else {
+            h.baseline().await;
+            let scope = selected(&["codex"]);
+            let generation = h
+                .processor
+                .provider_readiness
+                .begin_cli_probe(&h.workspace, &scope)
+                .await;
+            let mut result = ready_result(runtime_summary("codex", RuntimeStatus::Ready), "codex");
+            let models = result.models.as_mut().unwrap();
+            models.result.models.clear();
+            models.result.error_message = Some("fixture discovery processing failed".into());
+            publish_result(
+                &h.processor.provider_readiness,
+                &h.workspace,
+                generation,
+                &scope,
+                vec![result],
+            )
+            .await
+            .unwrap();
+        }
+        let (error, events) =
+            crate::public_error::test_support::capture_events_async(h.list_models_error("codex"))
+                .await;
+        let public: pioneer_protocol::PublicError =
+            serde_json::from_value(error.error.data.unwrap()["public_error"].clone()).unwrap();
+        assert_eq!(public.code, pioneer_protocol::PublicErrorCode::Unavailable);
+        assert_eq!(public.stage, pioneer_protocol::PublicErrorStage::Discovery);
+        assert_eq!(events.len(), 1);
+        crate::public_error::test_support::assert_correlated(&events[0], &public);
+        let sentry::protocol::Context::Other(fields) = &events[0].contexts["Rust Tracing Fields"]
+        else {
+            panic!("tracing fields must be present")
+        };
+        let diagnostic = fields["raw_diagnostic"].as_str().unwrap();
+        assert!(diagnostic.contains(if read_failure {
+            "failed to load CLI runtime readiness"
+        } else {
+            "fixture discovery processing failed"
+        }));
+        assert!(h.counts.lock().unwrap().is_empty());
+        assert!(h.commands().is_empty());
     }
 }
 

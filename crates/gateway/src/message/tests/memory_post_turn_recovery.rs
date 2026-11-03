@@ -330,8 +330,6 @@ async fn recovery_fixture_on_workspace(
             gateway.clone(),
             Some(writes.clone()),
             Some(gateway),
-            None,
-            None,
             background.agent_manager.memory_tool_bundle_artifact_store(),
             background.memory_loop_config(),
         ))

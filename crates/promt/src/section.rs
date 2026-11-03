@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 
 /// Runtime section marker used when the native provider capability decision
-/// replaces the static tool-usage policy with the exact filesystem contract
+/// replaces the static filesystem fallback with the exact filesystem contract
 /// projected for this turn.
 pub const FILESYSTEM_CAPABILITY_RUNTIME_SECTION_ID: &str = "pioneer_filesystem_capability";
 
@@ -198,6 +198,49 @@ pub enum PromptSectionId {
 }
 
 impl PromptSectionId {
+    /// Logical instruction groups, independent of producer arrival order.
+    /// Equal keys deliberately preserve scoped overrides and unknown hooks.
+    /// This is applied to newly compiled sections, never to saved wire payloads.
+    pub fn instruction_order(&self) -> u8 {
+        match self {
+            Self::AssistantSafety => 0,
+            Self::IdentityBase => 10,
+            Self::SoulCore => 11,
+            Self::IdentityCore => 12,
+            Self::UserPersona => 13,
+            Self::ToolRecoveryPolicy => 70,
+            Self::AgentsMd => 21,
+            // Untyped caller rules retain their legacy precedence after the
+            // known Pioneer policies; do not merge them into Pioneer Safety.
+            Self::ExtraSystem => 90,
+            Self::ToolUsagePolicy => 30,
+            Self::MemoryRecall => 44,
+            Self::TaskOrchestrationPolicy => 40,
+            Self::TasksPolicy => 41,
+            Self::SubagentsPolicy => 42,
+            Self::ThreadsPolicy => 43,
+            Self::PioneerCliRuntimeInstructions => 32,
+            Self::ArtifactOutputContract => 61,
+            Self::HtmlPolicy => 63,
+            Self::Dynamic(id) if id.as_str() == FILESYSTEM_CAPABILITY_RUNTIME_SECTION_ID => 32,
+            Self::Dynamic(id) if id.as_str() == "artifact_references" => 62,
+            Self::Dynamic(id) if id.as_str() == crate::REQUEST_TOOLS_HIDDEN_DOMAIN_SECTION_ID => {
+                105
+            }
+            Self::Dynamic(_) => 80,
+            Self::PioneerCliRuntimeContext => 100,
+            Self::ThreadContext => 101,
+            Self::SkillsRuntimePrompt => 102,
+            Self::SelectedSkills => 103,
+            Self::SelectedCapabilities => 104,
+            Self::CurrentPermissions => 106,
+            Self::ExecutionContinuation => 107,
+            Self::RecoveryContinuation => 108,
+            Self::RetryRuntimeInstruction => 109,
+            Self::DynamicContext => 110,
+        }
+    }
+
     pub fn manifest_id(&self) -> String {
         let id = match self {
             Self::IdentityBase => "identity_base",
@@ -357,30 +400,31 @@ mod tests {
     }
 
     #[test]
-    fn agents_md_builtin_round_trips_manifest_identity() {
-        let id = PromptRuntimeBuiltInSectionId::from_manifest_id("agents_md")
-            .expect("agents_md builtin should resolve");
-        assert_eq!(id, PromptRuntimeBuiltInSectionId::AgentsMd);
-        assert_eq!(id.manifest_id(), "agents_md");
-        assert_eq!(id.prompt_section_id(), PromptSectionId::AgentsMd);
-        assert_eq!(id.default_title(), "AGENTS.md");
-        assert!(PromptSectionId::is_builtin_manifest_id("agents_md"));
-    }
-
-    #[test]
-    fn execution_continuation_builtin_round_trips_manifest_identity() {
-        let id = PromptRuntimeBuiltInSectionId::from_manifest_id("execution_continuation")
-            .expect("execution_continuation builtin should resolve");
-        assert_eq!(id, PromptRuntimeBuiltInSectionId::ExecutionContinuation);
-        assert_eq!(id.manifest_id(), "execution_continuation");
-        assert_eq!(
-            id.prompt_section_id(),
-            PromptSectionId::ExecutionContinuation
-        );
-        assert_eq!(id.default_title(), "Execution Continuation");
-        assert!(PromptSectionId::is_builtin_manifest_id(
-            "execution_continuation"
-        ));
+    fn runtime_builtins_preserve_manifest_identity() {
+        for (manifest_id, expected_id, expected_section, expected_title, resolve_message) in [
+            (
+                "agents_md",
+                PromptRuntimeBuiltInSectionId::AgentsMd,
+                PromptSectionId::AgentsMd,
+                "AGENTS.md",
+                "agents_md builtin should resolve",
+            ),
+            (
+                "execution_continuation",
+                PromptRuntimeBuiltInSectionId::ExecutionContinuation,
+                PromptSectionId::ExecutionContinuation,
+                "Execution Continuation",
+                "execution_continuation builtin should resolve",
+            ),
+        ] {
+            let id = PromptRuntimeBuiltInSectionId::from_manifest_id(manifest_id)
+                .expect(resolve_message);
+            assert_eq!(id, expected_id);
+            assert_eq!(id.manifest_id(), manifest_id);
+            assert_eq!(id.prompt_section_id(), expected_section);
+            assert_eq!(id.default_title(), expected_title);
+            assert!(PromptSectionId::is_builtin_manifest_id(manifest_id));
+        }
     }
 
     #[test]

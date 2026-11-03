@@ -3602,6 +3602,19 @@ impl TurnMcpValidatedExecution for McpService {
             };
             let result = match outcome {
                 Ok(result) => result,
+                Err(error) if native_family == Some(crate::turn_mcp::native_tools::NativeToolFamily::Threads)
+                    && crate::message::thread_read_tools::THREAD_READ_TOOL_NAMES.contains(&validated.binding.raw_tool_name.as_str())
+                    && !matches!(error, pioneer_tools::ToolError::Cancelled(_)) => {
+                    let (message, reason) = crate::message::thread_read_tools::public_read_error(&error);
+                    let payload = json!({"error": message});
+                    return Ok(CanonicalMcpToolResult {
+                        content: json!([{"type":"text", "text":payload.to_string()}]),
+                        structured_content: Some(payload),
+                        is_error: true,
+                        duration_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                        meta: Some(json!({"pioneer":{"reasonCode":reason}})),
+                    });
+                }
                 Err(error) if native_tasks && validated.binding.raw_tool_name != "threads_start_options"
                     && !matches!(error, pioneer_tools::ToolError::Cancelled(_)) => {
                     return Ok(canonical_task_error_result(error, started.elapsed()));
@@ -3960,7 +3973,7 @@ impl McpService {
         let _activity = tokio::select! { biased;
             _ = cancel.cancelled() => return Err(TurnMcpInvocationError::new(
                 TurnMcpInvocationErrorCode::Cancelled, "HTML image delivery was cancelled")),
-            guard = processor.artifact_service.html_preview_activity() => guard,
+            guard = processor.artifact_service.html_preview_activity_signaled() => guard,
         };
         let context = pioneer_agent::TurnToolContext {
             workspace_id: validated.invocation.workspace_id.clone(),
@@ -4947,6 +4960,7 @@ async fn html_preview_mcp_content(
 
 #[cfg(test)]
 mod tests {
+    mod cli_mcp_call_finalization_tests;
     use super::*;
     use crate::auth::AuthenticatedSessionPrincipal;
     use crate::authorization::ExecutionAuthorizationContext;
@@ -4991,7 +5005,7 @@ mod tests {
         let artifacts =
             ArtifactService::new(store, Arc::new(LocalArtifactBlobStore::new(root.path())));
         // Match the production caller's retention protection across every read.
-        let _activity = artifacts.html_preview_activity().await;
+        let _activity = artifacts.html_preview_activity_signaled().await;
         let frames = [
             ("light", 360u32),
             ("light", 768),
@@ -5495,7 +5509,7 @@ mod tests {
             );
             self.calls.fetch_add(1, Ordering::SeqCst);
             if let Some((artifacts, retained)) = &self.replay {
-                let _activity = artifacts.html_preview_activity().await;
+                let _activity = artifacts.html_preview_activity_signaled().await;
                 let mut value = retained.clone();
                 let content = html_preview_mcp_content(
                     artifacts,
@@ -6359,6 +6373,7 @@ mod tests {
             turns: Vec::new(),
         };
         let turn = Turn {
+            work_owner: Default::default(),
             id: turn_id.to_owned(),
             status: TurnStatus::InProgress,
             turn_kind: Default::default(),

@@ -28,6 +28,8 @@ Think in three surfaces:
 
 Do not confuse "the task produced a result" with "the user saw the result in this thread." Execution and delivery are separate.
 
+Return the run result in the execution thread and let the configured delivery policy publish it. Do not use `thread_message_send` or `threads_turn_start` for inter-agent coordination or to announce or duplicate a task result. For attached children, use the result and review flow in `system:pioneer/subagents`.
+
 ## Quick Start
 
 Before using durable task tools, decide what kind of task work this is.

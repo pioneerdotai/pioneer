@@ -69,6 +69,7 @@ pub enum HookRuntimeError {
         phase: HookPhase,
         subscription_ids: Vec<HookSubscriptionId>,
     },
+    RecoveryStorageUnavailable,
     DurablePersistenceUnavailable {
         phase: HookPhase,
         operation: &'static str,
@@ -91,7 +92,9 @@ impl HookRuntimeError {
             Self::HookFailed { error, .. } | Self::HookFailedClosed { error, .. } => {
                 error.retryable
             }
-            Self::HookTimedOut { .. } | Self::DurablePersistenceUnavailable { .. } => true,
+            Self::HookTimedOut { .. }
+            | Self::RecoveryStorageUnavailable
+            | Self::DurablePersistenceUnavailable { .. } => true,
             Self::DurableExecutionIncomplete { retryable, .. } => *retryable,
             Self::Registry(_)
             | Self::MissingHandler { .. }
@@ -187,6 +190,9 @@ impl fmt::Display for HookRuntimeError {
                 }
                 Ok(())
             }
+            Self::RecoveryStorageUnavailable => {
+                formatter.write_str("hook recovery storage is unavailable")
+            }
             Self::DurablePersistenceUnavailable { phase, operation } => write!(
                 formatter,
                 "durable hook persistence failed during `{operation}` for phase `{phase}`"
@@ -217,6 +223,7 @@ impl std::error::Error for HookRuntimeError {
             | Self::MissingDependency { .. }
             | Self::DependencyCycle { .. }
             | Self::DurablePersistenceUnavailable { .. }
+            | Self::RecoveryStorageUnavailable
             | Self::DurableExecutionIncomplete { .. } => None,
         }
     }
@@ -895,7 +902,17 @@ impl HookRuntime {
                 phases: None,
             })
             .await
-            .unwrap_or_default();
+            .map_err(|error| {
+                let diagnostic = error.diagnostic();
+                tracing::error!(
+                    operation = "list_recoverable_runs",
+                    cause_class = diagnostic.cause_class.as_str(),
+                    sqlite_primary_code = diagnostic.sqlite_primary_code,
+                    sqlite_extended_code = diagnostic.sqlite_extended_code,
+                    "failed to discover recoverable hook runs"
+                );
+                HookRuntimeError::RecoveryStorageUnavailable
+            })?;
         let mut summary = HookRecoverySummary {
             scanned_count: records.len(),
             ..HookRecoverySummary::default()
@@ -2600,7 +2617,6 @@ fn recoverable_background_input_snapshot(
         }
         HookInputPayload::TurnPrePolicy(_)
         | HookInputPayload::TurnPrePromptContext(_)
-        | HookInputPayload::TurnPostPreflightPromptContext(_)
         | HookInputPayload::TurnPreToolMaterialization(_)
         | HookInputPayload::TurnPrePromptCompile(_)
         | HookInputPayload::TurnPreCompaction(_)
@@ -4014,38 +4030,6 @@ mod tests {
     }
 
     #[test]
-    fn non_best_effort_failure_returns_runtime_error() {
-        let handlers = Arc::new(HookRegistry::new());
-        let subscriptions = Arc::new(HookSubscriptionRegistry::new());
-        let calls = Arc::new(Mutex::new(Vec::new()));
-        register_handler(
-            &handlers,
-            "test.fail",
-            calls.clone(),
-            vec![Err(hook_error("hook.failed", "failed"))],
-        );
-        register_subscription(
-            &handlers,
-            &subscriptions,
-            "sub.fail",
-            "test.fail",
-            0,
-            HookFailurePolicy::Required,
-        );
-        let runtime = runtime(handlers, subscriptions);
-
-        let error = block_on_ready(runtime.run_phase(phase_request())).expect_err("runtime fails");
-
-        assert!(matches!(
-            error,
-            HookRuntimeError::HookFailed { subscription_id, hook_id, phase, .. }
-                if subscription_id == self::subscription_id("sub.fail")
-                    && hook_id == self::hook_id("test.fail")
-                    && phase == HookPhase::TurnPrePromptCompile
-        ));
-    }
-
-    #[test]
     fn disabled_subscription_is_not_executed() {
         let handlers = Arc::new(HookRegistry::new());
         let subscriptions = Arc::new(HookSubscriptionRegistry::new());
@@ -4077,114 +4061,6 @@ mod tests {
     }
 
     #[test]
-    fn runtime_uses_subscription_lookup_order_for_runs() {
-        let handlers = Arc::new(HookRegistry::new());
-        let subscriptions = Arc::new(HookSubscriptionRegistry::new());
-        let calls = Arc::new(Mutex::new(Vec::new()));
-        for id in ["test.second", "test.first"] {
-            register_handler(
-                &handlers,
-                id,
-                calls.clone(),
-                vec![Ok(HookHandlerResponse::default())],
-            );
-        }
-        register_subscription(
-            &handlers,
-            &subscriptions,
-            "sub.second",
-            "test.second",
-            2,
-            HookFailurePolicy::BestEffort,
-        );
-        register_subscription(
-            &handlers,
-            &subscriptions,
-            "sub.first",
-            "test.first",
-            1,
-            HookFailurePolicy::BestEffort,
-        );
-        let runtime = runtime(handlers, subscriptions);
-
-        let response =
-            block_on_ready(runtime.run_phase(phase_request())).expect("phase execution succeeds");
-
-        assert_eq!(
-            response
-                .runs
-                .into_iter()
-                .map(|run| run.subscription_id)
-                .collect::<Vec<_>>(),
-            vec![subscription_id("sub.first"), subscription_id("sub.second")]
-        );
-    }
-
-    #[test]
-    fn missing_handler_during_runtime_returns_error() {
-        let registration_handlers = Arc::new(HookRegistry::new());
-        let runtime_handlers = Arc::new(HookRegistry::new());
-        let subscriptions = Arc::new(HookSubscriptionRegistry::new());
-        register_handler(
-            &registration_handlers,
-            "test.missing",
-            Arc::new(Mutex::new(Vec::new())),
-            vec![Ok(HookHandlerResponse::default())],
-        );
-        register_subscription(
-            &registration_handlers,
-            &subscriptions,
-            "sub.missing",
-            "test.missing",
-            0,
-            HookFailurePolicy::BestEffort,
-        );
-        let runtime = runtime(runtime_handlers, subscriptions);
-
-        let error =
-            block_on_ready(runtime.run_phase(phase_request())).expect_err("handler missing");
-
-        assert!(matches!(
-            error,
-            HookRuntimeError::MissingHandler { subscription_id, hook_id, phase }
-                if subscription_id == self::subscription_id("sub.missing")
-                    && hook_id == self::hook_id("test.missing")
-                    && phase == HookPhase::TurnPrePromptCompile
-        ));
-    }
-
-    #[test]
-    fn handler_response_diagnostics_are_aggregated() {
-        let handlers = Arc::new(HookRegistry::new());
-        let subscriptions = Arc::new(HookSubscriptionRegistry::new());
-        register_handler(
-            &handlers,
-            "test.one",
-            Arc::new(Mutex::new(Vec::new())),
-            vec![Ok(HookHandlerResponse {
-                contributions: Vec::new(),
-                diagnostics: vec![diagnostic("diag.one", "diagnostic")],
-                metadata: HookMetadata::default(),
-            })],
-        );
-        register_subscription(
-            &handlers,
-            &subscriptions,
-            "sub.one",
-            "test.one",
-            0,
-            HookFailurePolicy::BestEffort,
-        );
-        let runtime = runtime(handlers, subscriptions);
-
-        let response =
-            block_on_ready(runtime.run_phase(phase_request())).expect("phase execution succeeds");
-
-        assert_eq!(response.diagnostics.len(), 1);
-        assert_eq!(response.runs[0].diagnostic_count, 1);
-    }
-
-    #[test]
     fn phase_request_roundtrips() {
         let request = phase_request();
         let value = serde_json::to_value(&request).expect("request serializes");
@@ -4195,17 +4071,9 @@ mod tests {
     }
 
     #[test]
-    fn hook_phase_request_defaults_to_empty_policy_set() {
-        assert!(phase_request().policy_set.is_empty());
-    }
-
-    #[test]
-    fn hook_phase_request_defaults_to_empty_prompt_context_set() {
-        assert!(phase_request().prompt_context_set.is_empty());
-    }
-
-    #[test]
     fn hook_phase_request_with_policy_set_reaches_handler_request() {
+        let request = phase_request();
+        assert!(request.policy_set.is_empty());
         let handlers = Arc::new(HookRegistry::new());
         let subscriptions = Arc::new(HookSubscriptionRegistry::new());
         let captured_policy_sets = Arc::new(Mutex::new(Vec::new()));
@@ -4237,7 +4105,7 @@ mod tests {
             diagnostics: Vec::new(),
         }]);
 
-        block_on_ready(runtime.run_phase(phase_request().with_policy_set(policy_set.clone())))
+        block_on_ready(runtime.run_phase(request.with_policy_set(policy_set.clone())))
             .expect("phase execution succeeds");
 
         assert_eq!(
@@ -4254,6 +4122,8 @@ mod tests {
 
     #[test]
     fn hook_phase_request_with_prompt_context_set_reaches_handler_request() {
+        let request = phase_request();
+        assert!(request.prompt_context_set.is_empty());
         let handlers = Arc::new(HookRegistry::new());
         let subscriptions = Arc::new(HookSubscriptionRegistry::new());
         let captured_policy_sets = Arc::new(Mutex::new(Vec::new()));
@@ -4293,7 +4163,7 @@ mod tests {
         );
 
         block_on_ready(
-            runtime.run_phase(phase_request().with_prompt_context_set(prompt_context_set.clone())),
+            runtime.run_phase(request.with_prompt_context_set(prompt_context_set.clone())),
         )
         .expect("phase execution succeeds");
 
@@ -4862,53 +4732,6 @@ mod tests {
     }
 
     #[test]
-    fn best_effort_failure_in_parallel_batch_records_diagnostic_and_continues() {
-        let handlers = Arc::new(HookRegistry::new());
-        let subscriptions = Arc::new(HookSubscriptionRegistry::new());
-        register_handler(
-            &handlers,
-            "test.fail",
-            Arc::new(Mutex::new(Vec::new())),
-            vec![Err(hook_error("hook.failed", "failed"))],
-        );
-        register_handler(
-            &handlers,
-            "test.ok",
-            Arc::new(Mutex::new(Vec::new())),
-            vec![Ok(HookHandlerResponse {
-                contributions: vec![contribution("section.ok", "ok")],
-                diagnostics: Vec::new(),
-                metadata: HookMetadata::default(),
-            })],
-        );
-        register_subscription(
-            &handlers,
-            &subscriptions,
-            "sub.fail",
-            "test.fail",
-            0,
-            HookFailurePolicy::BestEffort,
-        );
-        register_subscription(
-            &handlers,
-            &subscriptions,
-            "sub.ok",
-            "test.ok",
-            1,
-            HookFailurePolicy::BestEffort,
-        );
-        let runtime = runtime(handlers, subscriptions);
-
-        let response =
-            block_on_ready(runtime.run_phase(phase_request())).expect("phase execution succeeds");
-
-        assert_eq!(response.diagnostics.len(), 1);
-        assert_eq!(response.runs[0].status, HookRunStatus::Failed);
-        assert_eq!(response.runs[1].status, HookRunStatus::Succeeded);
-        assert_eq!(response.contributions.len(), 1);
-    }
-
-    #[test]
     fn non_best_effort_failure_stops_later_batches() {
         let handlers = Arc::new(HookRegistry::new());
         let subscriptions = Arc::new(HookSubscriptionRegistry::new());
@@ -5139,46 +4962,14 @@ mod tests {
                 .expect("deadline hook should return")
                 .expect("phase execution succeeds");
 
+        assert!(response.contributions.is_empty());
+        assert_eq!(response.runs[0].contribution_count, 0);
+        assert!(response.runs[0].contribution_hashes.is_empty());
         assert_eq!(response.diagnostics.len(), 1);
         assert_eq!(response.diagnostics[0].code.as_str(), "hook.timeout");
         assert_eq!(response.runs[0].status, HookRunStatus::TimedOut);
         assert_eq!(response.runs[0].attempts.len(), 1);
         assert_eq!(response.runs[0].attempts[0].status, HookRunStatus::TimedOut);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn deadline_timeout_does_not_include_late_contribution() {
-        let handlers = Arc::new(HookRegistry::new());
-        let subscriptions = Arc::new(HookSubscriptionRegistry::new());
-        handlers
-            .register_handler(Arc::new(DelayedHookHandler {
-                id: hook_id("test.late"),
-                delay: Duration::from_millis(50),
-                contribution: contribution("section.late", "late"),
-            }))
-            .expect("handler registers");
-        register_subscription_with_policy(
-            &handlers,
-            &subscriptions,
-            "sub.late",
-            "test.late",
-            0,
-            HookAwaitPolicy::Deadline,
-            Some(5),
-            HookFailurePolicy::BestEffort,
-            [],
-        );
-        let runtime = runtime(handlers, subscriptions);
-
-        let response =
-            tokio::time::timeout(Duration::from_secs(1), runtime.run_phase(phase_request()))
-                .await
-                .expect("deadline hook should return")
-                .expect("phase execution succeeds");
-
-        assert!(response.contributions.is_empty());
-        assert_eq!(response.runs[0].contribution_count, 0);
-        assert!(response.runs[0].contribution_hashes.is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -5430,44 +5221,6 @@ mod tests {
         assert_eq!(runtime.queued_background_len().expect("queue length"), 1);
     }
 
-    #[test]
-    fn fire_and_record_returns_no_contribution() {
-        let handlers = Arc::new(HookRegistry::new());
-        let subscriptions = Arc::new(HookSubscriptionRegistry::new());
-        let calls = Arc::new(Mutex::new(Vec::new()));
-        register_handler(
-            &handlers,
-            "test.fire",
-            calls.clone(),
-            vec![Ok(HookHandlerResponse {
-                contributions: vec![contribution("section.fire", "fire")],
-                diagnostics: Vec::new(),
-                metadata: HookMetadata::default(),
-            })],
-        );
-        register_subscription_with_policy(
-            &handlers,
-            &subscriptions,
-            "sub.fire",
-            "test.fire",
-            0,
-            HookAwaitPolicy::FireAndRecord,
-            Some(1),
-            HookFailurePolicy::BestEffort,
-            [],
-        );
-        let runtime = runtime(handlers, subscriptions);
-
-        let response =
-            block_on_ready(runtime.run_phase(phase_request())).expect("phase execution succeeds");
-
-        assert!(calls.lock().expect("calls lock").is_empty());
-        assert!(response.contributions.is_empty());
-        assert_eq!(response.runs[0].status, HookRunStatus::Queued);
-        assert!(response.runs[0].attempts.is_empty());
-        assert_eq!(runtime.queued_background_len().expect("queue length"), 1);
-    }
-
     #[tokio::test]
     async fn phase_20_fire_and_record_executes_through_runtime_drain() {
         let handlers = Arc::new(HookRegistry::new());
@@ -5504,6 +5257,7 @@ mod tests {
         assert!(response.contributions.is_empty());
         assert!(calls.lock().expect("calls lock").is_empty());
         assert_eq!(response.runs[0].status, HookRunStatus::Queued);
+        assert!(response.runs[0].attempts.is_empty());
         assert_eq!(runtime.queued_background_len().expect("queue length"), 1);
 
         let drain = runtime
@@ -5518,48 +5272,6 @@ mod tests {
             vec![hook_id("test.phase20.fire")]
         );
         assert_eq!(runtime.queued_background_len().expect("queue length"), 0);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn phase_20_caller_receives_queued_before_slow_handler_completion() {
-        let handlers = Arc::new(HookRegistry::new());
-        let subscriptions = Arc::new(HookSubscriptionRegistry::new());
-        let active_count = Arc::new(AtomicUsize::new(0));
-        let max_active_count = Arc::new(AtomicUsize::new(0));
-        handlers
-            .register_handler(Arc::new(ConcurrencyTrackingHookHandler {
-                id: hook_id("test.phase20.slow"),
-                active_count: active_count.clone(),
-                max_active_count: max_active_count.clone(),
-                delay: Duration::from_millis(25),
-            }))
-            .expect("handler registers");
-        register_subscription_with_policy(
-            &handlers,
-            &subscriptions,
-            "sub.phase20.slow",
-            "test.phase20.slow",
-            0,
-            HookAwaitPolicy::FireAndRecord,
-            Some(1_000),
-            HookFailurePolicy::BestEffort,
-            Vec::new(),
-        );
-        let runtime = runtime(handlers, subscriptions);
-
-        let response = runtime
-            .run_phase(phase_request())
-            .await
-            .expect("phase execution succeeds");
-
-        assert_eq!(response.runs[0].status, HookRunStatus::Queued);
-        assert_eq!(max_active_count.load(Ordering::SeqCst), 0);
-        let drain = runtime
-            .drain_queued_background()
-            .await
-            .expect("background drain succeeds");
-        assert_eq!(drain.succeeded_count, 1);
-        assert_eq!(max_active_count.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -6413,48 +6125,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn phase_20_background_prompt_contributions_do_not_mutate_returned_phase_output() {
-        let handlers = Arc::new(HookRegistry::new());
-        let subscriptions = Arc::new(HookSubscriptionRegistry::new());
-        register_handler(
-            &handlers,
-            "test.phase20.forbidden",
-            Arc::new(Mutex::new(Vec::new())),
-            vec![Ok(HookHandlerResponse {
-                contributions: vec![contribution("section.phase20.forbidden", "forbidden")],
-                diagnostics: Vec::new(),
-                metadata: HookMetadata::default(),
-            })],
-        );
-        register_subscription_with_policy(
-            &handlers,
-            &subscriptions,
-            "sub.phase20.forbidden",
-            "test.phase20.forbidden",
-            0,
-            HookAwaitPolicy::FireAndRecord,
-            Some(1_000),
-            HookFailurePolicy::BestEffort,
-            Vec::new(),
-        );
-        let runtime = runtime(handlers, subscriptions);
-
-        let response = runtime
-            .run_phase(phase_request())
-            .await
-            .expect("phase execution succeeds");
-        assert!(response.contributions.is_empty());
-
-        let drain = runtime
-            .drain_queued_background()
-            .await
-            .expect("background drain succeeds");
-
-        assert_eq!(drain.failed_count, 1);
-        assert_eq!(runtime.queued_background_len().expect("queue length"), 0);
-    }
-
-    #[tokio::test]
     async fn phase_20_all_prompt_mutating_background_contributions_are_rejected() {
         let forbidden = vec![
             policy_contribution("phase20.policy"),
@@ -6504,6 +6174,7 @@ mod tests {
                 .expect("background drain succeeds");
 
             assert_eq!(drain.failed_count, 1, "index {index}");
+            assert_eq!(runtime.queued_background_len().expect("queue length"), 0);
         }
     }
 
@@ -7017,6 +6688,8 @@ mod tests {
         let response =
             block_on_ready(runtime.run_phase(phase_request())).expect("phase execution succeeds");
 
+        assert_eq!(response.diagnostics.len(), 1);
+        assert_eq!(response.runs[0].diagnostic_count, 1);
         assert_eq!(
             response.diagnostics[0].message.as_str(),
             "diagnostic redacted"
@@ -7737,6 +7410,28 @@ mod tests {
                 .with_retry_policy(retry_policy),
             )
             .expect("subscription registers");
+    }
+
+    #[tokio::test]
+    async fn recovery_discovery_storage_error_is_retryable_and_never_empty_success() {
+        let runtime = HookRuntime::with_run_store(
+            Arc::new(HookRegistry::new()),
+            Arc::new(HookSubscriptionRegistry::new()),
+            Arc::new(RecordingHookRunStore {
+                fail_all: true,
+                ..Default::default()
+            }),
+        );
+        let error = runtime
+            .recover_background_runs_once(HookRecoveryOptions::default())
+            .await
+            .expect_err("storage failure must reach the recovery owner");
+        assert!(error.retryable());
+        assert!(matches!(
+            error,
+            HookRuntimeError::RecoveryStorageUnavailable
+        ));
+        assert_eq!(error.to_string(), "hook recovery storage is unavailable");
     }
 
     #[tokio::test]

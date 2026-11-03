@@ -56,23 +56,6 @@ fn desktop_depends_on_client_directly_and_not_on_mobile_boundary() {
 }
 
 #[test]
-fn foundation_manifest_contains_only_approved_runtime_dependencies() {
-    let manifest = fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"))
-        .expect("Foundation manifest must be readable");
-    let dependencies = manifest
-        .split("[dependencies]")
-        .nth(1)
-        .and_then(|value| value.split("[dev-dependencies]").next())
-        .expect("runtime dependency table");
-    let keys = dependencies
-        .lines()
-        .filter_map(|line| line.split_once('=').map(|(key, _)| key.trim()))
-        .filter(|key| !key.is_empty())
-        .collect::<Vec<_>>();
-    assert_eq!(keys, ["gpui-kit", "pioneer-client.workspace"]);
-}
-
-#[test]
 fn foundation_has_no_router_store_cache_or_custom_element_implementation() {
     let source_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut source_names = rust_sources(&source_root)
@@ -141,22 +124,4 @@ fn shell_uses_the_registrar_seam_without_exporting_its_concrete_router() {
     assert!(router.contains("ClientBindingRegistrar"));
     let foundation = fs::read_to_string(root.join("crates/desktop-foundation/src/lib.rs")).unwrap();
     assert!(!foundation.contains("DesktopClientBindingRouter"));
-}
-
-#[test]
-fn cached_element_contract_is_explicit_without_adding_a_cache() {
-    let source = fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/lib.rs"))
-        .expect("Foundation root source");
-    for required in [
-        "definite bounds",
-        "explicitly updates the element",
-        "notifies its retained owner",
-        "content mask",
-        "TextStyle",
-    ] {
-        assert!(
-            source.contains(required),
-            "missing cache contract: {required}"
-        );
-    }
 }

@@ -726,10 +726,8 @@ impl GatewayOperationVariant {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GatewayOperationStage {
     AuthRefreshDatabaseTransactionAcquire,
-    AuthMeSessionLoad,
-    AuthMeDeviceLoad,
-    AuthMePrincipalLoad,
-    AuthMeAvatarLoad,
+    AuthMeLeaseFactsLoad,
+    AuthMeProfileLoad,
     ResilienceReadModelRepair,
     ResilienceReadModelCheckpointLoad,
     ResilienceReadModelCheckpointReset,
@@ -761,6 +759,7 @@ pub enum GatewayOperationStage {
     DatabaseAuthorizationIntegrityAudit,
     DatabaseTurnPermissionProfileBackfill,
     DatabasePayloadCompression,
+    DatabaseTaskChildSeed,
     DatabaseThreadEpisodicRefill,
     ThreadTreeConnectionWorkspaceSet,
     ThreadTreePersistedThreadsLoad,
@@ -799,10 +798,8 @@ impl GatewayOperationStage {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::AuthRefreshDatabaseTransactionAcquire => "db.transaction.acquire",
-            Self::AuthMeSessionLoad => "session.load",
-            Self::AuthMeDeviceLoad => "device.load",
-            Self::AuthMePrincipalLoad => "principal.load",
-            Self::AuthMeAvatarLoad => "avatar.load",
+            Self::AuthMeLeaseFactsLoad => "lease_facts.load",
+            Self::AuthMeProfileLoad => "profile.load",
             Self::ResilienceReadModelRepair => "read_model.repair",
             Self::ResilienceReadModelCheckpointLoad => "read_model.checkpoint.load",
             Self::ResilienceReadModelCheckpointReset => "read_model.checkpoint.reset",
@@ -842,6 +839,7 @@ impl GatewayOperationStage {
             Self::DatabaseAuthorizationIntegrityAudit => "authorization.integrity_audit",
             Self::DatabaseTurnPermissionProfileBackfill => "turn_permission_profile.backfill",
             Self::DatabasePayloadCompression => "payload.compress",
+            Self::DatabaseTaskChildSeed => "task_child.seed",
             Self::DatabaseThreadEpisodicRefill => "thread_episodic.refill",
             Self::ThreadTreeConnectionWorkspaceSet => "connection_workspace.set",
             Self::ThreadTreePersistedThreadsLoad => "threads.persisted.load",
@@ -1386,8 +1384,8 @@ mod tests {
             "read_model.repair.repaired.count"
         );
         assert_eq!(
-            GatewayOperationStage::AuthMePrincipalLoad.as_str(),
-            "principal.load"
+            GatewayOperationStage::AuthMeProfileLoad.as_str(),
+            "profile.load"
         );
     }
 

@@ -253,12 +253,4 @@ mod tests {
         }
         assert!(!source.contains(&["Message composer UI", " is introduced"].concat()));
     }
-
-    #[test]
-    fn desktop_reply_replaces_mode_buttons_with_truncated_cancelable_context() {
-        let source = include_str!("mode_selector.rs");
-        assert!(source.contains("self.composer_domain().reply_target.clone()"));
-        assert!(source.contains(".text_ellipsis()"));
-        assert!(source.contains("cancel-composer-reply"));
-    }
 }

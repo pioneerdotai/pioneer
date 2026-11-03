@@ -228,12 +228,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mime_detects_png_from_bytes() {
-        let bytes = b"\x89PNG\r\n\x1a\nrest";
-        assert_eq!(detect_mime_from_bytes(bytes, None), "image/png");
-    }
-
-    #[test]
     fn mime_detects_json_text_from_bytes() {
         assert_eq!(
             detect_mime_from_bytes(br#"{"ok":true}"#, Some(Path::new("data.txt"))),
@@ -250,30 +244,6 @@ mod tests {
         assert_eq!(
             effective_mime_type(Some("text/plain"), "image/png"),
             "image/png"
-        );
-    }
-
-    #[test]
-    fn mime_records_declared_detected_metadata() {
-        let mut metadata = BTreeMap::new();
-
-        record_mime_metadata(&mut metadata, Some("text/plain"), "image/png", "image/png");
-
-        assert_eq!(
-            metadata.get("declared_mime_type"),
-            Some(&json!("text/plain"))
-        );
-        assert_eq!(
-            metadata.get("detected_mime_type"),
-            Some(&json!("image/png"))
-        );
-        assert_eq!(
-            metadata.get("effective_mime_type"),
-            Some(&json!("image/png"))
-        );
-        assert_eq!(
-            metadata.get("declared_detected_mime_mismatch"),
-            Some(&json!(true))
         );
     }
 

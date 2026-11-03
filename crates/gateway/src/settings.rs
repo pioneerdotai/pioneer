@@ -75,7 +75,27 @@ impl<'de> Deserialize<'de> for GatewaySettings {
     where
         D: serde::Deserializer<'de>,
     {
-        let wire = GatewaySettingsWire::deserialize(deserializer)?;
+        // Retire only known removed settings before strict validation of the wire.
+        let mut value = toml::Value::deserialize(deserializer)?;
+        let mut retired = false;
+        for (section, keys) in [
+            ("general", &["preflight_model"][..]),
+            (
+                "memory",
+                &[
+                    "deterministic_recall_enabled",
+                    "active_recall_enabled",
+                    "active_recall_model",
+                ][..],
+            ),
+        ] {
+            if let Some(table) = value.get_mut(section).and_then(toml::Value::as_table_mut) {
+                for key in keys {
+                    retired |= table.remove(*key).is_some();
+                }
+            }
+        }
+        let wire: GatewaySettingsWire = value.try_into().map_err(serde::de::Error::custom)?;
         let migrated_legacy_self_improvement = wire.self_improvement.is_some();
         let mut settings = Self {
             version: wire.version,
@@ -87,9 +107,8 @@ impl<'de> Deserialize<'de> for GatewaySettings {
             cli_runtimes: wire.cli_runtimes,
             remote_access: wire.remote_access,
             voice_input: wire.voice_input,
-            migrated: migrated_legacy_self_improvement,
+            migrated: migrated_legacy_self_improvement || retired,
         };
-        settings.migrate_legacy_active_recall_model();
         settings.migrate_default_claude_cli_runtime_instance();
         settings.migrate_default_opencode_cli_runtime_instance();
         Ok(settings)
@@ -103,8 +122,6 @@ struct GatewayGeneralSettings {
     keepawake: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     telemetry_enabled: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    preflight_model: Option<GatewayMemoryModelSelectionConfig>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -206,11 +223,6 @@ impl GatewayGeneralSettings {
             ),
             keepawake: self.keepawake.unwrap_or(config.keepawake),
             telemetry_enabled: self.telemetry_enabled.unwrap_or(config.telemetry.enabled),
-            preflight_model: model_selection_to_protocol(
-                self.preflight_model
-                    .as_ref()
-                    .unwrap_or(&config.preflight_model),
-            ),
             model_catalog: Default::default(),
         }
     }
@@ -227,11 +239,6 @@ impl GatewayGeneralSettings {
         if let Some(telemetry_enabled) = update.telemetry_enabled {
             self.telemetry_enabled = Some(telemetry_enabled);
             changes.telemetry_enabled = Some(telemetry_enabled);
-        }
-        if let Some(preflight_model) = update.preflight_model {
-            let preflight_model = model_selection_from_protocol(preflight_model);
-            self.preflight_model = Some(preflight_model.clone());
-            changes.preflight_model = Some(preflight_model);
         }
         changes
     }
@@ -252,8 +259,6 @@ pub enum GatewaySecretsBackend {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GatewayMemorySettings {
     pub enabled: bool,
-    pub deterministic_recall_enabled: bool,
-    pub active_recall_enabled: bool,
     pub tools_enabled: bool,
     pub proactive_writes_enabled: bool,
     pub background_extraction_enabled: bool,
@@ -275,17 +280,11 @@ struct GatewayMemorySettingsOverride {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    deterministic_recall_enabled: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    active_recall_enabled: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     tools_enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     proactive_writes_enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     background_extraction_enabled: Option<bool>,
-    #[serde(default, rename = "active_recall_model", skip_serializing)]
-    legacy_active_recall_model: Option<GatewayMemoryModelSelectionConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     proactive_writes_model: Option<GatewayMemoryModelSelectionConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1102,7 +1101,6 @@ impl GatewaySettings {
         let general = self.effective_general_settings(&config);
         config.keepawake = general.keepawake;
         config.telemetry.enabled = general.telemetry_enabled;
-        config.preflight_model = model_selection_from_protocol(general.preflight_model);
         config.memory = self.apply_to_gateway_memory_config(config.memory);
         config.thread_episodic =
             self.apply_to_gateway_thread_episodic_config(config.thread_episodic);
@@ -1127,19 +1125,6 @@ impl GatewaySettings {
     pub fn apply_to_app_config(&self, mut config: AppConfig) -> AppConfig {
         config.gateway = self.apply_to_gateway_config(config.gateway);
         config
-    }
-
-    fn migrate_legacy_active_recall_model(&mut self) -> bool {
-        let mut migrated = false;
-        if let Some(memory) = &mut self.memory {
-            if self.general.preflight_model.is_none() {
-                self.general.preflight_model = memory.legacy_active_recall_model.clone();
-            }
-            migrated = memory.legacy_active_recall_model.is_some();
-            memory.legacy_active_recall_model = None;
-        }
-        self.migrated |= migrated;
-        migrated
     }
 
     fn migrate_default_opencode_cli_runtime_instance(&mut self) -> bool {
@@ -1237,8 +1222,6 @@ impl GatewayMemorySettings {
     pub fn from_gateway_memory_config(config: &GatewayMemoryConfig) -> Self {
         Self {
             enabled: config.enabled,
-            deterministic_recall_enabled: config.deterministic_recall_enabled,
-            active_recall_enabled: config.active_recall_enabled,
             tools_enabled: config.tools_enabled,
             proactive_writes_enabled: config.proactive_writes_enabled,
             background_extraction_enabled: config.background_extraction_enabled,
@@ -1251,8 +1234,6 @@ impl GatewayMemorySettings {
     pub fn from_protocol(settings: pioneer_protocol::GatewayMemorySettings) -> Self {
         Self {
             enabled: settings.enabled,
-            deterministic_recall_enabled: settings.deterministic_recall_enabled,
-            active_recall_enabled: settings.active_recall_enabled,
             tools_enabled: settings.tools_enabled,
             proactive_writes_enabled: settings.proactive_writes_enabled,
             background_extraction_enabled: settings.background_extraction_enabled,
@@ -1265,8 +1246,6 @@ impl GatewayMemorySettings {
     pub fn to_protocol(&self) -> pioneer_protocol::GatewayMemorySettings {
         pioneer_protocol::GatewayMemorySettings {
             enabled: self.enabled,
-            deterministic_recall_enabled: self.deterministic_recall_enabled,
-            active_recall_enabled: self.active_recall_enabled,
             tools_enabled: self.tools_enabled,
             proactive_writes_enabled: self.proactive_writes_enabled,
             background_extraction_enabled: self.background_extraction_enabled,
@@ -1822,7 +1801,6 @@ pub struct GatewayVoiceInputChangeSet {
 pub struct GatewayGeneralSettingsChangeSet {
     pub keepawake: Option<bool>,
     pub telemetry_enabled: Option<bool>,
-    pub preflight_model: Option<GatewayMemoryModelSelectionConfig>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1839,12 +1817,9 @@ impl GatewayMemorySettingsOverride {
     fn from_memory_settings(settings: GatewayMemorySettings) -> Self {
         Self {
             enabled: Some(settings.enabled),
-            deterministic_recall_enabled: Some(settings.deterministic_recall_enabled),
-            active_recall_enabled: Some(settings.active_recall_enabled),
             tools_enabled: Some(settings.tools_enabled),
             proactive_writes_enabled: Some(settings.proactive_writes_enabled),
             background_extraction_enabled: Some(settings.background_extraction_enabled),
-            legacy_active_recall_model: None,
             proactive_writes_model: Some(settings.proactive_writes_model),
             debug_trace_enabled: Some(settings.debug_trace_enabled),
             strict_diagnostics_enabled: Some(settings.strict_diagnostics_enabled),
@@ -1857,12 +1832,6 @@ impl GatewayMemorySettingsOverride {
     ) -> GatewayMemorySettings {
         if let Some(enabled) = self.enabled {
             settings.enabled = enabled;
-        }
-        if let Some(deterministic_recall_enabled) = self.deterministic_recall_enabled {
-            settings.deterministic_recall_enabled = deterministic_recall_enabled;
-        }
-        if let Some(active_recall_enabled) = self.active_recall_enabled {
-            settings.active_recall_enabled = active_recall_enabled;
         }
         if let Some(tools_enabled) = self.tools_enabled {
             settings.tools_enabled = tools_enabled;
@@ -1891,12 +1860,6 @@ impl GatewayMemorySettingsOverride {
     ) -> GatewayMemoryConfig {
         if let Some(enabled) = self.enabled {
             config.enabled = enabled;
-        }
-        if let Some(deterministic_recall_enabled) = self.deterministic_recall_enabled {
-            config.deterministic_recall_enabled = deterministic_recall_enabled;
-        }
-        if let Some(active_recall_enabled) = self.active_recall_enabled {
-            config.active_recall_enabled = active_recall_enabled;
         }
         if let Some(tools_enabled) = self.tools_enabled {
             config.tools_enabled = tools_enabled;
@@ -2582,8 +2545,6 @@ pub(crate) fn read_gateway_settings(path: &Path, expected_version: u32) -> Resul
 /// fails. Callers must not infer that the previous configuration is still on
 /// disk from `Err` alone.
 pub fn save_gateway_settings(path: &Path, settings: &GatewaySettings) -> Result<()> {
-    let mut settings = settings.clone();
-    settings.migrate_legacy_active_recall_model();
     let content =
         toml::to_string_pretty(&settings).context("failed to serialize gateway settings")?;
     write_settings_file(path, content.as_str())
@@ -3122,7 +3083,6 @@ backend = "keystore"
 [memory]
 enabled = false
 debug_trace_enabled = true
-active_recall_model = { source = "custom", model_provider = "legacy-provider", model = "legacy-model" }
 proactive_writes_model = { source = "custom", model_provider = "extractor-provider", model = "extractor-model" }
 "#,
         )
@@ -3132,8 +3092,6 @@ proactive_writes_model = { source = "custom", model_provider = "extractor-provid
             capsules_dir: "memory/custom".to_owned(),
             allow_global_user_by_default: false,
             allow_global_agent_by_default: true,
-            deterministic_recall_enabled: false,
-            active_recall_enabled: false,
             tools_enabled: false,
             proactive_writes_enabled: false,
             background_extraction_enabled: false,
@@ -3141,28 +3099,15 @@ proactive_writes_model = { source = "custom", model_provider = "extractor-provid
             ..GatewayMemoryConfig::default()
         };
 
-        assert_eq!(
-            settings
-                .effective_general_settings(&gateway_config_with_keepawake(false))
-                .preflight_model,
-            pioneer_protocol::GatewayMemoryModelSelection::custom(
-                "legacy-provider",
-                "legacy-model"
-            )
-        );
-
         let mapped = settings.apply_to_gateway_memory_config(base);
 
         assert_eq!(mapped.capsules_dir, "memory/custom");
         assert!(!mapped.allow_global_user_by_default);
         assert!(mapped.allow_global_agent_by_default);
         assert!(!mapped.enabled);
-        assert!(!mapped.deterministic_recall_enabled);
-        assert!(!mapped.active_recall_enabled);
         assert!(!mapped.tools_enabled);
         assert!(!mapped.proactive_writes_enabled);
         assert!(!mapped.background_extraction_enabled);
-        assert!(mapped.active_recall_model.is_thread_model());
         assert_eq!(
             mapped.proactive_writes_model,
             GatewayMemoryModelSelectionConfig::custom("extractor-provider", "extractor-model")
@@ -3194,17 +3139,6 @@ backend = "keystore"
                 .effective_general_settings(&gateway_config)
                 .keepawake
         );
-        gateway_config.preflight_model =
-            GatewayMemoryModelSelectionConfig::custom("config-provider", "config-model");
-        assert_eq!(
-            settings_without_override
-                .effective_general_settings(&gateway_config)
-                .preflight_model,
-            pioneer_protocol::GatewayMemoryModelSelection::custom(
-                "config-provider",
-                "config-model"
-            )
-        );
 
         let settings_with_enabled_override = toml::from_str::<super::GatewaySettings>(
             r#"
@@ -3212,7 +3146,6 @@ version = 1
 
 [general]
 keepawake = true
-preflight_model = { source = "custom", model_provider = "settings-provider", model = "settings-model" }
 
 [secrets]
 backend = "keystore"
@@ -3223,15 +3156,6 @@ backend = "keystore"
             settings_with_enabled_override
                 .effective_general_settings(&gateway_config_with_keepawake(false))
                 .keepawake
-        );
-        assert_eq!(
-            settings_with_enabled_override
-                .effective_general_settings(&gateway_config)
-                .preflight_model,
-            pioneer_protocol::GatewayMemoryModelSelection::custom(
-                "settings-provider",
-                "settings-model"
-            )
         );
 
         let settings_with_disabled_override = toml::from_str::<super::GatewaySettings>(
@@ -3271,10 +3195,6 @@ backend = "keystore"
                     compaction_model: None,
                     keepawake: Some(true),
                     telemetry_enabled: Some(false),
-                    preflight_model: Some(pioneer_protocol::GatewayMemoryModelSelection::custom(
-                        "planner-provider",
-                        "planner-model",
-                    )),
                     model_catalog_proxy: Some(pioneer_protocol::GatewayModelCatalogProxyUpdate {
                         proxy_url: Some("http://user:pass@proxy.invalid:8080".to_owned()),
                     }),
@@ -3293,9 +3213,6 @@ backend = "keystore"
         assert!(content.contains("[general]"));
         assert!(content.contains("keepawake = true"));
         assert!(content.contains("telemetry_enabled = false"));
-        assert!(content.contains("preflight_model"));
-        assert!(content.contains("model_provider = \"planner-provider\""));
-        assert!(content.contains("model = \"planner-model\""));
         assert!(!content.contains("model_catalog_proxy"));
         assert!(!content.contains("[memory]"));
 
@@ -3368,35 +3285,6 @@ backend = "keystore"
         assert_eq!(
             snapshot.self_improvement,
             pioneer_protocol::GatewaySelfImprovementSettings::default()
-        );
-    }
-
-    #[test]
-    fn self_improvement_update_requires_workspace_scope() {
-        let mut settings = toml::from_str::<super::GatewaySettings>(
-            r#"
-version = 1
-
-[secrets]
-backend = "keystore"
-"#,
-        )
-        .expect("gateway settings should parse");
-
-        let error = settings
-            .apply_protocol_update(pioneer_protocol::GatewaySettingsUpdate {
-                self_improvement: Some(pioneer_protocol::GatewaySelfImprovementSettings {
-                    enabled: true,
-                    default_model: None,
-                    reviewer_model: None,
-                }),
-                ..Default::default()
-            })
-            .expect_err("self-improvement update without workspace must fail");
-
-        assert!(
-            format!("{error:#}")
-                .contains("workspace context is required to update self-improvement settings")
         );
     }
 
@@ -3675,8 +3563,6 @@ provider = "openai"
 
         settings.set_memory_settings(GatewayMemorySettings {
             enabled: false,
-            deterministic_recall_enabled: false,
-            active_recall_enabled: false,
             tools_enabled: false,
             proactive_writes_enabled: false,
             background_extraction_enabled: false,
@@ -3689,14 +3575,9 @@ provider = "openai"
         let content = fs::read_to_string(&path).expect("read settings");
         assert!(content.contains("[memory]"));
         assert!(content.contains("enabled = false"));
-        assert!(content.contains("deterministic_recall_enabled = false"));
-        assert!(content.contains("active_recall_enabled = false"));
         assert!(content.contains("tools_enabled = false"));
         assert!(content.contains("proactive_writes_enabled = false"));
         assert!(content.contains("background_extraction_enabled = false"));
-        assert!(!content.contains("active_recall_model"));
-        assert!(!content.contains("planner-provider"));
-        assert!(!content.contains("planner-model"));
         assert!(content.contains("proactive_writes_model = \"thread\""));
         assert!(content.contains("debug_trace_enabled = true"));
         assert!(content.contains("strict_diagnostics_enabled = true"));
@@ -4344,38 +4225,6 @@ backend = "keystore"
     }
 
     #[test]
-    fn gateway_thread_episodic_vector_update_requires_workspace_scope() {
-        let mut settings = toml::from_str::<super::GatewaySettings>(
-            r#"
-version = 1
-
-[secrets]
-backend = "keystore"
-"#,
-        )
-        .expect("gateway settings should parse");
-
-        let error = settings
-            .apply_protocol_update(pioneer_protocol::GatewaySettingsUpdate {
-                thread_episodic: Some(pioneer_protocol::GatewayThreadEpisodicSettingsUpdate {
-                    vector_search: Some(
-                        pioneer_protocol::GatewayThreadEpisodicVectorSearchSettingsUpdate {
-                            enabled: Some(true),
-                            ..Default::default()
-                        },
-                    ),
-                    ..pioneer_protocol::GatewayThreadEpisodicSettingsUpdate::default()
-                }),
-                ..pioneer_protocol::GatewaySettingsUpdate::default()
-            })
-            .expect_err("vector settings update without workspace should fail");
-
-        assert!(format!("{error:#}").contains(
-            "workspace context is required to update thread episodic vector search settings"
-        ));
-    }
-
-    #[test]
     fn gateway_thread_episodic_workspace_vector_update_is_workspace_scoped() {
         let mut settings = toml::from_str::<super::GatewaySettings>(
             r#"
@@ -4944,184 +4793,111 @@ backend = "keystore"
     }
 
     #[test]
-    fn gateway_settings_migration_copies_legacy_active_recall_model_to_general() {
+    fn retired_recall_settings_are_removed_without_losing_current_settings() {
         let temp_dir = unique_temp_dir();
         fs::create_dir_all(&temp_dir).expect("create temp dir");
         let path = temp_dir.join("gateway-settings.toml");
-        fs::write(
-            &path,
-            r#"
+        let legacy = r#"
 version = 1
-
 [secrets]
 backend = "keystore"
-
-[memory]
-proactive_writes_model = { source = "custom", model_provider = "extractor-provider", model = "extractor-model" }
-
-[memory.active_recall_model]
-source = "custom"
-model_provider = "legacy-provider"
-model = "legacy-model"
-"#,
-        )
-        .expect("write legacy settings");
-
-        let settings = load_or_create_gateway_settings(&path, 1, "gateway-settings.toml")
-            .expect("legacy settings should load");
-        assert_eq!(
-            settings
-                .effective_general_settings(&gateway_config_with_keepawake(false))
-                .preflight_model,
-            pioneer_protocol::GatewayMemoryModelSelection::custom(
-                "legacy-provider",
-                "legacy-model"
-            )
-        );
-
-        let content = fs::read_to_string(&path).expect("read migrated settings");
-        assert!(content.contains("preflight_model"));
-        assert!(content.contains("legacy-provider"));
-        assert!(content.contains("legacy-model"));
-        assert!(!content.contains("active_recall_model"));
-        assert!(content.contains("proactive_writes_model"));
-        assert!(content.contains("extractor-provider"));
-        assert!(content.contains("extractor-model"));
-
-        let _ = fs::remove_dir_all(temp_dir);
-    }
-
-    #[test]
-    fn gateway_settings_migration_preserves_explicit_preflight_model() {
-        let temp_dir = unique_temp_dir();
-        fs::create_dir_all(&temp_dir).expect("create temp dir");
-        let path = temp_dir.join("gateway-settings.toml");
-        fs::write(
-            &path,
-            r#"
-version = 1
-
 [general]
-preflight_model = { source = "custom", model_provider = "new-provider", model = "new-model" }
-
-[secrets]
-backend = "keystore"
-
-[memory.active_recall_model]
-source = "custom"
-model_provider = "legacy-provider"
-model = "legacy-model"
-"#,
-        )
-        .expect("write mixed settings");
-
+keepawake = true
+preflight_model = { source = "custom", model_provider = "old", model = "planner" }
+[memory]
+enabled = true
+deterministic_recall_enabled = true
+active_recall_enabled = true
+active_recall_model = "thread"
+proactive_writes_model = { source = "custom", model_provider = "current", model = "extractor" }
+"#;
+        fs::write(&path, legacy).expect("write legacy settings");
         let settings = load_or_create_gateway_settings(&path, 1, "gateway-settings.toml")
-            .expect("mixed settings should load");
-        assert_eq!(
+            .expect("load legacy settings");
+        assert!(
             settings
                 .effective_general_settings(&gateway_config_with_keepawake(false))
-                .preflight_model,
-            pioneer_protocol::GatewayMemoryModelSelection::custom("new-provider", "new-model")
+                .keepawake
         );
-
-        let content = fs::read_to_string(&path).expect("read migrated settings");
-        assert!(content.contains("new-provider"));
-        assert!(content.contains("new-model"));
-        assert!(!content.contains("active_recall_model"));
-        assert!(!content.contains("legacy-provider"));
-        assert!(!content.contains("legacy-model"));
-
+        let memory = settings.apply_to_gateway_memory_config(GatewayMemoryConfig::default());
+        assert_eq!(
+            memory.proactive_writes_model,
+            GatewayMemoryModelSelectionConfig::custom("current", "extractor")
+        );
+        let rewritten = fs::read_to_string(&path).expect("read migrated file");
+        for retired in [
+            "preflight_model",
+            "deterministic_recall_enabled",
+            "active_recall_enabled",
+            "active_recall_model",
+        ] {
+            assert!(!rewritten.contains(retired));
+        }
+        let restored =
+            toml::from_str::<super::GatewaySettings>(&rewritten).expect("read current format");
+        assert_eq!(
+            restored.apply_to_gateway_memory_config(GatewayMemoryConfig::default()),
+            memory
+        );
+        for unknown in [
+            legacy.replace(
+                "keepawake = true",
+                "keepawake = true\nunknown_general = true",
+            ),
+            legacy.replace(
+                "enabled = true\ndeterministic",
+                "unknown_memory = true\nenabled = true\ndeterministic",
+            ),
+        ] {
+            assert!(toml::from_str::<super::GatewaySettings>(&unknown).is_err());
+        }
         let _ = fs::remove_dir_all(temp_dir);
     }
 
     #[test]
-    fn rejects_gateway_settings_with_unsupported_version() {
-        let temp_dir = unique_temp_dir();
-        fs::create_dir_all(&temp_dir).expect("create temp dir");
-        let path = temp_dir.join("gateway-settings.toml");
-        fs::write(
-            &path,
-            r#"
+    fn gateway_settings_file_rejects_unsupported_and_removed_configuration() {
+        for (case, content, write_message, rejection_message, expected_error) in [
+            (
+                "rejects_gateway_settings_with_unsupported_version",
+                r#"
             version = 2
 
             [secrets]
             backend = "keystore"
             "#,
-        )
-        .expect("write unsupported-version settings");
-
-        let error = load_or_create_gateway_settings(&path, 1, "gateway-settings.toml")
-            .expect_err("unsupported settings version should be rejected");
-        assert!(
-            format!("{error:#}").contains("unsupported gateway settings version"),
-            "unexpected error: {error:#}"
-        );
-
-        let _ = fs::remove_dir_all(temp_dir);
-    }
-
-    #[test]
-    fn rejects_gateway_settings_with_removed_jwt_secret_field() {
-        let temp_dir = unique_temp_dir();
-        fs::create_dir_all(&temp_dir).expect("create temp dir");
-        let path = temp_dir.join("gateway-settings.toml");
-        fs::write(
-            &path,
-            r#"
+                "write unsupported-version settings",
+                "unsupported settings version should be rejected",
+                "unsupported gateway settings version",
+            ),
+            (
+                "rejects_gateway_settings_with_removed_jwt_secret_field",
+                r#"
             version = 1
             jwt_secret = "abcd"
 
             [secrets]
             backend = "keystore"
             "#,
-        )
-        .expect("write settings with removed jwt field");
-
-        let error = load_or_create_gateway_settings(&path, 1, "gateway-settings.toml")
-            .expect_err("removed jwt_secret field should be rejected");
-        assert!(
-            format!("{error:#}").contains("unknown field `jwt_secret`"),
-            "unexpected error: {error:#}"
-        );
-
-        let _ = fs::remove_dir_all(temp_dir);
-    }
-
-    #[test]
-    fn rejects_gateway_settings_with_top_level_keepawake_field() {
-        let temp_dir = unique_temp_dir();
-        fs::create_dir_all(&temp_dir).expect("create temp dir");
-        let path = temp_dir.join("gateway-settings.toml");
-        fs::write(
-            &path,
-            r#"
+                "write settings with removed jwt field",
+                "removed jwt_secret field should be rejected",
+                "unknown field `jwt_secret`",
+            ),
+            (
+                "rejects_gateway_settings_with_top_level_keepawake_field",
+                r#"
             version = 1
             keepawake = true
 
             [secrets]
             backend = "keystore"
             "#,
-        )
-        .expect("write settings with top-level keepawake field");
-
-        let error = load_or_create_gateway_settings(&path, 1, "gateway-settings.toml")
-            .expect_err("top-level keepawake field should be rejected");
-        assert!(
-            format!("{error:#}").contains("unknown field `keepawake`"),
-            "unexpected error: {error:#}"
-        );
-
-        let _ = fs::remove_dir_all(temp_dir);
-    }
-
-    #[test]
-    fn rejects_gateway_settings_with_removed_providers_field() {
-        let temp_dir = unique_temp_dir();
-        fs::create_dir_all(&temp_dir).expect("create temp dir");
-        let path = temp_dir.join("gateway-settings.toml");
-        fs::write(
-            &path,
-            r#"
+                "write settings with top-level keepawake field",
+                "top-level keepawake field should be rejected",
+                "unknown field `keepawake`",
+            ),
+            (
+                "rejects_gateway_settings_with_removed_providers_field",
+                r#"
             version = 1
 
             [secrets]
@@ -5130,27 +4906,13 @@ model = "legacy-model"
             [providers.keys]
             openrouter = "sk-test"
             "#,
-        )
-        .expect("write settings with removed providers field");
-
-        let error = load_or_create_gateway_settings(&path, 1, "gateway-settings.toml")
-            .expect_err("removed providers field should be rejected");
-        assert!(
-            format!("{error:#}").contains("unknown field `providers`"),
-            "unexpected error: {error:#}"
-        );
-
-        let _ = fs::remove_dir_all(temp_dir);
-    }
-
-    #[test]
-    fn rejects_gateway_settings_with_removed_mcp_field() {
-        let temp_dir = unique_temp_dir();
-        fs::create_dir_all(&temp_dir).expect("create temp dir");
-        let path = temp_dir.join("gateway-settings.toml");
-        fs::write(
-            &path,
-            r#"
+                "write settings with removed providers field",
+                "removed providers field should be rejected",
+                "unknown field `providers`",
+            ),
+            (
+                "rejects_gateway_settings_with_removed_mcp_field",
+                r#"
             version = 1
 
             [secrets]
@@ -5158,27 +4920,13 @@ model = "legacy-model"
 
             [mcp]
             "#,
-        )
-        .expect("write settings with removed mcp field");
-
-        let error = load_or_create_gateway_settings(&path, 1, "gateway-settings.toml")
-            .expect_err("removed mcp field should be rejected");
-        assert!(
-            format!("{error:#}").contains("unknown field `mcp`"),
-            "unexpected error: {error:#}"
-        );
-
-        let _ = fs::remove_dir_all(temp_dir);
-    }
-
-    #[test]
-    fn rejects_gateway_settings_with_removed_mcp_secrets_field() {
-        let temp_dir = unique_temp_dir();
-        fs::create_dir_all(&temp_dir).expect("create temp dir");
-        let path = temp_dir.join("gateway-settings.toml");
-        fs::write(
-            &path,
-            r#"
+                "write settings with removed mcp field",
+                "removed mcp field should be rejected",
+                "unknown field `mcp`",
+            ),
+            (
+                "rejects_gateway_settings_with_removed_mcp_secrets_field",
+                r#"
             version = 1
 
             [secrets]
@@ -5187,43 +4935,37 @@ model = "legacy-model"
             [mcp.secrets]
             token = "secret"
             "#,
-        )
-        .expect("write settings with removed mcp secrets field");
-
-        let error = load_or_create_gateway_settings(&path, 1, "gateway-settings.toml")
-            .expect_err("removed mcp secrets field should be rejected");
-        assert!(
-            format!("{error:#}").contains("unknown field `mcp`"),
-            "unexpected error: {error:#}"
-        );
-
-        let _ = fs::remove_dir_all(temp_dir);
-    }
-
-    #[test]
-    fn rejects_gateway_settings_with_unsupported_secret_backend() {
-        let temp_dir = unique_temp_dir();
-        fs::create_dir_all(&temp_dir).expect("create temp dir");
-        let path = temp_dir.join("gateway-settings.toml");
-        fs::write(
-            &path,
-            r#"
+                "write settings with removed mcp secrets field",
+                "removed mcp secrets field should be rejected",
+                "unknown field `mcp`",
+            ),
+            (
+                "rejects_gateway_settings_with_unsupported_secret_backend",
+                r#"
             version = 1
 
             [secrets]
             backend = "db-keystore"
             "#,
-        )
-        .expect("write settings with unsupported backend");
+                "write settings with unsupported backend",
+                "unsupported backend should be rejected",
+                "unknown variant `db-keystore`",
+            ),
+        ] {
+            let temp_dir = unique_temp_dir();
+            fs::create_dir_all(&temp_dir).expect("create temp dir");
+            let path = temp_dir.join("gateway-settings.toml");
+            fs::write(&path, content).expect(write_message);
 
-        let error = load_or_create_gateway_settings(&path, 1, "gateway-settings.toml")
-            .expect_err("unsupported backend should be rejected");
-        assert!(
-            format!("{error:#}").contains("unknown variant `db-keystore`"),
-            "unexpected error: {error:#}"
-        );
+            let error = load_or_create_gateway_settings(&path, 1, "gateway-settings.toml")
+                .expect_err(rejection_message);
+            assert!(
+                format!("{error:#}").contains(expected_error),
+                "{case}: unexpected error: {error:#}"
+            );
 
-        let _ = fs::remove_dir_all(temp_dir);
+            let _ = fs::remove_dir_all(temp_dir);
+        }
     }
 
     fn unique_temp_dir() -> PathBuf {
@@ -5470,7 +5212,6 @@ stderr_ring_lines = 73
             trusted_proxy_peers: Vec::new(),
             outbound_queue_capacity: 128,
             keepawake,
-            preflight_model: Default::default(),
             telemetry: Default::default(),
             thread: GatewayThreadConfig {
                 default_model: Some("gpt-5.4".to_owned()),
@@ -5517,6 +5258,59 @@ stderr_ring_lines = 73
                 device_activation_code_ttl_seconds: 600,
                 ..GatewayAuthConfig::default()
             },
+        }
+    }
+
+    #[test]
+    fn workspace_specific_settings_updates_require_workspace_context() {
+        for (update, rejection_message, expected_error) in [
+            (
+                pioneer_protocol::GatewaySettingsUpdate {
+                    self_improvement: Some(pioneer_protocol::GatewaySelfImprovementSettings {
+                        enabled: true,
+                        default_model: None,
+                        reviewer_model: None,
+                    }),
+                    ..Default::default()
+                },
+                "self-improvement update without workspace must fail",
+                "workspace context is required to update self-improvement settings",
+            ),
+            (
+                pioneer_protocol::GatewaySettingsUpdate {
+                    thread_episodic: Some(pioneer_protocol::GatewayThreadEpisodicSettingsUpdate {
+                        vector_search: Some(
+                            pioneer_protocol::GatewayThreadEpisodicVectorSearchSettingsUpdate {
+                                enabled: Some(true),
+                                ..Default::default()
+                            },
+                        ),
+                        ..pioneer_protocol::GatewayThreadEpisodicSettingsUpdate::default()
+                    }),
+                    ..pioneer_protocol::GatewaySettingsUpdate::default()
+                },
+                "vector settings update without workspace should fail",
+                "workspace context is required to update thread episodic vector search settings",
+            ),
+        ] {
+            let mut settings = toml::from_str::<super::GatewaySettings>(
+                r#"
+version = 1
+
+[secrets]
+backend = "keystore"
+"#,
+            )
+            .expect("gateway settings should parse");
+
+            let error = settings
+                .apply_protocol_update(update)
+                .expect_err(rejection_message);
+
+            assert!(
+                format!("{error:#}").contains(expected_error),
+                "{rejection_message}: {error:#}"
+            );
         }
     }
 }

@@ -6,12 +6,12 @@ Use current callable schemas as the authority. Canonical names below are mapped 
 
 | Tool | Input | Continuation and result |
 | --- | --- | --- |
-| `threads_list` | Required `limit` (1–100); optional string/null `cursor` | `threads`, `nextCursor`, `eof`; immutable thread-ID order, including accessible internal/archived threads |
+| `threads_list` | Required `limit` (1–100); optional string/null `cursor` | `threads`, `nextCursor`, `eof`; creation order `created_at DESC, id DESC`, standalone conversations including archived ones; internal children via history `childReference` or `threads_children_list` |
 | `threads_history_read` | Required `threadId`, `limit` (1–100); optional `anchor:{turnId,itemId?}`, `direction:"older"` or `"newer"` (default older), string/null `cursor` | `events`, `nextCursor`, `eof`, `reverseCursor`, `reverseDirection`, `direction` in a saved snapshot |
 | `threads_children_list` | Required `threadId`, `recursive`, `limit` (1–100); optional string/null `cursor` | `threads`, `nextCursor`, `eof`; direct children or recursive descendants |
 | `threads_search` | Required nonblank `query`, `limit` (1–100); optional string/null `cursor` | `threads`, `nextCursor`, `eof`, `coverageIncomplete`, `warnings`, optional `pageFragment` |
 
-No maximum query length is imposed. Listing and children may return an empty nonterminal page. Repeat with the issued cursor, original limit, and original recursive setting when applicable. A changed listing source can invalidate the cursor; restart that listing rather than editing the cursor. Children cursors track traversed edges/returned metadata, not unrelated workspace activity.
+No maximum query length is imposed. Listing and children may return an empty nonterminal page. Repeat with the issued cursor, original limit, and original recursive setting when applicable. `threads_list` uses `created_at DESC, id DESC`, retaining the exact creation date and ID of the last examined candidate. It progresses through inaccessible candidates too. Unrelated edits/activity and deletion of a completed candidate do not invalidate that position. New threads before it appear on a fresh first page. Access is rechecked on each page. A changed, missing, or inaccessible card being continued as fragments fails safely; never splice source versions. Old-format, invalid, or incompatible list cursors require restarting with the original parameters. Children cursors track traversed edges/returned metadata, not unrelated workspace activity.
 
 Large list/children metadata uses JSON fragments (`encoding`, `version`, `offset`, `nextOffset`, `eof`, `text`); concatenate exact text by UTF-8 byte offsets and decode only at EOF. Titles are not shortened to fit a card.
 
@@ -112,4 +112,11 @@ Start optionally accepts `launch`:
 
 Omitted launch inherits current identity, provider/executor, model, reasoning under server rules, without a preliminary catalog lookup. A targetOptionId remains mandatory.
 
-Mutation results: `status` (`accepted`, `queued`, `completed`, `denied`, `failed`), optional `outcome`, `receiptId`, `outboxId`, `publicMessage`, and `targetOptions`. Creation refreshes permitted targets, including on replay. Do not expect a result `threadId`. Existing call identity and Agent ledger/outbox handle replay; these JSON schemas declare no idempotencyKey.
+Mutation results: `status` (`accepted`, `queued`, `completed`, `denied`, `failed`), optional `outcome`, `receiptId`, `outboxId`, `publicMessage`, `threadResult`, and `targetOptions`. Creation refreshes permitted targets, including on replay. `threadResult` contains confirmed navigation references:
+
+- Create: `{workspaceId,threadId}` for the created thread.
+- Send: `{workspaceId,threadId,turnId}` for the saved message.
+- Start in Collaborative: `{workspaceId,threadId,turnId,taskId}`. `threadId/turnId` refer to the target's parent admission. The Task's executing child is created separately; read parent history near this turn to follow its later child reference.
+- Foreground start: `{workspaceId,threadId,turnId,executionId}` for the actual admitted turn and execution in the target thread.
+
+For send/start, call `threads_history_read` with the returned `threadResult.threadId` and `anchor:{turnId:threadResult.turnId}`. No workspace listing or index is needed. No speculative child ID is returned. Accepted/queued does not mean the model finished. References are fixed at commit and retained by replay; they grant no additional access and cannot replace `targetOptionId`. Older receipts without these fields remain readable but cannot supply references they never saved. Existing call identity and Agent ledger/outbox handle replay; these JSON schemas declare no idempotencyKey.

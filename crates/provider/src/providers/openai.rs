@@ -10,7 +10,6 @@ use crate::{
         lookup_uploaded_reference_with_artifact_for_authority, model_family_for_model,
         prepare_messages_for_provider_async, runtime, store_uploaded_reference_for_authority,
     },
-    reasoning_registry,
     tools::call::{StreamToolCallAccumulator, StreamToolCallDelta, StreamToolFunctionDelta},
     tools::parse::parse_tool_calls,
     tools::stream::IncrementalSseDecoder,
@@ -1214,18 +1213,7 @@ impl OpenAiProvider {
     }
 
     async fn api_error(response: reqwest::Response) -> anyhow::Error {
-        let status = response.status();
-        let body = match crate::http::read_response_text_bounded(
-            response,
-            16 * 1024,
-            "provider_error_body",
-        )
-        .await
-        {
-            Ok(body) => body,
-            Err(error) => return error,
-        };
-        anyhow!("OpenAI API error ({status}): {body}")
+        crate::http::provider_api_error(response, "OpenAI").await
     }
 }
 
@@ -1489,6 +1477,7 @@ impl crate::traits::Provider for OpenAiProvider {
             })
             .or_else(|| super::responses_api_compatible::classify_failure(error))
             .or_else(|| crate::failure::classify_stream_error(error))
+            .or_else(|| crate::failure::classify_http_error(error))
     }
 
     async fn prepare_input_budget(
@@ -1642,15 +1631,7 @@ impl crate::traits::Provider for OpenAiProvider {
                 )
                 .await
                 {
-                    let class = crate::failure::classify_provider_failure_class(
-                        &body.to_ascii_lowercase(),
-                        ProviderFailureStage::Connect,
-                        Some(status),
-                        None,
-                    );
-                    if class == ProviderFailureClass::ContextTooLarge {
-                        failure.0.class = class;
-                    }
+                    failure.0.class = super::embedding::classify_input_failure(status, &body);
                 }
             }
             return Err(failure.into());
@@ -1667,8 +1648,7 @@ impl crate::traits::Provider for OpenAiProvider {
 }
 
 fn provider_model_from_openai_model_entry(m: ApiModelEntry) -> ProviderModelInfo {
-    let mut capabilities = ProviderModelCapabilities::default();
-    reasoning_registry::apply_reasoning_capabilities("openai", m.id.as_str(), &mut capabilities);
+    let capabilities = ProviderModelCapabilities::default();
 
     ProviderModelInfo {
         id: m.id.clone(),
@@ -1710,114 +1690,6 @@ fn openai_embedding_model_info(model: &OpenAiEmbeddingModelDefinition) -> Provid
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn discovered_51_and_52_fallback_vocabulary_agrees_with_direct_chat_bodies() {
-        for (id, xhigh) in [("gpt-5.1", false), ("gpt-5.2", true)] {
-            let entry: ApiModelEntry =
-                serde_json::from_value(serde_json::json!({"id":id})).unwrap();
-            let discovered = provider_model_from_openai_model_entry(entry);
-            assert_eq!(
-                discovered
-                    .capabilities
-                    .reasoning
-                    .as_ref()
-                    .unwrap()
-                    .effort_options
-                    .contains(&"xhigh".into()),
-                xhigh
-            );
-            for stream in [false, true] {
-                let mut request = crate::generation::test_request(id);
-                request.reasoning = Some(ReasoningConfig::Effort(ReasoningEffort::XHigh));
-                let result =
-                    OpenAiProvider::build_chat_request_with_catalog(&request, vec![], stream, None);
-                assert_eq!(result.is_ok(), xhigh);
-                if xhigh {
-                    let body = serde_json::to_value(result.unwrap()).unwrap();
-                    assert_eq!(body["reasoning_effort"], "xhigh");
-                    assert_eq!(body["max_completion_tokens"], 1024);
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn mapped_efforts_obey_direct_chat_model_contract_in_both_modes() {
-        use crate::generation::{test_catalog_model, test_request};
-        let partial = test_catalog_model(
-            "openai",
-            "gpt-5.1",
-            "gpt-5.4",
-            serde_json::json!({"thinkingLevelMap":{}}),
-        );
-        let stale = test_catalog_model(
-            "openai",
-            "gpt-5.1",
-            "gpt-5.4",
-            serde_json::json!({"thinkingLevelMap":{"xhigh":"xhigh","max":"surprise"}}),
-        );
-        for catalog in [None, Some(&partial), Some(&stale)] {
-            for stream in [false, true] {
-                for (effort, valid) in [
-                    (ReasoningEffort::Low, true),
-                    (ReasoningEffort::High, true),
-                    (ReasoningEffort::XHigh, false),
-                    (ReasoningEffort::Max, false),
-                ] {
-                    let mut request = test_request("gpt-5.1");
-                    request.reasoning = Some(ReasoningConfig::Effort(effort));
-                    let result = OpenAiProvider::build_chat_request_with_catalog(
-                        &request,
-                        vec![],
-                        stream,
-                        catalog,
-                    );
-                    assert_eq!(result.is_ok(), valid);
-                    if valid {
-                        let body = serde_json::to_value(result.unwrap()).unwrap();
-                        assert_eq!(body["reasoning_effort"], effort.as_str());
-                        assert_eq!(body["max_completion_tokens"], 1024);
-                    }
-                }
-            }
-        }
-        let stale = test_catalog_model(
-            "openai",
-            "gpt-6-astra",
-            "gpt-5.4",
-            serde_json::json!({"thinkingLevelMap":{"off":"low"}}),
-        );
-        for catalog in [None, Some(&stale)] {
-            for off in [
-                ReasoningConfig::Disabled,
-                ReasoningConfig::Effort(ReasoningEffort::None),
-            ] {
-                let mut request = test_request("gpt-6-astra");
-                request.reasoning = Some(off);
-                for stream in [false, true] {
-                    assert!(
-                        OpenAiProvider::build_chat_request_with_catalog(
-                            &request,
-                            vec![],
-                            stream,
-                            catalog
-                        )
-                        .is_err()
-                    );
-                }
-            }
-        }
-        let mut request = test_request("gpt-5.6");
-        request.reasoning = Some(ReasoningConfig::Effort(ReasoningEffort::Max));
-        for stream in [false, true] {
-            let body = serde_json::to_value(
-                OpenAiProvider::build_chat_request_with_catalog(&request, vec![], stream, None)
-                    .unwrap(),
-            )
-            .unwrap();
-            assert_eq!(body["reasoning_effort"], "max");
-        }
-    }
 
     #[test]
     fn native_openai_honors_negative_fresh_source_temperature() {
@@ -1845,143 +1717,60 @@ mod tests {
     }
 
     #[test]
-    fn catalog_preferred_responses_does_not_certify_unknown_chat_family() {
-        use crate::catalog::ModelCatalog;
-        let mut models: serde_json::Value =
-            serde_json::from_str(include_str!("../../tests/fixtures/catalog/models.json")).unwrap();
-        let mut origins: serde_json::Value =
-            serde_json::from_str(include_str!("../../tests/fixtures/catalog/provenance.json"))
-                .unwrap();
-        let id = "future-unverified-family";
-        let mut model = models["openai"]["gpt-5.4"].clone();
-        model["id"] = serde_json::json!(id);
-        models["openai"][id] = model;
-        origins["openai"][id] = origins["openai"]["gpt-5.4"].clone();
-        let responses = ModelCatalog::parse(&models.to_string(), &origins.to_string()).unwrap();
-        let request = crate::generation::test_request(id);
+    fn catalog_controls_arbitrary_chat_model_and_unknown_effort_is_rejected() {
+        let id = "quartz-custom-782";
+        let catalog = crate::generation::test_catalog_model(
+            "openai",
+            id,
+            "gpt-5.4",
+            serde_json::json!({"api":"openai-completions", "reasoning":true,
+                "compat":{"supportsReasoningEffort":true,"maxTokensField":"max_completion_tokens"},
+                "thinkingLevelMap":{"high":"high","off":"none"}}),
+        );
         for stream in [false, true] {
+            let mut request = crate::generation::test_request(id);
+            let body = serde_json::to_value(
+                OpenAiProvider::build_chat_request_with_catalog(&request, vec![], stream, None)
+                    .unwrap(),
+            )
+            .unwrap();
+            assert!(body.get("reasoning_effort").is_none());
+            for (selection, expected) in [
+                (ReasoningConfig::Effort(ReasoningEffort::High), "high"),
+                (ReasoningConfig::Disabled, "none"),
+            ] {
+                request.reasoning = Some(selection);
+                assert!(
+                    OpenAiProvider::build_chat_request_with_catalog(&request, vec![], stream, None)
+                        .is_err()
+                );
+                let body = serde_json::to_value(
+                    OpenAiProvider::build_chat_request_with_catalog(
+                        &request,
+                        vec![],
+                        stream,
+                        Some(&catalog),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(body["model"], id);
+                assert_eq!(body["reasoning_effort"], expected);
+                assert_eq!(body["max_completion_tokens"], 1024);
+                assert_eq!(body["stream"], stream);
+                assert!(body.get("max_tokens").is_none());
+            }
+            request.reasoning = Some(ReasoningConfig::Effort(ReasoningEffort::Low));
             assert!(
                 OpenAiProvider::build_chat_request_with_catalog(
                     &request,
                     vec![],
                     stream,
-                    Some(&responses)
+                    Some(&catalog)
                 )
                 .is_err()
             );
         }
-        models["openai"][id]["api"] = serde_json::json!("openai-completions");
-        let chat = ModelCatalog::parse(&models.to_string(), &origins.to_string()).unwrap();
-        for stream in [false, true] {
-            let body = serde_json::to_value(
-                OpenAiProvider::build_chat_request_with_catalog(
-                    &request,
-                    vec![],
-                    stream,
-                    Some(&chat),
-                )
-                .unwrap(),
-            )
-            .unwrap();
-            assert_eq!(body["max_completion_tokens"], 1024);
-            assert!(body.get("reasoning_effort").is_none());
-        }
-    }
-
-    #[test]
-    fn real_chat_bodies_select_family_cap_and_preserve_default_off_and_effort() {
-        for stream in [false, true] {
-            for (model, reasoning, field, expected_effort) in [
-                ("gpt-4o", None, "max_tokens", None),
-                ("o3-mini", None, "max_completion_tokens", None),
-                (
-                    "gpt-5.4",
-                    Some(ReasoningConfig::Disabled),
-                    "max_completion_tokens",
-                    Some("none"),
-                ),
-                (
-                    "gpt-5.4",
-                    Some(ReasoningConfig::Effort(ReasoningEffort::None)),
-                    "max_completion_tokens",
-                    Some("none"),
-                ),
-                (
-                    "gpt-5.4",
-                    Some(ReasoningConfig::Effort(ReasoningEffort::High)),
-                    "max_completion_tokens",
-                    Some("high"),
-                ),
-            ] {
-                let mut request = crate::generation::test_request(model);
-                request.reasoning = reasoning;
-                let body = serde_json::to_value(
-                    OpenAiProvider::build_chat_request(&request, vec![], stream).unwrap(),
-                )
-                .unwrap();
-                assert_eq!(body[field], 1024);
-                assert_eq!(
-                    body.get("reasoning_effort")
-                        .and_then(serde_json::Value::as_str),
-                    expected_effort
-                );
-                assert!(body.get("max_output_tokens").is_none());
-                let other = if field == "max_tokens" {
-                    "max_completion_tokens"
-                } else {
-                    "max_tokens"
-                };
-                assert!(body.get(other).is_none());
-                assert_eq!(body["stream"], stream);
-            }
-        }
-    }
-
-    #[test]
-    fn chat_rejects_temperature_and_responses_only_combinations_without_downgrading() {
-        let mut request = crate::generation::test_request("gpt-5.4");
-        request.temperature = Some(0.4);
-        for stream in [false, true] {
-            assert!(OpenAiProvider::build_chat_request(&request, vec![], stream).is_err());
-            request.reasoning = Some(ReasoningConfig::Disabled);
-            let body = serde_json::to_value(
-                OpenAiProvider::build_chat_request(&request, vec![], stream).unwrap(),
-            )
-            .unwrap();
-            assert!(body.get("temperature").is_some());
-            request.reasoning = None;
-        }
-        request.temperature = None;
-        request.tools = Some(vec![ToolDefinition {
-            name: "read".into(),
-            description: "Read".into(),
-            parameters: serde_json::json!({"type":"object"}),
-        }]);
-        for model in [
-            "gpt-5.6-sol",
-            "gpt-6-astra",
-            "gpt-6.1-sol",
-            "gpt-5.4-pro",
-            "gpt-5.3-codex",
-        ] {
-            request.model = model.into();
-            request.reasoning = Some(ReasoningConfig::Effort(ReasoningEffort::High));
-            for stream in [false, true] {
-                assert!(
-                    OpenAiProvider::build_chat_request(&request, vec![], stream).is_err(),
-                    "{model}"
-                );
-            }
-        }
-        request.model = "gpt-5.6-sol".into();
-        request.reasoning = Some(ReasoningConfig::Effort(ReasoningEffort::None));
-        assert!(OpenAiProvider::build_chat_request(&request, vec![], true).is_ok());
-        request.model = "gpt-6-astra".into();
-        request.tools = None;
-        assert!(OpenAiProvider::build_chat_request(&request, vec![], true).is_err());
-        request.model = "unknown-new-family".into();
-        request.reasoning = None;
-        assert!(OpenAiProvider::build_chat_request(&request, vec![], false).is_err());
     }
     use super::*;
 
@@ -2021,7 +1810,7 @@ mod tests {
                 .unwrap_err();
             assert!(error.to_string().contains("budget"));
             let error = provider
-                .embed(EmbeddingRequest::new(model, vec![" a".repeat(8193)]))
+                .embed(EmbeddingRequest::new(model, vec!["abcd".repeat(8193)]))
                 .await
                 .unwrap_err();
             assert!(error.to_string().contains("token budget"));
@@ -2106,27 +1895,6 @@ mod tests {
     }
 
     #[test]
-    fn creates_with_custom_base_url() {
-        let provider = OpenAiProvider::with_base_url("key", "http://localhost:8080");
-        assert_eq!(provider.base_url, "http://localhost:8080");
-    }
-
-    #[test]
-    fn default_base_url() {
-        let provider = OpenAiProvider::new("key");
-        assert_eq!(provider.base_url, "https://api.openai.com/v1");
-    }
-
-    #[test]
-    fn chat_completions_url_built_correctly() {
-        let provider = OpenAiProvider::new("key");
-        assert_eq!(
-            provider.chat_completions_url(),
-            "https://api.openai.com/v1/chat/completions"
-        );
-    }
-
-    #[test]
     fn chat_completions_url_with_custom_base() {
         let provider = OpenAiProvider::with_base_url("key", "http://localhost:3000");
         assert_eq!(
@@ -2136,72 +1904,15 @@ mod tests {
     }
 
     #[test]
-    fn openai_reasoning_registry_exposes_documented_gpt_5_5_efforts() {
-        let reasoning = reasoning_registry::reasoning_capabilities_for_model("openai", "gpt-5.5")
-            .expect("gpt-5.5 reasoning metadata");
-
-        assert_eq!(reasoning.supported, Some(true));
-        assert_eq!(
-            reasoning.effort_options,
-            vec!["none", "low", "medium", "high", "xhigh"]
-        );
-        assert_eq!(reasoning.default_effort.as_deref(), Some("medium"));
-    }
-
-    #[test]
-    fn openai_reasoning_registry_matches_documented_gpt_5_4_family() {
-        let reasoning =
-            reasoning_registry::reasoning_capabilities_for_model("openai", "gpt-5.4-mini")
-                .expect("gpt-5.4 mini reasoning metadata");
-
-        assert_eq!(reasoning.supported, Some(true));
-        assert_eq!(
-            reasoning.effort_options,
-            vec!["none", "low", "medium", "high", "xhigh"]
-        );
-    }
-
-    #[test]
-    fn openai_reasoning_registry_leaves_unknown_models_unset() {
-        assert!(
-            reasoning_registry::reasoning_capabilities_for_model("openai", "custom-model")
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn openai_model_list_fixture_normalizes_reasoning_capabilities() {
-        let response: ModelsListResponse = serde_json::from_str(
-            r#"{
-                "data": [
-                    { "id": "gpt-5.5", "created": 1, "owned_by": "openai" },
-                    { "id": "custom-model", "created": 2, "owned_by": "user" }
-                ]
-            }"#,
-        )
-        .expect("fixture response");
-        let models = response
-            .data
-            .into_iter()
-            .map(provider_model_from_openai_model_entry)
-            .collect::<Vec<_>>();
-
-        let known = &models[0];
-        let reasoning = known
-            .capabilities
-            .reasoning
-            .as_ref()
-            .expect("known reasoning model");
-        assert_eq!(reasoning.supported, Some(true));
-        assert_eq!(
-            reasoning.effort_options,
-            vec!["none", "low", "medium", "high", "xhigh"]
-        );
-        assert_eq!(known.capabilities.thinking, Some(true));
-
-        assert!(models[1].capabilities.reasoning.is_none());
-        assert!(models[1].capabilities.thinking.is_none());
-        assert_eq!(models[1].capabilities.embeddings, None);
+    fn model_names_without_native_facts_leave_reasoning_unknown() {
+        for id in ["gpt-5.5", "custom-model"] {
+            let model = provider_model_from_openai_model_entry(
+                serde_json::from_value(serde_json::json!({"id":id,"created":1})).unwrap(),
+            );
+            assert!(model.capabilities.reasoning.is_none());
+            assert!(model.capabilities.thinking.is_none());
+            assert_eq!(model.created, Some(1));
+        }
     }
 
     #[test]
@@ -2380,109 +2091,6 @@ mod tests {
     }
 
     #[test]
-    fn api_request_serializes_with_max_tokens() {
-        let request = ApiChatRequest {
-            generation: Default::default(),
-            model: "gpt-4o".into(),
-            messages: vec![],
-            temperature: None,
-            max_tokens: Some(1024),
-            tools: None,
-            tool_choice: None,
-            parallel_tool_calls: None,
-            reasoning_effort: None,
-            stream: true,
-            stream_options: Some(serde_json::json!({"include_usage": true})),
-        };
-
-        let json = serde_json::to_string(&request).unwrap();
-
-        assert!(json.contains("\"max_tokens\":1024"));
-        assert!(json.contains("\"stream\":true"));
-        assert!(!json.contains("temperature"));
-    }
-
-    #[test]
-    fn api_request_serializes_reasoning_effort_only_when_selected() {
-        let request = ApiChatRequest {
-            generation: Default::default(),
-            model: "gpt-5.4".into(),
-            messages: vec![],
-            temperature: None,
-            max_tokens: None,
-            tools: None,
-            tool_choice: None,
-            parallel_tool_calls: None,
-            reasoning_effort: Some("high".to_owned()),
-            stream: false,
-            stream_options: None,
-        };
-
-        let json = serde_json::to_value(&request).unwrap();
-        assert_eq!(json["reasoning_effort"], "high");
-
-        let request_without_reasoning = ApiChatRequest {
-            reasoning_effort: None,
-            ..request
-        };
-        let json = serde_json::to_value(&request_without_reasoning).unwrap();
-        assert!(json.get("reasoning_effort").is_none());
-    }
-
-    #[test]
-    fn api_response_deserializes() {
-        let json = r#"{"choices":[{"message":{"content":"Hi from OpenAI"}}]}"#;
-        let response: ApiChatResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(response.choices.len(), 1);
-        assert_eq!(
-            response.choices[0].message.content.as_deref(),
-            Some("Hi from OpenAI")
-        );
-    }
-
-    #[test]
-    fn api_response_with_usage() {
-        let json = r#"{
-            "choices": [{"message": {"content": "Hello"}}],
-            "usage": {"prompt_tokens": 42, "completion_tokens": 15}
-        }"#;
-        let response: ApiChatResponse = serde_json::from_str(json).unwrap();
-        let usage = response.usage.unwrap().normalized();
-        assert_eq!(usage.input_tokens, Some(42));
-        assert_eq!(usage.output_tokens, Some(15));
-    }
-
-    #[test]
-    fn api_response_without_usage() {
-        let json = r#"{"choices":[{"message":{"content":"Hello"}}]}"#;
-        let response: ApiChatResponse = serde_json::from_str(json).unwrap();
-        assert!(response.usage.is_none());
-    }
-
-    #[test]
-    fn api_response_empty_choices() {
-        let json = r#"{"choices":[]}"#;
-        let response: ApiChatResponse = serde_json::from_str(json).unwrap();
-        assert!(response.choices.is_empty());
-    }
-
-    #[test]
-    fn stream_response_deserializes_delta() {
-        let json = r#"{"choices":[{"delta":{"content":"Hello"},"finish_reason":null}]}"#;
-        let response: StreamResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(response.choices.len(), 1);
-        assert_eq!(response.choices[0].delta.content.as_deref(), Some("Hello"));
-        assert!(response.choices[0].finish_reason.is_none());
-    }
-
-    #[test]
-    fn stream_response_deserializes_finish() {
-        let json = r#"{"choices":[{"delta":{"content":null},"finish_reason":"stop"}]}"#;
-        let response: StreamResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(response.choices[0].finish_reason.as_deref(), Some("stop"));
-    }
-
-    #[test]
     fn stream_response_empty_delta() {
         let json = r#"{"choices":[{"delta":{},"finish_reason":null}]}"#;
         let response: StreamResponse = serde_json::from_str(json).unwrap();
@@ -2490,19 +2098,41 @@ mod tests {
     }
 
     #[test]
-    fn provider_name() {
+    fn default_endpoint_and_capabilities() {
         use crate::traits::Provider;
         let provider = OpenAiProvider::new("key");
-        assert_eq!(provider.name(), "openai");
-    }
-
-    #[test]
-    fn provider_capabilities() {
-        use crate::traits::Provider;
-        let provider = OpenAiProvider::new("key");
+        assert_eq!(
+            provider.chat_completions_url(),
+            "https://api.openai.com/v1/chat/completions"
+        );
         let caps = provider.capabilities();
         assert!(caps.streaming);
         assert!(caps.vision);
+    }
+
+    #[test]
+    fn api_response_choices_and_absent_usage_mapping() {
+        let cases: [(&str, &[Option<&str>]); 3] = [
+            (
+                r#"{"choices":[{"message":{"content":"Hi from OpenAI"}}]}"#,
+                &[Some("Hi from OpenAI")],
+            ),
+            (
+                r#"{"choices":[{"message":{"content":"Hello"}}]}"#,
+                &[Some("Hello")],
+            ),
+            (r#"{"choices":[]}"#, &[]),
+        ];
+        for (json, expected_contents) in cases {
+            let response: ApiChatResponse = serde_json::from_str(json).unwrap();
+            let contents = response
+                .choices
+                .iter()
+                .map(|choice| choice.message.content.as_deref())
+                .collect::<Vec<_>>();
+            assert_eq!(contents.as_slice(), expected_contents, "{json}");
+            assert!(response.usage.is_none(), "{json}");
+        }
     }
 }
 

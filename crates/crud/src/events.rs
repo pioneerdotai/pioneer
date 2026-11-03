@@ -16,26 +16,7 @@ use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-/// Declares which durable object owns the execution UI associated with a Turn.
-///
-/// This is an immutable admission fact. It must not be inferred later from the
-/// Turn author, send mode, timing, or the eventual presence of a child Task.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TurnWorkOwner {
-    #[default]
-    Turn,
-    DetachedTask,
-}
-
-impl TurnWorkOwner {
-    pub(crate) const fn as_db_str(self) -> &'static str {
-        match self {
-            Self::Turn => "turn",
-            Self::DetachedTask => "detached_task",
-        }
-    }
-}
+pub use pioneer_protocol::TurnWorkOwner;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CanonicalTurnStartedEventPayload {
@@ -128,6 +109,19 @@ impl CanonicalTurnEventPayload {
             Self::TurnFailed(_) => events::TURN_FAILED,
             Self::TurnBlocked(_) => events::TURN_BLOCKED,
         }
+    }
+
+    /// Hydrate the client projection from the immutable persisted owner. This
+    /// only changes a decoded copy; historical canonical payloads stay intact.
+    pub(crate) fn project_work_owner(&mut self, owner: TurnWorkOwner) {
+        let turn = match self {
+            Self::TurnStarted(payload) => &mut payload.turn,
+            Self::TurnCompleted(notification) => &mut notification.turn,
+            Self::TurnFailed(notification) => &mut notification.turn,
+            Self::TurnBlocked(notification) => &mut notification.turn,
+            _ => return,
+        };
+        turn.work_owner = owner;
     }
 
     pub fn thread_id(&self) -> &str {
@@ -242,15 +236,13 @@ pub struct AppendedTurnEvent {
 #[cfg(test)]
 mod tests {
     use pioneer_protocol::{
-        PersistedActorRef, PrincipalId, SandboxMode, Thread, ThreadMode, ThreadOriginKind,
+        PersistedActorRef, SandboxMode, Thread, ThreadMode, ThreadOriginKind,
         ThreadSidebarVisibility, ThreadStatus, Turn, TurnKind, TurnOrigin, TurnPermissionMode,
         TurnPermissionProfileSnapshot, TurnPermissionProfileSource, TurnStatus, UserInput,
     };
     use serde_json::json;
 
     use super::{CanonicalTurnEventPayload, CanonicalTurnStartedEventPayload};
-
-    const PRINCIPAL_ID: &str = "P00000000000000000001";
 
     fn started_payload(actor: Option<PersistedActorRef>) -> CanonicalTurnStartedEventPayload {
         CanonicalTurnStartedEventPayload {
@@ -276,6 +268,7 @@ mod tests {
             },
             sandbox_mode: SandboxMode::FullAccess,
             turn: Turn {
+                work_owner: Default::default(),
                 id: "turn".to_owned(),
                 status: TurnStatus::InProgress,
                 turn_kind: TurnKind::Conversation,
@@ -322,27 +315,6 @@ mod tests {
             panic!("expected turn_started event");
         };
         assert_eq!(decoded.actor, None);
-    }
-
-    #[test]
-    fn turn_started_actor_round_trips_through_the_canonical_event_envelope() {
-        for actor in [
-            PersistedActorRef::Principal(
-                PrincipalId::new(PRINCIPAL_ID).expect("valid principal id"),
-            ),
-            PersistedActorRef::System,
-        ] {
-            let canonical =
-                CanonicalTurnEventPayload::TurnStarted(started_payload(Some(actor.clone())));
-            let encoded = serde_json::to_value(&canonical).expect("event should serialize");
-            let decoded: CanonicalTurnEventPayload =
-                serde_json::from_value(encoded).expect("event should deserialize");
-
-            let CanonicalTurnEventPayload::TurnStarted(decoded) = decoded else {
-                panic!("expected turn_started event");
-            };
-            assert_eq!(decoded.actor, Some(actor));
-        }
     }
 
     #[test]

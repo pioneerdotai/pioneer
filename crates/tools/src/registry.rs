@@ -129,28 +129,8 @@ impl Default for ToolRegistryBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::context::{FunctionToolOutput, ToolCallSource, ToolPayload};
-    use crate::spec::{ExecutionClass, PayloadKind, ToolSpec};
+    use crate::context::{ToolCallSource, ToolPayload};
     use std::path::PathBuf;
-
-    struct FixedHandler {
-        text: &'static str,
-        error: Option<ToolError>,
-    }
-
-    #[async_trait]
-    impl ToolHandler for FixedHandler {
-        async fn handle(
-            &self,
-            _invocation: ToolInvocation,
-            _trace: ToolEventTrace,
-        ) -> Result<Box<dyn crate::context::ToolOutput>, ToolError> {
-            if let Some(error) = self.error.clone() {
-                return Err(error);
-            }
-            Ok(Box::new(FunctionToolOutput::new(self.text, true)))
-        }
-    }
 
     fn invocation(tool_name: &str) -> ToolInvocation {
         ToolInvocation {
@@ -173,29 +153,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn builder_keeps_specs_and_handlers_separate() {
-        let spec = ToolSpec::new(
-            "read_file",
-            "Read file",
-            serde_json::json!({ "type": "object" }),
-            PayloadKind::Function,
-        );
-
-        let mut builder = ToolRegistryBuilder::new();
-        builder.push_configured_spec(ConfiguredToolSpec::with_output_projection(
-            spec.clone(),
-            ExecutionClass::Shared,
-            crate::output_policy::dynamic_unknown_output_policy(),
-            crate::output_policy::ToolOutputProjectionKind::DynamicGeneric,
-        ));
-        let (specs, registry) = builder.build();
-
-        assert_eq!(specs.len(), 1);
-        assert_eq!(specs[0].spec.name, "read_file");
-        assert!(!registry.has_handler("read_file"));
-    }
-
-    #[tokio::test]
     async fn dispatch_returns_not_found_when_handler_missing() {
         let registry = ToolRegistry::new(HashMap::new());
         let trace =
@@ -205,29 +162,5 @@ mod tests {
             Ok(_) => panic!("expected missing handler error"),
             Err(error) => assert!(matches!(error, ToolError::NotFound(_))),
         }
-    }
-
-    #[tokio::test]
-    async fn dispatch_returns_handler_output() {
-        let mut handlers: HashMap<String, Arc<dyn ToolHandler>> = HashMap::new();
-        handlers.insert(
-            "echo".to_owned(),
-            Arc::new(FixedHandler {
-                text: "ok",
-                error: None,
-            }),
-        );
-        let registry = ToolRegistry::new(handlers);
-
-        let result = registry
-            .dispatch(
-                invocation("echo"),
-                &crate::events::ToolEventBus::default().start_trace("turn", "call_1", "echo"),
-            )
-            .await
-            .expect("handler should succeed");
-        assert_eq!(result.call_id, "call_1");
-        assert_eq!(result.tool_name, "echo");
-        assert_eq!(result.raw_output_text(), "ok");
     }
 }

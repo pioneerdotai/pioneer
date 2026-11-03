@@ -415,7 +415,26 @@ impl ClientCore {
             } else {
                 super::list::cli_runtime_provider_key(&identity.target)
             };
-            self.refresh_provider_models(&identity.workspace_id, &provider);
+            // The accepted settings ACK is authoritative for this toggle. Keep
+            // catalog/runtime reconciliation, but do not ask a disabled runtime
+            // for models just because its collection already exists.
+            let disabled = applicable
+                && result.is_ok()
+                && identity.kind == ProviderActionKind::SetRuntimeEnabled
+                && self
+                    .gateway_settings()
+                    .settings
+                    .as_ref()
+                    .is_some_and(|settings| {
+                        settings
+                            .cli_runtimes
+                            .instances
+                            .iter()
+                            .any(|runtime| runtime.id == identity.target && !runtime.enabled)
+                    });
+            if !disabled {
+                self.refresh_provider_models(&identity.workspace_id, &provider);
+            }
             self.provider_collection_intent(ProviderCollectionIntent::Refresh {
                 key: ProviderCollectionKey::catalog(&identity.workspace_id),
             });
@@ -651,6 +670,186 @@ mod tests {
             clear_base_url: false,
         })
     }
+    fn settings_snapshot() -> GatewaySettingsSnapshot {
+        GatewaySettingsSnapshot {
+            general: Default::default(),
+            memory: Default::default(),
+            self_improvement: Default::default(),
+            self_improvement_status: None,
+            thread_episodic: Default::default(),
+            cli_runtimes: Default::default(),
+            remote_access: Default::default(),
+            voice_input: Default::default(),
+        }
+    }
+
+    #[test]
+    fn only_successful_disabled_toggle_skips_existing_model_collection_refresh() {
+        use crate::rpc::{JsonRpcRequestTransport, JsonRpcResponseSender};
+        use std::sync::Mutex;
+
+        #[derive(Default)]
+        struct CatalogTransport(Mutex<Vec<(String, String)>>);
+        impl JsonRpcRequestTransport for CatalogTransport {
+            fn send_json_rpc_request(
+                &self,
+                _: String,
+                payload: String,
+                reply: JsonRpcResponseSender,
+            ) -> Result<(), String> {
+                let request: JsonRpcRequest = serde_json::from_str(&payload).unwrap();
+                let params = request.params.unwrap();
+                let runtime = params["runtime_id"].as_str().unwrap_or_default();
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push((request.method.clone(), runtime.into()));
+                let result = match request.method.as_str() {
+                    constants::methods::CLI_RUNTIME_LIST_MODELS => serde_json::json!({
+                        "runtime_id": runtime, "models": [{"id": "fixture-model"}],
+                    }),
+                    constants::methods::PROVIDER_LIST => serde_json::json!({
+                        "providers": [], "definitions": [],
+                    }),
+                    _ => panic!("unexpected catalog request: {}", request.method),
+                };
+                reply.send(Ok(result)).unwrap();
+                Ok(())
+            }
+        }
+
+        for runtime_id in ["codex", "claude", "opencode", "codex_two"] {
+            // The proxy operation also retains refresh when settings say disabled.
+            for (enabled, success, proxy) in [
+                (false, true, false),
+                (true, true, false),
+                (false, false, false),
+                (false, true, true),
+            ] {
+                let core = crate::catalog_test_support::settings_model_picker_client();
+                let mut initial = settings_snapshot();
+                let mut instance = initial.cli_runtimes.instances[0].clone();
+                instance.id = runtime_id.into();
+                instance.kind = match runtime_id {
+                    "claude" => CLIAgentRuntimeKind::Claude,
+                    "opencode" => CLIAgentRuntimeKind::OpenCode,
+                    _ => CLIAgentRuntimeKind::Codex,
+                };
+                instance.enabled = !enabled && success && !proxy;
+                let mut other_instance = instance.clone();
+                other_instance.id = "unrelated".into();
+                other_instance.display_name = "Unrelated CLI".into();
+                other_instance.nickname = "unrelated".into();
+                other_instance.enabled = true;
+                initial.cli_runtimes.instances = vec![instance, other_instance];
+                let load = core.request_gateway_settings().unwrap();
+                assert!(core.finish_gateway_settings(load, &mut Ok(initial.clone())));
+                let transport = Arc::new(CatalogTransport::default());
+                *core
+                    .transport_runtime()
+                    .ws_command_sender()
+                    .test_requests
+                    .lock()
+                    .unwrap() = Some(transport.clone());
+                core.start_provider_controller();
+                let key = ProviderCollectionKey::models(
+                    "workspace",
+                    super::super::list::cli_runtime_provider_key(runtime_id),
+                    ProviderModelKind::Chat,
+                );
+                let other = ProviderCollectionKey::models(
+                    "workspace",
+                    "cli_runtime:unrelated",
+                    ProviderModelKind::Chat,
+                );
+                let read = |key: ProviderCollectionKey| {
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+                    core.read_provider_collection(key, false)
+                        .unwrap()
+                        .wait_while(|| std::time::Instant::now() < deadline)
+                        .unwrap()
+                };
+                assert_eq!(read(key.clone()).models()[0].id(), "fixture-model");
+                let other_before = read(other.clone());
+                transport.0.lock().unwrap().clear();
+                let command = if proxy {
+                    ProviderCommand::RemoveRuntimeProxy(CLIRuntimeProxyDeleteParams {
+                        workspace_id: "workspace".into(),
+                        runtime_id: runtime_id.into(),
+                    })
+                } else {
+                    ProviderCommand::SetRuntimeEnabled {
+                        workspace_id: "workspace".into(),
+                        runtime_id: runtime_id.into(),
+                        enabled,
+                    }
+                };
+                let operation = core.prepare_provider_command(command).unwrap();
+                let mut expected = initial;
+                let result = if proxy {
+                    Ok(ProviderOperationCompletion::Completed)
+                } else {
+                    let CLIRuntimeProviderSettingsPlan::Send(plan) =
+                        plan_cli_runtime_provider_enabled_update(
+                            Some(&expected),
+                            runtime_id,
+                            enabled,
+                        )
+                    else {
+                        panic!("loaded CLI settings")
+                    };
+                    let save = core
+                        .prepare_gateway_settings_update(Some(plan.snapshot.clone()))
+                        .unwrap();
+                    let mut ack = if success {
+                        expected = plan.snapshot.clone();
+                        Ok(plan.snapshot)
+                    } else {
+                        Err(anyhow::anyhow!("fixture settings save failed"))
+                    };
+                    assert!(core.finish_gateway_settings(save, &mut ack));
+                    ack.map(|_| ProviderOperationCompletion::Completed)
+                };
+                assert_eq!(
+                    core.finish_provider_operation(&operation.identity, result)
+                        .is_ok(),
+                    success
+                );
+                // Catalog completion is a FIFO barrier after any model request.
+                let catalog = read(ProviderCollectionKey::catalog("workspace"));
+                assert_eq!(catalog.request(), ProviderLoadState::Ready);
+                let calls = transport.0.lock().unwrap().clone();
+                let refresh_models = enabled || !success || proxy;
+                assert_eq!(
+                    calls,
+                    if refresh_models {
+                        vec![
+                            (
+                                constants::methods::CLI_RUNTIME_LIST_MODELS.into(),
+                                runtime_id.into(),
+                            ),
+                            (constants::methods::PROVIDER_LIST.into(), String::new()),
+                        ]
+                    } else {
+                        vec![(constants::methods::PROVIDER_LIST.into(), String::new())]
+                    }
+                );
+                assert!(
+                    core.provider_runtime_request_for_test("workspace")
+                        .is_some()
+                );
+                assert_eq!(core.gateway_settings().settings, Some(expected));
+                assert!(Arc::ptr_eq(
+                    &other_before,
+                    &core.provider_collection_snapshot(&other).unwrap()
+                ));
+                assert_eq!(
+                    core.provider_collection_snapshot(&key).unwrap().models()[0].id(),
+                    "fixture-model"
+                );
+            }
+        }
+    }
     #[test]
     fn retired_ticket_releases_exact_active_provider_operation() {
         for completed in [true, false] {
@@ -736,16 +935,7 @@ mod tests {
     #[test]
     fn cli_save_ack_survives_queued_refresh_and_both_old_read_response_orders() {
         use crate::settings::runtime::SettingsIntent;
-        let initial = GatewaySettingsSnapshot {
-            general: Default::default(),
-            memory: Default::default(),
-            self_improvement: Default::default(),
-            self_improvement_status: None,
-            thread_episodic: Default::default(),
-            cli_runtimes: Default::default(),
-            remote_access: Default::default(),
-            voice_input: Default::default(),
-        };
+        let initial = settings_snapshot();
         // None: Refresh is queued but has not reserved a read ticket yet.
         // Some: the old read replies before/after the write ACK.
         for old_read_before_ack in [None, Some(true), Some(false)] {

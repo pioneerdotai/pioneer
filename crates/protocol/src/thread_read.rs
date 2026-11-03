@@ -5,7 +5,10 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ThreadsListParams {
+    /// Page size in creation order (created_at DESC, id DESC), not activity order.
     pub limit: u32,
+    /// Opaque position after the last examined candidate, including skipped rows.
+    /// Retain the same parameters; unrelated activity does not invalidate it.
     #[serde(default)]
     pub cursor: Option<String>,
 }

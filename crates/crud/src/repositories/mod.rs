@@ -40,8 +40,6 @@ pub mod mcp_server_installation;
 pub(crate) mod membership;
 pub(crate) mod native_cancellation_context;
 pub(crate) mod native_event_cleanup;
-#[cfg(test)]
-pub(crate) mod native_event_cleanup_baseline;
 pub mod native_terminal_effect_outbox;
 pub mod patch_history;
 pub mod policy;
@@ -141,3 +139,16 @@ pub(crate) mod task_child_cleanup;
 pub(crate) mod unread_start;
 
 pub(crate) mod thread_history_read;
+
+pub(crate) mod portable_payload;
+pub(crate) mod portable_payload_legacy_text;
+
+mod portable_payload_json;
+
+pub mod html_preview_io_work;
+pub(crate) mod recovery_watchdog;
+pub(crate) mod task_child_producers;
+
+pub mod task_child_work;
+
+pub(crate) mod task_occurrence_producers;

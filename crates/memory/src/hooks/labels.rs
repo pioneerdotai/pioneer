@@ -1,15 +1,5 @@
 use super::*;
 
-#[cfg(test)]
-use chrono::{DateTime, Utc};
-
-#[cfg(test)]
-pub(super) fn date_label(timestamp: i64) -> String {
-    DateTime::<Utc>::from_timestamp(timestamp, 0)
-        .map(|dt| dt.format("%Y-%m-%d").to_string())
-        .unwrap_or_else(|| timestamp.to_string())
-}
-
 pub(super) fn scope_label(scope: &MemoryScope) -> String {
     match scope.kind {
         MemoryScopeKind::User => "user".to_owned(),

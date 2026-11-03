@@ -1,7 +1,10 @@
 //! Bounded progress for the existing frozen-storage worker. Physical eligibility
 //! is durable; no connection or capacity permit is retained between quanta.
 use super::{checkpoint_proofs, compaction, frozen_sweep_work};
-use crate::{CrudStore, frozen_lifetime::PreparedFrozenRoot};
+use crate::{
+    CrudStore,
+    frozen_lifetime::{FrozenRootStream, PreparedFrozenRoot},
+};
 use anyhow::{Result, ensure};
 use pioneer_compaction::runner::{RunnerPhase, RunnerState};
 use pioneer_entity::{
@@ -12,6 +15,7 @@ use pioneer_entity::{
     compaction_runner_plan as plan, compaction_runner_state as runner, task,
     task_run_conversation_snapshot as task_input,
 };
+use pioneer_observability::portable_payload as observe;
 use sea_orm::sea_query::{
     Alias, Expr, ExprTrait, Func, JoinType, Order, Query, SimpleExpr, UnionType,
 };
@@ -30,10 +34,6 @@ const META_ROWS: u64 = 64;
 // above this policy uses the original full-key single seek outside the page.
 // At most META_ROWS * SCOPE_PAGE_KEY_BYTES key bytes are retained in its page.
 const SCOPE_PAGE_KEY_BYTES: i64 = FRAGMENT_BYTES;
-// Legacy JSON has no producer byte cap. An oversized record remains unknown
-// (and blocks only its retaining scope), rather than allowing one worker job
-// to grow without bound. A normal authorized root replacement can verify it.
-const LEGACY_LOCATOR_BYTES: i64 = FRAGMENT_BYTES * 128;
 
 /// Owned by one existing maintenance worker, and dropped on cancellation.
 /// Each discovery family reaches EOF once per pass; completed families yield
@@ -57,6 +57,7 @@ pub struct FrozenStorageLifetimeProgress {
     proof_pending: VecDeque<String>,
     proof: Option<checkpoint_proofs::GraphPreparation>,
     expiry_after: String,
+    expiry_pending: VecDeque<history::Model>,
     expiry: Option<ExpiryPreparation>,
     sweep: Option<SweepPreparation>,
     sweep_pending: VecDeque<SweepPreparation>,
@@ -66,6 +67,7 @@ pub struct FrozenStorageLifetimeProgress {
     sweep_round: [frozen_sweep_work::ServiceRound; 2],
     accounting: SweepAccounting,
     discard_after: String,
+    discard_pending: VecDeque<Option<String>>,
     discard: Option<DiscardPreparation>,
     pub(super) conversion: Option<super::compaction_frozen_storage::StagedCopyCheck>,
 }
@@ -84,42 +86,113 @@ struct LocatorRead {
     id: String,
     workspace: String,
     size: i64,
-    bytes: Vec<u8>,
+    offset: i64,
+    stream: Option<FrozenRootStream>,
+    prepared: Option<PreparedFrozenRoot>,
 }
 impl LocatorRead {
+    fn new(kind: usize, id: String, workspace: String, size: i64) -> Self {
+        let stream = match kind {
+            0 | 1 => FrozenRootStream::new_history(),
+            2 => FrozenRootStream::new_cli(true),
+            3 => FrozenRootStream::new_cli(false),
+            _ => unreachable!(),
+        };
+        Self {
+            kind,
+            id,
+            workspace,
+            size,
+            offset: 0,
+            stream: Some(stream),
+            prepared: None,
+        }
+    }
     async fn step(&mut self, store: &CrudStore) -> Result<bool> {
+        let family = match self.kind {
+            0 => observe::Family::TaskHistory,
+            3 => observe::Family::CliMapping,
+            _ => return self.step_inner(store).await,
+        };
+        // Root preparation is a prerequisite of these two portable fields.
+        // Preserve the existing frozen-storage caller/workload and scope.
+        observe::scope_result(family, observe::Mode::Background, self.step_inner(store)).await
+    }
+    async fn step_inner(&mut self, store: &CrudStore) -> Result<bool> {
+        let portable = matches!(self.kind, 0 | 3);
         let (table, key, field) = ROOTS[self.kind];
         // SQLite BLOB fragment, fixed actual-byte budget; sentinel/identity CAS
-        // below stays typed and never compares the accumulated JSON in writer.
-        if i64::try_from(self.bytes.len())? < self.size {
-            let row = store.connection.query_one_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-                format!("SELECT substr(CAST({field} AS BLOB),?3,?4) AS fragment FROM {table} WHERE {key}=?1 AND workspace_id=?2 AND frozen_manifest_id='' AND length(CAST({field} AS BLOB))=?5 LIMIT 1"),
-                [self.id.clone().into(),self.workspace.clone().into(),(self.bytes.len() as i64+1).into(),FRAGMENT_BYTES.into(),self.size.into()])).await?;
-            let Some(row) = row else {
+        // below stays typed and never compares source JSON in the writer.
+        if self.offset < self.size {
+            let guard = Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                format!(
+                    "SELECT rowid FROM {table} WHERE {key}=?1 AND workspace_id=?2 AND frozen_manifest_id='' AND octet_length({field})=?3 LIMIT 1"
+                ),
+                [
+                    self.id.clone().into(),
+                    self.workspace.clone().into(),
+                    self.size.into(),
+                ],
+            );
+            let read = portable.then(|| observe::stage(observe::Stage::SourceRead));
+            let bytes = store
+                .connection
+                .read_blob_range(
+                    pioneer_sqlite::SqliteBlobSource {
+                        table,
+                        column: field,
+                    },
+                    guard,
+                    u64::try_from(self.offset)?,
+                    usize::try_from(std::cmp::min(FRAGMENT_BYTES, self.size - self.offset))?,
+                    u64::try_from(self.size)?,
+                )
+                .await?;
+            drop(read);
+            let Some(bytes) = bytes else {
+                if portable {
+                    observe::outcome(observe::Outcome::Stale);
+                }
                 return Ok(true);
             };
-            let bytes: Vec<u8> = row.try_get("", "fragment")?;
+            if portable {
+                observe::bytes(observe::ByteKind::ReadOriginal, bytes.len() as u64);
+            }
+            let _verify = portable.then(|| observe::stage(observe::Stage::VerifyAssemble));
             ensure!(
-                !bytes.is_empty() && bytes.len() <= FRAGMENT_BYTES as usize,
+                bytes.len() as i64 == std::cmp::min(FRAGMENT_BYTES, self.size - self.offset),
                 "legacy locator fragment missing"
             );
-            self.bytes.extend(bytes);
+            // The query has released database capacity before decoding. Only
+            // this fragment and the bounded semantic projection are retained.
+            self.stream
+                .as_mut()
+                .expect("legacy root stream")
+                .feed(&bytes)?;
+            self.offset += bytes.len() as i64;
             return Ok(false);
         }
         ensure!(
-            self.bytes.len() as i64 == self.size,
+            self.offset == self.size,
             "legacy locator exact size mismatch"
         );
-        let json = std::str::from_utf8(&self.bytes)?;
-        let prepared = match self.kind {
-            0 | 1 => PreparedFrozenRoot::history(json)?,
-            2 => PreparedFrozenRoot::cli(json, true)?,
-            3 => PreparedFrozenRoot::cli(json, false)?,
-            _ => unreachable!(),
-        };
+        if self.prepared.is_none() {
+            let _verify = portable.then(|| observe::stage(observe::Stage::VerifyAssemble));
+            self.prepared = Some(
+                self.stream
+                    .take()
+                    .ok_or_else(|| anyhow::anyhow!("legacy root stream already failed"))?
+                    .finish()?,
+            );
+        }
+        // Keep the prepared projection in progress across cancellation while
+        // queued for the writer; a later quantum must not consume it twice.
+        let prepared = self.prepared.as_ref().expect("prepared legacy root");
         // All JSON/root-identity mutations have already cut over to ID/NULL.
         // Metadata-only changes keep ''. Delete/recreate cannot regain ''.
         // No updated_at comparison or large JSON comparison under writer.
+        let _publish = portable.then(|| observe::stage(observe::Stage::Publish));
         store
             .run_serialized_write(|| async {
                 let tx = store.connection.begin().await?;
@@ -174,6 +247,10 @@ impl LocatorRead {
                             .to_owned(),
                     )
                     .await?;
+                } else {
+                    if portable {
+                        observe::outcome(observe::Outcome::Stale);
+                    }
                 }
                 tx.commit().await?;
                 Ok(())
@@ -1812,13 +1889,19 @@ impl FrozenStorageLifetimeProgress {
         if self.locator_pending[kind].is_empty() {
             // Seek only unknown roots through (frozen_manifest_id, PK), so
             // verified ID/NULL rows do not consume this bounded metadata page.
-            let query = Query::select().from(Alias::new(table))
+            let query = Query::select()
+                .from(Alias::new(table))
                 .expr_as(Expr::col(Alias::new(key)), Alias::new("id"))
                 .columns([Alias::new("workspace_id"), Alias::new("frozen_manifest_id")])
-                .expr_as(Expr::cust(format!("CASE WHEN frozen_manifest_id='' THEN length(CAST({field} AS BLOB)) ELSE 0 END")), Alias::new("size"))
+                .expr_as(
+                    Expr::cust(format!("octet_length({field})")),
+                    Alias::new("size"),
+                )
                 .and_where(Expr::col(Alias::new("frozen_manifest_id")).eq(""))
                 .and_where(Expr::col(Alias::new(key)).gt(&self.locators[kind]))
-                .order_by(Alias::new(key), Order::Asc).limit(META_ROWS).to_owned();
+                .order_by(Alias::new(key), Order::Asc)
+                .limit(META_ROWS)
+                .to_owned();
             let page = store.connection.query_all(&query).await?;
             if page.is_empty() {
                 self.locators[kind].clear();
@@ -1846,16 +1929,10 @@ impl FrozenStorageLifetimeProgress {
             .pop_front()
             .expect("locator page");
         ensure!(
-            (0..=LEGACY_LOCATOR_BYTES).contains(&size) && !workspace.is_empty(),
+            size >= 0 && !workspace.is_empty(),
             "legacy locator scope/size unsupported"
         );
-        self.locator = Some(LocatorRead {
-            kind,
-            id,
-            workspace,
-            size,
-            bytes: Vec::new(),
-        });
+        self.locator = Some(LocatorRead::new(kind, id, workspace, size));
         Ok(true)
     }
 
@@ -2013,22 +2090,23 @@ impl FrozenStorageLifetimeProgress {
             }
             return Ok(true);
         }
-        let row = history::Entity::find()
-            .select_only()
-            .column(history::Column::Id)
-            .filter(history::Column::Expired.eq(0))
-            .filter(history::Column::Ready.eq(1))
-            .filter(history::Column::Id.gt(&self.expiry_after))
-            .order_by_asc(history::Column::Id)
-            .into_tuple::<String>()
-            .one(&store.connection)
-            .await?;
-        if let Some(id) = row {
-            let header = history::Entity::find_by_id(&id)
-                .one(&store.connection)
-                .await?;
-            self.expiry_after = id;
-            let header = header.ok_or_else(|| anyhow::anyhow!("expiry discovery changed"))?;
+        // Only lightweight headers live in this Entity; payloads remain in
+        // separate tables. Prefetch is advisory: ExpiryPreparation and expire
+        // preserve individual root/hold checks and exact writer revalidation.
+        if self.expiry_pending.is_empty() {
+            self.expiry_pending = history::Entity::find()
+                .filter(history::Column::Expired.eq(0))
+                .filter(history::Column::Ready.eq(1))
+                .filter(history::Column::Id.gt(&self.expiry_after))
+                .order_by_asc(history::Column::Id)
+                .limit(16)
+                .all(&store.connection)
+                .await?
+                .into();
+        }
+        let header = self.expiry_pending.pop_front();
+        if let Some(header) = header {
+            self.expiry_after = header.id.clone();
             ensure!(counter_health(&header), "corrupt expiry counters");
             self.expiry = Some(ExpiryPreparation::new(header));
             Ok(true)
@@ -2189,70 +2267,61 @@ impl FrozenStorageLifetimeProgress {
             self.discard = None;
             return Ok(true);
         }
-        let row = store
-            .connection
-            .query_one(
-                &Query::select()
-                    .from(checkpoint::Entity)
-                    .column((checkpoint::Entity, checkpoint::Column::Id))
-                    .join(
-                        JoinType::InnerJoin,
-                        operation::Entity,
-                        Expr::col((operation::Entity, operation::Column::Id))
-                            .eq(Expr::col((
-                                checkpoint::Entity,
-                                checkpoint::Column::OperationId,
-                            )))
-                            .and(
-                                Expr::col((operation::Entity, operation::Column::Owner))
-                                    .eq(Expr::col((checkpoint::Entity, checkpoint::Column::Owner))),
-                            ),
-                    )
-                    .join(
-                        JoinType::InnerJoin,
-                        projection::Entity,
-                        Expr::col((projection::Entity, projection::Column::OperationId))
-                            .eq(Expr::col((operation::Entity, operation::Column::Id))),
-                    )
-                    .join(
-                        JoinType::InnerJoin,
-                        history::Entity,
-                        Expr::col((history::Entity, history::Column::Id)).eq(Expr::col((
-                            projection::Entity,
-                            projection::Column::ManifestId,
-                        ))),
-                    )
-                    .and_where(
-                        Expr::col((checkpoint::Entity, checkpoint::Column::Id))
-                            .gt(&self.discard_after),
-                    )
-                    .and_where(Expr::col((history::Entity, history::Column::Expired)).eq(1))
-                    .and_where(
-                        Expr::col((operation::Entity, operation::Column::Status)).is_in([
-                            "failed",
-                            "cancelled",
-                            "stale",
-                        ]),
-                    )
-                    .and_where(
-                        Expr::col((checkpoint::Entity, checkpoint::Column::Status)).ne("applied"),
-                    )
-                    .order_by((checkpoint::Entity, checkpoint::Column::Id), Order::Asc)
-                    .limit(1)
-                    .to_owned(),
+        if self.discard_pending.is_empty() {
+            // Physical PK seek only: no eligibility predicate/JOIN can make
+            // SQLite search past this page to fill it. Bound actual UTF-8 key
+            // bytes as well as rows, like ScopeDiscovery's metadata pages.
+            let key: SimpleExpr = Expr::case(
+                Expr::cust(format!(
+                    "length(CAST(id AS BLOB)) <= {SCOPE_PAGE_KEY_BYTES}"
+                )),
+                Expr::col(checkpoint::Column::Id),
             )
-            .await?;
-        let Some(row) = row else {
+            .finally(Expr::val(Option::<String>::None))
+            .into();
+            self.discard_pending = checkpoint::Entity::find()
+                .select_only()
+                .column_as(key, "id")
+                .filter(checkpoint::Column::Id.gt(&self.discard_after))
+                .order_by_asc(checkpoint::Column::Id)
+                .limit(META_ROWS)
+                .into_tuple::<Option<String>>()
+                .all(&store.connection)
+                .await?
+                .into();
+        }
+        let id = match self.discard_pending.front() {
+            Some(Some(id)) => Some(id.clone()),
+            Some(None) => {
+                // Preserve the legacy TEXT ID domain without retaining a page
+                // of oversized keys. A fresh single seek also handles deletion
+                // of the sentinel row. Never acknowledge its old cached tail.
+                self.discard_pending.clear();
+                checkpoint::Entity::find()
+                    .select_only()
+                    .column(checkpoint::Column::Id)
+                    .filter(checkpoint::Column::Id.gt(&self.discard_after))
+                    .order_by_asc(checkpoint::Column::Id)
+                    .into_tuple::<String>()
+                    .one(&store.connection)
+                    .await?
+            }
+            None => None,
+        };
+        let Some(id) = id else {
+            // Only an empty physical seek is EOF. Rejected eligibility on a
+            // nonempty page always returns more; the existing pass/revisit
+            // policy later rediscovers eligibility changes behind the cursor.
             self.discard_after.clear();
             return Ok(false);
         };
-        let id: String = row.try_get("", "id")?;
-        // One exact-key metadata read, after LIMIT has selected this candidate.
+        // One exact-key eligibility/preflight read, after physical selection.
         // A failed read acknowledges nothing; a successful refusal advances the
         // keyset without allocating a reverse traversal or decoding runner JSON.
         let admitted = discard_preflight(store, &id).await?;
         if !admitted {
             self.discard_after = id;
+            self.discard_pending.pop_front();
             return Ok(true);
         }
         // Discovery/preflight may already be stale. Fetch all current binding
@@ -2260,6 +2329,7 @@ impl FrozenStorageLifetimeProgress {
         // leaves this visit unacknowledged; a successful refusal is not EOF.
         let discard = prepare_discard_candidate(store, &id).await?;
         self.discard_after = id;
+        self.discard_pending.pop_front();
         self.discard = discard;
         Ok(true)
     }
@@ -2269,21 +2339,92 @@ impl FrozenStorageLifetimeProgress {
 // Use the same broad incoming-edge predicates as its final guard, including
 // unknown foreign scope/version combinations that must conservatively retain.
 async fn discard_preflight(store: &CrudStore, id: &str) -> Result<bool> {
-    let row = store
-        .connection
-        .query_one_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "SELECT 1 AS admitted FROM compaction_checkpoint c WHERE c.id=?1 \
-             AND NOT EXISTS(SELECT 1 FROM compaction_checkpoint WHERE previous=?1) \
-             AND NOT EXISTS(SELECT 1 FROM compaction_coverage WHERE source_id=?1 AND source_scope LIKE 'checkpoint:%') \
-             AND (c.proof_version=1 \
-             OR EXISTS(SELECT 1 FROM compaction_checkpoint_import WHERE checkpoint_id=?1) \
-             OR EXISTS(SELECT 1 FROM compaction_checkpoint_replay_alias WHERE checkpoint_id=?1) \
-             OR EXISTS(SELECT 1 FROM compaction_checkpoint_event_input WHERE checkpoint_id=?1)) LIMIT 1",
-            [id.into()],
-        ))
-        .await?;
-    Ok(row.is_some())
+    use pioneer_entity::{
+        compaction_checkpoint_event_input as event_input, compaction_checkpoint_import as import,
+        compaction_checkpoint_replay_alias as replay_alias,
+    };
+    // Correlated exact-key binding lookups: operation/projection/history PKs
+    // cannot fan out into a global terminal-operation scan per candidate.
+    let binding =
+        operation::Entity::find()
+            .select_only()
+            .column(operation::Column::Id)
+            .filter(
+                Expr::col((operation::Entity, operation::Column::Id)).eq(Expr::col((
+                    checkpoint::Entity,
+                    checkpoint::Column::OperationId,
+                ))),
+            )
+            .filter(
+                Expr::col((operation::Entity, operation::Column::Owner))
+                    .eq(Expr::col((checkpoint::Entity, checkpoint::Column::Owner))),
+            )
+            .filter(operation::Column::Status.is_in(["failed", "cancelled", "stale"]))
+            .filter(Expr::exists(
+                projection::Entity::find()
+                    .select_only()
+                    .column(projection::Column::OperationId)
+                    .filter(
+                        Expr::col((projection::Entity, projection::Column::OperationId))
+                            .eq(Expr::col((operation::Entity, operation::Column::Id))),
+                    )
+                    .filter(Expr::exists(
+                        history::Entity::find()
+                            .select_only()
+                            .column(history::Column::Id)
+                            .filter(Expr::col((history::Entity, history::Column::Id)).eq(
+                                Expr::col((projection::Entity, projection::Column::ManifestId)),
+                            ))
+                            .filter(history::Column::Expired.eq(1))
+                            .into_query(),
+                    ))
+                    .into_query(),
+            ))
+            .into_query();
+    let previous = checkpoint::Entity::find()
+        .select_only()
+        .column(checkpoint::Column::Id)
+        .filter(checkpoint::Column::Previous.eq(id))
+        .into_query();
+    let incoming = coverage::Entity::find()
+        .select_only()
+        .column(coverage::Column::CheckpointId)
+        .filter(coverage::Column::SourceId.eq(id))
+        .filter(coverage::Column::SourceScope.like("checkpoint:%"))
+        .into_query();
+    let imports = import::Entity::find()
+        .select_only()
+        .column(import::Column::CheckpointId)
+        .filter(import::Column::CheckpointId.eq(id))
+        .into_query();
+    let aliases = replay_alias::Entity::find()
+        .select_only()
+        .column(replay_alias::Column::CheckpointId)
+        .filter(replay_alias::Column::CheckpointId.eq(id))
+        .into_query();
+    let events = event_input::Entity::find()
+        .select_only()
+        .column(event_input::Column::CheckpointId)
+        .filter(event_input::Column::CheckpointId.eq(id))
+        .into_query();
+    Ok(checkpoint::Entity::find_by_id(id)
+        .select_only()
+        .column(checkpoint::Column::ProofVersion)
+        .filter(checkpoint::Column::Status.ne("applied"))
+        .filter(Expr::exists(binding))
+        .filter(Expr::exists(previous).not())
+        .filter(Expr::exists(incoming).not())
+        .filter(
+            Condition::any()
+                .add(checkpoint::Column::ProofVersion.eq(1))
+                .add(Expr::exists(imports))
+                .add(Expr::exists(aliases))
+                .add(Expr::exists(events)),
+        )
+        .into_tuple::<i64>()
+        .one(&store.connection)
+        .await?
+        .is_some())
 }
 
 // Both reads are advisory: cleanup still owns final authorization in its
@@ -2346,6 +2487,10 @@ async fn prepare_discard_candidate(
         manifest,
         status,
         generation,
+        operation,
+        owner,
+        checkpoint_status,
+        thread: scope.thread_id,
     }))
 }
 
@@ -2355,6 +2500,10 @@ struct DiscardPreparation {
     status: String,
     generation: Option<i64>,
     reverse: Reachability,
+    operation: String,
+    owner: String,
+    checkpoint_status: String,
+    thread: String,
 }
 impl DiscardPreparation {
     async fn cleanup(&self, store: &CrudStore) -> Result<()> {
@@ -2438,6 +2587,12 @@ impl DiscardPreparation {
                     )
                     .join(
                         JoinType::InnerJoin,
+                        context::Entity,
+                        Expr::col((context::Entity, context::Column::Owner))
+                            .eq(Expr::col((checkpoint::Entity, checkpoint::Column::Owner))),
+                    )
+                    .join(
+                        JoinType::InnerJoin,
                         runner::Entity,
                         Expr::col((runner::Entity, runner::Column::OperationId))
                             .eq(Expr::col((operation::Entity, operation::Column::Id))),
@@ -2465,6 +2620,33 @@ impl DiscardPreparation {
                     )
                     .and_where(Expr::col((history::Entity, history::Column::Id)).eq(&self.manifest))
                     .and_where(Expr::col((history::Entity, history::Column::Expired)).eq(1))
+                    // The reader's terminal proof/reverse traversal belongs to
+                    // this exact operation and scope, including unsealed keys
+                    // whose identity is not protected by sealed-row triggers.
+                    .and_where(
+                        Expr::col((checkpoint::Entity, checkpoint::Column::OperationId))
+                            .eq(&self.operation),
+                    )
+                    .and_where(
+                        Expr::col((checkpoint::Entity, checkpoint::Column::Owner)).eq(&self.owner),
+                    )
+                    .and_where(
+                        Expr::col((operation::Entity, operation::Column::Owner)).eq(&self.owner),
+                    )
+                    .and_where(
+                        Expr::col((checkpoint::Entity, checkpoint::Column::Status))
+                            .eq(&self.checkpoint_status),
+                    )
+                    .and_where(
+                        Expr::col((checkpoint::Entity, checkpoint::Column::FormatVersion)).eq(1),
+                    )
+                    .and_where(
+                        Expr::col((context::Entity, context::Column::WorkspaceId))
+                            .eq(&self.reverse.workspace),
+                    )
+                    .and_where(
+                        Expr::col((context::Entity, context::Column::ThreadId)).eq(&self.thread),
+                    )
                     .and_where(Expr::exists(incoming_previous).not())
                     .and_where(Expr::exists(incoming_foreign).not());
                 match self.generation {
@@ -3289,6 +3471,8 @@ mod tests {
             attempts: 0,
             retries: 0,
             portion_attempts: 0,
+            overflow_rejections: 0,
+            overflow_input_ceiling: None,
             corrections: 0,
             target_tokens: 10,
             source_text_projection_version: 0,
@@ -3442,7 +3626,9 @@ mod tests {
     async fn locator_sparse_pending_seek_revisits_poison_without_blocking_later_keys() {
         for poison in [
             "malformed retaining legacy receipt".to_owned(),
-            serde_json::json!({"padding":"я".repeat(LEGACY_LOCATOR_BYTES as usize / 2)})
+            // Oversized valid padding is supported now. This candidate is
+            // poison because of its malformed receipt, independently of size.
+            serde_json::json!({"padding":"я".repeat(4 * 1024 * 1024),"pioneerContext":{"version":99}})
                 .to_string(),
         ] {
             let (store, h) = legacy_locator_fixture_with_poison(63, &poison).await;
@@ -3479,10 +3665,10 @@ mod tests {
                     .collect::<Vec<_>>(),
                 ["root-0002", "root-0063", "root-0064", "root-0127"]
             );
-            // Use the public error/refusal handling, rather than treating an
-            // oversize or malformed candidate as a successful locator EOF.
+            // Use the public error/refusal handling, rather than treating a
+            // malformed candidate as a successful locator EOF.
             let mut finished = false;
-            for _ in 0..100 {
+            for _ in 0..1000 {
                 progress.pass_done[1..].fill(true);
                 let more = progress.quantum(&store).await.unwrap();
                 assert!(
@@ -3651,7 +3837,7 @@ mod tests {
             if progress
                 .locator
                 .as_ref()
-                .is_some_and(|read| read.id == "root-0002" && !read.bytes.is_empty())
+                .is_some_and(|read| read.id == "root-0002" && read.offset != 0)
             {
                 break;
             }
@@ -3671,10 +3857,10 @@ mod tests {
             Some("")
         );
 
-        // Restart after an unfinished fragment: no promise to keep RAM bytes.
+        // Restart after an unfinished fragment: parser progress is memory-only.
         let read = progress.locator.as_ref().unwrap();
         assert_eq!(read.id, "root-0002");
-        assert_eq!(read.bytes.len(), FRAGMENT_BYTES as usize);
+        assert_eq!(read.offset, FRAGMENT_BYTES);
         drop(progress);
         assert!(store.frozen_readers.lock().unwrap().is_empty());
         let mut restart = FrozenStorageLifetimeProgress::default();
@@ -3685,7 +3871,7 @@ mod tests {
             }
         }
         assert_eq!(restart.locator.as_ref().unwrap().id, "root-0002");
-        assert!(restart.locator.as_ref().unwrap().bytes.is_empty());
+        assert_eq!(restart.locator.as_ref().unwrap().offset, 0);
         assert!(
             restart
                 .locator_pending
@@ -3808,6 +3994,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn locator_final_writer_cancel_preserves_prepared_root_for_retry() {
+        let (store, descriptor) = legacy_locator_fixture().await;
+        let size: i64 = store.connection.query_one_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT octet_length(resume_cursor_json) AS bytes FROM thread_cli_runtime_binding WHERE thread_id='root-0002'",
+        )).await.unwrap().unwrap().try_get("", "bytes").unwrap();
+        let mut read = LocatorRead::new(2, "root-0002".into(), "ws".into(), size);
+        while read.offset < size {
+            assert!(!read.step(&store).await.unwrap());
+        }
+        assert_eq!(
+            locator_marker(&store, "root-0002").await.as_deref(),
+            Some("")
+        );
+
+        // Every source fragment is already fed. This step finishes the stream
+        // synchronously, then waits for the final writer reservation held by
+        // this real transaction. Cancellation must retain the prepared root.
+        let holder = store.connection.begin().await.unwrap();
+        let mut attempt = Box::pin(read.step(&store));
+        assert!(futures_util::poll!(attempt.as_mut()).is_pending());
+        drop(attempt);
+        holder.rollback().await.unwrap();
+
+        // A retry must publish through the ordinary verification/CAS path;
+        // consuming stream.finish a second time would fail before this commit.
+        assert!(read.step(&store).await.unwrap());
+        assert_eq!(
+            locator_marker(&store, "root-0002").await,
+            Some(descriptor.manifest_id)
+        );
+    }
+
+    #[tokio::test]
     async fn locator_fragment_cancel_and_foreground_mutation_preserve_scope_and_capacity() {
         for mutation in ["workspace", "json", "delete"] {
             let (store, _) = legacy_locator_fixture().await;
@@ -3828,17 +4048,14 @@ mod tests {
             progress.locator_quantum(&store).await.unwrap();
             let read = progress.locator.as_ref().unwrap();
             assert_eq!(read.id, "root-0002");
-            assert_eq!(read.bytes.len(), FRAGMENT_BYTES as usize);
+            assert_eq!(read.offset, FRAGMENT_BYTES);
             // Existing single-connection fixture: cancel a fragment while it
             // waits for DB capacity, then prove a foreground write can proceed.
             let holder = store.connection.begin_read().await.unwrap();
             let mut attempt = Box::pin(progress.locator_quantum(&store));
             assert!(futures_util::poll!(attempt.as_mut()).is_pending());
             drop(attempt);
-            assert_eq!(
-                progress.locator.as_ref().unwrap().bytes.len(),
-                FRAGMENT_BYTES as usize
-            );
+            assert_eq!(progress.locator.as_ref().unwrap().offset, FRAGMENT_BYTES);
             holder.rollback().await.unwrap();
             let foreground = store.with_interactive_writes();
             match mutation {
@@ -5586,25 +5803,19 @@ mod tests {
             db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,"INSERT INTO thread_cli_runtime_binding(thread_id,workspace_id,runtime_id,runtime_kind,native_thread_id,resume_cursor_json,status) VALUES('thread','ws','runtime','claude','native',?1,'active')",[json.clone().into()])).await.unwrap();
             Migrator::up(&db, None).await.unwrap();
             let store = CrudStore::new(db);
-            let mut read = LocatorRead {
-                kind: 2,
-                id: "thread".into(),
-                workspace: "ws".into(),
-                size: json.len() as i64,
-                bytes: vec![],
-            };
+            let mut read = LocatorRead::new(2, "thread".into(), "ws".into(), json.len() as i64);
             assert!(!read.step(&store).await.unwrap());
-            assert_eq!(read.bytes.len(), FRAGMENT_BYTES as usize);
+            assert_eq!(read.offset, FRAGMENT_BYTES);
             if mutation == "metadata" {
                 store.connection.execute_unprepared("UPDATE thread_cli_runtime_binding SET status='active',updated_at=created_at WHERE thread_id='thread'").await.unwrap();
-                while read.bytes.len() < json.len() {
+                while read.offset < json.len() as i64 {
                     assert!(!read.step(&store).await.unwrap());
                 }
                 assert!(read.step(&store).await.unwrap());
             } else {
                 // Finish the old fragments before the authoritative write, so
                 // final CAS, rather than a size mismatch, must lose the race.
-                while read.bytes.len() < json.len() {
+                while read.offset < json.len() as i64 {
                     assert!(!read.step(&store).await.unwrap());
                 }
                 if mutation == "recreate" {
@@ -6253,6 +6464,10 @@ mod tests {
             status: "failed".into(),
             generation: Some(0),
             reverse: Reachability::new("cp-1", "ws"),
+            operation: "op".into(),
+            owner: "owner".into(),
+            checkpoint_status: "candidate".into(),
+            thread: "thread".into(),
         };
         progress.discard = Some(discard);
         // The final pending reverse node is consumed before its first DB read.

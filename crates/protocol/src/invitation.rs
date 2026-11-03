@@ -619,10 +619,9 @@ mod tests {
             presentation
         );
         assert!(presentation.verify_gateway_id(&gateway_id).is_ok());
-        assert!(
-            presentation
-                .verify_gateway_id(&GatewayId::new("G00000000000000000002").unwrap())
-                .is_err()
+        assert_eq!(
+            presentation.verify_gateway_id(&GatewayId::new("G00000000000000000002").unwrap()),
+            Err(crate::InvitationErrorReason::InvitationUnavailable)
         );
         let rendered = format!("{presentation:?}");
         assert!(!rendered.contains(&raw));

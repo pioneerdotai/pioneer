@@ -6,6 +6,8 @@ use std::net::IpAddr;
 use std::path::{Component, Path, PathBuf};
 
 const DEFAULT_CONFIG_TOML: &str = include_str!("../../../config/default.toml");
+const DEV_CONFIG_TOML: &str = include_str!("../../../config/dev.toml");
+pub const DEV_GATEWAY_BUNDLE_ID: &str = "ai.pioneer.gateway.dev";
 
 // Bootstrap constant: this file may override AppConfig values, so we need its name
 // before AppConfig is available.
@@ -45,8 +47,6 @@ pub struct GatewayConfig {
     pub trusted_proxy_peers: Vec<IpAddr>,
     #[serde(default = "default_gateway_keepawake")]
     pub keepawake: bool,
-    #[serde(default)]
-    pub preflight_model: GatewayMemoryModelSelectionConfig,
     #[serde(default)]
     pub telemetry: GatewayTelemetryConfig,
     pub thread: GatewayThreadConfig,
@@ -781,12 +781,6 @@ pub struct GatewayMemoryConfig {
     /// Allows agent/global memories to be used when explicitly enabled by config.
     #[serde(default = "default_gateway_memory_allow_global_agent")]
     pub allow_global_agent_by_default: bool,
-    /// Enables deterministic pre-turn recall into the prompt context.
-    #[serde(default = "default_gateway_memory_deterministic_recall_enabled")]
-    pub deterministic_recall_enabled: bool,
-    /// Enables active recall planning before prompt compilation.
-    #[serde(default = "default_gateway_memory_active_recall_enabled")]
-    pub active_recall_enabled: bool,
     /// Exposes explicit memory tools to capable model providers.
     #[serde(default = "default_gateway_memory_tools_enabled")]
     pub tools_enabled: bool,
@@ -796,9 +790,6 @@ pub struct GatewayMemoryConfig {
     /// Runs post-turn extraction as background hook work instead of blocking the user turn.
     #[serde(default = "default_gateway_memory_background_extraction_enabled")]
     pub background_extraction_enabled: bool,
-    /// Provider/model used by active recall planner. Defaults to the thread model.
-    #[serde(default)]
-    pub active_recall_model: GatewayMemoryModelSelectionConfig,
     /// Provider/model used by proactive memory writes. Defaults to the thread model.
     #[serde(default)]
     pub proactive_writes_model: GatewayMemoryModelSelectionConfig,
@@ -817,12 +808,9 @@ impl Default for GatewayMemoryConfig {
             capsules_dir: default_gateway_memory_capsules_dir(),
             allow_global_user_by_default: default_gateway_memory_allow_global_user(),
             allow_global_agent_by_default: default_gateway_memory_allow_global_agent(),
-            deterministic_recall_enabled: default_gateway_memory_deterministic_recall_enabled(),
-            active_recall_enabled: default_gateway_memory_active_recall_enabled(),
             tools_enabled: default_gateway_memory_tools_enabled(),
             proactive_writes_enabled: default_gateway_memory_proactive_writes_enabled(),
             background_extraction_enabled: default_gateway_memory_background_extraction_enabled(),
-            active_recall_model: GatewayMemoryModelSelectionConfig::default(),
             proactive_writes_model: GatewayMemoryModelSelectionConfig::default(),
             debug_trace_enabled: false,
             strict_diagnostics_enabled: false,
@@ -2051,14 +2039,6 @@ const fn default_gateway_memory_allow_global_agent() -> bool {
     false
 }
 
-const fn default_gateway_memory_deterministic_recall_enabled() -> bool {
-    true
-}
-
-const fn default_gateway_memory_active_recall_enabled() -> bool {
-    true
-}
-
 const fn default_gateway_memory_tools_enabled() -> bool {
     true
 }
@@ -3046,7 +3026,79 @@ impl InstallState {
 
 impl AppConfig {
     pub fn load() -> Result<Self, ConfigError> {
-        load_config_from_sources(DEFAULT_CONFIG_TOML, config_override_candidates())
+        load_profile_config(
+            cfg!(debug_assertions),
+            workspace_local_config_path(),
+            user_override_config_path(),
+            std::env::var_os("PIONEER_CONFIG").map(PathBuf::from),
+        )
+    }
+
+    /// Debug commands share one isolated contour, including commands issued by
+    /// Desktop and a service manager without the developer's shell environment.
+    /// Validate before creating a home, preparing CUA or touching a registration.
+    pub fn validate_development_context(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.home_directory == ".pioneer.dev"
+                && self.gateway.service_name == "com.pioneer.gateway.dev"
+                && self.install.unix_root_directory_name == "pioneer-dev"
+                && self.install.macos_root_directory_name == "PioneerDev"
+                && self.install.windows_root_directory_name == "PioneerDev"
+                && self.install.managed_directory_name == "managed-dev"
+                && self.install.macos_associated_bundle_identifier == DEV_GATEWAY_BUNDLE_ID
+                && self.gateway.remote_access.service_name == "pioneer_gateway_dev"
+                && !self
+                    .gateway
+                    .legacy_service_names
+                    .iter()
+                    .any(|name| name.trim().eq_ignore_ascii_case("com.pioneer.gateway")),
+            "debug Gateway requires the isolated dev home, service, install root and Gateway identity"
+        );
+        let listen: std::net::SocketAddr = self
+            .gateway
+            .listen_addr
+            .parse()
+            .context("invalid dev Gateway listen address")?;
+        let remote: std::net::SocketAddr = self
+            .gateway
+            .remote_access
+            .local_addr
+            .parse()
+            .context("invalid dev remote-access local address")?;
+        anyhow::ensure!(
+            listen.port() != 0
+                && listen.port() != 17878
+                && remote.ip().is_loopback()
+                && remote.port() == listen.port()
+                && self.desktop.mcp_oauth.callback_port.get() != 37643,
+            "dev Gateway, remote access and Desktop callback must use ports separate from prod"
+        );
+        let home = self.runtime_home_dir()?;
+        for (value, field) in [
+            (&self.install_state_file_name, "install_state_file_name"),
+            (
+                &self.gateway.settings_file_name,
+                "gateway.settings_file_name",
+            ),
+            (
+                &self.gateway.database.file_name,
+                "gateway.database.file_name",
+            ),
+        ] {
+            let file = normalize_runtime_file_name(value, field)?;
+            ensure_development_path(&home.join(file))?;
+        }
+        let remote_dir = Path::new(&self.gateway.remote_access.runtime_dir);
+        anyhow::ensure!(
+            !remote_dir.as_os_str().is_empty()
+                && remote_dir
+                    .components()
+                    .all(|part| matches!(part, Component::Normal(_))),
+            "dev remote-access runtime must stay inside the dev home"
+        );
+        ensure_development_path(&home.join(remote_dir))?;
+        ensure_development_path(&home.join("gateway-runtime"))?;
+        Ok(())
     }
 
     pub fn runtime_home_dir(&self) -> Result<PathBuf> {
@@ -3303,13 +3355,70 @@ pub fn save_install_state(path: &Path, state: &InstallState) -> Result<()> {
     Ok(())
 }
 
-fn config_override_candidates() -> Vec<PathBuf> {
-    ordered_config_overrides(
-        cfg!(debug_assertions),
-        workspace_local_config_path(),
-        user_override_config_path(),
-        std::env::var_os("PIONEER_CONFIG").map(PathBuf::from),
-    )
+/// Reject directory aliases before any dev write. In particular .pioneer.dev
+/// must never be a link to the production home. Missing paths are safe to create.
+pub fn ensure_development_path(path: &Path) -> Result<()> {
+    for ancestor in path.ancestors() {
+        match std::fs::symlink_metadata(ancestor) {
+            Ok(metadata) => {
+                #[cfg(windows)]
+                {
+                    use std::os::windows::fs::MetadataExt;
+                    anyhow::ensure!(
+                        metadata.file_attributes() & 0x400 == 0,
+                        "dev path must not traverse a reparse point: {}",
+                        ancestor.display()
+                    );
+                }
+                anyhow::ensure!(
+                    !metadata.file_type().is_symlink(),
+                    "dev path must not traverse a symbolic link: {}",
+                    ancestor.display()
+                );
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("cannot inspect dev path"),
+        }
+    }
+    Ok(())
+}
+
+fn load_profile_config(
+    debug: bool,
+    workspace: PathBuf,
+    user: Option<PathBuf>,
+    explicit: Option<PathBuf>,
+) -> Result<AppConfig, ConfigError> {
+    let explicit_required = explicit.is_some();
+    let paths = ordered_config_overrides(debug, workspace.clone(), user, explicit);
+    let mut builder =
+        Config::builder().add_source(File::from_str(DEFAULT_CONFIG_TOML, FileFormat::Toml));
+    if debug {
+        // Versioned defaults must not replace safe developer network settings.
+        // The Gateway association is distinct from Desktop's local bundle ID;
+        // reassert only that association before user and explicit overrides.
+        builder = builder
+            .add_source(File::from_str(DEV_CONFIG_TOML, FileFormat::Toml))
+            .add_source(File::from(workspace.as_path()).required(false))
+            .add_source(File::from_str(
+                &format!(
+                    "[install]\nmacos_associated_bundle_identifier = {DEV_GATEWAY_BUNDLE_ID:?}\n"
+                ),
+                FileFormat::Toml,
+            ));
+    }
+    for (index, path) in paths.iter().enumerate().skip(usize::from(debug)) {
+        builder = builder.add_source(
+            File::from(path.as_path()).required(explicit_required && index + 1 == paths.len()),
+        );
+    }
+    let config: AppConfig = builder.build()?.try_deserialize()?;
+    if debug {
+        config
+            .validate_development_context()
+            .map_err(|error| ConfigError::Message(format!("{error:#}")))?;
+    }
+    Ok(config)
 }
 
 fn ordered_config_overrides(
@@ -3328,6 +3437,7 @@ fn ordered_config_overrides(
     candidates
 }
 
+#[cfg(test)]
 fn load_config_from_sources(
     default_config_toml: &str,
     override_paths: Vec<PathBuf>,
@@ -3339,54 +3449,8 @@ fn load_config_from_sources(
         builder = builder.add_source(File::from(path.as_path()).required(false));
     }
 
-    let mut config: AppConfig = builder.build()?.try_deserialize()?;
-    migrate_gateway_preflight_model_from_legacy_overrides(&mut config, override_paths.as_slice());
+    let config: AppConfig = builder.build()?.try_deserialize()?;
     Ok(config)
-}
-
-fn migrate_gateway_preflight_model_from_legacy_overrides(
-    config: &mut AppConfig,
-    override_paths: &[PathBuf],
-) {
-    if override_paths_contain_toml_path(override_paths, &["gateway", "preflight_model"]) {
-        return;
-    }
-
-    if override_paths_contain_toml_path(
-        override_paths,
-        &["gateway", "memory", "active_recall_model"],
-    ) {
-        config.gateway.preflight_model = config.gateway.memory.active_recall_model.clone();
-    }
-}
-
-fn override_paths_contain_toml_path(override_paths: &[PathBuf], path: &[&str]) -> bool {
-    override_paths.iter().any(|override_path| {
-        let Ok(content) = std::fs::read_to_string(override_path) else {
-            return false;
-        };
-        let Ok(value) = toml::from_str::<toml::Value>(content.as_str()) else {
-            return false;
-        };
-        toml_value_has_path(&value, path)
-    })
-}
-
-fn toml_value_has_path(value: &toml::Value, path: &[&str]) -> bool {
-    if path.is_empty() {
-        return true;
-    }
-
-    for end in 1..=path.len() {
-        let key = path[..end].join(".");
-        if let Some(next) = value.get(key.as_str())
-            && toml_value_has_path(next, &path[end..])
-        {
-            return true;
-        }
-    }
-
-    false
 }
 
 fn workspace_local_config_path() -> PathBuf {
@@ -3423,6 +3487,182 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn debug_profile_has_a_versioned_contour_without_local_config() {
+        let missing = unique_temp_file_path("absent-local-config");
+        let config = super::load_profile_config(true, missing.clone(), None, None).unwrap();
+        assert_eq!(config.home_directory, ".pioneer.dev");
+        assert_eq!(config.gateway.service_name, "com.pioneer.gateway.dev");
+        assert_eq!(config.gateway.listen_addr, "0.0.0.0:18778");
+        assert_eq!(config.gateway.remote_access.local_addr, "127.0.0.1:18778");
+        assert_eq!(
+            config.gateway.remote_access.service_name,
+            "pioneer_gateway_dev"
+        );
+        assert_eq!(
+            config.install.macos_associated_bundle_identifier,
+            "ai.pioneer.gateway.dev"
+        );
+        assert_eq!(config.install.managed_directory_name, "managed-dev");
+        assert_eq!(config.desktop.mcp_oauth.callback_port.get(), 37644);
+        let production = super::load_profile_config(false, missing, None, None).unwrap();
+        assert_eq!(production.home_directory, ".pioneer");
+        assert_eq!(production.gateway.service_name, "com.pioneer.gateway");
+        assert_eq!(production.gateway.listen_addr, "0.0.0.0:17878");
+        assert_eq!(
+            production.install.macos_associated_bundle_identifier,
+            "ai.pioneer.gateway"
+        );
+    }
+
+    #[test]
+    fn debug_profile_preserves_settings_precedence_and_owns_gateway_identity() {
+        let workspace = unique_temp_file_path("dev-workspace");
+        let user = unique_temp_file_path("dev-user");
+        let explicit = unique_temp_file_path("dev-explicit");
+        write_file(
+            &workspace,
+            "[install]\nmacos_associated_bundle_identifier = 'ai.pioneer.macos.dev'\n[gateway]\nkeepawake = true\noutbound_queue_capacity = 7\nlisten_addr = '127.0.0.1:18779'\n[gateway.remote_access]\nlocal_addr = '127.0.0.1:18779'\n",
+        );
+        write_file(
+            &user,
+            "[gateway]\noutbound_queue_capacity = 8\nlisten_addr = '127.0.0.1:18780'\n[gateway.remote_access]\nlocal_addr = '127.0.0.1:18780'\n",
+        );
+        write_file(
+            &explicit,
+            "[gateway]\noutbound_queue_capacity = 9\nlisten_addr = '127.0.0.1:18781'\n[gateway.remote_access]\nlocal_addr = '127.0.0.1:18781'\n",
+        );
+        for (user_path, selected, expected, port) in [
+            (None, None, 7, 18779),
+            (Some(user.clone()), None, 8, 18780),
+            (Some(user.clone()), Some(explicit.clone()), 9, 18781),
+        ] {
+            let config =
+                super::load_profile_config(true, workspace.clone(), user_path, selected).unwrap();
+            assert!(config.gateway.keepawake);
+            assert_eq!(config.gateway.outbound_queue_capacity, expected);
+            assert_eq!(
+                config.install.macos_associated_bundle_identifier,
+                "ai.pioneer.gateway.dev"
+            );
+            assert_eq!(config.gateway.listen_addr, format!("127.0.0.1:{port}"));
+            assert_eq!(
+                config.gateway.remote_access.local_addr,
+                format!("127.0.0.1:{port}")
+            );
+        }
+        for path in [workspace, user, explicit] {
+            fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn debug_profile_accepts_nested_relative_files_and_rejects_escapes() {
+        let explicit = unique_temp_file_path("dev-nested-paths");
+        write_file(
+            &explicit,
+            "install_state_file_name = 'state/install-state.toml'\n[gateway]\nsettings_file_name = 'settings/gateway.toml'\n[gateway.database]\nfile_name = 'data/gateway.db'\n",
+        );
+        let config = super::load_profile_config(
+            true,
+            unique_temp_file_path("missing-local"),
+            None,
+            Some(explicit.clone()),
+        )
+        .unwrap();
+        let home = config.runtime_home_dir().unwrap();
+        assert_eq!(
+            config.install_state_path().unwrap(),
+            home.join("state/install-state.toml")
+        );
+        assert_eq!(config.gateway.settings_file_name, "settings/gateway.toml");
+        assert_eq!(config.gateway.database.file_name, "data/gateway.db");
+        for field in [
+            "install_state_file_name",
+            "gateway.settings_file_name",
+            "gateway.database.file_name",
+        ] {
+            for path in ["../.pioneer/foreign.toml", "/absolute/foreign.toml"] {
+                let contents = match field.split_once('.') {
+                    Some((section, key)) => format!("[{section}]\n{key} = {path:?}\n"),
+                    None => format!("{field} = {path:?}\n"),
+                };
+                write_file(&explicit, &contents);
+                let error = super::load_profile_config(
+                    true,
+                    unique_temp_file_path("missing-local"),
+                    None,
+                    Some(explicit.clone()),
+                )
+                .unwrap_err();
+                assert!(error.to_string().contains(field), "{field}: {error}");
+            }
+        }
+        fs::remove_file(explicit).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn nested_dev_file_rejects_an_intermediate_alias_to_production() {
+        let root = unique_temp_file_path("dev-nested-alias");
+        fs::create_dir_all(root.join(".pioneer.dev")).unwrap();
+        fs::create_dir(root.join(".pioneer")).unwrap();
+        let root = root.canonicalize().unwrap();
+        let production = root.join(".pioneer/gateway.db");
+        fs::write(&production, b"production fixture remains untouched").unwrap();
+        std::os::unix::fs::symlink(root.join(".pioneer"), root.join(".pioneer.dev/data")).unwrap();
+        let error =
+            super::ensure_development_path(&root.join(".pioneer.dev/data/gateway.db")).unwrap_err();
+        assert!(error.to_string().contains("symbolic link"));
+        assert_eq!(
+            fs::read(production).unwrap(),
+            b"production fixture remains untouched"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn debug_profile_rejects_explicit_production_overlap() {
+        let explicit = unique_temp_file_path("dev-prod-overlap");
+        for contents in [
+            "home_directory = '.pioneer'",
+            "[gateway]\nservice_name = 'com.pioneer.gateway'",
+            "[gateway]\nlegacy_service_names = ['com.pioneer.gateway']",
+            "[gateway]\nlegacy_service_names = ['COM.PIONEER.GATEWAY']",
+            "[gateway]\nlegacy_service_names = ['CoM.PiOnEeR.GaTeWaY']",
+            "[gateway]\nlegacy_service_names = ['  COM.PIONEER.GATEWAY  ']",
+            "[gateway]\nlegacy_service_names = ['  CoM.PiOnEeR.GaTeWaY  ']",
+            "[install]\nmacos_root_directory_name = 'Pioneer'",
+            "[install]\nmacos_associated_bundle_identifier = 'ai.pioneer.gateway'",
+            "[gateway]\nlisten_addr = '0.0.0.0:17878'",
+            "[gateway.remote_access]\nservice_name = 'pioneer_gateway'",
+            "[gateway.remote_access]\nlocal_addr = '127.0.0.1:17878'",
+            "[gateway.database]\nfile_name = '../.pioneer/gateway.db'",
+            "[desktop.mcp_oauth]\ncallback_port = 37643",
+        ] {
+            write_file(&explicit, contents);
+            let error = super::load_profile_config(
+                true,
+                unique_temp_file_path("missing-local"),
+                None,
+                Some(explicit.clone()),
+            )
+            .unwrap_err();
+            let text = error.to_string();
+            if contents.contains("legacy_service_names") {
+                assert!(
+                    text.contains("debug Gateway requires the isolated dev home, service, install root and Gateway identity"),
+                    "legacy prod overlap must fail dev validation: {contents}: {text}"
+                );
+            }
+            assert!(
+                text.contains("dev") || text.contains("gateway.database.file_name"),
+                "{contents}: {text}"
+            );
+        }
+        fs::remove_file(explicit).unwrap();
+    }
 
     #[test]
     fn install_state_roundtrip() {
@@ -3581,7 +3821,6 @@ service_name = "com.pioneer.gateway.env"
         );
         assert_eq!(config.gateway.service_name, "com.pioneer.gateway");
         assert!(!config.gateway.keepawake);
-        assert!(config.gateway.preflight_model.is_thread_model());
         assert!(config.gateway.tasks.review.enabled);
         assert!(!config.gateway.tasks.review.allow_task_create_review_policy);
         assert!(
@@ -4094,112 +4333,6 @@ recovery_grace_secs = 1801
     }
 
     #[test]
-    fn settings_gateway_preflight_model_config_defaults_to_thread() {
-        let config =
-            load_config_from_sources(DEFAULT_CONFIG_TOML, Vec::new()).expect("load default config");
-
-        assert!(config.gateway.preflight_model.is_thread_model());
-    }
-
-    #[test]
-    fn settings_gateway_preflight_model_config_accepts_custom_override() {
-        let workspace_override = unique_temp_file_path("gateway-preflight-model-config");
-        write_file(
-            &workspace_override,
-            r#"
-[gateway]
-preflight_model = { source = "custom", model_provider = "planner-provider", model = "planner-model" }
-"#,
-        );
-
-        let config =
-            load_config_from_sources(DEFAULT_CONFIG_TOML, vec![workspace_override.clone()])
-                .expect("load config with preflight model override");
-
-        assert_eq!(
-            config.gateway.preflight_model,
-            GatewayMemoryModelSelectionConfig::custom("planner-provider", "planner-model")
-        );
-
-        let _ = fs::remove_file(workspace_override);
-    }
-
-    #[test]
-    fn settings_migration_gateway_preflight_model_copies_legacy_memory_active_recall_model() {
-        let workspace_override = unique_temp_file_path("gateway-preflight-model-migration");
-        write_file(
-            &workspace_override,
-            r#"
-[gateway.memory]
-active_recall_model = { source = "custom", model_provider = "legacy-provider", model = "legacy-model" }
-"#,
-        );
-
-        let config =
-            load_config_from_sources(DEFAULT_CONFIG_TOML, vec![workspace_override.clone()])
-                .expect("load config with legacy active recall model");
-
-        assert_eq!(
-            config.gateway.preflight_model,
-            GatewayMemoryModelSelectionConfig::custom("legacy-provider", "legacy-model")
-        );
-        assert_eq!(
-            config.gateway.memory.active_recall_model,
-            GatewayMemoryModelSelectionConfig::custom("legacy-provider", "legacy-model")
-        );
-
-        let _ = fs::remove_file(workspace_override);
-    }
-
-    #[test]
-    fn migration_toml_path_detection_handles_nested_tables() {
-        let content = r#"
-[gateway.memory]
-active_recall_model = { source = "custom", model_provider = "legacy-provider", model = "legacy-model" }
-"#;
-        let value = toml::from_str::<toml::Value>(content).expect("toml should parse");
-
-        assert!(super::toml_value_has_path(
-            &value,
-            &["gateway", "memory", "active_recall_model"]
-        ));
-        assert!(!super::toml_value_has_path(
-            &value,
-            &["gateway", "preflight_model"]
-        ));
-    }
-
-    #[test]
-    fn settings_migration_gateway_preflight_model_preserves_explicit_new_setting() {
-        let workspace_override = unique_temp_file_path("gateway-preflight-model-mixed");
-        write_file(
-            &workspace_override,
-            r#"
-[gateway]
-preflight_model = { source = "custom", model_provider = "new-provider", model = "new-model" }
-
-[gateway.memory]
-active_recall_model = { source = "custom", model_provider = "legacy-provider", model = "legacy-model" }
-"#,
-        );
-
-        let config =
-            load_config_from_sources(DEFAULT_CONFIG_TOML, vec![workspace_override.clone()])
-                .expect("load config with mixed preflight settings");
-
-        assert_eq!(
-            config.gateway.preflight_model,
-            GatewayMemoryModelSelectionConfig::custom("new-provider", "new-model")
-        );
-        assert_eq!(
-            config.gateway.memory.active_recall_model,
-            GatewayMemoryModelSelectionConfig::custom("legacy-provider", "legacy-model")
-        );
-
-        let _ = fs::remove_file(workspace_override);
-    }
-
-    #[test]
     fn config_loader_uses_scoped_skill_path_templates_by_default() {
         let config =
             load_config_from_sources(DEFAULT_CONFIG_TOML, Vec::new()).expect("load default config");
@@ -4347,12 +4480,9 @@ active_recall_model = { source = "custom", model_provider = "legacy-provider", m
         assert_eq!(config.gateway.memory.capsules_dir, "memory/capsules");
         assert!(config.gateway.memory.allow_global_user_by_default);
         assert!(!config.gateway.memory.allow_global_agent_by_default);
-        assert!(config.gateway.memory.deterministic_recall_enabled);
-        assert!(config.gateway.memory.active_recall_enabled);
         assert!(config.gateway.memory.tools_enabled);
         assert!(config.gateway.memory.proactive_writes_enabled);
         assert!(config.gateway.memory.background_extraction_enabled);
-        assert!(config.gateway.memory.active_recall_model.is_thread_model());
         assert!(
             config
                 .gateway
@@ -4511,12 +4641,9 @@ active_recall_model = { source = "custom", model_provider = "legacy-provider", m
         assert!(config.enabled);
         assert!(config.allow_global_user_by_default);
         assert!(!config.allow_global_agent_by_default);
-        assert!(config.deterministic_recall_enabled);
-        assert!(config.active_recall_enabled);
         assert!(config.tools_enabled);
         assert!(config.proactive_writes_enabled);
         assert!(config.background_extraction_enabled);
-        assert!(config.active_recall_model.is_thread_model());
         assert!(config.proactive_writes_model.is_thread_model());
         assert!(!config.debug_trace_enabled);
         assert!(!config.strict_diagnostics_enabled);
@@ -4657,22 +4784,6 @@ embedding_dimension = 384
         assert_eq!(config.total.max_wall_clock_ms_per_turn, None);
         assert_eq!(config.total.max_provider_tokens_per_turn, None);
         assert_eq!(config.total.max_consecutive_no_progress_windows, 3);
-    }
-
-    #[test]
-    fn gateway_tools_config_deserializes_missing_execution_windows_with_defaults() {
-        let config = toml::from_str::<super::GatewayToolsConfig>(
-            r#"
-[budget]
-max_agent_rounds_per_turn = 7
-max_tool_calls_per_turn = 11
-"#,
-        )
-        .expect("gateway tools config should deserialize with omitted execution_windows");
-
-        assert_eq!(config.budget.max_agent_rounds_per_turn, 7);
-        assert_eq!(config.budget.max_tool_calls_per_turn, 11);
-        assert!(config.execution_windows.is_none());
     }
 
     #[test]
@@ -4836,12 +4947,9 @@ capsules_dir = "memory/custom-capsules"
         assert_eq!(config.capsules_dir, "memory/custom-capsules");
         assert!(config.allow_global_user_by_default);
         assert!(!config.allow_global_agent_by_default);
-        assert!(config.deterministic_recall_enabled);
-        assert!(config.active_recall_enabled);
         assert!(config.tools_enabled);
         assert!(config.proactive_writes_enabled);
         assert!(config.background_extraction_enabled);
-        assert!(config.active_recall_model.is_thread_model());
         assert!(config.proactive_writes_model.is_thread_model());
         assert!(!config.debug_trace_enabled);
         assert!(!config.strict_diagnostics_enabled);
@@ -4951,15 +5059,9 @@ model = " claude-sonnet "
             capsules_dir: "memory/capsules".to_owned(),
             allow_global_user_by_default: true,
             allow_global_agent_by_default: false,
-            deterministic_recall_enabled: true,
-            active_recall_enabled: true,
             tools_enabled: false,
             proactive_writes_enabled: false,
             background_extraction_enabled: false,
-            active_recall_model: GatewayMemoryModelSelectionConfig::custom(
-                "planner-provider",
-                "planner-model",
-            ),
             proactive_writes_model: GatewayMemoryModelSelectionConfig::custom(
                 "extractor-provider",
                 "extractor-model",
@@ -4973,14 +5075,9 @@ model = " claude-sonnet "
         assert!(serialized.contains("capsules_dir = \"memory/capsules\""));
         assert!(serialized.contains("allow_global_user_by_default = true"));
         assert!(serialized.contains("allow_global_agent_by_default = false"));
-        assert!(serialized.contains("deterministic_recall_enabled = true"));
-        assert!(serialized.contains("active_recall_enabled = true"));
         assert!(serialized.contains("tools_enabled = false"));
         assert!(serialized.contains("proactive_writes_enabled = false"));
         assert!(serialized.contains("background_extraction_enabled = false"));
-        assert!(serialized.contains("active_recall_model"));
-        assert!(serialized.contains("model_provider = \"planner-provider\""));
-        assert!(serialized.contains("model = \"planner-model\""));
         assert!(serialized.contains("proactive_writes_model"));
         assert!(serialized.contains("model_provider = \"extractor-provider\""));
         assert!(serialized.contains("model = \"extractor-model\""));
@@ -4997,9 +5094,7 @@ model = " claude-sonnet "
         let serialized = toml::to_string(&GatewayMemoryConfig::default())
             .expect("gateway memory config should serialize");
 
-        assert!(serialized.contains("active_recall_model = \"thread\""));
         assert!(serialized.contains("proactive_writes_model = \"thread\""));
-        assert!(!serialized.contains("[active_recall_model]"));
         assert!(!serialized.contains("[proactive_writes_model]"));
     }
 

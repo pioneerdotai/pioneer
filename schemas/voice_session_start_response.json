@@ -3,6 +3,12 @@
   "title": "VoiceSessionStartResponse",
   "type": "object",
   "properties": {
+    "audio_integrity_version": {
+      "description": "Version 1 verifies the ordered PCM ingress at finalize, before publication.",
+      "type": ["integer", "null"],
+      "format": "uint32",
+      "minimum": 0
+    },
     "session_id": {
       "type": "string"
     },

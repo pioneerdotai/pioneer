@@ -2015,6 +2015,8 @@ pub async fn requeue_retryable_unresolved<C: ConnectionTrait>(
     if limit == 0 {
         return Ok(0);
     }
+    // provider_http_403 deliberately stays outside this allowlist: it receives
+    // the original durable budget only, never a fresh budget from periodic scans.
     let retryable_codes = [
         "effect_timeout",
         "memory.post_turn_extractor.runtime_unavailable",

@@ -102,8 +102,6 @@ pub struct GatewayGeneralSettingsUpdate {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub telemetry_enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub preflight_model: Option<GatewayMemoryModelSelection>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_catalog_proxy: Option<GatewayModelCatalogProxyUpdate>,
 }
 
@@ -268,8 +266,6 @@ pub struct GatewayGeneralSettings {
     #[serde(default = "default_telemetry_enabled")]
     pub telemetry_enabled: bool,
     #[serde(default)]
-    pub preflight_model: GatewayMemoryModelSelection,
-    #[serde(default)]
     pub model_catalog: GatewayModelCatalogSettings,
 }
 
@@ -279,7 +275,6 @@ impl Default for GatewayGeneralSettings {
             compaction_model: Default::default(),
             keepawake: false,
             telemetry_enabled: default_telemetry_enabled(),
-            preflight_model: GatewayMemoryModelSelection::default(),
             model_catalog: GatewayModelCatalogSettings::default(),
         }
     }
@@ -292,8 +287,6 @@ const fn default_telemetry_enabled() -> bool {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct GatewayMemorySettings {
     pub enabled: bool,
-    pub deterministic_recall_enabled: bool,
-    pub active_recall_enabled: bool,
     pub tools_enabled: bool,
     pub proactive_writes_enabled: bool,
     pub background_extraction_enabled: bool,
@@ -307,8 +300,6 @@ impl Default for GatewayMemorySettings {
     fn default() -> Self {
         Self {
             enabled: true,
-            deterministic_recall_enabled: true,
-            active_recall_enabled: true,
             tools_enabled: true,
             proactive_writes_enabled: true,
             background_extraction_enabled: true,
@@ -931,7 +922,10 @@ mod tests {
 
     #[test]
     fn general_settings_publish_only_supported_controls() {
-        let value = serde_json::to_value(GatewayGeneralSettings::default()).unwrap();
+        let settings = GatewayGeneralSettings::default();
+        assert!(!settings.keepawake);
+        assert!(settings.telemetry_enabled);
+        let value = serde_json::to_value(settings).unwrap();
         let keys: std::collections::BTreeSet<_> = value
             .as_object()
             .unwrap()
@@ -944,7 +938,6 @@ mod tests {
                 "compaction_model",
                 "keepawake",
                 "telemetry_enabled",
-                "preflight_model",
                 "model_catalog"
             ])
         );
@@ -953,15 +946,6 @@ mod tests {
         )
         .unwrap();
         assert!(update.compaction_model.is_some());
-    }
-
-    #[test]
-    fn settings_general_defaults_to_thread_preflight_model() {
-        let settings = GatewayGeneralSettings::default();
-
-        assert!(!settings.keepawake);
-        assert!(settings.telemetry_enabled);
-        assert!(settings.preflight_model.is_thread_model());
     }
 
     #[test]
@@ -1057,30 +1041,6 @@ mod tests {
             }))
             .expect("legacy runtime settings should decode");
         assert!(decoded.nickname.is_empty());
-    }
-
-    #[test]
-    fn settings_general_update_roundtrips_preflight_model() {
-        let update = GatewayGeneralSettingsUpdate {
-            compaction_model: None,
-            keepawake: Some(true),
-            telemetry_enabled: Some(false),
-            preflight_model: Some(GatewayMemoryModelSelection::custom(
-                "planner-provider",
-                "planner-model",
-            )),
-            model_catalog_proxy: None,
-        };
-
-        let serialized = serde_json::to_string(&update).expect("settings update should serialize");
-        assert!(serialized.contains("preflight_model"));
-        assert!(serialized.contains("telemetry_enabled"));
-        assert!(serialized.contains("planner-provider"));
-        assert!(serialized.contains("planner-model"));
-
-        let roundtrip: GatewayGeneralSettingsUpdate =
-            serde_json::from_str(serialized.as_str()).expect("settings update should deserialize");
-        assert_eq!(roundtrip, update);
     }
 
     #[test]

@@ -195,6 +195,62 @@ pub struct ThreadEpisodicMemvidIndexRequest {
     pub embedding: Option<ThreadEpisodicMemvidIndexEmbedding>,
 }
 
+/// Limits for prepared requests retained by one file dispatch. Large existing
+/// single-item requests keep their original path and WAL/capacity policy.
+pub const THREAD_EPISODIC_MEMVID_BATCH_ITEMS: usize = 8;
+pub const THREAD_EPISODIC_MEMVID_BATCH_BYTES: usize = 256 * 1024;
+
+impl ThreadEpisodicMemvidIndexRequest {
+    pub fn prepared_bytes(&self) -> usize {
+        let strings = [
+            &self.storage_uri,
+            &self.capsule_id,
+            &self.capsule_ref,
+            &self.index_item_id,
+            &self.frame_uri,
+            &self.text,
+        ];
+        let mut bytes = strings
+            .into_iter()
+            .fold(0usize, |n, value| n.saturating_add(value.len()));
+        for (key, value) in &self.metadata {
+            bytes = bytes.saturating_add(key.len()).saturating_add(value.len());
+        }
+        if let Some(embedding) = &self.embedding {
+            bytes = bytes
+                .saturating_add(
+                    embedding
+                        .vector
+                        .len()
+                        .saturating_mul(std::mem::size_of::<f32>()),
+                )
+                .saturating_add(embedding.identity.provider_id.len())
+                .saturating_add(embedding.identity.model.len());
+        }
+        bytes
+    }
+
+    pub fn batch_compatible(&self, other: &Self) -> bool {
+        self.storage_uri == other.storage_uri
+            && self.capsule_id == other.capsule_id
+            && self.capsule_ref == other.capsule_ref
+            && self.workspace_capsule == other.workspace_capsule
+            && self.metadata.get("pioneer.thread_episodic.workspace_id")
+                == other.metadata.get("pioneer.thread_episodic.workspace_id")
+            && self.embedding.as_ref().map(|value| &value.identity)
+                == other.embedding.as_ref().map(|value| &value.identity)
+            && self.frame_uri != other.frame_uri
+    }
+
+    pub fn validate_prepared(&self) -> Result<(), ThreadEpisodicMemvidError> {
+        path_from_storage_uri(&self.storage_uri)?;
+        if let Some(embedding) = &self.embedding {
+            validate_index_embedding(embedding)?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ThreadEpisodicMemvidIndexOutput {
     pub frame_id: i64,
@@ -627,6 +683,23 @@ pub trait ThreadEpisodicMemvidBackend: Send + Sync {
         self.index_item(request).await
     }
 
+    /// Stable per-request results. Implementations may retain the single-item
+    /// API; an error for one request must not skip its already admitted peers.
+    async fn index_batch_with_workspace_ownership(
+        &self,
+        requests: Vec<ThreadEpisodicMemvidIndexRequest>,
+        ownership: ThreadEpisodicWorkspaceOwnership,
+    ) -> Vec<Result<ThreadEpisodicMemvidIndexOutput, ThreadEpisodicMemvidError>> {
+        let mut outputs = Vec::with_capacity(requests.len());
+        for request in requests {
+            outputs.push(
+                self.index_item_with_workspace_ownership(request, ownership.clone())
+                    .await,
+            );
+        }
+        outputs
+    }
+
     async fn search(
         &self,
         request: ThreadEpisodicMemvidSearchRequest,
@@ -739,6 +812,86 @@ pub async fn remove_thread_episodic_capsule_file(
     .map_err(std::io::Error::other)?
 }
 
+// Idle readers release their OS lock. Local mutations still evict under the
+// capsule lock so no pre-mutation handle can be returned after invalidation.
+// The bounded idle cache is independent of corpus size: eviction only reopens.
+const IDLE_READER_CAPACITY: usize = 8;
+struct IdleReader {
+    path: PathBuf,
+    owner: (String, String),
+    reader: memvid_core::ReadOnlyReader,
+    embedding_identity: Option<ThreadEpisodicEmbeddingIdentity>,
+}
+#[derive(Default)]
+struct ReaderCache {
+    idle: std::sync::Mutex<Vec<IdleReader>>,
+    #[cfg(test)]
+    opens: std::sync::atomic::AtomicUsize,
+}
+fn reader_cache() -> &'static ReaderCache {
+    static READERS: OnceLock<ReaderCache> = OnceLock::new();
+    READERS.get_or_init(ReaderCache::default)
+}
+fn take_idle_reader(cache: &ReaderCache, path: &Path) -> Option<IdleReader> {
+    let mut readers = cache.idle.lock().unwrap_or_else(|e| e.into_inner());
+    let index = readers.iter().position(|entry| entry.path == path)?;
+    Some(readers.remove(index))
+}
+fn with_segment_reader<T>(
+    cache: &ReaderCache,
+    path: &Path,
+    workspace_id: &str,
+    capsule_id: &str,
+    operation: impl FnOnce(
+        &mut Memvid,
+        &mut Option<ThreadEpisodicEmbeddingIdentity>,
+    ) -> Result<T, ThreadEpisodicMemvidError>,
+) -> Result<T, ThreadEpisodicMemvidError> {
+    // Caller owns the capsule lock throughout checkout, validation and return.
+    let path = normalized_capsule_lock_path(path);
+    let owner = (workspace_id.to_owned(), capsule_id.to_owned());
+    let cached = take_idle_reader(cache, &path).filter(|entry| entry.owner == owner);
+    let mut entry = match cached {
+        Some(entry) => entry,
+        None => IdleReader {
+            reader: memvid_core::ReadOnlyReader::new(&path),
+            embedding_identity: None,
+            path,
+            owner,
+        },
+    };
+    let identity = &mut entry.embedding_identity;
+    let result = entry
+        .reader
+        .read(|reader, reopened| {
+            if reopened {
+                *identity = None;
+                #[cfg(test)]
+                cache
+                    .opens
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            operation(reader, identity)
+        })
+        .map_err(classify_memvid_error)?;
+    // Do not retain a possibly damaged handle after a failed search.
+    if result.is_ok() {
+        let evicted = {
+            let mut readers = cache.idle.lock().unwrap_or_else(|e| e.into_inner());
+            let evicted = if readers.len() >= IDLE_READER_CAPACITY {
+                Some(readers.remove(0))
+            } else {
+                None
+            };
+            readers.push(entry);
+            evicted
+        };
+        // Closing a reader is never work for the global registry lock.
+        drop(evicted);
+    }
+    result
+}
+
 type CapsuleLock = Arc<Mutex<()>>;
 type CapsuleLockRegistry = Mutex<BTreeMap<PathBuf, Weak<Mutex<()>>>>;
 
@@ -764,6 +917,7 @@ async fn lock_for_capsule_path(path: &Path) -> CapsuleLock {
     if let Some(lock) = locks.get(&path).and_then(Weak::upgrade) {
         return lock;
     }
+    locks.retain(|_, lock| lock.strong_count() > 0);
     let lock = Arc::new(Mutex::new(()));
     locks.insert(path, Arc::downgrade(&lock));
     lock
@@ -774,11 +928,27 @@ where
     T: Send + 'static,
     F: FnOnce() -> T + Send + 'static,
 {
+    run_capsule_blocking_mode(path, true, operation).await
+}
+
+async fn run_capsule_blocking_mode<T, F>(
+    path: &Path,
+    invalidate: bool,
+    operation: F,
+) -> Result<T, tokio::task::JoinError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let key = normalized_capsule_lock_path(path);
     let guard = lock_for_capsule_path(path).await.lock_owned().await;
     pioneer_observability::work::spawn_blocking(move || {
         // Keep ownership inside the blocking task. Cancelling the async waiter detaches the
         // task but cannot expose the capsule to another operation while this closure is running.
         let _guard = guard;
+        if invalidate {
+            drop(take_idle_reader(reader_cache(), &key));
+        }
         operation()
     })
     .await
@@ -802,6 +972,23 @@ impl MemvidThreadEpisodicBackend {
     pub fn with_workspace_ownership(mut self, ownership: ThreadEpisodicWorkspaceOwnership) -> Self {
         self.workspace_ownership = Some(ownership);
         self
+    }
+
+    async fn run_read_blocking<T, F>(
+        &self,
+        path: &Path,
+        operation: F,
+    ) -> Result<T, tokio::task::JoinError>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> T + Send + 'static,
+    {
+        let ownership = self.workspace_ownership.clone();
+        run_capsule_blocking_mode(path, false, move || {
+            let _ownership = ownership;
+            operation()
+        })
+        .await
     }
 
     async fn run_blocking<T, F>(
@@ -875,6 +1062,46 @@ impl ThreadEpisodicMemvidBackend for MemvidThreadEpisodicBackend {
             .with_workspace_ownership(ownership)
             .index_item(request)
             .await
+    }
+
+    async fn index_batch_with_workspace_ownership(
+        &self,
+        requests: Vec<ThreadEpisodicMemvidIndexRequest>,
+        ownership: ThreadEpisodicWorkspaceOwnership,
+    ) -> Vec<Result<ThreadEpisodicMemvidIndexOutput, ThreadEpisodicMemvidError>> {
+        if requests.is_empty() {
+            return Vec::new();
+        }
+        let count = requests.len();
+        let operation = async {
+            validate_index_batch(&requests)?;
+            let path = path_from_storage_uri(&requests[0].storage_uri)?;
+            let parent = path.parent().ok_or_else(|| {
+                ThreadEpisodicMemvidError::non_retryable("capsule path has no parent")
+            })?;
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|error| ThreadEpisodicMemvidError::retryable(error.to_string()))?;
+            let task_path = path.clone();
+            Self::with_capabilities(self.capabilities.clone())
+                .with_workspace_ownership(ownership)
+                .run_blocking(&path, move || {
+                    index_batch_or_single_blocking(task_path, requests)
+                })
+                .await
+                .map_err(|error| ThreadEpisodicMemvidError::retryable(error.to_string()))?
+        };
+        match operation.await {
+            Ok(outputs) => outputs,
+            Err(mut error) => {
+                // A shared mutation error does not identify an offending item.
+                // The executor isolates subsequent attempts through single writes.
+                if count > 1 && error.kind == ThreadEpisodicMemvidFailureKind::NonRetryable {
+                    error.kind = ThreadEpisodicMemvidFailureKind::Retryable;
+                }
+                vec![Err(error); count]
+            }
+        }
     }
 
     async fn search(
@@ -964,7 +1191,7 @@ impl ThreadEpisodicMemvidBackend for MemvidThreadEpisodicBackend {
         let segment = request.segments[0].clone();
         let path = path_from_storage_uri(&segment.storage_uri)?;
         let task_path = path.clone();
-        self.run_blocking(&path, move || {
+        self.run_read_blocking(&path, move || {
             search_segment_page_blocking(
                 task_path, request, segment, page_size, cursor, embedding, false,
             )
@@ -1013,7 +1240,7 @@ impl ThreadEpisodicMemvidBackend for MemvidThreadEpisodicBackend {
                 let segment = segment.clone();
                 let embedding = embedding.clone();
                 let size = request.profile.max_candidates as usize;
-                self.run_blocking(&path, move || {
+                self.run_read_blocking(&path, move || {
                     search_segment_page_blocking(
                         task_path,
                         segment_request,
@@ -1121,63 +1348,156 @@ fn finalize_thread_episodic_search_output(
     }
 }
 
+fn validate_index_batch(
+    requests: &[ThreadEpisodicMemvidIndexRequest],
+) -> Result<(), ThreadEpisodicMemvidError> {
+    if requests.is_empty()
+        || requests.len() > THREAD_EPISODIC_MEMVID_BATCH_ITEMS
+        || requests
+            .iter()
+            .fold(0usize, |n, r| n.saturating_add(r.prepared_bytes()))
+            > THREAD_EPISODIC_MEMVID_BATCH_BYTES
+        || requests.iter().enumerate().any(|(i, r)| {
+            requests[..i]
+                .iter()
+                .any(|previous| !previous.batch_compatible(r))
+        })
+    {
+        return Err(ThreadEpisodicMemvidError::non_retryable(
+            "incompatible or oversized Memvid batch",
+        ));
+    }
+    for request in requests {
+        request.validate_prepared()?;
+    }
+    Ok(())
+}
+
 fn index_item_blocking(
     path: PathBuf,
     request: ThreadEpisodicMemvidIndexRequest,
 ) -> Result<ThreadEpisodicMemvidIndexOutput, ThreadEpisodicMemvidError> {
-    if let Some(embedding) = request.embedding.as_ref() {
-        validate_index_embedding(embedding)?;
+    request.validate_prepared()?;
+    index_batch_blocking(path, vec![request]).map(|mut outputs| outputs.remove(0))
+}
+
+fn index_batch_or_single_blocking(
+    path: PathBuf,
+    requests: Vec<ThreadEpisodicMemvidIndexRequest>,
+) -> Result<
+    Vec<Result<ThreadEpisodicMemvidIndexOutput, ThreadEpisodicMemvidError>>,
+    ThreadEpisodicMemvidError,
+> {
+    let memvid = open_or_create_memvid(&path, requests[0].workspace_capsule)?;
+    let stats = memvid.stats().map_err(classify_memvid_error)?;
+    // Retained c499f5e checks capacity against cached_payload_end per put,
+    // without pending payloads. Reserve cumulative compressed payload plus WAL
+    // growth BEFORE any mutation. Compression can expand small inputs. The
+    // reserve covers two times raw payload + 1 KiB/frame, and twice a generous
+    // WAL encoding bound (16x prepared bytes + 64 KiB fixed overhead). Include
+    // the existing WAL size: wrapping pending entries can double that region.
+    // Chunk plans can duplicate text/metadata; keep their original single path.
+    let bytes = requests.iter().fold(0u64, |n, request| {
+        n.saturating_add(request.prepared_bytes() as u64)
+    });
+    let payload_reserve = requests.iter().fold(0u64, |n, request| {
+        n.saturating_add((request.text.len() as u64).saturating_mul(2))
+            .saturating_add(1024)
+    });
+    let wal_reserve = bytes.saturating_mul(16).saturating_add(64 * 1024);
+    let headroom = stats
+        .wal_bytes
+        .saturating_add(wal_reserve.saturating_mul(2))
+        .saturating_add(payload_reserve);
+    let chunks = requests
+        .iter()
+        .any(|request| memvid.preview_chunks(request.text.as_bytes()).is_some());
+    if chunks || stats.remaining_capacity_bytes < headroom {
+        // Finite, bounded fallback through the same blocking owner. Each result
+        // follows its own Full commit; a committed prefix is never relabeled as
+        // failed or replayed into a rotated file because a later item is full.
+        drop(memvid);
+        return Ok(requests
+            .into_iter()
+            .map(|request| index_item_blocking(path.clone(), request))
+            .collect());
     }
-    let embedding_identity = request
-        .embedding
-        .as_ref()
-        .map(|embedding| embedding.identity.clone());
-    let mut memvid = open_or_create_memvid(path.as_path(), request.workspace_capsule)?;
-    if let Some(embedding) = request.embedding.as_ref() {
+    index_items_on_handle(memvid, requests).map(|outputs| outputs.into_iter().map(Ok).collect())
+}
+
+fn index_batch_blocking(
+    path: PathBuf,
+    requests: Vec<ThreadEpisodicMemvidIndexRequest>,
+) -> Result<Vec<ThreadEpisodicMemvidIndexOutput>, ThreadEpisodicMemvidError> {
+    // Validate all prepared data before any shared mutation. Keep the normal
+    // WAL sync, automatic checkpoints and growth/capacity limits unchanged.
+    // Small groups normally reach the final Full commit together; recovery,
+    // auto-checkpoint and dirty-handle Drop may perform additional commits.
+    for request in &requests {
+        request.validate_prepared()?;
+    }
+    let memvid = open_or_create_memvid(&path, requests[0].workspace_capsule)?;
+    index_items_on_handle(memvid, requests)
+}
+
+fn index_items_on_handle(
+    mut memvid: Memvid,
+    requests: Vec<ThreadEpisodicMemvidIndexRequest>,
+) -> Result<Vec<ThreadEpisodicMemvidIndexOutput>, ThreadEpisodicMemvidError> {
+    let first = &requests[0];
+    if let Some(embedding) = &first.embedding {
         memvid.enable_vec().map_err(classify_memvid_error)?;
         memvid
-            .set_vec_model(embedding.identity.memvid_model_id().as_str())
+            .set_vec_model(&embedding.identity.memvid_model_id())
             .map_err(classify_memvid_error)?;
     }
-    let options = index_put_options(&request);
-    let payload = request.text.as_bytes().to_vec();
-    let embedding_vector = request
-        .embedding
-        .as_ref()
-        .map(|embedding| embedding.vector.clone());
-    match memvid.frame_by_uri(request.frame_uri.as_str()) {
-        Ok(frame) if frame.status == FrameStatus::Active => {
-            memvid
-                .update_frame(frame.id, Some(payload), options, embedding_vector)
-                .map_err(classify_memvid_error)?;
-        }
-        _ => {
-            if let Some(embedding_vector) = embedding_vector {
+    for request in &requests {
+        let options = index_put_options(request);
+        let payload = request.text.as_bytes().to_vec();
+        let embedding_vector = request
+            .embedding
+            .as_ref()
+            .map(|embedding| embedding.vector.clone());
+        match memvid.frame_by_uri(request.frame_uri.as_str()) {
+            Ok(frame) if frame.status == FrameStatus::Active => {
                 memvid
-                    .put_with_embedding_and_options(payload.as_slice(), embedding_vector, options)
+                    .update_frame(frame.id, Some(payload), options, embedding_vector)
                     .map_err(classify_memvid_error)?;
-            } else {
-                memvid
-                    .put_bytes_with_options(payload.as_slice(), options)
-                    .map_err(classify_memvid_error)?;
+            }
+            _ => {
+                if let Some(embedding_vector) = embedding_vector {
+                    memvid
+                        .put_with_embedding_and_options(
+                            payload.as_slice(),
+                            embedding_vector,
+                            options,
+                        )
+                        .map_err(classify_memvid_error)?;
+                } else {
+                    memvid
+                        .put_bytes_with_options(payload.as_slice(), options)
+                        .map_err(classify_memvid_error)?;
+                }
             }
         }
     }
+    // Never reuse this handle after any error, including unknown publication.
     memvid.commit().map_err(classify_memvid_error)?;
-    let frame = memvid
-        .frame_by_uri(request.frame_uri.as_str())
-        .map_err(classify_memvid_error)?;
-    let stats = memvid.stats().map_err(classify_memvid_error)?;
-    let stats = thread_episodic_stats_from_memvid(stats)?;
-
-    Ok(ThreadEpisodicMemvidIndexOutput {
-        frame_id: i64::try_from(frame.id).map_err(|_| {
-            ThreadEpisodicMemvidError::non_retryable("thread episodic frame id does not fit i64")
-        })?,
-        frame_uri: request.frame_uri,
-        stats,
-        embedding_identity,
-    })
+    let stats = thread_episodic_stats_from_memvid(memvid.stats().map_err(classify_memvid_error)?)?;
+    requests
+        .into_iter()
+        .map(|request| {
+            let frame = memvid
+                .frame_by_uri(&request.frame_uri)
+                .map_err(classify_memvid_error)?;
+            Ok(ThreadEpisodicMemvidIndexOutput {
+                frame_id: i64_from_u64(frame.id)?,
+                frame_uri: request.frame_uri,
+                stats: stats.clone(),
+                embedding_identity: request.embedding.map(|embedding| embedding.identity),
+            })
+        })
+        .collect()
 }
 
 fn validate_index_embedding(
@@ -1289,60 +1609,70 @@ fn search_segment_page_blocking(
     embedding: Option<ThreadEpisodicMemvidIndexEmbedding>,
     semantic_only: bool,
 ) -> Result<ThreadEpisodicMemvidSearchPage, ThreadEpisodicMemvidError> {
-    let mut memvid = Memvid::open_read_only(&path).map_err(classify_memvid_error)?;
-    let mut search = memvid_thread_episodic_search_request(
-        &request.profile,
-        &request.query,
-        request.scope.as_deref(),
-    );
-    search.top_k = page_size;
-    search.cursor = cursor;
-    if let Some(embedding) = embedding {
-        validate_index_embedding(&embedding)?;
-        validate_segment_embedding_identity(&path, &embedding)?;
-        search.query_embedding = Some(embedding.vector);
-    }
-    let response = if semantic_only {
-        memvid
-            .vec_search_with_embedding_acl(
-                &search.query,
-                search.query_embedding.as_deref().unwrap_or_default(),
-                search.top_k,
-                search.snippet_chars,
-                search.scope.as_deref(),
-                search.acl_context.as_ref(),
-                search.acl_enforcement_mode,
-                search.cursor.as_deref(),
-            )
-            .map_err(classify_memvid_error)?
-    } else {
-        memvid.search(search).map_err(classify_memvid_error)?
-    };
+    with_segment_reader(
+        reader_cache(),
+        &path,
+        &request.workspace_id,
+        &segment.capsule_id,
+        |memvid, identity| {
+            let mut search = memvid_thread_episodic_search_request(
+                &request.profile,
+                &request.query,
+                request.scope.as_deref(),
+            );
+            search.top_k = page_size;
+            search.cursor = cursor;
+            if let Some(embedding) = embedding {
+                validate_index_embedding(&embedding)?;
+                if identity.as_ref() != Some(&embedding.identity) {
+                    validate_segment_embedding_identity(&path, &embedding)?;
+                    *identity = Some(embedding.identity.clone());
+                }
+                search.query_embedding = Some(embedding.vector);
+            }
+            let response = if semantic_only {
+                memvid
+                    .vec_search_with_embedding_acl(
+                        &search.query,
+                        search.query_embedding.as_deref().unwrap_or_default(),
+                        search.top_k,
+                        search.snippet_chars,
+                        search.scope.as_deref(),
+                        search.acl_context.as_ref(),
+                        search.acl_enforcement_mode,
+                        search.cursor.as_deref(),
+                    )
+                    .map_err(classify_memvid_error)?
+            } else {
+                memvid.search(search).map_err(classify_memvid_error)?
+            };
 
-    let engine = response.engine;
-    let hits = response
-        .hits
-        .into_iter()
-        .filter_map(|mut hit| {
-            hydrate_search_hit_metadata(&memvid, &mut hit);
-            // The public engine snippet is sufficient; the canonical source is
-            // opened through its real history reference when more text is needed.
-            hit.chunk_text = None;
-            search_hit_to_thread_episodic_hit(
-                hit,
-                engine.clone(),
-                &segment,
-                &request.workspace_id,
-                &request.thread_id,
-            )
-        })
-        .collect();
-    Ok(ThreadEpisodicMemvidSearchPage {
-        hits,
-        next_cursor: response.next_cursor,
-        unavailable_segment_ids: Vec::new(),
-        warnings: Vec::new(),
-    })
+            let engine = response.engine;
+            let hits = response
+                .hits
+                .into_iter()
+                .filter_map(|mut hit| {
+                    hydrate_search_hit_metadata(memvid, &mut hit);
+                    // The public engine snippet is sufficient; the canonical source is
+                    // opened through its real history reference when more text is needed.
+                    hit.chunk_text = None;
+                    search_hit_to_thread_episodic_hit(
+                        hit,
+                        engine.clone(),
+                        &segment,
+                        &request.workspace_id,
+                        &request.thread_id,
+                    )
+                })
+                .collect();
+            Ok(ThreadEpisodicMemvidSearchPage {
+                hits,
+                next_cursor: response.next_cursor,
+                unavailable_segment_ids: Vec::new(),
+                warnings: Vec::new(),
+            })
+        },
+    )
 }
 
 fn hydrate_search_hit_metadata(memvid: &Memvid, hit: &mut SearchHit) {
@@ -1959,8 +2289,145 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
-    // The adapter must preserve engine continuation even when the legacy
-    // profile permits fewer candidates than the requested page.
+    // Local cache isolates capacity/open observations from parallel tests while
+    // exercising the same Memvid open and search boundary as production.
+    fn cached_lexical_page(
+        cache: &ReaderCache,
+        path: &Path,
+        cursor: Option<String>,
+    ) -> memvid_core::SearchResponse {
+        with_segment_reader(cache, path, "workspace", "capsule", |reader, _| {
+            let profile = ThreadEpisodicSearchProfile::for_kind(
+                ThreadEpisodicSearchProfileKind::DefaultContext,
+            );
+            let mut query =
+                memvid_thread_episodic_search_request(&profile, "paginationneedle", None);
+            query.top_k = 2;
+            query.cursor = cursor;
+            reader.search(query).map_err(classify_memvid_error)
+        })
+        .unwrap()
+    }
+
+    fn lexical_fixture(path: &Path, count: usize) {
+        for number in 0..count {
+            let mut item = concurrent_index_request(path, &number.to_string(), vec![1.0, 0.0, 0.0]);
+            item.embedding = None;
+            item.text = format!("paginationneedle document {number}");
+            index_item_blocking(path.to_owned(), item).unwrap();
+        }
+    }
+
+    #[test]
+    fn idle_reader_reuses_real_open_across_queries_and_pages_and_reopens_after_eviction() {
+        use std::sync::atomic::Ordering;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("pages.mv2");
+        lexical_fixture(&path, 5);
+        let cache = ReaderCache::default();
+        let first = cached_lexical_page(&cache, &path, None);
+        assert_eq!(first.hits.len(), 2);
+        let second = cached_lexical_page(&cache, &path, first.next_cursor);
+        assert_eq!(second.hits.len(), 2);
+        assert_eq!(
+            cached_lexical_page(&cache, &path, second.next_cursor)
+                .hits
+                .len(),
+            1
+        );
+        assert_eq!(cached_lexical_page(&cache, &path, None).hits.len(), 2);
+        assert_eq!(cache.opens.load(Ordering::Relaxed), 1);
+        for n in 0..IDLE_READER_CAPACITY {
+            let other = temp.path().join(format!("other-{n}.mv2"));
+            lexical_fixture(&other, 1);
+            assert_eq!(cached_lexical_page(&cache, &other, None).hits.len(), 1);
+        }
+        assert_eq!(cache.idle.lock().unwrap().len(), IDLE_READER_CAPACITY);
+        assert_eq!(cached_lexical_page(&cache, &path, None).hits.len(), 2);
+        assert_eq!(
+            cache.opens.load(Ordering::Relaxed),
+            IDLE_READER_CAPACITY + 2
+        );
+        // The evicted file remains writable; idle snapshots retain no OS lock.
+        let evicted = temp.path().join("other-0.mv2");
+        drop(Memvid::open(&evicted).unwrap());
+        with_segment_reader(
+            &cache,
+            &path,
+            "another-workspace",
+            "capsule",
+            |reader, _| {
+                assert_eq!(reader.frame_count(), 5);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            cache.opens.load(Ordering::Relaxed),
+            IDLE_READER_CAPACITY + 3
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_reader_open_is_coalesced_by_capsule_ownership() {
+        use std::sync::atomic::Ordering;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("concurrent.mv2");
+        lexical_fixture(&path, 1);
+        let cache = Arc::new(ReaderCache::default());
+        let mut tasks = Vec::new();
+        let barrier = Arc::new(tokio::sync::Barrier::new(5));
+        for _ in 0..4 {
+            let cache = cache.clone();
+            let path = path.clone();
+            let barrier = barrier.clone();
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                let task_path = path.clone();
+                run_capsule_blocking_mode(&path, false, move || {
+                    cached_lexical_page(&cache, &task_path, None).hits.len()
+                })
+                .await
+                .unwrap()
+            }));
+        }
+        barrier.wait().await;
+        for task in tasks {
+            assert_eq!(task.await.unwrap(), 1);
+        }
+        assert_eq!(cache.opens.load(Ordering::Relaxed), 1);
+        drop(cache);
+        drop(Memvid::open(&path).unwrap());
+    }
+
+    #[test]
+    fn reader_open_failure_recovers_and_external_replacement_discards_old_inode() {
+        use std::sync::atomic::Ordering;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("recover.mv2");
+        let cache = ReaderCache::default();
+        assert!(with_segment_reader(&cache, &path, "workspace", "capsule", |_, _| Ok(())).is_err());
+        lexical_fixture(&path, 1);
+        assert_eq!(cached_lexical_page(&cache, &path, None).hits.len(), 1);
+        let replacement = temp.path().join("replacement.mv2");
+        lexical_fixture(&replacement, 3);
+        std::fs::rename(&replacement, &path).unwrap();
+        let first = cached_lexical_page(&cache, &path, None);
+        assert_eq!(first.hits.len(), 2);
+        assert_eq!(
+            cached_lexical_page(&cache, &path, first.next_cursor)
+                .hits
+                .len(),
+            1
+        );
+        assert_eq!(cache.opens.load(Ordering::Relaxed), 2);
+        std::fs::remove_file(&path).unwrap();
+        assert!(with_segment_reader(&cache, &path, "workspace", "capsule", |_, _| Ok(())).is_err());
+        lexical_fixture(&path, 1);
+        assert_eq!(cached_lexical_page(&cache, &path, None).hits.len(), 1);
+    }
+
+    // The adapter preserves continuation even with a smaller legacy candidate cap.
     #[tokio::test]
     async fn segment_page_preserves_continuation_and_ignores_profile_candidate_cap() {
         let temp = tempfile::tempdir().expect("temporary directory");
@@ -2007,6 +2474,57 @@ mod tests {
         }
         assert_eq!(sizes, vec![3, 3, 1]);
         assert_eq!(ids.len(), 7);
+        let mut appended = concurrent_index_request(&path, "appended", vec![1.0, 0.0, 0.0]);
+        appended.embedding = None;
+        appended.text = "paginationneedle after committed write".into();
+        backend.index_item(appended).await.unwrap();
+        assert_eq!(
+            backend
+                .search_segment_page(request.clone(), 20, None, None)
+                .await
+                .unwrap()
+                .hits
+                .len(),
+            8
+        );
+        // The same mutation boundary covers open-time WAL recovery/repair.
+        let repair_path = path.clone();
+        backend
+            .run_blocking(&path, move || {
+                let mut repaired = Memvid::open(&repair_path).unwrap();
+                repaired.commit().unwrap();
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            backend
+                .search_segment_page(request.clone(), 20, None, None)
+                .await
+                .unwrap()
+                .hits
+                .len(),
+            8
+        );
+        let ownership = lock_thread_episodic_workspace("reader-delete-regression").await;
+        remove_thread_episodic_capsule_file(&path, ownership)
+            .await
+            .unwrap();
+        assert!(
+            backend
+                .search_segment_page(request.clone(), 20, None, None)
+                .await
+                .is_err()
+        );
+        let mut recreated = concurrent_index_request(&path, "recreated", vec![1.0, 0.0, 0.0]);
+        recreated.embedding = None;
+        recreated.text = "paginationneedle replacement".into();
+        backend.index_item(recreated).await.unwrap();
+        let page = backend
+            .search_segment_page(request, 20, None, None)
+            .await
+            .unwrap();
+        assert_eq!(page.hits.len(), 1);
+        assert_eq!(page.hits[0].index_item_id, "index_recreated");
     }
 
     #[tokio::test]
@@ -2149,6 +2667,7 @@ mod tests {
     async fn independent_backends_share_capsule_lock_after_async_cancellation() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let path = temp_dir.path().join("shared-capsule.mv2");
+        lexical_fixture(&path, 1);
         let refill_backend = Arc::new(MemvidThreadEpisodicBackend::new());
         let indexer_backend = Arc::new(MemvidThreadEpisodicBackend::new());
         let (first_started_tx, first_started_rx) = tokio::sync::oneshot::channel();
@@ -2159,10 +2678,24 @@ mod tests {
         let first_backend = refill_backend.clone();
         let first = tokio::spawn(async move {
             first_backend
-                .run_blocking(first_path.as_path(), move || {
-                    let _ = first_started_tx.send(());
-                    release_first_rx.recv().expect("release first writer");
-                    let _ = first_finished_tx.send(());
+                .run_read_blocking(first_path.as_path(), {
+                    let task_path = first_path.clone();
+                    move || {
+                        with_segment_reader(
+                            reader_cache(),
+                            &task_path,
+                            "workspace",
+                            "capsule",
+                            |reader, _| {
+                                assert_eq!(reader.frame_count(), 1);
+                                let _ = first_started_tx.send(());
+                                release_first_rx.recv().expect("release first reader");
+                                let _ = first_finished_tx.send(());
+                                Ok(())
+                            },
+                        )
+                        .unwrap();
+                    }
                 })
                 .await
         });
@@ -2205,8 +2738,12 @@ mod tests {
         let second = tokio::spawn(async move {
             let _ = second_attempting_tx.send(());
             second_backend
-                .run_blocking(second_path.as_path(), move || {
-                    let _ = second_started_tx.send(());
+                .run_blocking(second_path.as_path(), {
+                    let task_path = second_path.clone();
+                    move || {
+                        drop(Memvid::open(&task_path).unwrap());
+                        let _ = second_started_tx.send(());
+                    }
                 })
                 .await
         });
@@ -2215,18 +2752,19 @@ mod tests {
             .expect("second task attempt timeout")
             .expect("second task reached the lock attempt");
         assert!(
-            tokio::time::timeout(Duration::from_millis(150), second_started_rx)
-                .await
-                .is_err(),
-            "cancelling the async waiter must not release a running blocking writer's lock"
+            lock_for_capsule_path(&path).await.try_lock_owned().is_err(),
+            "canceled reader still owns the capsule until its blocking operation finishes"
         );
 
-        release_first_tx.send(()).expect("finish first writer");
+        release_first_tx.send(()).expect("finish first reader");
         tokio::time::timeout(Duration::from_secs(2), second)
             .await
             .expect("second writer completion timeout")
             .expect("second async task")
             .expect("second blocking task");
+        second_started_rx
+            .await
+            .expect("actual writer acquired exclusive OS lock");
         tokio::time::timeout(Duration::from_secs(2), first_finished_rx)
             .await
             .expect("detached blocking writer completion timeout")
@@ -2255,6 +2793,200 @@ mod tests {
                 .expect("valid test embedding"),
             ),
         }
+    }
+
+    fn capsule_generation_for_test(path: &Path) -> u64 {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut file = std::fs::File::open(path).unwrap();
+        file.seek(SeekFrom::End(-(memvid_core::footer::FOOTER_SIZE as i64)))
+            .unwrap();
+        let mut bytes = [0u8; memvid_core::footer::FOOTER_SIZE];
+        file.read_exact(&mut bytes).unwrap();
+        memvid_core::CommitFooter::decode(&bytes)
+            .unwrap()
+            .generation
+    }
+
+    #[tokio::test]
+    async fn native_batch_commits_one_generation_with_ordered_frames_and_absolute_stats() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("batch.mv2");
+        // Persisted footer generation is a dependency format contract, not a
+        // production counter. Seed first so creation/recovery is outside the delta.
+        let backend = MemvidThreadEpisodicBackend::new();
+        backend
+            .index_item(concurrent_index_request(&path, "seed", vec![1.0, 0.0, 0.0]))
+            .await
+            .unwrap();
+        let before = capsule_generation_for_test(&path);
+        let requests = vec![
+            concurrent_index_request(&path, "alpha", vec![1.0, 0.0, 0.0]),
+            concurrent_index_request(&path, "beta", vec![0.0, 1.0, 0.0]),
+            concurrent_index_request(&path, "gamma", vec![0.0, 0.0, 1.0]),
+        ];
+        let owner = lock_thread_episodic_workspace("native_batch_generation").await;
+        let outputs = backend
+            .index_batch_with_workspace_ownership(requests.clone(), owner.clone())
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(capsule_generation_for_test(&path), before + 1);
+        assert_eq!(outputs.len(), 3);
+        assert_eq!(outputs[0].stats.active_frame_count, Some(4));
+        assert_eq!(outputs[0].stats.frame_count, Some(4));
+        assert_eq!(
+            outputs[0].stats.size_bytes,
+            Some(std::fs::metadata(&path).unwrap().len() as i64)
+        );
+        let mut memvid = Memvid::open_read_only(&path).unwrap();
+        for (request, output) in requests.iter().zip(&outputs) {
+            assert_eq!(output.frame_uri, request.frame_uri);
+            assert_eq!(
+                output.embedding_identity.as_ref(),
+                request.embedding.as_ref().map(|e| &e.identity)
+            );
+            assert_eq!(output.stats, outputs[0].stats);
+            let frame = memvid.frame_by_uri(&request.frame_uri).unwrap();
+            assert_eq!(frame.id, output.frame_id as u64);
+            assert_eq!(
+                memvid.frame_canonical_payload(frame.id).unwrap(),
+                request.text.as_bytes()
+            );
+        }
+        assert_eq!(
+            memvid.search_vec(&[0.0, 0.0, 1.0], 1).unwrap()[0].frame_id,
+            outputs[2].frame_id as u64
+        );
+        drop(memvid);
+        // Replay after a lost DB acknowledgement may supersede old versions,
+        // but never produces a second active document for a stable URI.
+        let replay = backend
+            .index_batch_with_workspace_ownership(requests, owner)
+            .await;
+        assert!(replay.iter().all(Result::is_ok));
+        let memvid = Memvid::open_read_only(&path).unwrap();
+        assert_eq!(memvid.stats().unwrap().active_frame_count, 4);
+    }
+
+    #[tokio::test]
+    async fn native_batch_near_capacity_returns_committed_prefix_without_relabeling_it() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("small-capacity.mv2");
+        let seed = concurrent_index_request(&path, "seed", vec![1.0, 0.0, 0.0]);
+        let backend = MemvidThreadEpisodicBackend::new();
+        let seed_output = backend.index_item(seed).await.unwrap();
+        // A tiny real ticket boundary above the actual seed payload tail,
+        // independent of the size of derived indexes and the footer.
+        {
+            let mut memvid = Memvid::open(&path).unwrap();
+            let frame = memvid.frame_by_id(seed_output.frame_id as u64).unwrap();
+            let limit = frame.payload_offset + frame.payload_length + 1024;
+            memvid
+                .apply_ticket(
+                    memvid_core::Ticket::new("batch-capacity-test", 2).capacity_bytes(limit),
+                )
+                .unwrap();
+        }
+        let first = concurrent_index_request(&path, "fits", vec![0.0, 1.0, 0.0]);
+        let mut second = concurrent_index_request(&path, "full", vec![0.0, 0.0, 1.0]);
+        // Deterministic varied ASCII avoids a highly compressible repeated
+        // string. Capacity is checked before automatic chunk planning.
+        second.text = (0..1000u32)
+            .map(|i| format!("{:08x}", i.wrapping_mul(2654435761)))
+            .collect();
+        let owner = lock_thread_episodic_workspace("native_batch_capacity_prefix").await;
+        let results = backend
+            .index_batch_with_workspace_ownership(vec![first.clone(), second.clone()], owner)
+            .await;
+        assert_eq!(results.len(), 2);
+        let output = results[0].as_ref().unwrap();
+        assert_eq!(output.frame_uri, first.frame_uri);
+        assert_eq!(
+            results[1].as_ref().unwrap_err().kind,
+            ThreadEpisodicMemvidFailureKind::CapacityExceeded
+        );
+        let memvid = Memvid::open_read_only(&path).unwrap();
+        assert_eq!(
+            memvid.frame_by_uri(&first.frame_uri).unwrap().id,
+            output.frame_id as u64
+        );
+        assert!(memvid.frame_by_uri(&second.frame_uri).is_err());
+        assert_eq!(memvid.stats().unwrap().active_frame_count, 2);
+    }
+
+    #[tokio::test]
+    async fn native_batch_rejects_invalid_peers_before_any_file_mutation() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("invalid-batch.mv2");
+        let first = concurrent_index_request(&path, "first", vec![1.0, 0.0, 0.0]);
+        let second = concurrent_index_request(&path, "second", vec![0.0, 1.0, 0.0]);
+        let mut invalid = second.clone();
+        invalid.embedding.as_mut().unwrap().vector.pop();
+        let mut wrong_model = second.clone();
+        wrong_model.embedding.as_mut().unwrap().identity.model = "another-model".into();
+        let mut wrong_capsule = second.clone();
+        wrong_capsule.capsule_id = "other".into();
+        let mut wrong_workspace = second.clone();
+        wrong_workspace.metadata.insert(
+            "pioneer.thread_episodic.workspace_id".into(),
+            "other".into(),
+        );
+        let mut conflicting_uri = second.clone();
+        conflicting_uri.frame_uri = first.frame_uri.clone();
+        let mut oversized = second.clone();
+        oversized.text = "x".repeat(THREAD_EPISODIC_MEMVID_BATCH_BYTES);
+        let owner = lock_thread_episodic_workspace("invalid_batch_prevalidation").await;
+        let backend = MemvidThreadEpisodicBackend::new();
+        for peer in [
+            invalid,
+            wrong_model,
+            wrong_capsule,
+            wrong_workspace,
+            conflicting_uri,
+            oversized,
+        ] {
+            let results = backend
+                .index_batch_with_workspace_ownership(vec![first.clone(), peer], owner.clone())
+                .await;
+            assert_eq!(results.len(), 2);
+            assert!(results.iter().all(Result::is_err));
+            assert!(
+                !path.exists(),
+                "invalid group must not create or mutate the capsule"
+            );
+        }
+        // Same identity and individually valid vectors: only their combined
+        // byte count makes this group invalid (not a model/dimension mismatch).
+        let mut large_first = first.clone();
+        let mut large_second = second;
+        for request in [&mut large_first, &mut large_second] {
+            let embedding = request.embedding.as_mut().unwrap();
+            embedding.identity.dimension = THREAD_EPISODIC_MEMVID_BATCH_BYTES / 8;
+            embedding.vector = vec![0.0; embedding.identity.dimension];
+        }
+        assert!(
+            backend
+                .index_batch_with_workspace_ownership(
+                    vec![large_first, large_second],
+                    owner.clone()
+                )
+                .await
+                .iter()
+                .all(Result::is_err)
+        );
+        assert!(!path.exists());
+        let too_many = (0..=THREAD_EPISODIC_MEMVID_BATCH_ITEMS)
+            .map(|i| concurrent_index_request(&path, &format!("item_{i}"), vec![1.0, 0.0, 0.0]))
+            .collect();
+        assert!(
+            backend
+                .index_batch_with_workspace_ownership(too_many, owner)
+                .await
+                .iter()
+                .all(Result::is_err)
+        );
+        assert!(!path.exists());
     }
 
     #[tokio::test]
@@ -2322,7 +3054,10 @@ mod tests {
         let workspace = "blocking_projection_transition";
         let ownership = lock_thread_episodic_workspace(workspace).await;
         let backend = MemvidThreadEpisodicBackend::new().with_workspace_ownership(ownership);
-        let old_request = concurrent_index_request(&path, "model_a", vec![1.0, 0.0, 0.0]);
+        let old_requests = vec![
+            concurrent_index_request(&path, "model_a", vec![1.0, 0.0, 0.0]),
+            concurrent_index_request(&path, "model_a_peer", vec![0.0, 1.0, 0.0]),
+        ];
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
@@ -2338,7 +3073,7 @@ mod tests {
                     if release_rx.recv().is_err() {
                         return None;
                     }
-                    let output = index_item_blocking(task_path, old_request);
+                    let output = index_batch_blocking(task_path, old_requests);
                     let _ = finished_tx.send(output);
                     Some(())
                 })
@@ -2364,7 +3099,7 @@ mod tests {
                 .is_some()
         );
         release_tx.send(()).unwrap();
-        finished_rx.await.unwrap().unwrap();
+        assert_eq!(finished_rx.await.unwrap().unwrap().len(), 2);
         let replacement = lock_thread_episodic_workspace(workspace).await;
         remove_thread_episodic_capsule_file(&path, replacement.clone())
             .await
@@ -2512,43 +3247,6 @@ mod tests {
 
         assert_eq!(error.kind, ThreadEpisodicMemvidFailureKind::NonRetryable);
         assert!(error.message.contains("ask retrieval is not implemented"));
-    }
-
-    #[tokio::test]
-    async fn fake_backend_uses_typed_capabilities() {
-        let backend = FakeThreadEpisodicMemvidBackend {
-            capabilities: ThreadEpisodicMemvidBackendCapabilities::memvid_default(),
-        };
-
-        let capabilities = backend.capabilities();
-        assert_eq!(
-            capabilities.adaptive_retrieval,
-            ThreadEpisodicMemvidCapabilityState::Supported
-        );
-        assert_eq!(
-            capabilities.adaptive_retrieval_implementation,
-            ThreadEpisodicAdaptiveRetrievalImplementation::PioneerFallback
-        );
-        assert_eq!(
-            capabilities.semantic_search,
-            ThreadEpisodicMemvidCapabilityState::Supported
-        );
-        assert_eq!(
-            capabilities.hybrid_search,
-            ThreadEpisodicMemvidCapabilityState::Supported
-        );
-        assert_eq!(
-            capabilities.lexical_search,
-            ThreadEpisodicMemvidCapabilityState::Supported
-        );
-        assert_eq!(
-            capabilities.temporal_search,
-            ThreadEpisodicMemvidCapabilityState::Supported
-        );
-        assert_eq!(
-            capabilities.graph_search,
-            ThreadEpisodicMemvidCapabilityState::Disabled
-        );
     }
 
     #[test]
@@ -2796,36 +3494,6 @@ mod tests {
     }
 
     #[test]
-    fn workspace_index_creates_capacity_bounded_capsule() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let path = temp_dir.path().join("segment-000001.mv2");
-        let frame_uri =
-            "mv2://workspace/workspace_1/thread/thread_1/turn/turn_1/item/item_1/index/index_1";
-
-        let output = index_item_blocking(
-            path.clone(),
-            ThreadEpisodicMemvidIndexRequest {
-                storage_uri: thread_episodic_storage_uri_from_path(path.as_path()),
-                capsule_id: "capsule_1".to_owned(),
-                capsule_ref:
-                    "mv2://pioneer/thread_episodic/workspace/workspace_hash/segments/000001/capsules/capsule_1".to_owned(),
-                workspace_capsule: true,
-                index_item_id: "index_item_1".to_owned(),
-                frame_uri: frame_uri.to_owned(),
-                text: "workspace memory item".to_owned(),
-                metadata: BTreeMap::new(),
-                embedding: None,
-            },
-        )
-        .expect("workspace item should index");
-
-        assert_eq!(output.frame_uri, frame_uri);
-        assert_eq!(output.embedding_identity, None);
-        assert_eq!(output.stats.capacity_bytes, Some(50 * 1024 * 1024));
-        assert!(output.stats.remaining_capacity_bytes.is_some());
-    }
-
-    #[test]
     fn lexical_write_does_not_initialize_vector_index_and_preserves_metadata() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let path = temp_dir.path().join("segment-lexical.mv2");
@@ -2859,7 +3527,10 @@ mod tests {
         )
         .expect("lexical item should index");
 
+        assert_eq!(output.frame_uri, frame_uri);
         assert_eq!(output.embedding_identity, None);
+        assert_eq!(output.stats.capacity_bytes, Some(50 * 1024 * 1024));
+        assert!(output.stats.remaining_capacity_bytes.is_some());
         let memvid = Memvid::open(path.as_path()).expect("memvid should reopen");
         assert_eq!(
             memvid

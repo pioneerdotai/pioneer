@@ -218,134 +218,117 @@ mod tests {
     }
 
     #[test]
-    fn ownership_route_candidate_policy_durable_classes_use_control_plane() {
-        for ownership_class in [
-            MemoryOwnershipClass::DurableUserMemory,
-            MemoryOwnershipClass::DurableWorkspaceMemory,
-            MemoryOwnershipClass::DurableAgentMemory,
-        ] {
-            let route = resolve_memory_ownership_route(route_input(
-                MemoryQualityAction::CandidatePolicy,
-                ownership_class,
-                ownership_class,
-            ));
-
+    fn ownership_route_decision_matrix() {
+        use MemoryOwnershipClass as Ownership;
+        use MemoryOwnershipRouteDestination as Destination;
+        use MemoryOwnershipRouteReason as Reason;
+        use MemoryQualityAction as Action;
+        use MemorySemanticWriteRoute as Semantic;
+        let cases = [
+            (
+                Action::CandidatePolicy,
+                Ownership::DurableUserMemory,
+                Ownership::DurableUserMemory,
+                Destination::DurableControlPlane,
+                Reason::DurableCandidate,
+                Semantic::DurableControlPlane,
+                true,
+            ),
+            (
+                Action::CandidatePolicy,
+                Ownership::DurableWorkspaceMemory,
+                Ownership::DurableWorkspaceMemory,
+                Destination::DurableControlPlane,
+                Reason::DurableCandidate,
+                Semantic::DurableControlPlane,
+                true,
+            ),
+            (
+                Action::CandidatePolicy,
+                Ownership::DurableAgentMemory,
+                Ownership::DurableAgentMemory,
+                Destination::DurableControlPlane,
+                Reason::DurableCandidate,
+                Semantic::DurableControlPlane,
+                true,
+            ),
+            (
+                Action::RouteToThreadEpisodic,
+                Ownership::ThreadEpisodicContext,
+                Ownership::ThreadEpisodicContext,
+                Destination::ThreadEpisodic,
+                Reason::ThreadEpisodic,
+                Semantic::ThreadEpisodicDeferred,
+                false,
+            ),
+            (
+                Action::RouteToTaskState,
+                Ownership::TaskRuntimeState,
+                Ownership::TaskRuntimeState,
+                Destination::TaskState,
+                Reason::TaskState,
+                Semantic::TaskStateDeferred,
+                false,
+            ),
+            (
+                Action::RouteToDomainState,
+                Ownership::DomainRuntimeState,
+                Ownership::DomainRuntimeState,
+                Destination::DomainState,
+                Reason::DomainState,
+                Semantic::DomainStateDeferred,
+                false,
+            ),
+            (
+                Action::Quarantine,
+                Ownership::AuditOnly,
+                Ownership::AuditOnly,
+                Destination::AuditOnly,
+                Reason::QuarantineAuditOnly,
+                Semantic::AuditOnly,
+                false,
+            ),
+            (
+                Action::ForceReject,
+                Ownership::Reject,
+                Ownership::Reject,
+                Destination::Rejected,
+                Reason::ForceRejected,
+                Semantic::Rejected,
+                false,
+            ),
+            (
+                Action::CandidatePolicy,
+                Ownership::AuditOnly,
+                Ownership::AuditOnly,
+                Destination::AuditOnly,
+                Reason::InvalidCandidateOwnership,
+                Semantic::AuditOnly,
+                false,
+            ),
+            (
+                Action::RouteToThreadEpisodic,
+                Ownership::ThreadEpisodicContext,
+                Ownership::DurableUserMemory,
+                Destination::AuditOnly,
+                Reason::InvalidRouteOwnership,
+                Semantic::AuditOnly,
+                false,
+            ),
+        ];
+        for (action, target, owning, destination, reason, semantic, permits_candidate) in cases {
+            let route = resolve_memory_ownership_route(route_input(action, target, owning));
             assert_eq!(
-                route.destination,
-                MemoryOwnershipRouteDestination::DurableControlPlane
+                route.destination, destination,
+                "{action:?}, {target:?}, {owning:?}"
             );
-            assert_eq!(route.reason, MemoryOwnershipRouteReason::DurableCandidate);
-            assert!(route.permits_candidate_policy());
-            assert!(!route.is_terminal_non_memory_route());
+            assert_eq!(route.reason, reason);
+            assert_eq!(route.semantic_write_route(), semantic);
+            assert_eq!(route.permits_candidate_policy(), permits_candidate);
+            assert_eq!(route.is_terminal_non_memory_route(), !permits_candidate);
+            assert_eq!(route.thread_id.as_deref(), Some("thread-1"));
+            assert_eq!(route.source_turn_id.as_deref(), Some("turn-1"));
+            assert_eq!(route.source_item_id.as_deref(), Some("item-1"));
         }
-    }
-
-    #[test]
-    fn ownership_route_non_durable_actions_use_typed_destinations() {
-        let thread = resolve_memory_ownership_route(route_input(
-            MemoryQualityAction::RouteToThreadEpisodic,
-            MemoryOwnershipClass::ThreadEpisodicContext,
-            MemoryOwnershipClass::ThreadEpisodicContext,
-        ));
-        assert_eq!(
-            thread.destination,
-            MemoryOwnershipRouteDestination::ThreadEpisodic
-        );
-        assert_eq!(
-            thread.semantic_write_route(),
-            MemorySemanticWriteRoute::ThreadEpisodicDeferred
-        );
-        assert_eq!(thread.thread_id.as_deref(), Some("thread-1"));
-        assert_eq!(thread.source_turn_id.as_deref(), Some("turn-1"));
-        assert_eq!(thread.source_item_id.as_deref(), Some("item-1"));
-        assert!(thread.is_terminal_non_memory_route());
-
-        let task = resolve_memory_ownership_route(route_input(
-            MemoryQualityAction::RouteToTaskState,
-            MemoryOwnershipClass::TaskRuntimeState,
-            MemoryOwnershipClass::TaskRuntimeState,
-        ));
-        assert_eq!(task.destination, MemoryOwnershipRouteDestination::TaskState);
-        assert!(task.is_terminal_non_memory_route());
-
-        let domain = resolve_memory_ownership_route(route_input(
-            MemoryQualityAction::RouteToDomainState,
-            MemoryOwnershipClass::DomainRuntimeState,
-            MemoryOwnershipClass::DomainRuntimeState,
-        ));
-        assert_eq!(
-            domain.destination,
-            MemoryOwnershipRouteDestination::DomainState
-        );
-        assert!(domain.is_terminal_non_memory_route());
-    }
-
-    #[test]
-    fn ownership_route_quarantine_and_force_reject_are_terminal() {
-        let quarantine = resolve_memory_ownership_route(route_input(
-            MemoryQualityAction::Quarantine,
-            MemoryOwnershipClass::AuditOnly,
-            MemoryOwnershipClass::AuditOnly,
-        ));
-        assert_eq!(
-            quarantine.destination,
-            MemoryOwnershipRouteDestination::AuditOnly
-        );
-        assert_eq!(
-            quarantine.reason,
-            MemoryOwnershipRouteReason::QuarantineAuditOnly
-        );
-        assert!(quarantine.is_terminal_non_memory_route());
-
-        let rejected = resolve_memory_ownership_route(route_input(
-            MemoryQualityAction::ForceReject,
-            MemoryOwnershipClass::Reject,
-            MemoryOwnershipClass::Reject,
-        ));
-        assert_eq!(
-            rejected.destination,
-            MemoryOwnershipRouteDestination::Rejected
-        );
-        assert_eq!(rejected.reason, MemoryOwnershipRouteReason::ForceRejected);
-        assert!(rejected.is_terminal_non_memory_route());
-    }
-
-    #[test]
-    fn ownership_route_invalid_candidate_policy_combination_is_audit_only() {
-        let route = resolve_memory_ownership_route(route_input(
-            MemoryQualityAction::CandidatePolicy,
-            MemoryOwnershipClass::AuditOnly,
-            MemoryOwnershipClass::AuditOnly,
-        ));
-
-        assert_eq!(
-            route.destination,
-            MemoryOwnershipRouteDestination::AuditOnly
-        );
-        assert_eq!(
-            route.reason,
-            MemoryOwnershipRouteReason::InvalidCandidateOwnership
-        );
-        assert!(!route.permits_candidate_policy());
-        assert!(route.is_terminal_non_memory_route());
-    }
-
-    #[test]
-    fn ownership_route_invalid_action_ownership_mismatch_is_audit_only() {
-        let route = resolve_memory_ownership_route(route_input(
-            MemoryQualityAction::RouteToThreadEpisodic,
-            MemoryOwnershipClass::ThreadEpisodicContext,
-            MemoryOwnershipClass::DurableUserMemory,
-        ));
-
-        assert_eq!(
-            route.destination,
-            MemoryOwnershipRouteDestination::AuditOnly
-        );
-        assert_eq!(
-            route.reason,
-            MemoryOwnershipRouteReason::InvalidRouteOwnership
-        );
-        assert!(route.is_terminal_non_memory_route());
     }
 }

@@ -17,14 +17,26 @@ const NOW: i64 = 4_000_000_000;
 const AT: i64 = 1_700_000_000;
 const MIGRATION: &str = "m20261008_000003_task_occurrence_reconcile";
 
-// Pin migration fixtures to the schema under test so later, irreversible
-// migrations do not participate in its rollback or installation checks.
+// Keep this tracker last for rollback/installation checks. The shared helper
+// supplies only orthogonal current TaskEvent storage before the trackers;
+// later irreversible migrations remain excluded.
 struct TrackerMigrator;
 
 impl MigratorTrait for TrackerMigrator {
     fn migrations() -> Vec<Box<dyn migration::MigrationTrait>> {
         migrations_through(MIGRATION)
     }
+}
+
+// These pre-cutover regression matrices intentionally exercise the released
+// triggers, while task_occurrence_producers_tests owns the typed replacement.
+async fn legacy_tracking_store(workspace: &str) -> CrudStore {
+    let store = super::test_store_with_workspace(workspace).await;
+    pioneer_sqlite::apply_sqlite_pragmas(&store.connection)
+        .await
+        .unwrap();
+    restore_legacy_occurrence_tracking(&store).await;
+    store
 }
 
 async fn task(store: &CrudStore, kind: TaskExecutorKind) -> Task {
@@ -123,7 +135,7 @@ async fn authorities(store: &CrudStore, task: &Task, run: &TaskRun, n: u64) -> S
 }
 
 async fn fixture(kind: TaskExecutorKind) -> (CrudStore, TaskRun, String) {
-    let store = test_store_with_workspace("ws_task").await;
+    let store = legacy_tracking_store("ws_task").await;
     let task = task(&store, kind).await;
     let run = source_run(&store, &task, 0, TaskRunStatus::Succeeded).await;
     let id = authorities(&store, &task, &run, 0).await;
@@ -457,7 +469,7 @@ async fn preparation_mutation_and_task_scope_rebinding_fence_stale_repair() {
 
 #[tokio::test]
 async fn missing_late_authorities_and_same_id_aba_are_covered() {
-    let store = test_store_with_workspace("ws_task").await;
+    let store = legacy_tracking_store("ws_task").await;
     let task = task(&store, TaskExecutorKind::System).await;
     let run = source_run(&store, &task, 0, TaskRunStatus::Succeeded).await;
     let claimed = claim(&store, &run.id, NOW).await;
@@ -749,7 +761,7 @@ async fn heartbeat_lease_payload_progress_and_identical_upserts_do_not_refresh_d
 
 #[tokio::test]
 async fn scope_fanout_is_bounded_fenced_and_covers_new_ids_behind_cursor() {
-    let store = test_store_with_workspace("ws_task").await;
+    let store = legacy_tracking_store("ws_task").await;
     let task = task(&store, TaskExecutorKind::System).await;
     for n in 0..100 {
         source_run(&store, &task, n, TaskRunStatus::Succeeded).await;
@@ -1191,7 +1203,7 @@ async fn resume_retry_rebind_delete_and_monotonic_sequence_overflow() {
 
 #[tokio::test]
 async fn over_budget_poison_claims_and_healthy_rows_share_fair_quanta() {
-    let store = test_store_with_workspace("ws_task").await;
+    let store = legacy_tracking_store("ws_task").await;
     let task = task(&store, TaskExecutorKind::System).await;
     for n in 0..100 {
         let run = source_run(&store, &task, n, TaskRunStatus::Succeeded).await;
@@ -1268,7 +1280,7 @@ struct Plan {
 }
 #[tokio::test]
 async fn due_scope_and_seed_plans_use_covering_keyset_indexes() {
-    let store = test_store_with_workspace("ws_task").await;
+    let store = legacy_tracking_store("ws_task").await;
     let scope = scopes::Model {
         task_id: "task".into(),
         generation: 1,
@@ -1373,11 +1385,16 @@ async fn disk_store(path: &std::path::Path, routes: Arc<Routes>) -> CrudStore {
                 .pragma("query_only", "ON")
         });
     let reader = Database::connect(options).await.unwrap();
-    CrudStore::new(
+    let store = CrudStore::new(
         pioneer_sqlite::SqliteDatabase::from_executor_with_read_observer(reader, executor, routes),
-    )
+    );
+    restore_legacy_occurrence_tracking(&store).await;
+    store
 }
 async fn disk_fixture(store: &CrudStore) -> TaskRun {
+    pioneer_sqlite::apply_sqlite_pragmas(&store.connection)
+        .await
+        .unwrap();
     pioneer_entity::workspace::Entity::insert(pioneer_entity::workspace::ActiveModel {
         id: Set("ws_task".into()),
         name: Set("Contracts".into()),
@@ -1807,7 +1824,7 @@ async fn metadata_repair_does_not_decode_unrelated_payloads() {
 
 #[tokio::test]
 async fn poison_scope_rotates_without_advancing_prefix_and_healthy_scope_progresses() {
-    let store = test_store_with_workspace("ws_task").await;
+    let store = legacy_tracking_store("ws_task").await;
     let a = task(&store, TaskExecutorKind::System).await;
     let mut b = a.clone();
     b.id = "task_other_scope".into();
@@ -1882,5 +1899,450 @@ async fn poison_scope_rotates_without_advancing_prefix_and_healthy_scope_progres
             .await
             .unwrap()
             .is_none()
+    );
+}
+
+#[tokio::test]
+async fn unknown_contract_producer_recovers_a_missed_transition_after_seed_completion() {
+    let (store, run, _) = fixture(TaskExecutorKind::System).await;
+    store
+        .connection
+        .execute_unprepared(
+            "DROP TRIGGER task_occurrence_reconcile_task_occurrence_contract_update",
+        )
+        .await
+        .unwrap();
+    store.connection.execute_unprepared("CREATE TRIGGER task_occurrence_reconcile_task_occurrence_contract_update AFTER UPDATE OF status ON task_occurrence_contract BEGIN SELECT 1; END").await.unwrap();
+    clear_bookkeeping(&store).await; // Includes the durable finite seed EOF.
+    occurrence_status(&store, &run.id, "recovering").await;
+    assert!(
+        pending_row(&store, &run.id).await.is_none(),
+        "foreign generation really missed the mutation"
+    );
+    let candidates = store.discover_task_occurrence_reconcile(NOW).await.unwrap();
+    let candidate = candidates
+        .iter()
+        .find(|row| row.run_id == run.id)
+        .expect("conservative audit must restore the obligation");
+    let claimed = store
+        .claim_task_occurrence_reconcile(candidate, &|| NOW)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        store
+            .reconcile_claimed_task_occurrence(&claimed, NOW)
+            .await
+            .unwrap(),
+        Outcome::Changed
+    );
+    let actual = store
+        .get_task_occurrence_contract_by_run(&run.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(actual.status, TaskOccurrenceStatus::Delivered);
+    assert!(pending_row(&store, &run.id).await.is_none());
+}
+
+// The audit owns historical coverage, independently of durable ticket retry.
+async fn replace_contract_status_producer(store: &CrudStore) {
+    store
+        .connection
+        .execute_unprepared(
+            "DROP TRIGGER task_occurrence_reconcile_task_occurrence_contract_update",
+        )
+        .await
+        .unwrap();
+    store.connection.execute_unprepared("CREATE TRIGGER task_occurrence_reconcile_task_occurrence_contract_update AFTER UPDATE OF status ON task_occurrence_contract BEGIN SELECT 1; END").await.unwrap();
+}
+
+#[tokio::test]
+async fn compatibility_poison_is_partial_but_existing_ticket_and_later_pages_proceed() {
+    let store = legacy_tracking_store("ws_task").await;
+    pioneer_sqlite::apply_sqlite_pragmas(&store.connection)
+        .await
+        .unwrap();
+    let task = task(&store, TaskExecutorKind::System).await;
+    let mut runs = Vec::new();
+    for n in 0..65 {
+        let run = source_run(&store, &task, n, TaskRunStatus::Succeeded).await;
+        authorities(&store, &task, &run, n).await;
+        occurrence_status(&store, &run.id, "delivered").await;
+        runs.push(run);
+    }
+    clear_bookkeeping(&store).await;
+    // A healthy existing ticket outside the first audit page is independent.
+    occurrence_status(&store, &runs[64].id, "recovering").await;
+    replace_contract_status_producer(&store).await;
+    occurrence_status(&store, &runs[0].id, "recovering").await;
+    occurrence_status(&store, &runs[63].id, "recovering").await;
+    store.connection.execute_unprepared("CREATE TRIGGER reject_compatibility_ticket BEFORE INSERT ON task_occurrence_reconcile_pending WHEN NEW.run_id='r00000000000000000000' BEGIN SELECT RAISE(ABORT,'compatibility ticket rejected'); END").await.unwrap();
+    let result = store
+        .discover_task_occurrence_reconcile_with_audit(NOW)
+        .await
+        .unwrap();
+    assert!(result.audit_error.is_some());
+    let candidate = result
+        .candidates
+        .iter()
+        .find(|c| c.run_id == runs[64].id)
+        .unwrap();
+    let claimed = store
+        .claim_task_occurrence_reconcile(candidate, &|| NOW)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        store
+            .reconcile_claimed_task_occurrence(&claimed, NOW)
+            .await
+            .unwrap(),
+        Outcome::Changed
+    );
+    // The second page progresses past the poison head to a missed healthy tail.
+    let next = store
+        .with_maintenance_access()
+        .discover_task_occurrence_reconcile_with_audit(NOW)
+        .await
+        .unwrap();
+    assert!(next.candidates.iter().any(|c| c.run_id == runs[63].id));
+    store
+        .discover_task_occurrence_reconcile_with_audit(NOW)
+        .await
+        .unwrap(); // EOF
+    assert!(
+        store.discover_task_occurrence_reconcile(NOW).await.is_err(),
+        "Vec API cannot report complete success after a failed audit"
+    );
+    store
+        .connection
+        .execute_unprepared("DROP TRIGGER reject_compatibility_ticket")
+        .await
+        .unwrap();
+    for _ in 0..3 {
+        store
+            .discover_task_occurrence_reconcile_with_audit(NOW)
+            .await
+            .unwrap();
+    }
+    assert!(
+        pending_row(&store, &runs[0].id).await.is_some(),
+        "poison remains recoverable after wrap"
+    );
+}
+
+#[tokio::test]
+async fn compatibility_fixed_upper_revisits_earlier_mutations_despite_continuous_growth() {
+    let store = legacy_tracking_store("ws_task").await;
+    pioneer_sqlite::apply_sqlite_pragmas(&store.connection)
+        .await
+        .unwrap();
+    let task = task(&store, TaskExecutorKind::System).await;
+    for n in 0..65 {
+        let run = source_run(&store, &task, n, TaskRunStatus::Succeeded).await;
+        authorities(&store, &task, &run, n).await;
+        occurrence_status(&store, &run.id, "delivered").await;
+    }
+    clear_bookkeeping(&store).await;
+    replace_contract_status_producer(&store).await;
+    assert!(
+        store
+            .discover_task_occurrence_reconcile(NOW)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let early = "r00000000000000000000";
+    occurrence_status(&store, early, "recovering").await;
+    assert!(pending_row(&store, early).await.is_none());
+    // Every quantum adds a full page beyond the original upper bound. An
+    // unbounded moving cursor would never revisit the now-mismatching early ID.
+    let mut found = false;
+    for pass in 0..4 {
+        for n in (65 + pass * 32)..(97 + pass * 32) {
+            let run = source_run(&store, &task, n, TaskRunStatus::Succeeded).await;
+            pending::Entity::delete_by_id(run.id)
+                .exec(&store.connection)
+                .await
+                .unwrap();
+        }
+        let result = store
+            .with_maintenance_access()
+            .discover_task_occurrence_reconcile_with_audit(NOW)
+            .await
+            .unwrap();
+        assert!(result.audit_error.is_none());
+        found |= result.candidates.iter().any(|c| c.run_id == early);
+    }
+    assert!(found, "captured finite upper must permit a second pass");
+    let claimed = claim(&store, early, NOW).await;
+    assert_eq!(
+        store
+            .reconcile_claimed_task_occurrence(&claimed, NOW)
+            .await
+            .unwrap(),
+        Outcome::Changed
+    );
+}
+
+#[tokio::test]
+async fn compatibility_classifies_owners_independently_and_preserves_released_history() {
+    use pioneer_entity::task_run_occurrence_reconcile_pending as parent_pending;
+    for unknown_contract in [false, true] {
+        for generation in ["altered", "partial", "deleted"] {
+            let (store, thread, parent) =
+                super::terminal_task_run_occurrence_fixture(Some(TurnKind::TaskRun)).await;
+            pioneer_sqlite::apply_sqlite_pragmas(&store.connection)
+                .await
+                .unwrap();
+            restore_legacy_occurrence_tracking(&store).await;
+            let mut task = sample_task(AT);
+            task.id = "compatibility-system-task".into();
+            task.executor_kind = TaskExecutorKind::System;
+            crate::repositories::task::upsert_prepared_task(
+                &store.connection,
+                crate::repositories::task::prepare_task_projection(&task).unwrap(),
+            )
+            .await
+            .unwrap();
+            let contract = source_run(&store, &task, 0, TaskRunStatus::Succeeded).await;
+            authorities(&store, &task, &contract, 0).await;
+            clear_bookkeeping(&store).await;
+            parent_pending::Entity::delete_many()
+                .exec(&store.connection)
+                .await
+                .unwrap();
+            let pattern = if unknown_contract {
+                "task_occurrence_reconcile_*"
+            } else {
+                "task_run_occurrence_reconcile_*"
+            };
+            let rows = store.connection.query_all_raw(Statement::from_sql_and_values(DatabaseBackend::Sqlite, "SELECT name FROM sqlite_master WHERE type='trigger' AND name GLOB ? ORDER BY name", [pattern.into()])).await.unwrap();
+            for row in rows.iter().take(if generation == "deleted" {
+                rows.len()
+            } else {
+                1
+            }) {
+                let name: String = row.try_get("", "name").unwrap();
+                store
+                    .connection
+                    .execute_unprepared(&format!("DROP TRIGGER {name}"))
+                    .await
+                    .unwrap();
+                if generation == "altered" {
+                    store
+                        .connection
+                        .execute_unprepared(&format!(
+                            "CREATE TRIGGER {name} AFTER UPDATE ON task_run BEGIN SELECT 1; END"
+                        ))
+                        .await
+                        .unwrap();
+                }
+            }
+            assert!(!store.task_occurrence_tracking_is_typed().await.unwrap());
+            let parents = store
+                .discover_task_run_occurrence_reconcile(NOW, 32)
+                .await
+                .unwrap();
+            let contracts = store.discover_task_occurrence_reconcile(NOW).await.unwrap();
+            assert_eq!(
+                parents.iter().any(|c| c.run_id == parent.id),
+                !unknown_contract,
+                "{generation}"
+            );
+            assert_eq!(
+                contracts.iter().any(|c| c.run_id == contract.id),
+                unknown_contract,
+                "{generation}"
+            );
+            if unknown_contract {
+                let c = contracts.iter().find(|c| c.run_id == contract.id).unwrap();
+                let c = store
+                    .claim_task_occurrence_reconcile(c, &|| NOW)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    store
+                        .reconcile_claimed_task_occurrence(&c, NOW)
+                        .await
+                        .unwrap(),
+                    Outcome::Changed
+                );
+                assert_eq!(
+                    turn::find_turn_by_thread_and_id(&store.connection, &thread.id, &parent.id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .status,
+                    "in_progress"
+                );
+            } else {
+                let c = parents.iter().find(|c| c.run_id == parent.id).unwrap();
+                let c = store
+                    .claim_task_run_occurrence_reconcile(c, &|| NOW)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    store
+                        .reconcile_claimed_task_run_occurrence(&c, NOW)
+                        .await
+                        .unwrap(),
+                    TaskRunOccurrenceTerminalizationOutcome::Changed
+                );
+                assert_eq!(
+                    store
+                        .get_task_occurrence_contract_by_run(&contract.id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .status,
+                    TaskOccurrenceStatus::Running
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn compatibility_metadata_failure_is_partial_even_with_released_owner_and_healthy_ticket() {
+    let (store, run, _) = fixture(TaskExecutorKind::System).await;
+    // Hide only the migration metadata. Queue and exact released owner remain
+    // readable, so this deterministically isolates classification failure.
+    store
+        .connection
+        .execute_unprepared("ALTER TABLE seaql_migrations RENAME TO hidden_migrations")
+        .await
+        .unwrap();
+    let result = store
+        .discover_task_occurrence_reconcile_with_audit(NOW)
+        .await
+        .unwrap();
+    assert!(result.audit_error.is_some());
+    let candidate = result
+        .candidates
+        .iter()
+        .find(|c| c.run_id == run.id)
+        .unwrap();
+    assert!(store.discover_task_occurrence_reconcile(NOW).await.is_err());
+    store
+        .connection
+        .execute_unprepared("ALTER TABLE hidden_migrations RENAME TO seaql_migrations")
+        .await
+        .unwrap();
+    let c = store
+        .claim_task_occurrence_reconcile(candidate, &|| NOW)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        store
+            .reconcile_claimed_task_occurrence(&c, NOW)
+            .await
+            .unwrap(),
+        Outcome::Changed
+    );
+}
+
+#[tokio::test]
+async fn compatibility_cancelled_audit_reenters_scoped_clones_and_uses_physical_routes() {
+    use pioneer_sqlite::{SqliteReadClass, SqliteWriteClass, SqliteWriteEvent};
+    use std::time::Duration;
+    let directory = tempfile::tempdir().unwrap();
+    let routes = Arc::new(Routes::default());
+    let store = disk_store(
+        &directory.path().join("compatibility.sqlite"),
+        routes.clone(),
+    )
+    .await;
+    let run = disk_fixture(&store).await;
+    occurrence_status(&store, &run.id, "delivered").await;
+    clear_bookkeeping(&store).await;
+    replace_contract_status_producer(&store).await;
+    routes.reads.lock().unwrap().clear();
+    routes.writes.lock().unwrap().clear();
+    assert!(
+        store
+            .discover_task_occurrence_reconcile(NOW)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let reads = routes.reads.lock().unwrap().clone();
+    assert!(!reads.is_empty());
+    assert!(reads.iter().all(|c| *c == SqliteReadClass::Maintenance));
+    assert!(
+        routes.writes.lock().unwrap().is_empty(),
+        "agreeing audit page never acquires writer"
+    );
+    assert!(store.connection.reader_query_only_enabled().await.unwrap());
+    occurrence_status(&store, &run.id, "recovering").await;
+    let hold = store.connection.begin().await.unwrap();
+    routes.watch.store(true, Ordering::SeqCst);
+    let worker = store.with_maintenance_access();
+    let waiting = tokio::spawn(async move {
+        worker
+            .discover_task_occurrence_reconcile_with_audit(NOW)
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), routes.queued.notified())
+        .await
+        .unwrap();
+    assert!(
+        store.get_task_run(&run.id).await.unwrap().is_some(),
+        "interactive reader remains available"
+    );
+    waiting.abort();
+    assert!(waiting.await.unwrap_err().is_cancelled());
+    hold.rollback().await.unwrap();
+    routes.watch.store(false, Ordering::SeqCst);
+    assert!(pending_row(&store, &run.id).await.is_none());
+    assert!(routes.writes.lock().unwrap().iter().any(|e| matches!(e, SqliteWriteEvent::Cancelled { class: SqliteWriteClass::Maintenance, queue, .. } if queue.maintenance == 0)));
+    routes.reads.lock().unwrap().clear();
+    routes.writes.lock().unwrap().clear();
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        store
+            .with_maintenance_access()
+            .discover_task_occurrence_reconcile_with_audit(NOW),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(result.audit_error.is_none());
+    let c = result
+        .candidates
+        .iter()
+        .find(|c| c.run_id == run.id)
+        .unwrap();
+    assert!(
+        routes
+            .reads
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|c| *c == SqliteReadClass::Maintenance)
+    );
+    assert!(routes.writes.lock().unwrap().iter().any(|e| matches!(
+        e,
+        SqliteWriteEvent::Enqueued {
+            class: SqliteWriteClass::Maintenance,
+            ..
+        }
+    )));
+    assert!(!routes.writes.lock().unwrap().iter().any(|e| matches!(e, SqliteWriteEvent::Enqueued { class, .. } if *class != SqliteWriteClass::Maintenance)));
+    let claimed = store
+        .claim_task_occurrence_reconcile(c, &|| NOW)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        store
+            .reconcile_claimed_task_occurrence(&claimed, NOW)
+            .await
+            .unwrap(),
+        Outcome::Changed
     );
 }

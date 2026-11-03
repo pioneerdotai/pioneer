@@ -980,13 +980,6 @@ description = "Empêche l'ordinateur de passer en veille pour cause d'inactivit�
 label = "Envoyer la télémétrie"
 description = "Autoriser la collecte de données de diagnostic et de performance."
 
-[settings.general.preflight_model]
-label = "Modèle de preflight"
-description = "Choisissez le fournisseur et le modèle pour la planification interne avant le tour. Par défaut utilise le modèle du fil actuel."
-default = "Par défaut"
-select_model = "Sélectionner un modèle"
-dialog_title = "Sélectionner le modèle de preflight"
-
 [settings.voice_input]
 label = "Saisie vocale"
 description = "Utiliser un modèle de transcription local pour les messages vocaux."
@@ -1041,10 +1034,6 @@ description = "Contrôlez la façon dont Pioneer utilise la mémoire durable."
 [settings.memory.enabled]
 label = "Mémoire"
 description = "Autoriser Pioneer à utiliser les faits enregistrés et les décisions de projet lorsque c'est utile."
-
-[settings.memory.active_recall]
-label = "Rappel actif"
-description = "Exécuter une planification de rappel supplémentaire en lecture seule pour les tâches riches en contexte."
 
 [settings.memory.proactive_writes]
 label = "Écriture proactive"

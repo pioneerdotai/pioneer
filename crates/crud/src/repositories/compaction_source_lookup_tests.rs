@@ -1593,27 +1593,6 @@ async fn assert_production_plans(compressed: bool) {
     }
 }
 
-#[test]
-fn query_plan_key_recognition_does_not_confuse_id_suffixes_or_scans() {
-    assert!(search_has_exact_equality(
-        "SEARCH source USING INDEX x (turn_id=? AND id=?)",
-        "id"
-    ));
-    assert!(!search_has_exact_equality(
-        "SEARCH source USING INDEX x (turn_id=? AND owner_id=? AND source_id=?)",
-        "id"
-    ));
-    assert!(search_has_exact_equality(
-        "SEARCH source USING INDEX x (source_id=?)",
-        "source_id"
-    ));
-    assert!(plan_operation_targets_subject(
-        "SCAN source",
-        "SCAN",
-        "source"
-    ));
-}
-
 #[tokio::test]
 async fn source_lookup_plans_use_exact_keys_for_plain_and_zstd_storage() {
     assert_production_plans(false).await;

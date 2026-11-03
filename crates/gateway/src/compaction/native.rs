@@ -316,7 +316,7 @@ async fn prepare_native_projection_with_prepared(
         Some(processor) => Some(tokio::select! { biased;
             _ = context.cancellation.cancelled() => anyhow::bail!("native media preparation cancelled"),
             _ = clock.sleep_until(preparation_deadline) => anyhow::bail!("native media preparation deadline exceeded"),
-            guard = processor.artifact_service.html_preview_activity() => guard,
+            guard = processor.artifact_service.html_preview_activity_signaled() => guard,
         }),
         None => None,
     };
@@ -483,10 +483,10 @@ async fn prepare_native_projection_with_prepared(
         if request.messages.iter().any(|message| {
             message.content_parts.iter().any(|part| match part {
                 pioneer_provider::MessageContentPart::File { file } => {
-                    matches!(&file.source, pioneer_provider::AttachmentDataSource::Reference { reference } if reference.starts_with("pioneer-artifact:"))
+                    file.artifact.is_some() || matches!(&file.source, pioneer_provider::AttachmentDataSource::Reference { reference } if reference.starts_with("pioneer-artifact:"))
                 }
                 pioneer_provider::MessageContentPart::Image { image } => {
-                    matches!(&image.source, pioneer_provider::AttachmentDataSource::Reference { reference } if reference.starts_with("pioneer-artifact:"))
+                    image.artifact.is_some() || matches!(&image.source, pioneer_provider::AttachmentDataSource::Reference { reference } if reference.starts_with("pioneer-artifact:"))
                 }
                 pioneer_provider::MessageContentPart::Text { .. }
                 | pioneer_provider::MessageContentPart::Audio { .. }
@@ -535,12 +535,12 @@ async fn prepare_native_projection_with_prepared(
             basis.clone(),
         )?;
         let mut message_tokens = full.message_input_tokens.clone();
-        let mut input = receipt.calibrated_input(
+        let mut input = receipt.calibrated_estimate(
             full.estimated_input_tokens,
             &message_tokens,
             measured.as_ref(),
         )?;
-        if !budget.fits(input, full.output_reserve, recovery) {
+        if !budget.fits_estimate(input, full.output_reserve, recovery) {
             if let Some(reduced) = super::result_budget::shrink_results(
                 &store, workspace, &full, &media, &budget, recovery,
             )
@@ -557,7 +557,7 @@ async fn prepare_native_projection_with_prepared(
                 )?;
                 // Representation changed: exact-prefix validation decides
                 // whether any earlier provider measurement is still usable.
-                input = receipt.calibrated_input(
+                input = receipt.calibrated_estimate(
                     full.estimated_input_tokens,
                     &message_tokens,
                     measured.as_ref(),
@@ -565,7 +565,7 @@ async fn prepare_native_projection_with_prepared(
             }
         }
         let history_check = history_check_metadata(&full)?;
-        if !recovery && budget.fits(input, full.output_reserve, false) {
+        if !recovery && budget.fits_estimate(input, full.output_reserve, false) {
             return Ok::<_, anyhow::Error>((full.request, receipt, history_check, None));
         }
         let _startup_compaction = pioneer_observability::turn_startup::current_stage(
@@ -585,23 +585,21 @@ async fn prepare_native_projection_with_prepared(
             effort,
         };
         let selection = effective_selection(&current, settings.selection.as_ref(), None).clone();
-        let summarizer =
-            super::service::make_summarizer(providers, store, processor, workspace, selection)
-                .await?;
+        let summarizer = super::service::make_summarizer(
+            providers, store, processor, workspace, thread, selection,
+        )
+        .await?;
         let layout = NativeHistoryLayout::from_messages(
             workspace,
             thread,
             &full.request.messages,
             &message_tokens,
         )?;
-        let message_total = message_tokens
-            .iter()
-            .fold(0_u64, |sum, n| sum.saturating_add(*n));
-        let fixed = input.saturating_sub(message_total);
-        let available = budget
-            .context
-            .saturating_sub(full.output_reserve)
-            .saturating_sub(fixed);
+        // Compaction changes the measured prefix; its replacement candidates
+        // must use their local fixed framing, not reuse an old provider anchor.
+        let fixed = full.fixed_input_tokens;
+        let available =
+            estimated_input_capacity(&budget, full.output_reserve, recovery).saturating_sub(fixed);
         let goal = summarizer
             .model_budget()
             .summarizer_cap(u64::MAX)?
@@ -1017,6 +1015,8 @@ async fn refresh_native_history(
                             | "context"
                             | "item"
                             | "pending-input"
+                            | "pending-turn-input-projection"
+                            | "pending-runtime-context"
                             | "pending-assistant"
                             | "pending-tool"
                             | "pending-item"
@@ -1083,7 +1083,9 @@ async fn refresh_native_history(
                 "history unit crosses the current execution boundary"
             );
             if origin.sources.iter().any(|source| {
-                source.scope.starts_with("input:") || source.scope.starts_with("pending-input:")
+                source.scope.starts_with("input:")
+                    || source.scope.starts_with("pending-input:")
+                    || source.scope.starts_with("pending-turn-input-projection:")
             }) {
                 origin.protected_input = true;
             }

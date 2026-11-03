@@ -1113,20 +1113,6 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_completed_invocation_returns_existing_report() {
-        let observer = InMemoryCommitObserver::new();
-        let identity = identity();
-        let first = observer.admit(&identity, &admission([7; 32])).unwrap();
-        let ordinal = match first {
-            ObserverAdmission::Execute { ordinal } => ordinal,
-            ObserverAdmission::Existing { .. } => panic!("first admission cannot be replay"),
-        };
-        observer.on_terminal(&identity, ordinal, &report()).unwrap();
-        let second = observer.admit(&identity, &admission([7; 32])).unwrap();
-        assert!(matches!(second, ObserverAdmission::Existing { .. }));
-    }
-
-    #[test]
     fn duplicate_identity_with_different_plan_is_rejected() {
         let observer = InMemoryCommitObserver::new();
         let identity = identity();

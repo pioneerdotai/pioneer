@@ -1,0 +1,64 @@
+name: Release compile environment
+description: Prepare native compile dependencies and matching ONNX link/runtime inputs.
+inputs:
+  target:
+    required: true
+    description: Rust target.
+  component:
+    required: true
+    description: gateway or desktop.
+  variant:
+    default: default
+    description: Gateway variant.
+runs:
+  using: composite
+  steps:
+    - name: select-cua-xcode
+      if: runner.os == 'macOS' && (inputs.component == 'desktop' || inputs.variant == 'computer-use')
+      shell: bash
+      run: |
+        sudo xcode-select --switch /Applications/Xcode_26.2.app/Contents/Developer
+        echo 'DEVELOPER_DIR=/Applications/Xcode_26.2.app/Contents/Developer' >> "$GITHUB_ENV"
+    - uses: dtolnay/rust-toolchain@stable
+      with:
+        toolchain: "1.99.0"
+        targets: ${{ inputs.target }}
+    - name: configure-native-release-environment
+      shell: bash
+      run: python scripts/packaging/build-gateway.py --target "${{ inputs.target }}" --configure
+    - name: install-linux-compile-dependencies
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        set -euo pipefail
+        packages=(pkg-config libssl-dev libegl1-mesa-dev libgbm-dev
+                  libpipewire-0.3-dev libwayland-dev libxkbcommon-dev)
+        if [[ "${{ inputs.component }}" == desktop ]]; then
+          packages+=(libasound2-dev libxkbcommon-x11-dev libfontconfig-dev libfreetype6-dev
+                     libwebkit2gtk-4.1-dev libx11-dev libxi-dev libxtst-dev libxext-dev
+                     libxcb-shape0-dev libxcb-xfixes0-dev libgl1-mesa-dev)
+        elif [[ "${{ inputs.variant }}" == computer-use ]]; then
+          packages+=(libx11-dev libxi-dev libxtst-dev libxext-dev)
+        fi
+        sudo apt-get update
+        sudo apt-get install -y "${packages[@]}"
+        multiarch="$(gcc -print-multiarch)"
+        echo "BINDGEN_EXTRA_CLANG_ARGS=-I/usr/include/${multiarch}" >> "$GITHUB_ENV"
+    - name: install-onnx-runtime-macos-x86_64
+      if: inputs.target == 'x86_64-apple-darwin'
+      shell: bash
+      run: |
+        set -euo pipefail
+        ORT_VERSION="1.24.2"
+        ORT_ARCHIVE="$RUNNER_TEMP/onnxruntime-osx-x86_64-${ORT_VERSION}.tgz"
+        ORT_DIR="$RUNNER_TEMP/onnxruntime-osx-x86_64-${ORT_VERSION}"
+        curl -fL --retry 3 --retry-delay 1 \
+          -o "$ORT_ARCHIVE" \
+          "https://blob.handy.computer/onnxruntime-osx-x86_64-${ORT_VERSION}.tgz"
+        tar -xzf "$ORT_ARCHIVE" -C "$RUNNER_TEMP"
+        test -d "$ORT_DIR/lib"
+        echo "ORT_LIB_LOCATION=$ORT_DIR/lib" >> "$GITHUB_ENV"
+        echo "ORT_PREFER_DYNAMIC_LINK=1" >> "$GITHUB_ENV"
+        echo "PIONEER_ONNXRUNTIME_DYLIB_DIR=$ORT_DIR/lib" >> "$GITHUB_ENV"
+        existing_rustflags="${RUSTFLAGS:-}"
+        echo "RUSTFLAGS=${existing_rustflags:+$existing_rustflags }-C link-arg=-Wl,-rpath,@executable_path" >> "$GITHUB_ENV"

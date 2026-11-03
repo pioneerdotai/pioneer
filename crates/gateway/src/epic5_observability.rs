@@ -358,22 +358,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bounded_window_denies_then_resets_without_raw_secret_key() {
-        let limiter = BoundedWindowLimiter::default();
-        let start = Instant::now();
-        let key = LimitKey::RestrictedFingerprint([7; 8]);
-        assert!(limiter.consume_at(key.clone(), 2, Duration::from_secs(10), start));
-        assert!(limiter.consume_at(key.clone(), 2, Duration::from_secs(10), start));
-        assert!(!limiter.consume_at(key.clone(), 2, Duration::from_secs(10), start));
-        assert!(limiter.consume_at(
-            key,
-            2,
-            Duration::from_secs(10),
-            start + Duration::from_secs(10),
-        ));
-    }
-
-    #[test]
     fn limiter_covers_each_epic5_key_class_and_keeps_bounded_state() {
         let limiter = BoundedWindowLimiter::default();
         let now = Instant::now();

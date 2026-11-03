@@ -174,48 +174,6 @@ mod tests {
     use std::sync::mpsc::channel;
 
     #[test]
-    fn test_event_proxy_creation() {
-        let (tx, _rx) = channel();
-        let _proxy = GpuiEventProxy::new(tx);
-    }
-
-    #[test]
-    fn test_wakeup_event() {
-        let (tx, rx) = channel();
-        let proxy = GpuiEventProxy::new(tx);
-
-        proxy.send_event(Event::Wakeup);
-
-        let event = rx.recv().unwrap();
-        assert!(matches!(event, TerminalEvent::Wakeup));
-    }
-
-    #[test]
-    fn test_bell_event() {
-        let (tx, rx) = channel();
-        let proxy = GpuiEventProxy::new(tx);
-
-        proxy.send_event(Event::Bell);
-
-        let event = rx.recv().unwrap();
-        assert!(matches!(event, TerminalEvent::Bell));
-    }
-
-    #[test]
-    fn test_title_event() {
-        let (tx, rx) = channel();
-        let proxy = GpuiEventProxy::new(tx);
-
-        proxy.send_event(Event::Title("Test Title".to_string()));
-
-        let event = rx.recv().unwrap();
-        match event {
-            TerminalEvent::Title(title) => assert_eq!(title, "Test Title"),
-            _ => panic!("Expected Title event"),
-        }
-    }
-
-    #[test]
     fn test_clipboard_store_event() {
         use alacritty_terminal::term::ClipboardType;
 
@@ -231,47 +189,6 @@ mod tests {
         match event {
             TerminalEvent::ClipboardStore(data) => assert_eq!(data, "clipboard data"),
             _ => panic!("Expected ClipboardStore event"),
-        }
-    }
-
-    #[test]
-    fn test_clipboard_load_event() {
-        use alacritty_terminal::term::ClipboardType;
-        use std::sync::Arc;
-
-        let (tx, rx) = channel();
-        let proxy = GpuiEventProxy::new(tx);
-
-        // ClipboardLoad requires a callback function
-        let callback = Arc::new(|s: &str| s.to_string());
-        proxy.send_event(Event::ClipboardLoad(ClipboardType::Clipboard, callback));
-
-        let event = rx.recv().unwrap();
-        assert!(matches!(event, TerminalEvent::ClipboardLoad));
-    }
-
-    #[test]
-    fn test_exit_event() {
-        let (tx, rx) = channel();
-        let proxy = GpuiEventProxy::new(tx);
-
-        proxy.send_event(Event::Exit);
-
-        let event = rx.recv().unwrap();
-        assert!(matches!(event, TerminalEvent::Exit));
-    }
-
-    #[test]
-    fn test_reset_title_event() {
-        let (tx, rx) = channel();
-        let proxy = GpuiEventProxy::new(tx);
-
-        proxy.send_event(Event::ResetTitle);
-
-        let event = rx.recv().unwrap();
-        match event {
-            TerminalEvent::Title(title) => assert!(title.is_empty()),
-            _ => panic!("Expected Title event"),
         }
     }
 
@@ -298,5 +215,45 @@ mod tests {
 
         // Sending should not panic even though the channel is disconnected
         proxy.send_event(Event::Wakeup);
+    }
+
+    #[test]
+    fn unit_events_keep_their_exact_terminal_variant() {
+        use alacritty_terminal::term::ClipboardType;
+        use std::sync::Arc;
+        for (input, expected) in [
+            (Event::Wakeup, TerminalEvent::Wakeup),
+            (Event::Bell, TerminalEvent::Bell),
+            (
+                Event::ClipboardLoad(ClipboardType::Clipboard, Arc::new(|s: &str| s.to_string())),
+                TerminalEvent::ClipboardLoad,
+            ),
+            (Event::Exit, TerminalEvent::Exit),
+        ] {
+            let (tx, rx) = channel();
+            let proxy = GpuiEventProxy::new(tx);
+            proxy.send_event(input);
+            let actual = rx.recv().unwrap();
+            assert_eq!(
+                std::mem::discriminant(&actual),
+                std::mem::discriminant(&expected)
+            );
+        }
+    }
+
+    #[test]
+    fn title_events_keep_text_and_reset_to_an_empty_title() {
+        for (input, expected) in [
+            (Event::Title("Test Title".to_string()), "Test Title"),
+            (Event::ResetTitle, ""),
+        ] {
+            let (tx, rx) = channel();
+            let proxy = GpuiEventProxy::new(tx);
+            proxy.send_event(input);
+            let TerminalEvent::Title(title) = rx.recv().unwrap() else {
+                panic!("Expected Title event");
+            };
+            assert_eq!(title, expected);
+        }
     }
 }

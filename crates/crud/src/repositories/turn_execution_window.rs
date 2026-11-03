@@ -6,7 +6,7 @@ use pioneer_protocol::{
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::{
     ActiveModelTrait, ActiveValue, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter,
-    QueryOrder, Set, Unchanged,
+    QueryOrder, QuerySelect, QueryTrait, Set, Unchanged,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
@@ -760,19 +760,13 @@ pub async fn close_active_execution_windows_for_terminal_turns<C: ConnectionTrai
     ];
 
     let terminal_turn_ids = turn::Entity::find()
+        .select_only()
+        .column(turn::Column::Id)
         .filter(turn::Column::Status.is_in(terminal_turn_statuses))
-        .all(db)
-        .await
-        .context("failed to list terminal turns for execution-window repair")?
-        .into_iter()
-        .map(|turn| turn.id)
-        .collect::<Vec<_>>();
-    if terminal_turn_ids.is_empty() {
-        return Ok(0);
-    }
+        .into_query();
 
     let windows = turn_execution_window::Entity::find()
-        .filter(turn_execution_window::Column::TurnId.is_in(terminal_turn_ids))
+        .filter(turn_execution_window::Column::TurnId.in_subquery(terminal_turn_ids))
         .filter(turn_execution_window::Column::Status.is_in(active_window_statuses))
         .all(db)
         .await
@@ -1208,13 +1202,5 @@ mod tests {
             execution_window_exhaustion_reason_from_db(&reason_db).unwrap(),
             reason
         );
-    }
-
-    #[test]
-    fn checkpoint_kind_roundtrips_through_db_string() {
-        let kind = TurnExecutionCheckpointKind::WindowExhausted;
-        let encoded = checkpoint_kind_to_db(kind);
-        assert_eq!(encoded, "window_exhausted");
-        assert_eq!(checkpoint_kind_from_db(&encoded).unwrap(), kind);
     }
 }

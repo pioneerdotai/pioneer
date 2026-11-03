@@ -2,7 +2,9 @@ use anyhow::{Context, Result, bail};
 use pioneer_entity::turn_event_projection_stream_state;
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::{Expr, OnConflict};
-use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, Set};
+use sea_orm::{
+    ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QuerySelect, QueryTrait, Set,
+};
 
 pub const STREAM_STATUS_HEALTHY: &str = "healthy";
 pub const STREAM_STATUS_QUARANTINED: &str = "quarantined";
@@ -42,9 +44,13 @@ pub async fn ensure_healthy<C: ConnectionTrait>(
         format!("failed to initialize projection stream state for Turn `{turn_id}`")
     })?;
 
-    find(db, turn_id).await?.with_context(|| {
-        format!("projection stream state for Turn `{turn_id}` is missing after initialization")
-    })
+    turn_event_projection_stream_state::Entity::find_by_id(turn_id)
+        .lock_exclusive()
+        .one(db)
+        .await?
+        .with_context(|| {
+            format!("projection stream state for Turn `{turn_id}` is missing after initialization")
+        })
 }
 
 pub async fn find<C: ConnectionTrait>(
@@ -55,6 +61,60 @@ pub async fn find<C: ConnectionTrait>(
         .one(db)
         .await
         .with_context(|| format!("failed to load projection stream state for Turn `{turn_id}`"))
+}
+
+/// One reader snapshot proves scope, immutable ownership, projected admission,
+/// stream health and summary absence. Never synthesize a zero-revision tombstone.
+pub async fn find_detached_work_tombstone<C: ConnectionTrait>(
+    db: &C,
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+) -> Result<Option<(i64, i64)>> {
+    use pioneer_entity::{thread, turn, turn_work_projection};
+
+    let state = turn_event_projection_stream_state::Entity::find_by_id(turn_id.to_owned())
+        .filter(turn_event_projection_stream_state::Column::ThreadId.eq(thread_id))
+        .filter(turn_event_projection_stream_state::Column::Status.eq(STREAM_STATUS_HEALTHY))
+        .filter(turn_event_projection_stream_state::Column::BlockingEventId.is_null())
+        .filter(turn_event_projection_stream_state::Column::ProjectedThroughSequence.gt(0))
+        .filter(
+            turn_event_projection_stream_state::Column::TurnId.in_subquery(
+                turn::Entity::find_by_id(turn_id.to_owned())
+                    .select_only()
+                    .column(turn::Column::Id)
+                    .filter(turn::Column::ThreadId.eq(thread_id))
+                    .filter(
+                        turn::Column::WorkOwner.eq(crate::TurnWorkOwner::DetachedTask.as_db_str()),
+                    )
+                    .filter(
+                        turn::Column::ThreadId.in_subquery(
+                            thread::Entity::find_by_id(thread_id.to_owned())
+                                .select_only()
+                                .column(thread::Column::Id)
+                                .filter(thread::Column::WorkspaceId.eq(workspace_id))
+                                .into_query(),
+                        ),
+                    )
+                    .into_query(),
+            ),
+        )
+        .filter(
+            turn_event_projection_stream_state::Column::TurnId.not_in_subquery(
+                turn_work_projection::Entity::find_by_id(turn_id.to_owned())
+                    .select_only()
+                    .column(turn_work_projection::Column::TurnId)
+                    .into_query(),
+            ),
+        )
+        .one(db)
+        .await?;
+    Ok(state.map(|state| {
+        (
+            state.projected_through_sequence,
+            state.updated_at.timestamp_micros(),
+        )
+    }))
 }
 
 pub async fn advance_projected_through<C: ConnectionTrait>(
@@ -70,7 +130,7 @@ pub async fn advance_projected_through<C: ConnectionTrait>(
         );
     }
 
-    Ok(turn_event_projection_stream_state::Entity::update_many()
+    let changed = turn_event_projection_stream_state::Entity::update_many()
         .col_expr(
             turn_event_projection_stream_state::Column::ProjectedThroughSequence,
             Expr::value(projected_through_sequence),
@@ -92,7 +152,22 @@ pub async fn advance_projected_through<C: ConnectionTrait>(
             )
         })?
         .rows_affected
-        > 0)
+        > 0;
+    if changed {
+        let new = turn_event_projection_stream_state::Entity::find_by_id(turn_id)
+            .lock_exclusive()
+            .one(db)
+            .await?;
+        // The successful conditional UPDATE proves the previous watermark.
+        // It changes no identity/health/accepted-terminal facts, so reconstruct
+        // that before-image without a second metadata read per streaming delta.
+        let old = new.clone().map(|mut row| {
+            row.projected_through_sequence = expected_current_sequence;
+            row
+        });
+        super::task_child_producers::receipt_change(db, old.as_ref(), new.as_ref()).await?;
+    }
+    Ok(changed)
 }
 
 /// Records the active causal blocker. Repeating the same transition is a
@@ -165,10 +240,15 @@ pub async fn quarantine<C: ConnectionTrait>(
         > 0;
 
     if changed {
+        let mut new = current.clone();
+        new.status = STREAM_STATUS_QUARANTINED.to_owned();
+        super::task_child_producers::receipt_change(db, Some(&current), Some(&new)).await?;
         return Ok(true);
     }
 
-    let current = find(db, turn_id)
+    let current = turn_event_projection_stream_state::Entity::find_by_id(turn_id)
+        .lock_exclusive()
+        .one(db)
         .await?
         .with_context(|| format!("projection stream `{turn_id}` disappeared during quarantine"))?;
     if current.status == STREAM_STATUS_QUARANTINED
@@ -185,7 +265,11 @@ pub async fn restore<C: ConnectionTrait>(
     blocking_event_id: &str,
     restored_at: DateTimeWithTimeZone,
 ) -> Result<bool> {
-    Ok(turn_event_projection_stream_state::Entity::update_many()
+    let old = turn_event_projection_stream_state::Entity::find_by_id(turn_id)
+        .lock_exclusive()
+        .one(db)
+        .await?;
+    let changed = turn_event_projection_stream_state::Entity::update_many()
         .col_expr(
             turn_event_projection_stream_state::Column::Status,
             Expr::value(STREAM_STATUS_HEALTHY.to_owned()),
@@ -223,7 +307,15 @@ pub async fn restore<C: ConnectionTrait>(
         .await
         .with_context(|| format!("failed to restore projection stream for Turn `{turn_id}`"))?
         .rows_affected
-        > 0)
+        > 0;
+    if changed {
+        let new = turn_event_projection_stream_state::Entity::find_by_id(turn_id)
+            .lock_exclusive()
+            .one(db)
+            .await?;
+        super::task_child_producers::receipt_change(db, old.as_ref(), new.as_ref()).await?;
+    }
+    Ok(changed)
 }
 
 /// Canonical acceptance, independent of projection completion. PK lookup only.
@@ -249,6 +341,10 @@ pub async fn accept_terminal<C: ConnectionTrait>(
     ) {
         return Ok(());
     }
+    let old = turn_event_projection_stream_state::Entity::find_by_id(&event.turn_id)
+        .lock_exclusive()
+        .one(db)
+        .await?;
     let changed = turn_event_projection_stream_state::Entity::update_many()
         .col_expr(
             turn_event_projection_stream_state::Column::AcceptedTerminalEventId,
@@ -274,6 +370,11 @@ pub async fn accept_terminal<C: ConnectionTrait>(
         changed == 1,
         "terminal append conflicts with accepted canonical result"
     );
+    let new = turn_event_projection_stream_state::Entity::find_by_id(&event.turn_id)
+        .lock_exclusive()
+        .one(db)
+        .await?;
+    super::task_child_producers::receipt_change(db, old.as_ref(), new.as_ref()).await?;
     Ok(())
 }
 
@@ -297,7 +398,11 @@ pub async fn clear_confirmed_blocked_for_resume<C: ConnectionTrait>(
         !super::native_cancellation_context::has_accepted(db, turn_id).await?,
         "blocked resume cannot clear an accepted cancellation fence"
     );
-    let Some(current) = find(db, turn_id).await? else {
+    let Some(current) = turn_event_projection_stream_state::Entity::find_by_id(turn_id)
+        .lock_exclusive()
+        .one(db)
+        .await?
+    else {
         return Ok(());
     };
     anyhow::ensure!(
@@ -315,6 +420,7 @@ pub async fn clear_confirmed_blocked_for_resume<C: ConnectionTrait>(
         .context("blocked marker has no accepted sequence")?;
     let id = current
         .accepted_terminal_event_id
+        .clone()
         .context("blocked marker has no canonical identity")?;
     anyhow::ensure!(
         current.accepted_terminal_event_type.as_deref() == Some("turn/blocked")
@@ -353,5 +459,10 @@ pub async fn clear_confirmed_blocked_for_resume<C: ConnectionTrait>(
         changed == 1,
         "blocked terminal marker changed while resuming"
     );
+    let new = turn_event_projection_stream_state::Entity::find_by_id(turn_id)
+        .lock_exclusive()
+        .one(db)
+        .await?;
+    super::task_child_producers::receipt_change(db, Some(&current), new.as_ref()).await?;
     Ok(())
 }

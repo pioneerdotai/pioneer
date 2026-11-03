@@ -45,6 +45,26 @@ pub struct ArtifactService {
     quota_policy: ArtifactQuotaPolicy,
     gc_policy: ArtifactGcPolicy,
     preview_activity: Arc<tokio::sync::RwLock<()>>,
+    preview_released: Arc<tokio::sync::Notify>,
+}
+
+/// Drop the actual activity fence before waking maintenance. No SQL in Drop.
+pub struct HtmlPreviewActivityGuard {
+    guard: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
+    released: Arc<tokio::sync::Notify>,
+}
+impl Drop for HtmlPreviewActivityGuard {
+    fn drop(&mut self) {
+        drop(self.guard.take());
+        self.released.notify_one();
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HtmlPreviewMaintenanceOutcome {
+    More,
+    Idle,
+    Deferred,
 }
 
 /// Cursors and EOF are one pass: a short traversal stays finished while the
@@ -55,6 +75,7 @@ pub struct HtmlPreviewMaintenanceProgress {
     blobs: String,
     copies: String,
     finished: [bool; 3],
+    io_seeded: bool,
 }
 
 /// Domain-owned bounded read used by the agent artifact tool.
@@ -206,6 +227,7 @@ impl ArtifactService {
             quota_policy: ArtifactQuotaPolicy::default(),
             gc_policy: ArtifactGcPolicy::default(),
             preview_activity: Default::default(),
+            preview_released: Default::default(),
         }
     }
 
@@ -220,6 +242,7 @@ impl ArtifactService {
             quota_policy,
             gc_policy: ArtifactGcPolicy::default(),
             preview_activity: Default::default(),
+            preview_released: Default::default(),
         }
     }
 
@@ -235,6 +258,7 @@ impl ArtifactService {
             quota_policy,
             gc_policy,
             preview_activity: Default::default(),
+            preview_released: Default::default(),
         }
     }
 
@@ -242,6 +266,18 @@ impl ArtifactService {
     /// Shared by this service and its maintenance owner; never a DB permit.
     pub async fn html_preview_activity(&self) -> tokio::sync::OwnedRwLockReadGuard<()> {
         self.preview_activity.clone().read_owned().await
+    }
+
+    pub async fn html_preview_activity_signaled(&self) -> HtmlPreviewActivityGuard {
+        HtmlPreviewActivityGuard {
+            guard: Some(self.preview_activity.clone().read_owned().await),
+            released: self.preview_released.clone(),
+        }
+    }
+
+    /// Retained local hint only; durable due discovery remains authoritative.
+    pub async fn html_preview_release_notified(&self) {
+        self.preview_released.notified().await;
     }
 
     pub async fn ingest_bytes(
@@ -793,17 +829,29 @@ impl ArtifactService {
         &self,
         progress: &mut HtmlPreviewMaintenanceProgress,
     ) -> ArtifactResult<bool> {
+        Ok(self.html_preview_maintenance_outcome(progress).await?
+            != HtmlPreviewMaintenanceOutcome::Idle)
+    }
+
+    pub async fn html_preview_maintenance_outcome(
+        &self,
+        progress: &mut HtmlPreviewMaintenanceProgress,
+    ) -> ArtifactResult<HtmlPreviewMaintenanceOutcome> {
         let store = self.store.with_maintenance_access();
         if progress.finished.iter().all(|done| *done) {
             progress.finished = [false; 3];
         }
+        let mut deferred = false;
+        let mut copies_deferred = false;
         let preview_result = if progress.finished[0] {
             Ok(false)
         } else {
             match self.preview_activity.clone().try_write_owned() {
                 Ok(_activity) => progress.previews.quantum(&store).await,
-                // Defer this traversal until the next pass; no ownership is released.
-                Err(_) => Ok(false),
+                Err(_) => {
+                    deferred = true;
+                    Ok(true)
+                }
             }
         };
         if let Ok(more) = &preview_result {
@@ -848,7 +896,10 @@ impl ArtifactService {
                 deletion_error = Some(error);
             }
         }
-        let (id, copy) = if progress.finished[2] {
+        if !progress.io_seeded {
+            progress.io_seeded = store.html_preview_io_seed_complete().await?;
+        }
+        let (id, copy) = if progress.finished[2] || progress.io_seeded {
             (String::new(), None)
         } else {
             store
@@ -858,35 +909,73 @@ impl ArtifactService {
         progress.finished[2] = id.is_empty();
         progress.copies = id.clone();
         if let Some((workspace, previous)) = copy {
-            if let Some(root) = self.blob_store.local_artifact_root() {
-                let mut metadata: serde_json::Value = serde_json::from_str(&previous)
-                    .map_err(|_| content_invariant("invalid released preview metadata"))?;
-                if let Some(paths) = metadata["htmlTool"]["releasedCopies"].as_array() {
-                    for path in paths {
-                        let path = path.as_str().ok_or_else(|| {
-                            content_invariant("invalid released preview copy path")
-                        })?;
-                        crate::readable_copy::remove_released_preview_copy(
-                            &root,
-                            &workspace,
-                            Path::new(path),
-                        )
+            match self
+                .prepare_html_preview_copy_cleanup(&workspace, &previous)
+                .await?
+            {
+                Some(prepared) => {
+                    store
+                        .finish_html_preview_copy_cleanup(&id, &previous, &prepared)
                         .await?;
-                    }
                 }
-                metadata["htmlTool"]["releasedCopies"] = json!([]);
-                let prepared = serde_json::to_string(&metadata)
-                    .map_err(|_| content_invariant("invalid released preview metadata"))?;
-                store
-                    .finish_html_preview_copy_cleanup(&id, &previous, &prepared)
-                    .await?;
+                None => {
+                    copies_deferred = true;
+                    progress.copies.clear();
+                    progress.finished[2] = false;
+                }
             }
         }
         if let Some(error) = deletion_error {
             return Err(error);
         }
         preview_result?;
-        Ok(!progress.finished.iter().all(|done| *done))
+        let runnable = (!progress.finished[0] && !deferred)
+            || !progress.finished[1]
+            || (!progress.finished[2] && !copies_deferred);
+        Ok(if runnable {
+            HtmlPreviewMaintenanceOutcome::More
+        } else if deferred || copies_deferred {
+            HtmlPreviewMaintenanceOutcome::Deferred
+        } else if progress.finished.iter().all(|done| *done) {
+            HtmlPreviewMaintenanceOutcome::Idle
+        } else {
+            HtmlPreviewMaintenanceOutcome::More
+        })
+    }
+
+    /// Physical preparation only: caller owns source proof and conditional
+    /// source+ticket commit. Partial deletion is retried idempotently.
+    /// None means this storage backend has no local root, never success.
+    pub async fn prepare_html_preview_copy_cleanup(
+        &self,
+        workspace: &str,
+        previous: &str,
+    ) -> ArtifactResult<Option<String>> {
+        let Some(root) = self.blob_store.local_artifact_root() else {
+            return Ok(None);
+        };
+        let mut metadata: serde_json::Value = serde_json::from_str(previous)
+            .map_err(|_| content_invariant("invalid released preview metadata"))?;
+        let paths = metadata["htmlTool"]["releasedCopies"]
+            .as_array()
+            .ok_or_else(|| content_invariant("invalid released preview copy list"))?;
+        // Validate the entire list before beginning physical work.
+        let paths = paths
+            .iter()
+            .map(|path| {
+                path.as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| content_invariant("invalid released preview copy path"))
+            })
+            .collect::<ArtifactResult<Vec<_>>>()?;
+        for path in paths {
+            crate::readable_copy::remove_released_preview_copy(&root, workspace, Path::new(&path))
+                .await?;
+        }
+        metadata["htmlTool"]["releasedCopies"] = json!([]);
+        serde_json::to_string(&metadata)
+            .map(Some)
+            .map_err(|_| content_invariant("invalid released preview metadata"))
     }
 
     pub async fn read_bounded_artifact(
@@ -2102,41 +2191,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn registration_db_failure_after_blob_write_cleans_up_blob_and_rows() {
-        let harness = setup().await;
-        harness
-            .store
-            .database_connection()
-            .execute_unprepared(
-                "CREATE TRIGGER fail_artifact_insert BEFORE INSERT ON artifact BEGIN SELECT RAISE(FAIL, 'forced artifact failure'); END;",
-            )
-            .await
-            .expect("create failure trigger");
-        let bytes = b"blob already written";
-        let request = ingest_request("ws_a", "thr_a", "turn_a", bytes, "cleanup.txt");
-        let storage_key = storage_key_for(bytes);
-        let blob_path = LocalArtifactBlobStore::new(harness._temp.path())
-            .blob_path("ws_a", storage_key.as_str())
-            .expect("blob path");
-
-        let error = harness
-            .service
-            .ingest_bytes(request)
-            .await
-            .expect_err("DB failure should fail registration");
-
-        assert!(matches!(error, ArtifactError::Database { .. }));
-        assert_eq!(count_blobs(harness.store.as_ref(), "ws_a").await, 0);
-        assert_eq!(count_artifacts(harness.store.as_ref(), "ws_a").await, 0);
-        assert_eq!(count_versions(harness.store.as_ref(), "ws_a").await, 0);
-        assert_eq!(count_bindings(harness.store.as_ref(), "ws_a").await, 0);
-        assert!(
-            !blob_path.exists(),
-            "blob should be cleaned up after DB failure"
-        );
-    }
-
-    #[tokio::test]
     async fn registration_blob_write_failure_leaves_no_db_rows() {
         let db = Database::connect("sqlite::memory:")
             .await
@@ -2162,41 +2216,6 @@ mod tests {
         assert_eq!(count_artifacts(store.as_ref(), "ws_a").await, 0);
         assert_eq!(count_versions(store.as_ref(), "ws_a").await, 0);
         assert_eq!(count_bindings(store.as_ref(), "ws_a").await, 0);
-    }
-
-    #[tokio::test]
-    async fn registration_binding_failure_rolls_back_artifact_graph_and_cleans_blob() {
-        let harness = setup().await;
-        harness
-            .store
-            .database_connection()
-            .execute_unprepared(
-                "CREATE TRIGGER fail_artifact_binding_insert BEFORE INSERT ON artifact_binding BEGIN SELECT RAISE(FAIL, 'forced binding failure'); END;",
-            )
-            .await
-            .expect("create failure trigger");
-        let bytes = b"binding failure";
-        let request = ingest_request("ws_a", "thr_a", "turn_a", bytes, "binding.txt");
-        let storage_key = storage_key_for(bytes);
-        let blob_path = LocalArtifactBlobStore::new(harness._temp.path())
-            .blob_path("ws_a", storage_key.as_str())
-            .expect("blob path");
-
-        let error = harness
-            .service
-            .ingest_bytes(request)
-            .await
-            .expect_err("binding failure should fail registration");
-
-        assert!(matches!(error, ArtifactError::Database { .. }));
-        assert_eq!(count_blobs(harness.store.as_ref(), "ws_a").await, 0);
-        assert_eq!(count_artifacts(harness.store.as_ref(), "ws_a").await, 0);
-        assert_eq!(count_versions(harness.store.as_ref(), "ws_a").await, 0);
-        assert_eq!(count_bindings(harness.store.as_ref(), "ws_a").await, 0);
-        assert!(
-            !blob_path.exists(),
-            "blob should be cleaned up after binding rollback"
-        );
     }
 
     #[tokio::test]
@@ -2763,65 +2782,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_provider_attachment_rejects_deleted_artifact() {
-        let harness = setup().await;
-        let created = harness
-            .service
-            .ingest_bytes(ingest_request(
-                "ws_a",
-                "thr_a",
-                "turn_a",
-                b"hello provider",
-                "provider.txt",
-            ))
-            .await
-            .expect("ingest bytes");
-        harness
-            .store
-            .update_test_artifact_status(&created.artifact.artifact_id, "deleted")
-            .await
-            .expect("mark deleted");
-
-        let error = harness
-            .service
-            .resolve_provider_attachment("ws_a", created.artifact.artifact_id.as_str(), None)
-            .await
-            .expect_err("deleted artifact should be rejected");
-
-        assert!(matches!(error, ArtifactError::InvalidRequest { .. }));
-    }
-
-    #[tokio::test]
-    async fn resolve_provider_attachment_rejects_quarantined_artifact() {
-        let harness = setup().await;
-        let created = harness
-            .service
-            .ingest_bytes(ingest_request(
-                "ws_a",
-                "thr_a",
-                "turn_a",
-                b"hello provider",
-                "provider.txt",
-            ))
-            .await
-            .expect("ingest bytes");
-        update_artifact_status(
-            harness.store.as_ref(),
-            &created.artifact.artifact_id,
-            "quarantined",
-        )
-        .await;
-
-        let error = harness
-            .service
-            .resolve_provider_attachment("ws_a", created.artifact.artifact_id.as_str(), None)
-            .await
-            .expect_err("quarantined artifact should be rejected");
-
-        assert!(matches!(error, ArtifactError::InvalidRequest { .. }));
-    }
-
-    #[tokio::test]
     async fn resolve_provider_attachment_missing_artifact_is_not_found() {
         let harness = setup().await;
 
@@ -2899,6 +2859,7 @@ mod tests {
         assert_eq!(summary.artifact.kind, ArtifactKind::Text);
         assert_eq!(summary.artifact.mime_type.as_deref(), Some("text/plain"));
         assert_eq!(summary.bindings.len(), 1);
+        assert_eq!(summary.bindings[0].turn_id.as_deref(), Some("turn_a"));
     }
 
     #[tokio::test]
@@ -3027,32 +2988,6 @@ mod tests {
         assert!(matches!(error, ArtifactError::LocalPathRejected { .. }));
         assert_eq!(count_artifacts(harness.store.as_ref(), "ws_a").await, 0);
         assert_eq!(count_blobs(harness.store.as_ref(), "ws_a").await, 0);
-    }
-
-    #[tokio::test]
-    async fn local_path_successful_ingestion_creates_binding() {
-        let harness = setup().await;
-        let root = harness._temp.path().join("allowed");
-        tokio::fs::create_dir_all(&root).await.expect("create root");
-        let file = root.join("bound.txt");
-        tokio::fs::write(&file, b"bound")
-            .await
-            .expect("write local file");
-
-        let summary = harness
-            .service
-            .ingest_source(local_source_request(
-                "ws_a",
-                "thr_a",
-                "turn_a",
-                file,
-                ArtifactLocalPathPolicy::new(vec![root]),
-            ))
-            .await
-            .expect("ingest local path");
-
-        assert_eq!(summary.bindings.len(), 1);
-        assert_eq!(summary.bindings[0].turn_id.as_deref(), Some("turn_a"));
     }
 
     #[tokio::test]
@@ -3483,5 +3418,89 @@ mod tests {
             .update_test_artifact_status(artifact_id, status)
             .await
             .expect("update artifact status");
+    }
+
+    #[tokio::test]
+    async fn resolve_provider_attachment_rejects_unavailable_artifact_states() {
+        for (status, rejection_message) in [
+            ("deleted", "deleted artifact should be rejected"),
+            ("quarantined", "quarantined artifact should be rejected"),
+        ] {
+            let harness = setup().await;
+            let created = harness
+                .service
+                .ingest_bytes(ingest_request(
+                    "ws_a",
+                    "thr_a",
+                    "turn_a",
+                    b"hello provider",
+                    "provider.txt",
+                ))
+                .await
+                .expect("ingest bytes");
+            update_artifact_status(
+                harness.store.as_ref(),
+                &created.artifact.artifact_id,
+                status,
+            )
+            .await;
+
+            let error = harness
+                .service
+                .resolve_provider_attachment("ws_a", created.artifact.artifact_id.as_str(), None)
+                .await
+                .expect_err(rejection_message);
+
+            assert!(
+                matches!(error, ArtifactError::InvalidRequest { .. }),
+                "{status}: {error:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn registration_database_faults_roll_back_graph_and_clean_blob() {
+        for (trigger, bytes, display_name, registration_failure, cleanup_failure) in [
+            (
+                "CREATE TRIGGER fail_artifact_insert BEFORE INSERT ON artifact BEGIN SELECT RAISE(FAIL, 'forced artifact failure'); END;",
+                b"blob already written".as_slice(),
+                "cleanup.txt",
+                "DB failure should fail registration",
+                "blob should be cleaned up after DB failure",
+            ),
+            (
+                "CREATE TRIGGER fail_artifact_binding_insert BEFORE INSERT ON artifact_binding BEGIN SELECT RAISE(FAIL, 'forced binding failure'); END;",
+                b"binding failure".as_slice(),
+                "binding.txt",
+                "binding failure should fail registration",
+                "blob should be cleaned up after binding rollback",
+            ),
+        ] {
+            let harness = setup().await;
+            harness
+                .store
+                .database_connection()
+                .execute_unprepared(trigger)
+                .await
+                .expect("create failure trigger");
+            let request = ingest_request("ws_a", "thr_a", "turn_a", bytes, display_name);
+            let storage_key = storage_key_for(bytes);
+            let blob_path = LocalArtifactBlobStore::new(harness._temp.path())
+                .blob_path("ws_a", storage_key.as_str())
+                .expect("blob path");
+
+            let error = harness
+                .service
+                .ingest_bytes(request)
+                .await
+                .expect_err(registration_failure);
+
+            assert!(matches!(error, ArtifactError::Database { .. }));
+            assert_eq!(count_blobs(harness.store.as_ref(), "ws_a").await, 0);
+            assert_eq!(count_artifacts(harness.store.as_ref(), "ws_a").await, 0);
+            assert_eq!(count_versions(harness.store.as_ref(), "ws_a").await, 0);
+            assert_eq!(count_bindings(harness.store.as_ref(), "ws_a").await, 0);
+            assert!(!blob_path.exists(), "{cleanup_failure}");
+        }
     }
 }
