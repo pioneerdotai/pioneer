@@ -38047,11 +38047,16 @@ async fn assert_detached_native_child_turn_cancellation(native_api: bool) {
         "parent TaskRun occurrences are execution-free projections"
     );
 
-    let parent_anchor = wait_for_task_anchor_item_status(
-        crud_store.clone(),
-        parent_occurrence_turn_id,
-        crate::task_tools::task_run_anchor_id(run.id.as_str()).as_str(),
-        TaskStatus::Cancelled,
+    // Keep the subscribed client reading while the fanout worker publishes
+    // cancellation. A full notification queue would stall the card refresh.
+    let parent_anchor = drain_test_notifications_while(
+        &mut rx,
+        wait_for_task_anchor_item_status(
+            crud_store.clone(),
+            parent_occurrence_turn_id,
+            crate::task_tools::task_run_anchor_id(run.id.as_str()).as_str(),
+            TaskStatus::Cancelled,
+        ),
     )
     .await;
     assert_eq!(parent_anchor.status, TaskStatus::Cancelled);
@@ -38106,11 +38111,14 @@ async fn assert_detached_native_child_turn_cancellation(native_api: bool) {
         TurnStatus::Interrupted,
         "late delivery must not turn a cancelled occurrence into Completed"
     );
-    let reloaded_anchor = wait_for_task_anchor_item_status(
-        crud_store,
-        parent_occurrence_turn_id,
-        crate::task_tools::task_run_anchor_id(run.id.as_str()).as_str(),
-        TaskStatus::Cancelled,
+    let reloaded_anchor = drain_test_notifications_while(
+        &mut rx,
+        wait_for_task_anchor_item_status(
+            crud_store,
+            parent_occurrence_turn_id,
+            crate::task_tools::task_run_anchor_id(run.id.as_str()).as_str(),
+            TaskStatus::Cancelled,
+        ),
     )
     .await;
     assert_eq!(reloaded_anchor.status, TaskStatus::Cancelled);
