@@ -81066,7 +81066,10 @@ async fn wait_for_task_anchor_item_status(
     item_id: &str,
     expected_status: TaskStatus,
 ) -> TaskTurnItem {
-    for _ in 0..100 {
+    // Fanout uses bounded pages and a five-second periodic wake when a bus
+    // notification is coalesced. Allow multiple quanta, as the turn-status
+    // waiter does, while still requiring the exact durable card status.
+    for _ in 0..1_200 {
         if let Some(TurnItem::Task { item }) = crud_store
             .get_turn_item(turn_id, item_id)
             .await
