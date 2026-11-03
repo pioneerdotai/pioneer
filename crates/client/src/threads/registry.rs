@@ -6446,6 +6446,114 @@ mod tests {
     }
 
     #[test]
+    fn terminal_cancellation_wakes_history_after_queued_job_reaches_blocked_wait() {
+        struct GatedResume {
+            held: HeldHistory,
+            release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+        }
+        impl crate::rpc::JsonRpcRequestTransport for GatedResume {
+            fn send_json_rpc_request(
+                &self,
+                id: String,
+                payload: String,
+                response: crate::rpc::JsonRpcResponseSender,
+            ) -> Result<(), String> {
+                let rpc: serde_json::Value = serde_json::from_str(&payload).unwrap();
+                let gate = rpc["method"] == "turn/get";
+                crate::rpc::JsonRpcRequestTransport::send_json_rpc_request(
+                    &self.held, id, payload, response,
+                )?;
+                if gate {
+                    self.release
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .map_err(|_| "test did not release Resume send".to_owned())?;
+                }
+                Ok(())
+            }
+        }
+        let (core, _, waiting) = history_owner_fixture();
+        let watchdog = std::time::Duration::from_secs(5);
+        let (tx, requests) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        *core
+            .transport_runtime()
+            .ws_command_sender()
+            .test_requests
+            .lock()
+            .unwrap() = Some(Arc::new(GatedResume {
+            held: HeldHistory(tx),
+            release: std::sync::Mutex::new(released),
+        }));
+        core.apply_thread_conversation_event(
+            "ws",
+            ConversationEvent::TurnStarted {
+                thread_id: "a".into(),
+                turn: running_turn("A"),
+            },
+            None,
+        );
+        core.schedule_thread_resume("a").unwrap();
+        let (rpc, old) = requests.recv_timeout(watchdog).unwrap();
+        assert_eq!(rpc["method"], "turn/get");
+        assert_eq!(rpc["params"]["turn_id"], "A");
+        let (token, params) = core.begin_thread_turn_cancellation("a", None).unwrap();
+        assert_eq!(params.turn_id, "A");
+        queue_history(&core, "b");
+        // Owner is still inside send A, so draining cannot race with a new
+        // waiting notification. Every later signal belongs to the B phase.
+        for _ in waiting.try_iter() {}
+        release.send(()).unwrap();
+        // The first wait consumes the coalesced enqueue wake. The second has
+        // exhausted that wake and the eligible work, with A's barrier held.
+        for _ in 0..2 {
+            assert!(
+                waiting
+                    .recv_timeout(watchdog)
+                    .unwrap()
+                    .is_some_and(|d| !d.is_zero())
+            );
+        }
+        assert!(old.is_active());
+        assert!(std::time::Instant::now() < old.deadline());
+        let mut cancelled = running_turn("A");
+        cancelled.status = TurnStatus::Interrupted;
+        let event = crate::turns::cancel::turn_cancel_response_event(TurnCancelResponse {
+            workspace_id: "ws".into(),
+            thread_id: "a".into(),
+            turn: cancelled,
+        });
+        assert!(core.finish_thread_turn_cancellation(&token, "A", event, false));
+        assert_eq!(
+            core.thread_coordinator_snapshot("a")
+                .unwrap()
+                .conversation
+                .in_flight_turn_id(),
+            None
+        );
+        let (rpc, b) = requests
+            .recv_timeout(
+                watchdog.min(
+                    old.deadline()
+                        .saturating_duration_since(std::time::Instant::now()),
+                ),
+            )
+            .expect("terminal cancellation alone wakes history and releases the serial barrier");
+        assert!(
+            std::time::Instant::now() < old.deadline(),
+            "progress must precede A's timeout"
+        );
+        assert_eq!(rpc["method"], "thread/timeline/page");
+        assert_eq!(rpc["params"]["threadId"], "b");
+        assert!(!old.is_active());
+        assert!(old.send(Ok(serde_json::Value::Null)).is_err());
+        assert!(b.is_active());
+        core.shutdown();
+        wait_history_owner_exit(&waiting);
+    }
+
+    #[test]
     fn terminal_or_moved_resume_retires_snapshot_and_items_without_waiting_for_reply() {
         let watchdog = std::time::Duration::from_secs(5);
         for page in [false, true] {
@@ -6477,14 +6585,20 @@ mod tests {
                 }
                 queue_history(&core, "b");
                 if moved {
-                    core.apply_thread_conversation_event(
-                        "ws",
-                        ConversationEvent::TurnStarted {
-                            thread_id: "a".into(),
-                            turn: running_turn("new"),
-                        },
-                        None,
-                    );
+                    // One registry-owned lifecycle transition: history cannot
+                    // retire the held RPC in the gap between terminal A and B.
+                    let mut mutation = core.thread_mutation("a", "ws").unwrap();
+                    let mut cancelled = running_turn("old");
+                    cancelled.status = TurnStatus::Interrupted;
+                    mutation.conversation.apply(ConversationEvent::TurnFailed {
+                        thread_id: "a".into(),
+                        turn: cancelled,
+                    });
+                    mutation.conversation.apply(ConversationEvent::TurnStarted {
+                        thread_id: "a".into(),
+                        turn: running_turn("new"),
+                    });
+                    assert_eq!(mutation.conversation.in_flight_turn_id(), Some("new"));
                 } else {
                     let mut turn = running_turn("old");
                     turn.status = TurnStatus::Completed;
@@ -6773,10 +6887,17 @@ mod tests {
             {
                 let mut mutation = core.thread_mutation("a", "ws").unwrap();
                 super::resume::reset_thread_resume_coordinator(&mut mutation.resume);
+                let mut cancelled = running_turn("A");
+                cancelled.status = TurnStatus::Interrupted;
+                mutation.conversation.apply(ConversationEvent::TurnFailed {
+                    thread_id: "a".into(),
+                    turn: cancelled,
+                });
                 mutation.conversation.apply(ConversationEvent::TurnStarted {
                     thread_id: "a".into(),
                     turn: running_turn("B"),
                 });
+                assert_eq!(mutation.conversation.in_flight_turn_id(), Some("B"));
             }
             if !reset_after_sweep {
                 core.retire_thread_controller_jobs();
@@ -6847,14 +6968,12 @@ mod tests {
             let (sender, receiver) = crate::threads::history_scheduler::channel();
             *core.thread_request_sender.lock().unwrap() = Some(sender);
             let start = |turn: &str| {
-                core.apply_thread_conversation_event(
-                    "ws",
-                    ConversationEvent::TurnStarted {
-                        thread_id: "a".into(),
-                        turn: running_turn(turn),
-                    },
-                    None,
-                );
+                let mut mutation = core.thread_mutation("a", "ws").unwrap();
+                mutation.conversation.apply(ConversationEvent::TurnStarted {
+                    thread_id: "a".into(),
+                    turn: running_turn(turn),
+                });
+                assert_eq!(mutation.conversation.in_flight_turn_id(), Some(turn));
             };
             let cancel = |turn: &str| {
                 let (token, params) = core.begin_thread_turn_cancellation("a", None).unwrap();
@@ -6889,13 +7008,13 @@ mod tests {
                 None,
             )));
 
-            // Both lifecycle paths leave the Resume coordinator untouched.
-            // Cancellation removes the turn; a live new turn moves it to B.
+            // Cancellation removes A without resetting Resume. Only then
+            // may a live TurnStarted move the conversation to B.
+            cancel("A");
             if moved {
                 start("B");
                 core.schedule_thread_resume("a").unwrap();
             } else {
-                cancel("A");
                 assert_eq!(
                     core.thread_coordinator_snapshot("a")
                         .unwrap()
@@ -19023,6 +19142,10 @@ impl ClientCore {
             drafts,
             vec![],
         );
+        drop(registry);
+        // The cancellation owner may still hold its mutex. Only wake history;
+        // its normal sweep cancels retired waiters outside all domain locks.
+        self.wake_thread_timeline_requests();
         true
     }
 }
