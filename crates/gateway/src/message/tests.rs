@@ -50560,9 +50560,7 @@ async fn production_self_improvement_vertical_e2e_reaches_native_and_excludes_cl
             None => None,
         };
         panic!(
-            "native Agent turn must invoke read_skill and continue: {error:?}; transport_len={}; transport_capacity={}; requests={:#?}; snapshot={native_snapshot:#?}; items={native_items:#?}; aggregate={native_aggregate:#?}",
-            harness.rx.len(),
-            harness.rx.capacity(),
+            "native Agent turn must invoke read_skill and continue: {error:?}; requests={:#?}; snapshot={native_snapshot:#?}; items={native_items:#?}; aggregate={native_aggregate:#?}",
             native_provider.snapshot_requests(),
         );
     }

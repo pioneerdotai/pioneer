@@ -19,6 +19,8 @@ pub(crate) mod test_support;
 pub(crate) mod outbound;
 pub(crate) use outbound::SessionOutbound;
 
+pub(crate) const OUTBOUND_CLOSE_GRACE: Duration = Duration::from_millis(250);
+
 pub type ConnectionId = u64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -434,6 +436,7 @@ impl SessionManager {
         match sender.try_send_data(Message::Text(payload.into())) {
             Ok(()) => Ok(()),
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                sender.abort();
                 record_outbound_queue_saturation("notification_connection_evicted");
                 self.unregister_connection(connection_id).await;
                 Err(anyhow!(

@@ -24,7 +24,7 @@ use crate::auth::{AuthenticatedSessionPrincipal, GatewayAuthService};
 use crate::message::MessageProcessor;
 use crate::session::SessionManager;
 
-const ACCESS_CLOSE_GRACE: Duration = Duration::from_millis(250);
+const ACCESS_CLOSE_GRACE: Duration = crate::session::OUTBOUND_CLOSE_GRACE;
 
 // Existing deferred budgets. Check projected bytes before retaining any frame.
 const MAX_DEFERRED_FRAMES: usize = 64;
@@ -334,6 +334,15 @@ pub(super) async fn run_admitted_connection(
     }
 }
 
+/// Per-connection deterministic fault synchronization; no runtime policy flag.
+#[cfg(test)]
+pub(crate) struct NormalConnectionTestHooks {
+    pub registered: tokio::sync::oneshot::Sender<(crate::session::ConnectionId, SessionOutbound)>,
+    pub writer_start: tokio::sync::oneshot::Receiver<()>,
+    pub write_block: Option<tokio::sync::oneshot::Receiver<()>>,
+    pub write_entered: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
 pub(crate) async fn run_normal_connection(
     ws: WebSocket,
     config: AppConfig,
@@ -341,7 +350,31 @@ pub(crate) async fn run_normal_connection(
     auth_service: Arc<GatewayAuthService>,
     message_processor: Arc<MessageProcessor>,
     session_manager: Arc<SessionManager>,
+    server_cancellation: watch::Receiver<bool>,
+) -> Result<()> {
+    run_normal_connection_inner(
+        ws,
+        config,
+        principal,
+        auth_service,
+        message_processor,
+        session_manager,
+        server_cancellation,
+        #[cfg(test)]
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn run_normal_connection_inner(
+    ws: WebSocket,
+    config: AppConfig,
+    principal: Arc<AuthenticatedSessionPrincipal>,
+    auth_service: Arc<GatewayAuthService>,
+    message_processor: Arc<MessageProcessor>,
+    session_manager: Arc<SessionManager>,
     mut server_cancellation: watch::Receiver<bool>,
+    #[cfg(test)] mut test_hooks: Option<NormalConnectionTestHooks>,
 ) -> Result<()> {
     config.gateway.validate_outbound()?;
     let (mut ws_writer, mut ws_reader) = ws.split();
@@ -405,10 +438,26 @@ pub(crate) async fn run_normal_connection(
         .await;
     });
 
+    #[cfg(test)]
+    let mut writer_hooks = test_hooks.take().map(|hooks| {
+        let _ = hooks.registered.send((connection_id, outbound_tx.clone()));
+        (hooks.writer_start, hooks.write_block, hooks.write_entered)
+    });
     let writer_outbound = outbound_tx.clone();
     let mut writer_task = tokio::spawn(async move {
+        #[cfg(test)]
+        if let Some((start, _, _)) = writer_hooks.as_mut() {
+            let _ = start.await;
+        }
+        let mut sealed = false;
         while let Some(envelope) = tokio::select! {
-            _ = writer_outbound.closed() => { return Ok(()); }
+            biased;
+            _ = writer_outbound.writer_stopped() => anyhow::bail!("outbound writer retired"),
+            _ = writer_outbound.closed(), if !sealed => {
+                outbound_rx.seal();
+                sealed = true;
+                continue;
+            }
             envelope = outbound_rx.recv() => envelope,
         } {
             let crate::session::outbound::OutboundEnvelope {
@@ -466,7 +515,18 @@ pub(crate) async fn run_normal_connection(
                     } else {
                         write_timeout
                     },
-                    ws_writer.send(message),
+                    async {
+                        #[cfg(test)]
+                        if let Some((_, block, entered)) = writer_hooks.as_mut() {
+                            if let Some(entered) = entered.take() {
+                                let _ = entered.send(());
+                            }
+                            if let Some(block) = block.take() {
+                                let _ = block.await;
+                            }
+                        }
+                        ws_writer.send(message).await
+                    },
                 ),
             ))
             .await?;
@@ -780,7 +840,8 @@ async fn write_outbound_bounded<E: std::error::Error + Send + Sync + 'static>(
     write: impl Future<Output = std::result::Result<(), E>>,
 ) -> Result<()> {
     tokio::select! {
-        _ = outbound.closed() => anyhow::bail!("outbound retired during write"),
+        biased;
+        _ = outbound.writer_stopped() => anyhow::bail!("outbound retired during write"),
         result = tokio::time::timeout(deadline, write) => {
             result.context("websocket write deadline exceeded")?
                 .context("websocket write failed")

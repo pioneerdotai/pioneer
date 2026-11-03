@@ -19,6 +19,8 @@ struct Usage {
     data_count: usize,
     data_bytes: usize,
     closed: bool,
+    aborted: bool,
+    drain_deadline: Option<tokio::time::Instant>,
 }
 struct Admission {
     usage: Mutex<Usage>,
@@ -30,10 +32,18 @@ struct Admission {
 }
 impl Admission {
     fn close(&self) {
-        self.usage
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .closed = true;
+        let mut u = self.usage.lock().unwrap_or_else(|p| p.into_inner());
+        u.closed = true;
+        u.drain_deadline
+            .get_or_insert_with(|| tokio::time::Instant::now() + super::OUTBOUND_CLOSE_GRACE);
+        drop(u);
+        self.changed.notify_waiters();
+    }
+    fn abort(&self) {
+        let mut u = self.usage.lock().unwrap_or_else(|p| p.into_inner());
+        u.closed = true;
+        u.aborted = true;
+        drop(u);
         self.changed.notify_waiters();
     }
 }
@@ -69,6 +79,10 @@ pub(crate) struct OutboundReceiver {
     admission: Arc<Admission>,
 }
 impl OutboundReceiver {
+    pub(crate) fn seal(&mut self) {
+        self.admission.close();
+        self.rx.close();
+    }
     #[cfg(test)]
     pub(crate) fn try_recv(&mut self) -> Result<OutboundEnvelope, mpsc::error::TryRecvError> {
         self.rx.try_recv()
@@ -79,7 +93,7 @@ impl OutboundReceiver {
 }
 impl Drop for OutboundReceiver {
     fn drop(&mut self) {
-        self.admission.close();
+        self.admission.abort();
     }
 }
 #[derive(Clone)]
@@ -122,6 +136,36 @@ impl SessionOutbound {
     }
     pub(crate) fn close(&self) {
         self.admission.close();
+    }
+    pub(crate) fn abort(&self) {
+        self.admission.abort();
+    }
+    /// Graceful seal stops producers immediately but permits FIFO drain until
+    /// its original deadline. Repeated seal cannot extend that deadline.
+    pub(crate) async fn writer_stopped(&self) {
+        loop {
+            let notified = self.admission.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let (aborted, deadline) = {
+                let u = self
+                    .admission
+                    .usage
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                (u.aborted, u.drain_deadline)
+            };
+            if aborted {
+                return;
+            }
+            match deadline {
+                Some(deadline) => tokio::select! {
+                    _ = tokio::time::sleep_until(deadline) => return,
+                    _ = notified => {},
+                },
+                None => notified.await,
+            }
+        }
     }
     pub(crate) async fn closed(&self) {
         loop {
@@ -175,6 +219,7 @@ impl SessionOutbound {
         };
         if bytes > ceiling {
             u.closed = true;
+            u.aborted = true;
             drop(u);
             self.admission.changed.notify_waiters();
             tracing::debug!(
@@ -360,6 +405,30 @@ mod tests {
         let (tx, _rx) = SessionOutbound::channel(8, 100, 20);
         assert!(tx.try_send_data(text(81)).is_err());
         assert!(tx.try_send(text(1)).is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn graceful_seal_rejects_new_producers_without_extending_drain_deadline() {
+        let (tx, _rx) = SessionOutbound::channel(2, 100, 20);
+        tx.send(text(100)).await.unwrap();
+        let mut waiting = Box::pin(tx.send(text(1)));
+        assert!(waiting.as_mut().now_or_never().is_none());
+        tx.close();
+        assert!(waiting.await.is_err());
+        assert!(tx.writer_stopped().now_or_never().is_none());
+        tokio::time::advance(std::time::Duration::from_millis(200)).await;
+        tx.close();
+        assert!(tx.writer_stopped().now_or_never().is_none());
+        tokio::time::advance(std::time::Duration::from_millis(50)).await;
+        tx.writer_stopped()
+            .now_or_never()
+            .expect("repeat close must not extend the original 250ms grace");
+        let (tx, _rx) = SessionOutbound::channel(2, 100, 20);
+        tx.close();
+        tx.abort();
+        tx.writer_stopped()
+            .now_or_never()
+            .expect("abort must escalate seal immediately");
     }
 
     #[tokio::test]
