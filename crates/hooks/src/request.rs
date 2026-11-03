@@ -395,6 +395,10 @@ impl TurnPostTurnHookInputLimits {
 pub struct HookTextPreview {
     pub text: String,
     pub original_chars: usize,
+    #[serde(default)]
+    pub original_bytes: Option<usize>,
+    #[serde(default)]
+    pub original_size_known: bool,
     pub truncated: bool,
     pub max_chars: usize,
 }
@@ -535,6 +539,8 @@ impl HookTextPreview {
         Self {
             text: preview,
             original_chars,
+            original_bytes: Some(text.len()),
+            original_size_known: true,
             truncated,
             max_chars,
         }
@@ -634,6 +640,11 @@ impl TurnPostTurnDomainEventSummary {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnPostTurnHookInput {
     pub status: TurnPostTurnStatus,
+    /// Bounded extraction sources, independent of diagnostic previews. Missing in legacy payloads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extraction_user_text: Option<HookTextPreview>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extraction_assistant_text: Option<HookTextPreview>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -691,6 +702,12 @@ impl TurnPostTurnHookInput {
         let model = model.and_then(|value| bounded_nonempty_string(value.as_ref(), 160));
         let model_provider =
             model_provider.and_then(|value| bounded_nonempty_string(value.as_ref(), 160));
+        let extraction_user_text = user_text
+            .as_ref()
+            .map(|text| HookTextPreview::from_text(text, 16_000));
+        let extraction_assistant_text = assistant_text
+            .as_ref()
+            .map(|text| HookTextPreview::from_text(text, 16_000));
         let user_text = user_text
             .filter(|text| !text.as_ref().is_empty())
             .map(|text| HookTextPreview::from_text(text, limits.user_text_preview_max_chars));
@@ -713,6 +730,8 @@ impl TurnPostTurnHookInput {
 
         Self {
             status,
+            extraction_user_text,
+            extraction_assistant_text,
             model,
             model_provider,
             user_text,

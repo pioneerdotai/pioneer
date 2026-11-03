@@ -798,3 +798,11 @@ pub(crate) fn agent_memory_repair_job_record_from_model(
         updated_at_unix: model.updated_at.timestamp(),
     })
 }
+
+/// Reserved scope identity for new workspace-local user facts. Legacy user keys stay global.
+pub fn parse_workspace_user_scope_key(key: &str) -> Option<String> {
+    key.strip_prefix("workspace:")?
+        .strip_suffix(":user:default")
+        .filter(|workspace| !workspace.is_empty())
+        .map(str::to_owned)
+}

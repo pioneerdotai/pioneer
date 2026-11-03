@@ -6,6 +6,7 @@ use pioneer_memory::hooks::{
     MemoryDurableTerminalEffectClaim, MemoryManifest, MemoryManifestRequest,
     MemoryPostTurnExtractorContext, MemoryPostTurnExtractorRequest, MemoryTurnContext,
 };
+use pioneer_protocol::MemoryStatus;
 use pioneer_provider::{ProviderFailureClassification, ProviderTermination};
 use sea_orm::EntityTrait;
 use std::collections::VecDeque;
@@ -21,6 +22,9 @@ struct ResponseProvider {
     streams: std::sync::Mutex<Option<VecDeque<Vec<StreamChunk>>>>,
     revoke: std::sync::Mutex<Option<(Arc<CrudStore>, String, String, i64)>>,
     failures: std::sync::Mutex<VecDeque<ScriptedProviderFailure>>,
+    limits: std::sync::Mutex<Option<pioneer_provider::catalog::CatalogLimits>>,
+    preparations: AtomicUsize,
+    requests: std::sync::Mutex<Vec<ChatRequest>>,
 }
 
 #[derive(Debug)]
@@ -61,6 +65,9 @@ impl ResponseProvider {
             streams: std::sync::Mutex::new(None),
             revoke: std::sync::Mutex::new(None),
             failures: std::sync::Mutex::new(VecDeque::new()),
+            limits: std::sync::Mutex::new(None),
+            preparations: AtomicUsize::new(0),
+            requests: std::sync::Mutex::new(Vec::new()),
         }
     }
 }
@@ -86,10 +93,37 @@ impl Provider for ResponseProvider {
         classification.retry_after_ms = failure.retry_after_ms;
         Some(classification)
     }
+    async fn prepare_model(&self, _model: &str) -> anyhow::Result<()> {
+        self.preparations.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+    async fn model_limits(
+        &self,
+        model: &str,
+    ) -> anyhow::Result<pioneer_provider::catalog::CatalogLimits> {
+        // Simulate connection-local facts made available by lazy discovery.
+        if self.preparations.load(Ordering::SeqCst) > 0
+            && let Some(limits) = self.limits.lock().unwrap().clone()
+        {
+            return Ok(limits);
+        }
+        Ok(pioneer_provider::catalog::model_catalog()?.limits(self.name(), model))
+    }
     async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
         if is_memory_post_turn_extractor_request(&request) {
             assert!(request.tools.is_none());
-            assert!(request.max_tokens.is_none());
+            assert!(request.temperature.is_none());
+            if self
+                .limits
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(|limits| limits.max_output)
+                .is_none()
+            {
+                assert!(request.max_tokens.is_none());
+            }
+            self.requests.lock().unwrap().push(request.clone());
             self.calls.fetch_add(1, Ordering::SeqCst);
             if let Some(failure) = self.failures.lock().unwrap().pop_front() {
                 return Err(failure.into());
@@ -128,6 +162,7 @@ impl Provider for ResponseProvider {
     ) -> anyhow::Result<futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>> {
         assert!(is_memory_post_turn_extractor_request(&request));
         assert!(request.tools.is_none());
+        self.requests.lock().unwrap().push(request.clone());
         self.calls.fetch_add(1, Ordering::SeqCst);
         let chunks = self
             .streams
@@ -147,6 +182,7 @@ struct Fixture {
     effect_id: String,
     now: i64,
     preparation: pioneer_protocol::NativeTerminalEffectPreparation,
+    correction_target_id: Option<String>,
 }
 
 async fn fixture(replies: Vec<ChatResponse>) -> Fixture {
@@ -168,7 +204,16 @@ async fn fixture_with_registry(
     provider_name: &str,
     fail_write: bool,
 ) -> Fixture {
-    fixture_on_workspace(provider, registry, provider_name, fail_write, None, Some(3)).await
+    fixture_on_workspace(
+        provider,
+        registry,
+        provider_name,
+        fail_write,
+        None,
+        Some(3),
+        false,
+    )
+    .await
 }
 
 async fn fixture_on_workspace(
@@ -178,6 +223,7 @@ async fn fixture_on_workspace(
     fail_write: bool,
     workspace: Option<(Arc<WorkspaceManager>, Arc<CrudStore>, String)>,
     max_attempts: Option<u16>,
+    correction_replay: bool,
 ) -> Fixture {
     let harness = match workspace {
         Some(workspace) => {
@@ -198,6 +244,8 @@ async fn fixture_on_workspace(
         let write = Arc::new(FailOnceAfterWrite {
             bridge: bridge.clone(),
             calls: AtomicUsize::new(0),
+            fail_call_index: usize::from(correction_replay),
+            before_write: correction_replay,
         });
         let runtime =
             crate::hook_runtime::GatewayHookRuntimeBuilder::new(harness.crud_store.clone())
@@ -220,16 +268,48 @@ async fn fixture_on_workspace(
             .set_hook_runtime(Some(runtime))
             .await;
     }
-    let params = test_task_create_params(
-        &harness.workspace_id,
-        THREAD,
-        TURN,
-        "My name is Alexander",
-        3,
-    );
+    let source = if correction_replay {
+        "Remember my corrected name: My name is Alexander. Use English."
+    } else {
+        "My name is Alexander"
+    };
+    let params = test_task_create_params(&harness.workspace_id, THREAD, TURN, source, 3);
     ensure_task_create_parent_turn_for_test(&harness.processor, &params)
         .await
         .unwrap();
+    let correction_target_id = if correction_replay {
+        let runtime = harness.processor.memory_runtime();
+        let operation = runtime.operation_context(Some(harness.workspace_id.clone()), None);
+        let mut initial = memory_remember_params(
+            user_memory_scope(),
+            MemoryCategory::Identity,
+            Some("user/global:identity:self:name"),
+            "User name is Previous",
+        );
+        initial.namespace = Some("identity".into());
+        let target = runtime
+            .service()
+            .remember(operation, initial)
+            .await
+            .unwrap()
+            .record
+            .id;
+        let mut response: serde_json::Value = serde_json::from_str(&valid_fact()).unwrap();
+        response["facts"][0]["target_memory_id"] = json!(target);
+        let mut second = response["facts"][0].clone();
+        second["target_memory_id"] = serde_json::Value::Null;
+        second["semantic"]["category"] = json!("preference");
+        second["semantic"]["attribute"] = json!("preferred_language");
+        second["ontology"]["fact_class"] = json!("stable_user_preference");
+        second["content"] = json!("User prefers English");
+        second["value"] = json!("English");
+        second["evidence"]["quote_or_span"] = json!("Use English.");
+        response["facts"].as_array_mut().unwrap().push(second);
+        *provider.replies.lock().unwrap() = VecDeque::from([text_response(response.to_string())]);
+        Some(target)
+    } else {
+        None
+    };
     let runtime = harness
         .processor
         .agent_manager
@@ -247,7 +327,7 @@ async fn fixture_on_workspace(
                 pioneer_hooks::TurnPostTurnStatus::Succeeded,
                 Some("test-model"),
                 Some(provider_name),
-                Some("My name is Alexander"),
+                Some(source),
                 Some("Understood."),
                 None::<&str>,
                 vec![],
@@ -258,6 +338,45 @@ async fn fixture_on_workspace(
         .await
         .unwrap()
         .unwrap();
+    if correction_replay {
+        // This fixture represents an explicitly authorized policy at preparation,
+        // before the durable snapshot is published, not an LLM permission claim.
+        let pioneer_protocol::NativeTerminalEffectPayload::PostTurnHook { request, .. } =
+            &mut preparation.effects[0].payload
+        else {
+            panic!("post-turn snapshot");
+        };
+        let mut phase: pioneer_hooks::HookPhaseRequest =
+            serde_json::from_value(request.clone()).unwrap();
+        let entry = phase
+            .policy_set
+            .entries
+            .values_mut()
+            .find(|entry| entry.domain.as_str() == "memory" && entry.key.as_str() == "turn_policy")
+            .unwrap();
+        let pioneer_hooks::HookValue::Object(policy) = &mut entry.value else {
+            panic!("typed memory policy");
+        };
+        policy.insert(
+            pioneer_hooks::HookMetadataKey::new("explicit_remember").unwrap(),
+            pioneer_hooks::HookValue::Bool(true),
+        );
+        policy.insert(
+            pioneer_hooks::HookMetadataKey::new("reason_code").unwrap(),
+            pioneer_hooks::HookValue::Text("explicit_remember".into()),
+        );
+        policy.insert(
+            pioneer_hooks::HookMetadataKey::new("source").unwrap(),
+            pioneer_hooks::HookValue::Text("structured_override".into()),
+        );
+        assert!(
+            pioneer_memory::hooks::memory_turn_policy_from_hook_policy_set(&phase.policy_set)
+                .unwrap()
+                .unwrap()
+                .explicit_remember
+        );
+        *request = serde_json::to_value(phase).unwrap();
+    }
     assert_eq!(preparation.effects[0].max_attempts, 8);
     if let Some(max_attempts) = max_attempts {
         preparation.effects[0].max_attempts = max_attempts;
@@ -294,6 +413,7 @@ async fn fixture_on_workspace(
         effect_id,
         now,
         preparation,
+        correction_target_id,
     }
 }
 
@@ -530,6 +650,7 @@ fn memory_http_403_exhausts_original_eight_attempts_across_database_restart() {
             false,
             Some((manager, store, workspace)),
             None,
+            false,
         )
         .await;
         let database = f
@@ -945,6 +1066,7 @@ fn memory_response_stale_claim_cannot_publish_checkpoint_or_memory() {
                 .extract_post_turn_memory_json(
                     context,
                     MemoryPostTurnExtractorRequest {
+                        source_metadata: serde_json::Value::Null,
                         user_text: "My name is Alexander".to_owned(),
                         assistant_text: "Understood".to_owned(),
                         tool_events_summary: String::new(),
@@ -1015,6 +1137,8 @@ fn memory_response_stale_claim_cannot_publish_checkpoint_or_memory() {
 struct FailOnceAfterWrite {
     bridge: Arc<GatewayMemoryProvider>,
     calls: AtomicUsize,
+    fail_call_index: usize,
+    before_write: bool,
 }
 
 #[async_trait]
@@ -1032,8 +1156,12 @@ impl AgentMemoryWriteProvider for FailOnceAfterWrite {
         params: pioneer_protocol::MemorySemanticWriteParams,
     ) -> Result<pioneer_protocol::MemorySemanticWriteResponse, pioneer_memory::MemoryWriteFailure>
     {
+        let fail = self.calls.fetch_add(1, Ordering::SeqCst) == self.fail_call_index;
+        if fail && self.before_write {
+            return Err(pioneer_memory::MemoryWriteFailure::StorageTransient);
+        }
         let result = self.bridge.write_semantic_memory(context, params).await?;
-        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+        if fail {
             return Err(pioneer_memory::MemoryWriteFailure::StorageTransient);
         }
         Ok(result)
@@ -1214,7 +1342,7 @@ fn memory_response_canary_is_absent_from_sentry_events_and_breadcrumbs() {
         assert!(!serialized.contains(CANARY));
         assert!(serialized.contains("fresh_response_validation"));
         assert!(serialized.contains("test-model"));
-        assert!(serialized.contains("structure"));
+        assert!(serialized.contains("facts_not_array"));
     });
 }
 
@@ -1431,6 +1559,242 @@ fn memory_openrouter_incomplete_adapter_stream_exhausts_only_original_budget() {
                 assert_eq!(f.row().await.attempt_count, 3);
                 let _ = std::fs::remove_dir_all(&f.harness.runtime_home);
             }
+        }
+    });
+}
+
+#[test]
+fn disabled_extraction_returns_typed_empty_response_without_provider_calls() {
+    run_gateway_message_test("disabled_extractor_response", || async {
+        let f = fixture(vec![]).await;
+        let bridge = GatewayMemoryProvider::new(Arc::downgrade(&f.harness.processor));
+        let base = f.harness.processor.memory_loop_config();
+        for flag in ["enabled", "provider_enabled", "proactive_writes_enabled"] {
+            let mut config = base.clone();
+            match flag {
+                "enabled" => config.post_turn_extractor.enabled = false,
+                "provider_enabled" => config.post_turn_extractor.provider_enabled = false,
+                _ => config.post_turn_extractor.proactive_writes_enabled = false,
+            }
+            f.harness.processor.apply_memory_loop_config(config);
+            let result = bridge
+                .extract_post_turn_memory_json(
+                    MemoryPostTurnExtractorContext {
+                        workspace_id: f.harness.workspace_id.clone(),
+                        thread_id: THREAD.into(),
+                        turn_id: TURN.into(),
+                        mode: ThreadMode::Agent,
+                        model: Some("test-model".into()),
+                        model_provider: Some("openai".into()),
+                        durable_terminal_effect: None,
+                    },
+                    MemoryPostTurnExtractorRequest {
+                        source_metadata: serde_json::Value::Null,
+                        user_text: "source".into(),
+                        assistant_text: String::new(),
+                        tool_events_summary: String::new(),
+                        domain_events_summary: String::new(),
+                        manifest: MemoryManifest::default(),
+                        max_facts: 1,
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(result.raw_json, "{\"facts\":[]}");
+            assert!(result.manifest.is_none());
+        }
+        assert_eq!(f.provider.calls.load(Ordering::SeqCst), 0);
+        let _ = std::fs::remove_dir_all(&f.harness.runtime_home);
+    });
+}
+
+#[test]
+fn authorized_correction_partial_failure_replays_same_successor_and_checkpoint() {
+    run_gateway_message_test("correction_partial_replay", || async {
+        let provider = Arc::new(ResponseProvider::new(vec![]));
+        let registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+            "openai",
+            provider.clone(),
+        ));
+        let f = fixture_on_workspace(provider, registry, "openai", true, None, Some(3), true).await;
+        f.attempt().await;
+        assert_eq!(f.row().await.status, "retry_wait");
+        assert!(f.row().await.handler_checkpoint_json.is_some());
+        assert_eq!(f.provider.calls.load(Ordering::SeqCst), 1);
+        let target = f
+            .harness
+            .crud_store
+            .get_agent_memory_record(f.correction_target_id.as_deref().unwrap(), true)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(target.status, MemoryStatus::Superseded);
+        let successor = target.superseded_by.unwrap();
+        let b = f
+            .harness
+            .crud_store
+            .get_agent_memory_record(&successor, false)
+            .await
+            .unwrap()
+            .unwrap();
+        let metadata: serde_json::Value =
+            serde_json::from_str(b.metadata_json.as_deref().unwrap()).unwrap();
+        let evidence = metadata["evidence"].clone();
+        assert_eq!(evidence["count"], 1);
+        f.attempt().await;
+        assert_eq!(f.row().await.status, "succeeded");
+        assert_eq!(f.provider.calls.load(Ordering::SeqCst), 1);
+        let replay = f
+            .harness
+            .crud_store
+            .get_agent_memory_record(&successor, false)
+            .await
+            .unwrap()
+            .unwrap();
+        let replay_metadata: serde_json::Value =
+            serde_json::from_str(replay.metadata_json.as_deref().unwrap()).unwrap();
+        assert_eq!(replay_metadata["evidence"], evidence);
+        let records = f
+            .harness
+            .crud_store
+            .list_agent_memory_records(pioneer_crud::AgentMemoryListFilter {
+                scopes: vec![user_memory_scope()],
+                statuses: vec![MemoryStatus::Active],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(records.len(), 2);
+        assert!(records.iter().any(|row| row.id == successor));
+        assert!(records.iter().any(
+            |row| row.key.as_deref() == Some("user/global:preference:self:preferred_language")
+        ));
+        let _ = std::fs::remove_dir_all(&f.harness.runtime_home);
+    });
+}
+
+#[test]
+fn extractor_admission_uses_selected_provider_instance_limits() {
+    run_gateway_message_test("extractor_instance_limits", || async {
+        use pioneer_provider::catalog::{CatalogLimits, OriginKind};
+        for streaming in [false, true] {
+            let provider = Arc::new(ResponseProvider::new(vec![text_response(
+                r#"{"facts":[]}"#,
+            )]));
+            if streaming {
+                *provider.streams.lock().unwrap() = Some(
+                    vec![vec![
+                        StreamChunk::delta(r#"{"facts":[]}"#),
+                        StreamChunk::final_chunk_with(ProviderTermination::Complete),
+                    ]]
+                    .into(),
+                );
+            }
+            let registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+                "openai",
+                provider.clone(),
+            ));
+            let f = fixture_with_registry(provider.clone(), registry, "openai", false).await;
+            let bridge = GatewayMemoryProvider::new(Arc::downgrade(&f.harness.processor));
+            let context = MemoryPostTurnExtractorContext {
+                workspace_id: f.harness.workspace_id.clone(),
+                thread_id: THREAD.into(),
+                turn_id: TURN.into(),
+                mode: ThreadMode::Agent,
+                model: Some("test-model".into()),
+                model_provider: Some("openai".into()),
+                durable_terminal_effect: None,
+            };
+            let request = MemoryPostTurnExtractorRequest {
+                source_metadata: serde_json::Value::Null,
+                user_text: "My name is Alexander".into(),
+                assistant_text: String::new(),
+                tool_events_summary: String::new(),
+                domain_events_summary: String::new(),
+                manifest: MemoryManifest::default(),
+                max_facts: 1,
+            };
+            let instance = CatalogLimits {
+                context_window: 32_768,
+                context_origin: OriginKind::Source,
+                max_input: Some(30_000),
+                max_output: Some(1024),
+            };
+            let public = pioneer_provider::catalog::model_catalog()
+                .unwrap()
+                .limits("openai", "test-model");
+            assert_ne!(public.max_output, instance.max_output);
+            *provider.limits.lock().unwrap() = Some(instance.clone());
+            bridge
+                .extract_post_turn_memory_json(context.clone(), request.clone())
+                .await
+                .unwrap();
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                provider.requests.lock().unwrap().last().unwrap().max_tokens,
+                Some(1024)
+            );
+            // Both context and input constraints come from this connection, before
+            // chat/stream can be called (the fixture has no second response).
+            for limits in [
+                CatalogLimits {
+                    context_window: 64,
+                    ..instance.clone()
+                },
+                CatalogLimits {
+                    max_input: Some(1),
+                    ..instance.clone()
+                },
+            ] {
+                *provider.limits.lock().unwrap() = Some(limits);
+                let error = bridge
+                    .extract_post_turn_memory_json(context.clone(), request.clone())
+                    .await
+                    .unwrap_err();
+                assert_eq!(
+                    error.code.as_str(),
+                    "memory.post_turn_extractor.source_budget_exceeded"
+                );
+                assert!(!error.retryable);
+                assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+            }
+            // Unknown optional facts retain omission; provider default parameters
+            // remain compatible, with the usual finality and response guards.
+            *provider.limits.lock().unwrap() = Some(CatalogLimits {
+                context_window: 128_000,
+                context_origin: OriginKind::Fallback,
+                max_input: None,
+                max_output: None,
+            });
+            if streaming {
+                provider
+                    .streams
+                    .lock()
+                    .unwrap()
+                    .as_mut()
+                    .unwrap()
+                    .push_back(vec![
+                        StreamChunk::delta(r#"{"facts":[]}"#),
+                        StreamChunk::final_chunk_with(ProviderTermination::Complete),
+                    ]);
+            } else {
+                provider
+                    .replies
+                    .lock()
+                    .unwrap()
+                    .push_back(text_response(r#"{"facts":[]}"#));
+            }
+            bridge
+                .extract_post_turn_memory_json(context, request)
+                .await
+                .unwrap();
+            let requests = provider.requests.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            assert!(requests[1].max_tokens.is_none());
+            assert!(requests[1].temperature.is_none());
+            drop(requests);
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+            let _ = std::fs::remove_dir_all(&f.harness.runtime_home);
         }
     });
 }

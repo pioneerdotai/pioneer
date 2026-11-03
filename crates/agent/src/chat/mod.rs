@@ -4766,7 +4766,7 @@ async fn execute_agent_provider_response(
                 let summary = AgentTurnPostTurnSummary::succeeded_with_model(
                     Some(post_turn_model.clone()),
                     Some(post_turn_model_provider.clone()),
-                    extract_user_text(input),
+                    extract_post_turn_user_text(input),
                     assistant_text,
                     Vec::new(),
                     Vec::new(),
@@ -7453,7 +7453,7 @@ async fn execute_agent_provider_response(
             let summary = AgentTurnPostTurnSummary::succeeded_with_model(
                 Some(post_turn_model.clone()),
                 Some(post_turn_model_provider.clone()),
-                extract_user_text(input),
+                extract_post_turn_user_text(input),
                 post_turn_assistant_text,
                 post_turn_tool_events,
                 post_turn_domain_events,
@@ -7538,6 +7538,18 @@ async fn execute_agent_provider_response(
             ))
         }
     }
+}
+
+// Post-turn evidence preserves canonical text whitespace independently of main prompt rendering.
+fn extract_post_turn_user_text(input: &[UserInput]) -> String {
+    input
+        .iter()
+        .filter_map(|part| match part {
+            UserInput::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn extract_user_text(input: &[UserInput]) -> String {

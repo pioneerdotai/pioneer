@@ -6006,6 +6006,11 @@ async fn terminal_effect_execution_uses_the_origin_runtime_generation() {
         .await
         .expect("thread should expose one durable receiver");
 
+    let source = format!(
+        "  {}middle{}tail\n",
+        "я".repeat(6000),
+        "я".repeat(12_000 - 6000 - "  middletail\n".chars().count())
+    );
     manager
         .start_test_turn_with_default_profile(
             thread_id,
@@ -6015,7 +6020,7 @@ async fn terminal_effect_execution_uses_the_origin_runtime_generation() {
             "capture",
             HashMap::new(),
             vec![UserInput::Text {
-                text: "Complete with the origin hook runtime.".to_owned(),
+                text: source.clone(),
                 text_elements: Vec::new(),
             }],
             Vec::new(),
@@ -6034,6 +6039,18 @@ async fn terminal_effect_execution_uses_the_origin_runtime_generation() {
         .into_iter()
         .next()
         .expect("post-turn effect should be prepared");
+
+    let pioneer_protocol::NativeTerminalEffectPayload::PostTurnHook { request, .. } =
+        &effect.payload
+    else {
+        panic!("post-turn payload");
+    };
+    assert_eq!(
+        request
+            .pointer("/input/payload/value/extraction_user_text/text")
+            .and_then(serde_json::Value::as_str),
+        Some(source.as_str())
+    );
 
     manager
         .set_hook_runtime(Some(recording_hook_runtime_for_phase(
