@@ -10,8 +10,8 @@ use pioneer_memory::hooks::{
     AgentMemoryPostTurnExtractorProvider, AgentMemoryProvider, AgentMemoryWriteProvider,
     MemoryManifest, MemoryManifestActiveItem, MemoryManifestCandidateItem, MemoryManifestRequest,
     MemoryPostTurnExtractorContext, MemoryPostTurnExtractorRequest,
-    MemoryPostTurnResponseFormatError, MemoryToolMaterialization, MemoryTurnContext,
-    validate_memory_post_turn_response_format,
+    MemoryPostTurnExtractorResponse, MemoryPostTurnResponseFormatError, MemoryToolMaterialization,
+    MemoryTurnContext, validate_memory_post_turn_response_format,
 };
 use pioneer_memory::{
     MemoryManifestFailure, MemoryManifestFailureClass, MemoryManifestFailureStage,
@@ -46,12 +46,18 @@ const MEMORY_GET_TOOL: &str = "memory_get";
 const MEMORY_REMEMBER_TOOL: &str = "memory_remember";
 const MAX_POST_TURN_EXTRACTOR_RAW_BYTES: usize = 64 * 1024;
 const MAX_POST_TURN_EXTRACTOR_CHECKPOINT_BYTES: usize = 128 * 1024;
+// Legacy checkpoints retain the 64 KiB decoder bound. Fresh responses reserve
+// space for their JSON-string encoding and the exact manifest before model I/O.
+const MAX_POST_TURN_EXTRACTOR_FRESH_RAW_BYTES: usize = 32 * 1024;
+const POST_TURN_EXTRACTOR_OUTPUT_TOKENS: u64 = 2_048;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DurableMemoryPostTurnExtractorCheckpoint {
     schema_version: u8,
     raw_json: String,
+    #[serde(default)]
+    manifest: Option<MemoryManifest>,
     model: String,
     model_provider: String,
 }
@@ -60,7 +66,7 @@ fn decode_memory_post_turn_extractor_checkpoint(
     checkpoint_json: &str,
     model: &str,
     model_provider: &str,
-) -> Result<String, String> {
+) -> Result<MemoryPostTurnExtractorResponse, String> {
     if checkpoint_json.len() > MAX_POST_TURN_EXTRACTOR_CHECKPOINT_BYTES {
         return Err(
             "memory post-turn extraction checkpoint exceeds its durable byte limit".to_owned(),
@@ -69,7 +75,7 @@ fn decode_memory_post_turn_extractor_checkpoint(
     let checkpoint: DurableMemoryPostTurnExtractorCheckpoint =
         serde_json::from_str(checkpoint_json)
             .map_err(|_| "memory post-turn extraction checkpoint is invalid".to_owned())?;
-    if checkpoint.schema_version != 1
+    if !matches!(checkpoint.schema_version, 1 | 2)
         || checkpoint.raw_json.len() > MAX_POST_TURN_EXTRACTOR_RAW_BYTES
         || checkpoint.model.trim().is_empty()
         || checkpoint.model_provider.trim().is_empty()
@@ -79,11 +85,19 @@ fn decode_memory_post_turn_extractor_checkpoint(
     if checkpoint.model != model || checkpoint.model_provider != model_provider {
         return Err("memory post-turn extraction checkpoint provider identity mismatch".to_owned());
     }
-    Ok(checkpoint.raw_json)
+    Ok(MemoryPostTurnExtractorResponse {
+        raw_json: checkpoint.raw_json,
+        manifest: if checkpoint.schema_version == 2 {
+            checkpoint.manifest
+        } else {
+            None
+        },
+    })
 }
 
 fn encode_memory_post_turn_extractor_checkpoint(
     raw_json: &str,
+    manifest: Option<MemoryManifest>,
     model: &str,
     model_provider: &str,
 ) -> Result<String, String> {
@@ -91,7 +105,8 @@ fn encode_memory_post_turn_extractor_checkpoint(
         return Err("memory post-turn extractor response exceeds its byte limit".to_owned());
     }
     let checkpoint_json = serde_json::to_string(&DurableMemoryPostTurnExtractorCheckpoint {
-        schema_version: 1,
+        schema_version: 2,
+        manifest,
         raw_json: raw_json.to_owned(),
         model: model.to_owned(),
         model_provider: model_provider.to_owned(),
@@ -104,6 +119,72 @@ fn encode_memory_post_turn_extractor_checkpoint(
     }
     Ok(checkpoint_json)
 }
+/// Strictly valid JSON can contain literal C0 controls only as tab/CR/LF
+/// whitespace. Those, quotes and backslashes expand at most 2x when the raw
+/// response is encoded as a JSON string. Typed validation precedes persistence.
+fn bound_post_turn_checkpoint_manifest(
+    manifest: &mut MemoryManifest,
+    model: &str,
+    provider: &str,
+) -> Result<(), String> {
+    loop {
+        let empty = serde_json::to_vec(&DurableMemoryPostTurnExtractorCheckpoint {
+            schema_version: 2,
+            raw_json: String::new(),
+            manifest: Some(manifest.clone()),
+            model: model.into(),
+            model_provider: provider.into(),
+        })
+        .map_err(|_| "checkpoint projection encoding failed".to_owned())?;
+        if empty
+            .len()
+            .saturating_add(2 * MAX_POST_TURN_EXTRACTOR_FRESH_RAW_BYTES)
+            <= MAX_POST_TURN_EXTRACTOR_CHECKPOINT_BYTES
+        {
+            return Ok(());
+        }
+        // Keep active correction targets ahead of optional candidate context.
+        if manifest.candidates.pop().is_none() && manifest.active.pop().is_none() {
+            return Err("checkpoint envelope exceeds bounded projection budget".into());
+        }
+        manifest.truncated = true;
+        if !manifest
+            .diagnostics
+            .iter()
+            .any(|code| code == "checkpoint_projection_truncated")
+        {
+            manifest
+                .diagnostics
+                .push("checkpoint_projection_truncated".into());
+        }
+    }
+}
+
+fn post_turn_output_budget(
+    estimated_input: u64,
+    limits: Option<&pioneer_provider::catalog::CatalogLimits>,
+) -> Option<u32> {
+    let context = limits
+        .map(|limits| limits.context_window)
+        .unwrap_or(pioneer_provider::catalog::UNKNOWN_CONTEXT_WINDOW);
+    if estimated_input
+        > limits
+            .and_then(|limits| limits.max_input)
+            .unwrap_or(u64::MAX)
+    {
+        return None;
+    }
+    let available = context.checked_sub(estimated_input)?;
+    let desired = limits
+        .and_then(|limits| limits.max_output)
+        .unwrap_or(POST_TURN_EXTRACTOR_OUTPUT_TOKENS)
+        .min(POST_TURN_EXTRACTOR_OUTPUT_TOKENS);
+    let output = available.min(desired);
+    // Even an empty facts envelope needs nonzero response headroom. Do not
+    // impose a 16K minimum context on otherwise supported short requests.
+    (output >= 32).then_some(output as u32)
+}
+
 const MEMORY_FORGET_TOOL: &str = "memory_forget";
 const DEFAULT_SEARCH_LIMIT: u32 = 8;
 const MAX_SEARCH_LIMIT: u32 = 20;
@@ -480,11 +561,61 @@ impl AgentMemoryProvider for GatewayMemoryProvider {
 
 #[async_trait]
 impl AgentMemoryPostTurnExtractorProvider for GatewayMemoryProvider {
+    async fn replay_manifest(
+        &self,
+        context: &MemoryPostTurnExtractorContext,
+    ) -> HookResult<Option<MemoryManifest>> {
+        let Some(claim) = context.durable_terminal_effect.as_ref() else {
+            return Ok(None);
+        };
+        let processor = self.processor().map_err(|_| {
+            memory_extractor_hook_error(
+                "memory.post_turn_extractor.runtime_unavailable",
+                "memory runtime unavailable",
+                true,
+                HookErrorMetadata::default(),
+            )
+        })?;
+        let checkpoint = processor
+            .crud_store
+            .with_maintenance_access()
+            .native_terminal_effect_handler_checkpoint(&claim.effect_id, &claim.claim_token)
+            .await
+            .map_err(|error| {
+                memory_extractor_hook_error(
+                    "memory.post_turn_extractor.checkpoint_load_failed",
+                    "checkpoint load failed",
+                    error
+                        .downcast_ref::<pioneer_crud::HandlerCheckpointInvalid>()
+                        .is_none(),
+                    HookErrorMetadata::default(),
+                )
+            })?;
+        checkpoint
+            .map(|checkpoint| {
+                decode_memory_post_turn_extractor_checkpoint(
+                    &checkpoint,
+                    context.model.as_deref().unwrap_or_default(),
+                    context.model_provider.as_deref().unwrap_or_default(),
+                )
+                .map(|response| response.manifest.unwrap_or_default())
+                .map_err(|_| {
+                    memory_extractor_hook_error(
+                        "memory.post_turn_extractor.checkpoint_invalid",
+                        "checkpoint invalid",
+                        false,
+                        HookErrorMetadata::default(),
+                    )
+                })
+            })
+            .transpose()
+    }
+
     async fn extract_post_turn_memory_json(
         &self,
         context: MemoryPostTurnExtractorContext,
-        request: MemoryPostTurnExtractorRequest,
-    ) -> HookResult<String> {
+        mut request: MemoryPostTurnExtractorRequest,
+    ) -> HookResult<MemoryPostTurnExtractorResponse> {
         let processor = self.processor().map_err(|_| {
             memory_extractor_hook_error(
                 "memory.post_turn_extractor.runtime_unavailable",
@@ -495,7 +626,10 @@ impl AgentMemoryPostTurnExtractorProvider for GatewayMemoryProvider {
         })?;
         let config = processor.memory_loop_config().post_turn_extractor;
         if !config.enabled || !config.provider_enabled || !config.proactive_writes_enabled {
-            return Ok(r#"{"facts":[]}"#.to_owned());
+            return Ok(MemoryPostTurnExtractorResponse {
+                raw_json: r#"{"facts":[]}"#.to_owned(),
+                manifest: None,
+            });
         }
         authorize_post_turn_memory_execution(
             processor.as_ref(),
@@ -607,8 +741,9 @@ impl AgentMemoryPostTurnExtractorProvider for GatewayMemoryProvider {
                     ),
                 )
             })
-            .and_then(|raw_json| {
-                validate_memory_post_turn_response_format(&raw_json).map_err(|error| {
+            .and_then(|extracted| {
+                let raw_json = &extracted.raw_json;
+                validate_memory_post_turn_response_format(raw_json).map_err(|error| {
                     memory_response_format_error(
                         provider_name,
                         model,
@@ -617,7 +752,7 @@ impl AgentMemoryPostTurnExtractorProvider for GatewayMemoryProvider {
                         error,
                     )
                 })?;
-                Ok(raw_json)
+                Ok(extracted)
             });
         }
         let provider_authorization = processor
@@ -700,9 +835,66 @@ impl AgentMemoryPostTurnExtractorProvider for GatewayMemoryProvider {
             "memory_extraction",
             context.workspace_id.as_str(),
         );
+        bound_post_turn_checkpoint_manifest(&mut request.manifest, model, provider_name).map_err(
+            |_| {
+                memory_extractor_hook_error(
+                    "memory.post_turn_extractor.source_budget_exceeded",
+                    "memory extraction checkpoint projection exceeds bounded budget",
+                    false,
+                    provider_model_metadata(provider_name, model, "checkpoint_budget"),
+                )
+            },
+        )?;
+        let prompt = request.render_prompt();
+        let instructions =
+            pioneer_promt::render_memory_post_turn_extractor_instructions(request.max_facts);
+        let estimated_input = pioneer_compaction::text_tokens(&prompt)
+            .saturating_add(pioneer_compaction::text_tokens(&instructions))
+            .saturating_add(128);
+        // Resolve connection-owned facts through both authority and usage wrappers.
+        // These awaits remain in the owning hook's cancellation/deadline scope.
+        provider.prepare_model(model).await.map_err(|error| {
+            memory_provider_request_error(
+                provider.as_ref(),
+                model,
+                "provider_model_prepare",
+                ProviderFailureStage::Connect,
+                &error,
+            )
+        })?;
+        let limits = provider.model_limits(model).await.map_err(|error| {
+            memory_provider_request_error(
+                provider.as_ref(),
+                model,
+                "provider_model_limits",
+                ProviderFailureStage::Connect,
+                &error,
+            )
+        })?;
+        let output_budget = post_turn_output_budget(estimated_input, Some(&limits));
+        if prompt.len().saturating_add(instructions.len()) > 192 * 1024 || output_budget.is_none() {
+            return Err(memory_extractor_hook_error(
+                "memory.post_turn_extractor.source_budget_exceeded",
+                "memory extraction request exceeds bounded input/output budget",
+                false,
+                provider_model_metadata(provider_name, model, "request_budget"),
+            ));
+        }
+        // Preserve omission for models without a known output contract (some
+        // existing providers reject optional output parameters). Known limits
+        // use the supported ChatRequest field, capped to remaining context.
+        let max_output_tokens = limits.max_output.and(output_budget);
         let raw_json =
-            request_post_turn_extractor_json(provider.as_ref(), model, request.render_prompt())
+            request_post_turn_extractor_json(provider.as_ref(), model, prompt, max_output_tokens)
                 .await?;
+        if raw_json.len() > MAX_POST_TURN_EXTRACTOR_FRESH_RAW_BYTES {
+            return Err(memory_extractor_hook_error(
+                "memory.post_turn_extractor.response_too_large",
+                "fresh memory extraction response exceeds its checkpoint headroom",
+                false,
+                provider_model_metadata(provider_name, model, "response_budget"),
+            ));
+        }
         validate_memory_post_turn_response_format(&raw_json).map_err(|error| {
             memory_response_format_error(
                 provider_name,
@@ -715,6 +907,7 @@ impl AgentMemoryPostTurnExtractorProvider for GatewayMemoryProvider {
         if let Some(claim) = context.durable_terminal_effect.as_ref() {
             let checkpoint_json = encode_memory_post_turn_extractor_checkpoint(
                 raw_json.as_str(),
+                Some(request.manifest.clone()),
                 model,
                 provider_name,
             )
@@ -776,7 +969,10 @@ impl AgentMemoryPostTurnExtractorProvider for GatewayMemoryProvider {
                     )
                 })?;
         }
-        Ok(raw_json)
+        Ok(MemoryPostTurnExtractorResponse {
+            raw_json,
+            manifest: Some(request.manifest),
+        })
     }
 }
 
@@ -784,8 +980,17 @@ async fn request_post_turn_extractor_json(
     provider: &dyn Provider,
     model: &str,
     prompt: String,
+    max_output_tokens: Option<u32>,
 ) -> HookResult<String> {
-    request_post_turn_extractor_json_once(provider, model, prompt, None, "primary").await
+    request_post_turn_extractor_json_once(
+        provider,
+        model,
+        prompt,
+        None,
+        "primary",
+        max_output_tokens,
+    )
+    .await
 }
 
 async fn request_post_turn_extractor_json_once(
@@ -794,8 +999,9 @@ async fn request_post_turn_extractor_json_once(
     prompt: String,
     temperature: Option<f32>,
     request_attempt: &'static str,
+    max_output_tokens: Option<u32>,
 ) -> HookResult<String> {
-    let request = post_turn_extractor_chat_request(model, prompt, temperature);
+    let request = post_turn_extractor_chat_request(model, prompt, temperature, max_output_tokens);
     if provider.capabilities().streaming {
         let stream = provider.stream_chat(request).await.map_err(|error| {
             let classified = memory_provider_request_error(
@@ -1206,12 +1412,22 @@ fn post_turn_extractor_chat_request(
     model: &str,
     prompt: String,
     temperature: Option<f32>,
+    max_output_tokens: Option<u32>,
 ) -> ChatRequest {
+    let max_facts = serde_json::from_str::<serde_json::Value>(&prompt)
+        .ok()
+        .and_then(|value| value.get("max_facts").and_then(serde_json::Value::as_u64))
+        .unwrap_or(8) as usize;
     ChatRequest {
         model: model.to_owned(),
-        messages: vec![ChatMessage::user(prompt)],
+        messages: vec![
+            ChatMessage::system(
+                pioneer_promt::render_memory_post_turn_extractor_instructions(max_facts),
+            ),
+            ChatMessage::user(prompt),
+        ],
         temperature,
-        max_tokens: None,
+        max_tokens: max_output_tokens,
         tools: None,
         tool_choice: None,
         parallel_tool_calls: None,
@@ -1429,7 +1645,7 @@ impl AgentMemoryWriteProvider for GatewayMemoryProvider {
                 operation_context.clone(),
                 MemoryListParams {
                     statuses: vec![MemoryStatus::Active],
-                    limit: Some(request.max_items as u32),
+                    limit: Some(request.max_items.saturating_add(1).min(u32::MAX as usize) as u32),
                     ..MemoryListParams::default()
                 },
             )
@@ -1452,7 +1668,7 @@ impl AgentMemoryWriteProvider for GatewayMemoryProvider {
                         MemoryCandidateStatus::ReviewDisabledRejected,
                         MemoryCandidateStatus::MergedDuplicate,
                     ],
-                    limit: Some(request.max_items as u32),
+                    limit: Some(request.max_items.saturating_add(1).min(u32::MAX as usize) as u32),
                     ..MemoryCandidatesListParams::default()
                 },
             )
@@ -1461,6 +1677,7 @@ impl AgentMemoryWriteProvider for GatewayMemoryProvider {
                 classify_memory_manifest_failure(error, MemoryManifestFailureStage::Candidates)
             })?;
 
+        let has_more = active.next_cursor.is_some() || candidates.next_cursor.is_some();
         let active_count = active.records.len();
         let candidate_count = candidates.candidates.len();
         Ok(MemoryManifest {
@@ -1473,6 +1690,7 @@ impl AgentMemoryWriteProvider for GatewayMemoryProvider {
                     scope: record.scope,
                     category: record.category,
                     key: record.key,
+                    content_truncated: record.content.chars().count() > request.max_item_chars,
                     content_preview: truncate_chars(
                         record.content.as_str(),
                         request.max_item_chars,
@@ -1490,6 +1708,8 @@ impl AgentMemoryWriteProvider for GatewayMemoryProvider {
                     scope: candidate.scope,
                     category: candidate.category,
                     key: candidate.key,
+                    content_truncated: candidate.candidate_text.chars().count()
+                        > request.max_item_chars,
                     content_preview: truncate_chars(
                         candidate.candidate_text.as_str(),
                         request.max_item_chars,
@@ -1498,8 +1718,10 @@ impl AgentMemoryWriteProvider for GatewayMemoryProvider {
                     created_at: candidate.created_at,
                 })
                 .collect(),
-            diagnostics: Vec::new(),
-            truncated: active_count > request.max_items || candidate_count > request.max_items,
+            diagnostics: vec!["bounded_manifest_coverage_unknown".to_owned()],
+            truncated: has_more
+                || active_count > request.max_items
+                || candidate_count > request.max_items,
         })
     }
 
@@ -2991,6 +3213,7 @@ mod tests {
         let raw_json = r#"{"facts":[]}"#;
         let encoded = encode_memory_post_turn_extractor_checkpoint(
             raw_json,
+            None,
             "memory-model",
             "memory-provider",
         )
@@ -3001,7 +3224,8 @@ mod tests {
                 "memory-model",
                 "memory-provider",
             )
-            .expect("matching provider identity should replay"),
+            .expect("matching provider identity should replay")
+            .raw_json,
             raw_json
         );
         assert!(
@@ -3016,12 +3240,145 @@ mod tests {
         assert!(
             encode_memory_post_turn_extractor_checkpoint(
                 "x".repeat(MAX_POST_TURN_EXTRACTOR_RAW_BYTES + 1).as_str(),
+                None,
                 "memory-model",
                 "memory-provider",
             )
             .is_err(),
             "raw provider output must remain bounded before persistence"
         );
+    }
+
+    #[test]
+    fn checkpoint_retains_original_manifest_and_legacy_does_not_invent_one() {
+        let original = MemoryManifest {
+            truncated: true,
+            diagnostics: vec!["coverage_unknown".into()],
+            ..Default::default()
+        };
+        let encoded = encode_memory_post_turn_extractor_checkpoint(
+            r#"{"facts":[]}"#,
+            Some(original.clone()),
+            "model",
+            "provider",
+        )
+        .unwrap();
+        let decoded =
+            decode_memory_post_turn_extractor_checkpoint(&encoded, "model", "provider").unwrap();
+        assert_eq!(decoded.manifest, Some(original));
+        let legacy = serde_json::json!({ "schema_version": 1, "raw_json": "{\"facts\":[]}", "model": "model", "model_provider": "provider" }).to_string();
+        assert!(
+            decode_memory_post_turn_extractor_checkpoint(&legacy, "model", "provider")
+                .unwrap()
+                .manifest
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn short_extraction_fits_small_model_window_and_real_overflow_is_rejected() {
+        let limits = pioneer_provider::catalog::CatalogLimits {
+            context_window: 8192,
+            context_origin: pioneer_provider::catalog::OriginKind::Source,
+            max_output: Some(1024),
+            max_input: Some(8192),
+        };
+        let output = post_turn_output_budget(6000, Some(&limits)).unwrap();
+        assert_eq!(output, 1024);
+        let wire = post_turn_extractor_chat_request(
+            "small-model",
+            "{\"max_facts\":1}".into(),
+            None,
+            Some(output),
+        );
+        assert_eq!(wire.max_tokens, Some(1024));
+        assert!(6000 + u64::from(output) <= limits.context_window);
+        assert!(post_turn_output_budget(8192, Some(&limits)).is_none());
+        let input_limited = pioneer_provider::catalog::CatalogLimits {
+            max_input: Some(4000),
+            ..limits
+        };
+        assert!(post_turn_output_budget(6000, Some(&input_limited)).is_none());
+    }
+
+    #[test]
+    fn unicode_manifest_projection_reserves_a_full_encoded_fresh_response() {
+        let mut manifest = MemoryManifest::default();
+        for index in 0..24 {
+            manifest.active.push(MemoryManifestActiveItem {
+                memory_id: format!("active-{index}"),
+                scope: MemoryScope {
+                    kind: MemoryScopeKind::Workspace,
+                    key: "workspace".into(),
+                },
+                category: MemoryCategory::ProjectFact,
+                key: None,
+                content_truncated: false,
+                content_preview: "🧠".repeat(800),
+                updated_at: 1,
+                status: MemoryStatus::Active,
+            });
+            manifest.candidates.push(MemoryManifestCandidateItem {
+                candidate_id: format!("candidate-{index}"),
+                scope: MemoryScope {
+                    kind: MemoryScopeKind::Workspace,
+                    key: "workspace".into(),
+                },
+                category: MemoryCategory::ProjectFact,
+                key: None,
+                content_truncated: false,
+                content_preview: "🧠".repeat(800),
+                created_at: 1,
+                status: MemoryCandidateStatus::Pending,
+            });
+        }
+        assert!(
+            encode_memory_post_turn_extractor_checkpoint(
+                "{\"facts\":[]}",
+                Some(manifest.clone()),
+                "model",
+                "provider"
+            )
+            .is_err()
+        );
+        bound_post_turn_checkpoint_manifest(&mut manifest, "model", "provider").unwrap();
+        assert!(manifest.truncated);
+        assert!(
+            manifest
+                .diagnostics
+                .iter()
+                .any(|code| code == "checkpoint_projection_truncated")
+        );
+        assert!(!manifest.active.is_empty());
+        let request = MemoryPostTurnExtractorRequest {
+            source_metadata: serde_json::Value::Null,
+            user_text: "source".into(),
+            assistant_text: String::new(),
+            tool_events_summary: String::new(),
+            domain_events_summary: String::new(),
+            manifest: manifest.clone(),
+            max_facts: 1,
+        };
+        let sent: serde_json::Value = serde_json::from_str(&request.render_prompt()).unwrap();
+        assert_eq!(
+            sent["memory_manifest"],
+            serde_json::to_value(&manifest).unwrap()
+        );
+        let mut raw = "{\"facts\":[]}".to_owned();
+        raw.push_str(&"\n".repeat(MAX_POST_TURN_EXTRACTOR_FRESH_RAW_BYTES - raw.len()));
+        validate_memory_post_turn_response_format(&raw).unwrap();
+        let encoded = encode_memory_post_turn_extractor_checkpoint(
+            &raw,
+            Some(manifest.clone()),
+            "model",
+            "provider",
+        )
+        .unwrap();
+        assert!(encoded.len() <= MAX_POST_TURN_EXTRACTOR_CHECKPOINT_BYTES);
+        let replay =
+            decode_memory_post_turn_extractor_checkpoint(&encoded, "model", "provider").unwrap();
+        assert_eq!(replay.raw_json, raw);
+        assert_eq!(replay.manifest, Some(manifest));
     }
 
     struct CompatibilityFallbackProvider {
@@ -3195,6 +3552,7 @@ mod tests {
             &provider,
             "openrouter/owl-alpha",
             "extract memory".to_owned(),
+            None,
         )
         .await
         .expect("fallback request should succeed");
@@ -3236,7 +3594,7 @@ mod tests {
         };
 
         let error =
-            request_post_turn_extractor_json(&provider, "model", "extract memory".to_owned())
+            request_post_turn_extractor_json(&provider, "model", "extract memory".to_owned(), None)
                 .await
                 .expect_err("network errors should be returned to hook runtime");
 

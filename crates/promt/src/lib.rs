@@ -42,7 +42,8 @@ pub use render::{
         render_execution_continuation_runtime_facts,
     },
     memory_post_turn_extractor::{
-        MemoryPostTurnExtractorPromptInput, render_memory_post_turn_extractor_prompt,
+        MemoryPostTurnExtractorPromptInput, render_memory_post_turn_extractor_instructions,
+        render_memory_post_turn_extractor_prompt,
     },
     memory_recall::{
         MemoryRecallPromptInput, MemoryRecallPromptPolicy, render_memory_recall_prompt,

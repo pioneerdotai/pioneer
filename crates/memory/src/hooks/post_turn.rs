@@ -72,22 +72,96 @@ pub(super) fn memory_post_turn_extractor_request_from_input(
     manifest: MemoryManifest,
     config: &MemoryPostTurnExtractorConfig,
 ) -> MemoryPostTurnExtractorRequest {
+    let metadata = |source: Option<&pioneer_hooks::HookTextPreview>| {
+        source.map(|source| serde_json::json!({
+            "original_chars": if source.original_size_known { Some(source.original_chars) } else { None },
+            "original_bytes": source.original_bytes,
+            "delivered_chars": source.text.chars().count().min(config.max_input_chars),
+            "delivered_bytes": source.text.len(),
+            "complete": source.original_size_known && !source.truncated && source.text.chars().count() <= config.max_input_chars,
+        }))
+    };
     MemoryPostTurnExtractorRequest {
+        source_metadata: serde_json::json!({
+            "snapshot_version": if input.extraction_user_text.is_some() || input.extraction_assistant_text.is_some() { 1 } else { 0 },
+            "user": metadata(input.extraction_user_text.as_ref().or(input.user_text.as_ref())),
+            "assistant": metadata(input.extraction_assistant_text.as_ref().or(input.assistant_text.as_ref())),
+        }),
         user_text: input
-            .user_text
+            .extraction_user_text
             .as_ref()
+            .or(input.user_text.as_ref())
             .map(|text| truncate_chars(text.text.as_str(), config.max_input_chars))
             .unwrap_or_default(),
         assistant_text: input
-            .assistant_text
+            .extraction_assistant_text
             .as_ref()
+            .or(input.assistant_text.as_ref())
             .map(|text| truncate_chars(text.text.as_str(), config.max_input_chars))
             .unwrap_or_default(),
-        tool_events_summary: turn_post_tool_events_summary(&input.tool_events),
-        domain_events_summary: turn_post_domain_events_summary(&input.domain_events),
+        tool_events_summary: String::new(),
+        domain_events_summary: String::new(),
         manifest,
         max_facts: config.max_facts_per_turn,
     }
+}
+
+/// Validate before semantic normalization. Only persisted, delivered source text is evidence.
+pub(super) fn validate_post_turn_source(
+    fact: &mut MemoryPostTurnExtractedFact,
+    input: &TurnPostTurnHookInput,
+    context: &MemoryTurnContext,
+    source_context: MemorySourceContextKind,
+) -> Result<MemorySourceContextKind, &'static str> {
+    let evidence = &mut fact.evidence;
+    let (source, kind) = match evidence.source_ref.as_deref() {
+        Some("turn.post_turn:user") => (
+            input
+                .extraction_user_text
+                .as_ref()
+                .or(input.user_text.as_ref()),
+            source_context,
+        ),
+        Some("turn.post_turn:assistant") => (
+            input
+                .extraction_assistant_text
+                .as_ref()
+                .or(input.assistant_text.as_ref()),
+            MemorySourceContextKind::AssistantResponse,
+        ),
+        _ => return Err("unprovided_source"),
+    };
+    let source = source.ok_or("missing_source")?;
+    let quote = evidence.quote_or_span.as_deref().ok_or("missing_quote")?;
+    if quote.trim().is_empty() || !source.text.contains(quote) {
+        return Err("quote_not_in_source");
+    }
+    if evidence
+        .source_thread_id
+        .as_deref()
+        .is_some_and(|id| !id.is_empty() && id != context.thread_id)
+        || evidence
+            .source_turn_id
+            .as_deref()
+            .is_some_and(|id| !id.is_empty() && id != context.turn_id)
+        || evidence
+            .source_item_id
+            .as_deref()
+            .is_some_and(|id| !id.is_empty())
+    {
+        return Err("source_identity_mismatch");
+    }
+    evidence.source_thread_id = Some(context.thread_id.clone());
+    evidence.source_turn_id = Some(context.turn_id.clone());
+    evidence.source_item_id = None;
+    if kind != MemorySourceContextKind::DirectUserConversation {
+        if fact.semantic.subject == MemorySubject::CurrentUser {
+            return Err("non_user_authority");
+        }
+        fact.semantic.intent = MemoryIntent::ImplicitCandidate;
+        fact.semantic.explicitness = MemoryExplicitness::Implicit;
+    }
+    Ok(kind)
 }
 
 pub(super) fn memory_turn_context_from_post_turn_request(
@@ -142,49 +216,6 @@ pub(super) fn memory_turn_context_from_post_turn_request(
     })
 }
 
-pub(super) fn turn_post_tool_events_summary(
-    events: &[pioneer_hooks::TurnPostTurnToolEventSummary],
-) -> String {
-    if events.is_empty() {
-        return String::new();
-    }
-    events
-        .iter()
-        .map(|event| {
-            format!(
-                "{} status={:?} outcome={:?} error={:?}",
-                event.tool_name, event.status, event.outcome_status, event.error_class
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-pub(super) fn turn_post_domain_events_summary(
-    events: &[pioneer_hooks::TurnPostTurnDomainEventSummary],
-) -> String {
-    if events.is_empty() {
-        return String::new();
-    }
-    events
-        .iter()
-        .map(|event| {
-            format!(
-                "domain={:?} code={} item={} message={}",
-                event.domain,
-                event.code.as_deref().unwrap_or("none"),
-                event.item_id.as_deref().unwrap_or("none"),
-                event
-                    .message
-                    .as_ref()
-                    .map(|message| message.text.as_str())
-                    .unwrap_or("")
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct MemoryPostTurnParsedFacts {
     pub(super) facts: Vec<MemoryPostTurnExtractedFact>,
@@ -207,7 +238,6 @@ pub(super) struct MemoryPostTurnExtractedFact {
 
 #[derive(Debug, Deserialize)]
 pub(super) struct MemoryPostTurnExtractorJson {
-    #[serde(default)]
     pub(super) facts: Vec<MemoryPostTurnExtractedFactJson>,
 }
 
@@ -244,6 +274,9 @@ pub struct MemoryPostTurnResponseFormatError {
 pub enum MemoryPostTurnResponseFormatCategory {
     Syntax,
     Structure,
+    MissingFacts,
+    NullEnvelope,
+    FactsNotArray,
     Eof,
     Io,
 }
@@ -253,6 +286,9 @@ impl MemoryPostTurnResponseFormatCategory {
         match self {
             Self::Syntax => "syntax",
             Self::Structure => "structure",
+            Self::MissingFacts => "missing_facts",
+            Self::NullEnvelope => "null_envelope",
+            Self::FactsNotArray => "facts_not_array",
             Self::Eof => "eof",
             Self::Io => "io",
         }
@@ -274,6 +310,29 @@ impl fmt::Display for MemoryPostTurnResponseFormatError {
 fn decode_memory_post_turn_response(
     raw: &str,
 ) -> Result<MemoryPostTurnExtractorJson, MemoryPostTurnResponseFormatError> {
+    // Inspect envelope shape without quoting any response values in diagnostics.
+    if let Ok(value) = serde_json::from_str::<Value>(raw) {
+        let category = if value.is_null() {
+            Some(MemoryPostTurnResponseFormatCategory::NullEnvelope)
+        } else if let Some(object) = value.as_object() {
+            match object.get("facts") {
+                None => Some(MemoryPostTurnResponseFormatCategory::MissingFacts),
+                Some(facts) if !facts.is_array() => {
+                    Some(MemoryPostTurnResponseFormatCategory::FactsNotArray)
+                }
+                _ => None,
+            }
+        } else {
+            Some(MemoryPostTurnResponseFormatCategory::Structure)
+        };
+        if let Some(category) = category {
+            return Err(MemoryPostTurnResponseFormatError {
+                category,
+                line: 0,
+                column: 0,
+            });
+        }
+    }
     serde_json::from_str(raw.trim()).map_err(|error| MemoryPostTurnResponseFormatError {
         category: match error.classify() {
             serde_json::error::Category::Syntax => MemoryPostTurnResponseFormatCategory::Syntax,
@@ -299,7 +358,7 @@ pub(super) fn parse_memory_post_turn_extractor_json(
 ) -> Result<MemoryPostTurnParsedFacts, MemoryPostTurnResponseFormatError> {
     let parsed = decode_memory_post_turn_response(raw)?;
     let raw_fact_count = parsed.facts.len();
-    let mut validation_rejected_count = 0;
+    let mut validation_rejected_count = raw_fact_count.saturating_sub(config.max_facts_per_turn);
     let mut diagnostics = Vec::new();
     let mut facts = Vec::new();
     for (index, fact) in parsed
@@ -398,13 +457,15 @@ pub(super) fn validate_memory_post_turn_fact(
         .quote_or_span
         .as_deref()
         .unwrap_or("")
-        .trim()
         .to_owned();
-    if quote.is_empty() {
+    if quote.trim().is_empty() {
         return Err("missing_evidence_quote");
     }
     let mut evidence = fact.evidence;
-    evidence.quote_or_span = bounded_nonempty_text(quote.as_str(), config.max_evidence_chars);
+    if quote.chars().count() > config.max_evidence_chars {
+        return Err("evidence_quote_too_long");
+    }
+    evidence.quote_or_span = Some(quote);
     evidence.extractor_reason = evidence
         .extractor_reason
         .as_deref()
@@ -710,6 +771,8 @@ pub(super) fn memory_semantic_write_params_from_extracted_fact(
         );
     }
 
+    let confidence = Some(computed_post_turn_fact_confidence(&fact.semantic));
+    let importance = Some(computed_post_turn_fact_importance(&fact.semantic));
     Some(MemorySemanticWriteParams {
         scope,
         semantic: fact.semantic,
@@ -721,8 +784,8 @@ pub(super) fn memory_semantic_write_params_from_extracted_fact(
         disposition: Some(MemorySemanticWriteDisposition::RouteToCandidatePolicy),
         client_provided_key: None,
         target_memory_id: fact.target_memory_id,
-        confidence: fact.confidence,
-        importance: fact.importance,
+        confidence,
+        importance,
         metadata,
     })
 }
@@ -732,7 +795,11 @@ pub(super) fn memory_scope_from_semantic_hint(
     hint: MemoryScopeHint,
 ) -> Option<MemoryScope> {
     match hint {
-        MemoryScopeHint::UserGlobal | MemoryScopeHint::UserWorkspace => Some(MemoryScope {
+        MemoryScopeHint::UserWorkspace => Some(MemoryScope {
+            kind: MemoryScopeKind::User,
+            key: format!("workspace:{}:user:default", context.workspace_id),
+        }),
+        MemoryScopeHint::UserGlobal => Some(MemoryScope {
             kind: MemoryScopeKind::User,
             key: MEMORY_DEFAULT_USER_SCOPE_KEY.to_owned(),
         }),
@@ -785,31 +852,63 @@ pub(super) struct MemoryPostTurnExtractorStats {
     pub(super) write_success_count: usize,
     pub(super) write_failure_count: usize,
     pub(super) auto_approved_count: usize,
+    pub(super) active_created_count: usize,
+    pub(super) active_updated_count: usize,
+    pub(super) pending_created_count: usize,
     pub(super) rejected_or_suppressed_count: usize,
     pub(super) duplicate_or_merged_count: usize,
 }
 
 impl MemoryPostTurnExtractorStats {
     pub(super) fn observe_write_response(&mut self, response: &MemorySemanticWriteResponse) {
-        if response.record.is_some() {
-            self.auto_approved_count += 1;
+        if response
+            .record
+            .as_ref()
+            .is_some_and(|record| record.status == MemoryStatus::Active)
+        {
+            if response.relation == MemoryWriteRelation::CompatibleUpdate {
+                self.active_updated_count += 1;
+            } else if response.created && response.relation == MemoryWriteRelation::Novel {
+                self.active_created_count += 1;
+                self.auto_approved_count += 1;
+            }
         }
-        if response.evidence_merged || response.relation == MemoryWriteRelation::Duplicate {
+        if response.created
+            && response.candidate.as_ref().is_some_and(|candidate| {
+                matches!(
+                    candidate.status,
+                    MemoryCandidateStatus::Pending
+                        | MemoryCandidateStatus::PendingSilent
+                        | MemoryCandidateStatus::AskOnUse
+                        | MemoryCandidateStatus::NeedsReview
+                )
+            })
+        {
+            self.pending_created_count += 1;
+        }
+        if response.evidence_merged
+            || response.relation == MemoryWriteRelation::Duplicate
+            || response
+                .candidate
+                .as_ref()
+                .is_some_and(|candidate| candidate.status == MemoryCandidateStatus::MergedDuplicate)
+        {
             self.duplicate_or_merged_count += 1;
         }
-        if matches!(
-            response.relation,
-            MemoryWriteRelation::SuppressedByRejection | MemoryWriteRelation::Contradiction
-        ) {
+        let suppressed_relation = response.relation == MemoryWriteRelation::SuppressedByRejection
+            || response.route.as_ref().is_some_and(|route| {
+                route.route != pioneer_protocol::MemorySemanticWriteRoute::DurableControlPlane
+            });
+        if suppressed_relation {
             self.rejected_or_suppressed_count += 1;
         }
-        if let Some(candidate) = &response.candidate
+        if !suppressed_relation
+            && let Some(candidate) = &response.candidate
             && matches!(
                 candidate.status,
                 MemoryCandidateStatus::Rejected
                     | MemoryCandidateStatus::AutoRejected
                     | MemoryCandidateStatus::ReviewDisabledRejected
-                    | MemoryCandidateStatus::MergedDuplicate
                     | MemoryCandidateStatus::Superseded
             )
         {
@@ -844,6 +943,9 @@ pub(super) fn memory_post_turn_stats_diagnostic(
         ("write_success_count", stats.write_success_count),
         ("write_failure_count", stats.write_failure_count),
         ("auto_approved_count", stats.auto_approved_count),
+        ("active_created_count", stats.active_created_count),
+        ("active_updated_count", stats.active_updated_count),
+        ("pending_created_count", stats.pending_created_count),
         (
             "rejected_or_suppressed_count",
             stats.rejected_or_suppressed_count,
@@ -860,6 +962,18 @@ pub(super) fn memory_post_turn_stats_metadata(
 ) -> HookMetadata {
     let mut metadata = HookMetadata::default();
     for (key, value) in [
+        (
+            "post_turn_extractor.active_created_count",
+            stats.active_created_count,
+        ),
+        (
+            "post_turn_extractor.active_updated_count",
+            stats.active_updated_count,
+        ),
+        (
+            "post_turn_extractor.pending_created_count",
+            stats.pending_created_count,
+        ),
         ("post_turn_extractor.raw_fact_count", stats.raw_fact_count),
         (
             "post_turn_extractor.validation_rejected_count",

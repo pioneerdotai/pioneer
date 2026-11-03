@@ -154,7 +154,7 @@ pub(crate) fn merge_metadata(
     let mut root = match existing_json {
         Some(existing_json) if !existing_json.trim().is_empty() => {
             serde_json::from_str::<Map<String, Value>>(existing_json)
-                .with_context(|| format!("invalid memory metadata JSON `{existing_json}`"))?
+                .context("invalid memory metadata JSON")?
         }
         _ => Map::new(),
     };
@@ -180,6 +180,44 @@ pub(crate) fn normalize_semantic_text(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+pub(crate) fn evidence_metadata_has_source(
+    metadata_json: Option<&str>,
+    evidence: &MemoryWriteEvidence,
+) -> bool {
+    metadata_json
+        .and_then(|metadata| serde_json::from_str::<Value>(metadata).ok())
+        .and_then(|metadata| metadata.get(EVIDENCE_METADATA_KEY).cloned())
+        .and_then(|evidence| evidence.as_object().cloned())
+        .is_some_and(|object| evidence_object_has_source(&object, evidence))
+}
+
+fn evidence_object_has_source(object: &Map<String, Value>, evidence: &MemoryWriteEvidence) -> bool {
+    evidence
+        .source_thread_id
+        .as_deref()
+        .is_some_and(|v| !v.is_empty())
+        && evidence
+            .source_turn_id
+            .as_deref()
+            .is_some_and(|v| !v.is_empty())
+        && evidence
+            .source_ref
+            .as_deref()
+            .is_some_and(|v| !v.is_empty())
+        && object
+            .get("sources")
+            .and_then(Value::as_array)
+            .is_some_and(|sources| {
+                sources.iter().any(|source| {
+                    source.get("source_thread_id") == Some(&json!(evidence.source_thread_id))
+                        && source.get("source_turn_id") == Some(&json!(evidence.source_turn_id))
+                        && source.get("source_item_id") == Some(&json!(evidence.source_item_id))
+                        && source.get("source_ref") == Some(&json!(evidence.source_ref))
+                        && source.get("quote_or_span") == Some(&json!(evidence.quote_or_span))
+                })
+            })
+}
+
 fn merge_evidence_metadata(
     root: &mut Map<String, Value>,
     evidence: Option<&MemoryWriteEvidence>,
@@ -198,6 +236,11 @@ fn merge_evidence_metadata(
         }
     };
 
+    // A runtime replay is the same witness even if an extractor reason changed.
+    // Missing identities retain legacy semantics; never invent historical provenance.
+    if evidence.is_some_and(|evidence| evidence_object_has_source(evidence_object, evidence)) {
+        return;
+    }
     let count = evidence_object
         .get("count")
         .and_then(Value::as_u64)
@@ -498,5 +541,29 @@ mod tests {
         let key = build_memory_canonical_key(&scope, &semantic).expect("unicode custom key");
         assert!(key.key.starts_with("workspace/проект:custom:custom_"));
         assert!(key.key.contains(":custom_"));
+    }
+
+    #[test]
+    fn evidence_replay_is_not_a_new_witness_but_a_different_turn_is() {
+        let mut evidence = MemoryWriteEvidence {
+            source_thread_id: Some("thread".into()),
+            source_turn_id: Some("turn-one".into()),
+            source_item_id: None,
+            source_ref: Some("turn.post_turn:user".into()),
+            quote_or_span: Some("exact\nquote".into()),
+            extractor_reason: Some("reason-one".into()),
+        };
+        let first = merge_metadata(None, BTreeMap::new(), Some(&evidence), 1).unwrap();
+        evidence.extractor_reason = Some("different generated reason".into());
+        let replay = merge_metadata(Some(&first), BTreeMap::new(), Some(&evidence), 2).unwrap();
+        let data: Value = serde_json::from_str(&replay).unwrap();
+        assert_eq!(data["evidence"]["count"], 1);
+        assert_eq!(data["evidence"]["sources"].as_array().unwrap().len(), 1);
+        evidence.source_turn_id = Some("turn-two".into());
+        let confirmation =
+            merge_metadata(Some(&replay), BTreeMap::new(), Some(&evidence), 3).unwrap();
+        let data: Value = serde_json::from_str(&confirmation).unwrap();
+        assert_eq!(data["evidence"]["count"], 2);
+        assert_eq!(data["evidence"]["sources"].as_array().unwrap().len(), 2);
     }
 }

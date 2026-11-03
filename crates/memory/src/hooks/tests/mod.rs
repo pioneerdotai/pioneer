@@ -486,6 +486,7 @@ fn hook_tool_names_to_strings(tool_names: &[HookToolName]) -> Vec<&str> {
 
 #[derive(Default)]
 struct TestMemoryWriteProvider {
+    manifest: MemoryManifest,
     manifest_calls: Arc<Mutex<usize>>,
     manifest_failures: Mutex<std::collections::VecDeque<crate::MemoryManifestFailure>>,
     write_calls: Arc<Mutex<usize>>,
@@ -536,7 +537,7 @@ impl AgentMemoryWriteProvider for TestMemoryWriteProvider {
         if let Some(failure) = self.manifest_failures.lock().unwrap().pop_front() {
             return Err(failure);
         }
-        Ok(MemoryManifest::default())
+        Ok(self.manifest.clone())
     }
 
     async fn write_semantic_memory(
@@ -622,7 +623,7 @@ impl AgentMemoryPostTurnExtractorProvider for TestSequencedPostTurnExtractorProv
         &self,
         context: MemoryPostTurnExtractorContext,
         _request: MemoryPostTurnExtractorRequest,
-    ) -> HookResult<String> {
+    ) -> HookResult<MemoryPostTurnExtractorResponse> {
         self.contexts
             .lock()
             .expect("context lock poisoned")
@@ -637,6 +638,10 @@ impl AgentMemoryPostTurnExtractorProvider for TestSequencedPostTurnExtractorProv
                     "no sequenced provider response",
                 ))
             })
+            .map(|raw_json| MemoryPostTurnExtractorResponse {
+                raw_json,
+                manifest: Some(_request.manifest),
+            })
     }
 }
 
@@ -646,7 +651,7 @@ impl AgentMemoryPostTurnExtractorProvider for TestPostTurnExtractorProvider {
         &self,
         context: MemoryPostTurnExtractorContext,
         request: MemoryPostTurnExtractorRequest,
-    ) -> HookResult<String> {
+    ) -> HookResult<MemoryPostTurnExtractorResponse> {
         *self.calls.lock().expect("extractor call lock poisoned") += 1;
         self.contexts
             .lock()
@@ -656,7 +661,10 @@ impl AgentMemoryPostTurnExtractorProvider for TestPostTurnExtractorProvider {
             .lock()
             .expect("prompt lock poisoned")
             .push(request.render_prompt());
-        Ok(self.json.clone())
+        Ok(MemoryPostTurnExtractorResponse {
+            raw_json: self.json.clone(),
+            manifest: Some(request.manifest),
+        })
     }
 }
 
@@ -677,7 +685,7 @@ impl AgentMemoryPostTurnExtractorProvider for TestFailingPostTurnExtractorProvid
         &self,
         _context: MemoryPostTurnExtractorContext,
         _request: MemoryPostTurnExtractorRequest,
-    ) -> HookResult<String> {
+    ) -> HookResult<MemoryPostTurnExtractorResponse> {
         *self.calls.lock().expect("extractor call lock poisoned") += 1;
         Err(memory_retryable_safe_hook_error(
             "memory.post_turn_extractor.provider_network_transient",
