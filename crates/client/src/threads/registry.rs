@@ -6886,7 +6886,7 @@ mod tests {
             }
             {
                 let mut mutation = core.thread_mutation("a", "ws").unwrap();
-                super::resume::reset_thread_resume_coordinator(&mut mutation.resume);
+                crate::threads::resume::reset_thread_resume_coordinator(&mut mutation.resume);
                 let mut cancelled = running_turn("A");
                 cancelled.status = TurnStatus::Interrupted;
                 mutation.conversation.apply(ConversationEvent::TurnFailed {
