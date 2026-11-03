@@ -2186,7 +2186,11 @@ mod tests {
                 AuthStyle::Bearer,
             );
             for stream in [false, true] {
-                let request = crate::generation::test_request(profile["model"].as_str().unwrap());
+                let mut request =
+                    crate::generation::test_request(profile["model"].as_str().unwrap());
+                request.messages[0].application_context = Some(
+                    serde_json::json!({"kind":"turn_input","context":"internal-context-metadata-must-not-reach-wire"}),
+                );
                 let prepared = prepared_for(&provider, &request.messages);
                 let result =
                     provider.build_chat_request_with_catalog(request, stream, prepared, None);
@@ -2198,6 +2202,12 @@ mod tests {
                 assert_eq!(body[profile["cap_field"].as_str().unwrap()], profile["cap"]);
                 assert_eq!(body["stream"], stream);
                 assert_eq!(body["messages"][0]["content"], "Hello");
+                assert!(body["messages"][0].get("application_context").is_none());
+                assert!(
+                    !body
+                        .to_string()
+                        .contains("internal-context-metadata-must-not-reach-wire")
+                );
                 assert!(body.get("reasoning_effort").is_none());
                 assert!(body.get("thinking").is_none());
                 assert!(body.get("thinking_budget").is_none());
@@ -3469,7 +3479,7 @@ mod tests {
             model: "test-model".to_owned(),
             messages: vec![
                 ChatMessage::system("legacy system prompt should be ignored"),
-                ChatMessage::user("Hello"),
+                ChatMessage::user("turn-facts-2026-11-02\nHello"),
             ],
             temperature: None,
             max_tokens: None,
@@ -3493,7 +3503,9 @@ mod tests {
         assert_eq!(api_messages[0].role, "user");
         assert_eq!(
             text_content(&api_messages[0].content),
-            Some("Stable rules\n<!-- PIONEER_PROMPT_CACHE_BOUNDARY -->\nDynamic runtime\n\nHello")
+            Some(
+                "Stable rules\n<!-- PIONEER_PROMPT_CACHE_BOUNDARY -->\nDynamic runtime\n\nturn-facts-2026-11-02\nHello"
+            )
         );
     }
 

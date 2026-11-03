@@ -6497,6 +6497,92 @@ async fn restore_entry(
         }
         return Ok(restored);
     }
+    // A prepared user projection owns both its exact context bytes and the
+    // original input references. Keep both dependencies for coverage/revision
+    // checks, but restore the bytes from the canonical projection only.
+    if reference.sources.len() > 1 {
+        let contexts = reference
+            .sources
+            .iter()
+            .filter(|source| source.scope.starts_with("context:"))
+            .collect::<Vec<_>>();
+        if let [source] = contexts.as_slice() {
+            let turn = source
+                .scope
+                .strip_prefix("context:")
+                .expect("context scope");
+            ensure!(
+                reference.sources.iter().all(|candidate| {
+                    candidate == *source || candidate.scope == format!("input:{turn}")
+                }),
+                "unsupported composite frozen projection"
+            );
+            let expected = store
+                .compaction_context_reference_for_item(
+                    workspace,
+                    &reference.source_thread,
+                    turn,
+                    "turn-input-projection",
+                    "turn_input_projection_v1",
+                )
+                .await?;
+            ensure!(
+                expected.as_ref() == Some(*source),
+                "invalid frozen input projection source"
+            );
+            ensure!(
+                store
+                    .compaction_references_current(
+                        workspace,
+                        &reference.source_thread,
+                        &reference.sources,
+                    )
+                    .await?,
+                "frozen input projection dependencies changed"
+            );
+            let payload = super::history::reference_payload(
+                store,
+                workspace,
+                &reference.source_thread,
+                source,
+            )
+            .await?;
+            let view: pioneer_tools::ToolResultView = serde_json::from_str(&payload)?;
+            let pioneer_tools::ToolResultView::Json {
+                value,
+                truncated: false,
+            } = view
+            else {
+                anyhow::bail!("incomplete frozen input projection")
+            };
+            let message: ChatMessage = serde_json::from_value(value)?;
+            ensure!(
+                message.role == pioneer_provider::Role::User
+                    && message
+                        .application_context
+                        .as_ref()
+                        .and_then(|metadata| metadata.get("kind"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some("turn_input"),
+                "invalid frozen input projection payload"
+            );
+            let restored = finish_restored_entry(
+                store,
+                workspace,
+                reference,
+                vec![FrozenModelCandidate::exact(message.clone())],
+                projection,
+                Some(Some(message)),
+            )
+            .await?;
+            if projection == FrozenRestoreProjection::Execution {
+                state
+                    .authoritative_inputs
+                    .insert((reference.source_thread.clone(), turn.to_owned()));
+            }
+            return Ok(restored);
+        }
+    }
     ensure!(
         reference.sources.len() == 1,
         "unsupported composite frozen projection"

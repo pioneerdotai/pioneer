@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 
 /// Runtime section marker used when the native provider capability decision
-/// replaces the static tool-usage policy with the exact filesystem contract
+/// replaces the static filesystem fallback with the exact filesystem contract
 /// projected for this turn.
 pub const FILESYSTEM_CAPABILITY_RUNTIME_SECTION_ID: &str = "pioneer_filesystem_capability";
 
@@ -198,6 +198,49 @@ pub enum PromptSectionId {
 }
 
 impl PromptSectionId {
+    /// Logical instruction groups, independent of producer arrival order.
+    /// Equal keys deliberately preserve scoped overrides and unknown hooks.
+    /// This is applied to newly compiled sections, never to saved wire payloads.
+    pub fn instruction_order(&self) -> u8 {
+        match self {
+            Self::AssistantSafety => 0,
+            Self::IdentityBase => 10,
+            Self::SoulCore => 11,
+            Self::IdentityCore => 12,
+            Self::UserPersona => 13,
+            Self::ToolRecoveryPolicy => 70,
+            Self::AgentsMd => 21,
+            // Untyped caller rules retain their legacy precedence after the
+            // known Pioneer policies; do not merge them into Pioneer Safety.
+            Self::ExtraSystem => 90,
+            Self::ToolUsagePolicy => 30,
+            Self::MemoryRecall => 44,
+            Self::TaskOrchestrationPolicy => 40,
+            Self::TasksPolicy => 41,
+            Self::SubagentsPolicy => 42,
+            Self::ThreadsPolicy => 43,
+            Self::PioneerCliRuntimeInstructions => 32,
+            Self::ArtifactOutputContract => 61,
+            Self::HtmlPolicy => 63,
+            Self::Dynamic(id) if id.as_str() == FILESYSTEM_CAPABILITY_RUNTIME_SECTION_ID => 32,
+            Self::Dynamic(id) if id.as_str() == "artifact_references" => 62,
+            Self::Dynamic(id) if id.as_str() == crate::REQUEST_TOOLS_HIDDEN_DOMAIN_SECTION_ID => {
+                105
+            }
+            Self::Dynamic(_) => 80,
+            Self::PioneerCliRuntimeContext => 100,
+            Self::ThreadContext => 101,
+            Self::SkillsRuntimePrompt => 102,
+            Self::SelectedSkills => 103,
+            Self::SelectedCapabilities => 104,
+            Self::CurrentPermissions => 106,
+            Self::ExecutionContinuation => 107,
+            Self::RecoveryContinuation => 108,
+            Self::RetryRuntimeInstruction => 109,
+            Self::DynamicContext => 110,
+        }
+    }
+
     pub fn manifest_id(&self) -> String {
         let id = match self {
             Self::IdentityBase => "identity_base",

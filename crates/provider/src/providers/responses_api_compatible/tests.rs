@@ -904,6 +904,7 @@ async fn compiled_prompt_tool_controls_and_responses_generation_policy() {
                 ] {
                     let mut req = request();
                     req.tool_choice = Some(choice.clone());
+                    req.messages[0] = ChatMessage::user("turn-facts-2026-11-02\ntest");
                     req.compiled_prompt = Some(crate::CompiledPromptPayload {
                         stable_system_text: "compiled".into(),
                         dynamic_system_text: String::new(),
@@ -918,6 +919,7 @@ async fn compiled_prompt_tool_controls_and_responses_generation_policy() {
                         .unwrap();
                     let body = provider.render(&prepared, true).unwrap();
                     assert_eq!(body["instructions"], "compiled");
+                    assert!(body["input"].to_string().contains("turn-facts-2026-11-02"));
                     assert!(!body["input"].to_string().contains("must not duplicate"));
                     assert_eq!(body["max_output_tokens"], 100);
                     assert_eq!(body["parallel_tool_calls"], json!(false));

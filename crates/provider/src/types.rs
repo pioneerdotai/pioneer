@@ -577,6 +577,10 @@ pub struct MessageProvenance {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ChatMessage {
+    /// Pioneer-owned delivery metadata. Never serialized by provider wire adapters.
+    /// Input constructors and provider-response parsers leave it empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub application_context: Option<serde_json::Value>,
     #[serde(skip)]
     pub provenance: Option<MessageProvenance>,
     pub role: Role,
@@ -598,6 +602,7 @@ pub struct ChatMessage {
 impl ChatMessage {
     pub fn system(content: impl Into<String>) -> Self {
         Self {
+            application_context: None,
             provenance: None,
             role: Role::System,
             content: content.into(),
@@ -612,6 +617,7 @@ impl ChatMessage {
 
     pub fn user(content: impl Into<String>) -> Self {
         Self {
+            application_context: None,
             provenance: None,
             role: Role::User,
             content: content.into(),
@@ -626,6 +632,7 @@ impl ChatMessage {
 
     pub fn assistant(content: impl Into<String>) -> Self {
         Self {
+            application_context: None,
             provenance: None,
             role: Role::Assistant,
             content: content.into(),
@@ -640,6 +647,7 @@ impl ChatMessage {
 
     pub fn tool(content: impl Into<String>) -> Self {
         Self {
+            application_context: None,
             provenance: None,
             role: Role::Tool,
             content: content.into(),
@@ -674,6 +682,7 @@ impl ChatMessage {
         provider_replay_state: Option<ProviderReplayState>,
     ) -> Self {
         Self {
+            application_context: None,
             provenance: None,
             role: Role::Assistant,
             content: content.map(Into::into).unwrap_or_default(),
@@ -692,6 +701,7 @@ impl ChatMessage {
         content: impl Into<String>,
     ) -> Self {
         Self {
+            application_context: None,
             provenance: None,
             role: Role::Tool,
             content: content.into(),
@@ -706,6 +716,7 @@ impl ChatMessage {
 
     pub fn user_parts(parts: Vec<MessageContentPart>) -> Self {
         Self {
+            application_context: None,
             provenance: None,
             role: Role::User,
             content: String::new(),

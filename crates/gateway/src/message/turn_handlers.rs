@@ -6728,10 +6728,16 @@ impl MessageProcessor {
                 None => None,
             };
             self.ensure_hook_runtime_with_run_store().await;
-            let selected_skill_names = installed_skills
-                .iter()
-                .map(|skill| skill.install_name.clone())
-                .collect::<Vec<_>>();
+            // Installation includes required system exports. The current explicit
+            // selection is a separate fact and must retain Composer input order.
+            let selected_skill_names = crate::cli_runtime::context::explicit_cli_skill_names(
+                &outcome.materialization.capabilities,
+                &combined_preflight.skill_install_plans,
+            );
+            crate::cli_runtime::context::prepend_cli_environment_input(
+                &mut input_mapping,
+                &security_snapshot,
+            );
             let PreparedCliRuntimeDelivery {
                 frozen_hold: cli_basis_hold,
                 plan: delivery_plan,
@@ -7233,6 +7239,7 @@ impl MessageProcessor {
                 ).await;
             }
             let input_mapping_json = match pioneer_crud::serialize_cli_runtime_json(&input_mapping)
+                .and_then(|json| crate::cli_runtime::context::persist_inventory_mapping(&json, &delivery_plan))
                 .and_then(|json| match sent_context_basis.as_ref() {
                     Some(basis) => crate::cli_runtime::thread_binding::persist_sent_context_basis_in_input_mapping(
                         json.as_str(),
@@ -10469,7 +10476,30 @@ impl MessageProcessor {
                     }
                 }
             }
-            let plan = stage_sync(Stage::CliContextBuild, || crate::cli_runtime::context::compile_cli_runtime_delivery_plan(
+            // Compare against a completed turn in this exact native conversation.
+            // This is delivery evidence, not proof of native context retention:
+            // apply_inventory_mapping conservatively retains unchanged baselines.
+            // Bootstrap/fork/unknown continuity receives a bounded baseline.
+            let mut inventory_mapping = None;
+            if !bootstrap_provider_context
+                && continuation_thread_id == outcome.started_notification.thread_id
+                && let (Some(binding), Some(sent)) = (persisted_binding.as_ref(), sent_context_basis.as_ref())
+                && sent.completed.execution_thread_id == continuation_thread_id
+                && let Some(last) = sent.completed.delivered_turns.last()
+                && let Some(source) = self.crud_store.get_cli_runtime_turn_binding(&last.turn_id).await?
+                && source.status == "completed"
+                && source.native_turn_id.as_deref().is_some_and(|id| !id.is_empty())
+                && source.native_thread_id == binding.native_thread_id
+                && source.thread_id == continuation_thread_id
+                && source.workspace_id == outcome.started_notification.workspace_id
+                && source.runtime_id == runtime_id
+                && source.runtime_kind == cli_runtime_protocol_kind_label(runtime_kind)
+                && source.continuation_thread_id == continuation_thread_id
+                && last.thread_id.as_deref().unwrap_or(&sent.completed.execution_thread_id) == continuation_thread_id
+            {
+                inventory_mapping = Some(source.input_mapping_json.clone());
+            }
+            let mut plan = stage_sync(Stage::CliContextBuild, || crate::cli_runtime::context::compile_cli_runtime_delivery_plan(
                 self.artifact_runtime_home.as_path(),
                 crate::cli_runtime::context::CLIRuntimeContextBuildInput {
                     workspace_id: outcome.started_notification.workspace_id.as_str(),
@@ -10488,6 +10518,7 @@ impl MessageProcessor {
                         crate::cli_runtime::context::cli_runtime_mcp_capabilities_input(mcp_projection),
                 },
             ))?;
+            crate::cli_runtime::context::apply_inventory_mapping(&mut plan, inventory_mapping.as_deref())?;
             crate::cli_runtime::context::prepend_cli_turn_context_and_history_input(
                 input_mapping,
                 &plan,
@@ -10618,13 +10649,9 @@ impl MessageProcessor {
                     let Some(artifact) = attachment.artifact.as_ref() else {
                         continue;
                     };
-                    if !matches!(
-                        &attachment.source,
-                        pioneer_provider::AttachmentDataSource::Reference { reference }
-                            if reference == &format!("pioneer-artifact:{}", artifact.artifact_id)
-                    ) {
-                        continue;
-                    }
+                    // Prepared input history may already contain resolved bytes or a
+                    // path. The accepted artifact identity still requires a fresh
+                    // availability check before another provider delivery.
                     anyhow::ensure!(
                         artifact.workspace_id.is_empty() || artifact.workspace_id == workspace_id,
                         "historical attachment {message_index}:{part_index} belongs to another workspace"
@@ -10666,7 +10693,11 @@ impl MessageProcessor {
                         resolved_is_image == expected_image,
                         "historical attachment kind changed after accepted capture"
                     );
-                    *attachment = resolved.attachment;
+                    // Validate availability even for saved materialized bytes, but
+                    // preserve their accepted representation on subsequent requests.
+                    if matches!(attachment.source, pioneer_provider::AttachmentDataSource::Reference { .. }) {
+                        *attachment = resolved.attachment;
+                    }
                 }
             }
             Ok(history)

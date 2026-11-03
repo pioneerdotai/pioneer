@@ -4104,6 +4104,7 @@ impl TaskAgentExecutor {
                 resolved_artifacts,
                 runtime_environment,
                 history,
+                Vec::new(),
                 execution_checkpoint_context,
                 runtime_permission_profile,
                 child_security_snapshot,
@@ -4695,6 +4696,11 @@ impl TaskAgentExecutor {
             .context("failed to resolve restored task permission profile")?;
         let runtime_security_snapshot =
             load_required_task_child_execution_security_snapshot(processor, child_turn_id).await?;
+        let retained_provider_history = processor
+            .recovery_coordinator
+            .retained_provider_history_for_turn(child_turn_id)
+            .await
+            .context("failed to hydrate retained Task provider history")?;
         processor
             .agent_manager
             .start_turn_with_hook_context_and_execution_checkpoint_permission_profile_security_snapshot_and_agent_skill_overlay(
@@ -4712,6 +4718,7 @@ impl TaskAgentExecutor {
                 resolved_artifacts,
                 runtime_environment,
                 history,
+                retained_provider_history,
                 execution_checkpoint_context,
                 runtime_permission_profile,
                 runtime_security_snapshot,
