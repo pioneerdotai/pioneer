@@ -2981,7 +2981,7 @@ async fn occurrence_evidence_is_per_run_and_untrusted_legacy_links_remain_visibl
     for sql in [
         "UPDATE task_actor_contract SET workspace_id='W0000000000000000000O' WHERE task_id='actor-workspace'",
         "UPDATE task_occurrence_contract SET task_id='other-task' WHERE run_id='occurrence-task'",
-        "INSERT INTO thread(id,workspace_id,mode,model,model_provider,status,origin_kind,access_class) VALUES('foreign-internal','W0000000000000000000O','agent','m','p','active','task_run','internal')",
+        "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class) VALUES('foreign-internal','W0000000000000000000O','','agent','m','p','active','task_run','internal')",
         "UPDATE task_actor_contract SET creator_json='{\"kind\":\"agent_execution\",\"id\":7}' WHERE task_id='invalid-creator'",
         "DELETE FROM task_actor_contract WHERE task_id='missing-actor'",
     ] {
