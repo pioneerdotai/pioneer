@@ -42368,7 +42368,12 @@ fn task_progress_refreshes_parent_task_anchor_preview() {
 }
 
 async fn task_progress_refreshes_parent_task_anchor_preview_impl() {
-    for scenario in ["ordered", "parent_stop", "foreign_replacement"] {
+    for scenario in [
+        "ordered",
+        "parent_stop",
+        "foreign_replacement",
+        "semantic_terminal",
+    ] {
         task_anchor_publication_scenario(scenario).await;
     }
 }
@@ -42523,6 +42528,166 @@ async fn task_anchor_publication_scenario(scenario: &str) {
             detached.task.lifecycle_policy.as_ref().unwrap().attachment,
             TaskAttachmentMode::Detached
         );
+        if scenario == "semantic_terminal" {
+            assert!(
+                timeout(
+                    Duration::from_secs(5),
+                    processor.mark_turn_blocked(
+                        thread_id.into(),
+                        turn_id.into(),
+                        "semantic fixture blocked".into()
+                    )
+                )
+                .await
+                .unwrap()
+            );
+            assert!(
+                crud_store
+                    .native_turn_has_accepted_terminal(turn_id)
+                    .await
+                    .unwrap()
+            );
+            let terminal_work = crud_store
+                .get_turn_work_projection(turn_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(terminal_work.state, "blocked");
+            timeout(
+                Duration::from_secs(5),
+                processor.task_runtime.service().update_task(
+                    pioneer_tasks::TaskMutationContext::default(),
+                    TaskUpdateParams {
+                        task_id: task_id.clone(),
+                        title: Some("Metadata after source terminal".into()),
+                        ..Default::default()
+                    },
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let metadata = crud_store
+                .list_task_events_after(&task_id, 0)
+                .await
+                .unwrap()
+                .into_iter()
+                .rev()
+                .find(|event| matches!(event.payload, TaskEventPayload::TaskUpdated { .. }))
+                .unwrap();
+            fanout_task_event_through(&processor, &task_id, metadata.sequence).await;
+            let terminal_work = crud_store
+                .get_turn_work_projection(turn_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(terminal_work.state, "blocked");
+            assert_eq!(
+                crud_store
+                    .get_task(&task_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .task
+                    .title,
+                "Metadata after source terminal"
+            );
+            let mut saw_metadata = false;
+            while let Ok(Message::Text(text)) = rx.try_recv() {
+                let value: JsonValue = serde_json::from_str(&text).unwrap();
+                assert_ne!(value["method"], events::TURN_STARTED);
+                if value["method"] == events::TASK_UPDATED
+                    && value["params"]["task"]["id"] == task_id
+                {
+                    saw_metadata = true;
+                }
+                if value["method"] == events::TURN_WORK_STATE_CHANGED
+                    && value["params"]["thread_id"] == thread_id
+                    && value["params"]["turn_id"] == turn_id
+                {
+                    panic!("Work snapshot escaped initial publication: {value}");
+                }
+            }
+            assert!(
+                saw_metadata,
+                "actual task fanout must finish while publisher is held"
+            );
+            processor.release_completed_history_preparation_barrier();
+            live_wake.claim_barrier.release();
+            timeout(Duration::from_secs(10), async {
+                let mut started = false;
+                loop {
+                    for claim in crud_store
+                        .claim_due_turn_event_deliveries(
+                            pioneer_crud::NATIVE_TURN_EVENT_LIVE_CONSUMER,
+                            now_timestamp_secs() + 600,
+                            64,
+                        )
+                        .await
+                        .unwrap()
+                    {
+                        processor
+                            .process_claimed_native_turn_event_delivery(claim)
+                            .await
+                            .unwrap();
+                    }
+                    let mut observed = false;
+                    while let Ok(Message::Text(text)) = rx.try_recv() {
+                        let value: JsonValue = serde_json::from_str(&text).unwrap();
+                        if value["method"] == events::TURN_STARTED
+                            && value["params"]["turn"]["id"] == turn_id
+                        {
+                            assert!(!started);
+                            started = true;
+                        }
+                        if value["method"] == events::TURN_WORK_STATE_CHANGED
+                            && value["params"]["thread_id"] == thread_id
+                            && value["params"]["turn_id"] == turn_id
+                        {
+                            assert!(started, "Work preceded start: {value}");
+                            let snapshot: pioneer_protocol::TurnWorkStateChangedNotification =
+                                serde_json::from_value(value["params"].clone()).unwrap();
+                            assert_eq!(snapshot.work.turn_id, turn_id);
+                            assert_eq!(
+                                snapshot.work.state,
+                                pioneer_protocol::TurnWorkState::Blocked
+                            );
+                            assert!(
+                                snapshot.source_high_watermark
+                                    >= terminal_work.source_high_watermark
+                            );
+                            assert_eq!(
+                                snapshot.work.completed_at_unix_ms,
+                                terminal_work
+                                    .completed_at
+                                    .as_ref()
+                                    .map(|at| at.timestamp_millis())
+                            );
+                            observed = true;
+                        }
+                    }
+                    if observed {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            cancel_task_for_test(
+                &processor,
+                pioneer_protocol::TaskCancelParams {
+                    task_id: task_id.clone(),
+                    reason: Some("fixture cleanup".into()),
+                    scope: pioneer_protocol::TaskCancelScope::AttachedSubtree,
+                },
+            )
+            .await
+            .unwrap();
+            processor.foreground_starts.shutdown().await;
+            processor.agent_manager.remove_thread(thread_id).await;
+            return;
+        }
         if scenario == "parent_stop" {
             assert!(
                 timeout(
