@@ -3331,7 +3331,17 @@ impl MessageProcessor {
             )
             .await;
         if let Err(error) = start_result {
-            if expected.is_some() {
+            if let Some(expected) = expected {
+                // Stop can retire the actor after our pre-dispatch check. Its
+                // canonical terminal is still accepted intent, not a new start.
+                if self
+                    .crud_store
+                    .native_turn_has_accepted_terminal(&expected.turn_id)
+                    .await
+                    .map_err(ApiProviderTurnDispatchFailure::OwnershipPersistence)?
+                {
+                    return Ok(None);
+                }
                 // The startup owner revalidates its exact durable generation
                 // before recording recovery, including indeterminate actor ACKs.
                 return Err(ApiProviderTurnDispatchFailure::ActorStart(error));
