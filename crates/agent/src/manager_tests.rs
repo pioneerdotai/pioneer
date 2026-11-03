@@ -15132,6 +15132,8 @@ async fn phased_rejected_final_keeps_native_candidate_and_commentary_before_retr
 
 #[tokio::test]
 async fn initial_start_receipt_cannot_cancel_a_later_run_in_the_same_actor() {
+    use super::AgentStartReceipt;
+
     let manager = AgentManager::new(
         Arc::new(ProviderRegistry::new(|_| String::new())),
         test_tool_loop_config(),
