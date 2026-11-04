@@ -107,6 +107,9 @@ pub(crate) struct IdentityAuthorizationStore {
 }
 
 impl IdentityAuthorizationStore {
+    pub(crate) fn history_ticket_matches(&self, ticket: u64) -> bool {
+        self.identity_request == ticket
+    }
     pub(crate) fn authorization_epoch(&self) -> (u64, u64) {
         (self.connection_generation, self.policy_generation)
     }

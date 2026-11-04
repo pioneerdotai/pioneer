@@ -1128,6 +1128,63 @@ pub struct ClientCore {
     publication_ready: std::sync::Condvar,
 }
 
+pub(crate) struct HistoryAuthority {
+    auth: (u64, Option<u64>),
+    transport: Option<crate::transport::ws::runtime::ConnectionRequestTransport>,
+}
+impl HistoryAuthority {
+    pub(crate) fn capture(core: &ClientCore) -> Self {
+        let auth = core.current_auth_ticket();
+        let transport = auth.1.map(|c| {
+            core.transport_runtime
+                .ws_command_sender()
+                .requests_for_connection(c)
+        });
+        Self { auth, transport }
+    }
+    pub(crate) fn is_current(&self, core: &ClientCore) -> bool {
+        self.auth == core.current_auth_ticket()
+            && self
+                .transport
+                .as_ref()
+                .is_none_or(|t| t.scope().is_none() || t.is_current())
+    }
+    // Apply lock order: identity -> registry -> HTTP access -> captured socket.
+    // Decoding precedes these guards; publication and cancellation follow them.
+    pub(crate) fn lock<'a>(&'a self, core: &'a ClientCore) -> (impl Sized + 'a, bool) {
+        let identity = core
+            .identity_authorization
+            .lock()
+            .expect("identity owner poisoned");
+        let current = identity.history_ticket_matches(self.auth.0);
+        (identity, current)
+    }
+    pub(crate) fn lock_transport(&self) -> (impl Sized + '_, bool) {
+        let guard = self
+            .transport
+            .as_ref()
+            .map(|t| t.history_apply_fence(self.auth.1));
+        let current = guard.as_ref().is_some_and(|g| g.1);
+        (guard, current)
+    }
+}
+
+struct HistoryFlight {
+    reservation: u64,
+    response: crate::rpc::JsonRpcResponseSender,
+    receiver: std::sync::mpsc::Receiver<crate::rpc::JsonRpcResponseResult>,
+    transport: Option<crate::transport::ws::runtime::ConnectionRequestTransport>,
+    auth: (u64, Option<u64>),
+    apply: crate::threads::registry::HistoryApply,
+    work: pioneer_observability::work::WorkCarrier,
+    queue: Option<pioneer_observability::queues::QueueObserver>,
+}
+impl Drop for HistoryFlight {
+    fn drop(&mut self) {
+        self.response.cancel();
+    }
+}
+
 impl Drop for ClientCore {
     fn drop(&mut self) {
         self.shutdown();
@@ -2153,6 +2210,7 @@ impl ClientCore {
             std::thread::Builder::new()
                 .name("client-thread-requests".into())
                 .spawn(move || {
+                    let mut flights: Vec<HistoryFlight> = Vec::new();
                     loop {
                         let Some(core) = weak_requests.upgrade() else {
                             break;
@@ -2161,6 +2219,56 @@ impl ClientCore {
                             break;
                         }
                         core.retire_thread_controller_jobs();
+                        let mut index = 0;
+                        while index < flights.len() {
+                            let flight = &flights[index];
+                            let current = receiver.applicable(flight.reservation)
+                                && HistoryAuthority {
+                                    auth: flight.auth,
+                                    transport: flight.transport.clone(),
+                                }
+                                .is_current(&core);
+                            if !current || std::time::Instant::now() >= flight.response.deadline() {
+                                flight.response.cancel();
+                            }
+                            let result = match flight.receiver.try_recv() {
+                                Ok(result) => Some(result.map_err(anyhow::Error::new)),
+                                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                    Some(Err(anyhow::anyhow!("history response owner dropped")))
+                                }
+                                Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                            };
+                            let Some(result) = result else {
+                                index += 1;
+                                continue;
+                            };
+                            let mut flight = flights.remove(index);
+                            let apply =
+                                std::mem::replace(&mut flight.apply, Box::new(|_, _, _| None));
+                            // Physical retirement is not logical finalization. Discard
+                            // stale payloads, but run the same reducer's exact-generation
+                            // error path so continuing-session rotation cannot strand work.
+                            let result = if current {
+                                result
+                            } else {
+                                Err(anyhow::anyhow!("History request authority retired"))
+                            };
+                            let continuation = flight.work.run(|| {
+                                apply(
+                                    &core,
+                                    result,
+                                    Some(&HistoryAuthority {
+                                        auth: flight.auth,
+                                        transport: flight.transport.clone(),
+                                    }),
+                                )
+                                .map(|request| {
+                                    Self::history_continuation(request, flight.queue.clone())
+                                })
+                            });
+                            receiver.finish_active(flight.reservation, continuation);
+                        }
+
                         // Discovery is an intentional independent reconciliation pass.
                         // It publishes jobs only; RPC execution stays with the scheduler.
                         pioneer_observability::work::WorkCarrier::independent(
@@ -2179,14 +2287,121 @@ impl ClientCore {
                                 .thread_registry
                                 .lock()
                                 .expect("thread registry poisoned");
-                            receiver
-                                .take_by(|request| registry.controller_request_interactive(request))
+                            receiver.take_ready_by(|request| {
+                                registry.controller_request_interactive(request)
+                            })
                         };
-                        if let Some(item) = item {
-                            let continuation = core.dispatch_thread_controller_item(item);
-                            receiver.finish(continuation);
+                        if let Some((reservation, item)) = item {
+                            let queue = item.queue.as_ref().map(|(q, _)| q.clone());
+                            let (request, work) = item.received(
+                                pioneer_observability::work::Boundary::StdThread,
+                                pioneer_observability::work::WorkKind::ClientCommand,
+                                pioneer_observability::work::ExecutorRole::ClientController,
+                            );
+                            let mut processing = queue.as_ref().map(|q| q.processing());
+                            // Capture network authority before domain preparation, then
+                            // revalidate it before sending or accepting any payload.
+                            let HistoryAuthority { auth, transport } =
+                                HistoryAuthority::capture(&core);
+                            let prepared = work.run(|| core.prepare_history_request(request));
+                            if let Some(processing) = &mut processing {
+                                processing.processed();
+                            }
+                            if let Some(prepared) = prepared {
+                                if let Some(identity) = &prepared.identity {
+                                    let registry = core
+                                        .thread_registry
+                                        .lock()
+                                        .expect("thread registry poisoned");
+                                    receiver.refine(
+                                        reservation,
+                                        identity.clone(),
+                                        identity.current(&registry),
+                                    );
+                                }
+                                let deadline =
+                                    std::time::Instant::now() + crate::rpc::RPC_REQUEST_TIMEOUT;
+                                let (tx, rx) = std::sync::mpsc::channel();
+                                let response = crate::rpc::JsonRpcResponseSender::new_with_wake(
+                                    tx,
+                                    deadline,
+                                    receiver.completion_wake(),
+                                );
+                                if !receiver.attach(reservation, response.clone())
+                                    || core.current_auth_ticket() != auth
+                                    || transport
+                                        .as_ref()
+                                        .is_some_and(|t| t.scope().is_some() && !t.is_current())
+                                {
+                                    response.cancel();
+                                }
+                                let payload = prepared.rpc.map(|(method, params)| {
+                                    crate::rpc::build_json_rpc_request_payload(method, params)
+                                });
+                                // Registration precedes send: inline completion cannot be lost.
+                                flights.push(HistoryFlight {
+                                    reservation,
+                                    response: response.clone(),
+                                    receiver: rx,
+                                    transport: transport.clone(),
+                                    auth,
+                                    apply: prepared.apply,
+                                    work: work.clone(),
+                                    queue,
+                                });
+                                work.run(|| {
+                                    use pioneer_observability::work::{
+                                        Boundary, ExecutorRole, Trigger, WorkCarrier, WorkKind,
+                                    };
+                                    WorkCarrier::child(
+                                        Boundary::ClientRpc,
+                                        WorkKind::ClientRpc,
+                                        Trigger::Rpc,
+                                        ExecutorRole::ClientController,
+                                    )
+                                    .run(|| match payload {
+                                        Some(Ok(payload)) => {
+                                            use crate::rpc::JsonRpcRequestTransport;
+                                            if let Err(error) = transport
+                                                .as_ref()
+                                                .ok_or_else(|| {
+                                                    "History transport unavailable".to_owned()
+                                                })
+                                                .and_then(|transport| {
+                                                    transport.send_json_rpc_request(
+                                                        payload.request_id,
+                                                        payload.payload,
+                                                        response.clone(),
+                                                    )
+                                                })
+                                            {
+                                                let _ = response.send(Err(
+                                                    crate::rpc::JsonRpcResponseError::transport(
+                                                        error,
+                                                    ),
+                                                ));
+                                            }
+                                        }
+                                        Some(Err(error)) => {
+                                            let _ = response.send(Err(
+                                                crate::rpc::JsonRpcResponseError::transport(
+                                                    format!("{error:#}"),
+                                                ),
+                                            ));
+                                        }
+                                        None => {
+                                            let _ = response.send(Ok(serde_json::Value::Null));
+                                        }
+                                    });
+                                });
+                            } else {
+                                receiver.finish_active(reservation, None);
+                            }
                             continue;
                         }
+                        // Elapsed discovery timers have just been serviced. If
+                        // admission is blocked by a flight, only its completion
+                        // or a future timer can change eligibility.
                         let delay = [
                             core.next_thread_resume_delay(),
                             core.next_timeline_request_delay(),
@@ -2194,13 +2409,19 @@ impl ClientCore {
                         ]
                         .into_iter()
                         .flatten()
+                        .filter(|d| flights.is_empty() || !d.is_zero())
+                        .chain(flights.iter().map(|f| {
+                            f.response
+                                .deadline()
+                                .saturating_duration_since(std::time::Instant::now())
+                        }))
                         .min();
                         #[cfg(test)]
                         if let Some(waiting) = &waiting {
                             let _ = waiting.send(delay);
                         }
                         drop(core);
-                        if !receiver.wait(delay) {
+                        if !receiver.wait_ready(delay) {
                             break;
                         }
                     }
@@ -2209,6 +2430,61 @@ impl ClientCore {
         );
     }
 
+    fn history_continuation(
+        request: crate::threads::registry::ThreadControllerRequest,
+        queue: Option<pioneer_observability::queues::QueueObserver>,
+    ) -> pioneer_observability::work::WorkItem<crate::threads::registry::ThreadControllerRequest>
+    {
+        use pioneer_observability::work::{Boundary, ExecutorRole, WorkItem, WorkKind};
+        let item = WorkItem::new(
+            request,
+            Boundary::StdThread,
+            WorkKind::ClientCommand,
+            ExecutorRole::ClientController,
+        );
+        if let Some(queue) = queue {
+            item.observed(
+                queue,
+                pioneer_observability::queues::QueueBytes::Unsupported,
+            )
+        } else {
+            item
+        }
+    }
+
+    fn prepare_history_request(
+        &self,
+        request: crate::threads::registry::ThreadControllerRequest,
+    ) -> Option<crate::threads::registry::PreparedHistory> {
+        use crate::threads::registry::ThreadControllerRequest as R;
+        match request {
+            R::Semantic(request) => {
+                self.prepare_thread_semantic_request(request)
+                    .map(|mut prepared| crate::threads::registry::PreparedHistory {
+                        identity: None,
+                        rpc: prepared.rpc.take(),
+                        apply: Box::new(move |core, result, authority| {
+                            core.complete_thread_semantic_request(prepared, result, authority)
+                                .map(R::Semantic)
+                        }),
+                    })
+            }
+            R::Read(request) => self.prepare_timeline_read(request),
+            R::ResumeJob(request) => self.prepare_thread_resume_quantum(request),
+            R::Binding {
+                id,
+                workspace,
+                generation,
+            } => self.prepare_thread_cli_binding_request(id, workspace, generation),
+            R::Subscribe(request) => {
+                self.execute_thread_subscription_request(request);
+                None
+            }
+            R::Resume => None,
+        }
+    }
+
+    #[cfg(test)]
     fn dispatch_thread_controller_item(
         &self,
         item: pioneer_observability::work::WorkItem<
@@ -2250,38 +2526,24 @@ impl ClientCore {
         continuation
     }
 
+    #[cfg(test)]
     fn execute_thread_controller_request(
         &self,
         request: crate::threads::registry::ThreadControllerRequest,
     ) -> Option<crate::threads::registry::ThreadControllerRequest> {
-        use crate::threads::registry::ThreadControllerRequest as R;
-        match request {
-            R::Read(request) => self.execute_timeline_read(request),
-            R::Semantic(request) => {
-                return self
-                    .execute_thread_semantic_request(
-                        &self.transport_runtime.ws_command_sender(),
-                        request,
-                    )
-                    .map(R::Semantic);
-            }
-            R::ResumeJob(request) => {
-                return self
-                    .execute_thread_resume_quantum(
-                        &self.transport_runtime.ws_command_sender(),
-                        request,
-                    )
-                    .map(R::ResumeJob);
-            }
-            R::Subscribe(request) => self.execute_thread_subscription_request(request),
-            R::Binding {
-                id,
-                workspace,
-                generation,
-            } => self.execute_thread_cli_binding_request(&id, &workspace, generation),
-            R::Resume => {}
-        }
-        None
+        let prepared = self.prepare_history_request(request)?;
+        let result = prepared.rpc.as_ref().map_or_else(
+            || Ok(serde_json::Value::Null),
+            |(method, params)| {
+                crate::rpc::send_json_rpc_request_value(
+                    &self.transport_runtime.ws_command_sender(),
+                    method,
+                    params.clone(),
+                    crate::rpc::RPC_REQUEST_TIMEOUT,
+                )
+            },
+        );
+        (prepared.apply)(self, result, None)
     }
 
     pub(crate) fn start_gateway_event_dispatcher(self: &Arc<Self>) {
@@ -3342,6 +3604,10 @@ impl ClientCore {
         drop(presentation_fence);
         drop(composer_fence);
         drop(document_fence);
+        if evict_protected {
+            self.retire_thread_controller_jobs();
+        }
+        self.wake_thread_timeline_requests();
         self.update_thread_presentation_identity(principal);
         // Identity commits bypass transition() while applying the access fence.
         // Resume consumers waiting for workspace capabilities/model metadata too.
