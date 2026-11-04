@@ -2847,9 +2847,15 @@ impl MessageProcessor {
                     }))
                 }
             }).catch_unwind()).await;
+            #[cfg(test)]
+            let mut finalization_settled = false;
             match cycle {
                 Ok(Ok(plan)) if !owner.requires_settlement() => {
-                    owner.publish(observed, plan);
+                    let _settled = owner.publish(observed, plan);
+                    #[cfg(test)]
+                    {
+                        finalization_settled = _settled && matches!(plan, Plan::Dormant);
+                    }
                 }
                 Ok(Err(error)) => {
                     error!(finalization, error = %format!("{error:#}"), "native projection/finalization recovery deferred");
@@ -2870,6 +2876,12 @@ impl MessageProcessor {
                     &cancellation,
                 )
                 .await;
+            #[cfg(test)]
+            if finalization && finalization_settled && owner.observe() == observed {
+                this.completed_history_preparation_barrier
+                    .wait_if_armed("__finalization_settled__", &cancellation)
+                    .await;
+            }
             drop(this);
         }
     }

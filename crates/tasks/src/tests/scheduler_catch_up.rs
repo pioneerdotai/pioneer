@@ -166,23 +166,25 @@ async fn skip_missed_restart_discards_backlog_but_arms_the_next_occurrence() {
 #[tokio::test]
 async fn skip_missed_cold_one_shot_is_exhausted_without_a_run() {
     let runtime = runtime().await;
+    // A cold restored deadline was already past when this runtime observed it.
+    let first = chrono::Utc::now().timestamp() - 60;
     let created = runtime
         .service()
         .create_task(
             TaskCreateContext::default(),
             create_params(TaskTriggerSpec::ScheduledAt {
-                scheduled_at: FIRST,
+                scheduled_at: first,
                 timezone: None,
                 catch_up_policy: Some(TaskTriggerCatchUpPolicy::skip_missed()),
             }),
         )
         .await
         .unwrap();
-    assert_eq!(runtime.process_due_once(FIRST + 2).await.unwrap(), 0);
-    assert_eq!(runtime.process_due_once(FIRST + 2).await.unwrap(), 0);
+    assert_eq!(runtime.process_due_once(first + 2).await.unwrap(), 0);
+    assert_eq!(runtime.process_due_once(first + 2).await.unwrap(), 0);
     let saved = task(&runtime, &created.task.id).await;
     assert!(saved.runs.is_empty());
-    assert_eq!(saved.triggers[0].last_fire_at, Some(FIRST));
+    assert_eq!(saved.triggers[0].last_fire_at, Some(first));
     assert_eq!(saved.triggers[0].next_fire_at, None);
     assert_eq!(saved.triggers[0].status, TaskTriggerStatus::Exhausted);
 }

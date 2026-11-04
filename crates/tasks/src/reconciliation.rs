@@ -1315,20 +1315,59 @@ mod tests {
         // absent. Later foreground pages must be genuinely read-only: otherwise
         // a recovery-event commit could accidentally rescue a lost handoff.
         let reconciler = runtime.live_owner_for_test();
+        let reconstruction_now = crate::service::now_timestamp_secs();
+        // Occurrence reconstruction consumes one Task scope per quantum,
+        // independently of the 64-Run recovery pages used by the race below.
+        for _ in 0..count + 32 {
+            reconciler
+                .reconcile_terminal_occurrences(reconstruction_now)
+                .await
+                .unwrap();
+            if store
+                .next_task_occurrence_reconcile_at(reconstruction_now)
+                .await
+                .unwrap()
+                .is_none_or(|at| at > reconstruction_now)
+            {
+                break;
+            }
+        }
         let mut settled = false;
         for _ in 0..64 {
-            reconciler.reconcile(now).await.unwrap();
+            reconciler.reconcile(reconstruction_now).await.unwrap();
             let admission = reconciler.work.drain().await.unwrap();
-            let plan = reconciler.next_plan(now).await.unwrap();
+            let plan = reconciler.next_plan(reconstruction_now).await.unwrap();
             drop(admission);
             if matches!(plan, pioneer_sqlite::background::Plan::Dormant) {
                 settled = true;
                 break;
             }
         }
+        if !settled {
+            let state = reconciler.state.discovery.lock().unwrap();
+            eprintln!(
+                "live fixture cycle={} rescan={} leases={:?} cutoff={} runs={:?} pending={} retry={:?}",
+                state.cycle_open,
+                state.rescan_requested,
+                state.lease_nearest,
+                state.lease_cutoff,
+                state.run_done,
+                store.task_live_changes().pending(),
+                state.retry_at
+            );
+            drop(state);
+            eprintln!(
+                "occurrence next={:?}, now={}",
+                store
+                    .next_task_occurrence_reconcile_at(reconstruction_now)
+                    .await,
+                reconstruction_now
+            );
+        }
         assert!(
             settled,
-            "fixture must finish reconstruction before the race"
+            "fixture must finish reconstruction before the race: {:?}",
+            reconciler.next_plan(reconstruction_now).await,
         );
         store.task_live_changes().take();
         runs
@@ -1408,9 +1447,23 @@ mod tests {
             let report = foreground.await.unwrap().unwrap();
             assert_eq!(report.recovered_events, 0, "quiet foreground page");
             assert_eq!(report.repaired_terminal_occurrences, 0);
-            tokio::time::timeout(Duration::from_secs(10), reconciler.state.parked.notified())
-                .await
-                .unwrap();
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if store
+                        .get_task_run(&runs[target].id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .status
+                        == TaskRunStatus::Succeeded
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("handoff must recover without a later producer");
             assert_eq!(
                 store
                     .get_task_run(&runs[target].id)
@@ -2005,9 +2058,6 @@ mod tests {
             let (_directory, store, runtime, observer) = live_fixture().await;
             let now = crate::service::now_timestamp_secs() + 7200;
             let runs = ordered_live_runs(&store, &runtime, 65, 0, now - 7200).await;
-            runtime
-                .register_executor(Arc::new(CompletingRecovery))
-                .await;
             let response = runtime
                 .maintenance_service()
                 .create_task(
@@ -2035,6 +2085,9 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
+            runtime
+                .register_executor(Arc::new(CompletingRecovery))
+                .await;
             let db = store.database_connection();
             run_row::Entity::update_many()
                 .col_expr(run_row::Column::ResultJson, Expr::value("{"))
@@ -2211,6 +2264,13 @@ mod tests {
                 .await
                 .unwrap();
             }
+            // Recovery above is proved under the rolled-back clock. Its
+            // completion/cancellation then creates real occurrence obligations
+            // at commit time; restore business time before requiring EOF.
+            reconciler.work.set_wall_clock_for_test(
+                std::time::UNIX_EPOCH
+                    + Duration::from_secs(crate::service::now_timestamp_secs() as u64),
+            );
             tokio::time::timeout(Duration::from_secs(10), reconciler.state.parked.notified())
                 .await
                 .unwrap();
@@ -2455,9 +2515,38 @@ mod tests {
             drop(admission);
             tokio::time::advance(OCCURRENCE_STORAGE_BACKOFF).await;
             tokio::time::resume();
-            tokio::time::timeout(Duration::from_secs(30), reconciler.state.parked.notified())
-                .await
-                .unwrap();
+            tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    let recovered = if trigger_fault {
+                        store
+                            .get_task_events(&inputs[0].0, None)
+                            .await
+                            .unwrap()
+                            .events
+                            .iter()
+                            .any(|event| {
+                                matches!(
+                                    &event.payload,
+                                    TaskEventPayload::TaskRecovered { run_id: None, .. }
+                                )
+                            })
+                    } else {
+                        store
+                            .get_task_run(&inputs[0].1)
+                            .await
+                            .unwrap()
+                            .unwrap()
+                            .status
+                            == TaskRunStatus::Succeeded
+                    };
+                    if recovered {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
             if trigger_fault {
                 let events = store.get_task_events(&inputs[0].0, None).await.unwrap();
                 assert_eq!(
@@ -2482,6 +2571,16 @@ mod tests {
                     TaskRunStatus::Succeeded
                 );
             }
+            // Completion creates real occurrence reconciliation clocks at its
+            // commit time. After proving repair under rollback, let those
+            // independent wall obligations settle before asserting Dormant.
+            reconciler.work.set_wall_clock_for_test(
+                std::time::UNIX_EPOCH
+                    + Duration::from_secs(crate::service::now_timestamp_secs() as u64),
+            );
+            tokio::time::timeout(Duration::from_secs(30), reconciler.state.parked.notified())
+                .await
+                .unwrap();
             observer.reads.lock().unwrap().clear();
             observer.writes.lock().unwrap().clear();
             tokio::time::pause();
@@ -2549,6 +2648,26 @@ mod tests {
                     .unwrap();
             }
             tasks.push((response.task.id, trigger_id));
+        }
+        // Settle the independent occurrence bootstrap without auditing the
+        // dormant trigger. Its missing diagnostic is the fault's real target.
+        let reconciler = runtime.live_owner_for_test();
+        reconciler
+            .work
+            .set_wall_clock_for_test(std::time::UNIX_EPOCH + Duration::from_secs(now as u64));
+        for _ in 0..tasks.len() + 32 {
+            reconciler
+                .reconcile_terminal_occurrences(now)
+                .await
+                .unwrap();
+            if store
+                .next_task_occurrence_reconcile_at(now)
+                .await
+                .unwrap()
+                .is_none_or(|at| at > now)
+            {
+                break;
+            }
         }
         let bad_event = event_row::Entity::find()
             .filter(event_row::Column::TaskId.eq(&tasks[0].0))

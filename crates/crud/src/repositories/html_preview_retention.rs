@@ -706,6 +706,7 @@ pub struct HtmlPreviewRetentionProgress {
     input_after: String,
     phase: usize,
     idle: [bool; 3],
+    artifact_rescan: bool,
 }
 impl HtmlPreviewRetentionProgress {
     /// Returns false at discovery EOF. Errors do not pin the cursor to poison
@@ -725,8 +726,18 @@ impl HtmlPreviewRetentionProgress {
                         1 => input_adoption_quantum(store, &mut self.input_after).await?,
                         _ => self.artifact_quantum(store).await?,
                     };
+                    // A proof can become known after the artifact lane passed
+                    // its dependent preview. Finish both tails, then revalidate
+                    // that lane once before publishing the completed pass.
+                    if path == 0 && more {
+                        self.artifact_rescan = true;
+                    }
                     self.idle[path] = !more;
                     if self.idle.iter().all(|idle| *idle) {
+                        if std::mem::take(&mut self.artifact_rescan) {
+                            self.idle[2] = false;
+                            return Ok(true);
+                        }
                         self.idle = [false; 3];
                         Ok(false)
                     } else {

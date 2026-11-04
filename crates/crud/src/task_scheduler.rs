@@ -1252,15 +1252,19 @@ impl CrudStore {
         for (id, task_id) in keys {
             let row = async {
                 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
-                let Some(row) =
-                    pioneer_entity::task_run::Entity::find_by_id(id.clone())
-                        .filter(pioneer_entity::task_run::Column::TaskId.eq(task_id.clone()))
-                        .filter(pioneer_entity::task_run::Column::Status.eq("queued"))
-                        .filter(pioneer_entity::task_run::Column::ReadyAt.is_null().or(
-                            pioneer_entity::task_run::Column::ReadyAt.lte(unix_to_datetime(now)),
-                        ))
-                        .one(&self.connection)
-                        .await?
+                let Some(row) = pioneer_entity::task_run::Entity::find_by_id(id.clone())
+                    .filter(pioneer_entity::task_run::Column::TaskId.eq(task_id.clone()))
+                    .filter(pioneer_entity::task_run::Column::Status.eq("queued"))
+                    .filter(
+                        sea_orm::Condition::any()
+                            .add(pioneer_entity::task_run::Column::ReadyAt.is_null())
+                            .add(
+                                pioneer_entity::task_run::Column::ReadyAt
+                                    .lte(unix_to_datetime(now)),
+                            ),
+                    )
+                    .one(&self.connection)
+                    .await?
                 else {
                     return Ok(None);
                 };

@@ -1600,28 +1600,32 @@ pub(crate) async fn rollback_with_hold_refusal(
 /// Existing CRUD retry attempts own their DB futures. Destroy the complete
 /// operation before recording; do this inside the attempt's WorkCarrier so
 /// its original work token is still active. Includes the final failed attempt.
-pub(crate) async fn after_database_owners<T>(
+pub(crate) fn after_database_owners<T>(
     db: &pioneer_sqlite::SqliteDatabase,
     future: impl std::future::Future<Output = Result<T>>,
-) -> Result<T> {
-    let runtime = PayloadRuntime::for_database(db);
-    let released = db
-        .shared_resource::<pioneer_sqlite::background::Registry>()
-        .owner("storage.portable");
-    PAYLOAD_RUNTIME
-        .scope(
-            runtime,
-            PAYLOAD_RELEASE.scope(released, async {
-                let mut future = Box::pin(future);
-                let result = future.as_mut().await;
-                drop(future);
-                let mut refusal = DeferredHoldRejection::default();
-                refusal.capture(&result);
-                drop(refusal);
-                result
-            }),
-        )
-        .await
+) -> impl std::future::Future<Output = Result<T>> {
+    // Establish the heap boundary before either task-local scope captures the
+    // operation. Boxing only after polling still embeds it in every outer frame.
+    let mut future = Box::pin(future);
+    async move {
+        let runtime = PayloadRuntime::for_database(db);
+        let released = db
+            .shared_resource::<pioneer_sqlite::background::Registry>()
+            .owner("storage.portable");
+        PAYLOAD_RUNTIME
+            .scope(
+                runtime,
+                PAYLOAD_RELEASE.scope(released, async move {
+                    let result = future.as_mut().await;
+                    drop(future);
+                    let mut refusal = DeferredHoldRejection::default();
+                    refusal.capture(&result);
+                    drop(refusal);
+                    result
+                }),
+            )
+            .await
+    }
 }
 
 // Availability refusals are expected; malformed persisted header counters are
@@ -1712,7 +1716,7 @@ async fn publish(
         "portable publication affected invalid row count"
     );
     if affected == 0 && matches!(family, Family::CliMapping | Family::TaskHistory) {
-        let invalid = target!(family, |Target, Col, key, field, reference| {
+        let invalid = target!(family, |Target, Col, key, _field, _reference| {
             Target::find()
                 .select_only()
                 .expr(Expr::cust(invalid_root_sql(family)))
@@ -2254,8 +2258,9 @@ mod tests {
             );
             // Rejected staging remains protected while a reader holds it, then
             // ordinary bounded cleanup can reclaim both header and blocks.
-            let hold = PayloadReadHold::capture(&id, Family::TaskHistory).unwrap();
-            assert!(!cleanup(&store, None).await.unwrap().0);
+            let hold =
+                PayloadReadHold::capture_in(&store.connection, &id, Family::TaskHistory).unwrap();
+            assert!(!cleanup(&store, None, None).await.unwrap().0);
             assert!(
                 value::Entity::find_by_id(&id)
                     .one(&store.connection)
@@ -2265,7 +2270,7 @@ mod tests {
             );
             drop(hold);
             for _ in 0..10 {
-                cleanup(&store, None).await.unwrap();
+                cleanup(&store, None, None).await.unwrap();
             }
             assert!(
                 value::Entity::find_by_id(&id)

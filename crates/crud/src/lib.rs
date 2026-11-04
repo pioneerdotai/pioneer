@@ -10607,31 +10607,39 @@ impl CrudStore {
     /// A narrow process-local hint around one existing domain operation. Only
     /// known successful outcomes publish a change; errors/cancellation retain
     /// unknown settlement debt. No SQL/authority is supplied by the hint.
-    async fn background_change<T>(
-        &self,
+    fn background_change<'a, T: 'a>(
+        &'a self,
         name: &'static str,
-        operation: impl std::future::Future<Output = Result<T>>,
-        changed: impl FnOnce(&T) -> bool,
-    ) -> Result<T> {
-        self.background_changes(&[name], operation, changed).await
+        operation: impl std::future::Future<Output = Result<T>> + Send + 'a,
+        changed: impl FnOnce(&T) -> bool + 'a,
+    ) -> impl std::future::Future<Output = Result<T>> + 'a {
+        let operation: std::pin::Pin<Box<dyn std::future::Future<Output = Result<T>> + Send + 'a>> =
+            Box::pin(operation);
+        async move { self.background_changes(&[name], operation, changed).await }
     }
 
-    async fn background_changes<T>(
-        &self,
-        names: &[&'static str],
-        operation: impl std::future::Future<Output = Result<T>>,
-        changed: impl FnOnce(&T) -> bool,
-    ) -> Result<T> {
-        let changes: Vec<_> = names
-            .iter()
-            .map(|name| self.background_work(name).changing())
-            .collect();
-        let result = operation.await?;
-        let changed = changed(&result);
-        for change in changes {
-            change.finish(changed);
+    fn background_changes<'a, T: 'a>(
+        &'a self,
+        names: &'a [&'static str],
+        operation: impl std::future::Future<Output = Result<T>> + Send + 'a,
+        changed: impl FnOnce(&T) -> bool + 'a,
+    ) -> impl std::future::Future<Output = Result<T>> + 'a {
+        // Box before constructing the guard future: nesting a large mutation
+        // inline in multiple hint scopes multiplies caller/poll stack frames.
+        let operation: std::pin::Pin<Box<dyn std::future::Future<Output = Result<T>> + Send + 'a>> =
+            Box::pin(operation);
+        async move {
+            let changes: Vec<_> = names
+                .iter()
+                .map(|name| self.background_work(name).changing())
+                .collect();
+            let result = operation.await?;
+            let changed = changed(&result);
+            for change in changes {
+                change.finish(changed);
+            }
+            Ok(result)
         }
-        Ok(result)
     }
 
     pub async fn create_hook_run(
@@ -37185,7 +37193,25 @@ impl CrudStore {
             .await
     }
 
-    async fn append_task_events_in_connection_with_delivery_policy<C: ConnectionTrait + Sync>(
+    fn append_task_events_in_connection_with_delivery_policy<'a, C: ConnectionTrait + Sync>(
+        &'a self,
+        db: &'a C,
+        events: Vec<task_event::PreparedTaskEvent>,
+        event_timestamp_secs: i64,
+        delivery_cancellation: bool,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<Vec<DeferredAppendedTaskEvent>>> + Send + 'a>>
+    {
+        // This shared transactional projection contains large event variants.
+        // Keep its future out of every claim/terminal caller's retained frame.
+        Box::pin(self.append_task_events_with_delivery_policy_inner(
+            db,
+            events,
+            event_timestamp_secs,
+            delivery_cancellation,
+        ))
+    }
+
+    async fn append_task_events_with_delivery_policy_inner<C: ConnectionTrait + Sync>(
         &self,
         db: &C,
         events: Vec<task_event::PreparedTaskEvent>,
@@ -39022,7 +39048,9 @@ mod tests {
     mod task_webhook;
     mod thread_read_pages;
     mod unread_start;
+    use crate::repositories::turn_event_delivery;
     use crate::{
+        NATIVE_TURN_EVENT_EPISODIC_CONSUMER, NATIVE_TURN_EVENT_LIVE_CONSUMER,
         NewThreadEpisodicExclusionRecord, NewTurnExecution, PROJECTION_META_STATUS_PENDING,
         ProjectionMetaConfigRecord, ProjectionMetaRecord, THREAD_EPISODIC_PROJECTION_CHANGED_ERROR,
         THREAD_EPISODIC_SOURCE_VERSION_SUPERSEDED_ERROR, THREAD_EPISODIC_USER_DELETED_ERROR,

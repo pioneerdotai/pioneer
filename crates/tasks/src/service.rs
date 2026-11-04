@@ -410,7 +410,9 @@ impl TaskRuntime {
             _ = closing.wait_for(|closed| *closed) => Err(anyhow!("Task runtime is shut down")),
             result = async {
                 let _phase = self.start_gate.acquire().await.expect("phase gate stays open");
-                self.start_inner().await
+                // Keep startup reconstruction out of the lifecycle select's
+                // retained frame; its dispatch path can complete Tasks inline.
+                Box::pin(self.start_inner()).await
             } => result,
         }
     }
@@ -446,7 +448,7 @@ impl TaskRuntime {
         }
         let now = now_timestamp_secs();
         let mut partial_failures = Vec::new();
-        match self.reconciler.reconcile(now).await {
+        match Box::pin(self.reconciler.reconcile(now)).await {
             Ok(_) => {}
             Err(error)
                 if error
@@ -474,7 +476,7 @@ impl TaskRuntime {
         self.maintenance_service
             .auto_accept_expired_review_candidates(now, REVIEW_AUTO_ACCEPT_SCAN_LIMIT)
             .await?;
-        match self.scheduler.process_due_once(now).await {
+        match Box::pin(self.scheduler.process_due_once(now)).await {
             Ok(_) => {}
             Err(error)
                 if error
@@ -7385,7 +7387,7 @@ mod resource_policy_tests {
         );
         let service = runtime.maintenance_service();
         let wake = service.store.background_work("tasks.review");
-        let now = now_timestamp_secs();
+        let now = super::now_timestamp_secs();
         wake.set_wall_clock_for_test(std::time::UNIX_EPOCH + Duration::from_secs(now as u64));
         // Every fixture uses the actual execution/turn/candidate admission path.
         let mut inputs = Vec::new();
@@ -7423,15 +7425,17 @@ mod resource_policy_tests {
                 .unwrap();
         }
         // A real active failed extraction suppresses an older clock.
+        let mut failed_extraction = service
+            .store
+            .get_task_result_candidate(&inputs[1].2)
+            .await
+            .unwrap()
+            .unwrap();
+        failed_extraction.status = pioneer_protocol::TaskResultCandidateStatus::ExtractionFailed;
+        failed_extraction.updated_at = now;
         service
             .store
-            .update_task_result_candidate_resolution(
-                &inputs[1].2,
-                pioneer_protocol::TaskResultCandidateStatus::ExtractionFailed,
-                None,
-                None,
-                now,
-            )
+            .upsert_task_result_candidate(failed_extraction)
             .await
             .unwrap();
         let page_barrier = Arc::new(tokio::sync::Barrier::new(2));
@@ -7466,13 +7470,33 @@ mod resource_policy_tests {
         // Both changes are behind the retained Run cursor, inside the same
         // finite pass. Lower committed APIs publish the invalidation themselves.
         for index in [0usize, 1] {
-            service
+            let mut candidate = service
                 .store
-                .update_task_result_candidate_resolution(
-                    &inputs[index].2,
-                    pioneer_protocol::TaskResultCandidateStatus::Cancelled,
-                    None,
-                    Some(now),
+                .get_task_result_candidate(&inputs[index].2)
+                .await
+                .unwrap()
+                .unwrap();
+            let review_event = super::cancel_review_event_for_candidate(
+                &candidate,
+                "superseded fixture round",
+                now,
+            );
+            let review_event_id = review_event.id.clone();
+            candidate.status = pioneer_protocol::TaskResultCandidateStatus::Cancelled;
+            candidate.final_review_event_id = Some(review_event_id.clone());
+            candidate.resolved_at = Some(now);
+            candidate.updated_at = now;
+            service
+                .append_events(
+                    vec![
+                        pioneer_protocol::TaskEventPayload::TaskResultReviewEventRecorded {
+                            review_event,
+                        },
+                        pioneer_protocol::TaskEventPayload::TaskResultCandidateCancelled {
+                            candidate,
+                            review_event_id,
+                        },
+                    ],
                     now,
                 )
                 .await
@@ -8282,12 +8306,23 @@ mod background_lifecycle_tests {
             hold_clock.abort();
             let _ = hold_clock.await;
             succeeded(&store, &scheduled.task.id).await;
-            timeout(
-                Duration::from_secs(10),
-                c.maintenance_service.review_accepted_and_settled.notified(),
-            )
+            timeout(Duration::from_secs(10), async {
+                loop {
+                    if store
+                        .get_task_result_candidate(&candidate)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .status
+                        == TaskResultCandidateStatus::Accepted
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
             .await
-            .unwrap();
+            .expect("review deadline must durably accept without a producer");
             assert_eq!(
                 store
                     .get_task_result_candidate(&candidate)

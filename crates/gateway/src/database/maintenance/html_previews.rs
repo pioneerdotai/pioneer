@@ -19,6 +19,10 @@ pub(crate) struct Progress {
     finished: [bool; 2],
     io_seeded: bool,
     blocked_finished: bool,
+    #[cfg(test)]
+    quantum_observation: Option<pioneer_sqlite::background::Observation>,
+    #[cfg(test)]
+    quantum_rescan: bool,
 }
 
 async fn settle(
@@ -126,6 +130,16 @@ pub(crate) async fn quantum(
     progress: &mut Progress,
 ) -> anyhow::Result<bool> {
     let store = store.with_maintenance_access();
+    // Foreground fixtures drive the same finite passes without an Owner. Keep
+    // committed dependency changes across their handoff, as run_phase does.
+    let work = store.background_work("storage.html.retention");
+    let observed = work.observe();
+    if progress
+        .quantum_observation
+        .is_some_and(|old| old != observed)
+    {
+        progress.quantum_rescan = true;
+    }
     // Bounded queue recovery runs even after a lost local wake or restart.
     if !progress.blocked_finished {
         match store
@@ -181,10 +195,20 @@ pub(crate) async fn quantum(
     if let Some(error) = witness_error {
         return Err(error);
     }
-    Ok(io_more
+    let more = io_more
         || !progress.blocked_finished
         || !progress.finished[0]
-        || (!deferred && !progress.finished[1]))
+        || (!deferred && !progress.finished[1]);
+    let completed = work.observe();
+    progress.quantum_rescan |= completed != observed;
+    progress.quantum_observation = Some(completed);
+    if !more && std::mem::take(&mut progress.quantum_rescan) {
+        progress.finished = [false; 2];
+        progress.blocked_finished = false;
+        progress.previews.rediscover();
+        return Ok(true);
+    }
+    Ok(more)
 }
 
 #[derive(Clone, Copy)]

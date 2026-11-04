@@ -14,7 +14,7 @@ async fn queue_worker_delivery(
     thread: &str,
     at: i64,
 ) -> pioneer_protocol::TaskDelivery {
-    let task = processor
+    let response = processor
         .task_runtime
         .service()
         .create_task(
@@ -55,8 +55,34 @@ async fn queue_worker_delivery(
             },
         )
         .await
-        .unwrap()
-        .task;
+        .unwrap();
+    let task = response.task;
+    if response.trigger.next_fire_at != Some(at) {
+        // Restore the requested historical interval fire through its committed
+        // schedule producer. Creation computes a future fire from today's UTC.
+        let mut trigger = response.trigger;
+        trigger.next_fire_at = Some(at);
+        trigger.spec = TaskTriggerSpec::Interval {
+            interval_seconds: 3600,
+            interval_anchor_at: Some(at),
+            catch_up_policy: Some(
+                pioneer_protocol::TaskTriggerCatchUpPolicy::run_once_for_latest_missed(),
+            ),
+        };
+        processor
+            .crud_store
+            .append_task_event(
+                pioneer_protocol::TaskEventPayload::TaskRescheduled {
+                    task_id: task.id.clone(),
+                    trigger,
+                    rescheduled_at: at,
+                    reason: pioneer_protocol::TaskRescheduleReason::UserRequested,
+                },
+                at,
+            )
+            .await
+            .unwrap();
+    }
     processor.task_runtime.process_due_once(at).await.unwrap();
     processor
         .crud_store
@@ -416,12 +442,22 @@ fn hold_delivery_clock() -> tokio::task::JoinHandle<()> {
     })
 }
 async fn lifecycle_publication(processor: &MessageProcessor) {
-    timeout(
-        Duration::from_secs(10),
-        processor.wait_for_completed_history_preparation_barrier(),
-    )
-    .await
-    .unwrap();
+    // The virtual clock is intentionally frozen while SQLite's real worker
+    // threads finish. Bound this rendezvous in real time without advancing
+    // the monotonic budget whose behavior the matrix is proving.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let entered = processor.wait_for_completed_history_preparation_barrier();
+    tokio::pin!(entered);
+    loop {
+        if futures_util::FutureExt::now_or_never(entered.as_mut()).is_some() {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "lifecycle publication did not settle"
+        );
+        tokio::task::yield_now().await;
+    }
 }
 
 #[tokio::test]
@@ -430,7 +466,9 @@ async fn lifecycle_owner_fractional_grace_matches_real_recovery_source() {
     use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, sea_query::Expr};
     for (fraction_ms, retry_delay) in [(0, 0), (500, 0), (500, 2)] {
         let (_directory, processor, workspace, observer) = clock_delivery_processor().await;
-        let now = now_timestamp_secs();
+        // Only delivery eligibility uses the controlled wall source here.
+        // Leave UTC-created occurrence obligations in its genuine future.
+        let now = now_timestamp_secs() - 7200;
         let created = now - 300;
         let row = queue_worker_delivery(&processor, &workspace, "thr_race_delivery", created).await;
         let TaskDeliveryTransitionOutcome::Applied((_, original)) = processor
@@ -475,10 +513,10 @@ async fn lifecycle_owner_fractional_grace_matches_real_recovery_source() {
                     .unwrap()
             );
         }
-        let due = now + i64::from(fraction_ms != 0).max(retry_delay);
+        let due = now + std::cmp::max(i64::from(fraction_ms != 0), retry_delay);
         let wake = processor.crud_store.background_work("tasks.lifecycle");
         wake.set_wall_clock_for_test(std::time::UNIX_EPOCH + Duration::from_secs(now as u64));
-        processor.arm_completed_history_preparation_barrier("__task_lifecycle_before_wait__");
+        processor.arm_completed_history_preparation_barrier("__task_lifecycle_delivery_settled__");
         let worker = tokio::spawn(MessageProcessor::run_task_lifecycle_resilience_worker(
             Arc::downgrade(&processor),
         ));
@@ -513,10 +551,16 @@ async fn lifecycle_owner_fractional_grace_matches_real_recovery_source() {
                 "no successful-Empty SQL spin before authoritative grace"
             );
             assert!(observer.writes.lock().unwrap().is_empty());
-            processor.arm_completed_history_preparation_barrier("__task_lifecycle_before_wait__");
+            processor
+                .arm_completed_history_preparation_barrier("__task_lifecycle_delivery_settled__");
             wake.set_wall_clock_for_test(std::time::UNIX_EPOCH + Duration::from_secs(due as u64));
             // Cross the actual wait's original deadline, without an input hint.
-            tokio::time::advance(Duration::from_secs((due - now) as u64)).await;
+            // Tokio's timer wheel rounds the monotonic sleep up to its next
+            // millisecond; keep wall eligibility exactly at the tested second.
+            tokio::time::advance(
+                Duration::from_secs((due - now) as u64) + Duration::from_millis(1),
+            )
+            .await;
             lifecycle_publication(&processor).await;
             guard.abort();
             tokio::time::resume();
@@ -552,7 +596,9 @@ async fn lifecycle_owner_retains_real_delivery_cooldown_with_independent_wall_wo
     use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, sea_query::Expr};
     for forward in [false, true] {
         let (_directory, processor, workspace, _observer) = clock_delivery_processor().await;
-        let now = now_timestamp_secs();
+        // Only delivery eligibility uses the controlled wall source here.
+        // Leave UTC-created occurrence obligations in its genuine future.
+        let now = now_timestamp_secs() - 7200;
         // Remains genuinely stale even after a one-hour wall rollback.
         let poison =
             queue_worker_delivery(&processor, &workspace, "thr_race_delivery", now - 7200).await;
@@ -603,7 +649,7 @@ async fn lifecycle_owner_retains_real_delivery_cooldown_with_independent_wall_wo
         db.execute_unprepared("DROP TRIGGER clock_reject_retry")
             .await
             .unwrap();
-        processor.arm_completed_history_preparation_barrier("__task_lifecycle_before_wait__");
+        processor.arm_completed_history_preparation_barrier("__task_lifecycle_delivery_settled__");
         let worker = tokio::spawn(MessageProcessor::run_task_lifecycle_resilience_worker(
             Arc::downgrade(&processor),
         ));
@@ -626,6 +672,7 @@ async fn lifecycle_owner_retains_real_delivery_cooldown_with_independent_wall_wo
                 .timestamp(),
             now + 2
         );
+        processor.arm_completed_history_preparation_barrier("__task_lifecycle_delivery_settled__");
         processor.release_completed_history_preparation_barrier();
         for _ in 0..32 {
             tokio::task::yield_now().await;
@@ -635,21 +682,8 @@ async fn lifecycle_owner_retains_real_delivery_cooldown_with_independent_wall_wo
         if forward {
             // Force Wake's pending wall wait to resample before the retry is due.
             // An original two-second wall deadline is its next sample.
-            tokio::time::advance(Duration::from_secs(2)).await;
-            for _ in 0..128 {
-                if processor
-                    .crud_store
-                    .get_task_delivery(&pending.id)
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    .status
-                    == pioneer_protocol::TaskDeliveryStatus::Delivered
-                {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
+            tokio::time::advance(Duration::from_secs(2) + Duration::from_millis(1)).await;
+            lifecycle_publication(&processor).await;
             assert_eq!(
                 processor
                     .crud_store
@@ -660,22 +694,17 @@ async fn lifecycle_owner_retains_real_delivery_cooldown_with_independent_wall_wo
                     .status,
                 pioneer_protocol::TaskDeliveryStatus::Delivered
             );
+            assert!(
+                processor
+                    .task_runtime
+                    .background_control_service()
+                    .delivery_recovery_retry_deadline()
+                    .is_some_and(|at| at > tokio::time::Instant::now()),
+                "independent wall work finishes before the monotonic cooldown"
+            );
         } else {
             tokio::time::advance(Duration::from_secs(5)).await;
-            for _ in 0..128 {
-                if processor
-                    .crud_store
-                    .get_task_delivery(&poison.id)
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    .status
-                    == pioneer_protocol::TaskDeliveryStatus::Delivered
-                {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
+            lifecycle_publication(&processor).await;
             assert_eq!(
                 processor
                     .crud_store
@@ -712,8 +741,13 @@ async fn lifecycle_owner_reconstructs_future_delivery_pages_and_old_key() {
     wake.set_wall_clock_for_test(std::time::UNIX_EPOCH + Duration::from_secs(now as u64));
     let mut inputs = Vec::new();
     for index in 0..65 {
-        let row =
-            queue_worker_delivery(&processor, &workspace, "thr_race_delivery", now + index).await;
+        let row = queue_worker_delivery(
+            &processor,
+            &workspace,
+            "thr_race_delivery",
+            now - 7200 + index,
+        )
+        .await;
         inputs.push(row);
     }
     inputs.sort_by(|a, b| a.id.cmp(&b.id));
@@ -769,6 +803,15 @@ async fn lifecycle_owner_reconstructs_future_delivery_pages_and_old_key() {
             .status,
         pioneer_protocol::TaskDeliveryStatus::Delivered
     );
+    // The useful tail's durable delivery is proved above. Native delivery and
+    // refill/index work have independent lifetimes; finish their fixture work
+    // before measuring whole-database quiet. A final bootstrap observation
+    // cannot rescue the already-asserted traversal or the old-key proof below.
+    let index_idle_release = pause_native_delivery_index_at_idle(&processor).await;
+    processor.arm_completed_history_preparation_barrier("__task_lifecycle_delivery_settled__");
+    wake.invalidate();
+    processor.release_completed_history_preparation_barrier();
+    lifecycle_publication(&processor).await;
     // Complete finite discovery before measuring quiet; nearest is odd-index
     // grace now+401, even-index retries are later (now+1005).
     let deadlines = processor
@@ -777,10 +820,11 @@ async fn lifecycle_owner_reconstructs_future_delivery_pages_and_old_key() {
         .await
         .unwrap();
     assert_eq!(deadlines.delivery_recovery, Some(now + 401));
-    processor.release_completed_history_preparation_barrier();
     let guard = hold_delivery_clock();
     observer.reads.lock().unwrap().clear();
     observer.writes.lock().unwrap().clear();
+    processor.release_completed_history_preparation_barrier();
+    index_idle_release.send(()).unwrap();
     tokio::time::advance(Duration::from_secs(100)).await;
     for _ in 0..128 {
         tokio::task::yield_now().await;
@@ -824,7 +868,7 @@ async fn lifecycle_owner_reconstructs_future_delivery_pages_and_old_key() {
     processor.release_completed_history_preparation_barrier();
     processor.arm_completed_history_preparation_barrier("__task_lifecycle_delivery_settled__");
     wake.set_wall_clock_for_test(std::time::UNIX_EPOCH + Duration::from_secs((now + 60) as u64));
-    tokio::time::advance(Duration::from_secs(60)).await;
+    tokio::time::advance(Duration::from_secs(60) + Duration::from_millis(1)).await;
     lifecycle_publication(&processor).await;
     assert_eq!(
         processor

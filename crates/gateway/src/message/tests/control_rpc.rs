@@ -7,7 +7,7 @@ use crate::transport::{
 use futures_util::FutureExt;
 use pioneer_protocol::{JsonRpcRequest, constants::methods};
 use pioneer_provider::ProviderRegistry;
-use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
+use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, Set};
 use tokio::sync::watch;
 
 const THREAD: &str = "thrControl00000000001";
@@ -695,24 +695,27 @@ async fn wait_reauthorizes_original_task_and_run_targets_after_initial_proof() {
                     } else {
                         None
                     };
-                    // Complete the actual persisted target. Service rescan, not an
-                    // injected authorized reply, releases the no-timeout wait.
-                    pioneer_entity::task_run::Entity::update_many()
-                        .col_expr(
-                            pioneer_entity::task_run::Column::Status,
-                            Expr::value("succeeded"),
+                    // Complete through the committed Task producer so the
+                    // no-timeout waiter observes the same domain change as clients.
+                    let completed_at = chrono::Utc::now().timestamp();
+                    f.processor
+                        .crud_store
+                        .append_task_events(
+                            vec![
+                                pioneer_protocol::TaskEventPayload::RunCompleted {
+                                    task_id: TASK.into(),
+                                    run_id: RUN.into(),
+                                    result: None,
+                                    completed_at,
+                                },
+                                pioneer_protocol::TaskEventPayload::TaskCompleted {
+                                    task_id: TASK.into(),
+                                    result: None,
+                                    completed_at,
+                                },
+                            ],
+                            completed_at,
                         )
-                        .filter(pioneer_entity::task_run::Column::Id.eq(RUN))
-                        .exec(&f.processor.crud_store.database_connection())
-                        .await
-                        .unwrap();
-                    pioneer_entity::task::Entity::update_many()
-                        .col_expr(
-                            pioneer_entity::task::Column::Status,
-                            Expr::value("completed"),
-                        )
-                        .filter(pioneer_entity::task::Column::Id.eq(TASK))
-                        .exec(&f.processor.crud_store.database_connection())
                         .await
                         .unwrap();
                     replacement

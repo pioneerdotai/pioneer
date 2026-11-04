@@ -940,36 +940,27 @@ async fn finalization_owner_rescans_new_intent_after_owner_or_foreground_frontie
                 .status,
             TurnStatus::Completed
         );
-        // This <64 fresh page includes N and establishes settled EOF. Release
-        // its barrier and wait for any already spawned optional deliveries.
+        // The 65th durable outcome is already proved. Finish independent
+        // delivery/refill/index work before fencing whole-database quiet.
+        let index_idle_release = pause_native_delivery_index_at_idle(&processor).await;
+        processor.arm_completed_history_preparation_barrier("__finalization_settled__");
         processor.release_completed_history_preparation_barrier();
-        timeout(Duration::from_secs(10), async {
-            while processor
-                .native_turn_event_delivery_workers
-                .live
-                .running
-                .load(Ordering::Acquire)
-                || processor
-                    .native_turn_event_delivery_workers
-                    .episodic
-                    .running
-                    .load(Ordering::Acquire)
-            {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
+        activation_owner_barrier(&processor).await;
+        let quiet_generation = lower.background_work("turn.finalization").observe();
         observer.reads.lock().unwrap().clear();
         observer.writes.lock().unwrap().clear();
+        processor.release_completed_history_preparation_barrier();
+        index_idle_release.send(()).unwrap();
         tokio::time::pause();
         tokio::time::advance(Duration::from_secs(300)).await;
         for _ in 0..32 {
             tokio::task::yield_now().await;
         }
+        let reads = observer.reads.lock().unwrap().clone();
         assert!(
-            observer.reads.lock().unwrap().is_empty(),
-            "foreground={foreground}"
+            reads.is_empty(),
+            "foreground={foreground}; reads={reads:?}; generation={quiet_generation:?}->{:?}",
+            lower.background_work("turn.finalization").observe()
         );
         assert!(observer.writes.lock().unwrap().is_empty());
         tokio::time::resume();

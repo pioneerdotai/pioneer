@@ -2133,17 +2133,9 @@ async fn cli_saved_native_outcome_reopens_for_codex_and_claude_without_provider_
             original_owner
         );
         assert!(session.turn_starts.lock().await.is_empty());
-        use pioneer_entity::turn_execution as execution;
-        let expired_at = chrono::DateTime::from_timestamp(now - 1, 0)
-            .unwrap()
-            .fixed_offset();
-        execution::Entity::update_many()
-            .col_expr(execution::Column::HeartbeatAt, Expr::value(expired_at))
-            .col_expr(execution::Column::LeaseUntil, Expr::value(expired_at))
-            .filter(execution::Column::TurnId.eq(BLOCKED_TURN))
-            .exec(&store.database_connection())
-            .await
-            .unwrap();
+        // Cross the retained foreign lease deadline. An unannounced raw
+        // rewrite after EOF does not model the restart/takeover contract.
+        let now = std::cmp::max(now, original_owner.lease_until.timestamp() + 1);
         // Exercise the real lease CAS, rather than assigning the new owner.
         let events = reopened
             .recovery_coordinator
@@ -3773,17 +3765,9 @@ async fn cli_accepted_unconfirmed_recovery_outcome_survives_expiration_takeover_
                         .unwrap(),
                     original_owner
                 );
-                use pioneer_entity::turn_execution as execution;
-                let expired_at = chrono::DateTime::from_timestamp(now - 1, 0)
-                    .unwrap()
-                    .fixed_offset();
-                execution::Entity::update_many()
-                    .col_expr(execution::Column::HeartbeatAt, Expr::value(expired_at))
-                    .col_expr(execution::Column::LeaseUntil, Expr::value(expired_at))
-                    .filter(execution::Column::TurnId.eq(BLOCKED_TURN))
-                    .exec(&store.database_connection())
-                    .await
-                    .unwrap();
+                // Cross the captured lease deadline without an unannounced
+                // raw rewrite behind the finite orphan pass's frontier.
+                let now = std::cmp::max(now, original_owner.lease_until.timestamp() + 1);
                 let events = reopened
                     .recovery_coordinator
                     .run_ready_jobs(now, 16)
@@ -4661,7 +4645,7 @@ async fn command_owner_dormant_then_lower_commit_arms_real_heartbeat_and_complet
         .await
         .unwrap()
         .map_or(now_timestamp_secs(), |row| {
-            row.last_activity_at_unix.max(now_timestamp_secs())
+            std::cmp::max(row.last_activity_at_unix, now_timestamp_secs())
         })
         .saturating_add(1);
     lower
@@ -4749,7 +4733,7 @@ async fn command_owner_dormant_then_lower_commit_arms_real_heartbeat_and_complet
                 &native_owner.attempt.id,
                 pioneer_crud::CliRuntimeTurnAttemptStatus::Completed,
                 None,
-                utc_now(),
+                chrono::Utc::now().fixed_offset(),
             )
             .await
             .unwrap()
@@ -4965,6 +4949,8 @@ async fn cli_supervision_source_after_empty_arms_stale_deadline_without_client()
     assert!(observer.writes.lock().unwrap().is_empty());
     processor.cli_history_shutdown.cancel();
     worker.await.unwrap();
+}
+
 // Real wire reader/ordered queue -> native mapping -> existing receipt journal
 // -> durable projection -> DB readback. No native process/model is needed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

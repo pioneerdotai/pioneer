@@ -415,11 +415,15 @@ async fn shutdown_retains_claim_and_restored_processor_recovers_with_a_new_token
             }
         }
     }
+    let workspace_manager = processor.workspace_manager.clone();
+    // A restart releases the closed physical delivery runtime before its
+    // replacement is constructed; another facade must not revive a closed owner.
+    drop(processor);
     let restored = MessageProcessor::with_agent_manager(
         Arc::new(ThreadManager::new("test-model", "openai")),
         Arc::new(AgentManager::new(test_provider(), test_tool_loop_config())),
         Arc::new(SessionManager::new()),
-        processor.workspace_manager.clone(),
+        workspace_manager,
         store.clone(),
     );
     let restored_ingestor = Arc::new(BlockingIngestor::default());

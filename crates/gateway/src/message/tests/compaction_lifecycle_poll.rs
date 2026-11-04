@@ -359,28 +359,28 @@ async fn lifecycle_owner_stays_dormant_and_finishes_a_new_operation_at_its_clock
         OperationSnapshot, Transport,
     };
     let (_directory, processor, store, observer) = fixture().await;
-    // Finish finite startup/restored debt without starting optional provider
-    // work. The following worker is the real independently owned lifecycle.
+    processor.arm_completed_history_preparation_barrier("__compaction_lifecycle_before_wait__");
+    let worker = tokio::spawn(MessageProcessor::run_compaction_lifecycle_worker(
+        Arc::downgrade(&processor),
+    ));
+    // The lifecycle owner itself finishes finite startup/restored debt.
     for _ in 0..16 {
-        processor.reconcile_compaction_lifecycle().await.unwrap();
+        timeout(
+            Duration::from_secs(10),
+            processor.wait_for_completed_history_preparation_barrier(),
+        )
+        .await
+        .unwrap();
         if store.compaction_lifecycle_deadlines().await.unwrap() == (None, None) {
             break;
         }
+        processor.arm_completed_history_preparation_barrier("__compaction_lifecycle_before_wait__");
+        processor.release_completed_history_preparation_barrier();
     }
     assert_eq!(
         store.compaction_lifecycle_deadlines().await.unwrap(),
         (None, None)
     );
-    processor.arm_completed_history_preparation_barrier("__compaction_lifecycle_before_wait__");
-    let worker = tokio::spawn(MessageProcessor::run_compaction_lifecycle_worker(
-        Arc::downgrade(&processor),
-    ));
-    timeout(
-        Duration::from_secs(10),
-        processor.wait_for_completed_history_preparation_barrier(),
-    )
-    .await
-    .unwrap();
     observer.reads.lock().unwrap().clear();
     observer.writes.lock().unwrap().clear();
     processor.release_completed_history_preparation_barrier();

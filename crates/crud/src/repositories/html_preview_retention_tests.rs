@@ -2862,7 +2862,12 @@ async fn maintenance_lifecycle_admission_observes_foreign_deadlines_without_writ
     f.sql("INSERT INTO compaction_lifecycle_scope(kind,owner,turn_id,generation,due_at) VALUES('turn','owner','parent-turn',1,500)").await;
     f.sql("INSERT INTO compaction_context(owner,workspace_id,thread_id,format_version) VALUES('admission-owner','ws','parent',1)").await;
     f.sql("INSERT INTO compaction_operation(id,owner,fingerprint,status,snapshot,deadline_ms) VALUES('legacy','admission-owner','admission','completed','{}',1)").await;
-    f.sql("INSERT INTO compaction_lifecycle_pending(operation_id,generation,eligible_at,retry_not_before,due_at) VALUES('legacy',1,700,900,900)").await;
+    // Model the context-registration scope as already reconstructed; its
+    // immediate producer obligation is separate from the restored clocks below.
+    f.sql("DELETE FROM compaction_lifecycle_scope WHERE kind='owner' AND owner='admission-owner'")
+        .await;
+    // The operation trigger already registers its durable pending locator.
+    f.sql("UPDATE compaction_lifecycle_pending SET eligible_at=700,retry_not_before=900,due_at=900 WHERE operation_id='legacy'").await;
     // Offline/restored state reconstructs both concrete future deadlines. Retry/lease due_at, not eligible_at alone, admits pending.
     assert_eq!(
         f.store.compaction_lifecycle_deadlines().await.unwrap(),

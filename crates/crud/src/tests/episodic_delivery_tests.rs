@@ -537,7 +537,7 @@ async fn episodic_claim_production_sql_uses_unfinished_index_with_large_terminal
         "cover discovery and every guarded claim"
     );
     for claim in claims {
-        assert!(
+        assert_eq!(
             deliveries::mark_delivered(
                 &db,
                 &claim.row.id,
@@ -545,7 +545,8 @@ async fn episodic_claim_production_sql_uses_unfinished_index_with_large_terminal
                 unix_to_datetime(NOW)
             )
             .await
-            .unwrap()
+            .unwrap(),
+            Some(EPISODIC.to_owned())
         );
     }
     let next = deliveries::claim_due(
@@ -559,7 +560,7 @@ async fn episodic_claim_production_sql_uses_unfinished_index_with_large_terminal
     .unwrap();
     assert_eq!(next.len(), 1);
     assert_eq!(next[0].row.sequence, 20_002);
-    assert!(
+    assert_eq!(
         deliveries::mark_failed(
             &db,
             &next[0].row.id,
@@ -570,7 +571,8 @@ async fn episodic_claim_production_sql_uses_unfinished_index_with_large_terminal
             true
         )
         .await
-        .unwrap()
+        .unwrap(),
+        Some(EPISODIC.to_owned())
     );
     let last = deliveries::claim_due(
         &db,

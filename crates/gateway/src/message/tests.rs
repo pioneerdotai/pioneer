@@ -4073,6 +4073,53 @@ impl pioneer_sqlite::SqliteWriteObserver for NativeSchedulingObserver {
     }
 }
 
+async fn pause_native_delivery_index_at_idle(
+    processor: &MessageProcessor,
+) -> tokio::sync::oneshot::Sender<()> {
+    // Native delivery EOF does not join its separately owned refill/index work.
+    timeout(Duration::from_secs(10), async {
+        while !processor
+            .native_turn_event_delivery_workers
+            .tasks
+            .is_empty()
+            || processor
+                .native_turn_event_delivery_workers
+                .live
+                .running
+                .load(Ordering::Acquire)
+            || processor
+                .native_turn_event_delivery_workers
+                .episodic
+                .running
+                .load(Ordering::Acquire)
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let mut held: Option<tokio::sync::oneshot::Sender<()>> = None;
+    for _ in 0..2 {
+        let (entered, idle) = tokio::sync::oneshot::channel();
+        let (release, resume) = tokio::sync::oneshot::channel();
+        processor
+            .thread_episodic_index_executor
+            .pause_before_idle_for_test(entered, resume)
+            .await;
+        processor.thread_episodic_index_executor.wake();
+        if let Some(previous) = held.take() {
+            previous.send(()).unwrap();
+        }
+        timeout(Duration::from_secs(60), idle)
+            .await
+            .expect("episodic history must finish before quiet observation")
+            .unwrap();
+        held = Some(release);
+    }
+    // The second round consumes any kick coalesced during the first one.
+    held.unwrap()
+}
+
 struct MainCaptureProvider {
     text: String,
     requests: std::sync::Mutex<Vec<ChatRequest>>,
@@ -90172,7 +90219,7 @@ async fn skill_upload_owner_reopens_old_key_and_expires_without_client_or_empty_
     cleanup_workspaces.sort();
     let config =
         test_tool_loop_config_with_roots(&system_root, &user_root, &workspace_root, &registry_root);
-    let ttl = config.skills.security.upload_ttl_secs.max(60);
+    let ttl = std::cmp::max(config.skills.security.upload_ttl_secs, 60);
     // Use the configured public path resolver, without exposing private
     // SkillsRuntimeContext fields to this sibling test module.
     let roots = |id: &str| {

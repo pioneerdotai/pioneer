@@ -727,6 +727,9 @@ async fn portable_tool_storage_survives_staging_restart_and_preserves_retry_and_
         .execute_unprepared("DELETE FROM tool_output_chunk WHERE item_id='portable'")
         .await
         .unwrap();
+    // This storage-level fixture drives Progress directly, without the owner
+    // that reopens completed reclamation after a relevant source change.
+    restarted.invalidate();
     for _ in 0..80 {
         restarted.quantum(&reopened).await.unwrap();
     }

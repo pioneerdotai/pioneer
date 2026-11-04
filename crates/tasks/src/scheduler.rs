@@ -1374,7 +1374,15 @@ impl TaskScheduler {
         let Some(executor) = self.executors.get(run.executor_kind).await else {
             return Ok(false);
         };
-        let claimed_at = now_timestamp_secs();
+        // Sample the same wall source used for scheduler eligibility. The
+        // transactional claim still revalidates ReadyAt at this fresh instant.
+        let claimed_at = self
+            .work
+            .wall_now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            .min(i64::MAX as u64) as i64;
         let claim = if let Some(occurrence) = retry_occurrence {
             store
                 .claim_task_retry_for_dispatch_with_event(&run.id, claimed_at, occurrence)
@@ -1850,12 +1858,19 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            tokio::time::timeout(
-                Duration::from_secs(10),
-                scheduler.future_observed.notified(),
-            )
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if matches!(scheduler.next_work_plan(now).await.unwrap(),
+                        pioneer_sqlite::background::Plan::WallDeadline(at)
+                        if at == std::time::UNIX_EPOCH + Duration::from_secs((now + 30) as u64))
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
             .await
-            .unwrap();
+            .expect("committed old-key deadline must replace the former arm");
             scheduler.work.set_wall_clock_for_test(
                 std::time::UNIX_EPOCH + Duration::from_secs((now + 31) as u64),
             );
@@ -1874,15 +1889,14 @@ mod tests {
                 }
                 tokio::task::yield_now().await;
             }
+            let saved = store.get_task(&tasks[0].task.id).await.unwrap().unwrap();
             assert!(
-                store
-                    .get_task(&tasks[0].task.id)
-                    .await
-                    .unwrap()
-                    .unwrap()
+                saved
                     .runs
                     .iter()
-                    .any(|run| run.status == TaskRunStatus::Succeeded)
+                    .any(|run| run.status == TaskRunStatus::Succeeded),
+                "rescheduled task must complete: {saved:?}; plan={:?}",
+                scheduler.next_work_plan(now + 31).await
             );
             worker.abort();
             let _ = worker.await;
@@ -2287,9 +2301,8 @@ mod tests {
             use pioneer_entity::task_run as run_row;
             use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, sea_query::Expr};
             let (_directory, store, runtime, observer) = scheduler_fixture().await;
-            // Dispatch's writer-owned UTC revalidation stays authoritative.
-            // Both test clock samples are historical to real UTC, while A is
-            // genuinely future to the scheduler's first sample.
+            // Readiness and writer-owned claim revalidation share the same
+            // wall source. A is genuinely future to its first sample.
             let now = now_timestamp_secs() - 7200;
             let due = now + 1;
             let mut tail = Vec::new();

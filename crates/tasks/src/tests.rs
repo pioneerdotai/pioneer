@@ -4695,6 +4695,7 @@ async fn daily_cron_catches_up_latest_missed_once_and_advances_to_next_day() {
 
 #[tokio::test]
 async fn skip_missed_cron_advances_trigger_without_creating_run() {
+    use sea_orm::{ColumnTrait, QueryFilter};
     let runtime = runtime().await;
     let response = runtime
         .service()
@@ -4711,7 +4712,22 @@ async fn skip_missed_cron_advances_trigger_without_creating_run() {
     let first_fire = response
         .trigger
         .next_fire_at
-        .expect("cron should have initial fire");
+        .expect("cron should have initial fire")
+        - 24 * 60 * 60;
+    // Restore an unseen missed fire, rather than a newly committed future arm.
+    pioneer_entity::task_trigger::Entity::update_many()
+        .filter(pioneer_entity::task_trigger::Column::Id.eq(&response.trigger.id))
+        .col_expr(
+            pioneer_entity::task_trigger::Column::NextFireAt,
+            sea_orm::sea_query::Expr::value(
+                chrono::DateTime::from_timestamp(first_fire, 0)
+                    .unwrap()
+                    .fixed_offset(),
+            ),
+        )
+        .exec(&runtime.service().store().database_connection())
+        .await
+        .unwrap();
     let missed_by_two_hours = first_fire + 2 * 60 * 60;
 
     assert_eq!(
@@ -7131,7 +7147,7 @@ async fn wait_detects_terminal_state_through_lower_commit_without_bus_delivery()
 
     runtime
         .service()
-        .store
+        .store()
         .append_task_event(
             TaskEventPayload::RunCompleted {
                 task_id,

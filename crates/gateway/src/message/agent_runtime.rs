@@ -3798,7 +3798,7 @@ impl MessageProcessor {
     // has no clock override and still reads UTC separately for each wave.
     pub(super) fn spawn_native_terminal_effect_kick(
         &self,
-        #[cfg(test)] discovery_clock: Option<Box<dyn Fn() -> i64 + Send>>,
+        #[cfg(test)] discovery_clock: Option<Box<dyn Fn() -> i64 + Send + Sync>>,
     ) {
         let work = self.crud_store.background_work("recovery.effects");
         work.invalidate();

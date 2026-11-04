@@ -1820,9 +1820,8 @@ impl ThreadEpisodicIndexExecutor {
                     }
                     #[cfg(test)]
                     if deadline.is_none() && !blocked {
-                        if let Some((started, release)) =
-                            executor.before_idle_pause.lock().await.take()
-                        {
+                        let pause = executor.before_idle_pause.lock().await.take();
+                        if let Some((started, release)) = pause {
                             let _ = started.send(());
                             tokio::select! { biased; _ = stopping.cancelled() => return, _ = release => {} }
                         }

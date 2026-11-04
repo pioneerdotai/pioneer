@@ -370,12 +370,23 @@ async fn reconciliation_reporting_is_retained_in_both_real_worker_loops() {
             let projection_passes = events
                 .iter()
                 .filter(|event| {
-                    event.message.as_deref() == Some("turn event projection replay failed")
+                    event.message.as_deref() == Some("native projection/finalization recovery deferred")
+                        && matches!(event.contexts.get("Rust Tracing Fields"),
+                            Some(sentry::protocol::Context::Other(fields))
+                            if fields.get("finalization").and_then(JsonValue::as_bool) == Some(true))
                 })
                 .count();
             let lifecycle_passes = events
                 .iter()
-                .filter(|event| event.message.as_deref() == Some("task delivery worker failed"))
+                .filter(|event| {
+                    matches!(
+                        event.message.as_deref(),
+                        Some(
+                            "Task lifecycle deadline observation failed"
+                                | "Task lifecycle change settlement failed"
+                        )
+                    )
+                })
                 .count();
             if projection_passes >= pass && lifecycle_passes >= pass {
                 completed = true;
@@ -387,7 +398,11 @@ async fn reconciliation_reporting_is_retained_in_both_real_worker_loops() {
         }
         assert!(
             completed,
-            "both workers must finish their real reconciliation pass"
+            "both workers must finish retry wave {pass}: {:?}",
+            events
+                .iter()
+                .map(|event| (&event.message, &event.contexts))
+                .collect::<Vec<_>>()
         );
         tokio::time::advance(std::time::Duration::from_secs(2)).await;
     }
@@ -431,14 +446,26 @@ async fn reconciliation_reporting_is_retained_in_both_real_worker_loops() {
         );
     }
     assert!(
+        events.iter().any(|event| {
+            event.message.as_deref() == Some("task child terminal reconciler failed")
+        }),
+        "the initial domain failure remains visible"
+    );
+    // Once the failed mutation leaves Unknown debt, subsequent waves must
+    // report settlement failure rather than reentering domain reconciliation.
+    assert!(
         events
             .iter()
-            .filter(|event| {
-                event.message.as_deref() == Some("task child terminal reconciler failed")
-            })
+            .filter(|event| matches!(
+                event.message.as_deref(),
+                Some(
+                    "task child terminal reconciler failed"
+                        | "Task lifecycle change settlement failed"
+                )
+            ))
             .count()
-            >= 2,
-        "neighbor ERROR is still emitted each pass"
+            >= 3,
+        "neighbor errors remain visible through all three retry waves"
     );
 }
 
@@ -600,13 +627,13 @@ async fn queue_control_phase_preserves_parked_capacity_and_fractional_predicates
     // valid durable metadata; queue is still empty at this point.
     for i in 0..130 {
         execution::ActiveModel {
-            id: Set(format!("history-{i:03}")),
+            id: Set(format!("History{i:014}")),
             workspace_id: Set(workspace.clone()),
             agent_identity_id: Set("Aidentity123456789012".into()),
             identity_source_revision: Set(1),
             identity_source_fingerprint: Set("source".into()),
             home_root_thread_id: Set("queue-thread".into()),
-            work_graph_root_execution_id: Set(format!("history-{i:03}")),
+            work_graph_root_execution_id: Set(format!("History{i:014}")),
             requested_identity_selection_json: Set("{}".into()),
             requested_profile_selection_json: Set("{}".into()),
             authorization_context_fingerprint: Set("authorization".into()),
@@ -622,7 +649,7 @@ async fn queue_control_phase_preserves_parked_capacity_and_fractional_predicates
         .unwrap();
         pioneer_crud::ensure_root_resource_scope(
             &db,
-            &format!("history-{i:03}"),
+            &format!("History{i:014}"),
             1,
             8,
             8,
@@ -639,7 +666,12 @@ async fn queue_control_phase_preserves_parked_capacity_and_fractional_predicates
         "empty queue finishes in its first quantum regardless of historical scopes"
     );
     // Durable inputs only: none of these commits sends a Gateway queue kick.
-    for root in ["saturated", "inactive", "runnable", "no-schedule"] {
+    for root in [
+        "Saturated000000000000",
+        "Inactive0000000000000",
+        "Runnable0000000000000",
+        "NoSchedule00000000000",
+    ] {
         execution::ActiveModel {
             id: Set(root.into()),
             workspace_id: Set(workspace.clone()),
@@ -690,7 +722,7 @@ async fn queue_control_phase_preserves_parked_capacity_and_fractional_predicates
                 attempt_generation: 1,
                 branch_key: root.into(),
                 enqueue_sequence: 1,
-                eligible_at: Some(fractional_due),
+                eligible_at: (root != "NoSchedule00000000000").then_some(fractional_due),
                 now: second,
             },
         )
@@ -699,18 +731,18 @@ async fn queue_control_phase_preserves_parked_capacity_and_fractional_predicates
     }
     // Several valid queue entries share the saturated root/branch. This
     // extends semantic root-set coverage, not a claim about SQL VM step counts.
-    let original_execution = execution::Entity::find_by_id("saturated")
+    let original_execution = execution::Entity::find_by_id("Saturated000000000000")
         .one(&db)
         .await
         .unwrap()
         .unwrap();
-    let original_resource = resource::Entity::find_by_id("state-saturated")
+    let original_resource = resource::Entity::find_by_id("state-Saturated000000000000")
         .one(&db)
         .await
         .unwrap()
         .unwrap();
     for index in 1..=3 {
-        let id = format!("saturated-child-{index}");
+        let id = format!("SaturatedChild{index:07}");
         let mut child: execution::ActiveModel = original_execution.clone().into();
         child.id = Set(id.clone());
         child.insert(&db).await.unwrap();
@@ -722,10 +754,10 @@ async fn queue_control_phase_preserves_parked_capacity_and_fractional_predicates
             &db,
             &pioneer_crud::AgentQueueEntryInput {
                 id: format!("queue-{id}"),
-                root_execution_id: "saturated".into(),
+                root_execution_id: "Saturated000000000000".into(),
                 execution_id: id,
                 attempt_generation: 1,
-                branch_key: "saturated".into(),
+                branch_key: "Saturated000000000000".into(),
                 enqueue_sequence: index + 1,
                 eligible_at: Some(fractional_due),
                 now: second,
@@ -736,27 +768,37 @@ async fn queue_control_phase_preserves_parked_capacity_and_fractional_predicates
     }
     // Active historical scopes without eligible queue work do not admit promotion.
     let mut history: execution::ActiveModel = original_execution.into();
-    history.id = Set("history-only".into());
-    history.work_graph_root_execution_id = Set("history-only".into());
+    history.id = Set("HistoryOnly0000000000".into());
+    history.work_graph_root_execution_id = Set("HistoryOnly0000000000".into());
     history.status = Set("completed".into());
     history.insert(&db).await.unwrap();
-    pioneer_crud::ensure_root_resource_scope(&db, "history-only", 1, 8, 8, 8, 64, second)
+    pioneer_crud::ensure_root_resource_scope(&db, "HistoryOnly0000000000", 1, 8, 8, 8, 64, second)
         .await
         .unwrap();
-    pioneer_crud::acquire_agent_running_permit(&db, "held", "saturated", "old-attempt", 1, second)
-        .await
-        .unwrap();
+    pioneer_crud::acquire_agent_running_permit(
+        &db,
+        "held",
+        "Saturated000000000000",
+        "old-attempt",
+        1,
+        second,
+    )
+    .await
+    .unwrap();
     scope::Entity::update_many()
         .col_expr(
             scope::Column::Status,
             sea_orm::sea_query::Expr::value("closed"),
         )
-        .filter(scope::Column::RootExecutionId.is_in(["inactive", "runnable"]))
+        .filter(
+            scope::Column::RootExecutionId
+                .is_in(["Inactive0000000000000", "Runnable0000000000000"]),
+        )
         .exec(&db)
         .await
         .unwrap();
     branch::Entity::delete_many()
-        .filter(branch::Column::RootExecutionId.eq("no-schedule"))
+        .filter(branch::Column::RootExecutionId.eq("NoSchedule00000000000"))
         .exec(&db)
         .await
         .unwrap();
@@ -785,7 +827,7 @@ async fn queue_control_phase_preserves_parked_capacity_and_fractional_predicates
             scope::Column::Status,
             sea_orm::sea_query::Expr::value("active"),
         )
-        .filter(scope::Column::RootExecutionId.eq("runnable"))
+        .filter(scope::Column::RootExecutionId.eq("Runnable0000000000000"))
         .exec(&db)
         .await
         .unwrap();
@@ -796,7 +838,7 @@ async fn queue_control_phase_preserves_parked_capacity_and_fractional_predicates
             queue::Column::EligibleAt,
             sea_orm::sea_query::Expr::value(Some(second + chrono::Duration::seconds(1))),
         )
-        .filter(queue::Column::RootExecutionId.eq("runnable"))
+        .filter(queue::Column::RootExecutionId.eq("Runnable0000000000000"))
         .exec(&db)
         .await
         .unwrap();
@@ -821,7 +863,7 @@ async fn queue_control_phase_preserves_parked_capacity_and_fractional_predicates
             queue::Column::EligibleAt,
             sea_orm::sea_query::Expr::value(Some(fractional_due)),
         )
-        .filter(queue::Column::RootExecutionId.eq("runnable"))
+        .filter(queue::Column::RootExecutionId.eq("Runnable0000000000000"))
         .exec(&db)
         .await
         .unwrap();
@@ -885,7 +927,7 @@ async fn queue_control_phase_preserves_parked_capacity_and_fractional_predicates
             .iter()
             .map(|row| row.root_execution_id.as_str())
             .collect::<Vec<_>>(),
-        vec!["runnable"]
+        vec!["Runnable0000000000000"]
     );
     assert!(observer.writes.lock().unwrap().iter().any(|event| matches!(
         event,
@@ -898,7 +940,11 @@ async fn queue_control_phase_preserves_parked_capacity_and_fractional_predicates
     // Predicate oracle: re-read after durable release/activation/reconstruction.
     // Raw fixture ORM writes are not supported online producer notifications;
     // the retained worker uses guarded production commits, not foreign polling.
-    for root in ["saturated", "inactive", "no-schedule"] {
+    for root in [
+        "Saturated000000000000",
+        "Inactive0000000000000",
+        "NoSchedule00000000000",
+    ] {
         assert!(
             !worker
                 .crud_store
@@ -908,7 +954,7 @@ async fn queue_control_phase_preserves_parked_capacity_and_fractional_predicates
                 .queue
         );
         match root {
-            "saturated" => {
+            "Saturated000000000000" => {
                 permit::Entity::update_many()
                     .col_expr(
                         permit::Column::Status,
@@ -923,7 +969,7 @@ async fn queue_control_phase_preserves_parked_capacity_and_fractional_predicates
                     .await
                     .unwrap();
             }
-            "inactive" => {
+            "Inactive0000000000000" => {
                 scope::Entity::update_many()
                     .col_expr(
                         scope::Column::Status,
@@ -958,7 +1004,7 @@ async fn queue_control_phase_preserves_parked_capacity_and_fractional_predicates
             .await
             .unwrap();
         assert!(ready.queue);
-        if root == "no-schedule" {
+        if root == "NoSchedule00000000000" {
             assert_eq!(
                 ready.queue_next, None,
                 "NULL is immediate, never a sampled future wall deadline"
@@ -994,39 +1040,50 @@ async fn queue_control_phase_preserves_parked_capacity_and_fractional_predicates
     // the old saturated root and its queued children remain independent.
     let now = pioneer_crud::utc_now();
     let future = now + chrono::Duration::hours(1) + chrono::Duration::nanoseconds(1);
-    let mut root: execution::ActiveModel = execution::Entity::find_by_id("runnable")
+    let mut root: execution::ActiveModel = execution::Entity::find_by_id("Runnable0000000000000")
         .one(&db)
         .await
         .unwrap()
         .unwrap()
         .into();
-    root.id = Set("f05-future-root".into());
-    root.work_graph_root_execution_id = Set("f05-future-root".into());
+    root.id = Set("F05FutureRoot00000000".into());
+    root.work_graph_root_execution_id = Set("F05FutureRoot00000000".into());
     root.status = Set("queued".into());
     root.insert(&db).await.unwrap();
-    pioneer_crud::ensure_root_resource_scope(&db, "f05-future-root", 2, 128, 8, 128, 128, now)
-        .await
-        .unwrap();
+    pioneer_crud::ensure_root_resource_scope(
+        &db,
+        "F05FutureRoot00000000",
+        2,
+        128,
+        8,
+        128,
+        128,
+        now,
+    )
+    .await
+    .unwrap();
     for i in 0..66 {
-        let id = format!("f05-q-{i:03}");
-        let mut child: execution::ActiveModel = execution::Entity::find_by_id("f05-future-root")
-            .one(&db)
-            .await
-            .unwrap()
-            .unwrap()
-            .into();
+        let id = format!("F05Queue{i:013}");
+        let mut child: execution::ActiveModel =
+            execution::Entity::find_by_id("F05FutureRoot00000000")
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap()
+                .into();
         child.id = Set(id.clone());
         child.insert(&db).await.unwrap();
-        let mut state: resource::ActiveModel = resource::Entity::find_by_id("state-runnable")
-            .one(&db)
-            .await
-            .unwrap()
-            .unwrap()
-            .into();
+        let mut state: resource::ActiveModel =
+            resource::Entity::find_by_id("state-Runnable0000000000000")
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap()
+                .into();
         state.id = Set(format!("state-{id}"));
         state.execution_id = Set(id.clone());
         state.status = Set("queued".into());
-        state.branch_key = Set("f05-future-root".into());
+        state.branch_key = Set("F05FutureRoot00000000".into());
         state.permit_id = Set(None);
         state.last_heartbeat_at = Set(None);
         state.idle_deadline = Set(None);
@@ -1036,10 +1093,10 @@ async fn queue_control_phase_preserves_parked_capacity_and_fractional_predicates
             &db,
             &pioneer_crud::AgentQueueEntryInput {
                 id: format!("f05-queue-{i:03}"),
-                root_execution_id: "f05-future-root".into(),
+                root_execution_id: "F05FutureRoot00000000".into(),
                 execution_id: id,
                 attempt_generation: 1,
-                branch_key: "f05-future-root".into(),
+                branch_key: "F05FutureRoot00000000".into(),
                 enqueue_sequence: i + 1,
                 eligible_at: Some(if i == 65 {
                     now - chrono::Duration::seconds(1)
@@ -1065,7 +1122,7 @@ async fn queue_control_phase_preserves_parked_capacity_and_fractional_predicates
     .await
     .unwrap();
     assert_eq!(
-        execution::Entity::find_by_id("f05-q-065")
+        execution::Entity::find_by_id("F05Queue0000000000065")
             .one(&db)
             .await
             .unwrap()
@@ -1082,7 +1139,7 @@ async fn queue_control_phase_preserves_parked_capacity_and_fractional_predicates
     .await
     .unwrap();
     assert_eq!(
-        execution::Entity::find_by_id("f05-q-065")
+        execution::Entity::find_by_id("F05Queue0000000000065")
             .one(&db)
             .await
             .unwrap()
@@ -1123,7 +1180,7 @@ async fn queue_control_phase_preserves_parked_capacity_and_fractional_predicates
     .await
     .unwrap();
     assert_eq!(
-        execution::Entity::find_by_id("f05-q-000")
+        execution::Entity::find_by_id("F05Queue0000000000000")
             .one(&db)
             .await
             .unwrap()
@@ -1154,7 +1211,11 @@ async fn queue_control_phase_preserves_parked_capacity_and_fractional_predicates
     processor.arm_completed_history_preparation_barrier("__control_owner_settled__");
     assert!(
         store
-            .finalize_agent_execution("f05-q-065", "completed", pioneer_crud::utc_now())
+            .finalize_agent_execution(
+                "F05Queue0000000000065",
+                "completed",
+                pioneer_crud::utc_now()
+            )
             .await
             .unwrap()
     );
@@ -1401,6 +1462,9 @@ async fn control_owner_parks_cold_and_terminal_history_and_handles_lower_committ
         test_summary_config(),
         test_tool_loop_config(),
     ));
+    // Recovery terminalization requires the same durable Task cleanup adapter
+    // installed during Gateway startup. Keep that authority in this fixture.
+    processor.bind_task_bridge().await;
     let cancellation = tokio_util::sync::CancellationToken::new();
     let label = "__control_owner_settled__";
     processor.arm_completed_history_preparation_barrier(label);
@@ -1593,7 +1657,7 @@ async fn control_owner_parks_cold_and_terminal_history_and_handles_lower_committ
             .await
             .unwrap();
         restoration.finish(true);
-        timeout(Duration::from_secs(10), async {
+        let result = timeout(Duration::from_secs(10), async {
             loop {
                 processor
                     .wait_for_completed_history_preparation_barrier()
@@ -1609,8 +1673,16 @@ async fn control_owner_parks_cold_and_terminal_history_and_handles_lower_committ
                 processor.release_completed_history_preparation_barrier();
             }
         })
-        .await
-        .unwrap();
+        .await;
+        assert!(
+            result.is_ok(),
+            "restored outbox must deliver: row={:?}; job={:?}; turn={:?}",
+            terminal::Entity::find_by_id(job_id.clone())
+                .one(&store.database_connection())
+                .await,
+            store.get_recovery_job(job_id).await,
+            store.get_turn(turn, turn).await
+        );
         assert_eq!(
             store.get_turn(turn, turn).await.unwrap().unwrap().1.status,
             TurnStatus::Failed
@@ -1737,7 +1809,7 @@ async fn control_owner_parks_cold_and_terminal_history_and_handles_lower_committ
         observer.writes.lock().unwrap().iter().any(|event| matches!(
             event,
             pioneer_sqlite::SqliteWriteEvent::Acquired {
-                class: SqliteWriteClass::Critical,
+                class: pioneer_sqlite::SqliteWriteClass::Critical,
                 ..
             }
         )),
@@ -2133,6 +2205,7 @@ async fn transient_recovery_admission_failure_does_not_delay_late_terminalizatio
 
     let (processor, _, _, _, _, workspace) = setup_workspace_message_processor().await;
     let processor = Arc::new(processor);
+    processor.bind_task_bridge().await;
     let store = processor.crud_store.clone();
     let errors = PollErrors::default();
     let _subscriber =
@@ -2525,6 +2598,25 @@ async fn timeout_owner_point_decode_retry_survives_rollback_and_keeps_wall_forwa
                 )
                 .await
                 .unwrap();
+        }
+        // These fixtures restore old hard deadlines after initial text activity.
+        // A current heartbeat keeps that earlier text from legitimately
+        // suppressing recovery as post-attempt progress.
+        for turn in ["timeout-point", "timeout-wall"] {
+            assert!(
+                lower
+                    .heartbeat_turn_item_attempt(
+                        turn,
+                        "timed-fetch",
+                        TurnItemType::WebFetch,
+                        now_timestamp_secs(),
+                        Some(now + 1000),
+                        Some(now + 1000),
+                        None,
+                    )
+                    .await
+                    .unwrap()
+            );
         }
         assert!(
             lower
@@ -3263,12 +3355,7 @@ async fn control_orphan_raw_history_and_point_retry_survive_wall_rollback() {
                 turn_id: Set(id.into()),
                 thread_id: Set(format!("thread-{id}")),
                 workspace_id: Set(workspace.clone()),
-                executor_kind: Set(if poison {
-                    "invalid-point-kind"
-                } else {
-                    "cli_runtime"
-                }
-                .into()),
+                executor_kind: Set("cli_runtime".into()),
                 executor_key: Set(None),
                 status: Set(if foreign { "starting" } else { "recovering" }.into()),
                 owner_id: Set(if foreign {
@@ -3291,6 +3378,17 @@ async fn control_orphan_raw_history_and_point_retry_survive_wall_rollback() {
             .insert(&store.database_connection())
             .await
             .unwrap();
+            if poison {
+                execution::Entity::update_many()
+                    .col_expr(
+                        execution::Column::CreatedAt,
+                        sea_orm::sea_query::Expr::val("invalid-point-timestamp"),
+                    )
+                    .filter(execution::Column::TurnId.eq(id))
+                    .exec(&store.database_connection())
+                    .await
+                    .unwrap();
+            }
         }
         // Raw APIs expose the excluded first page as progress, with no matches.
         let upper = store
@@ -3599,8 +3697,8 @@ async fn control_orphan_raw_history_and_point_retry_survive_wall_rollback() {
         }
         execution::Entity::update_many()
             .col_expr(
-                execution::Column::ExecutorKind,
-                sea_orm::sea_query::Expr::val("cli_runtime"),
+                execution::Column::CreatedAt,
+                sea_orm::sea_query::Expr::val(pioneer_crud::unix_to_datetime(now - 7201)),
             )
             .filter(execution::Column::TurnId.eq("m-owned-point"))
             .exec(&store.database_connection())
@@ -3836,12 +3934,37 @@ async fn control_backfill_processed_history_tail_and_old_key_retry() {
         test_summary_config(),
         test_tool_loop_config(),
     ));
+    // Recovery terminalization requires the same durable Task cleanup adapter
+    // installed during Gateway startup. Keep that authority in this fixture.
+    processor.bind_task_bridge().await;
     // Keep source liveness behind the controlled eligibility clock even while
     // normal Turn materialization uses UTC during this large setup.
     let now = now_timestamp_secs() + 86_400;
     let wake = store.background_work("recovery.control");
     wake.set_wall_clock_for_test(std::time::UNIX_EPOCH + Duration::from_secs(now as u64));
     let db = store.database_connection();
+    // This control-only matrix exercises terminal repair. Missing snapshots
+    // intentionally choose BlockResumable and belong to the independent due
+    // owner; declare a real non-retryable tool policy instead.
+    let terminal_item = || {
+        let mut item = web_fetch_item("fetch");
+        if let TurnItem::WebFetch {
+            recovery_policy, ..
+        } = &mut item
+        {
+            *recovery_policy = Some(pioneer_protocol::ToolRecoveryPolicySnapshot {
+                retry_class: pioneer_protocol::ToolRecoveryRetryClass::Never,
+                idempotency_mode: pioneer_protocol::ToolRecoveryIdempotencyMode::None,
+                max_attempts: 1,
+                can_resume: false,
+                resolved_action: pioneer_protocol::RecoveryAction::MarkFailed,
+                base_backoff_secs: 1,
+                max_wall_clock_secs: 240,
+                no_progress_limit: 1,
+            });
+        }
+        item
+    };
     let mut processed = Vec::new();
     for index in 0..130 {
         let id = format!("a-backfill-{index:03}");
@@ -3852,7 +3975,7 @@ async fn control_backfill_processed_history_tail_and_old_key_retry() {
                     workspace_id: workspace.clone(),
                     thread_id: id.clone(),
                     turn_id: id.clone(),
-                    item: web_fetch_item("fetch"),
+                    item: terminal_item(),
                 },
                 now - 20,
                 TurnItemAttemptDeadlines {
@@ -4026,7 +4149,7 @@ async fn control_backfill_processed_history_tail_and_old_key_retry() {
                 workspace_id: workspace.clone(),
                 thread_id: tail.into(),
                 turn_id: tail.into(),
-                item: web_fetch_item("fetch"),
+                item: terminal_item(),
             },
             now - 20,
             deadlines.clone(),
@@ -4254,6 +4377,10 @@ async fn control_backfill_processed_history_tail_and_old_key_retry() {
             .recovery_action
             .is_some()
     );
+    // The rollback experiment above proves the local retry independently.
+    // Restore business time before waiting for jobs whose genuine next_run_at
+    // was captured before that rollback to finish terminalization.
+    wake.set_wall_clock_for_test(std::time::UNIX_EPOCH + Duration::from_secs(now as u64));
     // A job's existence alone can precede its mark-failed repair. Wait at
     // actual published boundaries until all useful obligations are terminal.
     let mut terminal = false;
@@ -4272,12 +4399,18 @@ async fn control_backfill_processed_history_tail_and_old_key_retry() {
         tokio::time::pause();
         tokio::time::advance(Duration::from_secs(2)).await;
         tokio::time::resume();
-        timeout(
+        let settled = timeout(
             Duration::from_secs(10),
             processor.wait_for_completed_history_preparation_barrier(),
         )
-        .await
-        .unwrap();
+        .await;
+        assert!(
+            settled.is_ok(),
+            "terminal retry must publish: tail={:?}; bad={:?}; old={:?}",
+            store.get_turn(tail, tail).await,
+            store.get_turn(&bad.turn_id, &bad.turn_id).await,
+            store.get_turn(&old.turn_id, &old.turn_id).await
+        );
     }
     assert!(
         terminal,

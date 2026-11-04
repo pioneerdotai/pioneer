@@ -238,16 +238,29 @@ async fn local_device_online_admission_and_lost_reply_replay_use_the_owned_runti
         .await
         .unwrap()
         .unwrap();
-    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, TransactionTrait};
+    let expiry = chrono::Utc::now().fixed_offset();
+    let transaction = reopened.begin().await.unwrap();
     pioneer_entity::auth_session::Entity::update_many()
         .col_expr(
-            pioneer_entity::auth_session::Column::Status,
-            sea_orm::sea_query::Expr::value("expired"),
+            pioneer_entity::auth_session::Column::ActivationExpiresAt,
+            sea_orm::sea_query::Expr::value(Some(expiry)),
         )
         .filter(pioneer_entity::auth_session::Column::Id.eq(expired_response.session_id.as_str()))
-        .exec(&reopened)
+        .exec(&transaction)
         .await
         .unwrap();
+    assert!(
+        pioneer_crud::expire_pending_auth_session(
+            &transaction,
+            &expired_response.session_id,
+            &expired_response.device_id,
+            expiry,
+        )
+        .await
+        .unwrap()
+    );
+    transaction.commit().await.unwrap();
     reopened.close().await.unwrap();
     assert!(
         crate::prepare_device_creation(&config, directory.path(), false)

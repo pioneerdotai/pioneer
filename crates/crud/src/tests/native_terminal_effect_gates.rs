@@ -1935,24 +1935,28 @@ async fn grouped_admission_tracks_gate_due_retry_and_expired_claim_without_histo
         .await;
     let scoped = f.store.with_maintenance_access();
     for (status, due, lease, gate, expected) in [
-        ("prepared", Some(NOW), None, NOW, false),
+        ("prepared", None, None, NOW, false),
         ("waiting_acceptance", None, None, NOW + 1, false),
         ("waiting_acceptance", None, None, NOW, true),
         ("ready", Some(NOW + 1), None, NOW, false),
-        ("ready", None, None, NOW, false),
         ("ready", Some(NOW), None, NOW, true),
         ("retry_wait", Some(NOW + 1), None, NOW, false),
         ("retry_wait", Some(NOW), None, NOW, true),
         ("running", Some(NOW - 100), Some(NOW + 1), NOW, false),
-        ("running", Some(NOW - 100), None, NOW, false),
         ("running", Some(NOW + 100), Some(NOW), NOW, true),
-        ("succeeded", Some(NOW), Some(NOW), NOW, false),
-        ("unresolved", Some(NOW), Some(NOW), NOW, false),
+        ("succeeded", None, None, NOW, false),
+        ("unresolved", None, None, NOW, false),
     ] {
         let mut row: effect::ActiveModel = f.row(&id).await.into_active_model();
         row.status = Set(status.to_owned());
         row.next_run_at = Set(due.map(unix_to_datetime));
         row.claim_expires_at = Set(lease.map(unix_to_datetime));
+        // Persist valid lifecycle states: NULL ready clocks/running leases are
+        // rejected by the schema, while prepared/gated rows genuinely allow NULL.
+        row.claim_token = Set((status == "running").then(|| "admission-claim".to_owned()));
+        row.terminal_committed_at = Set((status != "prepared").then(|| unix_to_datetime(NOW)));
+        row.completed_at =
+            Set(matches!(status, "succeeded" | "unresolved").then(|| unix_to_datetime(NOW)));
         row.gate_probe_at = Set(gate);
         row.update(&f.store.connection).await.unwrap(); // setup bypasses hints; this test observes the durable clock directly
         let before = f.routes.reads.load(Ordering::SeqCst);
@@ -1969,6 +1973,7 @@ async fn grouped_admission_tracks_gate_due_retry_and_expired_claim_without_histo
     }
     let mut row: effect::ActiveModel = f.row(&id).await.into_active_model();
     row.status = Set("waiting_acceptance".into());
+    row.completed_at = Set(None);
     row.gate_probe_at = Set(NOW + 1);
     row.update(&f.store.connection).await.unwrap();
     assert!(

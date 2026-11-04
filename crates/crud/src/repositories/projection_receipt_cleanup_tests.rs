@@ -738,8 +738,18 @@ async fn stale_preparation_is_revalidated_under_the_writer() {
             .unwrap();
         db.execute_unprepared(mutation).await.unwrap();
         let transaction = db.begin().await.unwrap();
-        assert_eq!(apply(&transaction, &prepared).await.unwrap(), 0);
-        transaction.commit().await.unwrap();
+        let result = apply(&transaction, &prepared).await;
+        if mutation == "UPDATE thread_timeline_projection_meta SET last_error = 'injected failure'"
+        {
+            assert!(
+                result.is_err(),
+                "failed backfill retains explicit recovery debt"
+            );
+            transaction.rollback().await.unwrap();
+        } else {
+            assert_eq!(result.unwrap(), 0);
+            transaction.commit().await.unwrap();
+        }
         assert_eq!(boundary(&store, "turn").await, 0);
         assert_eq!(receipt::Entity::find().count(&db).await.unwrap(), 2);
     }
