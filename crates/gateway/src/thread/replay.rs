@@ -738,7 +738,7 @@ mod tests {
 
     #[tokio::test]
     async fn panic_shutdown_and_old_cleanup_do_not_leave_successful_orphan_work() {
-        for panic in [false, true] {
+        for (panic, unpolled) in [(false, true), (false, false), (true, false)] {
             let owner = Arc::new(ReplayTasks::default());
             let order = Arc::new(PendingDeliveryOrder::default());
             let (outbound, _receiver) = outbound_channel(8);
@@ -751,7 +751,11 @@ mod tests {
                 }
                 std::future::pending::<()>().await;
             });
-            waiting.await.unwrap();
+            // The default current-thread runtime cannot poll the spawned task
+            // before this synchronous stop. Its captured guard must still run.
+            if !unpolled {
+                waiting.await.unwrap();
+            }
             if !panic {
                 owner.stop();
             }
