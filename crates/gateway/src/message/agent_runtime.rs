@@ -1844,6 +1844,59 @@ impl MessageProcessor {
         Err(NativeTurnControlTransitionPending.into())
     }
 
+    // Statistics are supplemental only when the CLI producer marker and native
+    // identity agree with this Turn's persisted CLI binding. A code alone must
+    // never exempt API usage or arbitrary SystemEvents from failure handling.
+    async fn is_bound_cli_statistics(&self, notification: &ItemCompletedNotification) -> bool {
+        let TurnItem::SystemEvent {
+            code: Some(code),
+            details: Some(details),
+            ..
+        } = &notification.item
+        else {
+            return false;
+        };
+        let identity = match code.as_str() {
+            "provider_usage"
+                if details["schema_version"] == 1
+                    && details["observation_kind"] == "cli_native_statistics" =>
+            {
+                &details["usage"]
+            }
+            "cli_native_turn_timing" if details["observation_kind"] == "cli_native_turn_timing" => {
+                details
+            }
+            _ => return false,
+        };
+        let (Some(runtime), Some(native_thread), Some(native_turn)) = (
+            identity["runtime"].as_str(),
+            identity["native_thread_id"].as_str(),
+            identity["native_turn_id"].as_str(),
+        ) else {
+            return false;
+        };
+        if !matches!(runtime, "codex" | "claude" | "opencode") || native_turn.is_empty() {
+            return false;
+        }
+        match self
+            .crud_store
+            .get_cli_runtime_turn_binding(&notification.turn_id)
+            .await
+        {
+            Ok(Some(binding)) => {
+                binding.workspace_id == notification.workspace_id
+                    && binding.thread_id == notification.thread_id
+                    && binding.runtime_kind == runtime
+                    && binding.native_thread_id == native_thread
+            }
+            Ok(None) => false,
+            Err(error) => {
+                warn!(error = %error, "failed to validate supplemental CLI statistics binding");
+                false
+            }
+        }
+    }
+
     pub(super) fn handle_durable_agent_event<'a>(
         &'a self,
         event: AgentDurableEvent,
@@ -5487,6 +5540,11 @@ impl MessageProcessor {
                 ))
                 .await
                 {
+                    if self.is_bound_cli_statistics(&notification).await {
+                        warn!(thread_id, turn_id, error = %error,
+                            "failed to persist supplemental CLI statistics; native execution remains owned by CLI");
+                        return false;
+                    }
                     if matches!(&notification.item, TurnItem::SystemEvent {
                         level: SystemEventLevel::Warning, code: Some(code), ..
                     } if code == "codex_request_retried")

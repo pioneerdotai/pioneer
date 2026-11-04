@@ -5323,6 +5323,10 @@ pub(crate) fn opencode_usage_metadata<'a>(
     let mut totals = [Some(0_u64); 5];
     let mut known_parts = [None; 5];
     let mut reported = false;
+    let mut responses = Vec::new();
+    let mut responses_truncated = false;
+    let mut has_responses = false;
+    let mut cost_total = Some(0.0_f64);
     fn sum(values: &[Option<u64>]) -> Option<u64> {
         values
             .iter()
@@ -5333,6 +5337,57 @@ pub(crate) fn opencode_usage_metadata<'a>(
             continue;
         }
         let tokens = &message["tokens"];
+        has_responses = true;
+        let cost = message["cost"]
+            .as_f64()
+            .filter(|n| n.is_finite() && *n >= 0.);
+        cost_total = cost_total
+            .and_then(|total| cost.map(|n| total + n))
+            .filter(|n| n.is_finite());
+        if responses.len() < 8 {
+            let mut response = json!({"native_tokens":{
+                "input":tokens["input"].as_u64(), "output":tokens["output"].as_u64(),
+                "reasoning":tokens["reasoning"].as_u64(), "total":tokens["total"].as_u64(),
+                "cache":{"read":tokens["cache"]["read"].as_u64(),"write":tokens["cache"]["write"].as_u64()}
+            }});
+            for key in ["id", "sessionID", "parentID", "modelID", "providerID"] {
+                if let Some(value) =
+                    pioneer_provider::usage::cli_statistics_identifier(&message[key])
+                {
+                    response[key] = json!(value);
+                }
+            }
+            let mut model = serde_json::Map::new();
+            for key in ["id", "providerID", "variant"] {
+                if let Some(value) =
+                    pioneer_provider::usage::cli_statistics_identifier(&message["model"][key])
+                {
+                    model.insert(key.to_owned(), json!(value));
+                }
+            }
+            if !model.is_empty() {
+                response["model"] = JsonValue::Object(model);
+            }
+            for key in ["created", "streamed", "completed"] {
+                if let Some(value) = message["time"][key].as_u64() {
+                    response["time"][key] = json!(value);
+                }
+            }
+            if let (Some(start), Some(end)) = (
+                message["time"]["created"].as_u64(),
+                message["time"]["completed"].as_u64(),
+            ) {
+                if let Some(duration) = end.checked_sub(start) {
+                    response["duration_ms"] = json!(duration);
+                }
+            }
+            if let Some(cost) = cost {
+                response["cost_usd"] = json!(cost);
+            }
+            responses.push(response);
+        } else {
+            responses_truncated = true;
+        }
         reported |= tokens.is_object();
         for (index, value) in [
             tokens["input"].as_u64(),
@@ -5355,7 +5410,16 @@ pub(crate) fn opencode_usage_metadata<'a>(
         totals = [None; 5];
     }
     let [input, output, reasoning, read, write] = totals;
+    // Bound only additional evidence; aggregate categories and reader scope are
+    // computed above from every message and must not be re-sanitized away.
+    let evidence = pioneer_provider::usage::bounded_cli_statistics(&json!({
+        "responses":responses, "responses_truncated":responses_truncated,
+    }));
     json!({
+        "runtime":"opencode", "scope":"turn_snapshot",
+        "cost_usd":if has_responses {cost_total} else {None},
+        "responses":evidence["responses"], "responses_truncated":evidence["responses_truncated"],
+        "cost_basis":"opencode_reported_unknown_origin",
         "input_tokens":sum(&[input, read, write]),
         "output_tokens":sum(&[output, reasoning]),
         "uncached_input_tokens":input,
@@ -5417,7 +5481,11 @@ fn project_opencode_messages(
         }
     }
     let usage = opencode_usage_metadata(opencode_turn_messages(messages, &root));
-    if usage["native_tokens"].is_object() {
+    if usage["native_tokens"].is_object()
+        || usage["responses"]
+            .as_array()
+            .is_some_and(|responses| !responses.is_empty())
+    {
         state.last_usage = Some(usage);
     }
     events
@@ -6376,6 +6444,75 @@ mod tests {
             CLIAgentRuntimeObservedTurnStatus::Completed
         );
         assert!(observed.reconciliation_events.iter().any(|e|matches!(e,RuntimeEvent::ItemCompleted(i) if i.item_kind=="commandExecution" && i.metadata.as_ref().is_some_and(|m|m["success"]==false && m["pioneerBackgroundShellRejected"]==true))));
+    }
+
+    #[test]
+    fn v2_usage_retains_response_cost_identity_and_native_timing_only() {
+        let usage = opencode_usage_metadata([&json!({
+            "type":"assistant", "id":"message", "sessionID":"session", "model":{"id":"model","providerID":"provider","variant":"high"},
+            "cost":0.25, "time":{"created":100,"completed":130}, "secret":"SECRET",
+            "tokens":{"input":10,"output":3,"reasoning":7,"cache":{"read":80,"write":20}}
+        })]);
+        assert_eq!(usage["cost_usd"], 0.25);
+        assert_eq!(usage["responses"][0]["id"], "message");
+        assert_eq!(usage["responses"][0]["model"]["id"], "model");
+        assert_eq!(usage["responses"][0]["model"]["providerID"], "provider");
+        assert_eq!(usage["responses"][0]["duration_ms"], 30);
+        assert_eq!(usage["input_tokens"], 110);
+        assert_eq!(usage["output_tokens"], 10);
+        assert!(!usage.to_string().contains("SECRET"));
+    }
+
+    #[test]
+    fn v2_interactive_usage_bounds_evidence_before_durable_projection() {
+        let mut native = history("succeeded");
+        let mut step = native[1].clone();
+        step["content"] = json!([]);
+        step["cost"] = json!(0.25);
+        step["model"]["id"] = json!("x".repeat(129));
+        let mut messages = vec![native[0].clone()];
+        for index in 0..64 {
+            step["id"] = json!(format!("msg_{index}"));
+            messages.push(step.clone());
+        }
+        messages.push(native.as_array_mut().unwrap().remove(2));
+        let observation =
+            opencode_observation_from_messages("ses_test", "msg_user", &json!(messages), false)
+                .unwrap();
+        let usage = observation.reconciliation_events.iter().find(|event| {
+            matches!(event, RuntimeEvent::ItemCompleted(item) if item.item_kind == "tokenUsage")
+        }).unwrap();
+        let projected = crate::cli_runtime::projector::project_cli_runtime_event(
+            &crate::cli_runtime::projector::CLIRuntimeProjectorContext {
+                workspace_id: "workspace".into(),
+                thread_id: "thread".into(),
+                turn_id: "turn".into(),
+                recovery: None,
+                codex_retry_attempt_id: None,
+            },
+            usage,
+        );
+        let pioneer_protocol::AgentDurableEvent::ItemCompleted { notification } =
+            &projected.durable[0]
+        else {
+            panic!("durable usage")
+        };
+        let pioneer_protocol::TurnItem::SystemEvent {
+            details: Some(details),
+            ..
+        } = &notification.item
+        else {
+            panic!("usage item")
+        };
+        let usage = &details["usage"];
+        assert_eq!(usage["responses"].as_array().unwrap().len(), 8);
+        assert_eq!(usage["responses_truncated"], true);
+        assert!(usage["responses"][0]["model"].get("id").is_none());
+        assert_eq!(usage["input_tokens"], 640);
+        assert_eq!(usage["output_tokens"], 128);
+        assert_eq!(usage["cost_usd"], 16.0);
+        assert_eq!(usage["scope"], "turn_snapshot");
+        assert!(serde_json::to_string(&notification.item).unwrap().len() < 16 * 1024);
     }
 
     #[test]

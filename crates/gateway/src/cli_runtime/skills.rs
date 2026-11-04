@@ -994,25 +994,70 @@ pub(crate) fn owned_skill_projection_is_current(
     )
 }
 
-pub(crate) fn prepend_installed_skill_items(
+/// Exporting a skill does not invoke it. Only this turn's explicit selection
+/// becomes a native attachment; required service exports use progressive reads.
+/// We deliberately keep no "delivered" bit: native compaction can evict a read
+/// without notifying Gateway, and a disk receipt says nothing about retention.
+pub(crate) fn prepend_cli_skill_delivery(
     installed: &[CliRuntimeSkillInstallResult],
+    explicit_names: &[String],
     mapping: &mut pioneer_cli_agent_runtime::input::CLIRuntimeTurnInputMapping,
 ) {
-    if installed.is_empty() {
-        return;
+    use pioneer_cli_agent_runtime::input::CLIRuntimeTurnInputItem;
+
+    let required = installed
+        .iter()
+        .filter(|skill| !explicit_names.contains(&skill.install_name))
+        .collect::<Vec<_>>();
+    let mut prefix = Vec::new();
+    {
+        // Emit an empty list too, to revoke earlier availability references.
+        // These are only the required exports resolved for this turn, never a
+        // global catalog. JSON quoting preserves exact paths and prevents a
+        // newline in a path from becoming another instruction.
+        let references = required
+            .iter()
+            .map(|skill| {
+                serde_json::json!({
+                    "name": skill.install_name,
+                    "path": skill.installed_path.join("SKILL.md").to_string_lossy(),
+                    "folderHash": skill.source_folder_hash,
+                })
+            })
+            .collect::<Vec<_>>();
+        prefix.push(CLIRuntimeTurnInputItem::Text {
+            text: format!(
+                "Current required Pioneer skill exports (replaces earlier required-export references): {}. These are availability references, not explicit selections. Before an operation requiring one of these skills, use its guidance already read only if the exact path and folderHash above are still retained with its full instructions; otherwise read its SKILL.md through the available filesystem read capability and follow it before acting. After compaction or uncertain retention, read the relevant skill again. Resolve assets relative to its directory. The native skill action may be unavailable; filesystem reading remains subject to current permissions. Exports absent from this list and this turn's explicit selection are not authorized by an earlier reference.",
+                // Codex scans text for $skill mentions, including within JSON
+                // strings. Escape the sigil while preserving the exact locator
+                // as JSON data, so an unusual export root cannot invoke a skill.
+                serde_json::Value::Array(references).to_string().replace('$', "\\u0024"),
+            ),
+        });
     }
-    let mut prefix = Vec::with_capacity(installed.len());
-    prefix.extend(installed.iter().map(|skill| {
-        pioneer_cli_agent_runtime::input::CLIRuntimeTurnInputItem::Skill {
-            name: skill.install_name.clone(),
-            path: skill
+    // Composer selection order, not installation order, controls invocation.
+    let mut seen = std::collections::HashSet::new();
+    for name in explicit_names {
+        if let Some(skill) = installed.iter().find(|skill| &skill.install_name == name) {
+            let path = skill
                 .installed_path
                 .join(skill.skill_relative_path.as_deref().unwrap_or(""))
                 .join("SKILL.md")
                 .to_string_lossy()
-                .into_owned(),
+                .into_owned();
+            if seen.insert(path.clone()) {
+                prefix.push(CLIRuntimeTurnInputItem::Skill {
+                    name: skill.install_name.clone(),
+                    path,
+                });
+            }
         }
-    }));
+    }
+    // A mapped native item may overlap an installed explicit selection.
+    mapping.input.retain(|item| match item {
+        CLIRuntimeTurnInputItem::Skill { path, .. } => !seen.contains(path),
+        _ => true,
+    });
     prefix.append(&mut mapping.input);
     mapping.input = prefix;
 }
@@ -2394,7 +2439,7 @@ mod tests {
     }
 
     #[test]
-    fn cli_runtime_codex_skill_input_builder_prepends_only_structured_items() {
+    fn cli_runtime_explicit_skill_delivery_keeps_structured_attachments() {
         let mut mapping = pioneer_cli_agent_runtime::input::CLIRuntimeTurnInputMapping {
             input: vec![
                 pioneer_cli_agent_runtime::input::CLIRuntimeTurnInputItem::Text {
@@ -2404,17 +2449,22 @@ mod tests {
             diagnostics: Vec::new(),
         };
         let before = mapping.clone();
-        prepend_installed_skill_items(&[], &mut mapping);
-        assert_eq!(mapping, before);
-        prepend_installed_skill_items(
+        prepend_cli_skill_delivery(&[], &[], &mut mapping);
+        assert_eq!(&mapping.input[1..], before.input.as_slice());
+        assert!(
+            matches!(&mapping.input[0], pioneer_cli_agent_runtime::input::CLIRuntimeTurnInputItem::Text { text } if text.contains("[]"))
+        );
+        mapping = before;
+        prepend_cli_skill_delivery(
             &[
                 installed_skill("pdf", "/native/skills/pdf"),
                 installed_skill("slides", "/native/skills/slides"),
             ],
+            &["pdf".to_owned(), "slides".to_owned()],
             &mut mapping,
         );
         assert_eq!(
-            mapping.input,
+            mapping.input[1..],
             vec![
                 pioneer_cli_agent_runtime::input::CLIRuntimeTurnInputItem::Skill {
                     name: "pdf".to_owned(),
@@ -2464,10 +2514,14 @@ mod tests {
             diagnostics: Vec::new(),
         };
 
-        prepend_installed_skill_items(&[installed], &mut mapping);
+        prepend_cli_skill_delivery(
+            &[installed],
+            &["proposal-51-sentinel".to_owned()],
+            &mut mapping,
+        );
 
         assert_eq!(
-            mapping.input,
+            mapping.input[1..],
             vec![
                 pioneer_cli_agent_runtime::input::CLIRuntimeTurnInputItem::Skill {
                     name: "proposal-51-sentinel".to_owned(),
@@ -2485,6 +2539,103 @@ mod tests {
             std::fs::read(installed_path.join("references/guide.txt")).unwrap(),
             b"CODEX SUPPORTING FILE SENTINEL\n"
         );
+    }
+
+    #[test]
+    fn required_exports_remain_readable_without_automatic_body_invocation() {
+        use pioneer_cli_agent_runtime::input::{
+            CLIRuntimeTurnInputItem, CLIRuntimeTurnInputMapping,
+        };
+        let mut service = installed_skill("pioneer-system-tasks", "/native/tasks");
+        let user = installed_skill("chosen", "/native/chosen");
+        let make_mapping = || CLIRuntimeTurnInputMapping {
+            input: vec![CLIRuntimeTurnInputItem::Text {
+                text: "request".to_owned(),
+            }],
+            diagnostics: vec![],
+        };
+        // First dispatch and resumed/retried dispatch carry locators, never a
+        // service attachment. Actual retained reads decide whether to reload.
+        for _ in 0..2 {
+            let mut mapping = make_mapping();
+            prepend_cli_skill_delivery(
+                &[service.clone(), user.clone()],
+                &["chosen".to_owned()],
+                &mut mapping,
+            );
+            assert!(
+                matches!(&mapping.input[0], CLIRuntimeTurnInputItem::Text { text }
+                if text.contains("/native/tasks/SKILL.md") && text.contains(&service.source_folder_hash)
+                    && text.contains("After compaction") && !text.contains("SKILL BODY SENTINEL"))
+            );
+            assert_eq!(
+                mapping
+                    .input
+                    .iter()
+                    .filter(|item| matches!(item, CLIRuntimeTurnInputItem::Skill { .. }))
+                    .count(),
+                1
+            );
+            assert!(
+                matches!(&mapping.input[1], CLIRuntimeTurnInputItem::Skill { name, .. } if name == "chosen")
+            );
+        }
+        service.source_folder_hash = "changed-immutable-version".to_owned();
+        service.installed_path = "/native/$chosen".into();
+        let mut updated = make_mapping();
+        prepend_cli_skill_delivery(&[service.clone()], &[], &mut updated);
+        assert!(
+            matches!(&updated.input[0], CLIRuntimeTurnInputItem::Text { text }
+                if text.contains("changed-immutable-version")
+                    && text.contains("\\u0024chosen") && !text.contains("$chosen"))
+        );
+        assert!(
+            !updated
+                .input
+                .iter()
+                .any(|item| matches!(item, CLIRuntimeTurnInputItem::Skill { .. }))
+        );
+
+        // Explicit selection overrides automatic availability, keeps input order,
+        // and required/explicit/mapped overlap produces one attachment per path.
+        let mut selected = make_mapping();
+        selected.input.push(CLIRuntimeTurnInputItem::Skill {
+            name: "chosen".to_owned(),
+            path: "/native/chosen/SKILL.md".to_owned(),
+        });
+        prepend_cli_skill_delivery(
+            &[service, user],
+            &[
+                "chosen".to_owned(),
+                "pioneer-system-tasks".to_owned(),
+                "chosen".to_owned(),
+            ],
+            &mut selected,
+        );
+        assert!(
+            matches!(&selected.input[1], CLIRuntimeTurnInputItem::Skill { name, .. } if name == "chosen")
+        );
+        assert!(
+            matches!(&selected.input[2], CLIRuntimeTurnInputItem::Skill { name, .. } if name == "pioneer-system-tasks")
+        );
+        assert_eq!(
+            selected
+                .input
+                .iter()
+                .filter(|item| matches!(item, CLIRuntimeTurnInputItem::Skill { .. }))
+                .count(),
+            2
+        );
+        let saved = serde_json::to_string(&selected).unwrap();
+        let replay: CLIRuntimeTurnInputMapping = serde_json::from_str(&saved).unwrap();
+        assert_eq!(selected, replay);
+
+        let mut removed = make_mapping();
+        prepend_cli_skill_delivery(&[], &[], &mut removed);
+        assert!(
+            matches!(&removed.input[0], CLIRuntimeTurnInputItem::Text { text } if text.contains("[]") && text.contains("replaces earlier"))
+        );
+        assert_eq!(removed.input.len(), 2);
     }
 
     #[tokio::test]
@@ -2996,9 +3147,9 @@ mod tests {
                     input: Vec::new(),
                     diagnostics: Vec::new(),
                 };
-                prepend_installed_skill_items(&[updated], &mut mapping);
+                prepend_cli_skill_delivery(&[updated], &[plan.install_name.clone()], &mut mapping);
                 assert!(
-                    matches!(&mapping.input[0], pioneer_cli_agent_runtime::input::CLIRuntimeTurnInputItem::Skill { name, path }
+                    matches!(&mapping.input[1], pioneer_cli_agent_runtime::input::CLIRuntimeTurnInputItem::Skill { name, path }
                     if name == &plan.install_name && path == &plan.destination.join(relative.as_deref().unwrap_or("")).join("SKILL.md").to_string_lossy())
                 );
                 fs::write(plan.destination.join("references/guide.txt"), b"tampered").unwrap();

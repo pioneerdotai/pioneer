@@ -3016,6 +3016,64 @@ async fn capability_persistence_order_impl() {
             runtime_kind,
             CLIAgentRuntimeKind::Codex | CLIAgentRuntimeKind::OpenCode
         ) {
+            // Read the actual dispatch saved before native start, using a fresh
+            // repository handle rather than serializing the helper result.
+            let reopened = CrudStore::new(harness.crud_store.database_connection());
+            let saved = reopened
+                .get_cli_runtime_turn_binding(&turn_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let saved_mapping: JsonValue = serde_json::from_str(&saved.input_mapping_json).unwrap();
+            assert_eq!(saved_mapping["input"], native_turn.input);
+            let required = saved_mapping["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|item| item["text"].as_str())
+                .find(|text| text.starts_with("Current required Pioneer skill exports"))
+                .expect("required references must cross dispatch persistence");
+            for name in [
+                "pioneer-system-tasks",
+                "pioneer-system-subagents",
+                "pioneer-system-html",
+                "pioneer-system-threads",
+            ] {
+                assert!(required.contains(name));
+            }
+            assert!(!required.contains("# alpha"));
+            assert!(!required.contains("# beta"));
+            let saved_skills = saved_mapping["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|item| item["type"] == "skill")
+                .collect::<Vec<_>>();
+            assert_eq!(
+                saved_skills.len(),
+                2,
+                "required exports must remain references"
+            );
+            // Duplicate admission must use the persisted logical Turn, without
+            // invoking skills again or rewriting the saved dispatch payload.
+            let starts_before = harness.cli_session.turn_starts.lock().await.len();
+            harness
+                .processor
+                .process_request_for_connection(harness.connection_id, &request)
+                .await;
+            assert_eq!(
+                harness.cli_session.turn_starts.lock().await.len(),
+                starts_before
+            );
+            assert_eq!(
+                reopened
+                    .get_cli_runtime_turn_binding(&turn_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .input_mapping_json,
+                saved.input_mapping_json
+            );
             let input = native_turn.input.as_array().unwrap();
             let skill_items = input
                 .iter()
@@ -37938,8 +37996,30 @@ async fn cli_task_bootstrap_honors_empty_parent_context_policy_impl() {
         .filter(|item| item["type"] == "skill")
         .map(|item| item["name"].as_str().unwrap())
         .collect::<Vec<_>>();
+    assert!(
+        skill_names.is_empty(),
+        "required system exports must not invoke native skills for an empty selection"
+    );
+    let reference_messages = adapter_input
+        .iter()
+        .filter_map(|item| item["text"].as_str())
+        .filter_map(|text| {
+            text.strip_prefix("Current required Pioneer skill exports (replaces earlier required-export references): ")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(reference_messages.len(), 1);
+    let required_exports: JsonValue = serde_json::Deserializer::from_str(reference_messages[0])
+        .into_iter::<JsonValue>()
+        .next()
+        .unwrap()
+        .unwrap();
     assert_eq!(
-        skill_names,
+        required_exports
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|export| export["name"].as_str().unwrap())
+            .collect::<Vec<_>>(),
         vec![
             "pioneer-system-tasks",
             "pioneer-system-subagents",
@@ -37950,10 +38030,16 @@ async fn cli_task_bootstrap_honors_empty_parent_context_policy_impl() {
     let adapter_messages = adapter_input
         .iter()
         .filter(|item| item["type"] == "text")
+        .filter(|item| {
+            !item["text"]
+                .as_str()
+                .unwrap()
+                .starts_with("Current required Pioneer skill exports")
+        })
         .collect::<Vec<_>>();
     assert_eq!(
         adapter_input.len(),
-        adapter_messages.len() + skill_names.len()
+        adapter_messages.len() + reference_messages.len()
     );
     assert_eq!(adapter_messages.len(), 3);
     assert!(
@@ -38232,7 +38318,8 @@ async fn assert_detached_native_child_turn_cancellation(native_api: bool) {
         .await
         .expect("recording CLI runtimes should seed authoritative readiness");
     processor.bind_task_bridge().await;
-    processor.start_task_event_listener().await;
+    // This fixture drives the durable fanout dispatcher explicitly below.
+    // A competing background listener would make projection order probabilistic.
 
     let parent_thread_id = "thr_native_child_turn_cancel";
     let source_turn_id = "turn_native_child_turn_cancel_source";
@@ -38444,6 +38531,26 @@ async fn assert_detached_native_child_turn_cancellation(native_api: bool) {
             .unwrap();
         assert_eq!(receipts.iter().filter(|r| r.run_id == run.id).count(), 1);
     }
+
+    let mut fanout_drained = false;
+    for _ in 0..32 {
+        let summary =
+            drain_test_notifications_while(&mut rx, processor.task_event_fanout_quantum())
+                .await
+                .expect("cancellation fanout should run");
+        assert_eq!(
+            summary.errors, 0,
+            "cancellation fanout must not defer errors"
+        );
+        if summary.pending == Some(false) {
+            fanout_drained = true;
+            break;
+        }
+    }
+    assert!(
+        fanout_drained,
+        "cancellation fanout must drain its bounded queue"
+    );
 
     let parent_occurrence_turn_id = lineage
         .created_by_turn_id
@@ -54389,17 +54496,23 @@ async fn codex_goal_segments_share_one_pioneer_turn_and_fence_subagents_impl() {
             }),
         )
         .await;
-    processor
-        .handle_cli_runtime_timeline_event(
-            session_handle.instance(),
-            RuntimeEvent::TurnCompleted(RuntimeTurnCompleted {
-                native_thread_id: Some(native_thread_id.to_owned()),
-                native_turn_id: first_segment_id.to_owned(),
-                status: "completed".to_owned(),
-                native: None,
-            }),
-        )
-        .await;
+    let first_completion = RuntimeEvent::TurnCompleted(RuntimeTurnCompleted {
+        native_thread_id: Some(native_thread_id.to_owned()),
+        native_turn_id: first_segment_id.to_owned(),
+        status: "completed".to_owned(),
+        native: Some(pioneer_cli_agent_runtime::event::RuntimeNativeEvent {
+            method: "turn/completed".into(),
+            payload_redacted: Some(
+                json!({"turn":{"startedAt":10,"completedAt":11,"durationMs":1000}}),
+            ),
+            raw_redacted: None,
+        }),
+    });
+    for _ in 0..2 {
+        processor
+            .handle_cli_runtime_timeline_event(session_handle.instance(), first_completion.clone())
+            .await;
+    }
 
     let (_, intermediate_turn) = crud_store
         .get_turn(thread_id, turn_id)
@@ -54441,7 +54554,13 @@ async fn codex_goal_segments_share_one_pioneer_turn_and_fence_subagents_impl() {
                 native_thread_id: Some(native_thread_id.to_owned()),
                 native_turn_id: submission_id.to_owned(),
                 status: "completed".to_owned(),
-                native: None,
+                native: Some(pioneer_cli_agent_runtime::event::RuntimeNativeEvent {
+                    method: "turn/completed".into(),
+                    payload_redacted: Some(
+                        json!({"turn":{"startedAt":10,"completedAt":11,"durationMs":1000}}),
+                    ),
+                    raw_redacted: None,
+                }),
             }),
         )
         .await;
@@ -54557,7 +54676,13 @@ async fn codex_goal_segments_share_one_pioneer_turn_and_fence_subagents_impl() {
                 native_thread_id: Some(native_thread_id.to_owned()),
                 native_turn_id: second_segment_id.to_owned(),
                 status: "completed".to_owned(),
-                native: None,
+                native: Some(pioneer_cli_agent_runtime::event::RuntimeNativeEvent {
+                    method: "turn/completed".into(),
+                    payload_redacted: Some(
+                        json!({"turn":{"startedAt":10,"completedAt":11,"durationMs":1000}}),
+                    ),
+                    raw_redacted: None,
+                }),
             }),
         )
         .await;
@@ -54567,6 +54692,35 @@ async fn codex_goal_segments_share_one_pioneer_turn_and_fence_subagents_impl() {
         .expect("Goal-held turn should load")
         .expect("Goal-held turn should exist");
     assert_eq!(held_turn.status, TurnStatus::InProgress);
+    let items = crud_store
+        .list_turn_items_by_type(turn_id, "system_event")
+        .await
+        .unwrap();
+    let timings = items
+        .iter()
+        .filter_map(|item| match item {
+            TurnItem::SystemEvent {
+                code: Some(code),
+                details: Some(details),
+                ..
+            } if code == "cli_native_turn_timing" => Some(details),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        timings.len(),
+        3,
+        "each intermediate native segment retains timing"
+    );
+    for native_turn in [first_segment_id, submission_id, second_segment_id] {
+        assert!(
+            timings
+                .iter()
+                .any(|details| details["native_turn_id"] == native_turn
+                    && details["native_thread_id"] == native_thread_id
+                    && details["native_timing"]["durationMs"] == 1000)
+        );
+    }
 
     processor
         .handle_cli_runtime_timeline_event(
@@ -81467,7 +81621,10 @@ async fn wait_for_task_anchor_item_status(
     item_id: &str,
     expected_status: TaskStatus,
 ) -> TaskTurnItem {
-    for _ in 0..100 {
+    // Fanout uses bounded pages and a five-second periodic wake when a bus
+    // notification is coalesced. Allow multiple quanta, as the turn-status
+    // waiter does, while still requiring the exact durable card status.
+    for _ in 0..1_200 {
         if let Some(TurnItem::Task { item }) = crud_store
             .get_turn_item(turn_id, item_id)
             .await
@@ -89253,7 +89410,7 @@ async fn failed_codex_summary_journal_retains_decoder_numeric_evidence_without_c
     let transcript = concat!(
         "{\"type\":\"thread.started\",\"thread_id\":\"SECRET_SESSION\"}\n",
         "{\"type\":\"turn.started\"}\n",
-        "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":100,\"output_tokens\":0,\"cached_input_tokens\":80,\"prompt\":\"SECRET_PROMPT\"}}\n"
+        "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":100,\"output_tokens\":0,\"cached_input_tokens\":80,\"cache_write_input_tokens\":3,\"reasoning_output_tokens\":0,\"prompt\":\"SECRET_PROMPT\"}}\n"
     );
     let mut observed = pioneer_provider::TokenUsage {
         provider: Some("codex-cli".into()),
@@ -89287,7 +89444,10 @@ async fn failed_codex_summary_journal_retains_decoder_numeric_evidence_without_c
     assert_eq!(retained.input_tokens, Some(100));
     assert_eq!(retained.output_tokens, Some(0));
     assert_eq!(retained.cache_read_input_tokens, Some(80));
-    assert_eq!(retained.cache_write_input_tokens, None);
+    assert_eq!(retained.cache_write_input_tokens, Some(3));
+    let evidence = &retained.raw_usage.as_ref().unwrap()["cli_statistics"];
+    assert_eq!(evidence["cache_write_input_tokens"], 3);
+    assert_eq!(evidence["reasoning_output_tokens"], 0);
     assert_eq!(retained.physical_attempt_id, None);
     assert_eq!(retained.generation_id, None);
     assert_eq!(
@@ -89300,6 +89460,96 @@ async fn failed_codex_summary_journal_retains_decoder_numeric_evidence_without_c
     );
     assert!(!rows[0].usage_json.contains("SECRET"));
     assert!(!rows[0].usage_json.contains("no final answer"));
+}
+
+#[tokio::test]
+async fn claude_service_optional_statistics_survive_normalization_and_journal_readback() {
+    use pioneer_cli_agent_runtime::{
+        claude::service::ensure_process_outcome, service::ObservedServiceUsage,
+    };
+    let (_, store, workspace) =
+        setup_execution_window_terminal_turn("thr_claude_stats", "turn_claude_stats").await;
+    // Old 0.2.79 and expanded 0.3.317 native result contracts, both optional.
+    for expanded in [false, true] {
+        let mut terminal = json!({"type":"result", "subtype":"error_during_execution",
+            "usage":{"input_tokens":1,"cache_read_input_tokens":2,
+                "cache_creation_input_tokens":3,"output_tokens":9,"api_key":"SECRET"},
+            "duration_ms":120,"duration_api_ms":90,"num_turns":2,"total_cost_usd":0.25,
+            "modelUsage":{"claude-sonnet":{"inputTokens":20,"outputTokens":9,
+                "cacheReadInputTokens":2,"cacheCreationInputTokens":3,"costUSD":0.25}},
+            "result":"SECRET_TRANSCRIPT", "credentials":"SECRET_CREDENTIALS"});
+        if expanded {
+            terminal["ttft_ms"] = json!(10);
+            terminal["ttft_stream_ms"] = json!(11);
+            terminal["time_to_request_ms"] = json!(12);
+            terminal["time_to_request_from_spawn_ms"] = json!(13);
+            let model = &mut terminal["modelUsage"]["claude-sonnet"];
+            model["thinkingTokens"] = json!(4);
+            model["cacheCreationEphemeral5mInputTokens"] = json!(1);
+            model["cacheCreationEphemeral1hInputTokens"] = json!(2);
+            model["canonicalModel"] = json!("claude-sonnet");
+            model["provider"] = json!("anthropic");
+            model["costBasis"] = json!("list");
+            model["transcript"] = json!("SECRET_MODEL_TRANSCRIPT");
+        }
+        let error =
+            ensure_process_outcome(&serde_json::to_vec(&terminal).unwrap(), false).unwrap_err();
+        let raw = &error.downcast_ref::<ObservedServiceUsage>().unwrap().0;
+        let owner = format!("claude-stats-{expanded}");
+        let mut observed = pioneer_provider::TokenUsage {
+            provider: Some("claude-cli".into()),
+            ..Default::default()
+        };
+        let call =
+            crate::usage_journal::Call::start(&store, &workspace, "summary", &owner, &observed)
+                .await
+                .unwrap();
+        crate::compaction::apply_cli_usage(&mut observed, raw);
+        // Partial same-call enrichment must recompute the complete input.
+        crate::compaction::apply_cli_usage(&mut observed, &json!({"cache_read_input_tokens":4}));
+        call.record("failed", &observed).await.unwrap();
+        call.record("failed", &observed).await.unwrap();
+        let reopened = CrudStore::new(store.database_connection());
+        let rows = reopened
+            .provider_usage_page(&workspace, &owner, "", 100)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        let retained: pioneer_provider::TokenUsage =
+            serde_json::from_str(&rows[0].usage_json).unwrap();
+        assert_eq!(retained.input_tokens, Some(8));
+        assert_eq!(retained.output_tokens, Some(9));
+        let stats = &retained.raw_usage.as_ref().unwrap()["cli_statistics"];
+        assert_eq!(stats["duration_ms"], 120);
+        assert_eq!(stats["duration_api_ms"], 90);
+        assert_eq!(stats["num_turns"], 2);
+        assert_eq!(
+            stats["model_usage_scope"],
+            "session_snapshot_including_subagents"
+        );
+        assert_eq!(stats["model_usage"]["claude-sonnet"]["inputTokens"], 20);
+        assert_eq!(stats["model_usage"]["claude-sonnet"]["costUSD"], 0.25);
+        if expanded {
+            assert_eq!(stats["ttft_ms"], 10);
+            assert_eq!(stats["ttft_stream_ms"], 11);
+            assert_eq!(stats["time_to_request_ms"], 12);
+            assert_eq!(stats["time_to_request_from_spawn_ms"], 13);
+            let model = &stats["model_usage"]["claude-sonnet"];
+            assert_eq!(model["thinkingTokens"], 4);
+            assert_eq!(model["cacheCreationEphemeral5mInputTokens"], 1);
+            assert_eq!(model["cacheCreationEphemeral1hInputTokens"], 2);
+            assert_eq!(model["canonicalModel"], "claude-sonnet");
+            assert_eq!(model["provider"], "anthropic");
+            assert_eq!(model["costBasis"], "list");
+        } else {
+            assert_eq!(stats["ttft_ms"], serde_json::Value::Null);
+            assert_eq!(
+                stats["model_usage"]["claude-sonnet"]["thinkingTokens"],
+                serde_json::Value::Null
+            );
+        }
+        assert!(!rows[0].usage_json.contains("SECRET"));
+    }
 }
 
 #[tokio::test]
@@ -90678,14 +90928,33 @@ async fn opencode_v2_summary_totals_and_native_categories_reach_completion_and_j
     )
     .await;
     let selected = serde_json::json!({"providerID":"local","id":"model"});
-    let step = serde_json::json!({"type":"assistant","model":selected,"content":[{"type":"text","text":"Summary"}],"tokens":{"input":10,"output":3,"reasoning":7,"cache":{"read":80,"write":20}}});
+    let step = serde_json::json!({"type":"assistant","id":"response-id","sessionID":"session-id","model":selected,"cost":0.25,"time":{"created":100,"streamed":105,"completed":130},"api_key":"SECRET","content":[{"type":"text","text":"Summary"}],"tokens":{"input":10,"output":3,"reasoning":7,"cache":{"read":80,"write":20}}});
+    let mut partial_steps = vec![step.clone(); 64];
+    partial_steps[63]["tokens"]["cache"]
+        .as_object_mut()
+        .unwrap()
+        .remove("read");
     let cases = [
+        (
+            serde_json::json!(partial_steps),
+            None,
+            Some(640),
+            Some(640),
+            Some(448),
+        ),
         (
             serde_json::json!([step]),
             Some(110_u64),
             Some(10_u64),
             Some(10_u64),
             Some(7_u64),
+        ),
+        (
+            serde_json::json!(vec![step.clone(); 64]),
+            Some(7040),
+            Some(640),
+            Some(640),
+            Some(448),
         ),
         (
             serde_json::json!([step, step]),
@@ -90763,14 +91032,37 @@ async fn opencode_v2_summary_totals_and_native_categories_reach_completion_and_j
         assert_eq!(rows[0].status, "completed");
         let retained: pioneer_provider::TokenUsage =
             serde_json::from_str(&rows[0].usage_json).unwrap();
+        let statistics = &retained.raw_usage.as_ref().unwrap()["cli_statistics"];
+        if messages
+            .as_array()
+            .unwrap()
+            .first()
+            .is_some_and(|m| m["id"] == "response-id")
+        {
+            let response = &statistics["responses"][0];
+            assert_eq!(response["id"], "response-id");
+            assert_eq!(response["sessionID"], "session-id");
+            assert_eq!(response["model"]["id"], "model");
+            assert_eq!(response["model"]["providerID"], "local");
+            assert_eq!(response["cost_usd"], 0.25);
+            assert_eq!(response["time"]["created"], 100);
+            assert_eq!(response["time"]["streamed"], 105);
+            assert_eq!(response["time"]["completed"], 130);
+            assert_eq!(response["duration_ms"], 30);
+        }
+        if messages.as_array().unwrap().len() == 64 {
+            assert_eq!(statistics["responses"].as_array().unwrap().len(), 8);
+            assert_eq!(statistics["responses_truncated"], true);
+            assert_eq!(statistics["cost_usd"], 16.0);
+        }
+        assert!(rows[0].usage_json.len() <= 32768);
+        assert!(!rows[0].usage_json.contains("SECRET"));
+        assert!(!rows[0].usage_json.contains("Summary"));
         assert_eq!(retained.input_tokens, completion.input_tokens);
         assert_eq!(retained.output_tokens, completion.output_tokens);
         assert_eq!(retained.uncached_input_tokens, uncached);
         assert_eq!(retained.reasoning_tokens, reasoning);
-        assert_eq!(
-            retained.raw_usage.as_ref().unwrap()["native_tokens"],
-            raw["native_tokens"]
-        );
+        assert_eq!(statistics["native_tokens"], raw["native_tokens"]);
         assert_eq!(
             retained.cache_read_input_tokens,
             raw["cache_read_input_tokens"].as_u64()
@@ -90779,6 +91071,22 @@ async fn opencode_v2_summary_totals_and_native_categories_reach_completion_and_j
             retained.cache_write_input_tokens,
             raw["cache_creation_input_tokens"].as_u64()
         );
+        assert_eq!(
+            statistics["known_partial_tokens"],
+            raw["known_partial_tokens"]
+        );
+        assert_eq!(
+            statistics["visible_output_tokens"],
+            raw["visible_output_tokens"]
+        );
+        if messages.as_array().unwrap().len() == 64 && input.is_none() {
+            assert_eq!(
+                statistics["native_tokens"]["cache"]["read"],
+                serde_json::Value::Null
+            );
+            assert_eq!(statistics["known_partial_tokens"]["cache_read"], 5040);
+            assert_eq!(statistics["known_partial_tokens"]["input"], 640);
+        }
         crate::compaction::apply_cli_usage(&mut observed, &raw);
         assert_eq!(observed.input_tokens, input);
         assert_eq!(observed.output_tokens, output);

@@ -1152,3 +1152,77 @@ async fn cache_admission_resolves_native_facts_per_field_and_respects_private_au
     )
     .await;
 }
+
+#[test]
+fn cli_evidence_is_bounded_through_update_without_widening_api_usage() {
+    let models = (0..9)
+        .map(|i| (format!("model-{i}"), json!({"inputTokens":i})))
+        .collect::<serde_json::Map<String, Value>>();
+    let evidence = json!({"model_usage":models,"duration_ms":2,"responses":vec![json!({
+        "id":"message-1","model":{"id":"model","providerID":"provider"},
+        "cost_usd":0.25,"time":{"created":10,"completed":13},
+        "content":"SECRET","authorization":"SECRET"
+    });1000]});
+    let raw = json!({"input_tokens":5,"cli_statistics":bounded_cli_statistics(&evidence)});
+    let snapshot = TokenUsage {
+        raw_usage: Some(raw.clone()),
+        ..Default::default()
+    };
+    let mut cli = TokenUsage {
+        provider: Some("opencode-cli".into()),
+        ..Default::default()
+    };
+    cli.update(&snapshot);
+    cli.update(&TokenUsage {
+        raw_usage: Some(json!({"output_tokens":2})),
+        ..Default::default()
+    });
+    let persisted = serde_json::to_value(&cli).unwrap();
+    let stats = &persisted["raw_usage"]["cli_statistics"];
+    assert_eq!(stats["responses"].as_array().unwrap().len(), 8);
+    assert_eq!(stats["responses_truncated"], true);
+    assert_eq!(stats["responses"][0]["cost_usd"], 0.25);
+    assert!(persisted.to_string().len() < 32 * 1024);
+    assert!(!persisted.to_string().contains("SECRET"));
+    let partial = TokenUsage {
+        raw_usage: Some(json!({"cli_statistics":bounded_cli_statistics(&json!({
+            "model_usage":{"model-0":{"inputTokens":20}},
+            "responses":[{"id":"message-1"}],
+            "model_usage_truncated":false,"responses_truncated":false,
+        }))})),
+        ..Default::default()
+    };
+    cli.update(&partial);
+    let mut fresh = TokenUsage {
+        provider: Some("opencode-cli".into()),
+        ..Default::default()
+    };
+    fresh.update(&partial);
+    for marker in ["responses_truncated", "model_usage_truncated"] {
+        assert_eq!(
+            cli.raw_usage.as_ref().unwrap()["cli_statistics"][marker],
+            true
+        );
+        assert_eq!(
+            fresh.raw_usage.as_ref().unwrap()["cli_statistics"][marker],
+            false
+        );
+    }
+    // Same untrusted extension in an API envelope is still discarded.
+    let mut api = TokenUsage::default();
+    api.update(&snapshot);
+    assert!(
+        api.raw_usage
+            .as_ref()
+            .unwrap()
+            .get("cli_statistics")
+            .is_none()
+    );
+    assert!(
+        decode::<0>(raw)
+            .raw_usage
+            .unwrap()
+            .get("cli_statistics")
+            .is_none()
+    );
+}

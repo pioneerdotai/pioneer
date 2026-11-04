@@ -7360,12 +7360,19 @@ impl MessageProcessor {
                 return;
             };
             message_future(async move {
+            // Installation includes required system exports. The current explicit
+            // selection is a separate fact and must retain Composer input order.
+            let selected_skill_names = crate::cli_runtime::context::explicit_cli_skill_names(
+                &outcome.materialization.capabilities,
+                &combined_preflight.skill_install_plans,
+            );
             if matches!(
                 runtime_kind,
                 CLIAgentRuntimeKind::Codex | CLIAgentRuntimeKind::OpenCode
             ) {
-                crate::cli_runtime::skills::prepend_installed_skill_items(
+                crate::cli_runtime::skills::prepend_cli_skill_delivery(
                     &installed_skills,
+                    &selected_skill_names,
                     &mut input_mapping,
                 );
             }
@@ -7399,12 +7406,6 @@ impl MessageProcessor {
                 None => None,
             };
             self.ensure_hook_runtime_with_run_store().await;
-            // Installation includes required system exports. The current explicit
-            // selection is a separate fact and must retain Composer input order.
-            let selected_skill_names = crate::cli_runtime::context::explicit_cli_skill_names(
-                &outcome.materialization.capabilities,
-                &combined_preflight.skill_install_plans,
-            );
             crate::cli_runtime::context::prepend_cli_environment_input(
                 &mut input_mapping,
                 &security_snapshot,

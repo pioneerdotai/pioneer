@@ -6006,6 +6006,11 @@ async fn terminal_effect_execution_uses_the_origin_runtime_generation() {
         .await
         .expect("thread should expose one durable receiver");
 
+    let source = format!(
+        "  {}middle{}tail\n",
+        "я".repeat(6000),
+        "я".repeat(12_000 - 6000 - "  middletail\n".chars().count())
+    );
     manager
         .start_test_turn_with_default_profile(
             thread_id,
@@ -6015,7 +6020,7 @@ async fn terminal_effect_execution_uses_the_origin_runtime_generation() {
             "capture",
             HashMap::new(),
             vec![UserInput::Text {
-                text: "Complete with the origin hook runtime.".to_owned(),
+                text: source.clone(),
                 text_elements: Vec::new(),
             }],
             Vec::new(),
@@ -6034,6 +6039,18 @@ async fn terminal_effect_execution_uses_the_origin_runtime_generation() {
         .into_iter()
         .next()
         .expect("post-turn effect should be prepared");
+
+    let pioneer_protocol::NativeTerminalEffectPayload::PostTurnHook { request, .. } =
+        &effect.payload
+    else {
+        panic!("post-turn payload");
+    };
+    assert_eq!(
+        request
+            .pointer("/input/payload/value/extraction_user_text/text")
+            .and_then(serde_json::Value::as_str),
+        Some(source.as_str())
+    );
 
     manager
         .set_hook_runtime(Some(recording_hook_runtime_for_phase(
@@ -9211,11 +9228,35 @@ async fn chat_request_carries_current_context_before_original_user_input() {
     assert_eq!(request.messages.len(), 1);
     let user = &request.messages[0];
     assert_eq!(user.role, Role::User);
-    assert!(user.content.starts_with("<pioneer_turn_context>\nDate: "));
+    assert!(
+        user.content
+            .starts_with("<pioneer_turn_context>\n## Execution\n\nDate: ")
+    );
     assert!(user.content.contains("Workspace: ws_chat_context"));
     assert!(user.content.contains("Thread: thr_chat_context"));
     assert!(user.content.contains("Turn: turn_chat_context"));
-    assert!(user.content.contains("Explicit skills: []"));
+    assert!(user.content.contains("Explicit selection: []"));
+    assert!(
+        user.content
+            .contains("\nRuntime: API\nModel: test-model\nProvider: capture")
+    );
+    assert!(user.content.contains("\n\n## Environment\n\nCwd: "));
+    assert!(
+        user.content
+            .contains("\nPermission mode: FullAccess\nApproval prompts: unavailable")
+    );
+    assert!(
+        user.content
+            .contains("\n\n## Conversation\n\nWorkspace: ws_chat_context")
+    );
+    assert!(
+        user.content
+            .contains("\nActor: unavailable\n\n## Skills\n\nExplicit selection: []")
+    );
+    assert!(!user.content.contains("Provider instance:"));
+    assert!(!user.content.contains("TurnApprovalScopePolicySnapshot"));
+    assert!(!user.content.contains("## Tools"));
+
     assert!(
         user.content
             .ends_with("</pioneer_turn_context>\n\noriginal chat input")
@@ -9511,7 +9552,35 @@ async fn memory_tool_materialization_bundles_are_merged_when_provider_returns_th
             .count(),
         1
     );
-    assert!(initial_user.content.contains("Explicit skills: []"));
+    assert!(initial_user.content.contains("Explicit selection: []"));
+    let mut previous = 0;
+    for heading in [
+        "## Execution",
+        "## Environment",
+        "## Conversation",
+        "## Skills",
+        "## Tools",
+    ] {
+        let position = initial_user
+            .content
+            .find(&format!("\n{heading}\n\n"))
+            .unwrap();
+        assert!(position > previous);
+        previous = position;
+    }
+    assert_eq!(initial_user.content.matches("## Skills\n").count(), 1);
+    assert!(!initial_user.content.contains("Provider instance:"));
+    assert!(
+        !initial_user
+            .content
+            .contains("Actual visibility and authorization are determined")
+    );
+    assert!(
+        !initial_user
+            .content
+            .contains("TurnApprovalScopePolicySnapshot")
+    );
+
     assert!(initial_user.content.contains("Workspace: ws_memory_bundle"));
     assert!(
         initial_user

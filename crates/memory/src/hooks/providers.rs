@@ -1,4 +1,5 @@
 use super::*;
+use serde::Serialize;
 
 #[async_trait::async_trait]
 pub trait AgentMemoryProvider: Send + Sync {
@@ -14,7 +15,7 @@ pub struct MemoryManifestRequest {
     pub max_item_chars: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct MemoryManifest {
     pub active: Vec<MemoryManifestActiveItem>,
     pub candidates: Vec<MemoryManifestCandidateItem>,
@@ -22,23 +23,27 @@ pub struct MemoryManifest {
     pub truncated: bool,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MemoryManifestActiveItem {
     pub memory_id: String,
     pub scope: MemoryScope,
     pub category: MemoryCategory,
     pub key: Option<String>,
+    #[serde(default)]
+    pub content_truncated: bool,
     pub content_preview: String,
     pub updated_at: i64,
     pub status: MemoryStatus,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MemoryManifestCandidateItem {
     pub candidate_id: String,
     pub scope: MemoryScope,
     pub category: MemoryCategory,
     pub key: Option<String>,
+    #[serde(default)]
+    pub content_truncated: bool,
     pub content_preview: String,
     pub status: MemoryCandidateStatus,
     pub created_at: i64,
@@ -63,6 +68,7 @@ pub struct MemoryDurableTerminalEffectClaim {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct MemoryPostTurnExtractorRequest {
+    pub source_metadata: serde_json::Value,
     pub user_text: String,
     pub assistant_text: String,
     pub tool_events_summary: String,
@@ -73,19 +79,40 @@ pub struct MemoryPostTurnExtractorRequest {
 
 impl MemoryPostTurnExtractorRequest {
     pub fn render_prompt(&self) -> String {
-        render_memory_post_turn_extractor_prompt(&MemoryPostTurnExtractorPromptInput {
+        let data = render_memory_post_turn_extractor_prompt(&MemoryPostTurnExtractorPromptInput {
             user_text: self.user_text.clone(),
             assistant_text: self.assistant_text.clone(),
             tool_events_summary: self.tool_events_summary.clone(),
             domain_events_summary: self.domain_events_summary.clone(),
             memory_manifest: render_memory_manifest(&self.manifest),
             max_facts: self.max_facts,
-        })
+        });
+        let mut data: serde_json::Value =
+            serde_json::from_str(&data).expect("serialized extractor data");
+        data["source_metadata"] = self.source_metadata.clone();
+        data["memory_manifest"] =
+            serde_json::to_value(&self.manifest).expect("serializable manifest");
+        data.to_string()
     }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MemoryPostTurnExtractorResponse {
+    pub raw_json: String,
+    /// Original manifest from the immutable checkpoint; None for legacy checkpoints.
+    pub manifest: Option<MemoryManifest>,
 }
 
 #[async_trait::async_trait]
 pub trait AgentMemoryPostTurnExtractorProvider: Send + Sync {
+    /// A saved checkpoint owns its projection; do not require today's optional manifest.
+    async fn replay_manifest(
+        &self,
+        _context: &MemoryPostTurnExtractorContext,
+    ) -> HookResult<Option<MemoryManifest>> {
+        Ok(None)
+    }
+
     /// Providers that own durable checkpoints must validate the typed response
     /// with `validate_memory_post_turn_response_format` before publication and
     /// after replay decoding. Fresh format failures may retry within the outbox
@@ -94,7 +121,7 @@ pub trait AgentMemoryPostTurnExtractorProvider: Send + Sync {
         &self,
         context: MemoryPostTurnExtractorContext,
         request: MemoryPostTurnExtractorRequest,
-    ) -> HookResult<String>;
+    ) -> HookResult<MemoryPostTurnExtractorResponse>;
 }
 
 #[async_trait::async_trait]

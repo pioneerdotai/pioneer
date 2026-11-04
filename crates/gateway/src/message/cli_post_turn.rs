@@ -86,7 +86,7 @@ impl MessageProcessor {
         let limits = TurnPostTurnHookInputLimits::default();
         let (user_text, user_text_truncated) = self
             .crud_store
-            .post_turn_user_text(&binding.turn_id, limits.user_text_preview_max_chars)
+            .post_turn_user_text(&binding.turn_id, 16_000)
             .await?;
         let assistant_text = match final_item {
             Some(TurnItem::AgentMessage {
@@ -145,8 +145,19 @@ impl MessageProcessor {
             domain_events,
             limits,
         );
+        if let Some(text) = input.extraction_user_text.as_mut() {
+            text.truncated |= user_text_truncated;
+            if user_text_truncated {
+                text.original_size_known = false;
+                text.original_bytes = None;
+            }
+        }
         if let Some(text) = input.user_text.as_mut() {
             text.truncated |= user_text_truncated;
+            if user_text_truncated {
+                text.original_size_known = false;
+                text.original_bytes = None;
+            }
         }
         if let Some(mut preparation) = runtime
             .prepare_completed_turn_hook(CompletedTurnHookInput {

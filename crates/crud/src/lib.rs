@@ -1729,7 +1729,7 @@ pub use crate::memory::{
     NewAgentMemoryCandidate, NewAgentMemoryControlRecord, NewAgentMemoryEvent,
     NewAgentMemoryPolicyDecision, NewAgentMemoryQualityDecision, NewAgentMemoryQuarantine,
     NewAgentMemoryRepairJob, ResolveAgentMemoryQuarantine, global_agent_memory_scope_key,
-    memory_scope_key_hash, workspace_agent_memory_scope_key,
+    memory_scope_key_hash, parse_workspace_user_scope_key, workspace_agent_memory_scope_key,
 };
 pub use crate::repositories::hook_run::{
     HOOK_RUN_CONTRIBUTION_HASH_MAX_COUNT, HOOK_RUN_DIAGNOSTIC_MESSAGE_MAX_CHARS,
@@ -10118,7 +10118,7 @@ impl CrudStore {
         };
         let scope_key_hash = memory_scope_key_hash(scope.kind, key.as_str())?;
         let workspace_id = match scope.kind {
-            MemoryScopeKind::User => None,
+            MemoryScopeKind::User => crate::memory::parse_workspace_user_scope_key(&key),
             MemoryScopeKind::Workspace => Some(key),
             MemoryScopeKind::Thread => {
                 let thread = pioneer_entity::thread::Entity::find_by_id(key.clone())
@@ -11080,9 +11080,20 @@ impl CrudStore {
 
     pub async fn insert_agent_memory_candidate(
         &self,
-        mut candidate: NewAgentMemoryCandidate,
+        candidate: NewAgentMemoryCandidate,
         event_timestamp_secs: i64,
     ) -> Result<AgentMemoryCandidateRecord> {
+        self.insert_agent_memory_candidate_with_outcome(candidate, event_timestamp_secs)
+            .await
+            .map(|(candidate, _created)| candidate)
+    }
+
+    /// The dedupe decision and creation event share the serialized transaction.
+    pub async fn insert_agent_memory_candidate_with_outcome(
+        &self,
+        mut candidate: NewAgentMemoryCandidate,
+        event_timestamp_secs: i64,
+    ) -> Result<(AgentMemoryCandidateRecord, bool)> {
         let candidate_id = candidate
             .id
             .get_or_insert_with(|| generate_id(DB_ID_LEN))
@@ -11110,20 +11121,25 @@ impl CrudStore {
                     .begin()
                     .await
                     .context("failed to begin memory candidate insert transaction")?;
-                let row = agent_memory_candidate::insert_candidate(
+                let (row, created) = agent_memory_candidate::insert_candidate(
                     &transaction,
                     candidate,
                     resolved,
                     unix_to_datetime(event_timestamp_secs),
                 )
                 .await?;
-                agent_memory_event::append_prepared_memory_event(&transaction, prepared_event)
-                    .await?;
+                if created {
+                    agent_memory_event::append_prepared_memory_event(&transaction, prepared_event)
+                        .await?;
+                }
                 transaction
                     .commit()
                     .await
                     .context("failed to commit memory candidate insert transaction")?;
-                crate::memory::agent_memory_candidate_record_from_model(row)
+                Ok((
+                    crate::memory::agent_memory_candidate_record_from_model(row)?,
+                    created,
+                ))
             }
         })
         .await
@@ -11186,28 +11202,28 @@ impl CrudStore {
         Ok(Some(record))
     }
 
-    pub async fn update_agent_memory_candidate_metadata(
+    /// Compare metadata bytes inside the serialized transaction; preparation
+    /// and any conflict reread/recompute belong outside this writer operation.
+    pub async fn update_agent_memory_candidate_metadata_if_unchanged(
         &self,
         candidate_id: &str,
-        reason: String,
+        expected_metadata_json: Option<String>,
         metadata_json: Option<String>,
-        event_timestamp_secs: i64,
     ) -> Result<Option<AgentMemoryCandidateRecord>> {
         let row = self
             .run_serialized_write(|| {
-                let reason = reason.clone();
+                let expected_metadata_json = expected_metadata_json.clone();
                 let metadata_json = metadata_json.clone();
                 async move {
                     let transaction =
                         self.connection.begin().await.context(
                             "failed to begin memory candidate metadata update transaction",
                         )?;
-                    let Some(row) = agent_memory_candidate::update_candidate_metadata(
+                    let Some(row) = agent_memory_candidate::update_candidate_metadata_if_unchanged(
                         &transaction,
                         candidate_id,
-                        reason,
+                        expected_metadata_json,
                         metadata_json,
-                        unix_to_datetime(event_timestamp_secs),
                     )
                     .await?
                     else {
