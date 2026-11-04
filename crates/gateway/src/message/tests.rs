@@ -22206,6 +22206,53 @@ async fn thread_subscriptions_bind_identity_and_revalidate_current_visibility() 
         "Member thread/start must remain runtime-only before the first turn"
     );
 
+    // Exercise the canonical dispatcher while the resource is still runtime-only.
+    let runtime_open_id = generate_test_request_id("realtimethread", "runtimeowneropen");
+    processor.process_request_for_connection(allowed_connection_id, &json!({
+        "jsonrpc":"2.0", "id":runtime_open_id, "method":"thread/open", "params":{"thread_id":THREAD_ID}
+    }).to_string()).await;
+    let opened = recv_response_by_id(&mut allowed_rx, &runtime_open_id).await;
+    let opened: ThreadStartResponse = serde_json::from_value(opened.result).unwrap();
+    assert_eq!(opened.thread.workspace_id, workspace_id);
+    let _ = recv_notification_by_method(&mut allowed_rx, events::THREAD_STARTED).await;
+    assert!(
+        crud_store
+            .get_thread_model(THREAD_ID)
+            .await
+            .unwrap()
+            .is_none(),
+        "runtime open must not promote draft"
+    );
+    processor
+        .session_manager
+        .set_connection_workspace(denied_connection_id, Some("selected-before-denial".into()))
+        .await;
+    let runtime_denied_id = generate_test_request_id("realtimethread", "runtimeforeignopen");
+    processor.process_request_for_connection(denied_connection_id, &json!({
+        "jsonrpc":"2.0", "id":runtime_denied_id, "method":"thread/open", "params":{"thread_id":THREAD_ID}
+    }).to_string()).await;
+    assert_eq!(
+        recv_error_by_id(&mut denied_rx, &runtime_denied_id)
+            .await
+            .error
+            .message,
+        "not_found"
+    );
+    assert_eq!(
+        processor
+            .session_manager
+            .connection_workspace_id(denied_connection_id)
+            .await
+            .as_deref(),
+        Some("selected-before-denial")
+    );
+    assert!(
+        !thread_manager
+            .subscribed_connection_ids(THREAD_ID)
+            .await
+            .contains(&denied_connection_id)
+    );
+
     let materialize_id = generate_test_request_id("realtimethread", "firstturn");
     processor
         .process_request_for_connection(
@@ -22250,10 +22297,9 @@ async fn thread_subscriptions_bind_identity_and_revalidate_current_visibility() 
             &json!({
                 "jsonrpc": "2.0",
                 "id": superuser_open_id,
-                "method": "thread/start",
+                "method": "thread/open",
                 "params": {
-                    "thread_id": THREAD_ID,
-                    "workspace_id": workspace_id
+                    "thread_id": THREAD_ID
                 }
             })
             .to_string(),
@@ -22320,10 +22366,9 @@ async fn thread_subscriptions_bind_identity_and_revalidate_current_visibility() 
             &json!({
                 "jsonrpc": "2.0",
                 "id": denied_open_id,
-                "method": "thread/start",
+                "method": "thread/open",
                 "params": {
-                    "thread_id": THREAD_ID,
-                    "workspace_id": workspace_id
+                    "thread_id": THREAD_ID
                 }
             })
             .to_string(),
@@ -22331,6 +22376,14 @@ async fn thread_subscriptions_bind_identity_and_revalidate_current_visibility() 
         .await;
     let denied = recv_error_by_id(&mut denied_rx, denied_open_id.as_str()).await;
     assert_eq!(denied.error.message, "not_found");
+    assert_eq!(
+        processor
+            .session_manager
+            .connection_workspace_id(denied_connection_id)
+            .await
+            .as_deref(),
+        Some("selected-before-denial")
+    );
     assert!(
         !thread_manager
             .subscribed_connection_ids(THREAD_ID)

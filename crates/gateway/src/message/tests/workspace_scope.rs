@@ -286,6 +286,20 @@ async fn id_only_open_selects_authoritative_workspace_and_never_creates_missing_
         .await
         .unwrap()
         .unwrap();
+    let other = harness
+        .processor
+        .workspace_manager
+        .create_workspace("open_other_workspace", Some("Selected before open"))
+        .await
+        .unwrap()
+        .id;
+    let selected = rpc(
+        &mut harness,
+        "workspace/select",
+        json!({"workspace_id":other,"make_current":false}),
+    )
+    .await;
+    assert!(selected.get("error").is_none());
     let result = rpc(&mut harness, "thread/open", json!({"thread_id":thread_id})).await;
     let opened: pioneer_protocol::ThreadStartResponse =
         serde_json::from_value(result["result"].clone()).unwrap();
@@ -313,4 +327,13 @@ async fn id_only_open_selects_authoritative_workspace_and_never_creates_missing_
             .is_none()
     );
     assert!(!harness.processor.thread_manager.has_thread(&missing).await);
+    assert_eq!(
+        harness
+            .processor
+            .session_manager
+            .connection_workspace_id(harness.connection_id)
+            .await
+            .as_deref(),
+        Some(expected.workspace_id.as_str())
+    );
 }
