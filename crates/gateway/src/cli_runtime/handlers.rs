@@ -2981,6 +2981,7 @@ impl MessageProcessor {
         &self,
         request: NewCliRuntimePendingRequest,
     ) -> anyhow::Result<CliRuntimePendingRequestRecord> {
+        let opened_producer = self.pending_delivery_order.opened(&request.request_id);
         let interaction = pioneer_crud::deserialize_cli_runtime_json::<CLIRuntimePendingRequest>(
             request.payload_json.as_str(),
         )
@@ -3047,7 +3048,20 @@ impl MessageProcessor {
                 .await?
         };
         if opened.status == StoredCliRuntimePendingRequestStatus::Pending {
-            self.emit_cli_runtime_request_opened(opened.clone()).await;
+            if let Some(producer) = opened_producer {
+                producer
+                    .expires_at(
+                        opened
+                            .created_at
+                            .timestamp_millis()
+                            .saturating_add(CLI_RUNTIME_HUMAN_RESPONSE_TIMEOUT_MS),
+                    )
+                    .run(self.emit_cli_runtime_request_opened(opened.clone()))
+                    .await;
+            } else {
+                self.retire_pending_delivery_observers(&opened.thread_id)
+                    .await;
+            }
         }
         Ok(opened)
     }
@@ -11617,7 +11631,10 @@ impl MessageProcessor {
                         error = %format!("{error:#}"),
                         "failed to replay durable CLI human interactions"
                     );
-                    break;
+                    self.session_manager
+                        .unregister_connection(connection_id)
+                        .await;
+                    return;
                 }
             };
             let next = requests
@@ -11632,6 +11649,18 @@ impl MessageProcessor {
                 {
                     continue;
                 }
+                let Some(producer) = self.pending_delivery_order.opened(&request.request_id) else {
+                    self.session_manager
+                        .unregister_connection(connection_id)
+                        .await;
+                    return;
+                };
+                let producer = producer.expires_at(
+                    request
+                        .created_at
+                        .timestamp_millis()
+                        .saturating_add(CLI_RUNTIME_HUMAN_RESPONSE_TIMEOUT_MS),
+                );
                 let visible_thread_ids = self.pending_request_ancestor_thread_ids(&request).await;
                 if request.thread_id != thread_id
                     && !visible_thread_ids
@@ -11643,16 +11672,7 @@ impl MessageProcessor {
                 if now_unix_ms.saturating_sub(request.created_at.timestamp_millis())
                     >= CLI_RUNTIME_HUMAN_RESPONSE_TIMEOUT_MS
                 {
-                    if let Err(error) = self
-                        .expire_cli_runtime_pending_request_as_stale(&request)
-                        .await
-                    {
-                        warn!(
-                            request_id = request.request_id,
-                            error = %format!("{error:#}"),
-                            "failed to expire stale CLI human interaction during replay"
-                        );
-                    }
+                    // The existing runtime timeout/recovery sweep owns expiry.
                     continue;
                 }
 
@@ -11660,17 +11680,22 @@ impl MessageProcessor {
                     &request,
                     visible_thread_ids.clone(),
                 );
-                self.send_execution_collaborator_notification_to_connections(
-                    thread_id,
-                    crate::authorization::ResourceAction::AgentRequestObserve,
-                    events::CLI_RUNTIME_REQUEST_OPENED,
-                    &opened,
-                    vec![connection_id],
-                )
-                .await;
+                producer
+                    .run(async {
+                        self.send_execution_collaborator_notification_to_connections(
+                            thread_id,
+                            crate::authorization::ResourceAction::AgentRequestObserve,
+                            events::CLI_RUNTIME_REQUEST_OPENED,
+                            &opened,
+                            vec![connection_id],
+                        )
+                        .await;
+                    })
+                    .await;
 
                 // Resolution may race the replay. Never leave a late client
                 // with an opened card after the durable request was consumed.
+                let correction = producer.correction();
                 let current = self
                     .crud_store
                     .get_cli_runtime_pending_request(request.request_id.as_str())
@@ -11682,20 +11707,28 @@ impl MessageProcessor {
                 }) {
                     continue;
                 }
-                let resolved_record = current.as_ref().unwrap_or(&request);
+                let Some(resolved_record) = current.as_ref() else {
+                    self.session_manager
+                        .unregister_connection(connection_id)
+                        .await;
+                    return;
+                };
                 let resolved = cli_runtime_request_resolved_notification_from_record(
                     resolved_record,
                     visible_thread_ids,
                     cli_runtime_replay_resolution(resolved_record),
                 );
-                self.send_execution_collaborator_notification_to_connections(
-                    thread_id,
-                    crate::authorization::ResourceAction::AgentRequestObserve,
-                    events::CLI_RUNTIME_REQUEST_RESOLVED,
-                    &resolved,
-                    vec![connection_id],
-                )
-                .await;
+                correction
+                    .run(
+                        self.send_execution_collaborator_notification_to_connections(
+                            thread_id,
+                            crate::authorization::ResourceAction::AgentRequestObserve,
+                            events::CLI_RUNTIME_REQUEST_RESOLVED,
+                            &resolved,
+                            vec![connection_id],
+                        ),
+                    )
+                    .await;
             }
 
             let Some(next) = next else {
@@ -11730,19 +11763,24 @@ impl MessageProcessor {
         request: CliRuntimePendingRequestRecord,
         resolution: CLIRuntimeRequestResolution,
     ) {
+        let terminal = self.pending_delivery_order.terminal(&request.request_id);
         let visible_thread_ids = self.pending_request_ancestor_thread_ids(&request).await;
         let notification = cli_runtime_request_resolved_notification_from_record(
             &request,
             visible_thread_ids.clone(),
             resolution,
         );
-        self.send_cli_runtime_request_notification(
+        let delivery = self.send_cli_runtime_request_notification(
             &request,
             visible_thread_ids.as_slice(),
             events::CLI_RUNTIME_REQUEST_RESOLVED,
             &notification,
-        )
-        .await;
+        );
+        if let Some(terminal) = terminal {
+            terminal.run(delivery).await;
+        } else {
+            delivery.await;
+        }
         self.notify_semantic_timeline_pending_request_changed(&request)
             .await;
     }

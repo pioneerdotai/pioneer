@@ -494,6 +494,12 @@ impl MessageProcessor {
         let Some(serialized) = self.serialize_notification(method, payload) else {
             return;
         };
+        let mut expected = HashMap::new();
+        for connection in &serialization_connection_ids {
+            if let Ok(principal) = self.session_manager.connection_principal(*connection).await {
+                expected.insert(*connection, principal);
+            }
+        }
         let connection_ids = self
             .authorized_execution_collaborator_notification_recipients_for_threads(
                 thread_ids,
@@ -501,8 +507,19 @@ impl MessageProcessor {
                 serialization_connection_ids,
             )
             .await;
-        self.send_serialized_notification_to_connections(method, &serialized, connection_ids)
-            .await;
+        for connection in connection_ids {
+            if let Some(principal) = expected.get(&connection) {
+                let _ = self
+                    .session_manager
+                    .try_send_execution_notification(
+                        connection,
+                        principal,
+                        serialized.clone(),
+                        method,
+                    )
+                    .await;
+            }
+        }
     }
 
     async fn send_execution_scoped_notification<T: Serialize>(
@@ -536,6 +553,12 @@ impl MessageProcessor {
         let Some(serialized) = self.serialize_notification(method, payload) else {
             return;
         };
+        let mut expected = HashMap::new();
+        for connection in &serialization_connection_ids {
+            if let Ok(principal) = self.session_manager.connection_principal(*connection).await {
+                expected.insert(*connection, principal);
+            }
+        }
         let connection_ids = self
             .authorized_execution_collaborator_notification_recipients(
                 thread_id,
@@ -543,8 +566,33 @@ impl MessageProcessor {
                 serialization_connection_ids,
             )
             .await;
-        self.send_serialized_notification_to_connections(method, &serialized, connection_ids)
+        for connection in connection_ids {
+            if let Some(principal) = expected.get(&connection) {
+                let _ = self
+                    .session_manager
+                    .try_send_execution_notification(
+                        connection,
+                        principal,
+                        serialized.clone(),
+                        method,
+                    )
+                    .await;
+            }
+        }
+    }
+
+    pub(super) async fn retire_pending_delivery_observers(&self, thread_id: &str) {
+        let candidates = self.session_manager.connection_ids().await;
+        let recipients = self
+            .authorized_execution_collaborator_notification_recipients(
+                thread_id,
+                crate::authorization::ResourceAction::AgentRequestObserve,
+                candidates,
+            )
             .await;
+        for connection in recipients {
+            self.session_manager.unregister_connection(connection).await;
+        }
     }
 
     async fn authorized_execution_collaborator_notification_recipients(
@@ -1922,6 +1970,7 @@ impl MessageProcessor {
                     crate::epic5_observability::Epic5Operation::Notification,
                     crate::epic5_observability::Epic5Outcome::Unavailable,
                 );
+                crate::thread::replay::fail_current();
                 error!(method, error = %error, "failed to encode notification");
                 return None;
             }
@@ -1960,6 +2009,7 @@ impl MessageProcessor {
                     crate::epic5_observability::Epic5Operation::Notification,
                     crate::epic5_observability::Epic5Outcome::Unavailable,
                 );
+                crate::thread::replay::fail_current();
                 error!(method, error = %error, "failed to serialize notification");
                 None
             }
@@ -1983,7 +2033,11 @@ impl MessageProcessor {
             }
             if let Err(error) = self
                 .session_manager
-                .try_send_notification_text(target_connection_id, serialized.to_owned())
+                .try_send_classified_notification_text(
+                    target_connection_id,
+                    serialized.to_owned(),
+                    method,
+                )
                 .await
             {
                 crate::epic5_observability::record_outcome(

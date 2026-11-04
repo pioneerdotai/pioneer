@@ -20,6 +20,7 @@ const MAX_ORDERED_REQUESTS: usize = 4096;
 struct SubscriptionState {
     live: bool,
     replay: bool,
+    committed: bool,
     replayed: bool,
 }
 pub(crate) struct SubscriptionIncarnation {
@@ -48,6 +49,7 @@ impl SubscriptionIncarnation {
             state: Mutex::new(SubscriptionState {
                 live: true,
                 replay: false,
+                committed: false,
                 replayed: false,
             }),
             cancel: CancellationToken::new(),
@@ -65,15 +67,22 @@ impl SubscriptionIncarnation {
             && self.identity.session_id == principal.session_id
     }
     fn fail(&self) {
-        self.retire();
-        if let Some(outbound) = self
-            .delivery_failure
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .as_ref()
-        {
-            outbound.abort();
+        // Retirement and the terminal outbound decision share this lock. Late
+        // failure of a retired token cannot close a replacement on the socket.
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if state.live {
+            state.live = false;
+            if let Some(outbound) = self
+                .delivery_failure
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .as_ref()
+            {
+                outbound.abort();
+            }
         }
+        drop(state);
+        self.cancel.cancel();
     }
     pub(crate) fn admit_reply<T>(
         &self,
@@ -89,15 +98,21 @@ impl SubscriptionIncarnation {
     fn claim(&self) -> Result<bool> {
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         anyhow::ensure!(state.live, "subscription retired");
-        if state.replay || state.replayed {
+        if state.replayed {
+            return Ok(false);
+        }
+        if state.replay {
+            anyhow::ensure!(state.committed, "post-open reply handoff is not committed");
             return Ok(false);
         }
         state.replay = true;
+        state.committed = false;
         Ok(true)
     }
     fn release(&self, complete: bool) {
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         state.replay = false;
+        state.committed = false;
         state.replayed |= complete;
     }
 }
@@ -352,14 +367,12 @@ impl ReplayTasks {
         token: Arc<SubscriptionIncarnation>,
         outbound: SessionOutbound,
         order: &Arc<PendingDeliveryOrder>,
-    ) -> Result<Option<ReplayReservation>> {
+    ) -> Result<ReplayReservation> {
         *token
             .delivery_failure
             .lock()
             .unwrap_or_else(|p| p.into_inner()) = Some(outbound.clone());
-        if !token.claim()? {
-            return Ok(None);
-        }
+        let owns_replay = token.claim()?;
         let admission = (|| {
             let mut state = self.0.lock().unwrap_or_else(|p| p.into_inner());
             while state.tasks.try_join_next().is_some() {}
@@ -367,20 +380,27 @@ impl ReplayTasks {
                 !state.stopped && state.tasks.len() + state.reserved < MAX_REPLAYS_PER_CONNECTION,
                 "post-open replay capacity exhausted"
             );
-            let capture = order.capture(&token)?;
+            let capture = if owns_replay {
+                Some(order.capture(&token)?)
+            } else {
+                None
+            };
             state.reserved += 1;
             Ok(capture)
         })();
         match admission {
-            Ok(capture) => Ok(Some(ReplayReservation {
+            Ok(capture) => Ok(ReplayReservation {
                 owner: self.clone(),
                 token,
-                outbound,
-                capture: Some(capture),
+                capture,
+                owns_replay,
+                acknowledged: false,
                 started: false,
-            })),
+            }),
             Err(error) => {
-                token.release(false);
+                if owns_replay {
+                    token.release(false);
+                }
                 Err(error)
             }
         }
@@ -389,42 +409,52 @@ impl ReplayTasks {
 pub(crate) struct ReplayReservation {
     owner: Arc<ReplayTasks>,
     token: Arc<SubscriptionIncarnation>,
-    outbound: SessionOutbound,
     capture: Option<Capture>,
+    owns_replay: bool,
+    acknowledged: bool,
     started: bool,
 }
 struct RunningReplay {
+    owns_replay: bool,
     token: Arc<SubscriptionIncarnation>,
-    outbound: SessionOutbound,
     complete: bool,
 }
 impl Drop for RunningReplay {
     fn drop(&mut self) {
         // A live obligation cannot disappear on panic/drop: terminal socket
         // teardown forces recovery from durable pending state on reconnect.
-        if !self.complete
-            && self
-                .token
-                .state
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .live
-        {
-            self.outbound.abort();
+        if !self.complete {
+            self.token.fail();
         }
-        self.token.release(self.complete);
+        if self.owns_replay {
+            self.token.release(self.complete);
+        }
     }
 }
 impl ReplayReservation {
+    pub(crate) fn includes_pending(&self) -> bool {
+        self.owns_replay
+    }
+    pub(crate) fn acknowledge(&mut self) {
+        self.acknowledged = true;
+        if self.owns_replay {
+            self.token
+                .state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .committed = true;
+        }
+    }
     pub(crate) fn start<F: Future<Output = ()> + Send + 'static>(mut self, future: F) {
+        self.acknowledge();
         let mut state = self.owner.0.lock().unwrap_or_else(|p| p.into_inner());
         state.reserved -= 1;
         self.started = true;
         let token = self.token.clone();
         let capture = self.capture.take();
         let mut running = RunningReplay {
+            owns_replay: self.owns_replay,
             token: token.clone(),
-            outbound: self.outbound.clone(),
             complete: false,
         };
         if state.stopped {
@@ -449,12 +479,17 @@ impl ReplayReservation {
 impl Drop for ReplayReservation {
     fn drop(&mut self) {
         if !self.started {
+            if self.acknowledged {
+                self.token.fail();
+            }
             self.owner
                 .0
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .reserved -= 1;
-            self.token.release(false);
+            if self.owns_replay {
+                self.token.release(false);
+            }
         }
     }
 }
@@ -608,10 +643,7 @@ mod tests {
         let owner = Arc::new(ReplayTasks::default());
         let (outbound, _receiver) = outbound_channel(8);
         let current = token(1);
-        let reservation = owner
-            .reserve(current, outbound.clone(), &order)
-            .unwrap()
-            .unwrap();
+        let reservation = owner.reserve(current, outbound.clone(), &order).unwrap();
         for index in 0..MAX_ORDERED_REQUESTS {
             let _ = order.terminal(&format!("terminal-{index}"));
         }
@@ -649,22 +681,16 @@ mod tests {
         let first = token(1);
         let reservation = owner
             .reserve(first.clone(), outbound.clone(), &order)
-            .unwrap()
             .unwrap();
         assert!(
             owner
                 .reserve(first.clone(), outbound.clone(), &order)
-                .unwrap()
-                .is_none()
+                .is_err(),
+            "an uncommitted pre-reply reservation cannot justify another success"
         );
         let mut reservations = vec![reservation];
         for _ in 2..=8 {
-            reservations.push(
-                owner
-                    .reserve(token(1), outbound.clone(), &order)
-                    .unwrap()
-                    .unwrap(),
-            );
+            reservations.push(owner.reserve(token(1), outbound.clone(), &order).unwrap());
         }
         let ninth = token(1);
         assert!(
@@ -673,14 +699,36 @@ mod tests {
                 .is_err()
         );
         drop(reservations.pop());
-        let admitted = owner
-            .reserve(ninth, outbound.clone(), &order)
-            .unwrap()
-            .unwrap();
+        let admitted = owner.reserve(ninth, outbound.clone(), &order).unwrap();
         drop(admitted);
         drop(reservations);
         // Pre-response cancellation must permit the same membership to retry.
-        assert!(owner.reserve(first, outbound, &order).unwrap().is_some());
+        assert!(owner.reserve(first, outbound, &order).is_ok());
+    }
+
+    #[tokio::test]
+    async fn dropping_acknowledged_handoff_forces_recovery_but_retired_handoff_cannot_close_replacement()
+     {
+        for retired in [false, true] {
+            let owner = Arc::new(ReplayTasks::default());
+            let order = Arc::new(PendingDeliveryOrder::default());
+            let (outbound, _receiver) = outbound_channel(8);
+            let old = token(1);
+            let mut reservation = owner
+                .reserve(old.clone(), outbound.clone(), &order)
+                .unwrap();
+            reservation.acknowledge();
+            if retired {
+                old.retire();
+            }
+            drop(reservation);
+            assert_eq!(
+                outbound
+                    .try_send_data(Message::Text("current socket".into()))
+                    .is_ok(),
+                retired
+            );
+        }
     }
 
     #[tokio::test]
@@ -690,10 +738,7 @@ mod tests {
             let order = Arc::new(PendingDeliveryOrder::default());
             let (outbound, _receiver) = outbound_channel(8);
             let (entered, waiting) = tokio::sync::oneshot::channel();
-            let reservation = owner
-                .reserve(token(1), outbound.clone(), &order)
-                .unwrap()
-                .unwrap();
+            let reservation = owner.reserve(token(1), outbound.clone(), &order).unwrap();
             reservation.start(async move {
                 let _ = entered.send(());
                 if panic {
@@ -720,7 +765,6 @@ mod tests {
         owner
             .reserve(old.clone(), outbound.clone(), &order)
             .unwrap()
-            .unwrap()
             .start(async move {
                 let _ = entered.send(());
                 std::future::pending::<()>().await;
@@ -730,7 +774,6 @@ mod tests {
         let replacement = token(1);
         owner
             .reserve(replacement, outbound.clone(), &order)
-            .unwrap()
             .unwrap()
             .start(async {});
         owner.drain().await;

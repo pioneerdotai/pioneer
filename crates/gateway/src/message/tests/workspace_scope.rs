@@ -336,4 +336,36 @@ async fn id_only_open_selects_authoritative_workspace_and_never_creates_missing_
             .as_deref(),
         Some(expected.workspace_id.as_str())
     );
+    // Physical deletion through the project's runtime/ORM fixture boundary.
+    // The loaded runtime and its old membership are deliberately still present.
+    use sea_orm::EntityTrait;
+    pioneer_entity::thread::Entity::delete_by_id(expected.id.clone())
+        .exec(&harness.processor.crud_store.database_connection())
+        .await
+        .unwrap();
+    let denied = rpc(
+        &mut harness,
+        "thread/open",
+        json!({"thread_id":expected.id}),
+    )
+    .await;
+    assert_eq!(denied["error"]["message"], "not_found");
+    assert!(
+        harness
+            .processor
+            .crud_store
+            .get_thread_model(&expected.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        harness
+            .processor
+            .session_manager
+            .connection_workspace_id(harness.connection_id)
+            .await
+            .as_deref(),
+        Some(expected.workspace_id.as_str())
+    );
 }

@@ -437,6 +437,40 @@ impl MessageProcessor {
         let replay_workspace_id = outcome.response.thread.workspace_id.clone();
         let replay_thread_id = outcome.response.thread.id.clone();
 
+        // Captured with membership creation under ThreadManager's lock. A
+        // later same-socket re-subscribe must never substitute its new token.
+        let Some(incarnation) = outcome
+            .subscription_incarnations
+            .iter()
+            .find(|token| token.connection == connection_id)
+            .cloned()
+        else {
+            return false;
+        };
+        let started_recipients = outcome.subscription_incarnations.clone();
+        let mut replay = match self
+            .session_manager
+            .reserve_thread_replay(
+                connection_id,
+                incarnation.clone(),
+                &self.pending_delivery_order,
+            )
+            .await
+        {
+            Ok(replay) => replay,
+            Err(error) => {
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        Some(request_id),
+                        INVALID_REQUEST_CODE,
+                        format!("post-open replay admission failed: {error}"),
+                    ),
+                )
+                .await;
+                return false;
+            }
+        };
         self.foreground_starts
             .before_thread_snapshot(&replay_thread_id)
             .await;
@@ -468,7 +502,15 @@ impl MessageProcessor {
         let response_send_stage = trace.map(|trace| {
             trace.stage(pioneer_observability::GatewayOperationStage::ThreadOpenResponseSend)
         });
-        if let Err(error) = self.send_json(connection_id, &response).await {
+        let encoded = match serde_json::to_string(&response) {
+            Ok(encoded) => encoded,
+            Err(_) => return false,
+        };
+        if let Err(error) = self
+            .session_manager
+            .try_send_thread_open_reply(connection_id, &incarnation, encoded)
+            .await
+        {
             drop(response_send_stage);
             warn!(
                 connection_id,
@@ -477,42 +519,49 @@ impl MessageProcessor {
             );
             return false;
         }
+        replay.acknowledge();
         if let Some(stage) = response_send_stage {
             stage.succeed();
         }
 
-        // Keep this tail inside the ordinary completion barrier. Enqueueing the
-        // reply is not physical receipt. Subscription principal/session identity
-        // does not fence unsubscribe/resubscribe, and collaborator delivery has
-        // no subscription-incarnation check at actual enqueue. Offloading also
-        // requires terminal opened/resolved ordering for every native/CLI replay
-        // branch (including durable native orphans), alongside live delivery.
-        // A bounded task owner alone cannot establish those delivery contracts.
-        let post_response_replay_stage = trace.map(|trace| {
-            trace.stage(pioneer_observability::GatewayOperationStage::ThreadOpenPostResponseReplay)
-        });
-        self.send_notification_to_authorized_thread_connections(
-            replay_thread_id.as_str(),
-            events::THREAD_STARTED,
-            &outcome.started_notification,
-            outcome.started_notification_connection_ids,
-        )
-        .await;
-
-        self.replay_native_permission_requests_for_thread(
-            connection_id,
-            replay_workspace_id.as_str(),
-            replay_thread_id.as_str(),
-        )
-        .await;
-        self.replay_cli_runtime_pending_requests_for_thread(
-            connection_id,
-            replay_workspace_id.as_str(),
-            replay_thread_id.as_str(),
-        )
-        .await;
-        if let Some(stage) = post_response_replay_stage {
-            stage.succeed();
+        // Reply admission confirms the authorized subscription, not physical
+        // receipt. The reserved connection owner now owns the entire tail.
+        {
+            let includes_pending = replay.includes_pending();
+            let processor = self.clone();
+            replay.start(async move {
+                for token in started_recipients {
+                    token
+                        .run(
+                            processor.send_notification_to_authorized_thread_connections(
+                                &replay_thread_id,
+                                events::THREAD_STARTED,
+                                &outcome.started_notification,
+                                vec![token.connection],
+                            ),
+                        )
+                        .await;
+                }
+                // Each successful open keeps its THREAD_STARTED notification;
+                // the durable pending replay itself has one owner/incarnation.
+                if !includes_pending {
+                    return;
+                }
+                processor
+                    .replay_native_permission_requests_for_thread(
+                        connection_id,
+                        &replay_workspace_id,
+                        &replay_thread_id,
+                    )
+                    .await;
+                processor
+                    .replay_cli_runtime_pending_requests_for_thread(
+                        connection_id,
+                        &replay_workspace_id,
+                        &replay_thread_id,
+                    )
+                    .await;
+            });
         }
         true
     }

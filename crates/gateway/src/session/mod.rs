@@ -153,7 +153,7 @@ impl SessionManager {
         id: ConnectionId,
         token: Arc<crate::thread::replay::SubscriptionIncarnation>,
         order: &Arc<crate::thread::replay::PendingDeliveryOrder>,
-    ) -> Result<Option<crate::thread::replay::ReplayReservation>> {
+    ) -> Result<crate::thread::replay::ReplayReservation> {
         anyhow::ensure!(token.connection == id, "subscription connection mismatch");
         let connection = self
             .connections

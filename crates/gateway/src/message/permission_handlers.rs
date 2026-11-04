@@ -20,6 +20,7 @@ impl MessageProcessor {
         &self,
         request: crate::permissions::GatewayPermissionApprovalRequest,
     ) {
+        let opened_producer = self.pending_delivery_order.opened(&request.request_id);
         let Some(workspace_id) = request.workspace_id.clone() else {
             let _ = request
                 .respond_to
@@ -319,12 +320,24 @@ impl MessageProcessor {
         let notification = TurnPermissionRequestOpenedNotification {
             request: protocol_request.clone(),
         };
-        self.send_native_permission_collaborator_notification(
-            &protocol_request,
-            events::TURN_PERMISSION_REQUEST_OPENED,
-            &notification,
-        )
-        .await;
+        if let Some(producer) = opened_producer {
+            producer
+                .expires_at(now.timestamp_millis().saturating_add(
+                    crate::human_interaction::HUMAN_INTERACTION_RESPONSE_TIMEOUT_MS,
+                ))
+                .run(async {
+                    self.send_native_permission_collaborator_notification(
+                        &protocol_request,
+                        events::TURN_PERMISSION_REQUEST_OPENED,
+                        &notification,
+                    )
+                    .await;
+                })
+                .await;
+        } else {
+            self.retire_pending_delivery_observers(&protocol_request.thread_id)
+                .await;
+        }
     }
 
     pub(super) async fn replay_native_permission_requests_for_thread(
@@ -333,22 +346,16 @@ impl MessageProcessor {
         workspace_id: &str,
         thread_id: &str,
     ) {
-        let live_request_ids = self
-            .native_permission_pending_requests
-            .lock()
-            .await
-            .keys()
-            .cloned()
-            .collect::<HashSet<_>>();
-        let now_unix_ms = chrono::Utc::now().timestamp_millis();
+        // Both live rendezvous and restart orphans are persisted before their
+        // OPENED producer publishes. Page that single authoritative set.
         let mut after = None;
         loop {
-            let orphaned = match self
+            let records = match self
                 .crud_store
                 .list_cli_runtime_pending_requests(
                     pioneer_crud::CliRuntimePendingRequestListFilter {
-                        workspace_id: Some(workspace_id.to_owned()),
                         runtime_id: Some(NATIVE_HUMAN_INTERACTION_RUNTIME_ID.to_owned()),
+                        workspace_id: Some(workspace_id.to_owned()),
                         open_only: true,
                         after,
                         limit: Some(pioneer_crud::CLI_RUNTIME_PENDING_REQUEST_PAGE_MAX),
@@ -357,108 +364,128 @@ impl MessageProcessor {
                 )
                 .await
             {
-                Ok(orphaned) => orphaned,
-                Err(error) => {
-                    warn!(
-                        workspace_id,
-                        error = %format!("{error:#}"),
-                        "failed to reconcile durable native human interactions during replay"
-                    );
-                    break;
+                Ok(records) => records,
+                Err(_) => {
+                    self.session_manager
+                        .unregister_connection(connection_id)
+                        .await;
+                    return;
                 }
             };
-            let next = orphaned
+            let next = records
                 .last()
                 .map(|record| (record.created_at, record.request_id.clone()));
-            for record in orphaned {
-                if live_request_ids.contains(record.request_id.as_str()) {
-                    continue;
-                }
-                // A restart drops only the in-process responder, not the
-                // durable approval. Keep the row visible until its bounded
-                // lifecycle TTL; a recovered native Turn can reopen the same
-                // deterministic request id and attach a fresh responder.
-                if now_unix_ms.saturating_sub(record.created_at.timestamp_millis())
-                    < crate::human_interaction::HUMAN_INTERACTION_RESPONSE_TIMEOUT_MS
-                {
-                    if record.status == StoredCliRuntimePendingRequestStatus::Pending
-                        && let Some(request) = durable_native_permission_request(&record)
-                        && (request.thread_id == thread_id
-                            || request
-                                .visible_thread_ids
-                                .iter()
-                                .any(|visible_thread_id| visible_thread_id == thread_id))
-                    {
-                        self.send_execution_collaborator_notification_to_connections(
-                            thread_id,
-                            crate::authorization::ResourceAction::AgentRequestObserve,
-                            events::TURN_PERMISSION_REQUEST_OPENED,
-                            &TurnPermissionRequestOpenedNotification { request },
-                            vec![connection_id],
-                        )
+            for record in records {
+                if let Some(request) = durable_native_permission_request(&record) {
+                    self.deliver_native_permission_replay(connection_id, thread_id, request)
                         .await;
-                    }
-                    continue;
                 }
-                let _ = self.expire_durable_native_permission_record(&record).await;
             }
             let Some(next) = next else {
                 break;
             };
             after = Some(next);
         }
-        let mut requests = self
-            .native_permission_pending_requests
-            .lock()
-            .await
-            .values()
-            .filter(|pending| {
-                pending.workspace_id == workspace_id
-                    && (pending.request.thread_id == thread_id
-                        || pending
-                            .request
-                            .visible_thread_ids
-                            .iter()
-                            .any(|visible_thread_id| visible_thread_id == thread_id))
-            })
-            .map(|pending| pending.request.clone())
-            .collect::<Vec<_>>();
-        requests.sort_by(|left, right| left.request_id.cmp(&right.request_id));
+    }
 
-        for request in requests {
-            self.send_execution_collaborator_notification_to_connections(
-                thread_id,
-                crate::authorization::ResourceAction::AgentRequestObserve,
-                events::TURN_PERMISSION_REQUEST_OPENED,
-                &TurnPermissionRequestOpenedNotification {
-                    request: request.clone(),
-                },
-                vec![connection_id],
-            )
+    async fn deliver_native_permission_replay(
+        &self,
+        connection_id: ConnectionId,
+        visible_thread: &str,
+        request: TurnPermissionApprovalRequest,
+    ) {
+        if request.thread_id != visible_thread
+            && !request
+                .visible_thread_ids
+                .iter()
+                .any(|id| id == visible_thread)
+        {
+            return;
+        }
+        // A capture owner is reserved before the open reply and before any
+        // pending snapshot. LIVE producers register before their durable insert.
+        let Some(producer) = self.pending_delivery_order.opened(&request.request_id) else {
+            self.session_manager
+                .unregister_connection(connection_id)
+                .await;
+            return;
+        };
+        let current = self
+            .crud_store
+            .get_cli_runtime_pending_request(&request.request_id)
             .await;
-
-            let still_pending = self
-                .native_permission_pending_requests
-                .lock()
-                .await
-                .get(request.request_id.as_str())
-                .is_some_and(|pending| pending.request == request);
-            if !still_pending {
-                self.send_execution_collaborator_notification_to_connections(
-                    thread_id,
-                    crate::authorization::ResourceAction::AgentRequestObserve,
-                    events::TURN_PERMISSION_REQUEST_RESOLVED,
-                    &TurnPermissionRequestResolvedNotification {
-                        request_id: request.request_id,
-                        workspace_id: request.workspace_id,
-                        thread_id: request.thread_id,
-                        turn_id: request.turn_id,
-                        resolution: TurnPermissionApprovalResolution::Expired,
-                    },
-                    vec![connection_id],
+        let Ok(Some(current)) = current else {
+            self.session_manager
+                .unregister_connection(connection_id)
+                .await;
+            return;
+        };
+        if current.workspace_id != request.workspace_id || current.thread_id != request.thread_id {
+            return;
+        }
+        let producer = producer.expires_at(
+            current
+                .created_at
+                .timestamp_millis()
+                .saturating_add(crate::human_interaction::HUMAN_INTERACTION_RESPONSE_TIMEOUT_MS),
+        );
+        let expired = chrono::Utc::now()
+            .timestamp_millis()
+            .saturating_sub(current.created_at.timestamp_millis())
+            >= crate::human_interaction::HUMAN_INTERACTION_RESPONSE_TIMEOUT_MS;
+        if current.status == StoredCliRuntimePendingRequestStatus::Pending && !expired {
+            producer
+                .run(
+                    self.send_execution_collaborator_notification_to_connections(
+                        visible_thread,
+                        crate::authorization::ResourceAction::AgentRequestObserve,
+                        events::TURN_PERMISSION_REQUEST_OPENED,
+                        &TurnPermissionRequestOpenedNotification {
+                            request: request.clone(),
+                        },
+                        vec![connection_id],
+                    ),
                 )
                 .await;
-            }
+        }
+        // Durable TTL/reconciliation belongs to the existing timeout/recovery
+        // owner, never to a cancellable subscription task. Read terminal outcome
+        // only to repair a missed LIVE delivery, preserving the actual type.
+        let correction = producer.correction();
+        let Ok(Some(current)) = self
+            .crud_store
+            .get_cli_runtime_pending_request(&request.request_id)
+            .await
+        else {
+            self.session_manager
+                .unregister_connection(connection_id)
+                .await;
+            return;
+        };
+        if current.status != StoredCliRuntimePendingRequestStatus::Pending {
+            let Some(resolution) = durable_native_permission_resolution(&current) else {
+                self.session_manager
+                    .unregister_connection(connection_id)
+                    .await;
+                return;
+            };
+            correction
+                .run(
+                    self.send_execution_collaborator_notification_to_connections(
+                        visible_thread,
+                        crate::authorization::ResourceAction::AgentRequestObserve,
+                        events::TURN_PERMISSION_REQUEST_RESOLVED,
+                        &TurnPermissionRequestResolvedNotification {
+                            request_id: request.request_id,
+                            workspace_id: request.workspace_id,
+                            thread_id: request.thread_id,
+                            turn_id: request.turn_id,
+                            resolution,
+                        },
+                        vec![connection_id],
+                    ),
+                )
+                .await;
         }
     }
 
@@ -1092,6 +1119,28 @@ impl MessageProcessor {
             }
             _ => {}
         }
+        if let Some(current) = self
+            .crud_store
+            .get_cli_runtime_pending_request(&record.request_id)
+            .await?
+            && current.status != StoredCliRuntimePendingRequestStatus::Pending
+            && let Some(resolution) = durable_native_permission_resolution(&current)
+            && let Some(request) = durable_native_permission_request(&current)
+        {
+            let notification = TurnPermissionRequestResolvedNotification {
+                request_id: request.request_id.clone(),
+                workspace_id: request.workspace_id.clone(),
+                thread_id: request.thread_id.clone(),
+                turn_id: request.turn_id.clone(),
+                resolution,
+            };
+            self.send_native_permission_collaborator_notification(
+                &request,
+                events::TURN_PERMISSION_REQUEST_RESOLVED,
+                &notification,
+            )
+            .await;
+        }
         Ok(())
     }
 
@@ -1282,14 +1331,21 @@ impl MessageProcessor {
         method: &str,
         payload: &T,
     ) {
+        let terminal = (method == events::TURN_PERMISSION_REQUEST_RESOLVED)
+            .then(|| self.pending_delivery_order.terminal(&request.request_id))
+            .flatten();
         let thread_ids = native_permission_notification_thread_ids(request);
-        self.send_execution_collaborator_notification_for_threads(
+        let delivery = self.send_execution_collaborator_notification_for_threads(
             thread_ids.as_slice(),
             crate::authorization::ResourceAction::AgentRequestObserve,
             method,
             payload,
-        )
-        .await;
+        );
+        if let Some(terminal) = terminal {
+            terminal.run(delivery).await;
+        } else {
+            delivery.await;
+        }
 
         match method {
             events::TURN_PERMISSION_REQUEST_OPENED => {
