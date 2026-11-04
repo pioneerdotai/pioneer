@@ -2,6 +2,8 @@
 
 #[path = "cold_open.rs"]
 mod cold_open;
+#[path = "retirement.rs"]
+mod retirement;
 
 use super::{coordinator::ThreadCoordinator, start::ThreadStartCoordinator};
 use crate::{
@@ -193,6 +195,7 @@ struct ThreadSubscriptionBaseline {
 }
 
 struct ThreadDomainStore {
+    retirement: Option<Arc<retirement::ThreadRetirement>>,
     resume_attempt: u64,
     coordinator: ThreadCoordinator,
     semantic: SemanticTimelineState,
@@ -421,6 +424,7 @@ impl ThreadDomainStore {
 
     fn new(id: &str, workspace: &str) -> Self {
         Self {
+            retirement: None,
             resume_attempt: 0,
             coordinator: ThreadCoordinator::pending(id, workspace),
             semantic: Default::default(),
@@ -560,11 +564,19 @@ impl ThreadRegistry {
 
 impl ThreadRegistry {
     pub(crate) fn has_thread_store(&self, id: &str) -> bool {
-        self.stores.contains_key(id)
+        self.stores
+            .get(id)
+            .is_some_and(|store| store.retirement.is_none())
     }
 
     fn require(&mut self, id: &str, workspace: &str) -> bool {
-        if id.is_empty() || workspace.is_empty() {
+        if id.is_empty()
+            || workspace.is_empty()
+            || self
+                .stores
+                .get(id)
+                .is_some_and(|store| store.retirement.is_some())
+        {
             return false;
         }
         if self
@@ -667,6 +679,13 @@ impl ThreadRegistry {
     }
 
     fn publish(&mut self, id: &str) -> Vec<ClientPublicationDraft> {
+        if self
+            .stores
+            .get(id)
+            .is_some_and(|store| store.retirement.is_some())
+        {
+            return vec![];
+        }
         let Some(store) = self.stores.get_mut(id) else {
             return Vec::new();
         };
@@ -1042,6 +1061,9 @@ impl ClientCore {
     }
 
     pub fn upsert_thread(&self, thread: Thread) {
+        if !self.finish_pending_thread_retirement(&thread.id) {
+            return;
+        }
         let notification =
             GatewayNotification::ThreadUpdated(pioneer_protocol::ThreadUpdatedNotification {
                 thread,
@@ -1320,6 +1342,7 @@ impl ClientCore {
                 registry
                     .stores
                     .iter()
+                    .filter(|(_, store)| store.retirement.is_none())
                     .map(|(id, store)| (id.clone(), store.coordinator.snapshot_copy())),
             );
             result
@@ -1333,7 +1356,7 @@ impl ClientCore {
             .thread_registry
             .lock()
             .expect("thread registry poisoned");
-        if !registry.stores.contains_key(id) {
+        if !registry.has_thread_store(id) {
             return None;
         }
         Some(ThreadMutation {
@@ -1454,7 +1477,7 @@ impl ClientCore {
     pub fn remove_thread_store(&self, id: &str) {
         self.evict_thread_store(id, true);
     }
-    fn evict_thread_store(&self, id: &str, remove_navigation: bool) {
+    fn cancel_retired_thread_operations(&self, id: &str) {
         self.cancel_artifact_downloads(Some(id));
         self.cancel_composer_requests_for_thread(id);
         self.invalidate_task_reviews(Some(id));
@@ -1465,6 +1488,12 @@ impl ClientCore {
         self.invalidate_thread_capabilities(Some(id));
         self.invalidate_thread_members(Some(id));
         self.invalidate_artifacts(Some(id));
+    }
+    fn evict_thread_store(&self, id: &str, remove_navigation: bool) {
+        if !self.finish_pending_thread_retirement(id) {
+            return;
+        }
+        self.cancel_retired_thread_operations(id);
         let workspace = self
             .thread_coordinator_snapshot(id)
             .map(|c| c.workspace_id.clone());
@@ -1478,11 +1507,27 @@ impl ClientCore {
             .thread_registry
             .lock()
             .expect("thread registry poisoned");
+        let drafts = self.retire_thread_state_locked(&mut registry, id, remove_navigation);
+        self.transition_directory(
+            &mut registry,
+            &ClientMutationAuthority { _private: () },
+            drafts,
+            Vec::new(),
+        );
+        drop(registry);
+        self.notify_send_readiness();
+        self.retire_thread_controller_jobs();
+    }
+    fn retire_thread_state_locked(
+        &self,
+        registry: &mut ThreadRegistry,
+        id: &str,
+        remove_navigation: bool,
+    ) -> Vec<ClientPublicationDraft> {
         registry.timeline.invalidate(Some(id));
         if let Some(store) = registry.stores.get(id) {
             store.retire_subscription();
         }
-        self.notify_send_readiness();
         if remove_navigation {
             registry.stores.remove(id);
         } else {
@@ -1507,14 +1552,7 @@ impl ClientCore {
         let mut drafts = registry.navigation_change().into_iter().collect::<Vec<_>>();
         drafts.extend(registry.retire(id));
         drafts.extend(registry.retire_summary(id));
-        self.transition_directory(
-            &mut registry,
-            &ClientMutationAuthority { _private: () },
-            drafts,
-            Vec::new(),
-        );
-        drop(registry);
-        self.retire_thread_controller_jobs();
+        drafts
     }
     pub fn clear_thread_stores(&self) {
         self.cancel_artifact_downloads(None);
@@ -1565,7 +1603,12 @@ impl ClientCore {
         let session_revision = registry.session_revision.saturating_add(1);
         let navigation_revision = registry.navigation_revision;
         let navigation_publication = registry.navigation_publication.take();
+        let stores = std::mem::take(&mut registry.stores)
+            .into_iter()
+            .filter(|(_, store)| store.retirement.is_some())
+            .collect();
         *registry = ThreadRegistry {
+            stores,
             current_principal_id,
             directory,
             presentation_revisions,
@@ -2657,7 +2700,8 @@ impl ThreadRegistry {
             .stores
             .iter()
             .filter(|(id, store)| {
-                self.navigation.active_thread_id.as_ref() != Some(id)
+                store.retirement.is_none()
+                    && self.navigation.active_thread_id.as_ref() != Some(id)
                     && !self.navigation.drafts.values().any(|draft| draft == *id)
                     && self.start.pending_thread_id.as_ref() != Some(id)
                     && !self.ready_resume_set.contains(*id)
@@ -2883,6 +2927,8 @@ mod tests {
     thread_local! {
         pub(super) static RESUME_CAPTURE_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = Default::default();
         pub(super) static SUBSCRIPTION_DUE_CAPTURE_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = Default::default();
+        pub(super) static COLD_CAPTURE_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = Default::default();
+        pub(super) static COLD_RETIREMENT_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = Default::default();
         pub(super) static SUBSCRIPTION_FINISH_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = Default::default();
         pub(super) static SUBSCRIPTION_PROMOTION_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = Default::default();
     }
@@ -14313,6 +14359,129 @@ mod tests {
     }
 
     #[test]
+    fn prepared_cold_close_matches_normal_retirement_and_old_cleanup_preserves_replacement() {
+        use crate::artifacts::operations::{ArtifactDownloadState, ArtifactDownloadTarget};
+        for mode in ["late", "replacement", "normal"] {
+            let (core, transport, responses, _requests) = shared_subscription_core();
+            core.remove_thread_store("a");
+            let opening = {
+                let core = core.clone();
+                std::thread::spawn(move || core.open_thread_by_id("a"))
+            };
+            let ack = responses.recv_timeout(Duration::from_secs(2)).unwrap();
+            let (captured, capture) = std::sync::mpsc::channel();
+            let (release_capture, captured_release) = std::sync::mpsc::channel();
+            let (retired, retirement) = std::sync::mpsc::channel();
+            let (release_retirement, retired_release) = std::sync::mpsc::channel();
+            let close = if mode != "normal" {
+                let core = core.clone();
+                Some(std::thread::spawn(move || {
+                    COLD_CAPTURE_HOOK.with(|slot| {
+                        *slot.borrow_mut() = Some(Box::new(move || {
+                            captured.send(()).unwrap();
+                            captured_release
+                                .recv_timeout(Duration::from_secs(2))
+                                .unwrap();
+                        }))
+                    });
+                    if mode == "replacement" {
+                        COLD_RETIREMENT_HOOK.with(|slot| {
+                            *slot.borrow_mut() = Some(Box::new(move || {
+                                retired.send(()).unwrap();
+                                retired_release
+                                    .recv_timeout(Duration::from_secs(2))
+                                    .unwrap();
+                            }))
+                        });
+                    }
+                    core.apply_thread_notification(GatewayNotification::ThreadClosed(
+                        pioneer_protocol::ThreadClosedNotification {
+                            thread_id: "a".into(),
+                            workspace_id: "ws".into(),
+                        },
+                    ));
+                }))
+            } else {
+                None
+            };
+            if mode != "normal" {
+                capture.recv_timeout(Duration::from_secs(2)).unwrap();
+            }
+            subscription_reply(&ack);
+            opening.join().unwrap().unwrap();
+            assert_eq!(core.active_thread_id().as_deref(), Some("a"));
+            core.enqueue_thread_resume("a".into()).unwrap();
+            let target = ArtifactDownloadTarget {
+                thread_id: Some("a".into()),
+                workspace_id: "ws".into(),
+                artifact_id: "artifact".into(),
+                version_id: Some("version".into()),
+            };
+            let old_download = core
+                .begin_artifact_download("download".into(), target.clone())
+                .unwrap();
+            if mode == "normal" {
+                core.apply_thread_notification(GatewayNotification::ThreadClosed(
+                    pioneer_protocol::ThreadClosedNotification {
+                        thread_id: "a".into(),
+                        workspace_id: "ws".into(),
+                    },
+                ));
+            } else {
+                release_capture.send(()).unwrap();
+            }
+            if mode == "replacement" {
+                retirement.recv_timeout(Duration::from_secs(2)).unwrap();
+                assert!(core.active_thread_id().is_none());
+                assert!(core.thread_snapshot("a").is_none());
+                let reopening = {
+                    let core = core.clone();
+                    std::thread::spawn(move || core.open_thread_by_id("a"))
+                };
+                let response = responses.recv_timeout(Duration::from_secs(2)).unwrap();
+                subscription_reply(&response);
+                reopening.join().unwrap().unwrap();
+                assert!(old_download.cancellation().is_cancelled());
+                let replacement = core
+                    .begin_artifact_download("download".into(), target)
+                    .unwrap();
+                let budget =
+                    crate::rpc::RequestBudget::new(Instant::now() + Duration::from_secs(2));
+                let receipt = core.ensure_thread_subscription("a", "ws", &budget).unwrap();
+                release_retirement.send(()).unwrap();
+                close.unwrap().join().unwrap();
+                assert!(receipt.is_current());
+                assert_eq!(core.active_thread_id().as_deref(), Some("a"));
+                assert!(core.thread_snapshot("a").is_some());
+                assert!(!replacement.cancellation().is_cancelled());
+                assert_eq!(
+                    core.artifact_download_snapshot("download").unwrap().state,
+                    ArtifactDownloadState::Queued
+                );
+                assert_eq!(transport.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+            } else {
+                if let Some(close) = close {
+                    close.join().unwrap();
+                }
+                assert!(core.active_thread_id().is_none());
+                assert!(core.thread_snapshot("a").is_none());
+                assert!(core.thread_operation_token("a").is_none());
+                assert!(core.take_thread_resume().is_none());
+                assert!(old_download.cancellation().is_cancelled());
+                assert_eq!(
+                    core.artifact_download_snapshot("download").unwrap().state,
+                    ArtifactDownloadState::Cancelled
+                );
+                let registry = core.thread_registry.lock().unwrap();
+                assert!(!registry.directory.threads.contains_key("a"));
+                assert!(!registry.directory.summaries.contains_key("a"));
+                assert!(!registry.directory.placements.contains_key("a"));
+                assert!(registry.navigation.active_thread_id().is_none());
+            }
+        }
+    }
+
+    #[test]
     fn cold_open_capacity_rejects_before_rpc_and_is_released_on_error() {
         let (core, transport, responses, _requests) = shared_subscription_core();
         core.remove_thread_store("a");
@@ -18270,6 +18439,10 @@ impl ClientCore {
         hydrate: bool,
         expected_navigation_revision: Option<(u64, u64)>,
     ) -> anyhow::Result<(ThreadSubscriptionRequest, bool)> {
+        anyhow::ensure!(
+            self.finish_pending_thread_retirement(id),
+            "Thread retirement in progress"
+        );
         let open_existing = expected_navigation_revision.is_some();
         anyhow::ensure!(
             open_existing || !workspace.trim().is_empty(),
@@ -19239,6 +19412,7 @@ impl ClientCore {
             .expect("thread registry poisoned")
             .stores
             .get(id)
+            .filter(|store| store.retirement.is_none())
             .map(|store| ThreadOperationToken {
                 id: id.into(),
                 generation: store.generation,
@@ -19838,6 +20012,9 @@ impl ThreadRegistry {
         self.ready_resume.clear();
         self.ready_resume_set.clear();
         for (id, store) in &mut self.stores {
+            if store.retirement.is_some() {
+                continue;
+            }
             // A protected-publication fence also retires the source incarnation:
             // neither an old RPC completion nor retained semantic pages can revive it.
             self.clock = self.clock.saturating_add(1);

@@ -44,6 +44,7 @@ pub(super) struct ColdApplyEffects {
     pub(super) pending: Vec<PendingRequestsReduction>,
     pub(super) drafts: Vec<ClientPublicationDraft>,
     pub(super) actions: Vec<SemanticTimelineRequestAction>,
+    pub(super) retirement: Option<Arc<retirement::ThreadRetirement>>,
 }
 
 impl ClientCore {
@@ -94,6 +95,12 @@ impl ClientCore {
             }
             request.clone()
         };
+        #[cfg(test)]
+        tests::COLD_CAPTURE_HOOK.with(|slot| {
+            if let Some(hook) = slot.borrow_mut().take() {
+                hook();
+            }
+        });
         // Serialization is outside identity/registry/flight locks.
         let bytes = serde_json::to_vec(notification).map_or(usize::MAX, |bytes| bytes.len());
         let identity = self
@@ -155,6 +162,16 @@ impl ClientCore {
         );
         drop(registry);
         drop(identity);
+        if let Some(ticket) = effects.retirement {
+            self.notify_send_readiness();
+            #[cfg(test)]
+            tests::COLD_RETIREMENT_HOOK.with(|slot| {
+                if let Some(hook) = slot.borrow_mut().take() {
+                    hook();
+                }
+            });
+            self.finish_thread_retirement(&ticket);
+        }
         for action in effects.actions {
             let _ = self.schedule_thread_semantic_request_inner(
                 action,
@@ -244,14 +261,11 @@ impl ClientCore {
                 }
             }
             Some(ThreadClosed(r)) => {
-                if let Some(store) = registry.stores.remove(id) {
-                    store.retire_subscription();
-                }
-                registry.timeline.invalidate(Some(id));
-                let drafts = registry.retire(id);
+                let (retirement, drafts) = self.begin_thread_retirement_locked(registry, id);
                 return ColdApplyEffects {
                     pending: r.pending_requests.into_iter().collect(),
                     drafts,
+                    retirement: Some(retirement),
                     ..Default::default()
                 };
             }
@@ -309,6 +323,7 @@ impl ClientCore {
                     pending: r.pending_requests.into_iter().collect(),
                     drafts,
                     actions,
+                    ..Default::default()
                 };
             }
             Some(SemanticTimeline(update)) => {
