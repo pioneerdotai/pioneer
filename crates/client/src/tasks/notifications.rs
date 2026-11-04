@@ -134,6 +134,10 @@ pub struct TaskInboxPublication {
     opened: Option<TaskNotificationPublication>,
     native_notifications: Vec<TaskNotificationEffect>,
     loading: bool,
+    // Request-slot lifecycle, independent of retained rows and presentation loading.
+    // Both shells may use this projection without changing their loading UI policy.
+    request_busy: bool,
+    completed_operation_id: Option<u64>,
     error: Option<String>,
 }
 impl TaskInboxPublication {
@@ -193,6 +197,7 @@ struct Request {
 }
 #[derive(Default)]
 struct Inbox {
+    dispatching_action: bool,
     push_paused: bool,
     push_revision: Option<(String, u64)>,
     publication: TaskInboxPublication,
@@ -382,6 +387,7 @@ impl TaskNotificationStore {
             return None;
         }
         inbox.request = None;
+        inbox.publication.completed_operation_id = Some(request.generation);
         inbox.publication.loading = false;
         for item in &mut inbox.publication.items {
             item.dismissing = false;
@@ -1090,6 +1096,7 @@ impl ClientCore {
             return;
         }
         inbox.request = None;
+        inbox.publication.completed_operation_id = Some(request.generation);
         inbox.publication.loading = false;
         for item in &mut inbox.publication.items {
             item.dismissing = false;
@@ -1148,7 +1155,7 @@ impl ClientCore {
                 let Some(inbox) = owner.store.inboxes.get_mut(workspace) else {
                     return;
                 };
-                if inbox.request.is_some() {
+                if inbox.request.is_some() || inbox.dispatching_action {
                     return;
                 }
                 let next = inbox.pending_actions.pop_front().or_else(|| {
@@ -1158,9 +1165,19 @@ impl ClientCore {
                         }
                     })
                 });
+                // Keep the slot busy across the unlocked queue-to-request handoff.
+                inbox.dispatching_action = next.is_some();
                 (next, inbox.push_paused)
             };
             let Some(intent) = next else {
+                // Queue drain may have skipped stale/no-op actions without starting an RPC.
+                // Publish the now-idle slot even when retained rows did not change.
+                {
+                    let mut owner = self.task_notifications.lock().expect("task inbox poisoned");
+                    if owner.store.inboxes.contains_key(workspace) {
+                        self.publish_task_inbox(&mut owner.store, workspace);
+                    }
+                }
                 // A workspace wake may have been consumed while this request
                 // blocked a paused scope. Both normal and Open completion drain
                 // here; retain the obligation until the last deferred action
@@ -1171,6 +1188,10 @@ impl ClientCore {
                 return;
             };
             self.task_notification_intent(intent);
+            let mut owner = self.task_notifications.lock().expect("task inbox poisoned");
+            if let Some(inbox) = owner.store.inboxes.get_mut(workspace) {
+                inbox.dispatching_action = false;
+            }
         }
     }
     fn publish_task_inbox(
@@ -1194,7 +1215,12 @@ impl ClientCore {
             workspace_id: workspace.into(),
         };
         let previous = self.task_inbox(workspace);
+        let request_busy = inbox.request.is_some()
+            || inbox.dispatching_action
+            || !inbox.pending_actions.is_empty()
+            || inbox.refresh_again;
         let next = &mut inbox.publication;
+        next.request_busy = request_busy;
         next.native_notifications = next
             .items
             .iter()
@@ -1609,6 +1635,89 @@ mod tests {
             next_cursor: None,
         })
     }
+    #[test]
+    fn request_projection_survives_push_removal_and_releases_after_queue_drain() {
+        let core = ClientCore::new();
+        let mut store = TaskNotificationStore::default();
+        let mut a = notification("a", "workspace");
+        let mut b = notification("b", "workspace");
+        a.completed_key = "2026-10-22 09:00:00.000000".into();
+        b.completed_key = "2026-10-22 09:01:00.000000".into();
+        let initial = store
+            .begin(identity("p"), "workspace".into(), None)
+            .unwrap();
+        store.complete(&initial, response(vec![a.clone(), b.clone()]));
+        ClientCore::set_inbox_push_epoch(&mut store, "workspace", Some("epoch"));
+        let mut packet = pioneer_protocol::WorkspacePushNotification {
+            workspace_id: "workspace".into(),
+            epoch: "epoch".into(),
+            revision: 1,
+            snapshot: true,
+            resync_required: false,
+            thread_summaries: vec![],
+            indicators: vec![],
+            inbox: Some(pioneer_protocol::TaskInboxPatch {
+                replace: true,
+                upserts: vec![a, b],
+                removes: vec![],
+                unread_count: 2,
+                next_cursor: None,
+            }),
+        };
+        assert!(core.apply_inbox_push(&mut store, &packet));
+        let revision = store.inboxes["workspace"]
+            .publication
+            .items
+            .iter()
+            .find(|item| item.notification.run_id == "a")
+            .unwrap()
+            .revision;
+        let dismiss = store
+            .begin(identity("p"), "workspace".into(), Some(("a".into(), revision)))
+            .unwrap();
+        core.publish_task_inbox(&mut store, "workspace");
+        packet.revision = 2;
+        packet.snapshot = false;
+        packet.inbox = Some(pioneer_protocol::TaskInboxPatch {
+            replace: false,
+            upserts: vec![],
+            removes: vec!["a".into()],
+            unread_count: 1,
+            next_cursor: None,
+        });
+        assert!(core.apply_inbox_push(&mut store, &packet));
+        core.publish_task_inbox(&mut store, "workspace");
+        let pushed = core.task_inbox("workspace").unwrap();
+        assert!(!pushed.loading);
+        assert!(pushed.items.iter().all(|item| !item.dismissing));
+        assert!(pushed.request_busy);
+        assert_eq!(pushed.completed_operation_id, Some(initial.generation));
+        assert_eq!(store.inboxes["workspace"].request.as_ref(), Some(&dismiss));
+
+        // An action rejected on revalidation must keep the slot busy until drained,
+        // without requiring a new RPC or a retained busy row.
+        store
+            .inboxes
+            .get_mut("workspace")
+            .unwrap()
+            .pending_actions
+            .push_back(TaskNotificationIntent::Open {
+                workspace_id: "workspace".into(),
+                notification_id: "gone".into(),
+                revision: 0,
+            });
+        store.complete_request(&dismiss, Ok(None));
+        core.publish_task_inbox(&mut store, "workspace");
+        let completed = core.task_inbox("workspace").unwrap();
+        assert!(completed.request_busy);
+        assert_eq!(completed.completed_operation_id, Some(dismiss.generation));
+        core.task_notifications.lock().unwrap().store = store;
+        core.continue_task_inbox_actions("workspace");
+        let drained = core.task_inbox("workspace").unwrap();
+        assert!(!drained.request_busy);
+        assert_eq!(drained.completed_operation_id, Some(dismiss.generation));
+    }
+
     #[test]
     fn new_completion_keeps_the_loaded_page_frontier() {
         let core = ClientCore::new();
@@ -2464,6 +2573,7 @@ mod tests {
                     });
                 request
             };
+            let open_operation = request.generation;
             let change = || {
                 let mut changed = notification("run", "a");
                 changed.completed_key = "2026-10-22 09:00:00.000000".into();
@@ -2500,17 +2610,21 @@ mod tests {
                     )))
                     .unwrap();
             }
-            worker_request(
+            let read_all_response = worker_request(
                 &requests,
                 pioneer_protocol::constants::methods::TASK_COMPLETION_INBOX_READ_ALL,
-            )
-            .send(Ok(serde_json::to_value(TaskCompletionInboxListResponse {
-                entries: vec![],
-                unread_count: 0,
-                next_cursor: None,
-            })
-            .unwrap()))
-            .unwrap();
+            );
+            let open_finished = core.task_inbox("a").unwrap();
+            assert_eq!(open_finished.completed_operation_id, Some(open_operation));
+            assert!(open_finished.request_busy);
+            read_all_response
+                .send(Ok(serde_json::to_value(TaskCompletionInboxListResponse {
+                    entries: vec![],
+                    unread_count: 0,
+                    next_cursor: None,
+                })
+                .unwrap()))
+                .unwrap();
             wait_worker_idle(&core);
             let inbox = core.task_inbox("a").unwrap();
             assert!(!inbox.is_loading());

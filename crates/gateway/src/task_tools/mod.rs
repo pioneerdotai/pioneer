@@ -24,7 +24,6 @@ use pioneer_protocol::{
     TaskRunThreadBindingKind, TaskStatus, TaskTimeoutPolicy, TaskTrigger, TaskTriggerCatchUpPolicy,
     TaskTriggerInput, TaskTriggerKind, TaskTriggerSpec, TaskTurnItem, TaskUpdateParams,
     TaskUpdateResponse, TaskWaitMode, TaskWaitParams, ToolCallStatus, ToolStoragePayload, TurnItem,
-    constants::events,
 };
 use pioneer_tools::{
     ConfiguredToolSpec, ExecutionClass, FunctionToolOutput, PayloadKind, ToolError,
