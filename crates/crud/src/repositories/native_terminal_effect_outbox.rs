@@ -1517,7 +1517,7 @@ pub(crate) async fn next_execution_deadline<C: ConnectionTrait>(db: &C) -> Resul
             .await?
         {
             let at = crate::util::deadline_unix_seconds(at);
-            next = Some(next.map_or(at, |old: i64| old.min(at)));
+            next = Some(next.map_or(at, |old: i64| std::cmp::Ord::min(old, at)));
         }
     }
     if let Some(at) = native_terminal_effect_outbox::Entity::find()
@@ -1529,7 +1529,7 @@ pub(crate) async fn next_execution_deadline<C: ConnectionTrait>(db: &C) -> Resul
         .one(db)
         .await?
     {
-        next = Some(next.map_or(at, |old| old.min(at)));
+        next = Some(next.map_or(at, |old| std::cmp::Ord::min(old, at)));
     }
     Ok(next)
 }
@@ -2114,14 +2114,13 @@ pub async fn next_unresolved_retry_at<C: ConnectionTrait>(
         completed.map(|at| {
             // If the window closes first, rediscover once just after its inclusive
             // boundary to remove this row from the eligible head.
-            crate::util::deadline_unix_seconds(at)
-                .saturating_add(60 * 60)
-                .min(
-                    prepared
-                        .timestamp()
-                        .saturating_add(24 * 60 * 60)
-                        .saturating_add(1),
-                )
+            std::cmp::Ord::min(
+                crate::util::deadline_unix_seconds(at).saturating_add(60 * 60),
+                prepared
+                    .timestamp()
+                    .saturating_add(24 * 60 * 60)
+                    .saturating_add(1),
+            )
         })
     }))
 }

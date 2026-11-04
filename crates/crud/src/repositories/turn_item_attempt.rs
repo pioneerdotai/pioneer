@@ -7,8 +7,8 @@ use pioneer_protocol::{
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::Expr;
 use sea_orm::{
-    ColumnTrait, Condition, ConnectionTrait, EntityTrait, ExprTrait, Order, QueryFilter,
-    QueryOrder, QuerySelect, Set,
+    ColumnTrait, Condition, ConnectionTrait, EntityTrait, ExprTrait, QueryFilter, QueryOrder,
+    QuerySelect, Set,
 };
 use std::collections::{HashMap, HashSet};
 

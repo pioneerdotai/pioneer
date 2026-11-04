@@ -5190,7 +5190,7 @@ impl CrudStore {
             maintenance_result
         }
         .await;
-        if let Ok(task_value) = &task_result {
+        if task_result.is_ok() {
             task_change.completed(true);
         }
         task_result
@@ -5882,7 +5882,7 @@ impl CrudStore {
             maintenance_result
         }
         .await;
-        if let Ok(task_value) = &task_result {
+        if task_result.is_ok() {
             task_change.completed(task_before.as_ref() != Some(&task_requested));
         }
         task_result
@@ -6150,7 +6150,7 @@ impl CrudStore {
             .await
         }
         .await;
-        if let Ok(value) = &result {
+        if result.is_ok() {
             for change in changes {
                 change.completed(true);
             }
@@ -17532,7 +17532,7 @@ impl CrudStore {
             .await
         }
         .await;
-        if let Ok(value) = &result {
+        if result.is_ok() {
             let after = self.get_task_actor_contract(&contract.task_id).await?;
             change.completed(before != after);
         }
@@ -17583,7 +17583,7 @@ impl CrudStore {
             .await
         }
         .await;
-        if let Ok(value) = &result {
+        if result.is_ok() {
             let mut after =
                 pioneer_entity::task_delivery_authority::Entity::find_by_id(delivery_id.to_owned())
                     .one(&self.connection)
@@ -17641,7 +17641,7 @@ impl CrudStore {
             .await
         }
         .await;
-        if let Ok(value) = &result {
+        if result.is_ok() {
             let after = self
                 .get_task_occurrence_contract(&contract.occurrence_id)
                 .await?;
@@ -18643,7 +18643,7 @@ impl CrudStore {
             .await
         }
         .await;
-        if let Ok(value) = &control_result {
+        if control_result.is_ok() {
             control_change.completed(true);
         }
         control_result
@@ -18898,7 +18898,7 @@ impl CrudStore {
             .await
         }
         .await;
-        if let Ok(value) = &task_result {
+        if task_result.is_ok() {
             let after =
                 pioneer_entity::agent_execution::Entity::find_by_id(root_execution_id.to_owned())
                     .select_only()
@@ -19513,7 +19513,7 @@ impl CrudStore {
                 result
             }
             .await;
-        if let Ok(value) = &control_result {
+        if control_result.is_ok() {
             control_change.completed(true);
         }
         control_result
@@ -24716,7 +24716,7 @@ impl CrudStore {
             .await
         }
         .await;
-        if let Ok(value) = &control_result {
+        if control_result.is_ok() {
             control_change.completed(true);
         }
         control_result
@@ -25674,7 +25674,7 @@ impl CrudStore {
             .await
         }
         .await;
-        if let Ok(task_value) = &task_result {
+        if task_result.is_ok() {
             task_change.completed(task_before.as_ref() != Some(&task_requested));
         }
         task_result
@@ -30523,7 +30523,7 @@ impl CrudStore {
             .await
         }
         .await;
-        if let Ok(value) = &control_result {
+        if control_result.is_ok() {
             control_change.completed(true);
         }
         control_result
