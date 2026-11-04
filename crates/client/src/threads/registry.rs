@@ -13985,10 +13985,11 @@ mod tests {
             response: crate::rpc::JsonRpcResponseSender,
         ) -> Result<(), String> {
             let request: pioneer_protocol::JsonRpcRequest = serde_json::from_str(&payload).unwrap();
-            assert_eq!(
-                request.method,
+            assert!(matches!(
+                request.method.as_str(),
                 pioneer_protocol::constants::methods::THREAD_START
-            );
+                    | pioneer_protocol::constants::methods::THREAD_OPEN
+            ));
             response
                 .send(Ok(serde_json::to_value(ThreadStartResponse {
                     thread: self.0.clone(),
@@ -14280,6 +14281,55 @@ mod tests {
             &crate::rpc::RequestBudget::new(Instant::now() + Duration::from_secs(2)),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn aba_open_intents_reuse_pending_a_without_restoring_b() {
+        let (core, transport, responses, _requests) = shared_subscription_core();
+        core.upsert_thread(thread("b", "ws"));
+        let first = {
+            let core = core.clone();
+            std::thread::spawn(move || core.open_thread_by_id("a"))
+        };
+        let a_response = responses.recv_timeout(Duration::from_secs(2)).unwrap();
+        let middle = {
+            let core = core.clone();
+            std::thread::spawn(move || core.open_thread_by_id("b"))
+        };
+        let b_response = responses.recv_timeout(Duration::from_secs(2)).unwrap();
+        let (joined_tx, joined_rx) = std::sync::mpsc::channel();
+        let latest = {
+            let core = core.clone();
+            std::thread::spawn(move || {
+                SUBSCRIPTION_PROMOTION_HOOK.with(|slot| {
+                    *slot.borrow_mut() = Some(Box::new(move || joined_tx.send(()).unwrap()))
+                });
+                core.open_thread_by_id("a")
+            })
+        };
+        joined_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        subscription_reply(&a_response);
+        latest.join().unwrap().unwrap();
+        assert!(first.join().unwrap().is_err());
+        b_response
+            .send(Ok(serde_json::to_value(ThreadStartResponse {
+                thread: thread("b", "ws"),
+                sandbox: SandboxPolicy::from_mode(SandboxMode::FullAccess),
+            })
+            .unwrap()))
+            .unwrap();
+        assert!(middle.join().unwrap().is_err());
+        assert_eq!(core.navigation_snapshot().active_thread_id(), Some("a"));
+        assert_eq!(transport.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        for id in ["a", "b"] {
+            core.ensure_thread_subscription(
+                id,
+                "ws",
+                &crate::rpc::RequestBudget::new(Instant::now() + Duration::from_secs(2)),
+            )
+            .unwrap();
+        }
+        assert_eq!(transport.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     #[test]
@@ -17701,6 +17751,9 @@ impl ClientCore {
 }
 
 impl ClientCore {
+    // Same-target opens share the RPC/receipt. Each waiter retains its captured
+    // navigation revision; the first selection retires competing UI selections,
+    // while independent subscription waiters remain valid.
     pub(crate) fn open_existing_thread_subscription(&self, id: &str) -> anyhow::Result<()> {
         let (revision, intent) = {
             let mut registry = self
