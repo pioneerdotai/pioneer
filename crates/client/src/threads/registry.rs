@@ -1438,7 +1438,7 @@ impl ClientCore {
             .thread_registry
             .lock()
             .expect("thread registry poisoned");
-        anyhow::ensure!(registry.stores.contains_key(&id), "Resume source retired");
+        anyhow::ensure!(registry.has_thread_store(&id), "Resume source retired");
         if registry.ready_resume.len() >= super::history_scheduler::MAX_JOBS
             && !registry.ready_resume_set.contains(&id)
         {
@@ -1691,7 +1691,7 @@ impl ClientCore {
             .thread_registry
             .lock()
             .expect("thread registry poisoned");
-        if !registry.stores.contains_key(id) {
+        if !registry.has_thread_store(id) {
             return None;
         }
         Some(ThreadTimelineMutation {
@@ -14442,6 +14442,8 @@ mod tests {
                 retirement.recv_timeout(Duration::from_secs(2)).unwrap();
                 assert!(core.active_thread_id().is_none());
                 assert!(core.thread_snapshot("a").is_none());
+                assert!(core.enqueue_thread_resume("a".into()).is_err());
+                assert!(core.existing_thread_timeline_mutation("a").is_none());
                 let reopening = {
                     let core = core.clone();
                     std::thread::spawn(move || core.open_thread_by_id("a"))
