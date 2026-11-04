@@ -592,6 +592,7 @@ pub struct MessageProcessor {
     execution_leases: Arc<crate::authorization::ExecutionLeaseRegistry>,
     observation_governor: Arc<crate::authorization::ObservationAdmissionGovernor>,
     turn_execution_owner_id: Arc<str>,
+    foreground_starts: Arc<turn_handlers::foreground_start::ForegroundStartOwners>,
     artifact_stream_invalidation:
         Arc<StdRwLock<Option<Weak<dyn ArtifactStreamInvalidation>>>>,
     view_grant_service: Arc<StdRwLock<Option<Weak<crate::view_grants::ViewGrantService>>>>,
@@ -1257,6 +1258,7 @@ impl MessageProcessor {
             execution_leases,
             observation_governor,
             turn_execution_owner_id,
+            foreground_starts: Arc::new(Default::default()),
             artifact_stream_invalidation: Arc::new(StdRwLock::new(None)),
             view_grant_service: Arc::new(StdRwLock::new(None)),
             auth_service: None,
@@ -3428,6 +3430,7 @@ impl MessageProcessor {
     }
 
     pub(crate) async fn shutdown_resilience_workers(&self) {
+        self.foreground_starts.shutdown().await;
         self.cli_history_shutdown.cancel();
         {
             let workers = &self.native_turn_event_delivery_workers;
@@ -5022,6 +5025,7 @@ impl MessageProcessor {
             execution_leases,
             observation_governor,
             turn_execution_owner_id,
+            foreground_starts: Arc::new(Default::default()),
             artifact_stream_invalidation: Arc::new(StdRwLock::new(None)),
             view_grant_service: Arc::new(StdRwLock::new(None)),
             auth_service: None,

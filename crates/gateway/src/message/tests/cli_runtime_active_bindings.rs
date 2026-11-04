@@ -4436,7 +4436,7 @@ async fn independently_heartbeating_owner_keeps_terminal_authority_and_cancellat
                     .unwrap();
             }
             "cancel" => {
-                let (tx, mut rx) = mpsc::channel(128);
+                let (tx, mut rx) = crate::session::test_support::outbound_channel(128);
                 let connection =
                     register_authenticated_test_connection(processor.session_manager.as_ref(), tx)
                         .await;

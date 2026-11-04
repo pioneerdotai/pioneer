@@ -5555,6 +5555,43 @@ impl CrudStore {
         .await
     }
 
+    /// Existing canonical/LIVE receipts retain an independent item's delivery
+    /// owner after its startup publication and process-local obligation retire.
+    pub async fn independent_item_uses_live_delivery(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        item_id: &str,
+    ) -> Result<bool> {
+        turn_event_delivery::independent_item_uses_live(
+            &self.connection,
+            thread_id,
+            turn_id,
+            item_id,
+        )
+        .await
+    }
+
+    /// Release a LIVE claim pending its foreground start without consuming a
+    /// normal delivery retry. The exact claim token fences replacement workers.
+    pub async fn defer_turn_event_delivery_for_foreground_start(
+        &self,
+        id: &str,
+        claim_token: &str,
+        now_unix: i64,
+    ) -> Result<bool> {
+        self.run_serialized_write(|| async {
+            turn_event_delivery::defer_for_foreground_start(
+                &self.connection,
+                id,
+                claim_token,
+                unix_to_datetime(now_unix),
+            )
+            .await
+        })
+        .await
+    }
+
     pub async fn fail_turn_event_delivery(
         &self,
         id: &str,
@@ -14954,6 +14991,68 @@ impl CrudStore {
         self.run_serialized_write(|| async {
             turn_execution::heartbeat_owner(&self.connection, owner_id.as_str(), lease_seconds)
                 .await
+        })
+        .await
+    }
+
+    /// Initial native handoff CAS, fenced against accepted terminal and exact
+    /// process ownership generation in the same serialized write transaction.
+    pub async fn mark_turn_execution_running_current(
+        &self,
+        expected: &TurnExecutionRecord,
+        lease_seconds: i64,
+    ) -> Result<bool> {
+        self.run_serialized_write(|| async {
+            let tx = self.connection.begin().await?;
+            if turn_event_projection_stream_state::has_accepted_terminal(&tx, &expected.turn_id)
+                .await?
+            {
+                return Ok(false);
+            }
+            let now = chrono::Utc::now().fixed_offset();
+            let updated = turn_execution::mark_running_current(
+                &tx,
+                expected,
+                now,
+                now + chrono::Duration::seconds(lease_seconds),
+            )
+            .await?;
+            tx.commit().await?;
+            Ok(updated)
+        })
+        .await
+    }
+
+    /// Failed foreground handoff leaves an exact receipt discoverable by the
+    /// existing Recovering scanner. Stale owners have no side effects.
+    pub async fn settle_foreground_start_for_recovery(
+        &self,
+        expected: &TurnExecutionRecord,
+    ) -> Result<bool> {
+        self.run_serialized_write(|| async {
+            let tx = self.connection.begin().await?;
+            let Some(current) = turn_execution::find(&tx, &expected.turn_id).await? else {
+                return Ok(false);
+            };
+            if current.owner_id != expected.owner_id
+                || current.owner_generation != expected.owner_generation
+                || current.thread_id != expected.thread_id
+                || current.workspace_id != expected.workspace_id
+                || !current.status.is_active()
+                || turn_event_projection_stream_state::has_accepted_terminal(&tx, &expected.turn_id)
+                    .await?
+            {
+                return Ok(false);
+            }
+            let updated = turn_execution::mark_recovering_owned(
+                &tx,
+                &expected.turn_id,
+                &expected.owner_id,
+                utc_now(),
+            )
+            .await?;
+            tx.commit().await?;
+            Ok(updated)
         })
         .await
     }
@@ -28547,6 +28646,7 @@ impl CrudStore {
             now_unix,
             initial_turn,
             None,
+            None,
         )
         .await
     }
@@ -28572,6 +28672,32 @@ impl CrudStore {
             now_unix,
             false,
             Some((execution, recovery)),
+            None,
+        )
+        .await
+    }
+
+    /// Foreground activation is admitted by the original durable New receipt,
+    /// atomically with registration and against Stop/replacement.
+    pub async fn confirm_foreground_start_cancellation_context(
+        &self,
+        preparation: pioneer_protocol::NativeTerminalEffectPreparation,
+        expected: &TurnExecutionRecord,
+        now_unix: i64,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            preparation.turn_id == expected.turn_id
+                && preparation.thread_id == expected.thread_id
+                && preparation.workspace_id == expected.workspace_id,
+            "foreground activation scope changed"
+        );
+        self.persist_native_cancellation_context_with_source(
+            preparation,
+            &expected.owner_id,
+            now_unix,
+            true,
+            None,
+            Some(expected),
         )
         .await
     }
@@ -28586,6 +28712,7 @@ impl CrudStore {
             &TurnExecutionRecord,
             &pioneer_protocol::RecoveryAttemptContext,
         )>,
+        foreground_source: Option<&TurnExecutionRecord>,
     ) -> Result<()> {
         native_terminal_effect_outbox::prepare_input(preparation.clone())?;
         let candidate = repositories::native_cancellation_context::prepare_registration(
@@ -28618,6 +28745,23 @@ impl CrudStore {
                         && execution.workspace_id == preparation.workspace_id
                         && execution.status.is_active(),
                     "native cancellation context has stale execution scope or owner"
+                );
+            }
+            if let Some(expected) = foreground_source {
+                let current = turn_execution::find(&tx, &expected.turn_id)
+                    .await?
+                    .context("foreground activation execution missing")?;
+                anyhow::ensure!(
+                    current.owner_id == expected.owner_id
+                        && current.owner_generation == expected.owner_generation
+                        && current.thread_id == expected.thread_id
+                        && current.workspace_id == expected.workspace_id
+                        && matches!(
+                            current.status,
+                            TurnExecutionStatus::Starting | TurnExecutionStatus::Running
+                        )
+                        && current.lease_until > utc_now(),
+                    "foreground activation source changed"
                 );
             }
             repositories::native_cancellation_context::insert_once(
@@ -32876,9 +33020,7 @@ impl CrudStore {
             );
         }
 
-        if let Some(expected) = projection_context.unactivated_terminal.as_ref()
-            && !turn_event::prepared_event_already_exists(&transaction, &event).await?
-        {
+        if let Some(expected) = projection_context.unactivated_terminal.as_ref() {
             let current = turn_execution::find(&transaction, &expected.turn_id)
                 .await?
                 .context("unactivated terminal execution disappeared")?;
@@ -32886,30 +33028,37 @@ impl CrudStore {
                 current.owner_id == expected.owner_id
                     && current.owner_generation == expected.owner_generation
                     && current.thread_id == expected.thread_id
-                    && current.workspace_id == expected.workspace_id
-                    && matches!(
+                    && current.workspace_id == expected.workspace_id,
+                UnactivatedTurnPhaseChanged
+            );
+            if !turn_event::prepared_event_already_exists(&transaction, &event).await? {
+                anyhow::ensure!(
+                    matches!(
                         current.status,
                         TurnExecutionStatus::Starting
                             | TurnExecutionStatus::Queued
                             | TurnExecutionStatus::Running
-                    )
-                    && (current.started_at.is_none()
+                    ) && (current.started_at.is_none()
                         || current.status == TurnExecutionStatus::Starting)
-                    && !repositories::native_cancellation_context::is_registered(
-                        &transaction,
-                        &expected.turn_id
-                    )
-                    .await?
-                    && cli_runtime_binding::latest_turn_attempt(&transaction, &expected.turn_id)
+                        && !repositories::native_cancellation_context::is_registered(
+                            &transaction,
+                            &expected.turn_id
+                        )
+                        .await?
+                        && cli_runtime_binding::latest_turn_attempt(
+                            &transaction,
+                            &expected.turn_id
+                        )
                         .await?
                         .is_none()
-                    && !turn_event_projection_stream_state::has_accepted_terminal(
-                        &transaction,
-                        &expected.turn_id
-                    )
-                    .await?,
-                UnactivatedTurnPhaseChanged
-            );
+                        && !turn_event_projection_stream_state::has_accepted_terminal(
+                            &transaction,
+                            &expected.turn_id
+                        )
+                        .await?,
+                    UnactivatedTurnPhaseChanged
+                );
+            }
         }
 
         let cancellation_turn_id = if let Some(cancellation) = native_cancellation {

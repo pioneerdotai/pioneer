@@ -105,7 +105,7 @@ fn recovered_turn_stop_active_observation_restore_failure_does_not_succeed_recov
 async fn open(
     processor: &MessageProcessor,
     connection_id: ConnectionId,
-    rx: &mut mpsc::Receiver<Message>,
+    rx: &mut crate::session::test_support::OutboundTestReceiver,
     client: &ClientCore,
     thread_id: &str,
     workspace_id: &str,
@@ -136,7 +136,10 @@ fn active(client: &ClientCore, thread_id: &str) -> ActiveThreadSnapshot {
     ActiveThreadSnapshot::from_coordinator(Some(thread_id), Some(&coordinator), false)
 }
 
-async fn receive_update(rx: &mut mpsc::Receiver<Message>, client: &ClientCore) -> Thread {
+async fn receive_update(
+    rx: &mut crate::session::test_support::OutboundTestReceiver,
+    client: &ClientCore,
+) -> Thread {
     let notification = recv_notification_by_method(rx, events::THREAD_UPDATED).await;
     let GatewayNotification::ThreadUpdated(update) =
         GatewayNotification::from_jsonrpc(notification).unwrap()
@@ -151,7 +154,7 @@ async fn receive_update(rx: &mut mpsc::Receiver<Message>, client: &ClientCore) -
 pub(super) async fn exercise(
     mut processor: MessageProcessor,
     connection_id: ConnectionId,
-    rx: &mut mpsc::Receiver<Message>,
+    rx: &mut crate::session::test_support::OutboundTestReceiver,
     cli_session: Arc<RecordingCliRuntimeSession>,
     event: crate::resilience::RecoveryCoordinatorEvent,
     scenario: Scenario,
@@ -688,7 +691,7 @@ pub(super) async fn exercise(
 async fn exercise_active_observation(
     mut processor: MessageProcessor,
     connection_id: ConnectionId,
-    rx: &mut mpsc::Receiver<Message>,
+    rx: &mut crate::session::test_support::OutboundTestReceiver,
     cli_session: Arc<RecordingCliRuntimeSession>,
     event: crate::resilience::RecoveryCoordinatorEvent,
     scenario: Scenario,

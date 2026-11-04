@@ -403,6 +403,9 @@ impl MessageProcessor {
         let replay_workspace_id = outcome.response.thread.workspace_id.clone();
         let replay_thread_id = outcome.response.thread.id.clone();
 
+        self.foreground_starts
+            .before_thread_snapshot(&replay_thread_id)
+            .await;
         let response_encode_stage = trace.map(|trace| {
             trace.stage(pioneer_observability::GatewayOperationStage::ThreadOpenResponseEncode)
         });
@@ -733,6 +736,12 @@ impl MessageProcessor {
         }
         .into_directory_summary();
 
+        for thread in &response_payload.threads {
+            self.foreground_starts
+                .before_thread_snapshot(&thread.id)
+                .await;
+        }
+
         let response_encode_stage =
             trace.stage(pioneer_observability::GatewayOperationStage::ThreadTreeResponseEncode);
         let response = match JsonRpcResponse::from_result(request_id, &response_payload) {
@@ -904,6 +913,9 @@ impl MessageProcessor {
             unread_count,
         };
 
+        self.foreground_starts
+            .before_thread_snapshot(&response_payload.thread.id)
+            .await;
         let response_encode_stage =
             trace.stage(pioneer_observability::GatewayOperationStage::ThreadGetResponseEncode);
         let response = match JsonRpcResponse::from_result(request_id, &response_payload) {
@@ -1248,6 +1260,9 @@ impl MessageProcessor {
         let response_payload = ThreadUpdateResponse {
             thread: thread.clone(),
         };
+        self.foreground_starts
+            .before_thread_snapshot(&response_payload.thread.id)
+            .await;
         let response = match JsonRpcResponse::from_result(request_id, &response_payload) {
             Ok(response) => response,
             Err(error) => {

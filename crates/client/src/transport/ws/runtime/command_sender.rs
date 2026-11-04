@@ -1888,6 +1888,23 @@ pub(crate) struct ConnectionRequestTransport {
     subscription_live: Option<Arc<Mutex<bool>>>,
 }
 impl ConnectionRequestTransport {
+    /// Retain the existing credential/socket retirement locks through a history
+    /// mutation. Caller holds identity then registry. Transport lifecycle never
+    /// waits for registry while retaining these locks; no callbacks run here.
+    pub(crate) fn history_apply_fence(&self, generation: Option<u64>) -> (impl Sized + '_, bool) {
+        let access = self
+            .sender
+            .session_access
+            .lock()
+            .expect("session access poisoned");
+        let live = self
+            .receipt
+            .as_ref()
+            .map(|r| r.live.lock().expect("socket receipt poisoned"));
+        let current = access.as_ref().map(|a| a.generation) == generation
+            && live.as_ref().is_some_and(|live| **live);
+        ((access, live), current)
+    }
     pub(crate) fn scope(&self) -> Option<ConnectionScope> {
         self.receipt.as_ref().map(|receipt| receipt.scope)
     }

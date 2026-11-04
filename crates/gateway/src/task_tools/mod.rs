@@ -3484,21 +3484,16 @@ impl TaskToolHandler {
         };
         let now = now_timestamp_secs();
         self.processor
-            .crud_store
-            .materialize_item_completed(notification.clone(), now)
+            .persist_task_anchor_event(
+                pioneer_crud::CanonicalTurnEventPayload::ItemCompleted(notification.clone()),
+                now,
+            )
             .await
             .map_err(|error| {
                 ToolError::execution_failed(format!(
                     "task was created but anchor persistence failed: {error:#}"
                 ))
             })?;
-        self.processor
-            .send_notification_to_thread_subscribers(
-                self.context.thread_id.as_str(),
-                events::ITEM_COMPLETED,
-                &notification,
-            )
-            .await;
         let latest_response = self
             .processor
             .crud_store
@@ -3519,21 +3514,16 @@ impl TaskToolHandler {
                 },
             };
             self.processor
-                .crud_store
-                .materialize_item_updated(update.clone(), now)
+                .persist_task_anchor_event(
+                    pioneer_crud::CanonicalTurnEventPayload::ItemUpdated(update.clone()),
+                    now,
+                )
                 .await
                 .map_err(|error| {
                     ToolError::execution_failed(format!(
                         "task anchor was created but refresh failed: {error:#}"
                     ))
                 })?;
-            self.processor
-                .send_notification_to_thread_subscribers(
-                    self.context.thread_id.as_str(),
-                    events::ITEM_UPDATED,
-                    &update,
-                )
-                .await;
         }
         Ok(latest_item)
     }

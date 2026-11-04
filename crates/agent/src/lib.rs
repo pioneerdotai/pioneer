@@ -832,6 +832,15 @@ pub enum AgentControlOperationStatus {
     },
 }
 
+/// Acceptance by the exact actor incarnation which received StartTurn.
+/// This is not a provider completion or a durable execution ownership receipt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentStartReceipt {
+    pub turn_id: String,
+    pub actor_generation: u64,
+    pub run_id: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentStartError {
     ThreadNotFound,
@@ -1393,7 +1402,7 @@ struct TurnTaskCompletion {
 
 #[derive(Debug, Clone)]
 enum StoredControlOutcome {
-    Start(Result<(), AgentStartError>),
+    Start(Result<u64, AgentStartError>),
     Control(Result<(), AgentControlError>),
 }
 
@@ -1815,7 +1824,7 @@ impl ControlOperationRegistry {
                     }
                 }
             }
-            StoredControlOperationState::Completed(StoredControlOutcome::Start(Ok(())))
+            StoredControlOperationState::Completed(StoredControlOutcome::Start(Ok(_)))
             | StoredControlOperationState::Completed(StoredControlOutcome::Control(Ok(()))) => {
                 AgentControlOperationStatus::Applied {
                     actor_generation: entry.actor_generation,
@@ -1845,14 +1854,14 @@ fn deadline_after(now: Instant, timeout: Duration) -> Instant {
 
 #[derive(Debug)]
 struct AgentStartAck {
-    sender: oneshot::Sender<Result<(), AgentStartError>>,
+    sender: oneshot::Sender<Result<u64, AgentStartError>>,
     operation_id: AgentControlOperationId,
     actor_generation: u64,
     outcomes: Arc<ControlOperationRegistry>,
 }
 
 impl AgentStartAck {
-    fn completed(&self) -> Option<Result<(), AgentStartError>> {
+    fn completed(&self) -> Option<Result<u64, AgentStartError>> {
         match self
             .outcomes
             .completed(&self.operation_id, self.actor_generation)
@@ -1864,8 +1873,8 @@ impl AgentStartAck {
 
     fn send(
         self,
-        attempted: Result<(), AgentStartError>,
-    ) -> Result<(), Result<(), AgentStartError>> {
+        attempted: Result<u64, AgentStartError>,
+    ) -> Result<(), Result<u64, AgentStartError>> {
         let canonical = match self.outcomes.complete(
             &self.operation_id,
             self.actor_generation,
@@ -1995,7 +2004,7 @@ fn cached_start_outcome(
     outcomes: &ControlOperationRegistry,
     operation_id: &AgentControlOperationId,
     actor_generation: u64,
-) -> Result<Option<Result<(), AgentStartError>>, AgentStartError> {
+) -> Result<Option<Result<u64, AgentStartError>>, AgentStartError> {
     let operation = operation_id.operation();
     match outcomes.begin(operation_id.clone(), actor_generation) {
         ControlOperationAdmission::Fresh => Ok(None),
@@ -2060,12 +2069,12 @@ fn cached_control_outcome(
 async fn dispatch_start_command(
     command_tx: mpsc::Sender<AgentCommand>,
     command: AgentCommand,
-    ack_rx: oneshot::Receiver<Result<(), AgentStartError>>,
+    ack_rx: oneshot::Receiver<Result<u64, AgentStartError>>,
     outcomes: Arc<ControlOperationRegistry>,
     operation_id: AgentControlOperationId,
     actor_generation: u64,
     config: AgentControlPlaneConfig,
-) -> Result<(), AgentStartError> {
+) -> Result<u64, AgentStartError> {
     use pioneer_observability::{NativeLifecycleOutcome as Outcome, NativeLifecycleStage as Stage};
 
     let started = Instant::now();
@@ -2123,7 +2132,7 @@ async fn dispatch_start_command(
         Ok(Ok(outcome)) => outcome,
     };
     let outcome = match &result {
-        Ok(()) => Outcome::Started,
+        Ok(_) => Outcome::Started,
         Err(AgentStartError::AcknowledgementTimeout { .. }) => Outcome::TimedOut,
         Err(AgentStartError::AcknowledgementDropped { .. }) => Outcome::Closed,
         Err(_) => Outcome::Rejected,
@@ -3425,8 +3434,9 @@ impl AgentManager {
             reasoning_effort,
             permission_profile,
             execution_security_snapshot,
+            None,
         )
-        .await
+        .await.map(|_| ())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3448,7 +3458,8 @@ impl AgentManager {
         reasoning_effort: Option<&str>,
         permission_profile: TurnPermissionProfileSnapshot,
         execution_security_snapshot: TurnExecutionSecuritySnapshot,
-    ) -> Result<(), AgentStartError> {
+        expected_actor_generation: Option<u64>,
+    ) -> Result<AgentStartReceipt, AgentStartError> {
         let reasoning = reasoning_config_from_effort(reasoning_effort)?;
         self.start_turn_with_hook_context_and_execution_checkpoint_and_reasoning(
             thread_id,
@@ -3470,6 +3481,7 @@ impl AgentManager {
             reasoning,
             permission_profile,
             Some(execution_security_snapshot),
+            expected_actor_generation,
         )
         .await
     }
@@ -3641,8 +3653,10 @@ impl AgentManager {
             reasoning,
             permission_profile,
             Some(execution_security_snapshot),
+            None,
         )
         .await
+        .map(|_| ())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3730,8 +3744,10 @@ impl AgentManager {
             None,
             permission_profile,
             Some(execution_security_snapshot),
+            None,
         )
         .await
+        .map(|_| ())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3756,12 +3772,16 @@ impl AgentManager {
         reasoning: Option<ReasoningConfig>,
         permission_profile: TurnPermissionProfileSnapshot,
         execution_security_snapshot: Option<TurnExecutionSecuritySnapshot>,
-    ) -> Result<(), AgentStartError> {
+        expected_actor_generation: Option<u64>,
+    ) -> Result<AgentStartReceipt, AgentStartError> {
         let (command_tx, actor_generation, outcomes) = {
             let state = self.state.read().await;
             let Some(thread) = state.threads.get(thread_id) else {
                 return Err(AgentStartError::ThreadNotFound);
             };
+            if expected_actor_generation.is_some_and(|generation| generation != thread.generation) {
+                return Err(AgentStartError::ThreadNotFound);
+            }
             (
                 thread.command_tx.clone(),
                 thread.generation,
@@ -3779,7 +3799,11 @@ impl AgentManager {
             )
             .await?
         {
-            return outcome;
+            return outcome.map(|run_id| AgentStartReceipt {
+                turn_id: turn_id.to_owned(),
+                actor_generation,
+                run_id,
+            });
         }
         let (ack_tx, ack_rx) = oneshot::channel();
         let command = AgentCommand::StartTurn {
@@ -3828,7 +3852,13 @@ impl AgentManager {
             self.control_plane_config,
         )
         .await;
-        self.finish_start_dispatch(thread_id, result).await
+        self.finish_start_dispatch(thread_id, result)
+            .await
+            .map(|run_id| AgentStartReceipt {
+                turn_id: turn_id.to_owned(),
+                actor_generation,
+                run_id,
+            })
     }
 
     pub async fn subscribe_progress(
@@ -4040,6 +4070,43 @@ impl AgentManager {
             });
         control.cancel_all_attempts();
         Ok(())
+    }
+
+    /// Check the exact initial task, including replacement recovery runs inside
+    /// the same actor incarnation. This grants no durable execution authority.
+    pub async fn start_receipt_is_current(
+        &self,
+        thread_id: &str,
+        receipt: &AgentStartReceipt,
+    ) -> bool {
+        let state = self.state.read().await;
+        state.threads.get(thread_id).is_some_and(|thread| {
+            thread.generation == receipt.actor_generation
+                && thread
+                    .control_plane
+                    .execution_for(&receipt.turn_id)
+                    .is_some_and(|control| control.run_id == receipt.run_id)
+        })
+    }
+
+    /// Cancel only the incarnation that acknowledged this initial start.
+    /// Gateway startup also supplies its original durable owner so cancellation
+    /// cannot terminalize an execution which replaced that accepted run.
+    pub async fn cancel_started_turn(
+        &self,
+        thread_id: &str,
+        receipt: &AgentStartReceipt,
+        reason: &str,
+        execution_owner: Option<(&str, u64)>,
+    ) -> Result<bool, AgentControlError> {
+        self.cancel_turn_owned(
+            thread_id,
+            &receipt.turn_id,
+            reason,
+            Some((receipt.actor_generation, receipt.run_id)),
+            execution_owner.map(|(owner, generation)| (owner.to_owned(), generation)),
+        )
+        .await
     }
 
     pub async fn cancel_turn(
@@ -4620,6 +4687,31 @@ impl AgentManager {
                 .cancellation_context_registered
                 .load(Ordering::Acquire))
         .then_some((thread.generation, control.run_id))
+    }
+
+    /// Initial activation source, read from the same control plane as Stop.
+    pub async fn initial_start_receipt(
+        &self,
+        preparation: &pioneer_protocol::NativeTerminalEffectPreparation,
+    ) -> Option<AgentStartReceipt> {
+        let state = self.state.read().await;
+        let thread = state.threads.get(&preparation.thread_id)?;
+        let control = thread.control_plane.execution_for(&preparation.turn_id)?;
+        if thread.workspace_id != preparation.workspace_id
+            || !control.initial_cancellation_registration
+            || preparation.batch_id
+                != format!(
+                    "{}:terminal-effects:{}:{}",
+                    preparation.turn_id, control.run_id, preparation.runtime_generation
+                )
+        {
+            return None;
+        }
+        Some(AgentStartReceipt {
+            turn_id: preparation.turn_id.clone(),
+            actor_generation: thread.generation,
+            run_id: control.run_id,
+        })
     }
 
     /// A queued initial Stop remains owned by this exact actor/run even after

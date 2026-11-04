@@ -1067,9 +1067,20 @@ impl ClientCore {
             .thread_registry
             .lock()
             .expect("thread registry poisoned");
-        self.apply_directory_read_locked(&mut registry, workspace, thread, cursor, unread);
+        if self.apply_directory_read_locked(&mut registry, workspace, thread, cursor, unread) {
+            let draft = registry.navigation.drafts.get(workspace).cloned();
+            if let Some(publication) =
+                registry
+                    .directory
+                    .project(workspace, draft.as_deref(), false, None)
+            {
+                self.publish_workspace_tree(publication);
+            }
+        }
     }
 
+    /// Mutate the confirmed cursor/counts only. The caller publishes a changed
+    /// count after releasing any request-authority fence, retaining registry.
     pub(crate) fn apply_directory_read_locked(
         &self,
         registry: &mut crate::threads::registry::ThreadRegistry,
@@ -1077,7 +1088,7 @@ impl ClientCore {
         thread: &str,
         cursor: &pioneer_protocol::ThreadReadCursor,
         unread: u64,
-    ) {
+    ) -> bool {
         if self.is_stopped()
             || !registry
                 .directory
@@ -1085,7 +1096,7 @@ impl ClientCore {
                 .get(thread)
                 .is_some_and(|t| t.workspace_id == workspace)
         {
-            return;
+            return false;
         }
         if registry
             .directory
@@ -1093,7 +1104,7 @@ impl ClientCore {
             .get(thread)
             .is_some_and(|previous| previous.sort_key > cursor.sort_key)
         {
-            return;
+            return false;
         }
         // Negotiated publisher owns counts; legacy reads still confirm the cursor.
         let unread = if registry.directory.push_revisions.contains_key(workspace) {
@@ -1115,17 +1126,10 @@ impl ClientCore {
             .cursors
             .insert(thread.to_owned(), cursor.clone());
         if registry.directory.unread.get(thread).copied().unwrap_or(0) == unread {
-            return;
+            return false;
         }
         registry.directory.unread.insert(thread.to_owned(), unread);
-        let draft = registry.navigation.drafts.get(workspace).cloned();
-        if let Some(publication) =
-            registry
-                .directory
-                .project(workspace, draft.as_deref(), false, None)
-        {
-            self.publish_workspace_tree(publication);
-        }
+        true
     }
 }
 

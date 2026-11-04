@@ -24,7 +24,7 @@ use crate::auth::{AuthenticatedSessionPrincipal, GatewayAuthService};
 use crate::message::MessageProcessor;
 use crate::session::SessionManager;
 
-const ACCESS_CLOSE_GRACE: Duration = Duration::from_millis(250);
+const ACCESS_CLOSE_GRACE: Duration = crate::session::OUTBOUND_CLOSE_GRACE;
 
 // Existing deferred budgets. Check projected bytes before retaining any frame.
 const MAX_DEFERRED_FRAMES: usize = 64;
@@ -334,6 +334,15 @@ pub(super) async fn run_admitted_connection(
     }
 }
 
+/// Per-connection deterministic fault synchronization; no runtime policy flag.
+#[cfg(test)]
+pub(crate) struct NormalConnectionTestHooks {
+    pub registered: tokio::sync::oneshot::Sender<(crate::session::ConnectionId, SessionOutbound)>,
+    pub writer_start: tokio::sync::oneshot::Receiver<()>,
+    pub write_block: Option<tokio::sync::oneshot::Receiver<()>>,
+    pub write_entered: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
 pub(crate) async fn run_normal_connection(
     ws: WebSocket,
     config: AppConfig,
@@ -341,14 +350,40 @@ pub(crate) async fn run_normal_connection(
     auth_service: Arc<GatewayAuthService>,
     message_processor: Arc<MessageProcessor>,
     session_manager: Arc<SessionManager>,
-    mut server_cancellation: watch::Receiver<bool>,
+    server_cancellation: watch::Receiver<bool>,
 ) -> Result<()> {
-    let (mut ws_writer, mut ws_reader) = ws.split();
-    let queue_capacity = config.gateway.outbound_queue_capacity.max(1);
-    let (outbound_tx, mut outbound_rx) =
-        mpsc::channel::<pioneer_observability::work::WorkItem<Message>>(queue_capacity);
+    run_normal_connection_inner(
+        ws,
+        config,
+        principal,
+        auth_service,
+        message_processor,
+        session_manager,
+        server_cancellation,
+        #[cfg(test)]
+        None,
+    )
+    .await
+}
 
-    let outbound_tx = SessionOutbound::observed(outbound_tx);
+pub(crate) async fn run_normal_connection_inner(
+    ws: WebSocket,
+    config: AppConfig,
+    principal: Arc<AuthenticatedSessionPrincipal>,
+    auth_service: Arc<GatewayAuthService>,
+    message_processor: Arc<MessageProcessor>,
+    session_manager: Arc<SessionManager>,
+    mut server_cancellation: watch::Receiver<bool>,
+    #[cfg(test)] mut test_hooks: Option<NormalConnectionTestHooks>,
+) -> Result<()> {
+    config.gateway.validate_outbound()?;
+    let (mut ws_writer, mut ws_reader) = ws.split();
+    let write_timeout = Duration::from_millis(config.gateway.outbound.write_timeout_ms);
+    let (outbound_tx, mut outbound_rx) = SessionOutbound::channel(
+        config.gateway.outbound_queue_capacity,
+        config.gateway.outbound.payload_bytes,
+        config.gateway.outbound.reserved_payload_bytes,
+    );
     let connection_id = session_manager
         .register_outbound_connection(outbound_tx.clone(), principal)
         .await?;
@@ -403,8 +438,36 @@ pub(crate) async fn run_normal_connection(
         .await;
     });
 
+    #[cfg(test)]
+    let mut writer_hooks = test_hooks.take().map(|hooks| {
+        let _ = hooks.registered.send((connection_id, outbound_tx.clone()));
+        (hooks.writer_start, hooks.write_block, hooks.write_entered)
+    });
+    let writer_outbound = outbound_tx.clone();
     let mut writer_task = tokio::spawn(async move {
-        while let Some(item) = outbound_rx.recv().await {
+        #[cfg(test)]
+        if let Some((start, _, _)) = writer_hooks.as_mut() {
+            let _ = start.await;
+        }
+        let mut sealed = false;
+        loop {
+            let envelope = tokio::select! {
+                biased;
+                _ = writer_outbound.writer_stopped() => anyhow::bail!("outbound writer retired"),
+                _ = writer_outbound.closed(), if !sealed => {
+                    outbound_rx.seal();
+                    sealed = true;
+                    continue;
+                }
+                envelope = outbound_rx.recv() => envelope,
+            };
+            let Some(envelope) = envelope else {
+                break;
+            };
+            let crate::session::outbound::OutboundEnvelope {
+                item,
+                reservation: _reservation,
+            } = envelope;
             let mut queue = item.queue.as_ref().map(|(q, _)| q.processing());
             let (message, work) = item.received(
                 pioneer_observability::work::Boundary::EventLane,
@@ -449,10 +512,28 @@ pub(crate) async fn run_normal_connection(
             let terminal = matches!(message, Message::Close(_));
             work.scope_result(pioneer_observability::live::waiting(
                 pioneer_observability::live::WaitKind::Network,
-                ws_writer.send(message),
+                write_outbound_bounded(
+                    &writer_outbound,
+                    if terminal {
+                        ACCESS_CLOSE_GRACE
+                    } else {
+                        write_timeout
+                    },
+                    async {
+                        #[cfg(test)]
+                        if let Some((_, block, entered)) = writer_hooks.as_mut() {
+                            if let Some(entered) = entered.take() {
+                                let _ = entered.send(());
+                            }
+                            if let Some(block) = block.take() {
+                                let _ = block.await;
+                            }
+                        }
+                        ws_writer.send(message).await
+                    },
+                ),
             ))
-            .await
-            .context("websocket write failed")?;
+            .await?;
             if let Some(queue) = queue.as_mut() {
                 queue.processed();
             }
@@ -473,7 +554,10 @@ pub(crate) async fn run_normal_connection(
                 return Ok::<(), anyhow::Error>(());
             }
         }
-        ws_writer.close().await.context("websocket close failed")?;
+        tokio::time::timeout(ACCESS_CLOSE_GRACE, ws_writer.close())
+            .await
+            .context("websocket close deadline exceeded")?
+            .context("websocket close failed")?;
         Ok::<(), anyhow::Error>(())
     });
     let mut writer_completion = None;
@@ -714,6 +798,7 @@ pub(crate) async fn run_normal_connection(
         Ok(())
     }).catch_unwind().await;
 
+    outbound_tx.close();
     if let Some(ordinary) = ordinary.as_mut() {
         ordinary.abort_and_join().await;
     }
@@ -749,6 +834,22 @@ pub(crate) async fn run_normal_connection(
     match read_result {
         Ok(result) => result,
         Err(panic) => std::panic::resume_unwind(panic),
+    }
+}
+
+/// Cancellation or deadline failure is terminal: caller must drop the socket.
+async fn write_outbound_bounded<E: std::error::Error + Send + Sync + 'static>(
+    outbound: &SessionOutbound,
+    deadline: Duration,
+    write: impl Future<Output = std::result::Result<(), E>>,
+) -> Result<()> {
+    tokio::select! {
+        biased;
+        _ = outbound.writer_stopped() => anyhow::bail!("outbound retired during write"),
+        result = tokio::time::timeout(deadline, write) => {
+            result.context("websocket write deadline exceeded")?
+                .context("websocket write failed")
+        }
     }
 }
 
@@ -1298,15 +1399,55 @@ mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn stalled_write_deadline_drops_writer_payload_and_wakes_admission() {
+        let (sender, mut receiver) = SessionOutbound::channel(2, 100, 20);
+        sender
+            .send(Message::Text("x".repeat(100).into()))
+            .await
+            .unwrap();
+        let owner = sender.clone();
+        let writer = tokio::spawn(async move {
+            let held = receiver.recv().await.unwrap();
+            let result = super::write_outbound_bounded(
+                &owner,
+                Duration::from_secs(30),
+                std::future::pending::<std::result::Result<(), std::io::Error>>(),
+            )
+            .await;
+            drop(held);
+            // This is the same receiver owner drop as normal writer failure.
+            drop(receiver);
+            result
+        });
+        let mut waiting = Box::pin(sender.send(Message::Text("pending".into())));
+        assert!(waiting.as_mut().now_or_never().is_none());
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(29)).await;
+        assert!(!writer.is_finished());
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert!(
+            writer
+                .await
+                .unwrap()
+                .unwrap_err()
+                .to_string()
+                .contains("deadline")
+        );
+        assert!(waiting.await.is_err());
+        assert!(sender.try_send(Message::Close(None)).is_err());
+    }
+
     #[tokio::test]
     async fn outbound_backpressure_is_bounded_and_peer_drop_is_terminal() {
-        let (sender, mut receiver) = mpsc::channel(1);
+        let (sender, mut receiver) = crate::session::test_support::outbound_channel(2);
         sender
             .send(Message::Text("first".into()))
             .await
             .expect("prime bounded queue");
 
-        let pending = sender.send(Message::Text("second".into()));
+        sender.send(Message::Text("second".into())).await.unwrap();
+        let pending = sender.send(Message::Text("third".into()));
         tokio::pin!(pending);
         assert!(pending.as_mut().now_or_never().is_none());
         assert!(matches!(receiver.recv().await, Some(Message::Text(_))));
@@ -1341,7 +1482,7 @@ mod tests {
             access_jti: "J00000000000000000001".to_owned(),
             access_expires_at_unix: 10_000,
         };
-        let (outbound_tx, mut outbound_rx) = mpsc::channel(1);
+        let (outbound_tx, mut outbound_rx) = crate::session::test_support::outbound_channel(2);
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let (expired_tx, expired_rx) = watch::channel(false);
         let (_renewal_tx, renewal_rx) = watch::channel(ConnectionAccessLease::new(
@@ -1370,7 +1511,7 @@ mod tests {
             principal.access_expires_at_unix = 10_000;
             let old = ConnectionAccessLease::new(principal.clone(), Duration::from_secs(1));
             let (renewal_tx, renewal_rx) = watch::channel(old);
-            let (outbound_tx, _outbound_rx) = mpsc::channel(4);
+            let (outbound_tx, _outbound_rx) = crate::session::test_support::outbound_channel(4);
             let (cancel_tx, cancel_rx) = watch::channel(false);
             let (expired_tx, expired_rx) = watch::channel(false);
             let task =

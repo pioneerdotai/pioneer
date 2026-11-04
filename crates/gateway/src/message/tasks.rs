@@ -1214,6 +1214,41 @@ impl MessageProcessor {
             .await
     }
 
+    /// Independent task anchors retain their canonical LIVE owner after start
+    /// publication; generic/occurrence anchors retain their eager path.
+    pub(crate) async fn persist_task_anchor_event(
+        &self,
+        event: pioneer_crud::CanonicalTurnEventPayload,
+        timestamp: i64,
+    ) -> Result<bool> {
+        if self
+            .materialize_independent_item_lifecycle(event.clone(), timestamp)
+            .await?
+        {
+            return Ok(true);
+        }
+        match event {
+            pioneer_crud::CanonicalTurnEventPayload::ItemCompleted(notification) => {
+                self.send_notification_to_thread_subscribers(
+                    &notification.thread_id,
+                    events::ITEM_COMPLETED,
+                    &notification,
+                )
+                .await;
+            }
+            pioneer_crud::CanonicalTurnEventPayload::ItemUpdated(notification) => {
+                self.send_notification_to_thread_subscribers(
+                    &notification.thread_id,
+                    events::ITEM_UPDATED,
+                    &notification,
+                )
+                .await;
+            }
+            _ => anyhow::bail!("task anchor requires an item completion or update"),
+        }
+        Ok(false)
+    }
+
     pub(super) async fn refresh_task_anchor_in_turn(
         &self,
         response: &TaskEventContext,
@@ -1274,23 +1309,22 @@ impl MessageProcessor {
             item: TurnItem::Task { item },
         };
         let event_timestamp_secs = now_timestamp_secs();
-        self.crud_store
-            .materialize_item_updated(notification.clone(), event_timestamp_secs)
+        let deferred = self
+            .persist_task_anchor_event(
+                pioneer_crud::CanonicalTurnEventPayload::ItemUpdated(notification.clone()),
+                event_timestamp_secs,
+            )
             .await?;
-        self.send_notification_to_thread_subscribers(
-            thread_id,
-            events::ITEM_UPDATED,
-            &notification,
-        )
-        .await;
-        self.notify_semantic_timeline_item_changed(
-            notification.workspace_id.as_str(),
-            notification.thread_id.as_str(),
-            notification.turn_id.as_str(),
-            &notification.item,
-            Some("completed"),
-        )
-        .await;
+        if !deferred {
+            self.notify_semantic_timeline_item_changed(
+                notification.workspace_id.as_str(),
+                notification.thread_id.as_str(),
+                notification.turn_id.as_str(),
+                &notification.item,
+                Some("completed"),
+            )
+            .await;
+        }
         Ok(true)
     }
 

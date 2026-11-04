@@ -728,23 +728,12 @@ impl MessageProcessor {
             received_bytes: updated.received_bytes,
             next_offset: updated.received_bytes,
         };
-        let notification = match JsonRpcNotification::from_params(
+        self.send_notification_to_connections(
             events::SKILLS_UPLOAD_CHUNK_ACK,
             &ack,
-        ) {
-            Ok(notification) => notification,
-            Err(error) => {
-                error!(connection_id, error = %format!("{error:#}"), "failed to encode upload chunk ack");
-                return;
-            }
-        };
-        if let Err(error) = self.send_json(connection_id, &notification).await {
-            warn!(
-                connection_id,
-                error = %format!("{error:#}"),
-                "failed to send upload chunk ack"
-            );
-        }
+            vec![connection_id],
+        )
+        .await;
     }
 
     pub(super) async fn materialize_uploaded_skill_source(

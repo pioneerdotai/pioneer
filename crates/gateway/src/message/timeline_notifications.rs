@@ -15,6 +15,7 @@ enum TurnWorkProjectionAvailability {
     Present,
     Absent,
     Failed,
+    Deferred,
 }
 
 impl MessageProcessor {
@@ -619,6 +620,11 @@ impl MessageProcessor {
         turn_id: &str,
         notify_block_change: bool,
     ) -> TurnWorkProjectionAvailability {
+        if self.foreground_starts.pending(thread_id, turn_id) {
+            // Replaceable snapshot: the durable LIVE terminal refreshes current
+            // Work after publication. Do not wait here or advertise absence.
+            return TurnWorkProjectionAvailability::Deferred;
+        }
         match self
             .semantic_turn_owns_work(workspace_id, thread_id, turn_id)
             .await

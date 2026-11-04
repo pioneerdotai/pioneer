@@ -1,3 +1,4 @@
+pub(super) mod foreground_start;
 use super::agent_runtime::TurnFailureRecoveryKind;
 use super::*;
 use crate::authorization::{
@@ -34,6 +35,37 @@ pub(super) struct PreparedApiProviderTurnStart {
     effective_reasoning_effort: Option<String>,
     permission_profile: pioneer_protocol::TurnPermissionProfileSnapshot,
     execution_security_snapshot: pioneer_protocol::TurnExecutionSecuritySnapshot,
+}
+
+/// Dispatch failures remain failures even when recovery was successfully scheduled.
+/// `Ok` only records actor acceptance followed by the running ownership update;
+/// it is not an exact-generation receipt or evidence of successful execution.
+/// Actor errors can include an indeterminate control outcome; an error is not
+/// permission to dispatch again without the existing durable reconciliation.
+#[derive(Debug)]
+pub(super) enum ApiProviderTurnDispatchFailure {
+    ActorStart(pioneer_agent::AgentStartError),
+    RunningOwnershipNotConfirmed,
+    OwnershipPersistence(anyhow::Error),
+}
+
+impl std::fmt::Display for ApiProviderTurnDispatchFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ActorStart(error) => write!(f, "actor start failed: {error}"),
+            Self::RunningOwnershipNotConfirmed => {
+                f.write_str("running execution ownership was not confirmed")
+            }
+            Self::OwnershipPersistence(error) => {
+                write!(f, "execution ownership persistence failed: {error:#}")
+            }
+        }
+    }
+}
+
+pub(super) enum ApiProviderTurnPreparation {
+    AllowNew,
+    ReplayOnly,
 }
 
 pub(super) enum ApiProviderTurnAdmission {
@@ -689,6 +721,22 @@ async fn persist_admitted_turn_start(
         params.execution_backend.as_ref(),
         materialization,
     )?;
+    let original_execution = pioneer_crud::TurnExecutionRecord {
+        turn_id: execution.turn_id.clone(),
+        thread_id: execution.thread_id.clone(),
+        workspace_id: execution.workspace_id.clone(),
+        executor_kind: execution.executor_kind,
+        executor_key: execution.executor_key.clone(),
+        status: execution.status,
+        owner_id: execution.owner_id.clone(),
+        owner_generation: 1,
+        lease_until: execution.lease_until,
+        heartbeat_at: execution.created_at,
+        started_at: None,
+        completed_at: None,
+        created_at: execution.created_at,
+        updated_at: execution.created_at,
+    };
     // The admitted Turn and its execution graph form one durable transaction,
     // but the transaction does not need to inherit the RPC dispatch poll stack.
     // Own its inputs and poll the complete commit from a fresh runtime task.
@@ -696,7 +744,7 @@ async fn persist_admitted_turn_start(
     let materialization = materialization.clone();
     let reasoning_effort = reasoning_effort.map(str::to_owned);
     let execution_security_snapshot = execution_security_snapshot.clone();
-    message_fresh_task(async move {
+    let result = message_fresh_task(async move {
         crud_store
             .materialize_authorized_turn_start_with_reasoning_effort_and_permission_audit(
                 &materialization.thread,
@@ -719,7 +767,11 @@ async fn persist_admitted_turn_start(
             .await
     })
     .await
-    .map_err(|error| anyhow::anyhow!("admitted turn/start persistence task failed: {error}"))?
+    .map_err(|error| anyhow::anyhow!("admitted turn/start persistence task failed: {error}"))?;
+    if result.is_ok() {
+        foreground_start::note_committed_start(original_execution);
+    }
+    result
 }
 
 pub(super) fn new_turn_execution(
@@ -2124,77 +2176,47 @@ impl MessageProcessor {
                 }
             }
 
-            let admission = match self
-                .prepare_api_provider_turn_start(
+            let acceptance = match self
+                .accept_foreground_api_provider_start(
                     connection_id,
                     request_actor,
                     scoped_principal_id,
                     params,
-                    requested_reasoning_effort.as_deref(),
-                    crate::authorization::ExecutionAdmissionEntryPoint::InteractiveTurn,
+                    requested_reasoning_effort,
                     execution_admission,
                 )
                 .await
             {
-                Ok(prepared) => prepared,
-                Err(message) => {
-                    self.send_error(connection_id, public_turn_start_error(request_id, message))
+                Ok(response) => response,
+                Err(error) => {
+                    self.send_error(connection_id, public_turn_start_error(request_id, error))
                         .await;
                     return;
                 }
             };
-            let prepared = match admission {
-                ApiProviderTurnAdmission::New(prepared) => prepared,
-                ApiProviderTurnAdmission::Replay(response) => {
-                    self.session_manager
-                        .set_connection_workspace(connection_id, Some(thread.workspace_id.clone()))
-                        .await;
-                    match JsonRpcResponse::from_result(request_id, &response) {
-                        Ok(response) => {
-                            if let Err(error) = self.send_json(connection_id, &response).await {
-                                warn!(
-                                    connection_id,
-                                    error = %format!("{error:#}"),
-                                    "failed to send idempotent turn/start replay response"
-                                );
-                            }
-                        }
-                        Err(error) => {
-                            self.send_error(
-                                connection_id,
-                                public_turn_error(
-                                    None,
-                                    INVALID_REQUEST_CODE,
-                                    pioneer_protocol::PublicErrorStage::Delivery,
-                                    format!(
-                                        "failed to encode idempotent turn/start response: {error}"
-                                    ),
-                                ),
-                            )
-                            .await;
-                        }
+            self.session_manager
+                .set_connection_workspace(connection_id, Some(thread.workspace_id.clone()))
+                .await;
+            match JsonRpcResponse::from_result(request_id, &acceptance.response) {
+                Ok(response) => {
+                    if let Err(error) = self.send_json(connection_id, &response).await {
+                        warn!(connection_id, error = %error, "failed to enqueue accepted turn/start response");
                     }
-                    return;
                 }
-            };
-            if !message_future(self.finish_turn_start_success(
-                connection_id,
-                request_id,
-                &prepared.outcome,
-                prepared.user_message_capability_attachments.as_slice(),
-            ))
-            .await
-            {
-                self.mark_turn_blocked(
-                    prepared.outcome.started_notification.thread_id.clone(),
-                    prepared.outcome.started_notification.turn.id.clone(),
-                    "failed to commit native turn start lifecycle".to_owned(),
-                )
-                .await;
-                return;
+                Err(error) => {
+                    self.send_error(
+                        connection_id,
+                        public_turn_error(
+                            None,
+                            INVALID_REQUEST_CODE,
+                            pioneer_protocol::PublicErrorStage::Delivery,
+                            format!("failed to encode turn/start response: {error}"),
+                        ),
+                    )
+                    .await;
+                }
             }
-            self.dispatch_prepared_api_provider_turn_start(prepared)
-                .await;
+            drop(acceptance);
         })
     }
 
@@ -3072,6 +3094,7 @@ impl MessageProcessor {
         mut params: TurnStartParams,
         requested_reasoning_effort: Option<&str>,
         entry_point: crate::authorization::ExecutionAdmissionEntryPoint,
+        preparation: ApiProviderTurnPreparation,
         mut execution_admission: ExecutionAuthorizationAdmission,
     ) -> Result<ApiProviderTurnAdmission, TurnStartFailure> {
         pioneer_observability::turn_startup::set_runtime(
@@ -3191,6 +3214,11 @@ impl MessageProcessor {
                 params.thread_id.trim(),
                 existing.status
             )));
+        }
+        if matches!(preparation, ApiProviderTurnPreparation::ReplayOnly) {
+            return Err(TurnStartFailure::conflict(
+                "turn admission disappeared during replay",
+            ));
         }
         self.validate_turn_artifact_user_inputs(
             thread.workspace_id.as_str(),
@@ -3548,7 +3576,7 @@ impl MessageProcessor {
                 .await
             {
                 let message = format!("failed to bind admitted root Agent execution: {error:#}");
-                self.mark_turn_blocked(
+                self.block_api_provider_preparation_failure(
                     outcome.materialization.thread.id.clone(),
                     outcome.materialization.turn.id.clone(),
                     message.clone(),
@@ -3566,7 +3594,7 @@ impl MessageProcessor {
             .await
         {
             let message = format!("failed to register execution lease: {error:#}");
-            self.mark_turn_blocked(
+            self.block_api_provider_preparation_failure(
                 outcome.started_notification.thread_id.clone(),
                 outcome.started_notification.turn.id.clone(),
                 message.clone(),
@@ -3584,7 +3612,7 @@ impl MessageProcessor {
             )
             .await
         {
-            self.mark_turn_blocked(
+            self.block_api_provider_preparation_failure(
                 outcome.started_notification.thread_id.clone(),
                 outcome.started_notification.turn.id.clone(),
                 format!("failed to prepare agent thread runtime: {error}"),
@@ -3595,12 +3623,20 @@ impl MessageProcessor {
             )));
         }
 
+        if let Some(generation) = self
+            .agent_manager
+            .thread_generation(&outcome.started_notification.thread_id)
+            .await
+        {
+            foreground_start::note_start_actor(generation);
+        }
+
         if let Err(error) = self
             .ensure_agent_listener_task(outcome.started_notification.thread_id.as_str())
             .await
         {
             let message = format!("failed to activate native durable listener: {error:#}");
-            self.mark_turn_blocked(
+            self.block_api_provider_preparation_failure(
                 outcome.started_notification.thread_id.clone(),
                 outcome.started_notification.turn.id.clone(),
                 message.clone(),
@@ -3625,7 +3661,7 @@ impl MessageProcessor {
             Err(_) => {
                 let message =
                     "Conversation history is unavailable; turn preparation paused".to_owned();
-                self.mark_turn_blocked(
+                self.block_api_provider_preparation_failure(
                     outcome.started_notification.thread_id.clone(),
                     outcome.started_notification.turn.id.clone(),
                     message.clone(),
@@ -3663,7 +3699,7 @@ impl MessageProcessor {
                 } else {
                     format!("failed to load workspace skill policies: {error:#}")
                 };
-                self.mark_turn_blocked(
+                self.block_api_provider_preparation_failure(
                     outcome.started_notification.thread_id.clone(),
                     outcome.started_notification.turn.id.clone(),
                     message.clone(),
@@ -3686,7 +3722,7 @@ impl MessageProcessor {
             {
                 Ok(resolved_artifacts) => resolved_artifacts,
                 Err(error) => {
-                    self.mark_turn_blocked(
+                    self.block_api_provider_preparation_failure(
                         outcome.started_notification.thread_id.clone(),
                         outcome.started_notification.turn.id.clone(),
                         format!("failed to resolve artifact input for provider: {error:#}"),
@@ -3715,7 +3751,7 @@ impl MessageProcessor {
                     runtime_environment.into_iter().collect::<HashMap<_, _>>()
                 }
                 Err(error) => {
-                    self.mark_turn_blocked(
+                    self.block_api_provider_preparation_failure(
                         outcome.started_notification.thread_id.clone(),
                         outcome.started_notification.turn.id.clone(),
                         format!("failed to prepare artifact output directory: {error:#}"),
@@ -3756,7 +3792,7 @@ impl MessageProcessor {
             )
             .await;
         if let Err(error) = snapshot_result {
-            self.mark_turn_blocked(
+            self.block_api_provider_preparation_failure(
                 outcome.started_notification.thread_id.clone(),
                 outcome.started_notification.turn.id.clone(),
                 format!("failed to persist turn runtime snapshot: {error:#}"),
@@ -3770,7 +3806,7 @@ impl MessageProcessor {
             match self.materialized_turn_permission_profile(&outcome.materialization.turn) {
                 Ok(permission_profile) => permission_profile,
                 Err(error) => {
-                    self.mark_turn_blocked(
+                    self.block_api_provider_preparation_failure(
                         outcome.started_notification.thread_id.clone(),
                         outcome.started_notification.turn.id.clone(),
                         format!("failed to resolve turn permission profile: {error:#}"),
@@ -3822,7 +3858,7 @@ impl MessageProcessor {
         prepared: &PreparedApiProviderTurnStart,
         reason: String,
     ) -> bool {
-        self.mark_turn_blocked(
+        self.block_api_provider_preparation_failure(
             prepared.outcome.started_notification.thread_id.clone(),
             prepared.outcome.started_notification.turn.id.clone(),
             reason,
@@ -3830,10 +3866,53 @@ impl MessageProcessor {
         .await
     }
 
+    async fn block_api_provider_preparation_failure(
+        &self,
+        thread: String,
+        turn: String,
+        reason: String,
+    ) -> bool {
+        if foreground_start::preparing_foreground_start() {
+            return false;
+        }
+        self.mark_turn_blocked(thread, turn, reason).await
+    }
+
     pub(super) async fn dispatch_prepared_api_provider_turn_start(
         &self,
         prepared: PreparedApiProviderTurnStart,
-    ) {
+    ) -> Result<(), ApiProviderTurnDispatchFailure> {
+        self.dispatch_prepared_api_provider_turn_start_current(prepared, None)
+            .await
+            .map(|_| ())
+    }
+
+    async fn dispatch_prepared_api_provider_turn_start_current(
+        &self,
+        prepared: PreparedApiProviderTurnStart,
+        source: Option<(&pioneer_crud::TurnExecutionRecord, u64)>,
+    ) -> Result<Option<pioneer_agent::AgentStartReceipt>, ApiProviderTurnDispatchFailure> {
+        let expected = source.map(|(execution, _)| execution);
+        if let Some(expected) = expected {
+            // Stop/fast terminal may have won before the actor was activated.
+            if self
+                .crud_store
+                .native_turn_has_accepted_terminal(&expected.turn_id)
+                .await
+                .map_err(ApiProviderTurnDispatchFailure::OwnershipPersistence)?
+            {
+                return Ok(None);
+            }
+        }
+        #[cfg(test)]
+        if expected.is_some() {
+            self.completed_history_preparation_barrier
+                .wait_if_armed(
+                    "__foreground_start_after_terminal_precheck__",
+                    &tokio_util::sync::CancellationToken::new(),
+                )
+                .await;
+        }
         let outcome = prepared.outcome;
         let plugin_launch = match self
             .acquire_plugin_launch_guards(
@@ -3872,10 +3951,27 @@ impl MessageProcessor {
                 prepared.effective_reasoning_effort.as_deref(),
                 prepared.permission_profile,
                 prepared.execution_security_snapshot,
+                source.map(|(_, generation)| generation),
             )
             .await;
         drop(plugin_launch);
         if let Err(error) = start_result {
+            if let Some(expected) = expected {
+                // Stop can retire the actor after our pre-dispatch check. Its
+                // canonical terminal is still accepted intent, not a new start.
+                if self
+                    .crud_store
+                    .native_turn_has_accepted_terminal(&expected.turn_id)
+                    .await
+                    .map_err(ApiProviderTurnDispatchFailure::OwnershipPersistence)?
+                {
+                    return Ok(None);
+                }
+                // The startup owner revalidates its exact durable generation
+                // before recording recovery, including indeterminate actor ACKs.
+                return Err(ApiProviderTurnDispatchFailure::ActorStart(error));
+            }
+
             let reason = format!("failed to dispatch turn to agent runtime: {error}");
             if !self
                 .report_turn_failure(
@@ -3893,26 +3989,90 @@ impl MessageProcessor {
                 )
                 .await;
             }
-            return;
+            return Err(ApiProviderTurnDispatchFailure::ActorStart(error));
         }
 
+        let receipt = start_result.expect("successful actor start was checked above");
+        #[cfg(test)]
+        if expected.is_some() {
+            self.completed_history_preparation_barrier
+                .wait_if_armed(
+                    "__foreground_start_after_actor_acceptance__",
+                    &tokio_util::sync::CancellationToken::new(),
+                )
+                .await;
+        }
+        if let Some(expected) = expected {
+            if !self
+                .agent_manager
+                .start_receipt_is_current(&outcome.started_notification.thread_id, &receipt)
+                .await
+                && !self
+                    .crud_store
+                    .native_turn_has_accepted_terminal(&expected.turn_id)
+                    .await
+                    .map_err(ApiProviderTurnDispatchFailure::OwnershipPersistence)?
+            {
+                return Err(ApiProviderTurnDispatchFailure::RunningOwnershipNotConfirmed);
+            }
+        }
         let now = now_timestamp_secs();
-        let ownership_started = self
-            .crud_store
-            .mark_turn_execution_running_owned(
-                outcome.started_notification.turn.id.as_str(),
-                self.turn_execution_owner_id.as_ref(),
-                now,
-                now.saturating_add(super::TURN_EXECUTION_OWNER_LEASE_SECONDS),
-            )
-            .await;
+        let ownership_started = if let Some(expected) = expected {
+            self.crud_store
+                .mark_turn_execution_running_current(
+                    expected,
+                    super::TURN_EXECUTION_OWNER_LEASE_SECONDS,
+                )
+                .await
+        } else {
+            self.crud_store
+                .mark_turn_execution_running_owned(
+                    outcome.started_notification.turn.id.as_str(),
+                    self.turn_execution_owner_id.as_ref(),
+                    now,
+                    now.saturating_add(super::TURN_EXECUTION_OWNER_LEASE_SECONDS),
+                )
+                .await
+        };
         if !matches!(ownership_started, Ok(true)) {
-            let reason = match ownership_started {
-                Ok(false) => {
-                    "Turn execution ownership changed before native dispatch completed".to_owned()
+            if let Some(expected) = expected {
+                if matches!(ownership_started, Ok(false))
+                    && self
+                        .crud_store
+                        .native_turn_has_accepted_terminal(&expected.turn_id)
+                        .await
+                        .map_err(ApiProviderTurnDispatchFailure::OwnershipPersistence)?
+                {
+                    return Ok(Some(receipt));
                 }
+                // A replacement must never be cancelled through its current
+                // thread lookup, nor assigned failure by the previous owner.
+                let _ = self
+                    .agent_manager
+                    .cancel_started_turn(
+                        &outcome.started_notification.thread_id,
+                        &receipt,
+                        "initial startup ownership was not confirmed",
+                        Some((&expected.owner_id, expected.owner_generation)),
+                    )
+                    .await;
+                return Err(match ownership_started {
+                    Err(error) => ApiProviderTurnDispatchFailure::OwnershipPersistence(error),
+                    _ => ApiProviderTurnDispatchFailure::RunningOwnershipNotConfirmed,
+                });
+            }
+            let (failure, reason) = match ownership_started {
+                Ok(false) => (
+                    ApiProviderTurnDispatchFailure::RunningOwnershipNotConfirmed,
+                    "Turn execution ownership changed before native dispatch completed".to_owned(),
+                ),
                 Err(error) => {
-                    format!("failed to persist native Turn execution ownership: {error:#}")
+                    let reason =
+                        format!("failed to persist native Turn execution ownership: {error:#}");
+                    (
+                        ApiProviderTurnDispatchFailure::OwnershipPersistence(error),
+                        reason,
+                    )
                 }
                 Ok(true) => unreachable!(),
             };
@@ -3940,7 +4100,23 @@ impl MessageProcessor {
                 )
                 .await;
             }
+            return Err(failure);
         }
+        if let Some(expected) = expected {
+            if !self
+                .agent_manager
+                .start_receipt_is_current(&outcome.started_notification.thread_id, &receipt)
+                .await
+                && !self
+                    .crud_store
+                    .native_turn_has_accepted_terminal(&expected.turn_id)
+                    .await
+                    .map_err(ApiProviderTurnDispatchFailure::OwnershipPersistence)?
+            {
+                return Err(ApiProviderTurnDispatchFailure::RunningOwnershipNotConfirmed);
+            }
+        }
+        Ok(Some(receipt))
     }
 
     /// Builds the ordinary API-provider runtime payload for a agent domain
@@ -12190,6 +12366,9 @@ impl MessageProcessor {
         request_id: RequestId,
         response_payload: TurnCancelResponse,
     ) {
+        self.foreground_starts
+            .before_turn_snapshot(&response_payload.thread_id, &response_payload.turn.id)
+            .await;
         let response = match JsonRpcResponse::from_result(request_id, &response_payload) {
             Ok(response) => response,
             Err(error) => {
@@ -12506,6 +12685,9 @@ impl MessageProcessor {
             }
         };
 
+        self.foreground_starts
+            .before_turn_snapshot(&thread_id, &turn_id)
+            .await;
         let response = match JsonRpcResponse::from_result(
             request_id,
             &TurnResumeResponse {
@@ -12642,6 +12824,9 @@ impl MessageProcessor {
             .set_connection_workspace(connection_id, Some(result.workspace_id.clone()))
             .await;
 
+        self.foreground_starts
+            .before_turn_snapshot(&params.thread_id, &params.turn_id)
+            .await;
         let response = match JsonRpcResponse::from_result(request_id, &result) {
             Ok(response) => response,
             Err(error) => {
@@ -12851,6 +13036,9 @@ impl MessageProcessor {
             .set_connection_workspace(connection_id, Some(result.workspace_id.clone()))
             .await;
 
+        self.foreground_starts
+            .before_turn_snapshot(&params.thread_id, &params.turn_id)
+            .await;
         let response = match JsonRpcResponse::from_result(request_id, &result) {
             Ok(response) => response,
             Err(error) => {
