@@ -17,6 +17,7 @@ struct Fixture {
     workspace: String,
     rx: OutboundTestReceiver,
     outbound: crate::session::SessionOutbound,
+    producer_rx: Option<OutboundTestReceiver>,
     responder: tokio::sync::oneshot::Receiver<pioneer_tools::PermissionApprovalResolution>,
 }
 impl Fixture {
@@ -87,7 +88,25 @@ impl Fixture {
             workspace,
             rx,
             outbound,
+            producer_rx: None,
             responder,
+        }
+    }
+
+    async fn use_member_observer(&mut self) {
+        materialize_test_member_collaborator(&self.processor.crud_store, &self.workspace, THREAD)
+            .await;
+        let (outbound, rx) = outbound_channel(128);
+        self.connection = self
+            .processor
+            .session_manager
+            .register_connection(outbound.clone(), authenticated_test_member_collaborator())
+            .await
+            .unwrap();
+        self.outbound = outbound;
+        let previous = std::mem::replace(&mut self.rx, rx);
+        if self.producer_rx.is_none() {
+            self.producer_rx = Some(previous);
         }
     }
 
@@ -609,4 +628,321 @@ async fn repeated_rotation_exhausts_bounded_delivery_and_forces_recoverable_sock
     })
     .await
     .expect("bounded rotation watchdog");
+}
+
+/// The fault is in the actual resource-authorization future, before recipient
+/// selection/serialization/Session enqueue. It never supplies a delivery result.
+pub(super) fn pause_auth_unavailable(
+    processor: &MessageProcessor,
+    connection: ConnectionId,
+    method: &'static str,
+    thread_id: &str,
+    skip: usize,
+) -> (
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    let (entered, waiting) = tokio::sync::oneshot::channel();
+    let (release, released) = tokio::sync::oneshot::channel();
+    *processor.execution_auth_fault.lock().unwrap() =
+        Some(super::super::notifications::ExecutionAuthFault {
+            connection,
+            method,
+            thread_id: thread_id.to_owned(),
+            skip,
+            entered,
+            release: released,
+        });
+    (waiting, release)
+}
+
+#[tokio::test]
+async fn native_authorization_unavailable_cannot_complete_a_live_lost_replay() {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        // All three resource passes; restart orphan shares the real durable path.
+        for (orphan, pass) in [(false, 0), (false, 1), (false, 2), (true, 2)] {
+            let mut f = Fixture::new(orphan).await;
+            f.use_member_observer().await;
+            let (entered, release) = pause_auth_unavailable(
+                &f.processor,
+                f.connection,
+                events::TURN_PERMISSION_REQUEST_OPENED,
+                THREAD,
+                pass,
+            );
+            let (id, mut opening) = f.open("authunavailable").await;
+            entered.await.unwrap();
+            opening.join().await.unwrap();
+            recv_response_by_id(&mut f.rx, &id).await;
+            recv_notification_by_method(&mut f.rx, events::THREAD_STARTED).await;
+            release.send(()).unwrap();
+            f.processor
+                .session_manager
+                .drain_thread_replays(f.connection)
+                .await;
+            f.outbound.writer_stopped().await;
+            assert!(
+                f.outbound
+                    .try_send_data(Message::Text("lost replay cannot stay live".into()))
+                    .is_err()
+            );
+            while let Ok(Message::Text(text)) = f.rx.try_recv() {
+                let frame: JsonValue = serde_json::from_str(&text).unwrap();
+                assert_ne!(frame["method"], events::TURN_PERMISSION_REQUEST_OPENED);
+            }
+            let stored = f
+                .processor
+                .crud_store
+                .get_cli_runtime_pending_request(REQUEST)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                stored.status,
+                pioneer_crud::CliRuntimePendingRequestStatus::Pending
+            );
+            if !orphan {
+                assert!(matches!(
+                    f.responder.try_recv(),
+                    Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+                ));
+            }
+            // A completed replay flag cannot justify another successful reply
+            // on the sealed socket. Recovery must establish a new incarnation.
+            let (repeat, mut repeated) = f.open("authlostdedup").await;
+            repeated.join().await.unwrap();
+            while let Ok(Message::Text(text)) = f.rx.try_recv() {
+                let frame: JsonValue = serde_json::from_str(&text).unwrap();
+                assert!(!(frame["id"] == repeat && frame.get("result").is_some()));
+            }
+            let old = f
+                .processor
+                .thread_manager
+                .subscription_incarnation(f.connection, THREAD)
+                .await
+                .unwrap();
+            f.processor
+                .session_manager
+                .unregister_connection(f.connection)
+                .await;
+            f.processor
+                .thread_manager
+                .connection_closed(f.connection)
+                .await;
+            f.use_member_observer().await;
+            let (id, mut reopening) = f.open("authrecovered").await;
+            reopening.join().await.unwrap();
+            recv_response_by_id(&mut f.rx, &id).await;
+            recv_notification_by_method(&mut f.rx, events::THREAD_STARTED).await;
+            let opened =
+                recv_notification_by_method(&mut f.rx, events::TURN_PERMISSION_REQUEST_OPENED)
+                    .await;
+            assert_eq!(opened.params.unwrap()["request"]["request_id"], REQUEST);
+            f.processor
+                .session_manager
+                .drain_thread_replays(f.connection)
+                .await;
+            assert!(!Arc::ptr_eq(
+                &old,
+                &f.processor
+                    .thread_manager
+                    .subscription_incarnation(f.connection, THREAD)
+                    .await
+                    .unwrap()
+            ));
+        }
+    })
+    .await
+    .expect("resource authorization replay watchdog");
+}
+
+#[tokio::test]
+async fn native_live_typed_terminal_auth_unavailable_requires_recovery_instead_of_lost_card() {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let mut f = Fixture::new(false).await;
+        let responder_connection = f.connection;
+        f.use_member_observer().await;
+        let (id, mut opening) = f.open("terminalauth").await;
+        opening.join().await.unwrap();
+        recv_response_by_id(&mut f.rx, &id).await;
+        recv_notification_by_method(&mut f.rx, events::THREAD_STARTED).await;
+        let opened =
+            recv_notification_by_method(&mut f.rx, events::TURN_PERMISSION_REQUEST_OPENED).await;
+        assert_eq!(opened.params.unwrap()["request"]["request_id"], REQUEST);
+        f.processor
+            .session_manager
+            .drain_thread_replays(f.connection)
+            .await;
+        let (entered, release) = pause_auth_unavailable(
+            &f.processor,
+            f.connection,
+            events::TURN_PERMISSION_REQUEST_RESOLVED,
+            THREAD,
+            2,
+        );
+        let context = f
+            .processor
+            .session_manager
+            .connection_context(responder_connection)
+            .await
+            .unwrap();
+        let id = generate_test_request_id("postopen", "terminalauthresolve");
+        let mut resolving = f.processor.clone().start_owned_request(
+            context,
+            json!({
+                "jsonrpc":"2.0", "id":id, "method":"turn/permission/request/respond",
+                "params":{"request_id":REQUEST,"resolution":"allow_once"}
+            })
+            .to_string(),
+        );
+        entered.await.unwrap();
+        release.send(()).unwrap();
+        resolving.join().await.unwrap();
+        f.outbound.writer_stopped().await;
+        assert!(
+            f.outbound
+                .try_send_data(Message::Text("terminal loss requires reconnect".into()))
+                .is_err()
+        );
+        assert!(
+            f.rx.try_recv().is_err(),
+            "no falsely delivered terminal frame"
+        );
+        assert_eq!(
+            (&mut f.responder).await.unwrap(),
+            pioneer_tools::PermissionApprovalResolution::AllowOnce
+        );
+        let stored = f
+            .processor
+            .crud_store
+            .get_cli_runtime_pending_request(REQUEST)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(
+            stored.status,
+            pioneer_crud::CliRuntimePendingRequestStatus::Pending
+        );
+        assert!(stored.response_json.unwrap().contains("allow_once"));
+        // Delivery recovery does not rewrite the terminal into Expired or cancel
+        // accepted execution; the authoritative reconnect set has no pending P.
+        f.processor
+            .session_manager
+            .unregister_connection(f.connection)
+            .await;
+        f.processor
+            .thread_manager
+            .connection_closed(f.connection)
+            .await;
+        let (outbound, rx) = outbound_channel(128);
+        f.connection = f
+            .processor
+            .session_manager
+            .register_connection(outbound.clone(), authenticated_test_member_collaborator())
+            .await
+            .unwrap();
+        f.rx = rx;
+        f.outbound = outbound;
+        let (id, mut reopening) = f.open("terminalauthreconnect").await;
+        reopening.join().await.unwrap();
+        recv_response_by_id(&mut f.rx, &id).await;
+        recv_notification_by_method(&mut f.rx, events::THREAD_STARTED).await;
+        f.processor
+            .session_manager
+            .drain_thread_replays(f.connection)
+            .await;
+        assert!(
+            f.rx.try_recv().is_err(),
+            "resolved P cannot reopen on recovery"
+        );
+    })
+    .await
+    .expect("typed terminal authorization watchdog");
+}
+
+#[tokio::test]
+async fn old_authorization_error_cannot_seal_a_resubscribed_member_socket() {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let mut f = Fixture::new(false).await;
+        f.use_member_observer().await;
+        let (id, mut opening) = f.open("oldauthscope").await;
+        opening.join().await.unwrap();
+        recv_response_by_id(&mut f.rx, &id).await;
+        recv_notification_by_method(&mut f.rx, events::THREAD_STARTED).await;
+        recv_notification_by_method(&mut f.rx, events::TURN_PERMISSION_REQUEST_OPENED).await;
+        f.processor
+            .session_manager
+            .drain_thread_replays(f.connection)
+            .await;
+        let old = f
+            .processor
+            .thread_manager
+            .subscription_incarnation(f.connection, THREAD)
+            .await
+            .unwrap();
+        let (entered, release) = pause_auth_unavailable(
+            &f.processor,
+            f.connection,
+            events::TURN_PERMISSION_REQUEST_OPENED,
+            THREAD,
+            0,
+        );
+        // Deliberately poll a captured producer even after retirement. The
+        // ordinary supervised owner cancels it; this cut independently tests
+        // the final recovery gate rather than relying on cancellation winning.
+        let late =
+            {
+                let processor = f.processor.clone();
+                let workspace = f.workspace.clone();
+                let connection = f.connection;
+                tokio::spawn(async move {
+                    old.run(processor.replay_native_permission_requests_for_thread(
+                        connection, &workspace, THREAD,
+                    ))
+                    .await;
+                })
+            };
+        entered.await.unwrap();
+        f.processor
+            .thread_manager
+            .thread_unsubscribe(f.connection, THREAD)
+            .await;
+        let (id, mut replacement) = f.open("newauthscope").await;
+        replacement.join().await.unwrap();
+        recv_response_by_id(&mut f.rx, &id).await;
+        recv_notification_by_method(&mut f.rx, events::THREAD_STARTED).await;
+        recv_notification_by_method(&mut f.rx, events::TURN_PERMISSION_REQUEST_OPENED).await;
+        f.processor
+            .session_manager
+            .drain_thread_replays(f.connection)
+            .await;
+        release.send(()).unwrap();
+        late.await.unwrap();
+        assert!(
+            f.rx.try_recv().is_err(),
+            "retired error cannot enqueue an old frame"
+        );
+        f.outbound
+            .try_send_data(Message::Text("replacement healthy".into()))
+            .unwrap();
+        assert!(
+            matches!(f.rx.recv().await, Some(Message::Text(text)) if text == "replacement healthy")
+        );
+        assert_eq!(
+            f.processor
+                .crud_store
+                .get_cli_runtime_pending_request(REQUEST)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            pioneer_crud::CliRuntimePendingRequestStatus::Pending
+        );
+        assert!(matches!(
+            f.responder.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+    })
+    .await
+    .expect("old authorization recovery watchdog");
 }

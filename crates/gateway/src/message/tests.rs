@@ -57792,6 +57792,89 @@ async fn cli_runtime_grandchild_request_replays_into_root_capsule_and_resolves_f
         vec![child_thread_id.to_owned(), root_thread_id.to_owned()]
     );
 
+    // A failed resource check in the ancestor replay's second pass must
+    // recover, rather than deduplicate a pending request nobody received.
+    let (unavailable_tx, mut unavailable_rx) = crate::session::test_support::outbound_channel(32);
+    let unavailable_outbound = unavailable_tx.clone();
+    let unavailable_connection = session_manager
+        .register_connection(unavailable_tx, authenticated_test_member_collaborator())
+        .await
+        .unwrap();
+    let (auth_entered, auth_release) = post_open_replay::pause_auth_unavailable(
+        &processor,
+        unavailable_connection,
+        events::CLI_RUNTIME_REQUEST_OPENED,
+        root_thread_id,
+        1,
+    );
+    let unavailable_open = generate_test_request_id("cliancestor", "authunavailable");
+    processor.process_request_for_connection(unavailable_connection, &json!({
+        "jsonrpc":"2.0", "id":unavailable_open, "method":"thread/open", "params":{"thread_id":root_thread_id}
+    }).to_string()).await;
+    tokio::time::timeout(Duration::from_secs(10), auth_entered)
+        .await
+        .unwrap()
+        .unwrap();
+    recv_response_by_id(&mut unavailable_rx, &unavailable_open).await;
+    recv_notification_by_method(&mut unavailable_rx, events::THREAD_STARTED).await;
+    auth_release.send(()).unwrap();
+    session_manager
+        .drain_thread_replays(unavailable_connection)
+        .await;
+    unavailable_outbound.writer_stopped().await;
+    assert!(
+        unavailable_outbound
+            .try_send_data(Message::Text("requires recovery".into()))
+            .is_err()
+    );
+    assert!(unavailable_rx.try_recv().is_err());
+    assert_eq!(
+        crud_store
+            .get_cli_runtime_pending_request(&pending_request_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        pioneer_crud::CliRuntimePendingRequestStatus::Pending
+    );
+    session_manager
+        .unregister_connection(unavailable_connection)
+        .await;
+    processor
+        .thread_manager
+        .connection_closed(unavailable_connection)
+        .await;
+    let (recovered_tx, mut recovered_rx) = crate::session::test_support::outbound_channel(32);
+    let recovered_connection = session_manager
+        .register_connection(recovered_tx, authenticated_test_member_collaborator())
+        .await
+        .unwrap();
+    let recovered_open = generate_test_request_id("cliancestor", "authrecovered");
+    processor.process_request_for_connection(recovered_connection, &json!({
+        "jsonrpc":"2.0", "id":recovered_open, "method":"thread/open", "params":{"thread_id":root_thread_id}
+    }).to_string()).await;
+    recv_response_by_id(&mut recovered_rx, &recovered_open).await;
+    recv_notification_by_method(&mut recovered_rx, events::THREAD_STARTED).await;
+    let recovered_pending =
+        recv_notification_by_method(&mut recovered_rx, events::CLI_RUNTIME_REQUEST_OPENED).await;
+    let recovered_pending: CLIRuntimeRequestOpenedNotification =
+        serde_json::from_value(recovered_pending.params.unwrap()).unwrap();
+    assert_eq!(recovered_pending.request_id, pending_request_id);
+    assert_eq!(
+        recovered_pending.visible_thread_ids,
+        vec![child_thread_id.to_owned(), root_thread_id.to_owned()]
+    );
+    session_manager
+        .drain_thread_replays(recovered_connection)
+        .await;
+    session_manager
+        .unregister_connection(recovered_connection)
+        .await;
+    processor
+        .thread_manager
+        .connection_closed(recovered_connection)
+        .await;
+
     let (racing_tx, mut racing_rx) = crate::session::test_support::outbound_channel(32);
     let racing_connection = session_manager
         .register_connection(racing_tx, authenticated_test_member_collaborator())
