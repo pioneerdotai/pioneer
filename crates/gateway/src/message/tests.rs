@@ -1887,7 +1887,7 @@ async fn plugins_list_and_details_preserve_native_member_disclosure() {
         "plugin-disclosure-thread",
     )
     .await;
-    let (tx, mut member_rx) = mpsc::channel(32);
+    let (tx, mut member_rx) = crate::session::test_support::outbound_channel(32);
     let member_connection = harness
         .processor
         .session_manager
@@ -88937,7 +88937,7 @@ mod memory_post_turn_recovery;
 
 #[tokio::test]
 async fn captured_descendant_stop_deadline_is_propagated_and_same_owner_can_retry() {
-    let (tx, mut rx) = mpsc::channel(64);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(64);
     let sessions = Arc::new(SessionManager::new());
     let connection = register_authenticated_test_connection(sessions.as_ref(), tx).await;
     let (workspaces, store, workspace) = setup_workspace_manager().await;
@@ -89003,7 +89003,7 @@ async fn captured_descendant_stop_deadline_is_propagated_and_same_owner_can_retr
 
 #[tokio::test]
 async fn graph_snapshot_matches_revision_runs_and_rejects_foreign_or_unknown() {
-    let (tx, mut rx) = mpsc::channel(64);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(64);
     let sessions = Arc::new(SessionManager::new());
     let connection = register_authenticated_test_connection(sessions.as_ref(), tx).await;
     let (workspaces, store, workspace) = setup_workspace_manager().await;
@@ -89211,7 +89211,7 @@ async fn graph_snapshot_matches_revision_runs_and_rejects_foreign_or_unknown() {
 
 #[tokio::test]
 async fn persisted_interrupted_turn_cannot_hide_accepted_direct_checkpoint_startup() {
-    let (tx, mut rx) = mpsc::channel(64);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(64);
     let sessions = Arc::new(SessionManager::new());
     let connection = register_authenticated_test_connection(sessions.as_ref(), tx).await;
     let (workspaces, store, workspace) = setup_workspace_manager().await;
