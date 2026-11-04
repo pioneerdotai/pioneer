@@ -20,6 +20,8 @@ pub(crate) struct Progress {
     finished: [bool; 2],
     io_seeded: bool,
     revisit: bool,
+    // Includes fallback witness preparation, which advances before physical IO.
+    retry_debt: bool,
 }
 
 async fn settle(
@@ -122,6 +124,26 @@ pub(crate) async fn quantum(
     service: &ArtifactService,
     progress: &mut Progress,
 ) -> anyhow::Result<bool> {
+    let result = pass_quantum(store, service, progress).await;
+    if progress.retry_debt && progress.finished[0] {
+        // Only fallback witness owns this debt. Rewind it at its own EOF,
+        // independently of preview Deferred, blocked recovery and queue backlog.
+        progress.witness_after = Default::default();
+        progress.witness_upper = None;
+        progress.finished[0] = false;
+        progress.retry_debt = false;
+        if result.is_ok() {
+            anyhow::bail!("HTML witness discovery pass requires retry");
+        }
+    }
+    result
+}
+
+async fn pass_quantum(
+    store: &CrudStore,
+    service: &ArtifactService,
+    progress: &mut Progress,
+) -> anyhow::Result<bool> {
     let store = store.with_maintenance_access();
     // Bounded queue recovery runs even after a lost local wake or restart.
     if progress.blocked_upper.is_none() {
@@ -163,11 +185,15 @@ pub(crate) async fn quantum(
             progress.finished[0] = true;
         }
         if let Some(witness) = witness {
+            let retry_debt = progress.retry_debt;
+            progress.retry_debt = true;
             if let Err(error) =
                 crate::compaction::frozen::prepare_html_preview_archive_witness(&store, &witness)
                     .await
             {
                 witness_error = Some(error);
+            } else {
+                progress.retry_debt = retry_debt;
             }
         }
     }
@@ -185,9 +211,15 @@ pub(crate) async fn quantum(
     // One poison IO row cannot prevent progress of retirement and BlobGC.
     let io_more = io_result?;
     if let Some(error) = witness_error {
+        // IO tickets/claim deadlines already recover queue failures. Only the
+        // legacy fallback advances a local cursor before physical preparation.
         return Err(error);
     }
-    if progress.finished.iter().all(|done| *done) && !blocked_more && progress.revisit {
+    if progress.finished.iter().all(|done| *done)
+        && !blocked_more
+        && progress.revisit
+        && !progress.retry_debt
+    {
         *progress = Progress::default();
         return Ok(true);
     }
@@ -256,14 +288,20 @@ pub(super) async fn run(
                 continue;
             }
         }
-        let pause = match result {
-            Ok(true) => Duration::from_millis(10),
-            Ok(false) => RETRY,
-            Err(_) => {
-                tracing::warn!("HTML preview maintenance deferred; durable work retained");
-                RETRY
+        if result.is_err() || matches!(&result, Ok(false)) {
+            // Error-owned backoff cannot be consumed by our own UNKNOWN wake
+            // after a failed write. Signals remain pending for the next pass.
+            tracing::warn!("HTML preview maintenance deferred; durable work retained");
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => return,
+                _ = pioneer_observability::live::sleeping(RETRY, tokio::time::sleep(RETRY)) => {},
             }
-        };
+            progress.revisit = true;
+            begin = true;
+            continue;
+        }
+        let pause = Duration::from_millis(10);
         let invalidated = tokio::select! {
             biased;
             _ = cancellation.cancelled() => return,

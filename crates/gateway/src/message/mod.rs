@@ -3661,9 +3661,24 @@ impl MessageProcessor {
                 }
                 round_failed |= transient_storage_poll_failed;
                 if more {
+                    let retry_delay = round_failed;
+                    // Queue drains can remain runnable forever. They must not
+                    // pin the cutoff or keep completed discovery phases idle.
+                    // Finish the finite sweep before acknowledging changes so
+                    // a mutation behind any live cursor is rediscovered from
+                    // the head on the next round, even with a busy outbox.
+                    begin_round = ledger_complete
+                        && timeout_complete
+                        && supervision_complete
+                        && cli_stale_complete
+                        && (command_rehydration_after.is_none()
+                            || command_rehydration_retry.is_some());
+                    if begin_round {
+                        round_failed = false;
+                    }
                     drop(maintenance);
                     drop(this);
-                    if round_failed {
+                    if retry_delay {
                         sleep(Duration::from_secs(2)).await;
                     } else {
                         tokio::task::yield_now().await;

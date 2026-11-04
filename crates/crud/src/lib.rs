@@ -17415,14 +17415,20 @@ impl CrudStore {
         expected_next_fire_at: i64,
         now: i64,
     ) -> Result<Option<DueTaskTriggerReconciliation>> {
-        self.run_serialized_write(|| {
-            self.reconcile_due_trigger_for_nonexecuting_task_once(
-                trigger_id.to_owned(),
-                expected_next_fire_at,
-                now,
-            )
-        })
-        .await
+        let change = crate::task_events::TaskWorkChange::new(&self.connection);
+        let result = self
+            .run_serialized_write(|| {
+                self.reconcile_due_trigger_for_nonexecuting_task_once(
+                    trigger_id.to_owned(),
+                    expected_next_fire_at,
+                    now,
+                )
+            })
+            .await;
+        if let Ok(value) = &result {
+            change.completed(value.is_some());
+        }
+        result
     }
 
     pub async fn get_task(&self, task_id: &str) -> Result<Option<TaskGetResponse>> {
@@ -32619,6 +32625,7 @@ impl CrudStore {
         execution_owner_id: &str,
         execution_lease_until_unix: i64,
     ) -> Result<Option<TaskOwnedTurnResumeOutcome>> {
+        let task_change = crate::task_events::TaskWorkChange::new(&self.connection);
         let control_change = self.connection.work_signal("gateway.control").changing();
         let control_result = async {
             let _recovery_change = recovery_wake::RecoveryChange(self.recovery_work.clone());
@@ -33293,10 +33300,9 @@ impl CrudStore {
         }
         .await;
         if let Ok(value) = &control_result {
-            control_change.completed(matches!(
-                value,
-                Some(TaskOwnedTurnResumeOutcome::Resumed { .. })
-            ));
+            let changed = matches!(value, Some(TaskOwnedTurnResumeOutcome::Resumed { .. }));
+            task_change.completed(changed);
+            control_change.completed(changed);
         }
         control_result
     }
@@ -49532,6 +49538,111 @@ mod tests {
         assert_eq!(blocked_job.status, RecoveryJobStatus::Blocked);
     }
 
+    use crate::{
+        AppendedTaskEvent, TASK_EVENT_FANOUT_BYTE_BUDGET, TaskEventFanoutOutcome,
+        TaskEventFanoutPage,
+    };
+
+    // Exercise the durable dispatcher boundary, including claim, decode and ACK.
+    // Callers can park after draining setup, then prove a custom publisher alone
+    // wakes the consumer and makes its newly committed events deliverable.
+    async fn drain_custom_publisher_fanout(store: &CrudStore) -> Vec<AppendedTaskEvent> {
+        let clock = || chrono::Utc::now().timestamp();
+        let mut delivered = Vec::new();
+        for row in store.due_task_event_fanout(clock(), 64).await.unwrap() {
+            let claim = store
+                .claim_task_event_fanout(&row, &clock)
+                .await
+                .unwrap()
+                .unwrap();
+            let after = store
+                .get_task_event_fanout_cursor(&row.task_id)
+                .await
+                .unwrap()
+                .unwrap_or(0);
+            let mut bytes = TASK_EVENT_FANOUT_BYTE_BUDGET;
+            let TaskEventFanoutPage::Prefix { events, .. } = store
+                .task_event_fanout_page(&row.task_id, after, 128, &mut bytes, true)
+                .await
+                .unwrap()
+            else {
+                panic!("small custom publisher fixture must fit its fanout budget")
+            };
+            for event in events {
+                let event = event.unwrap();
+                store
+                    .ack_task_event_fanout(&claim, event.sequence, &clock)
+                    .await
+                    .unwrap();
+                delivered.push(event);
+            }
+            store
+                .release_task_event_fanout(&claim, TaskEventFanoutOutcome::Delivered, &clock)
+                .await
+                .unwrap();
+        }
+        assert!(!store.has_pending_task_event_fanout().await.unwrap());
+        delivered
+    }
+
+    #[tokio::test]
+    async fn nonexecuting_trigger_reconciliation_wakes_fanout_and_noop_stays_parked() {
+        let store = test_store_with_workspace("ws_trigger_custom_publisher").await;
+        let now = 1_700_000_000;
+        let mut task = sample_task(now);
+        task.workspace_id = "ws_trigger_custom_publisher".into();
+        task.status = TaskStatus::Blocked;
+        let trigger = sample_task_trigger(now);
+        store
+            .append_task_events(
+                vec![
+                    TaskEventPayload::TaskCreated { task: task.clone() },
+                    TaskEventPayload::TriggerCreated {
+                        trigger: trigger.clone(),
+                    },
+                ],
+                now,
+            )
+            .await
+            .unwrap();
+        drain_custom_publisher_fanout(&store).await;
+        let database = store.database_connection();
+        let mut fanout = database.work_signal("tasks.fanout").subscribe();
+        fanout.begin_pass(&database).await.unwrap();
+        assert!(futures_util::FutureExt::now_or_never(fanout.wait(None)).is_none());
+        // A stale expectation is an ordinary no-op, not an unknown write.
+        assert!(
+            store
+                .reconcile_due_trigger_for_nonexecuting_task(&trigger.id, now, now + 3600)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(futures_util::FutureExt::now_or_never(fanout.wait(None)).is_none());
+        let outcome = store
+            .reconcile_due_trigger_for_nonexecuting_task(&trigger.id, now + 3600, now + 3600)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome.trigger_status, TaskTriggerStatus::Paused);
+        assert!(futures_util::FutureExt::now_or_never(fanout.wait(None)).is_some());
+        let delivered = drain_custom_publisher_fanout(&store).await;
+        assert_eq!(delivered.len(), 1);
+        assert!(
+            matches!(&delivered[0].payload, TaskEventPayload::TaskRescheduled { trigger, .. }
+            if trigger.status == TaskTriggerStatus::Paused && trigger.next_fire_at.is_none())
+        );
+        fanout.begin_pass(&database).await.unwrap();
+        assert!(
+            store
+                .reconcile_due_trigger_for_nonexecuting_task(&trigger.id, now + 3600, now + 3601)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(futures_util::FutureExt::now_or_never(fanout.wait(None)).is_none());
+    }
+
     #[tokio::test]
     async fn task_owned_blocked_turn_resume_reopens_the_full_aggregate() {
         let store = test_store_with_workspace("ws_task_owned_resume").await;
@@ -49668,6 +49779,11 @@ mod tests {
         .exec(&store.connection)
         .await
         .unwrap();
+        drain_custom_publisher_fanout(&store).await;
+        let database = store.database_connection();
+        let mut fanout = database.work_signal("tasks.fanout").subscribe();
+        fanout.begin_pass(&database).await.unwrap();
+        assert!(futures_util::FutureExt::now_or_never(fanout.wait(None)).is_none());
         let outcome = store
             .resume_task_owned_turn(
                 thread_id,
@@ -49679,6 +49795,33 @@ mod tests {
             )
             .await
             .expect("task-owned resume should commit");
+        assert!(futures_util::FutureExt::now_or_never(fanout.wait(None)).is_some());
+        let delivered = drain_custom_publisher_fanout(&store).await;
+        assert_eq!(delivered.len(), 2);
+        assert!(
+            matches!(&delivered[0].payload, TaskEventPayload::TaskResumed { task: resumed, .. }
+            if resumed.id == task.id)
+        );
+        assert!(
+            matches!(&delivered[1].payload, TaskEventPayload::TaskRecovered { run_id: Some(id), .. }
+            if id == &run.id)
+        );
+        fanout.begin_pass(&database).await.unwrap();
+        assert!(matches!(
+            store
+                .resume_task_owned_turn(
+                    thread_id,
+                    turn_id,
+                    Some(job.id.as_str()),
+                    timestamp + 7,
+                    "test-owner",
+                    timestamp + 52
+                )
+                .await
+                .unwrap(),
+            Some(TaskOwnedTurnResumeOutcome::NotFound)
+        ));
+        assert!(futures_util::FutureExt::now_or_never(fanout.wait(None)).is_none());
         let TaskOwnedTurnResumeOutcome::Resumed {
             task: resumed_task,
             run: resumed_run,

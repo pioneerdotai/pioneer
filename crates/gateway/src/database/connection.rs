@@ -330,7 +330,13 @@ fn configure_observability(
     max_connections: u32,
     query_fingerprints: Arc<QueryFingerprintLimiter>,
 ) {
+    // SeaORM's callback belongs to the connection wrapper, not the SQLx pool.
+    // Keep this anchor there; the global metrics registry must not own a pool
+    // (and hence its native writer ownership) after bootstrap is discarded.
+    let pool_lifetime = Arc::new(connection.get_sqlite_connection_pool().clone());
+    let observed_pool = Arc::downgrade(&pool_lifetime);
     connection.set_metric_callback(move |info| {
+        let _pool_lifetime = &pool_lifetime;
         let (enabled, generation) = pioneer_observability::telemetry_consent_snapshot();
         if !enabled {
             return;
@@ -365,13 +371,17 @@ fn configure_observability(
             Some(generation),
         );
     });
-    let pool = connection.get_sqlite_connection_pool().clone();
     pioneer_observability::register_database_pool_observer(
         role,
         u64::from(max_connections),
-        move || pioneer_observability::DatabasePoolSnapshot {
-            size: u64::from(pool.size()),
-            idle: u64::try_from(pool.num_idle()).unwrap_or(u64::MAX),
+        move || {
+            let Some(pool) = observed_pool.upgrade() else {
+                return pioneer_observability::DatabasePoolSnapshot { size: 0, idle: 0 };
+            };
+            pioneer_observability::DatabasePoolSnapshot {
+                size: u64::from(pool.size()),
+                idle: u64::try_from(pool.num_idle()).unwrap_or(u64::MAX),
+            }
         },
     );
 }
@@ -724,6 +734,84 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["select payload from turn_event where sequence=? and id=?"]
         );
+    }
+
+    // Unlike explicit close, bootstrap error/cancellation and discarded task
+    // output must release ownership through pool Drop with metrics registered.
+    #[tokio::test]
+    async fn observed_bootstrap_pool_drops_on_error_cancel_and_discard() {
+        pioneer_observability::init_otlp_observability(
+            pioneer_observability::OtlpTelemetryConfig {
+                metrics_endpoint: "http://127.0.0.1:9/v1/metrics".into(),
+                traces_endpoint: "http://127.0.0.1:9/v1/traces".into(),
+                export_interval: std::time::Duration::from_secs(900),
+                export_timeout: std::time::Duration::from_millis(100),
+                deployment_environment: None,
+                service_version: None,
+            },
+        )
+        .unwrap();
+        assert!(
+            pioneer_observability::register_database_pool_observer(
+                pioneer_observability::DatabaseRole::Writer,
+                1,
+                || pioneer_observability::DatabasePoolSnapshot { size: 0, idle: 0 },
+            ),
+            "the regression requires an active observer registry"
+        );
+        for mode in 0..3 {
+            let runtime = tempfile::tempdir().unwrap();
+            let mut config = pioneer_config::AppConfig::load().unwrap();
+            config.gateway.database.file_name = format!("observed-bootstrap-{mode}.db");
+            let path = super::gateway_database_path(runtime.path(), &config).unwrap();
+            let home = runtime.path().to_owned();
+            let (ready, initialized) = tokio::sync::oneshot::channel();
+            let (release, released) = tokio::sync::oneshot::channel();
+            let task = tokio::spawn(async move {
+                let database = super::initialize(&home, &config).await?;
+                ready.send(()).unwrap();
+                let _ = released.await;
+                if mode == 0 {
+                    anyhow::bail!("bootstrap caller rejected initialized pools");
+                }
+                Ok::<_, anyhow::Error>(database)
+            });
+            initialized.await.unwrap();
+            assert!(pioneer_sqlite::WriterOwnership::acquire(&path).is_err());
+            match mode {
+                0 => {
+                    release.send(()).unwrap();
+                    assert!(task.await.unwrap().is_err());
+                }
+                1 => {
+                    task.abort();
+                    assert!(task.await.unwrap_err().is_cancelled());
+                    drop(release);
+                }
+                _ => {
+                    drop(task);
+                    release.send(()).unwrap();
+                }
+            }
+            // Native dispatched work may still be finishing; never force-unlock
+            // it. The owner must disappear naturally without explicit close.
+            let ownership = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                loop {
+                    match pioneer_sqlite::WriterOwnership::acquire(&path) {
+                        Ok(owner) => break owner,
+                        Err(error)
+                            if error.downcast_ref::<pioneer_sqlite::WriterBusy>().is_some() =>
+                        {
+                            tokio::task::yield_now().await
+                        }
+                        Err(error) => panic!("unexpected reopen failure: {error:#}"),
+                    }
+                }
+            })
+            .await
+            .expect("observer must not retain a writer without Gateway");
+            drop(ownership);
+        }
     }
 
     #[tokio::test]

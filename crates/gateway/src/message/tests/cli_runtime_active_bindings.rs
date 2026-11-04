@@ -60,8 +60,13 @@ async fn has_recovery(store: &CrudStore, id: &str) -> bool {
 
 // Timeout discovery has completed before a deadline matures. Another finite
 // source still needs a second portion; its later clock must not erase the wake.
+// A busy action outbox must also permit fresh timeout/supervision rounds before
+// the outbox empties. The previous test with only a finite CLI tail missed this.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn control_owner_keeps_deadline_that_matures_between_portions() {
+    use pioneer_entity::{agent_action, agent_action_outbox as outbox, agent_identity};
+    use sea_orm::Set;
+
     let (processor, _, _rx, workspace, store, _session) = cli_runtime_approval_processor().await;
     binding::Entity::delete_many()
         .exec(&store.database_connection())
@@ -79,6 +84,43 @@ async fn control_owner_keeps_deadline_that_matures_between_portions() {
         )
         .await;
     }
+    // Use the same FK-backed owner/action shape as agent_action_outbox's
+    // outbox_fixture. The execution references an existing workspace identity;
+    // each outbox row below gets its own committed action.
+    let database = store.database_connection();
+    let identity = agent_identity::Entity::find()
+        .filter(agent_identity::Column::WorkspaceId.eq(&workspace))
+        .one(&database)
+        .await
+        .unwrap()
+        .unwrap();
+    let owner = "E00000000000000000008";
+    pioneer_crud::insert_agent_execution(
+        &database,
+        &pioneer_crud::AgentExecutionInput {
+            id: owner.into(),
+            workspace_id: workspace.clone(),
+            agent_identity_id: identity.id,
+            identity_source_revision: identity.source_revision,
+            identity_source_fingerprint: identity.source_fingerprint,
+            parent_execution_id: None,
+            parent_task_id: None,
+            parent_thread_id: None,
+            home_root_thread_id: "thread_cli_command_approval".into(),
+            work_graph_root_execution_id: owner.into(),
+            requested_identity_selection_json: "{}".into(),
+            requested_profile_selection_json: "{}".into(),
+            resolved_profile_id: None,
+            resolved_profile_fingerprint: None,
+            presentation_snapshot_id: None,
+            authorization_context_fingerprint: "fixture".into(),
+            execution_generation: 1,
+            status: "running".into(),
+            now: at,
+        },
+    )
+    .await
+    .unwrap();
     let target = "cutoff_deadline_target";
     materialize_cli_runtime_turn_with_text(&store, &workspace, target, target, "timeout").await;
     let now = now_timestamp_secs();
@@ -111,19 +153,88 @@ async fn control_owner_keeps_deadline_that_matures_between_portions() {
             now_timestamp_secs() < due,
             "the first timeout phase must precede the deadline"
         );
+        // Persist invalid detached envelopes: dispatch rejects them locally,
+        // with no provider or runtime needed. Twelve raw claim quanta keep the
+        // real outbox runnable throughout the observations below.
+        for batch in 0..12 {
+            agent_action::Entity::insert_many((0..32).map(|row| {
+                let id = format!("A{:020}", batch * 32 + row);
+                agent_action::ActiveModel {
+                    id: Set(id.clone()),
+                    execution_id: Set(owner.into()),
+                    action_kind: Set("send_message".into()),
+                    idempotency_key: Set(id),
+                    request_fingerprint: Set("fixture".into()),
+                    status: Set("committed".into()),
+                    created_at: Set(at),
+                    committed_at: Set(Some(at)),
+                    response_json: Set(Some("{}".into())),
+                }
+            }))
+            .exec(&database)
+            .await
+            .unwrap();
+            outbox::Entity::insert_many((0..32).map(|row| outbox::ActiveModel {
+                id: Set(format!("O{:020}", batch * 32 + row)),
+                action_id: Set(format!("A{:020}", batch * 32 + row)),
+                owner_execution_id: Set(owner.into()),
+                payload_json: Set(r#"{"execution_mode":"detached_task","kind":"invalid"}"#.into()),
+                status: Set("pending".into()),
+                attempts: Set(0),
+                next_attempt_at: Set(None),
+                delivered_at: Set(None),
+                last_error: Set(None),
+                created_at: Set(at),
+            }))
+            .exec(&database)
+            .await
+            .unwrap();
+        }
         while now_timestamp_secs() <= due {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        processor.release_completed_history_preparation_barrier();
-        // No client or producer writes after release. The preserved timeout
-        // head must start a new pass, which establishes durable recovery.
-        tokio::time::timeout(Duration::from_secs(4), async {
-            while !has_recovery(&store, target).await {
-                tokio::time::sleep(Duration::from_millis(10)).await;
+        // No producer writes or signal injection after release. Observe up to
+        // eight real quanta, keeping the existing phase barrier armed so the
+        // backlog cannot drain before we inspect durable recovery.
+        for quantum in 0..8u64 {
+            processor.arm_completed_history_preparation_barrier("__control_after_timeout_phase__");
+            processor.release_completed_history_preparation_barrier();
+            processor
+                .wait_for_completed_history_preparation_barrier()
+                .await;
+            // Every claimed row must have reached the expected terminal ACK,
+            // rather than a storage error, a retained lease or retry backoff.
+            assert_eq!(
+                outbox::Entity::find()
+                    .filter(outbox::Column::OwnerExecutionId.eq(owner))
+                    .filter(outbox::Column::Status.eq("failed"))
+                    .filter(outbox::Column::LastError.eq(
+                        pioneer_crud::AgentActionOutboxFailure::InvalidDetachedBinding.safe_name()
+                    ))
+                    .filter(outbox::Column::Attempts.eq(1))
+                    .filter(outbox::Column::NextAttemptAt.is_null())
+                    .filter(outbox::Column::DeliveredAt.is_null())
+                    .count(&database)
+                    .await
+                    .unwrap(),
+                32 * (quantum + 1),
+                "a full claim quantum must be rejected as InvalidBinding without retry"
+            );
+            assert!(
+                outbox::Entity::find()
+                    .filter(outbox::Column::OwnerExecutionId.eq(owner))
+                    .filter(outbox::Column::Status.eq("pending"))
+                    .count(&database)
+                    .await
+                    .unwrap()
+                    >= 32,
+                "the outbox must still supply another full claim quantum"
+            );
+            if has_recovery(&store, target).await {
+                return;
             }
-        })
-        .await
-        .expect("a matured deadline must survive the later portion's clock");
+        }
+        panic!("a matured timeout must establish durable recovery while backlog remains");
     })
     .await;
     processor.release_completed_history_preparation_barrier();

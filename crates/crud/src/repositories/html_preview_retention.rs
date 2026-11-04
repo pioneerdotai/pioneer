@@ -722,13 +722,15 @@ pub struct HtmlPreviewRetentionProgress {
     input_after: String,
     phase: usize,
     idle: [bool; 3],
+    // Legacy input EOF cannot publish completion after skipping a failed row.
+    input_retry_debt: bool,
     // Frozen index, legacy inputs and artifact IDs each own a finite pass.
     // A producer cannot extend an active suffix and postpone wrap forever.
     upper: [Option<String>; 3],
 }
 impl HtmlPreviewRetentionProgress {
     /// Returns false at discovery EOF. Errors do not pin the cursor to poison
-    /// data; the existing maintenance owner revisits every pass/restart.
+    /// data; the maintenance owner must retain retry debt through pass EOF.
     pub async fn quantum(&mut self, store: &CrudStore) -> Result<bool> {
         while self.idle[self.phase] {
             self.phase = (self.phase + 1) % 3;
@@ -767,15 +769,25 @@ impl HtmlPreviewRetentionProgress {
                 .await?
             }
             1 => {
-                input_adoption_quantum(
+                let retry_debt = self.input_retry_debt;
+                // Cancellation after cursor advancement also keeps the durable
+                // completion gate open when this progress is reused.
+                self.input_retry_debt = true;
+                let more = input_adoption_quantum(
                     store,
                     &mut self.input_after,
                     self.upper[1].as_deref().expect("captured frontier"),
+                    !retry_debt,
                 )
-                .await?
+                .await?;
+                self.input_retry_debt = retry_debt;
+                more
             }
             _ => self.artifact_quantum(store).await?,
         };
+        if path == 1 && !more {
+            self.input_retry_debt = false;
+        }
         self.idle[path] = !more;
         if self.idle.iter().all(|idle| *idle) {
             self.idle = [false; 3];
@@ -1684,6 +1696,7 @@ async fn input_adoption_quantum(
     store: &CrudStore,
     after: &mut String,
     upper: &str,
+    may_complete: bool,
 ) -> Result<bool> {
     // Supported input projection writers retain previews in their atomic write
     // set, including inputs inserted behind this legacy cursor after completion.
@@ -1720,6 +1733,12 @@ async fn input_adoption_quantum(
         .into_query();
     let row = store.connection.query_one(&query).await?;
     let Some(row) = row else {
+        if !may_complete {
+            // The owner retains retry debt through the common pass EOF. Keep
+            // the durable gate open so a fresh pass/restart revisits failures.
+            after.clear();
+            return Ok(false);
+        }
         store
             .run_serialized_write(|| async {
                 backfill::Entity::update_many()

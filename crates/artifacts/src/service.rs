@@ -81,6 +81,9 @@ pub struct HtmlPreviewMaintenanceProgress {
     gc_cutoff_ms: Option<i64>,
     blob_upper: Option<String>,
     copies_upper: Option<String>,
+    // Each family's error/cancellation survives successful suffix quanta until
+    // that family's EOF; unrelated Deferred work must not postpone its rewind.
+    retry_debt: [bool; 3],
 }
 
 impl HtmlPreviewMaintenanceProgress {
@@ -88,21 +91,28 @@ impl HtmlPreviewMaintenanceProgress {
     /// still waiting for an activity/read hold. The caller retains invalidation
     /// for unfinished keysets until their captured pass finishes as well.
     pub fn invalidate_completed(&mut self) {
-        if self.finished[0] {
-            self.previews = Default::default();
-            self.finished[0] = false;
+        for family in 0..3 {
+            if self.finished[family] {
+                self.invalidate_family(family);
+            }
         }
-        if self.finished[1] {
-            self.blobs.clear();
-            self.blob_upper = None;
-            self.gc_cutoff_ms = None;
-            self.finished[1] = false;
+    }
+
+    fn invalidate_family(&mut self, family: usize) {
+        match family {
+            0 => self.previews = Default::default(),
+            1 => {
+                self.blobs.clear();
+                self.blob_upper = None;
+                self.gc_cutoff_ms = None;
+            }
+            _ => {
+                self.copies.clear();
+                self.copies_upper = None;
+            }
         }
-        if self.finished[2] {
-            self.copies.clear();
-            self.copies_upper = None;
-            self.finished[2] = false;
-        }
+        self.finished[family] = false;
+        self.retry_debt[family] = false;
     }
 }
 
@@ -898,6 +908,28 @@ impl ArtifactService {
         &self,
         progress: &mut HtmlPreviewMaintenanceProgress,
     ) -> ArtifactResult<HtmlPreviewMaintenanceOutcome> {
+        let result = self.html_preview_maintenance_pass_quantum(progress).await;
+        let mut retry = false;
+        for family in 0..3 {
+            if progress.retry_debt[family] && progress.finished[family] {
+                // Rewind only the failed family's completed keyset. Another
+                // family's activity/read hold or IO backlog cannot postpone it.
+                progress.invalidate_family(family);
+                retry = true;
+            }
+        }
+        let blocked_debt = matches!(&result, Ok(HtmlPreviewMaintenanceOutcome::Deferred))
+            && progress.retry_debt.iter().any(|debt| *debt);
+        if (retry || blocked_debt) && result.is_ok() {
+            return Err(anyhow::anyhow!("HTML maintenance family requires retry").into());
+        }
+        result
+    }
+
+    async fn html_preview_maintenance_pass_quantum(
+        &self,
+        progress: &mut HtmlPreviewMaintenanceProgress,
+    ) -> ArtifactResult<HtmlPreviewMaintenanceOutcome> {
         let store = self.store.with_maintenance_access();
         if progress.finished.iter().all(|done| *done) {
             progress.finished = [false; 3];
@@ -907,6 +939,8 @@ impl ArtifactService {
         }
         let mut deferred = false;
         let mut copies_deferred = false;
+        let preview_debt = progress.retry_debt[0];
+        progress.retry_debt[0] = !progress.finished[0] || preview_debt;
         let preview_result = if progress.finished[0] {
             Ok(false)
         } else {
@@ -919,93 +953,118 @@ impl ArtifactService {
             }
         };
         if let Ok(more) = &preview_result {
+            progress.retry_debt[0] = preview_debt;
             progress.finished[0] = !more;
         }
-        let grace_ms =
-            i64::try_from(self.gc_policy.grace_secs.saturating_mul(1000)).unwrap_or(i64::MAX);
-        let (next, candidates) = if progress.finished[1] {
-            (String::new(), Vec::new())
-        } else {
-            if progress.blob_upper.is_none() {
-                progress.blob_upper = Some(store.html_preview_blob_frontier().await?);
+        let blob_debt = progress.retry_debt[1];
+        progress.retry_debt[1] = !progress.finished[1] || blob_debt;
+        let blob_result = async {
+            let grace_ms =
+                i64::try_from(self.gc_policy.grace_secs.saturating_mul(1000)).unwrap_or(i64::MAX);
+            let (next, candidates) = if progress.finished[1] {
+                (String::new(), Vec::new())
+            } else {
+                if progress.blob_upper.is_none() {
+                    progress.blob_upper = Some(store.html_preview_blob_frontier().await?);
+                }
+                let cutoff = Utc::now().timestamp_millis().saturating_sub(grace_ms);
+                progress.gc_cutoff_ms =
+                    Some(progress.gc_cutoff_ms.map_or(cutoff, |old| old.min(cutoff)));
+                store
+                    .html_preview_gc_blob_page_through(
+                        &progress.blobs,
+                        cutoff,
+                        progress.blob_upper.as_deref().expect("captured frontier"),
+                    )
+                    .await?
+            };
+            progress.finished[1] = next.is_empty();
+            progress.blobs = next;
+            let mut deletion_error = None;
+            for (workspace, blob) in candidates {
+                // Waiting and filesystem I/O are outside database admission. Every
+                // producer of original/projection bytes holds the same local lock
+                // until its metadata reference is durable.
+                let result = async {
+                    let guard = self.blob_store.acquire_mutation_guard(&workspace).await?;
+                    if store
+                        .artifact_storage_key_is_unreferenced(&workspace, &blob.storage_key)
+                        .await?
+                    {
+                        self.blob_store
+                            .delete_unreferenced_guarded(
+                                &workspace,
+                                &blob.storage_key,
+                                guard.clone(),
+                            )
+                            .await?;
+                        store
+                            .delete_artifact_blob_row(&workspace, &blob.blob_id)
+                            .await?;
+                    }
+                    Ok::<(), ArtifactError>(())
+                }
+                .await;
+                if let Err(error) = result {
+                    deletion_error = Some(error);
+                }
             }
-            let cutoff = Utc::now().timestamp_millis().saturating_sub(grace_ms);
-            progress.gc_cutoff_ms =
-                Some(progress.gc_cutoff_ms.map_or(cutoff, |old| old.min(cutoff)));
-            store
-                .html_preview_gc_blob_page_through(
-                    &progress.blobs,
-                    cutoff,
-                    progress.blob_upper.as_deref().expect("captured frontier"),
-                )
-                .await?
-        };
-        progress.finished[1] = next.is_empty();
-        progress.blobs = next;
-        let mut deletion_error = None;
-        for (workspace, blob) in candidates {
-            // Waiting and filesystem I/O are outside database admission. Every
-            // producer of original/projection bytes holds the same local lock
-            // until its metadata reference is durable.
-            let result = async {
-                let guard = self.blob_store.acquire_mutation_guard(&workspace).await?;
-                if store
-                    .artifact_storage_key_is_unreferenced(&workspace, &blob.storage_key)
+            if let Some(error) = deletion_error {
+                return Err(error);
+            }
+            Ok::<(), ArtifactError>(())
+        }
+        .await;
+        if blob_result.is_ok() {
+            progress.retry_debt[1] = blob_debt;
+        }
+        let copies_debt = progress.retry_debt[2];
+        progress.retry_debt[2] = !progress.finished[2] || copies_debt;
+        let copies_result = async {
+            if !progress.io_seeded {
+                progress.io_seeded = store.html_preview_io_seed_complete().await?;
+            }
+            let (id, copy) = if progress.finished[2] || progress.io_seeded {
+                (String::new(), None)
+            } else {
+                if progress.copies_upper.is_none() {
+                    progress.copies_upper = Some(store.html_preview_artifact_frontier().await?);
+                }
+                store
+                    .html_preview_released_copies_page_through(
+                        &progress.copies,
+                        progress.copies_upper.as_deref().expect("captured frontier"),
+                    )
+                    .await?
+            };
+            progress.finished[2] = id.is_empty();
+            progress.copies = id.clone();
+            if let Some((workspace, previous)) = copy {
+                match self
+                    .prepare_html_preview_copy_cleanup(&workspace, &previous)
                     .await?
                 {
-                    self.blob_store
-                        .delete_unreferenced_guarded(&workspace, &blob.storage_key, guard.clone())
-                        .await?;
-                    store
-                        .delete_artifact_blob_row(&workspace, &blob.blob_id)
-                        .await?;
-                }
-                Ok::<(), ArtifactError>(())
-            }
-            .await;
-            if let Err(error) = result {
-                deletion_error = Some(error);
-            }
-        }
-        if !progress.io_seeded {
-            progress.io_seeded = store.html_preview_io_seed_complete().await?;
-        }
-        let (id, copy) = if progress.finished[2] || progress.io_seeded {
-            (String::new(), None)
-        } else {
-            if progress.copies_upper.is_none() {
-                progress.copies_upper = Some(store.html_preview_artifact_frontier().await?);
-            }
-            store
-                .html_preview_released_copies_page_through(
-                    &progress.copies,
-                    progress.copies_upper.as_deref().expect("captured frontier"),
-                )
-                .await?
-        };
-        progress.finished[2] = id.is_empty();
-        progress.copies = id.clone();
-        if let Some((workspace, previous)) = copy {
-            match self
-                .prepare_html_preview_copy_cleanup(&workspace, &previous)
-                .await?
-            {
-                Some(prepared) => {
-                    store
-                        .finish_html_preview_copy_cleanup(&id, &previous, &prepared)
-                        .await?;
-                }
-                None => {
-                    copies_deferred = true;
-                    progress.copies.clear();
-                    progress.finished[2] = false;
+                    Some(prepared) => {
+                        store
+                            .finish_html_preview_copy_cleanup(&id, &previous, &prepared)
+                            .await?;
+                    }
+                    None => {
+                        copies_deferred = true;
+                        progress.copies.clear();
+                        progress.finished[2] = false;
+                    }
                 }
             }
+            Ok::<(), ArtifactError>(())
         }
-        if let Some(error) = deletion_error {
-            return Err(error);
+        .await;
+        if copies_result.is_ok() {
+            progress.retry_debt[2] = copies_debt;
         }
+        blob_result?;
         preview_result?;
+        copies_result?;
         let runnable = (!progress.finished[0] && !deferred)
             || !progress.finished[1]
             || (!progress.finished[2] && !copies_deferred);

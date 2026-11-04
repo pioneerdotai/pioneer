@@ -1033,28 +1033,42 @@ async fn completed_unknown_import_is_discoverable_and_rechecked_after_restart() 
 }
 
 #[tokio::test]
-async fn failed_completion_is_not_published_and_remains_discoverable_after_wrap() {
-    let f = fixture().await;
-    manifest(&f, "a", "parent", &[], &[], 0, None).await;
-    f.sql("UPDATE html_preview_index_backfill SET complete=1 WHERE singleton=1")
-        .await;
-    f.sql("CREATE TRIGGER fail_completion BEFORE UPDATE ON html_preview_frozen_index WHEN NEW.complete=1 BEGIN SELECT RAISE(ABORT,'fixture completion failure'); END").await;
-    let mut after = String::new();
-    let mut progress = None;
-    assert!(
-        index_quantum(&f.store, &mut after, &mut progress, "\u{10ffff}")
+async fn failed_index_read_or_completion_remains_discoverable_after_wrap() {
+    for reader_failure in [false, true] {
+        let f = fixture().await;
+        manifest(&f, "a", "parent", &[], &[], 0, None).await;
+        f.sql("UPDATE html_preview_index_backfill SET complete=1 WHERE singleton=1")
+            .await;
+        let repair = if reader_failure {
+            // Fail the physical reader's bounded page query after the index
+            // header advanced the keyset. Restore only this fixture's view.
+            let ddl: String = f.store.connection.query_one_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT sql FROM sqlite_master WHERE type='view' AND name='compaction_frozen_message'",
+            )).await.unwrap().unwrap().try_get("", "sql").unwrap();
+            f.sql("DROP VIEW compaction_frozen_message").await;
+            ddl
+        } else {
+            f.sql("CREATE TRIGGER fail_completion BEFORE UPDATE ON html_preview_frozen_index WHEN NEW.complete=1 BEGIN SELECT RAISE(ABORT,'fixture completion failure'); END").await;
+            "DROP TRIGGER fail_completion".into()
+        };
+        let mut after = String::new();
+        let mut progress = None;
+        let error = index_quantum(&f.store, &mut after, &mut progress, "\u{10ffff}")
             .await
-            .is_err()
-    );
-    assert_eq!(f.marker("a").await.complete, 0);
-    f.sql("DROP TRIGGER fail_completion").await;
-    assert!(
-        !index_quantum(&f.store, &mut after, &mut progress, "\u{10ffff}")
-            .await
-            .unwrap()
-    );
-    f.step(&mut after, &mut progress).await;
-    assert_eq!(f.marker("a").await.complete, 1);
+            .unwrap_err();
+        assert!(error.downcast_ref::<sea_orm::DbErr>().is_some());
+        assert_eq!(f.marker("a").await.complete, 0);
+        f.sql(&repair).await;
+        assert!(
+            !index_quantum(&f.store, &mut after, &mut progress, "\u{10ffff}")
+                .await
+                .unwrap()
+        );
+        // No domain wake/restart: the same cursor wraps to the retained row.
+        f.step(&mut after, &mut progress).await;
+        assert_eq!(f.marker("a").await.complete, 1);
+    }
 }
 
 #[tokio::test]
@@ -1069,20 +1083,20 @@ async fn input_gate_is_conservative_until_complete_and_quiet_after_completion() 
         let mut after = String::new();
         f.routes.reset();
         assert!(
-            input_adoption_quantum(&f.store, &mut after, "\u{10ffff}")
+            input_adoption_quantum(&f.store, &mut after, "\u{10ffff}", true)
                 .await
                 .unwrap()
         );
         assert_eq!(after, "old");
         assert_eq!(f.routes.counts(), (2, 0));
         assert!(
-            !input_adoption_quantum(&f.store, &mut after, "\u{10ffff}")
+            !input_adoption_quantum(&f.store, &mut after, "\u{10ffff}", true)
                 .await
                 .unwrap()
         );
         if missing {
             assert!(
-                input_adoption_quantum(&f.store, &mut after, "\u{10ffff}")
+                input_adoption_quantum(&f.store, &mut after, "\u{10ffff}", true)
                     .await
                     .unwrap()
             );
@@ -1091,7 +1105,7 @@ async fn input_gate_is_conservative_until_complete_and_quiet_after_completion() 
         for _ in 0..2 {
             f.routes.reset();
             assert!(
-                !input_adoption_quantum(&f.store, &mut after, "\u{10ffff}")
+                !input_adoption_quantum(&f.store, &mut after, "\u{10ffff}", true)
                     .await
                     .unwrap()
             );
@@ -1102,7 +1116,7 @@ async fn input_gate_is_conservative_until_complete_and_quiet_after_completion() 
         f.sql("UPDATE html_preview_index_backfill SET inputs_complete=0 WHERE singleton=1")
             .await;
         assert!(
-            input_adoption_quantum(&f.store, &mut after, "\u{10ffff}")
+            input_adoption_quantum(&f.store, &mut after, "\u{10ffff}", true)
                 .await
                 .unwrap()
         );
@@ -1233,7 +1247,7 @@ async fn new_inputs_after_complete_gate_are_adopted_atomically_and_rollback_pres
         let mut after = "~".to_owned();
         f.routes.reset();
         assert!(
-            !input_adoption_quantum(&f.store, &mut after, "\u{10ffff}")
+            !input_adoption_quantum(&f.store, &mut after, "\u{10ffff}", true)
                 .await
                 .unwrap()
         );
@@ -1256,7 +1270,7 @@ async fn legacy_versionless_input_is_adopted_once_and_protects_later_current_ver
     )).await.unwrap();
     let mut after = String::new();
     assert!(
-        input_adoption_quantum(&f.store, &mut after, "\u{10ffff}")
+        input_adoption_quantum(&f.store, &mut after, "\u{10ffff}", true)
             .await
             .unwrap()
     );
@@ -1269,7 +1283,7 @@ async fn legacy_versionless_input_is_adopted_once_and_protects_later_current_ver
         .unwrap();
     assert_eq!(binding.artifact_version_id.as_deref(), Some("v1"));
     assert!(
-        !input_adoption_quantum(&f.store, &mut after, "\u{10ffff}")
+        !input_adoption_quantum(&f.store, &mut after, "\u{10ffff}", true)
             .await
             .unwrap()
     );
@@ -1278,7 +1292,7 @@ async fn legacy_versionless_input_is_adopted_once_and_protects_later_current_ver
     assert!(!preview_is_temporary(&f).await);
     f.routes.reset();
     assert!(
-        !input_adoption_quantum(&f.store, &mut after, "\u{10ffff}")
+        !input_adoption_quantum(&f.store, &mut after, "\u{10ffff}", true)
             .await
             .unwrap()
     );
@@ -1301,7 +1315,7 @@ async fn concurrent_reader_sees_new_input_and_adoption_only_after_the_same_commi
             .await;
         let mut after = "~".to_owned();
         assert!(
-            !input_adoption_quantum(&f.store, &mut after, "\u{10ffff}")
+            !input_adoption_quantum(&f.store, &mut after, "\u{10ffff}", true)
                 .await
                 .unwrap()
         );
@@ -3132,4 +3146,65 @@ async fn blocked_io_recovery_revisits_an_older_row_with_a_growing_suffix() {
         .unwrap()
         .unwrap();
     assert_eq!(row.state, "ready");
+}
+
+// An error behind the input cursor must not make the startup gate terminal.
+// The service owner retries the finite traversal after EOF/backoff.
+#[tokio::test]
+async fn input_failure_keeps_gate_open_through_eof_and_retry_adopts_source() {
+    let f = fixture().await;
+    preview_input_fixture(&f).await;
+    f.sql("UPDATE html_preview_index_backfill SET inputs_complete=0 WHERE singleton=1")
+        .await;
+    // Keep retirement independently blocked while testing legacy adoption.
+    f.sql("UPDATE turn SET status='in_progress' WHERE id='parent-turn'")
+        .await;
+    let input = pioneer_protocol::UserInput::Artifact {
+        artifact_id: "preview".into(),
+        version_id: Some("v1".into()),
+    };
+    f.store.connection.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+        "INSERT INTO turn_input(id,turn_id,input_index,input_type,payload) VALUES('legacy','parent-turn',0,'artifact',?)",
+        [serde_json::to_string(&input).unwrap().into()],
+    )).await.unwrap();
+    f.sql("CREATE TRIGGER fail_legacy_adoption BEFORE INSERT ON artifact_binding WHEN NEW.binding_kind='user_input' BEGIN SELECT RAISE(ABORT,'fixture adoption failure'); END").await;
+    let mut progress = HtmlPreviewRetentionProgress::default();
+    let mut failed = false;
+    for _ in 0..32 {
+        if progress.quantum(&f.store).await.is_err() {
+            failed = true;
+            break;
+        }
+    }
+    assert!(failed);
+    let mut eof = false;
+    for _ in 0..32 {
+        if !progress.quantum(&f.store).await.unwrap() {
+            eof = true;
+            break;
+        }
+    }
+    assert!(eof);
+    let gate = backfill::Entity::find_by_id(1_i64)
+        .one(&f.store.connection)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        gate.inputs_complete, 0,
+        "failed source is still a durable obligation"
+    );
+    f.sql("DROP TRIGGER fail_legacy_adoption").await;
+    for _ in 0..32 {
+        if !progress.quantum(&f.store).await.unwrap() {
+            break;
+        }
+    }
+    let bindings = artifact_binding::Entity::find()
+        .filter(artifact_binding::Column::BindingKind.eq("user_input"))
+        .all(&f.store.connection)
+        .await
+        .unwrap();
+    assert_eq!(bindings.len(), 1);
+    assert_eq!(bindings[0].artifact_version_id.as_deref(), Some("v1"));
 }
