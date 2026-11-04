@@ -230,7 +230,8 @@
       "type": "string",
       "enum": [
         "execution_bound",
-        "identity_bound"
+        "identity_bound",
+        "capsule_bound"
       ]
     },
     "AgentRouteStatus": {

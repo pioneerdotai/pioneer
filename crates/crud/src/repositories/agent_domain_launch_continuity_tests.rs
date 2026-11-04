@@ -659,3 +659,75 @@ async fn new_workspace_executor_is_not_added_to_an_old_parent_grant() {
             .is_none()
     );
 }
+
+#[tokio::test]
+async fn capsule_route_commit_revalidates_saved_receipt_against_current_route() {
+    let store = store().await;
+    sync(&store, true, "original").await;
+    let graph = graph(&store, "Ecapsulecommit1234567", None).await;
+    store
+        .commit_agent_execution_graph(graph.clone())
+        .await
+        .unwrap();
+    let db = store.database_connection();
+    let execution = load_agent_execution(&db, &graph.child_execution.id)
+        .await
+        .unwrap()
+        .unwrap();
+    db.execute_unprepared("PRAGMA foreign_keys=OFF")
+        .await
+        .unwrap();
+    // SQL seeds the already-authorized route state; the subject is the actual
+    // transactional revalidation called by commit_agent_action, not insertion.
+    db.execute_unprepared("INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES('destination','continuity-workspace','','agent','m','p','idle','agent','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)").await.unwrap();
+    db.execute_unprepared("INSERT INTO agent_delegation_route(id,source_execution_id,destination_thread_id,route_kind,grant_fingerprint,status,source_capsule_id,destination_capsule_id,source_workspace_id,destination_workspace_id,source_identity_id,allowed_actions_json,disclosure_json) VALUES('route','finished-creator','destination','capsule_bound','fingerprint','active','continuity-root','destination','continuity-workspace','continuity-workspace','different-creator-identity','[\"send_message\"]','{\"text\":true}')").await.unwrap();
+    let now = utc_now();
+    let input = AgentCommitInput {
+        mutation_kind: "send_message".into(), idempotency_key: "commit-key".into(),
+        request_fingerprint: "request".into(), actor_identity_id: execution.agent_identity_id.clone(),
+        action: AgentActionInput { id: "action".into(), execution_id: execution.id.clone(),
+            action_kind: "send_message".into(), idempotency_key: "commit-key".into(), request_fingerprint: "request".into(), now },
+        receipt_id: "receipt".into(), outbox_id: "outbox".into(), action_response_json: None, receipt_response_json: None,
+        route_receipt_json: Some(serde_json::json!({"routeId":"route","routeGeneration":1,"sourcePolicyGeneration":1,"destinationPolicyGeneration":1,"action":"send_message"}).to_string()),
+        outbox_payload_json: serde_json::json!({"route_id":"route","destination_thread_id":"destination"}).to_string(),
+        policy_fingerprint: "policy".into(), execution_grant_fingerprint: graph.grant.grant_fingerprint.clone(), execution_grant_policy_generation: 1,
+        source_scope_id: "continuity-root".into(), destination_scope_id: Some("destination".into()),
+        subject_role_key: "thread_agent".into(), authorized_resource_action: "thread.message.send".into(), source_policy_generation: 1,
+        destination_policy_generation: Some(1), route_generation: Some(1), disclosure_class: "routed_text".into(),
+        expected_execution_generation: 1, expected_current_identity_source_revision: execution.identity_source_revision,
+        expected_current_identity_source_fingerprint: execution.identity_source_fingerprint.clone(), expected_attempt_generation: 1,
+        expected_policy_generation: 1, requires_cross_capsule_route: true, resource: None,
+    };
+    let txn = db.begin().await.unwrap();
+    revalidate_agent_route_for_commit(&txn, &input, &execution)
+        .await
+        .unwrap();
+    txn.rollback().await.unwrap();
+    for mutation in [
+        "status='revoked'",
+        "expires_at='2000-01-01T00:00:00Z'",
+        "route_generation=2",
+        "source_policy_generation=2",
+        "destination_policy_generation=2",
+        "disclosure_json='{}'",
+        "allowed_actions_json='[]'",
+        "source_capsule_id='foreign'",
+        "destination_thread_id='foreign'",
+        "route_kind='execution_bound'",
+        "route_kind='identity_bound'",
+    ] {
+        let txn = db.begin().await.unwrap();
+        txn.execute_unprepared(&format!(
+            "UPDATE agent_delegation_route SET {mutation} WHERE id='route'"
+        ))
+        .await
+        .unwrap();
+        assert!(
+            revalidate_agent_route_for_commit(&txn, &input, &execution)
+                .await
+                .is_err(),
+            "accepted {mutation}"
+        );
+        txn.rollback().await.unwrap();
+    }
+}

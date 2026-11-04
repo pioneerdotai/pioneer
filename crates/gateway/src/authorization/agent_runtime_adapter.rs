@@ -384,9 +384,13 @@ impl BoundAgentActionAdapter {
                 route.source_execution_id == self.root.execution_id.as_str()
             }
             pioneer_protocol::AgentRouteKind::IdentityBound => true,
+            pioneer_protocol::AgentRouteKind::CapsuleBound => {
+                route.source_capsule_id == self.root.envelope.root_capsule_id
+            }
         };
         if !source_binding_matches
-            || route.source_identity_id.as_ref() != Some(&self.root.identity.id)
+            || (route.kind != pioneer_protocol::AgentRouteKind::CapsuleBound
+                && route.source_identity_id.as_ref() != Some(&self.root.identity.id))
         {
             return Err(AgentToolAdapterError::InvalidInput(
                 "persisted route differs from its source binding".to_owned(),
@@ -2009,6 +2013,83 @@ mod tests {
                 McpScopeKind::Workspace,
                 "allowed-mcp",
             )],
+        }
+    }
+
+    #[test]
+    fn persisted_occurrence_bindings_recover_capsule_route_without_live_creator() {
+        let original = test_adapter();
+        let route = AgentRouteFacts {
+            source_execution_id: original.root.execution_id.to_string(),
+            source_capsule_id: original.root.home_root_thread_id.clone(),
+            destination_thread_id: "T12345678901234567891".into(),
+            destination_capsule_id: "T12345678901234567891".into(),
+            route_id: "R12345678901234567890".into(),
+            kind: pioneer_protocol::AgentRouteKind::CapsuleBound,
+            same_capsule: false,
+            active: true,
+            same_workspace: true,
+            same_gateway: true,
+            disclosure: pioneer_protocol::AgentRouteDisclosurePolicy {
+                text: true,
+                ..Default::default()
+            },
+            same_capsule_thread_ids: Vec::new(),
+            allowed_actions: vec![pioneer_protocol::AgentRouteAction::SendMessage],
+            generation: 1,
+            source_policy_generation: 1,
+            destination_policy_generation: 1,
+            source_identity_id: Some(original.root.identity.id.clone()),
+            destination_identity_id: None,
+            destination_profile_id: None,
+            hop_count: 1,
+            max_hops: 8,
+            expires_at_millis: None,
+            return_route_id: None,
+            grant_fingerprint: "G".repeat(64),
+        };
+        let identity = original.root.identity.clone();
+        let profile = original.root.profile.clone();
+        let envelope = original.envelope.clone();
+        let root = original.root.work_graph_root_execution_id.clone();
+        drop(original);
+        // All trigger types enter the same persisted binding path; vary the
+        // occurrence/attempt and supported internal depth, not route hop count.
+        for depth in 1..=8 {
+            let execution = AgentExecutionId::new(format!("E{:020}", depth)).unwrap();
+            let (mut restored, _, _) = materialize_persisted_task_agent_action_binding(
+                execution,
+                &route.source_capsule_id,
+                root.clone(),
+                identity.clone(),
+                profile.clone(),
+                1,
+                depth as u64,
+                depth,
+                "persisted-occurrence",
+                &envelope.role_key,
+                1,
+                1,
+                &envelope.fingerprint,
+                &envelope.allowed_action_names(),
+            )
+            .unwrap();
+            restored.bind_persisted_route(route.clone()).unwrap();
+            let options = test_options(&mut restored);
+            let option_id = target_option_id(&restored.root, Some(&route), "route");
+            assert!(
+                matches!(restored.resolve_target_option(&options, &option_id).unwrap(),
+                pioneer_protocol::AgentStartTarget::RoutedThread { thread_id, .. } if thread_id == route.destination_thread_id)
+            );
+            let mut foreign = route.clone();
+            foreign.source_capsule_id = route.destination_capsule_id.clone();
+            assert!(restored.bind_persisted_route(foreign).is_err());
+            restored.replace_persisted_routes(Vec::new()).unwrap();
+            assert!(
+                restored
+                    .resolve_target_option(&options, &option_id)
+                    .is_err()
+            );
         }
     }
 
