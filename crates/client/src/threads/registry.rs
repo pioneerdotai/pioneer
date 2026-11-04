@@ -14203,9 +14203,19 @@ mod tests {
     fn cold_open_preserves_live_metadata_terminal_and_item_before_ack() {
         let (core, _transport, responses, _requests) = shared_subscription_core();
         core.remove_thread_store("a");
+        let (committed, applied) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
         let open = {
             let core = core.clone();
-            std::thread::spawn(move || core.open_thread_by_id("a"))
+            std::thread::spawn(move || {
+                SUBSCRIPTION_FINISH_HOOK.with(|slot| {
+                    *slot.borrow_mut() = Some(Box::new(move || {
+                        committed.send(()).unwrap();
+                        released.recv_timeout(Duration::from_secs(2)).unwrap();
+                    }))
+                });
+                core.open_thread_by_id("a")
+            })
         };
         let response = responses.recv_timeout(Duration::from_secs(2)).unwrap();
         let mut stale = thread("a", "ws");
@@ -14258,10 +14268,16 @@ mod tests {
             })
             .unwrap()))
             .unwrap();
+        applied.recv_timeout(Duration::from_secs(2)).unwrap();
+        let mut later = thread("a", "ws");
+        later.updated_at = 4;
+        later.preview = "newer after ACK".into();
+        core.upsert_thread(later);
+        release.send(()).unwrap();
         open.join().unwrap().unwrap();
         let snapshot = core.thread_snapshot("a").unwrap();
         let coordinator = snapshot.coordinator();
-        assert_eq!(coordinator.thread().unwrap().preview, "new live metadata");
+        assert_eq!(coordinator.thread().unwrap().preview, "newer after ACK");
         let conversation = coordinator.conversation.projection();
         assert_eq!(
             conversation
@@ -14273,18 +14289,50 @@ mod tests {
             crate::conversation::TurnPhase::Completed
         );
         assert!(conversation.items.iter().any(|item| matches!(&item.item, TurnItem::AgentMessage { id, text, .. } if id == "answer" && text == "final live answer")));
-        let mut later = thread("a", "ws");
-        later.updated_at = 4;
-        later.preview = "newer after ACK".into();
-        core.upsert_thread(later);
+    }
+
+    #[test]
+    fn cold_open_capacity_rejects_before_rpc_and_is_released_on_error() {
+        let (core, transport, responses, _requests) = shared_subscription_core();
+        core.remove_thread_store("a");
+        let mut opens = vec![];
+        let mut replies = vec![];
+        for index in 0..8 {
+            let core = core.clone();
+            opens.push(std::thread::spawn(move || {
+                core.open_thread_by_id(&format!("cold-{index}"))
+            }));
+            replies.push(responses.recv_timeout(Duration::from_secs(2)).unwrap());
+        }
+        assert!(core.open_thread_by_id("overflow").is_err());
+        assert_eq!(transport.calls.load(std::sync::atomic::Ordering::SeqCst), 8);
+        assert!(
+            core.thread_snapshots().is_empty(),
+            "reservations are not snapshots"
+        );
+        for response in replies {
+            response
+                .send(Err(crate::rpc::JsonRpcResponseError::transport(
+                    "retryable failure",
+                )))
+                .unwrap();
+        }
+        for open in opens {
+            assert!(open.join().unwrap().is_err());
+        }
+        let retry = {
+            let core = core.clone();
+            std::thread::spawn(move || core.open_thread_by_id("a"))
+        };
+        let response = responses.recv_timeout(Duration::from_secs(2)).unwrap();
+        subscription_reply(&response);
+        retry.join().unwrap().unwrap();
         assert_eq!(
             core.thread_snapshot("a")
                 .unwrap()
                 .coordinator()
-                .thread()
-                .unwrap()
-                .preview,
-            "newer after ACK"
+                .workspace_id,
+            "ws"
         );
     }
 
@@ -18702,6 +18750,7 @@ impl ClientCore {
         let Some(response) = response else {
             return;
         };
+        let mut cold_actions = vec![];
         let result = response.map_err(anyhow::Error::new).and_then(|value| {
             let response: pioneer_protocol::ThreadStartResponse =
                 crate::rpc::deserialize_json_rpc_result(
@@ -18778,6 +18827,7 @@ impl ClientCore {
                         &workspace,
                         event,
                     );
+                    cold_actions.extend(effects.actions);
                     pending_reductions.extend(effects.pending);
                     staged_drafts.extend(effects.drafts);
                 }
@@ -18814,6 +18864,15 @@ impl ClientCore {
         let applied = result.is_ok();
         self.finish_thread_subscription_request(request, result);
         if applied {
+            for action in cold_actions {
+                let _ = self.schedule_thread_semantic_request_inner(
+                    action,
+                    Some(request.generation),
+                    true,
+                    false,
+                );
+            }
+            self.retire_thread_controller_jobs();
             self.refresh_approval_actions();
         }
     }

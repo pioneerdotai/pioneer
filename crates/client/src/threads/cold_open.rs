@@ -43,6 +43,7 @@ impl ColdOpenStaging {
 pub(super) struct ColdApplyEffects {
     pub(super) pending: Vec<PendingRequestsReduction>,
     pub(super) drafts: Vec<ClientPublicationDraft>,
+    pub(super) actions: Vec<SemanticTimelineRequestAction>,
 }
 
 impl ClientCore {
@@ -154,6 +155,15 @@ impl ClientCore {
         );
         drop(registry);
         drop(identity);
+        for action in effects.actions {
+            let _ = self.schedule_thread_semantic_request_inner(
+                action,
+                Some(request.generation),
+                true,
+                false,
+            );
+        }
+        self.retire_thread_controller_jobs();
         self.refresh_thread_timeline_generation(id, Some(request.generation));
         self.refresh_approval_actions();
         Some(true)
@@ -236,6 +246,7 @@ impl ClientCore {
                 return ColdApplyEffects {
                     pending: r.pending_requests.into_iter().collect(),
                     drafts,
+                    ..Default::default()
                 };
             }
             Some(ConversationEvent(r)) => {
@@ -257,6 +268,25 @@ impl ClientCore {
                         &mut store.coordinator.resume,
                     );
                 }
+                let actions = crate::timeline::semantic::terminal_turn_work_reconciliation(
+                    &store.semantic,
+                    &r.conversation_event,
+                )
+                .map(
+                    |reconciliation| SemanticTimelineRequestAction::TurnWorkItemsGet {
+                        key: SemanticTimelineRequestKey::TurnWorkItems {
+                            thread_id: reconciliation.thread_id.clone(),
+                            turn_id: reconciliation.turn_id.clone(),
+                        },
+                        params: pioneer_protocol::TurnWorkItemsGetParams {
+                            thread_id: reconciliation.thread_id,
+                            turn_id: reconciliation.turn_id,
+                            work_item_ids: reconciliation.running_work_item_ids,
+                        },
+                    },
+                )
+                .into_iter()
+                .collect();
                 store.apply_conversation_event(workspace, r.conversation_event, None);
                 if r.tick_conversation {
                     store.coordinator.conversation.tick();
@@ -269,15 +299,10 @@ impl ClientCore {
                         });
                 }
                 let drafts = registry.navigation_change().into_iter().collect();
-                if let Some(pending) = r.pending_requests {
-                    return ColdApplyEffects {
-                        pending: vec![pending],
-                        drafts,
-                    };
-                }
                 return ColdApplyEffects {
-                    pending: vec![],
+                    pending: r.pending_requests.into_iter().collect(),
                     drafts,
+                    actions,
                 };
             }
             Some(SemanticTimeline(update)) => {
@@ -306,8 +331,18 @@ impl ClientCore {
                 }
                 crate::timeline::semantic::apply_semantic_timeline_live_update(
                     &mut store.semantic,
-                    update,
+                    update.clone(),
                 );
+                let actions = thread_reconcile_actions(&store.semantic, &update);
+                registry.retire_unauthorized_targeted_requests(id);
+                let store = &registry.stores[id];
+                if !store.presentation_blocked && store.demand == ClientDemand::Visible {
+                    registry.timeline.rearm_exhausted_refresh(id);
+                }
+                return ColdApplyEffects {
+                    actions,
+                    ..Default::default()
+                };
             }
             Some(CLIRuntimePendingRequests(r)) | Some(PendingRequests { reduction: r }) => {
                 return ColdApplyEffects {
