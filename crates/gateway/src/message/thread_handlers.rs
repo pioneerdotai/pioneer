@@ -89,9 +89,16 @@ impl MessageProcessor {
 }
 
 fn open_only_thread_start_params(thread: &Thread) -> ThreadStartParams {
+    open_only_thread_start_params_for_id(thread.id.clone(), thread.workspace_id.clone())
+}
+
+pub(super) fn open_only_thread_start_params_for_id(
+    thread_id: String,
+    workspace_id: String,
+) -> ThreadStartParams {
     ThreadStartParams {
-        thread_id: thread.id.clone(),
-        workspace_id: thread.workspace_id.clone(),
+        thread_id,
+        workspace_id,
         name: None,
         model: None,
         model_provider: None,
@@ -390,6 +397,33 @@ impl MessageProcessor {
             trace.finish_success();
         } else {
             trace.finish_failure();
+        }
+    }
+
+    pub(super) async fn thread_open_runtime_draft(
+        &self,
+        context: &RequestContext,
+        access: &RuntimeDraftAccess,
+        request_id: RequestId,
+    ) {
+        match self.thread_manager.open_runtime_draft(access).await {
+            Some(outcome) => {
+                self.session_manager
+                    .set_connection_workspace(
+                        context.connection_id(),
+                        Some(access.workspace_id().to_owned()),
+                    )
+                    .await;
+                self.finish_thread_start(context.connection_id(), request_id, outcome, None)
+                    .await;
+            }
+            None => {
+                self.send_error(
+                    context.connection_id(),
+                    AuthorizationExternalError::NotFound.response(request_id),
+                )
+                .await
+            }
         }
     }
 

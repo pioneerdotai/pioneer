@@ -274,3 +274,43 @@ async fn shared_workspace_transitions_establish_connection_scope_without_global_
     workflow.await.unwrap();
     assert_preserved(&harness, &workspace_b, &catalog_before).await;
 }
+
+#[tokio::test]
+async fn id_only_open_selects_authoritative_workspace_and_never_creates_missing_thread() {
+    let mut harness = setup_semantic_timeline_query_harness().await;
+    let thread_id = harness.sandbox_thread_id.clone();
+    let expected = harness
+        .processor
+        .crud_store
+        .get_thread_model(&thread_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let result = rpc(&mut harness, "thread/open", json!({"thread_id":thread_id})).await;
+    let opened: pioneer_protocol::ThreadStartResponse =
+        serde_json::from_value(result["result"].clone()).unwrap();
+    assert_eq!(opened.thread.id, expected.id);
+    assert_eq!(opened.thread.workspace_id, expected.workspace_id);
+    assert_eq!(
+        harness
+            .processor
+            .session_manager
+            .connection_workspace_id(harness.connection_id)
+            .await
+            .as_deref(),
+        Some(expected.workspace_id.as_str())
+    );
+    let missing = generate_test_request_id("thread", "missingopen");
+    let result = rpc(&mut harness, "thread/open", json!({"thread_id":missing})).await;
+    assert!(result.get("error").is_some());
+    assert!(
+        harness
+            .processor
+            .crud_store
+            .get_thread_model(&missing)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(!harness.processor.thread_manager.has_thread(&missing).await);
+}

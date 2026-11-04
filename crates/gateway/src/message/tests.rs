@@ -9194,10 +9194,9 @@ async fn open_persisted_child_for_test(
             &json!({
                 "jsonrpc": "2.0",
                 "id": request_id,
-                "method": "thread/start",
+                "method": "thread/open",
                 "params": {
-                    "thread_id": child_thread_id,
-                    "workspace_id": workspace_id
+                    "thread_id": child_thread_id
                 }
             })
             .to_string(),
@@ -9205,8 +9204,9 @@ async fn open_persisted_child_for_test(
         .await;
     let response = recv_response_by_id(rx, request_id.as_str()).await;
     let opened: ThreadStartResponse = serde_json::from_value(response.result)
-        .expect("persisted child should open through the authorized thread/start path");
+        .expect("persisted child should open through the authorized thread/open path");
     assert_eq!(opened.thread.id, child_thread_id);
+    assert_eq!(opened.thread.workspace_id, workspace_id);
     assert!(processor.thread_manager.has_thread(child_thread_id).await);
 }
 

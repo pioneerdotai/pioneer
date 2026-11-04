@@ -825,6 +825,34 @@ impl ThreadManager {
         })
     }
 
+    /// Noncreating open of an already subscribed runtime draft. Recheck the
+    /// exact owner under the state lock; never promote or recreate a retired draft.
+    pub(crate) async fn open_runtime_draft(
+        &self,
+        access: &RuntimeDraftAccess,
+    ) -> Option<ThreadStartOutcome> {
+        let state = self.state.read().await;
+        let entry = state.threads.get(access.thread_id())?;
+        let ThreadEntryLifecycle::RuntimeDraft { owner } = &entry.lifecycle else {
+            return None;
+        };
+        if owner != access.owner()
+            || entry.thread.workspace_id != access.workspace_id()
+            || entry.subscribers.get(&owner.connection_id) != Some(&owner.identity)
+        {
+            return None;
+        }
+        let thread = entry.thread.clone();
+        Some(ThreadStartOutcome {
+            response: ThreadStartResponse {
+                thread: thread.clone(),
+                sandbox: SandboxPolicy::from_mode(entry.sandbox_mode),
+            },
+            started_notification: ThreadStartedNotification { thread },
+            started_notification_connection_ids: vec![owner.connection_id],
+        })
+    }
+
     /// Completes the in-memory half of the first-turn transaction after the
     /// durable thread, creator membership, and turn have committed.
     pub(crate) async fn mark_runtime_draft_durable(&self, access: &RuntimeDraftAccess) -> bool {
@@ -2904,6 +2932,19 @@ mod tests {
                 .await
                 .is_none()
         );
+        let access = manager
+            .authorize_runtime_draft(10, &identity, thread_id, None)
+            .await
+            .unwrap();
+        let opened = manager.open_runtime_draft(&access).await.unwrap();
+        assert_eq!(opened.response.thread.id, thread_id);
+        // Opening must preserve runtime-only lifecycle and exact owner policy.
+        assert!(
+            manager
+                .authorize_runtime_draft(10, &identity, thread_id, None)
+                .await
+                .is_some()
+        );
         let other_session = ThreadSubscriptionIdentity::new(
             identity.principal_id.clone(),
             pioneer_protocol::AuthSessionId::new("S00000000000000000002")
@@ -2920,6 +2961,9 @@ mod tests {
                 .await
                 .is_none()
         );
+        manager.connection_closed(10).await;
+        assert!(manager.open_runtime_draft(&access).await.is_none());
+        assert!(!manager.has_thread(thread_id).await);
     }
 
     #[tokio::test]
