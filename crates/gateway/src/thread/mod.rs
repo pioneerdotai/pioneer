@@ -1,3 +1,4 @@
+pub(crate) mod replay;
 use anyhow::{Context, Result, anyhow, bail};
 use pioneer_config::AppConfig;
 use pioneer_protocol::{
@@ -28,6 +29,7 @@ impl std::error::Error for ForegroundTurnConflict {}
 
 #[derive(Debug)]
 pub struct ThreadStartOutcome {
+    pub(crate) subscription_incarnations: Vec<std::sync::Arc<replay::SubscriptionIncarnation>>,
     pub response: ThreadStartResponse,
     pub started_notification: ThreadStartedNotification,
     pub started_notification_connection_ids: Vec<ConnectionId>,
@@ -170,6 +172,8 @@ struct ThreadEntry {
     thread: Thread,
     sandbox_mode: SandboxMode,
     subscribers: HashMap<ConnectionId, ThreadSubscriptionIdentity>,
+    subscription_incarnations:
+        HashMap<ConnectionId, std::sync::Arc<replay::SubscriptionIncarnation>>,
     lifecycle: ThreadEntryLifecycle,
 }
 
@@ -446,6 +450,7 @@ impl ThreadManager {
                 thread,
                 sandbox_mode: sandbox_mode.unwrap_or(DEFAULT_SANDBOX_MODE),
                 subscribers: HashMap::new(),
+                subscription_incarnations: HashMap::new(),
                 lifecycle: ThreadEntryLifecycle::Durable,
             },
         );
@@ -517,7 +522,7 @@ impl ThreadManager {
         let mode = requested_mode.unwrap_or(DEFAULT_THREAD_MODE);
 
         let now = unix_timestamp_secs()? as i64;
-        let (thread, effective_sandbox_mode) = {
+        let (thread, effective_sandbox_mode, subscription_incarnations) = {
             let mut state = self.state.write().await;
             if state.threads.contains_key(thread_id.as_str()) {
                 let existing_workspace_id = state
@@ -575,6 +580,25 @@ impl ThreadManager {
                     existing_entry.lifecycle = ThreadEntryLifecycle::Durable;
                 }
                 if let Some(subscriber) = subscriber.as_ref() {
+                    if existing_entry.subscribers.get(&subscriber.connection_id)
+                        != Some(&subscriber.identity)
+                    {
+                        if let Some(old) = existing_entry
+                            .subscription_incarnations
+                            .remove(&subscriber.connection_id)
+                        {
+                            old.retire();
+                        }
+                    }
+                    existing_entry
+                        .subscription_incarnations
+                        .entry(subscriber.connection_id)
+                        .or_insert_with(|| {
+                            replay::SubscriptionIncarnation::new(
+                                subscriber.connection_id,
+                                subscriber.identity.clone(),
+                            )
+                        });
                     existing_entry
                         .subscribers
                         .insert(subscriber.connection_id, subscriber.identity.clone());
@@ -587,7 +611,20 @@ impl ThreadManager {
                     existing_entry.thread.name = requested_name.clone();
                 }
 
-                (existing_entry.thread.clone(), existing_entry.sandbox_mode)
+                (
+                    existing_entry.thread.clone(),
+                    existing_entry.sandbox_mode,
+                    subscriber
+                        .as_ref()
+                        .and_then(|subscriber| {
+                            existing_entry
+                                .subscription_incarnations
+                                .get(&subscriber.connection_id)
+                                .cloned()
+                        })
+                        .into_iter()
+                        .collect(),
+                )
             } else {
                 let thread = if let Some(mut seed_thread) = seed_thread {
                     if seed_thread.id != thread_id {
@@ -679,16 +716,38 @@ impl ThreadManager {
                     ThreadStartKind::Durable => ThreadEntryLifecycle::Durable,
                 };
                 state.threads.insert(
-                    thread_id,
+                    thread_id.clone(),
                     ThreadEntry {
                         thread: thread.clone(),
                         sandbox_mode,
+                        subscription_incarnations: subscribers
+                            .iter()
+                            .map(|(connection, identity)| {
+                                (
+                                    *connection,
+                                    replay::SubscriptionIncarnation::new(
+                                        *connection,
+                                        identity.clone(),
+                                    ),
+                                )
+                            })
+                            .collect(),
                         subscribers,
                         lifecycle,
                     },
                 );
 
-                (thread, sandbox_mode)
+                let incarnations = subscriber
+                    .as_ref()
+                    .and_then(|subscriber| {
+                        state.threads[&thread_id]
+                            .subscription_incarnations
+                            .get(&subscriber.connection_id)
+                            .cloned()
+                    })
+                    .into_iter()
+                    .collect();
+                (thread, sandbox_mode, incarnations)
             }
         };
 
@@ -698,6 +757,7 @@ impl ThreadManager {
         };
 
         Ok(ThreadStartOutcome {
+            subscription_incarnations,
             response,
             started_notification: ThreadStartedNotification { thread },
             started_notification_connection_ids: subscriber
@@ -844,6 +904,12 @@ impl ThreadManager {
         }
         let thread = entry.thread.clone();
         Some(ThreadStartOutcome {
+            subscription_incarnations: vec![
+                entry
+                    .subscription_incarnations
+                    .get(&owner.connection_id)?
+                    .clone(),
+            ],
             response: ThreadStartResponse {
                 thread: thread.clone(),
                 sandbox: SandboxPolicy::from_mode(entry.sandbox_mode),
@@ -1749,6 +1815,21 @@ impl ThreadManager {
         Ok(true)
     }
 
+    pub(crate) async fn subscription_incarnation(
+        &self,
+        connection: ConnectionId,
+        thread: &str,
+    ) -> Option<std::sync::Arc<replay::SubscriptionIncarnation>> {
+        self.state
+            .read()
+            .await
+            .threads
+            .get(thread)?
+            .subscription_incarnations
+            .get(&connection)
+            .cloned()
+    }
+
     pub async fn subscribed_connection_ids(&self, thread_id: &str) -> Vec<ConnectionId> {
         let state = self.state.read().await;
         state
@@ -1837,7 +1918,12 @@ impl ThreadManager {
             let identity = state
                 .threads
                 .get_mut(candidate_thread_id.as_str())
-                .and_then(|entry| entry.subscribers.remove(&connection_id));
+                .and_then(|entry| {
+                    if let Some(token) = entry.subscription_incarnations.remove(&connection_id) {
+                        token.retire();
+                    }
+                    entry.subscribers.remove(&connection_id)
+                });
             if let Some(identity) = identity {
                 removed.push(ThreadSubscriber {
                     connection_id,
@@ -1945,6 +2031,9 @@ impl ThreadManager {
         for thread_id in thread_ids {
             let should_remove = match state.threads.get_mut(&thread_id) {
                 Some(entry) => {
+                    if let Some(token) = entry.subscription_incarnations.remove(&connection_id) {
+                        token.retire();
+                    }
                     entry.subscribers.remove(&connection_id);
                     entry.subscribers.is_empty()
                         && !has_in_progress_conversation_turn(&entry.thread)
@@ -1995,6 +2084,9 @@ impl ThreadManager {
             };
         };
 
+        if let Some(token) = entry.subscription_incarnations.remove(&connection_id) {
+            token.retire();
+        }
         let Some(removed_identity) = entry.subscribers.remove(&connection_id) else {
             return ThreadUnsubscribeOutcome {
                 response: ThreadUnsubscribeResponse {

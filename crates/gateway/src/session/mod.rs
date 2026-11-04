@@ -61,6 +61,7 @@ const TERMINATED_SESSION_TOMBSTONE_TTL: Duration = Duration::from_secs(60 * 60);
 #[derive(Clone)]
 struct SessionConnection {
     sender: SessionOutbound,
+    replay_tasks: Arc<crate::thread::replay::ReplayTasks>,
     termination_tx: watch::Sender<Option<AuthSessionTerminationReason>>,
     scope_change_tx: watch::Sender<()>,
     workspace_id: Option<String>,
@@ -80,6 +81,8 @@ pub struct SessionManager {
     session_connections: RwLock<HashMap<String, HashSet<ConnectionId>>>,
     device_sessions: RwLock<HashMap<String, HashSet<String>>>,
     terminated_sessions: RwLock<HashMap<String, TerminatedSessionTombstone>>,
+    #[cfg(test)]
+    pub(crate) replay_delivery_pause: std::sync::Mutex<Option<test_support::DeliveryPause>>,
 }
 
 impl SessionManager {
@@ -121,6 +124,7 @@ impl SessionManager {
         self.connections.write().await.insert(
             connection_id,
             SessionConnection {
+                replay_tasks: Arc::default(),
                 sender,
                 termination_tx,
                 scope_change_tx,
@@ -142,6 +146,43 @@ impl SessionManager {
             .insert(session_id);
         drop(terminated_sessions);
         Ok(connection_id)
+    }
+
+    pub(crate) async fn reserve_thread_replay(
+        &self,
+        id: ConnectionId,
+        token: Arc<crate::thread::replay::SubscriptionIncarnation>,
+        order: &Arc<crate::thread::replay::PendingDeliveryOrder>,
+    ) -> Result<Option<crate::thread::replay::ReplayReservation>> {
+        anyhow::ensure!(token.connection == id, "subscription connection mismatch");
+        let connection = self
+            .connections
+            .read()
+            .await
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| anyhow!("connection retired"))?;
+        connection
+            .replay_tasks
+            .reserve(token, connection.sender, order)
+    }
+    #[cfg(test)]
+    pub(crate) async fn drain_thread_replays(&self, id: ConnectionId) {
+        let owner = self
+            .connections
+            .read()
+            .await
+            .get(&id)
+            .map(|connection| connection.replay_tasks.clone());
+        if let Some(owner) = owner {
+            owner.drain().await;
+        }
+    }
+
+    pub(crate) async fn stop_thread_replays(&self) {
+        for connection in self.connections.read().await.values() {
+            connection.replay_tasks.stop();
+        }
     }
 
     pub async fn unregister_connection(&self, connection_id: ConnectionId) {
@@ -166,6 +207,9 @@ impl SessionManager {
                 }
             }
         }
+        // A replay can retire its own socket. Abort only after all indexes have
+        // been cleaned, so self-cancellation cannot strand session/device rows.
+        removed.replay_tasks.stop();
     }
 
     pub async fn connection_ids(&self) -> Vec<ConnectionId> {
@@ -418,22 +462,121 @@ impl SessionManager {
         enqueue(&connection.sender).map(Some)
     }
 
+    pub(crate) async fn try_send_thread_open_reply(
+        &self,
+        id: ConnectionId,
+        token: &crate::thread::replay::SubscriptionIncarnation,
+        payload: String,
+    ) -> Result<()> {
+        anyhow::ensure!(token.connection == id, "subscription connection mismatch");
+        #[cfg(test)]
+        self.pause_delivery(id, pioneer_protocol::constants::methods::THREAD_OPEN)
+            .await;
+        let result = {
+            let connections = self.connections.read().await;
+            let connection = connections
+                .get(&id)
+                .ok_or_else(|| anyhow!("connection retired"))?;
+            if connection.termination_tx.borrow().is_some()
+                || crate::helpers::unix_timestamp_secs()?
+                    >= connection.principal.access_expires_at_unix
+            {
+                return Err(anyhow!("connection lease retired"));
+            }
+            token.admit_reply(&connection.principal, || {
+                let result = connection.sender.try_send(Message::Text(payload.into()));
+                if result.is_err() {
+                    connection.sender.abort();
+                }
+                result
+            })
+        };
+        match result {
+            Some(Ok(())) => Ok(()),
+            _ => Err(anyhow!("thread open reply admission failed")),
+        }
+    }
+
+    /// Exact subject/lease check for collaborator delivery. Selection is not
+    /// authority: ancestor-visible requests may target a different workspace.
+    pub(crate) async fn try_send_execution_notification(
+        &self,
+        id: ConnectionId,
+        expected: &AuthenticatedSessionPrincipal,
+        payload: String,
+        method: &str,
+    ) -> Result<()> {
+        #[cfg(test)]
+        self.pause_delivery(id, method).await;
+        let result = {
+            let connections = self.connections.read().await;
+            let connection = connections
+                .get(&id)
+                .ok_or_else(|| anyhow!("connection retired"))?;
+            if connection.principal.as_ref() != expected
+                || connection.termination_tx.borrow().is_some()
+                || crate::helpers::unix_timestamp_secs()? >= expected.access_expires_at_unix
+            {
+                return Ok(());
+            }
+            crate::thread::replay::admit_delivery(id, method, &connection.principal, || {
+                let result = connection
+                    .sender
+                    .try_send_data(Message::Text(payload.into()));
+                if result.is_err() {
+                    connection.sender.abort();
+                }
+                result
+            })
+        };
+        match result {
+            None | Some(Ok(())) => Ok(()),
+            Some(Err(_)) => {
+                self.unregister_connection(id).await;
+                Err(anyhow!("execution notification outbound full or closed"))
+            }
+        }
+    }
+
     /// Best-effort delivery; a saturated socket is retired instead of queued.
     pub async fn try_send_notification_text(
         &self,
         connection_id: ConnectionId,
         payload: String,
     ) -> Result<()> {
-        let sender = {
-            self.connections
-                .read()
-                .await
+        self.try_send_classified_notification_text(connection_id, payload, "")
+            .await
+    }
+    pub(crate) async fn try_send_classified_notification_text(
+        &self,
+        connection_id: ConnectionId,
+        payload: String,
+        method: &str,
+    ) -> Result<()> {
+        let (sender, admitted) = {
+            let connections = self.connections.read().await;
+            let connection = connections
                 .get(&connection_id)
-                .map(|connection| connection.sender.clone())
-                .ok_or_else(|| anyhow!("connection `{connection_id}` is not registered"))?
+                .ok_or_else(|| anyhow!("connection retired"))?;
+            if connection.termination_tx.borrow().is_some()
+                || crate::helpers::unix_timestamp_secs()?
+                    >= connection.principal.access_expires_at_unix
+            {
+                return Ok(());
+            }
+            let sender = connection.sender.clone();
+            let admitted = crate::thread::replay::admit_delivery(
+                connection_id,
+                method,
+                &connection.principal,
+                || sender.try_send_data(Message::Text(payload.into())),
+            );
+            (sender, admitted)
         };
-
-        match sender.try_send_data(Message::Text(payload.into())) {
+        let Some(admitted) = admitted else {
+            return Ok(());
+        };
+        match admitted {
             Ok(()) => Ok(()),
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                 sender.abort();
