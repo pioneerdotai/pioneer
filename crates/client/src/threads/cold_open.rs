@@ -256,7 +256,7 @@ impl ClientCore {
                 };
             }
             Some(ConversationEvent(r)) => {
-                registry
+                let _ = registry
                     .stores
                     .get_mut(id)
                     .expect("open store")
@@ -293,7 +293,7 @@ impl ClientCore {
                 )
                 .into_iter()
                 .collect();
-                store.apply_conversation_event(workspace, r.conversation_event, None);
+                let _ = store.apply_conversation_event(workspace, r.conversation_event, None);
                 if r.tick_conversation {
                     store.coordinator.conversation.tick();
                 }

@@ -231,7 +231,7 @@ impl ThreadDomainStore {
         workspace: &str,
         event: crate::conversation::ConversationEvent,
         mode: Option<pioneer_protocol::ThreadComposerExecutionMode>,
-    ) -> crate::timeline::semantic::SemanticTimelineCachePatch {
+    ) -> Option<crate::timeline::semantic::SemanticTimelineCachePatch> {
         let store = self;
         if let crate::conversation::ConversationEvent::ItemDelta {
             turn_id,
@@ -285,7 +285,7 @@ impl ThreadDomainStore {
                 execution_mode,
                 crate::timeline::labels::now_unix_ms(),
             );
-        patch
+        Some(patch)
     }
     fn set_snapshot(&mut self, thread: Thread) {
         if self.coordinator.thread() == Some(&thread) {
@@ -1989,7 +1989,9 @@ impl ClientCore {
             return Default::default();
         }
         let store = registry.stores.get_mut(&id).expect("retained thread");
-        let patch = store.apply_conversation_event(workspace, event, mode);
+        let Some(patch) = store.apply_conversation_event(workspace, event, mode) else {
+            return Default::default();
+        };
         let drafts = registry.publish(&id);
         self.transition_directory(
             &mut registry,
