@@ -9,7 +9,7 @@ use crate::ids::{path_segment, workspace_segment};
 
 pub const ARTIFACT_READABLE_COPY_DIR_NAME: &str = "materialized";
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub struct ArtifactReadableCopyGcCandidate {
     pub copy_id: String,
     pub relative_path: String,

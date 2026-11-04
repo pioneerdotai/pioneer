@@ -659,3 +659,159 @@ async fn new_workspace_executor_is_not_added_to_an_old_parent_grant() {
             .is_none()
     );
 }
+
+// TaskRuntime::resume_task on an already active, nonblocked Task calls this
+// durable boundary with no Task events. No caller dispatch/publish follows it.
+#[tokio::test]
+async fn empty_task_resume_action_wakes_control_after_commit_and_exact_replay_parks() {
+    use futures_util::FutureExt;
+
+    let store = store().await;
+    sync(&store, true, "resume-action").await;
+    let mut graph = graph(&store, "Eresumeaction12345678", None).await;
+    let db = store.database_connection();
+    let generation = crate::repositories::policy_generation::current_policy_generation_on(&db)
+        .await
+        .unwrap()
+        .get() as i64;
+    let fingerprint = "a".repeat(64);
+    let mut grant: serde_json::Value = serde_json::from_str(&graph.grant.grant_json).unwrap();
+    grant["agent_authorization_fingerprint"] = serde_json::json!(fingerprint);
+    grant["role_key"] = serde_json::json!("owner");
+    grant["agent_policy_generation"] = serde_json::json!(generation);
+    grant["allowed_actions"] = serde_json::json!(["task_schedule_manage"]);
+    graph.grant.grant_json = grant.to_string();
+    graph.grant.grant_fingerprint =
+        agent_execution_grant_fingerprint(&graph.grant.grant_json).unwrap();
+    store
+        .commit_agent_execution_graph(graph.clone())
+        .await
+        .unwrap();
+
+    let mut task = crate::tests::sample_task(graph.contract_now);
+    task.workspace_id = "continuity-workspace".into();
+    store
+        .append_task_events(
+            vec![crate::TaskEventPayload::TaskCreated { task: task.clone() }],
+            graph.contract_now,
+        )
+        .await
+        .unwrap();
+    let before = store.get_task(&task.id).await.unwrap().unwrap();
+    assert_eq!(before.task.status, pioneer_protocol::TaskStatus::Scheduled);
+    assert!(before.triggers.is_empty());
+    let action = AgentCommitInput {
+        mutation_kind: "control_task".into(),
+        idempotency_key: "resume-active-task".into(),
+        request_fingerprint: "resume-request".into(),
+        actor_identity_id: graph.identity.id.clone(),
+        action: AgentActionInput {
+            id: canonical_agent_id('A', "resume-active-task"),
+            execution_id: graph.child_execution.id.clone(),
+            action_kind: "control_task".into(),
+            idempotency_key: "resume-active-task".into(),
+            request_fingerprint: "resume-request".into(),
+            now: graph.child_execution.now,
+        },
+        receipt_id: canonical_agent_id('R', "resume-active-task"),
+        outbox_id: canonical_agent_id('O', "resume-active-task"),
+        action_response_json: Some("{}".into()),
+        receipt_response_json: Some("{}".into()),
+        route_receipt_json: None,
+        outbox_payload_json: "{}".into(),
+        policy_fingerprint: fingerprint.clone(),
+        execution_grant_fingerprint: fingerprint,
+        execution_grant_policy_generation: generation,
+        source_scope_id: graph.child_execution.home_root_thread_id.clone(),
+        destination_scope_id: None,
+        subject_role_key: "owner".into(),
+        authorized_resource_action: "task_schedule_manage".into(),
+        source_policy_generation: generation,
+        destination_policy_generation: None,
+        route_generation: None,
+        disclosure_class: "source_capsule".into(),
+        expected_execution_generation: graph.child_execution.execution_generation,
+        expected_current_identity_source_revision: graph.identity.source_revision,
+        expected_current_identity_source_fingerprint: graph.identity.source_fingerprint.clone(),
+        expected_attempt_generation: 1,
+        expected_policy_generation: generation,
+        requires_cross_capsule_route: false,
+        resource: None,
+    };
+    let mut control = db.work_signal("gateway.control").subscribe();
+    control.begin_pass(&db).await.unwrap();
+    assert!(
+        load_agent_action_outbox(&db, &action.action.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(control.wait(None).now_or_never().is_none());
+
+    let appended = store
+        .append_task_events_with_agent_action(Vec::new(), graph.contract_now, action.clone())
+        .await
+        .unwrap();
+    assert!(appended.is_empty());
+    assert!(
+        control.wait(None).now_or_never().is_some(),
+        "new action-only commit must wake a parked control consumer"
+    );
+    let committed = agent_action::Entity::find_by_id(action.action.id.clone())
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(committed.status, "committed");
+    let receipt = load_agent_action_receipt(&db, &action.action.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(receipt.id, action.receipt_id);
+    let outbox = load_agent_action_outbox(&db, &action.action.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(outbox.id, action.outbox_id);
+    assert_eq!(outbox.status, "pending");
+    assert_eq!(outbox.attempts, 0);
+    assert_eq!(
+        store.get_task(&task.id).await.unwrap().unwrap().task,
+        before.task
+    );
+
+    control.begin_pass(&db).await.unwrap();
+    assert!(
+        store
+            .append_task_events_with_agent_action(Vec::new(), graph.contract_now, action.clone())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        control.wait(None).now_or_never().is_none(),
+        "exact replay must leave control parked"
+    );
+    assert_eq!(
+        load_agent_action_receipt(&db, &action.action.id)
+            .await
+            .unwrap()
+            .unwrap(),
+        receipt
+    );
+    assert_eq!(
+        load_agent_action_outbox(&db, &action.action.id)
+            .await
+            .unwrap()
+            .unwrap(),
+        outbox
+    );
+    assert_eq!(agent_action::Entity::find().count(&db).await.unwrap(), 1);
+    assert_eq!(
+        agent_domain_commit::Entity::find()
+            .count(&db)
+            .await
+            .unwrap(),
+        1
+    );
+}

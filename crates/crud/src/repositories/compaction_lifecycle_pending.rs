@@ -75,6 +75,27 @@ pub(crate) async fn due<C: ConnectionTrait>(db: &C, now: i64) -> Result<Vec<pend
         .all(db)
         .await?)
 }
+/// Scalar heads preserve bounded scope expansion and pending-attempt clocks.
+pub(crate) async fn next_deadline<C: ConnectionTrait>(db: &C) -> Result<Option<i64>> {
+    let pending = pending::Entity::find()
+        .select_only()
+        .column(pending::Column::DueAt)
+        .order_by_asc(pending::Column::DueAt)
+        .limit(1)
+        .into_tuple::<i64>()
+        .one(db)
+        .await?;
+    let scope = scope::Entity::find()
+        .select_only()
+        .column(scope::Column::DueAt)
+        .order_by_asc(scope::Column::DueAt)
+        .limit(1)
+        .into_tuple::<i64>()
+        .one(db)
+        .await?;
+    Ok(pending.into_iter().chain(scope).min())
+}
+
 pub(crate) async fn claim(
     db: &SqliteDatabase,
     row: &pending::Model,

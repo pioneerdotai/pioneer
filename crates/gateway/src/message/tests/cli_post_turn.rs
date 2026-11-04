@@ -520,10 +520,15 @@ async fn failed_gate_bookkeeping_dispatches_independent_hooks_and_defers_worker(
         .await
         .unwrap();
     timeout(Duration::from_secs(10), async {
-        while processor
-            .native_terminal_effect_kick_running
-            .load(Ordering::Acquire)
-        {
+        loop {
+            let row = effect::Entity::find_by_id(poison.clone())
+                .one(&store.database_connection())
+                .await
+                .unwrap()
+                .unwrap();
+            if row.gate_probe_attempts > 0 {
+                break;
+            }
             tokio::task::yield_now().await;
         }
     })
@@ -536,6 +541,20 @@ async fn failed_gate_bookkeeping_dispatches_independent_hooks_and_defers_worker(
         .unwrap();
     assert_eq!(row.attempt_count, 0);
     assert_eq!(row.status, "waiting_acceptance");
+    assert_eq!(
+        store
+            .next_native_terminal_effect_execution_deadline()
+            .await
+            .unwrap(),
+        Some(row.gate_probe_at)
+    );
+    // The existing owner now retains that real gate clock until cancellation.
+    processor.shutdown_resilience_workers().await;
+    assert!(
+        !processor
+            .native_terminal_effect_kick_running
+            .load(Ordering::Acquire)
+    );
 }
 
 #[tokio::test]
@@ -628,4 +647,74 @@ async fn terminal_effect_single_kick_drains_more_than_one_full_quantum() {
             );
         }
     }
+}
+
+#[tokio::test]
+async fn terminal_effect_owner_recovers_an_expired_lease_without_another_kick() {
+    let (processor, _, _rx, workspace, store, _) = cli_runtime_approval_processor().await;
+    let processor = Arc::new(processor);
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    install_recoverable_test_hook_runtime(
+        &processor,
+        task_post_turn_recording_hook_runtime(calls.clone()),
+    )
+    .await;
+    let turn_id = "terminal-lease-clock";
+    seed_cli_runtime_turn_with_text(
+        &store,
+        &workspace,
+        "codex",
+        "codex",
+        "thread-terminal-lease",
+        turn_id,
+        "native-terminal-lease",
+        "input",
+    )
+    .await;
+    let binding = store
+        .get_cli_runtime_turn_binding(turn_id)
+        .await
+        .unwrap()
+        .unwrap();
+    processor
+        .prepare_cli_post_turn_hook(&binding, 1, Some(&final_answer("done")))
+        .await
+        .unwrap();
+    commit_turn(&store, &binding).await;
+    let claimed = store
+        .claim_due_native_terminal_effects_at(now_timestamp_secs(), 5, 8)
+        .await
+        .unwrap();
+    assert_eq!(claimed.records.len(), 1);
+    processor.arm_completed_history_preparation_barrier("__terminal_effect_before_timer__");
+    // No resilience loop or further producer kick can rediscover this lease.
+    processor.kick_native_terminal_effects();
+    timeout(
+        Duration::from_secs(3),
+        processor.wait_for_completed_history_preparation_barrier(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        calls.lock().unwrap().is_empty(),
+        "the first wave found only a future lease"
+    );
+    processor.release_completed_history_preparation_barrier();
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if store
+                .native_terminal_effect_status(&claimed.records[0].effect_id)
+                .await
+                .unwrap()
+                .is_some_and(|row| row.status == "succeeded")
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(calls.lock().unwrap().len(), 1);
+    processor.shutdown_resilience_workers().await;
 }

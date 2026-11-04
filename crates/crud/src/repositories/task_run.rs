@@ -874,3 +874,21 @@ pub async fn scheduler_due_upper<C: ConnectionTrait>(
         .await
         .context("failed to capture due run upper")
 }
+
+/// Future queued rows outside the in-memory bounded page still own deadlines.
+pub(crate) async fn next_ready_deadline<C: ConnectionTrait>(
+    db: &C,
+    now: i64,
+) -> Result<Option<i64>> {
+    Ok(task_run::Entity::find()
+        .select_only()
+        .column(task_run::Column::ReadyAt)
+        .filter(task_run::Column::Status.eq(task_run_status_to_db(TaskRunStatus::Queued)))
+        .filter(task_run::Column::ReadyAt.gt(unix_to_datetime(now)))
+        .order_by_asc(task_run::Column::ReadyAt)
+        .limit(1)
+        .into_tuple::<DateTimeWithTimeZone>()
+        .one(db)
+        .await?
+        .map(crate::util::deadline_unix_seconds))
+}

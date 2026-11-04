@@ -131,6 +131,30 @@ async fn initialize_inner(
     app_config: &AppConfig,
     startup: Option<&pioneer_observability::GatewayStartupTrace>,
 ) -> Result<SqliteDatabase> {
+    let ownership = pioneer_sqlite::WriterOwnership::acquire(&gateway_database_path(
+        runtime_home,
+        app_config,
+    )?)?;
+    let runtime_home = runtime_home.to_path_buf();
+    let app_config = app_config.clone();
+    let startup = startup.cloned();
+    // This owned, idempotent bootstrap finishes even if its requester leaves.
+    // Otherwise cancelled pool creation could release the process lock while
+    // SQLx is still opening/configuring the physical writer. No services or
+    // watchers are started here; a discarded result closes its pools.
+    tokio::spawn(async move {
+        initialize_owned(&runtime_home, &app_config, startup.as_ref(), ownership).await
+    })
+    .await
+    .context("database initialization owner failed")?
+}
+
+async fn initialize_owned(
+    runtime_home: &Path,
+    app_config: &AppConfig,
+    startup: Option<&pioneer_observability::GatewayStartupTrace>,
+    ownership: Arc<pioneer_sqlite::WriterOwnership>,
+) -> Result<SqliteDatabase> {
     let database_open_stage =
         startup.map(|trace| trace.stage(pioneer_observability::GatewayStartupStage::DatabaseOpen));
     let config = GatewayDatabaseRuntimeConfig::from_app_config(app_config)?;
@@ -141,14 +165,30 @@ async fn initialize_inner(
     let writer_url = sqlite_connection_url(database_path.as_path());
     let query_fingerprints = Arc::new(QueryFingerprintLimiter::default());
 
-    let mut writer = Database::connect(connect_options(
+    let mut writer_options = connect_options(
         writer_url.clone(),
         WRITER_MAX_CONNECTIONS,
         &config,
         "pioneer-sqlite-writer-",
-    ))
-    .await
-    .with_context(|| format!("failed to connect to gateway writer `{writer_url}`"))?;
+    );
+    let weak_ownership = Arc::downgrade(&ownership);
+    writer_options.map_sqlx_sqlite_pool_opts(move |options| {
+        let ownership = weak_ownership.clone();
+        options
+            .acquire_time_level(log::LevelFilter::Trace)
+            .after_connect(move |connection, _| {
+                let ownership = ownership.clone();
+                Box::pin(async move {
+                    let ownership = ownership.upgrade().ok_or_else(|| {
+                        sea_orm::sqlx::Error::Protocol("database writer owner closed".into())
+                    })?;
+                    ownership.retain_on_connection(connection).await
+                })
+            })
+    });
+    let mut writer = Database::connect(writer_options)
+        .await
+        .with_context(|| format!("failed to connect to gateway writer `{writer_url}`"))?;
     if let Some(stage) = database_open_stage {
         stage.succeed();
     }
@@ -162,7 +202,8 @@ async fn initialize_inner(
         query_fingerprints.clone(),
     );
 
-    let writer = SqliteWriteExecutor::with_observer(writer, super::write_observer());
+    let writer = SqliteWriteExecutor::with_observer(writer, super::write_observer())
+        .retain_ownership(ownership);
     writer
         .ping(SqliteWriteClass::Maintenance)
         .await
@@ -412,6 +453,55 @@ pub(crate) async fn initialize_existing_for_operations(
     }
 
     initialize(runtime_home, app_config).await.map(Some)
+}
+
+/// Preserve operator commands' existing offline migration behavior. Online
+/// reads share no writable connection with the active owner and need no lock.
+pub(crate) async fn read_existing_for_operations(
+    runtime_home: &Path,
+    app_config: &AppConfig,
+) -> Result<Option<SqliteDatabase>> {
+    let path = gateway_database_path(runtime_home, app_config)?;
+    match std::fs::metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+        Ok(_) => {}
+    }
+    match initialize_existing_for_operations(runtime_home, app_config).await {
+        Ok(database) => return Ok(database),
+        Err(error) if error.downcast_ref::<pioneer_sqlite::WriterBusy>().is_some() => {}
+        Err(error) => return Err(error),
+    }
+    pioneer_sqlite::zstd::register_auto_extension_once()
+        .context("failed to register SQLite extensions for operator reads")?;
+    let config = GatewayDatabaseRuntimeConfig::from_app_config(app_config)?;
+    let mut options = connect_options(
+        sqlite_read_only_connection_url(&path),
+        1,
+        &config,
+        "pioneer-sqlite-operator-reader-",
+    );
+    options.map_sqlx_sqlite_opts(|options| {
+        options
+            .read_only(true)
+            .create_if_missing(false)
+            .pragma("query_only", "ON")
+    });
+    let mut reader = Database::connect(options)
+        .await
+        .context("open operator read-only database")?;
+    configure_observability(
+        &mut reader,
+        pioneer_observability::DatabaseRole::Reader,
+        1,
+        Arc::new(QueryFingerprintLimiter::default()),
+    );
+    let writer = SqliteWriteExecutor::with_observer(reader.clone(), super::write_observer());
+    let database =
+        SqliteDatabase::from_executor_with_read_observer(reader, writer, super::read_observer())
+            .maintenance();
+    database.validate_reader().await?;
+    Ok(Some(database))
 }
 
 #[cfg(test)]

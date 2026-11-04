@@ -206,6 +206,9 @@ impl InvitationService {
         let now_unix = u64::try_from(now.timestamp())
             .context("accept clock predates Unix epoch")
             .map_err(InvitationAcceptServiceError::Storage)?;
+        // A first Member session is committed by this outer transaction. Its
+        // expiry notification must outlive dispatch and follow that commit.
+        let expiry_change = database.work_signal("auth.expiry").changing();
         let transaction = database
             .begin_with_options(TransactionOptions {
                 sqlite_transaction_mode: Some(SqliteTransactionMode::Immediate),
@@ -265,6 +268,7 @@ impl InvitationService {
                 return Err(InvitationAcceptServiceError::Storage(error));
             }
         };
+        expiry_change.completed(true);
         auth_service
             .invitation_accept_committed(accepted.committed.clone())
             .await;

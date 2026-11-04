@@ -5,6 +5,7 @@
 //! mutation pass a `DatabaseTransaction`; no function infers an actor from a
 //! provider, model, display label or the last message.
 
+use crate::GatewayControlConnection;
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Duration, Utc};
 use futures_util::FutureExt;
@@ -2803,58 +2804,70 @@ pub async fn insert_agent_resource_state<C: ConnectionTrait>(
     Ok(state)
 }
 
-pub async fn enqueue_agent_execution<C: ConnectionTrait>(
+pub async fn enqueue_agent_execution<C: GatewayControlConnection>(
     db: &C,
     input: &AgentQueueEntryInput,
 ) -> Result<agent_work_queue::Model> {
-    ensure_agent_branch_schedule(
-        db,
-        input.root_execution_id.as_str(),
-        input.branch_key.as_str(),
-        input.now.clone(),
-    )
-    .await?;
-    agent_work_queue::Entity::insert(agent_work_queue::ActiveModel {
-        id: Set(input.id.clone()),
-        root_execution_id: Set(input.root_execution_id.clone()),
-        execution_id: Set(input.execution_id.clone()),
-        attempt_generation: Set(input.attempt_generation),
-        branch_key: Set(input.branch_key.clone()),
-        enqueue_sequence: Set(input.enqueue_sequence),
-        state: Set("queued".to_owned()),
-        eligible_at: Set(input.eligible_at),
-        claim_token: Set(None),
-        created_at: Set(input.now),
-        updated_at: Set(input.now),
-    })
-    .on_conflict(
-        OnConflict::columns([
-            agent_work_queue::Column::RootExecutionId,
-            agent_work_queue::Column::ExecutionId,
-            agent_work_queue::Column::AttemptGeneration,
-        ])
-        .do_nothing()
-        .to_owned(),
-    )
-    .exec_without_returning(db)
-    .await
-    .context("failed to enqueue agent execution")?;
-    let queue = agent_work_queue::Entity::find()
-        .filter(agent_work_queue::Column::RootExecutionId.eq(input.root_execution_id.clone()))
-        .filter(agent_work_queue::Column::ExecutionId.eq(input.execution_id.clone()))
-        .filter(agent_work_queue::Column::AttemptGeneration.eq(input.attempt_generation))
-        .one(db)
+    let change = db.gateway_control_change();
+    let mut changed = false;
+    let result = async {
+        ensure_agent_branch_schedule(
+            db,
+            input.root_execution_id.as_str(),
+            input.branch_key.as_str(),
+            input.now.clone(),
+        )
+        .await?;
+        let inserted = agent_work_queue::Entity::insert(agent_work_queue::ActiveModel {
+            id: Set(input.id.clone()),
+            root_execution_id: Set(input.root_execution_id.clone()),
+            execution_id: Set(input.execution_id.clone()),
+            attempt_generation: Set(input.attempt_generation),
+            branch_key: Set(input.branch_key.clone()),
+            enqueue_sequence: Set(input.enqueue_sequence),
+            state: Set("queued".to_owned()),
+            eligible_at: Set(input.eligible_at),
+            claim_token: Set(None),
+            created_at: Set(input.now),
+            updated_at: Set(input.now),
+        })
+        .on_conflict(
+            OnConflict::columns([
+                agent_work_queue::Column::RootExecutionId,
+                agent_work_queue::Column::ExecutionId,
+                agent_work_queue::Column::AttemptGeneration,
+            ])
+            .do_nothing()
+            .to_owned(),
+        )
+        .exec_without_returning(db)
         .await
-        .context("failed to reload agent work queue entry")?
-        .context("agent work queue entry disappeared after idempotent insert")?;
-    if queue.id != input.id
-        || queue.branch_key != input.branch_key
-        || queue.enqueue_sequence != input.enqueue_sequence
-        || queue.eligible_at != input.eligible_at
-    {
-        bail!("agent work queue entry was reused with different immutable facts");
+        .context("failed to enqueue agent execution")?;
+        changed = inserted > 0;
+        let queue = agent_work_queue::Entity::find()
+            .filter(agent_work_queue::Column::RootExecutionId.eq(input.root_execution_id.clone()))
+            .filter(agent_work_queue::Column::ExecutionId.eq(input.execution_id.clone()))
+            .filter(agent_work_queue::Column::AttemptGeneration.eq(input.attempt_generation))
+            .one(db)
+            .await
+            .context("failed to reload agent work queue entry")?
+            .context("agent work queue entry disappeared after idempotent insert")?;
+        if queue.id != input.id
+            || queue.branch_key != input.branch_key
+            || queue.enqueue_sequence != input.enqueue_sequence
+            || queue.eligible_at != input.eligible_at
+        {
+            bail!("agent work queue entry was reused with different immutable facts");
+        }
+        Ok(queue)
     }
-    Ok(queue)
+    .await;
+    if result.is_ok() {
+        if let Some(change) = change {
+            change.completed(changed);
+        }
+    }
+    result
 }
 
 pub(super) async fn ensure_agent_branch_schedule<C: ConnectionTrait>(
@@ -3734,6 +3747,20 @@ fn agent_action_decision_fingerprint(input: &AgentCommitInput) -> String {
         digest.update([generation.is_some() as u8]);
     }
     hex::encode(digest.finalize())
+}
+
+/// Read under the same writer transaction as the compound mutation. Exact
+/// replay returns before inserting the action receipt or outbox.
+pub(crate) async fn agent_action_commit_exists(
+    db: &DatabaseTransaction,
+    input: &AgentCommitInput,
+) -> Result<bool> {
+    Ok(agent_domain_commit::Entity::find()
+        .filter(agent_domain_commit::Column::IdempotencyKey.eq(input.idempotency_key.clone()))
+        .filter(agent_domain_commit::Column::ExecutionId.eq(input.action.execution_id.clone()))
+        .one(db)
+        .await?
+        .is_some())
 }
 
 /// Commit action, receipt, domain commit and outbox in one caller-owned transaction.
@@ -4795,22 +4822,8 @@ pub async fn commit_native_agent_config_mutation(
 /// window and only for a terminal, complete action tuple. Immutable action,
 /// receipt and outbox ownership facts remain queryable; exact payload hashes
 /// still fence a late direct replay without retaining provider-sized blobs.
-pub async fn compact_terminal_agent_action_ledger<C>(
-    db: &C,
-    now: DateTimeWithTimeZone,
-    limit: u64,
-) -> Result<AgentActionLedgerCompactionSummary>
-where
-    C: ConnectionTrait + TransactionTrait,
-{
-    if limit == 0 {
-        return Ok(AgentActionLedgerCompactionSummary::default());
-    }
-    if limit > AGENT_BACKGROUND_BATCH_LIMIT {
-        bail!("Agent action compaction batch exceeds its bounded limit");
-    }
-    let cutoff = now - Duration::days(AGENT_ACTION_LEDGER_PAYLOAD_RETENTION_DAYS);
-    let terminal = Condition::any()
+fn terminal_ledger_condition() -> Condition {
+    Condition::any()
         .add(
             Condition::all()
                 .add(agent_action_outbox::Column::Status.eq("delivered"))
@@ -4855,8 +4868,118 @@ where
                         ),
                 )
                 .add(agent_action_outbox::Column::NextAttemptAt.is_null()),
+        )
+}
+
+/// Future retention head only. Due rows belong to the finite compaction scan;
+/// blocked terminal-start proofs are reopened by source invalidation, not a
+/// past-due timestamp that would make the control owner spin forever.
+pub async fn next_agent_ledger_retention_at<C: ConnectionTrait>(
+    db: &C,
+    now: DateTimeWithTimeZone,
+) -> Result<Option<i64>> {
+    let cutoff = now - Duration::days(AGENT_ACTION_LEDGER_PAYLOAD_RETENTION_DAYS);
+    Ok(agent_action_outbox::Entity::find()
+        .select_only()
+        .column(agent_action_outbox::Column::CreatedAt)
+        .filter(terminal_ledger_condition())
+        .filter(agent_action_outbox::Column::PayloadJson.not_like("%\"_pioneer_compacted\"%"))
+        .filter(agent_action_outbox::Column::CreatedAt.gt(cutoff))
+        .order_by_asc(agent_action_outbox::Column::CreatedAt)
+        .limit(1)
+        .into_tuple::<DateTimeWithTimeZone>()
+        .one(db)
+        .await?
+        .map(|at| {
+            crate::util::deadline_unix_seconds(
+                at + Duration::days(AGENT_ACTION_LEDGER_PAYLOAD_RETENTION_DAYS),
+            )
+        }))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentLedgerCursor {
+    pub created_at: DateTimeWithTimeZone,
+    pub id: String,
+    pub upper_created_at: DateTimeWithTimeZone,
+    pub upper_id: String,
+}
+
+pub async fn compact_terminal_agent_action_ledger<C>(
+    db: &C,
+    now: DateTimeWithTimeZone,
+    limit: u64,
+) -> Result<AgentActionLedgerCompactionSummary>
+where
+    C: ConnectionTrait + TransactionTrait,
+{
+    compact_terminal_agent_action_ledger_page(db, now, limit, None)
+        .await
+        .map(|(summary, _)| summary)
+}
+
+/// Continue `next` until None, even when compacted_rows == 0. A skipped proof
+/// is not the end of the finite scan. Restart at None after source invalidation.
+pub async fn compact_terminal_agent_action_ledger_page<C>(
+    db: &C,
+    now: DateTimeWithTimeZone,
+    limit: u64,
+    after: Option<&AgentLedgerCursor>,
+) -> Result<(
+    AgentActionLedgerCompactionSummary,
+    Option<AgentLedgerCursor>,
+)>
+where
+    C: ConnectionTrait + TransactionTrait,
+{
+    if limit == 0 {
+        return Ok((AgentActionLedgerCompactionSummary::default(), None));
+    }
+    if limit > AGENT_BACKGROUND_BATCH_LIMIT {
+        bail!("Agent action compaction batch exceeds its bounded limit");
+    }
+    let cutoff = now - Duration::days(AGENT_ACTION_LEDGER_PAYLOAD_RETENTION_DAYS);
+    let terminal = terminal_ledger_condition();
+    let after_condition = match after {
+        Some(after) => Condition::any()
+            .add(agent_action_outbox::Column::CreatedAt.gt(after.created_at))
+            .add(
+                Condition::all()
+                    .add(agent_action_outbox::Column::CreatedAt.eq(after.created_at))
+                    .add(agent_action_outbox::Column::Id.gt(after.id.clone())),
+            ),
+        None => Condition::all(),
+    };
+    let (upper_created_at, upper_id) = if let Some(cursor) = after {
+        (cursor.upper_created_at, cursor.upper_id.clone())
+    } else {
+        let Some(upper) = agent_action_outbox::Entity::find()
+            .select_only()
+            .column(agent_action_outbox::Column::CreatedAt)
+            .column(agent_action_outbox::Column::Id)
+            .filter(terminal.clone())
+            .filter(agent_action_outbox::Column::CreatedAt.lte(cutoff))
+            .filter(agent_action_outbox::Column::PayloadJson.not_like("%\"_pioneer_compacted\"%"))
+            .order_by_desc(agent_action_outbox::Column::CreatedAt)
+            .order_by_desc(agent_action_outbox::Column::Id)
+            .into_tuple::<(DateTimeWithTimeZone, String)>()
+            .one(db)
+            .await?
+        else {
+            return Ok((AgentActionLedgerCompactionSummary::default(), None));
+        };
+        upper
+    };
+    let upper_condition = Condition::any()
+        .add(agent_action_outbox::Column::CreatedAt.lt(upper_created_at))
+        .add(
+            Condition::all()
+                .add(agent_action_outbox::Column::CreatedAt.eq(upper_created_at))
+                .add(agent_action_outbox::Column::Id.lte(upper_id.clone())),
         );
     let candidates = agent_action_outbox::Entity::find()
+        .filter(after_condition)
+        .filter(upper_condition)
         .filter(terminal)
         .filter(agent_action_outbox::Column::CreatedAt.lte(cutoff))
         .filter(agent_action_outbox::Column::PayloadJson.not_like("%\"_pioneer_compacted\"%"))
@@ -4866,6 +4989,16 @@ where
         .all(db)
         .await
         .context("failed to select terminal agent domain action ledger rows")?;
+    let next = if candidates.len() as u64 == limit {
+        candidates.last().map(|row| AgentLedgerCursor {
+            created_at: row.created_at,
+            id: row.id.clone(),
+            upper_created_at,
+            upper_id: upper_id.clone(),
+        })
+    } else {
+        None
+    };
     let mut summary = AgentActionLedgerCompactionSummary {
         candidate_rows: u64::try_from(candidates.len()).unwrap_or(u64::MAX),
         ..Default::default()
@@ -5029,7 +5162,7 @@ where
         summary.compacted_rows = summary.compacted_rows.saturating_add(1);
         summary.payload_bytes_released = summary.payload_bytes_released.saturating_add(released);
     }
-    Ok(summary)
+    Ok((summary, next))
 }
 
 fn compacted_agent_action_outbox_payload(
@@ -5272,6 +5405,9 @@ async fn discover_agent_action_outbox<C: ConnectionTrait>(
 /// Known-committed claims and independent candidate failures from one input quantum.
 #[derive(Debug, Default)]
 pub struct AgentActionOutboxClaimBatch {
+    /// Raw discovered identities before claims, filtering or dispatch failures.
+    /// Either range can fill before the combined 64-row budget is exhausted.
+    pub has_more: bool,
     pub rows: Vec<agent_action_outbox::Model>,
     pub errors: Vec<anyhow::Error>,
 }
@@ -5279,11 +5415,20 @@ pub struct AgentActionOutboxClaimBatch {
 /// Claim at most 32 immediate and 32 timed inputs. Expired final leases share
 /// this budget with delivery work. Nonzero limits must be 2..=64 so both ranges
 /// receive a share. Dispatch only `rows`, whose commits are known to have succeeded.
-pub async fn claim_agent_action_outbox<C: ConnectionTrait + TransactionTrait>(
+pub async fn claim_agent_action_outbox<C: GatewayControlConnection + TransactionTrait>(
     db: &C,
     limit: u64,
 ) -> Result<AgentActionOutboxClaimBatch> {
-    claim_agent_action_outbox_with_clock(db, limit, &utc_now).await
+    let change = db.gateway_control_change();
+    let result = claim_agent_action_outbox_with_clock(db, limit, &utc_now).await;
+    if let Ok(batch) = &result {
+        if batch.errors.is_empty() {
+            if let Some(change) = change {
+                change.completed(!batch.rows.is_empty());
+            }
+        }
+    }
+    result
 }
 
 // An immediate clock callback makes writer-admission timing testable without
@@ -5300,7 +5445,10 @@ async fn claim_agent_action_outbox_with_clock<C: ConnectionTrait + TransactionTr
         bail!("Agent action outbox nonzero batch limit must be 2..=64");
     }
     let ids = discover_agent_action_outbox(db, clock(), limit).await?;
-    let mut batch = AgentActionOutboxClaimBatch::default();
+    let mut batch = AgentActionOutboxClaimBatch {
+        has_more: ids.len() as u64 >= limit / 2,
+        ..Default::default()
+    };
     for id in ids {
         // The entire point operation is inside the boundary, including future
         // creation and polling. Dropping it releases transactions/reservations;
@@ -5535,32 +5683,42 @@ async fn transition_agent_action_outbox<C: ConnectionTrait>(
     Ok(true)
 }
 
-pub async fn mark_agent_action_outbox_delivered<C: ConnectionTrait>(
+pub async fn mark_agent_action_outbox_delivered<C: GatewayControlConnection>(
     db: &C,
     outbox_id: &str,
     expected_attempts: i64,
     delivered_at: DateTimeWithTimeZone,
 ) -> Result<bool> {
-    let result = agent_action_outbox::Entity::update_many()
-        .col_expr(
-            agent_action_outbox::Column::Status,
-            sea_orm::sea_query::Expr::value("delivered"),
-        )
-        .col_expr(
-            agent_action_outbox::Column::DeliveredAt,
-            sea_orm::sea_query::Expr::value(Some(delivered_at)),
-        )
-        .col_expr(
-            agent_action_outbox::Column::NextAttemptAt,
-            sea_orm::sea_query::Expr::value::<Option<DateTimeWithTimeZone>>(None),
-        )
-        .filter(agent_action_outbox::Column::Id.eq(outbox_id.to_owned()))
-        .filter(agent_action_outbox::Column::Status.eq("pending"))
-        .filter(agent_action_outbox::Column::Attempts.eq(expected_attempts))
-        .exec(db)
-        .await
-        .context("failed to mark agent domain outbox row delivered")?;
-    Ok(result.rows_affected == 1)
+    let change = db.gateway_control_change();
+    let result = async {
+        let result = agent_action_outbox::Entity::update_many()
+            .col_expr(
+                agent_action_outbox::Column::Status,
+                sea_orm::sea_query::Expr::value("delivered"),
+            )
+            .col_expr(
+                agent_action_outbox::Column::DeliveredAt,
+                sea_orm::sea_query::Expr::value(Some(delivered_at)),
+            )
+            .col_expr(
+                agent_action_outbox::Column::NextAttemptAt,
+                sea_orm::sea_query::Expr::value::<Option<DateTimeWithTimeZone>>(None),
+            )
+            .filter(agent_action_outbox::Column::Id.eq(outbox_id.to_owned()))
+            .filter(agent_action_outbox::Column::Status.eq("pending"))
+            .filter(agent_action_outbox::Column::Attempts.eq(expected_attempts))
+            .exec(db)
+            .await
+            .context("failed to mark agent domain outbox row delivered")?;
+        Ok(result.rows_affected == 1)
+    }
+    .await;
+    if let Ok(changed) = &result {
+        if let Some(change) = change {
+            change.completed(*changed);
+        }
+    }
+    result
 }
 
 /// Fixed diagnostics only: provider errors and user payloads never enter the ledger.
@@ -5600,7 +5758,7 @@ impl std::fmt::Display for AgentActionOutboxFailure {
 }
 impl std::error::Error for AgentActionOutboxFailure {}
 
-pub async fn mark_agent_action_outbox_failed<C: ConnectionTrait>(
+pub async fn mark_agent_action_outbox_failed<C: GatewayControlConnection>(
     db: &C,
     outbox_id: &str,
     expected_attempts: i64,
@@ -5617,7 +5775,7 @@ pub async fn mark_agent_action_outbox_failed<C: ConnectionTrait>(
     .await
 }
 
-pub async fn mark_agent_action_outbox_failed_with_cause<C: ConnectionTrait>(
+pub async fn mark_agent_action_outbox_failed_with_cause<C: GatewayControlConnection>(
     db: &C,
     outbox_id: &str,
     expected_attempts: i64,
@@ -5625,57 +5783,68 @@ pub async fn mark_agent_action_outbox_failed_with_cause<C: ConnectionTrait>(
     failure: AgentActionOutboxFailure,
     terminal: bool,
 ) -> Result<bool> {
-    let exhausted_start = if !terminal && expected_attempts == AGENT_ACTION_OUTBOX_MAX_ATTEMPTS {
-        match agent_action_outbox::Entity::find_by_id(outbox_id.to_owned())
-            .one(db)
-            .await?
+    let change = db.gateway_control_change();
+    let result = async {
+        let exhausted_start = if !terminal && expected_attempts == AGENT_ACTION_OUTBOX_MAX_ATTEMPTS
         {
-            Some(row) if row.attempts == expected_attempts => {
-                agent_action::Entity::find_by_id(row.action_id)
-                    .one(db)
-                    .await?
-                    .is_some_and(|action| action.action_kind == "start_agent")
+            match agent_action_outbox::Entity::find_by_id(outbox_id.to_owned())
+                .one(db)
+                .await?
+            {
+                Some(row) if row.attempts == expected_attempts => {
+                    agent_action::Entity::find_by_id(row.action_id)
+                        .one(db)
+                        .await?
+                        .is_some_and(|action| action.action_kind == "start_agent")
+                }
+                _ => false,
             }
-            _ => false,
+        } else {
+            false
+        };
+        let next_attempt_at = if terminal {
+            None
+        } else if exhausted_start {
+            Some(failed_at.clone() + Duration::seconds(AGENT_ACTION_OUTBOX_LEASE_SECONDS))
+        } else {
+            agent_action_outbox_retry_at(expected_attempts, failed_at.clone())?
+        };
+        let result = agent_action_outbox::Entity::update_many()
+            .col_expr(
+                agent_action_outbox::Column::Status,
+                sea_orm::sea_query::Expr::value("failed"),
+            )
+            .col_expr(
+                agent_action_outbox::Column::LastError,
+                sea_orm::sea_query::Expr::value(Some(
+                    if exhausted_start
+                        && AGENT_START_TERMINAL_FAILURE_CLASSES.contains(&failure.safe_name())
+                    {
+                        AGENT_START_RECONCILIATION_REQUIRED.to_owned()
+                    } else {
+                        failure.safe_name().to_owned()
+                    },
+                )),
+            )
+            .col_expr(
+                agent_action_outbox::Column::NextAttemptAt,
+                sea_orm::sea_query::Expr::value(next_attempt_at),
+            )
+            .filter(agent_action_outbox::Column::Id.eq(outbox_id.to_owned()))
+            .filter(agent_action_outbox::Column::Status.eq("pending"))
+            .filter(agent_action_outbox::Column::Attempts.eq(expected_attempts))
+            .exec(db)
+            .await
+            .context("failed to mark agent domain outbox row failed")?;
+        Ok(result.rows_affected == 1)
+    }
+    .await;
+    if let Ok(changed) = &result {
+        if let Some(change) = change {
+            change.completed(*changed);
         }
-    } else {
-        false
-    };
-    let next_attempt_at = if terminal {
-        None
-    } else if exhausted_start {
-        Some(failed_at.clone() + Duration::seconds(AGENT_ACTION_OUTBOX_LEASE_SECONDS))
-    } else {
-        agent_action_outbox_retry_at(expected_attempts, failed_at.clone())?
-    };
-    let result = agent_action_outbox::Entity::update_many()
-        .col_expr(
-            agent_action_outbox::Column::Status,
-            sea_orm::sea_query::Expr::value("failed"),
-        )
-        .col_expr(
-            agent_action_outbox::Column::LastError,
-            sea_orm::sea_query::Expr::value(Some(
-                if exhausted_start
-                    && AGENT_START_TERMINAL_FAILURE_CLASSES.contains(&failure.safe_name())
-                {
-                    AGENT_START_RECONCILIATION_REQUIRED.to_owned()
-                } else {
-                    failure.safe_name().to_owned()
-                },
-            )),
-        )
-        .col_expr(
-            agent_action_outbox::Column::NextAttemptAt,
-            sea_orm::sea_query::Expr::value(next_attempt_at),
-        )
-        .filter(agent_action_outbox::Column::Id.eq(outbox_id.to_owned()))
-        .filter(agent_action_outbox::Column::Status.eq("pending"))
-        .filter(agent_action_outbox::Column::Attempts.eq(expected_attempts))
-        .exec(db)
-        .await
-        .context("failed to mark agent domain outbox row failed")?;
-    Ok(result.rows_affected == 1)
+    }
+    result
 }
 
 /// Release an outbox claim whose execution is still legitimately queued.
@@ -5683,147 +5852,179 @@ pub async fn mark_agent_action_outbox_failed_with_cause<C: ConnectionTrait>(
 /// consume the bounded failure budget. The scheduler explicitly wakes this
 /// row when it grants the execution a permit; the short fallback deadline
 /// also keeps recovery independent from an in-memory notification.
-pub async fn defer_agent_action_outbox_for_permit<C: ConnectionTrait>(
+pub async fn defer_agent_action_outbox_for_permit<C: GatewayControlConnection>(
     db: &C,
     outbox_id: &str,
     expected_attempts: i64,
     deferred_at: DateTimeWithTimeZone,
 ) -> Result<bool> {
-    let restored_attempts = expected_attempts
-        .checked_sub(1)
-        .filter(|attempts| *attempts >= 0)
-        .context("outbox permit deferral has an invalid attempt fence")?;
-    let result = agent_action_outbox::Entity::update_many()
-        .col_expr(
-            agent_action_outbox::Column::Status,
-            sea_orm::sea_query::Expr::value("failed"),
-        )
-        .col_expr(
-            agent_action_outbox::Column::Attempts,
-            sea_orm::sea_query::Expr::value(restored_attempts),
-        )
-        .col_expr(
-            agent_action_outbox::Column::LastError,
-            sea_orm::sea_query::Expr::value(Some(AGENT_ACTION_OUTBOX_PERMIT_WAIT_CLASS.to_owned())),
-        )
-        .col_expr(
-            agent_action_outbox::Column::NextAttemptAt,
-            sea_orm::sea_query::Expr::value(Some(
-                deferred_at + Duration::seconds(AGENT_ACTION_OUTBOX_LEASE_SECONDS),
-            )),
-        )
-        .filter(agent_action_outbox::Column::Id.eq(outbox_id.to_owned()))
-        .filter(agent_action_outbox::Column::Status.eq("pending"))
-        .filter(agent_action_outbox::Column::Attempts.eq(expected_attempts))
-        .exec(db)
-        .await
-        .context("failed to defer agent domain outbox for a durable permit")?;
-    Ok(result.rows_affected == 1)
+    let change = db.gateway_control_change();
+    let result = async {
+        let restored_attempts = expected_attempts
+            .checked_sub(1)
+            .filter(|attempts| *attempts >= 0)
+            .context("outbox permit deferral has an invalid attempt fence")?;
+        let result = agent_action_outbox::Entity::update_many()
+            .col_expr(
+                agent_action_outbox::Column::Status,
+                sea_orm::sea_query::Expr::value("failed"),
+            )
+            .col_expr(
+                agent_action_outbox::Column::Attempts,
+                sea_orm::sea_query::Expr::value(restored_attempts),
+            )
+            .col_expr(
+                agent_action_outbox::Column::LastError,
+                sea_orm::sea_query::Expr::value(Some(
+                    AGENT_ACTION_OUTBOX_PERMIT_WAIT_CLASS.to_owned(),
+                )),
+            )
+            .col_expr(
+                agent_action_outbox::Column::NextAttemptAt,
+                sea_orm::sea_query::Expr::value(Some(
+                    deferred_at + Duration::seconds(AGENT_ACTION_OUTBOX_LEASE_SECONDS),
+                )),
+            )
+            .filter(agent_action_outbox::Column::Id.eq(outbox_id.to_owned()))
+            .filter(agent_action_outbox::Column::Status.eq("pending"))
+            .filter(agent_action_outbox::Column::Attempts.eq(expected_attempts))
+            .exec(db)
+            .await
+            .context("failed to defer agent domain outbox for a durable permit")?;
+        Ok(result.rows_affected == 1)
+    }
+    .await;
+    if let Ok(changed) = &result {
+        if let Some(change) = change {
+            change.completed(*changed);
+        }
+    }
+    result
 }
 
 /// Release a StartAgent outbox claim while another native Turn still owns the
 /// target thread runtime. This is ordinary serialization, not a delivery
 /// failure, so it restores the attempt counter and retries promptly after the
 /// parent Turn can finish.
-pub async fn defer_agent_action_outbox_for_runtime<C: ConnectionTrait>(
+pub async fn defer_agent_action_outbox_for_runtime<C: GatewayControlConnection>(
     db: &C,
     outbox_id: &str,
     expected_attempts: i64,
     deferred_at: DateTimeWithTimeZone,
 ) -> Result<bool> {
-    let restored_attempts = expected_attempts
-        .checked_sub(1)
-        .filter(|attempts| *attempts >= 0)
-        .context("outbox runtime deferral has an invalid attempt fence")?;
-    let result = agent_action_outbox::Entity::update_many()
-        .col_expr(
-            agent_action_outbox::Column::Status,
-            sea_orm::sea_query::Expr::value("failed"),
-        )
-        .col_expr(
-            agent_action_outbox::Column::Attempts,
-            sea_orm::sea_query::Expr::value(restored_attempts),
-        )
-        .col_expr(
-            agent_action_outbox::Column::LastError,
-            sea_orm::sea_query::Expr::value(Some(
-                AGENT_ACTION_OUTBOX_RUNTIME_WAIT_CLASS.to_owned(),
-            )),
-        )
-        .col_expr(
-            agent_action_outbox::Column::NextAttemptAt,
-            sea_orm::sea_query::Expr::value(Some(deferred_at + Duration::milliseconds(100))),
-        )
-        .filter(agent_action_outbox::Column::Id.eq(outbox_id.to_owned()))
-        .filter(agent_action_outbox::Column::Status.eq("pending"))
-        .filter(agent_action_outbox::Column::Attempts.eq(expected_attempts))
-        .exec(db)
-        .await
-        .context("failed to defer agent domain outbox for a busy native thread runtime")?;
-    Ok(result.rows_affected == 1)
+    let change = db.gateway_control_change();
+    let result = async {
+        let restored_attempts = expected_attempts
+            .checked_sub(1)
+            .filter(|attempts| *attempts >= 0)
+            .context("outbox runtime deferral has an invalid attempt fence")?;
+        let result = agent_action_outbox::Entity::update_many()
+            .col_expr(
+                agent_action_outbox::Column::Status,
+                sea_orm::sea_query::Expr::value("failed"),
+            )
+            .col_expr(
+                agent_action_outbox::Column::Attempts,
+                sea_orm::sea_query::Expr::value(restored_attempts),
+            )
+            .col_expr(
+                agent_action_outbox::Column::LastError,
+                sea_orm::sea_query::Expr::value(Some(
+                    AGENT_ACTION_OUTBOX_RUNTIME_WAIT_CLASS.to_owned(),
+                )),
+            )
+            .col_expr(
+                agent_action_outbox::Column::NextAttemptAt,
+                sea_orm::sea_query::Expr::value(Some(deferred_at + Duration::milliseconds(100))),
+            )
+            .filter(agent_action_outbox::Column::Id.eq(outbox_id.to_owned()))
+            .filter(agent_action_outbox::Column::Status.eq("pending"))
+            .filter(agent_action_outbox::Column::Attempts.eq(expected_attempts))
+            .exec(db)
+            .await
+            .context("failed to defer agent domain outbox for a busy native thread runtime")?;
+        Ok(result.rows_affected == 1)
+    }
+    .await;
+    if let Ok(changed) = &result {
+        if let Some(change) = change {
+            change.completed(*changed);
+        }
+    }
+    result
 }
 
 /// Make a capacity-deferred StartAgent row immediately eligible after the
 /// exact execution is promoted. The failure-class fence prevents scheduler
 /// activity from disturbing an unrelated delivery retry.
-pub async fn wake_agent_action_outbox_for_execution<C: ConnectionTrait>(
+pub async fn wake_agent_action_outbox_for_execution<C: GatewayControlConnection>(
     db: &C,
     execution_id: &str,
     now: DateTimeWithTimeZone,
 ) -> Result<u64> {
-    let execution = agent_execution::Entity::find_by_id(execution_id.to_owned())
+    let change = db.gateway_control_change();
+    let result = async {
+        let execution = agent_execution::Entity::find_by_id(execution_id.to_owned())
+            .one(db)
+            .await
+            .context("failed to resolve promoted AgentExecution")?
+            .context("promoted AgentExecution is missing")?;
+        if execution.parent_task_id.is_some() {
+            // Task candidate/reviewer executions are resumed by the Task runtime,
+            // not by a StartAgent action outbox. They may legitimately respond to
+            // multiple initial/revision Turns during one occurrence.
+            return Ok(0);
+        }
+        let responses = agent_turn_response_execution::Entity::find()
+            .filter(agent_turn_response_execution::Column::ExecutionId.eq(execution_id.to_owned()))
+            .limit(2)
+            .all(db)
+            .await
+            .context("failed to resolve promoted execution response Turn")?;
+        if responses.is_empty() {
+            return Ok(0);
+        }
+        if responses.len() != 1 {
+            bail!("promoted non-Task execution responds to multiple Turns");
+        }
+        let target = agent_action_timeline_target::Entity::find_by_id(format!(
+            "turn_input:{}",
+            responses[0].turn_id
+        ))
         .one(db)
         .await
-        .context("failed to resolve promoted AgentExecution")?
-        .context("promoted AgentExecution is missing")?;
-    if execution.parent_task_id.is_some() {
-        // Task candidate/reviewer executions are resumed by the Task runtime,
-        // not by a StartAgent action outbox. They may legitimately respond to
-        // multiple initial/revision Turns during one occurrence.
-        return Ok(0);
+        .context("failed to resolve promoted execution StartAgent action")?;
+        let Some(target) = target else {
+            return Ok(0);
+        };
+        if target.target_kind != ACTION_TIMELINE_TARGET_TURN_INPUT
+            || target.turn_id != responses[0].turn_id
+        {
+            bail!("promoted execution has an inconsistent action timeline target");
+        }
+        let result = agent_action_outbox::Entity::update_many()
+            .col_expr(
+                agent_action_outbox::Column::NextAttemptAt,
+                sea_orm::sea_query::Expr::value(Some(now)),
+            )
+            .filter(agent_action_outbox::Column::ActionId.eq(target.action_id))
+            .filter(agent_action_outbox::Column::Status.eq("failed"))
+            .filter(
+                agent_action_outbox::Column::LastError
+                    .eq(AGENT_ACTION_OUTBOX_PERMIT_WAIT_CLASS.to_owned()),
+            )
+            .exec(db)
+            .await
+            .context("failed to wake agent domain outbox after permit promotion")?;
+        Ok(result.rows_affected)
     }
-    let responses = agent_turn_response_execution::Entity::find()
-        .filter(agent_turn_response_execution::Column::ExecutionId.eq(execution_id.to_owned()))
-        .limit(2)
-        .all(db)
-        .await
-        .context("failed to resolve promoted execution response Turn")?;
-    if responses.is_empty() {
-        return Ok(0);
+    .await;
+    if let Ok(changed) = &result {
+        if let Some(change) = change {
+            change.completed(*changed > 0);
+        }
     }
-    if responses.len() != 1 {
-        bail!("promoted non-Task execution responds to multiple Turns");
-    }
-    let target = agent_action_timeline_target::Entity::find_by_id(format!(
-        "turn_input:{}",
-        responses[0].turn_id
-    ))
-    .one(db)
-    .await
-    .context("failed to resolve promoted execution StartAgent action")?;
-    let Some(target) = target else {
-        return Ok(0);
-    };
-    if target.target_kind != ACTION_TIMELINE_TARGET_TURN_INPUT
-        || target.turn_id != responses[0].turn_id
-    {
-        bail!("promoted execution has an inconsistent action timeline target");
-    }
-    let result = agent_action_outbox::Entity::update_many()
-        .col_expr(
-            agent_action_outbox::Column::NextAttemptAt,
-            sea_orm::sea_query::Expr::value(Some(now)),
-        )
-        .filter(agent_action_outbox::Column::ActionId.eq(target.action_id))
-        .filter(agent_action_outbox::Column::Status.eq("failed"))
-        .filter(
-            agent_action_outbox::Column::LastError
-                .eq(AGENT_ACTION_OUTBOX_PERMIT_WAIT_CLASS.to_owned()),
-        )
-        .exec(db)
-        .await
-        .context("failed to wake agent domain outbox after permit promotion")?;
-    Ok(result.rows_affected)
+    result
 }
 
 fn agent_action_outbox_retry_at(
@@ -5919,6 +6120,55 @@ pub async fn ensure_root_resource_scope<C: ConnectionTrait>(
         max_total_nodes,
     );
     Ok(scope)
+}
+
+/// Only facts that can make the control owner discover different graph work.
+/// Read before and after graph admission under its caller's writer transaction.
+pub(crate) async fn graph_scheduling_facts(
+    db: &DatabaseTransaction,
+    input: &AgentExecutionGraphCommitInput,
+) -> Result<(
+    Option<(
+        String,
+        Option<String>,
+        Option<DateTimeWithTimeZone>,
+        Option<DateTimeWithTimeZone>,
+    )>,
+    Option<(String, Option<DateTimeWithTimeZone>, Option<String>)>,
+)> {
+    let state = agent_execution_resource_state::Entity::find_by_id(&input.child_resource_state.id)
+        .select_only()
+        .columns([
+            agent_execution_resource_state::Column::Status,
+            agent_execution_resource_state::Column::PermitId,
+            agent_execution_resource_state::Column::IdleDeadline,
+            agent_execution_resource_state::Column::HardDeadline,
+        ])
+        .into_tuple::<(
+            String,
+            Option<String>,
+            Option<DateTimeWithTimeZone>,
+            Option<DateTimeWithTimeZone>,
+        )>()
+        .one(db)
+        .await?;
+    let queue = agent_work_queue::Entity::find()
+        .filter(agent_work_queue::Column::RootExecutionId.eq(input.root_execution_id.clone()))
+        .filter(agent_work_queue::Column::ExecutionId.eq(input.child_execution.id.clone()))
+        .filter(
+            agent_work_queue::Column::AttemptGeneration
+                .eq(input.child_resource_state.attempt_generation),
+        )
+        .select_only()
+        .columns([
+            agent_work_queue::Column::State,
+            agent_work_queue::Column::EligibleAt,
+            agent_work_queue::Column::ClaimToken,
+        ])
+        .into_tuple::<(String, Option<DateTimeWithTimeZone>, Option<String>)>()
+        .one(db)
+        .await?;
+    Ok((state, queue))
 }
 
 /// Atomically materialize the agent domain execution graph used by a durable
@@ -7535,7 +7785,7 @@ pub async fn heartbeat_agent_execution<C: ConnectionTrait>(
 /// Advance the progress frontier for exactly one execution attempt.  The
 /// caller supplies a bounded, non-secret summary; this is not a heartbeat and
 /// therefore advances progress_sequence/last_progress_at as evidence of work.
-pub async fn record_agent_execution_progress<C: ConnectionTrait>(
+pub async fn record_agent_execution_progress<C: GatewayControlConnection>(
     db: &C,
     execution_id: &str,
     expected_attempt_generation: i64,
@@ -7543,75 +7793,85 @@ pub async fn record_agent_execution_progress<C: ConnectionTrait>(
     progress_at: DateTimeWithTimeZone,
     idle_deadline: Option<DateTimeWithTimeZone>,
 ) -> Result<bool> {
-    if progress_frontier_json.len() > 16 * 1024 {
-        bail!("agent execution progress frontier is too large");
-    }
-    agent_execution::Entity::find_by_id(execution_id.to_owned())
-        .one(db)
-        .await
-        .context("failed to load agent execution for progress")?
-        .with_context(|| format!("agent execution `{execution_id}` is missing"))?;
-    if expected_attempt_generation < 1 {
-        bail!("agent execution `{execution_id}` has an invalid attempt generation");
-    }
-    let mut update = agent_execution_resource_state::Entity::update_many()
-        .col_expr(
-            agent_execution_resource_state::Column::ProgressSequence,
-            sea_orm::sea_query::Expr::cust("progress_sequence + 1"),
-        )
-        .col_expr(
-            agent_execution_resource_state::Column::ProgressFrontierJson,
-            sea_orm::sea_query::Expr::value(progress_frontier_json.to_owned()),
-        )
-        .col_expr(
-            agent_execution_resource_state::Column::LastProgressAt,
-            sea_orm::sea_query::Expr::value(Some(progress_at)),
-        )
-        .col_expr(
-            agent_execution_resource_state::Column::UpdatedAt,
-            sea_orm::sea_query::Expr::value(progress_at),
-        )
-        .filter(agent_execution_resource_state::Column::ExecutionId.eq(execution_id.to_owned()))
-        .filter(
-            agent_execution_resource_state::Column::AttemptGeneration
-                .eq(expected_attempt_generation),
-        )
-        .filter(agent_execution_resource_state::Column::ProgressSequence.lt(i64::MAX))
-        .filter(agent_execution_resource_state::Column::Status.eq("running"));
-    if let Some(idle_deadline) = idle_deadline {
-        update = update.col_expr(
-            agent_execution_resource_state::Column::IdleDeadline,
-            sea_orm::sea_query::Expr::cust_with_values(
-                "CASE WHEN hard_deadline IS NOT NULL AND hard_deadline <= ? THEN hard_deadline \
+    let change = db.gateway_control_change();
+    let result = async {
+        if progress_frontier_json.len() > 16 * 1024 {
+            bail!("agent execution progress frontier is too large");
+        }
+        agent_execution::Entity::find_by_id(execution_id.to_owned())
+            .one(db)
+            .await
+            .context("failed to load agent execution for progress")?
+            .with_context(|| format!("agent execution `{execution_id}` is missing"))?;
+        if expected_attempt_generation < 1 {
+            bail!("agent execution `{execution_id}` has an invalid attempt generation");
+        }
+        let mut update = agent_execution_resource_state::Entity::update_many()
+            .col_expr(
+                agent_execution_resource_state::Column::ProgressSequence,
+                sea_orm::sea_query::Expr::cust("progress_sequence + 1"),
+            )
+            .col_expr(
+                agent_execution_resource_state::Column::ProgressFrontierJson,
+                sea_orm::sea_query::Expr::value(progress_frontier_json.to_owned()),
+            )
+            .col_expr(
+                agent_execution_resource_state::Column::LastProgressAt,
+                sea_orm::sea_query::Expr::value(Some(progress_at)),
+            )
+            .col_expr(
+                agent_execution_resource_state::Column::UpdatedAt,
+                sea_orm::sea_query::Expr::value(progress_at),
+            )
+            .filter(agent_execution_resource_state::Column::ExecutionId.eq(execution_id.to_owned()))
+            .filter(
+                agent_execution_resource_state::Column::AttemptGeneration
+                    .eq(expected_attempt_generation),
+            )
+            .filter(agent_execution_resource_state::Column::ProgressSequence.lt(i64::MAX))
+            .filter(agent_execution_resource_state::Column::Status.eq("running"));
+        if let Some(idle_deadline) = idle_deadline {
+            update = update.col_expr(
+                agent_execution_resource_state::Column::IdleDeadline,
+                sea_orm::sea_query::Expr::cust_with_values(
+                    "CASE WHEN hard_deadline IS NOT NULL AND hard_deadline <= ? THEN hard_deadline \
                  WHEN idle_deadline IS NULL OR idle_deadline < ? THEN ? ELSE idle_deadline END",
-                [idle_deadline.clone(), idle_deadline.clone(), idle_deadline],
-            ),
-        );
+                    [idle_deadline.clone(), idle_deadline.clone(), idle_deadline],
+                ),
+            );
+        }
+        let result = update
+            .exec(db)
+            .await
+            .context("failed to record agent execution progress")?;
+        if result.rows_affected == 0 {
+            return Ok(false);
+        }
+        agent_execution::Entity::update_many()
+            .col_expr(
+                agent_execution::Column::UpdatedAt,
+                sea_orm::sea_query::Expr::value(progress_at),
+            )
+            .filter(agent_execution::Column::Id.eq(execution_id.to_owned()))
+            .filter(agent_execution::Column::Status.is_in([
+                "created",
+                "queued",
+                "running",
+                "paused",
+                "recovering",
+            ]))
+            .exec(db)
+            .await
+            .context("failed to touch agent execution progress timestamp")?;
+        Ok(true)
     }
-    let result = update
-        .exec(db)
-        .await
-        .context("failed to record agent execution progress")?;
-    if result.rows_affected == 0 {
-        return Ok(false);
+    .await;
+    if let Ok(changed) = &result {
+        if let Some(change) = change {
+            change.completed(*changed);
+        }
     }
-    agent_execution::Entity::update_many()
-        .col_expr(
-            agent_execution::Column::UpdatedAt,
-            sea_orm::sea_query::Expr::value(progress_at),
-        )
-        .filter(agent_execution::Column::Id.eq(execution_id.to_owned()))
-        .filter(agent_execution::Column::Status.is_in([
-            "created",
-            "queued",
-            "running",
-            "paused",
-            "recovering",
-        ]))
-        .exec(db)
-        .await
-        .context("failed to touch agent execution progress timestamp")?;
-    Ok(true)
+    result
 }
 
 async fn bind_running_state<C: ConnectionTrait>(
@@ -8704,7 +8964,49 @@ mod tests {
         )
         .await;
 
-        let summary = compact_terminal_agent_action_ledger(&db, now, 1)
+        insert_compaction_test_tuple(
+            &db, "proof-wait", "failed", 8, old - Duration::days(2), None,
+            "blocked-response".into(),
+            serde_json::json!({"action_id":"action-proof-wait", "execution_id":"execution-proof-wait",
+                "kind":"start_agent", "spawned_execution_id":"missing-proof"}).to_string(),
+        ).await;
+        agent_action_outbox::Entity::update_many()
+            .col_expr(
+                agent_action_outbox::Column::LastError,
+                sea_orm::sea_query::Expr::value(Some("outbox_start_integrity_rejected".to_owned())),
+            )
+            .filter(agent_action_outbox::Column::Id.eq("outbox-proof-wait"))
+            .exec(&db)
+            .await
+            .unwrap();
+        assert_eq!(
+            next_agent_ledger_retention_at(&db, now).await.unwrap(),
+            Some((now + Duration::days(1)).timestamp())
+        );
+        let (blocked, cursor) = compact_terminal_agent_action_ledger_page(&db, now, 1, None)
+            .await
+            .unwrap();
+        assert_eq!(blocked.candidate_rows, 1);
+        assert_eq!(blocked.compacted_rows, 0);
+        assert!(
+            cursor.is_some(),
+            "a skipped terminal proof is not the end of the scan"
+        );
+        let (summary, cursor) =
+            compact_terminal_agent_action_ledger_page(&db, now, 1, cursor.as_ref())
+                .await
+                .unwrap();
+        let (empty, end) = compact_terminal_agent_action_ledger_page(&db, now, 1, cursor.as_ref())
+            .await
+            .unwrap();
+        assert_eq!(empty.candidate_rows, 0);
+        assert!(
+            end.is_none(),
+            "a finite pass must finish even while its first proof stays blocked"
+        );
+        // The rest of this existing test exercises detached payload retention.
+        agent_action_outbox::Entity::delete_by_id("outbox-proof-wait")
+            .exec(&db)
             .await
             .unwrap();
         assert_eq!(summary.candidate_rows, 1);

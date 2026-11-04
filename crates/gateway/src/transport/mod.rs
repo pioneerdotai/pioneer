@@ -1,4 +1,5 @@
 mod http;
+pub(crate) mod local_operations;
 mod network;
 mod protocol;
 mod restricted;

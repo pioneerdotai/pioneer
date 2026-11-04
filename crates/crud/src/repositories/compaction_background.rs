@@ -9,7 +9,8 @@ use sea_orm::sea_query::{
     Alias, Condition, Expr, ExprTrait, Func, JoinType, OnConflict, Order, Query, SelectStatement,
 };
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, EntityTrait, FromQueryResult, QueryFilter, QuerySelect,
+    ColumnTrait, ConnectionTrait, EntityTrait, FromQueryResult, QueryFilter, QueryOrder,
+    QuerySelect,
 };
 #[derive(Debug, Clone, FromQueryResult)]
 pub struct CompletedHistoryCheck {
@@ -35,7 +36,7 @@ pub(crate) async fn compaction_enqueue_native_history_check<C: ConnectionTrait>(
     thread: &str,
     turn: &str,
     descriptor: &str,
-) -> Result<()> {
+) -> Result<bool> {
     ensure!(
         descriptor.len() <= 16384,
         "history descriptor exceeds bound"
@@ -93,6 +94,16 @@ pub(crate) async fn compaction_enqueue_native_history_check<C: ConnectionTrait>(
                                     compaction_history_check::Column::Managed,
                                 ))
                                 .eq(0_i64),
+                            )
+                            .and(
+                                Expr::col((
+                                    compaction_history_check::Entity,
+                                    compaction_history_check::Column::Descriptor,
+                                ))
+                                .ne(Expr::col((
+                                    "excluded",
+                                    compaction_history_check::Column::Descriptor,
+                                ))),
                             ),
                         )
                         .to_owned(),
@@ -123,7 +134,7 @@ pub(crate) async fn compaction_enqueue_native_history_check<C: ConnectionTrait>(
             .is_some();
         ensure!(valid_existing, "native history intent scope mismatch");
     }
-    Ok(())
+    Ok(inserted.rows_affected() > 0)
 }
 // Query-local names only: physical tables/columns always use generated entities.
 #[derive(Clone, Copy, sea_orm::DeriveIden)]
@@ -444,6 +455,13 @@ pub(crate) async fn compaction_due_history_checks<C: ConnectionTrait>(
     db: &C,
     now: i64,
 ) -> Result<Vec<CompletedHistoryCheck>> {
+    compaction_due_history_checks_excluding(db, now, &[]).await
+}
+pub(crate) async fn compaction_due_history_checks_excluding<C: ConnectionTrait>(
+    db: &C,
+    now: i64,
+    owned: &[(String, String)],
+) -> Result<Vec<CompletedHistoryCheck>> {
     use compaction_history_check as h;
     use turn_cli_runtime_binding as b;
     let mut query = root_history_checks();
@@ -511,10 +529,53 @@ pub(crate) async fn compaction_due_history_checks<C: ConnectionTrait>(
         .order_by((h::Entity, h::Column::NextAttemptMs), Order::Asc)
         .order_by((h::Entity, h::Column::TurnId), Order::Asc)
         .limit(16);
+    exclude_owned_roots(&mut query, owned);
     CompletedHistoryCheck::find_by_statement(db.get_database_backend().build(&query))
         .all(db)
         .await
         .map_err(Into::into)
+}
+
+/// Only current root obligations, excluding conversations owned in memory.
+/// The exclusion is bounded by the service's 16-job cap.
+pub(crate) async fn next_history_deadline<C: ConnectionTrait>(
+    db: &C,
+    owned: &[(String, String)],
+) -> Result<Option<i64>> {
+    use compaction_history_check::{Column as H, Entity as E};
+    let mut current = root_history_checks();
+    current
+        .column((compaction_history_check::Entity, H::TurnId))
+        .join(
+            JoinType::InnerJoin,
+            thread::Entity,
+            Expr::col((thread::Entity, thread::Column::Id))
+                .eq(Expr::col((turn::Entity, turn::Column::ThreadId))),
+        );
+    exclude_owned_roots(&mut current, owned);
+    let row = E::find()
+        .select_only()
+        .column(H::NextAttemptMs)
+        .filter(H::TurnId.in_subquery(current))
+        .order_by_asc(H::NextAttemptMs)
+        .limit(1)
+        .into_tuple::<i64>()
+        .one(db)
+        .await?;
+    Ok(row)
+}
+
+fn exclude_owned_roots(query: &mut SelectStatement, owned: &[(String, String)]) {
+    // The in-memory owner is keyed by conversation, not Turn. A newer Turn
+    // in the same root must wait for that owner's completion notification.
+    for (workspace, root) in owned {
+        query.and_where(
+            Expr::col((thread::Entity, thread::Column::WorkspaceId))
+                .eq(workspace)
+                .and(Expr::col((turn::Entity, turn::Column::ThreadId)).eq(root))
+                .not(),
+        );
+    }
 }
 
 /// Persist the captured settings/deadline before service admission; restart

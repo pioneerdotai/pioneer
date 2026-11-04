@@ -10,6 +10,7 @@ test-support = []
 
 [dependencies]
 anyhow.workspace = true
+fs4.workspace = true
 pioneer-observability.workspace = true
 async-trait.workspace = true
 env_logger.workspace = true

@@ -176,10 +176,10 @@ async fn relevant_pending_geometry_blocks_stale_delete_and_ack_before_target_rev
     let mut accounting = SweepAccounting::default();
     assert_eq!(
         sweep.step(&store, &mut accounting).await.unwrap(),
-        SweepStep::Retry
+        SweepStep::Blocked
     );
     selected
-        .finish(&store, Some(sweep.completion_guard()))
+        .finish(&store, frozen_sweep_work::Completion::Complete(sweep.completion_guard()))
         .await
         .unwrap();
     assert_eq!(pending(&store, "batch-physical", 0).await, 1);
@@ -541,7 +541,7 @@ async fn physical_round_pages_future_retries_without_false_eof_or_idle_loop() {
             row(&store, &id, kind, 0).await;
             work(&store, &id, kind)
                 .await
-                .finish(&store, None)
+                .finish(&store, frozen_sweep_work::Completion::Retry)
                 .await
                 .unwrap();
         }
@@ -647,7 +647,7 @@ async fn losing_physical_round_keeps_generation_and_relevant_prefanout_fence() {
         assert_eq!(pending(&store, "batch-physical", kind).await, 1);
         assert_eq!(progress.accounting.rows, [0, 0]);
         drop(progress); // lose advisory frontier and all active preparations
-        selected.finish(&store, Some(guard)).await.unwrap();
+        selected.finish(&store, frozen_sweep_work::Completion::Complete(guard)).await.unwrap();
         assert_eq!(pending(&store, "batch-physical", kind).await, 1);
         let mut restarted = FrozenStorageLifetimeProgress::default();
         let mut idle = false;

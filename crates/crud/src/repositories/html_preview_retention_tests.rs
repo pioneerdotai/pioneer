@@ -115,7 +115,11 @@ impl Fixture {
             .unwrap()
     }
     async fn step(&self, after: &mut String, progress: &mut Option<PreviewImportIndex>) {
-        assert!(index_quantum(&self.store, after, progress).await.unwrap());
+        assert!(
+            index_quantum(&self.store, after, progress, "\u{10ffff}")
+                .await
+                .unwrap()
+        );
     }
 }
 async fn fixture() -> Fixture {
@@ -374,6 +378,9 @@ async fn imports_consume_each_row_and_byte_bounded_page_once_in_order() {
         let (targets, proofs) = seed(&f, n, padding, false).await;
         start_imports(&f, &targets, &proofs, n, None).await;
         no_intermediate_writes(&f).await;
+        let database = f.store.database_connection();
+        let mut wake = database.work_signal("maintenance.html").subscribe();
+        wake.begin_pass(&database).await.unwrap();
         let mut after = String::new();
         let mut progress = None;
         for ordinal in 0..n {
@@ -401,6 +408,10 @@ async fn imports_consume_each_row_and_byte_bounded_page_once_in_order() {
                 assert!(after.is_empty());
             }
         }
+        assert!(
+            wake.wait(None).now_or_never().is_some(),
+            "verified index completion must revisit retirement"
+        );
         assert!(progress.is_none());
         assert_eq!(after, "a");
         assert_eq!(f.marker("a").await.complete, 1);
@@ -592,7 +603,7 @@ async fn writer_failure_and_restart_replay_the_entire_stream() {
     let mut progress = None;
     f.step(&mut after, &mut progress).await;
     f.sql("CREATE TRIGGER fail_index_commit BEFORE UPDATE ON html_preview_frozen_index BEGIN SELECT RAISE(ABORT,'fixture writer failure'); END").await;
-    let error = index_quantum(&f.store, &mut after, &mut progress)
+    let error = index_quantum(&f.store, &mut after, &mut progress, "\u{10ffff}")
         .await
         .unwrap_err();
     assert!(error.downcast_ref::<sea_orm::DbErr>().is_some());
@@ -627,7 +638,7 @@ async fn walker_db_error_and_cancelled_read_discard_partial_ram_before_retry() {
         if cancel {
             let held = f.store.connection.begin_read().await.unwrap();
             {
-                let step = index_quantum(&f.store, &mut after, &mut progress);
+                let step = index_quantum(&f.store, &mut after, &mut progress, "\u{10ffff}");
                 tokio::pin!(step);
                 tokio::time::timeout(std::time::Duration::from_secs(5), async {
                     tokio::select! {
@@ -648,7 +659,7 @@ async fn walker_db_error_and_cancelled_read_discard_partial_ram_before_retry() {
             // Close only this isolated physical reader to fail the graph read
             // after it has changed RAM. Reopen on the same temporary fixture.
             f.reader.clone().close().await.unwrap();
-            let error = index_quantum(&f.store, &mut after, &mut progress)
+            let error = index_quantum(&f.store, &mut after, &mut progress, "\u{10ffff}")
                 .await
                 .unwrap_err();
             assert!(error.downcast_ref::<sea_orm::DbErr>().is_some());
@@ -713,7 +724,7 @@ async fn missing_legacy_marker_messages_and_backfill_gate_remain_supported() {
         0
     );
     assert!(
-        !index_quantum(&f.store, &mut after, &mut progress)
+        !index_quantum(&f.store, &mut after, &mut progress, "\u{10ffff}")
             .await
             .unwrap()
     );
@@ -730,7 +741,7 @@ async fn missing_legacy_marker_messages_and_backfill_gate_remain_supported() {
     no_intermediate_writes(&f).await;
     f.routes.reset();
     assert!(
-        !index_quantum(&f.store, &mut after, &mut progress)
+        !index_quantum(&f.store, &mut after, &mut progress, "\u{10ffff}")
             .await
             .unwrap()
     ); // Complete markers are no longer enumerated.
@@ -831,7 +842,7 @@ async fn cancelled_terminal_writer_discards_digest_and_replays_without_publicati
     // stored notification before waiting for this blocked terminal statement.
     let _ = f.routes.writer_queued.notified().now_or_never();
     {
-        let step = index_quantum(&f.store, &mut after, &mut progress);
+        let step = index_quantum(&f.store, &mut after, &mut progress, "\u{10ffff}");
         tokio::pin!(step);
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             tokio::select! {
@@ -891,7 +902,7 @@ async fn complete_gate_selects_only_live_ready_work_and_unknown_does_not_starve(
         }
         f.routes.reset();
         assert!(
-            !index_quantum(&f.store, &mut after, &mut progress)
+            !index_quantum(&f.store, &mut after, &mut progress, "\u{10ffff}")
                 .await
                 .unwrap()
         );
@@ -917,7 +928,7 @@ async fn work_cursor_wrap_and_restart_find_new_and_newly_ready_headers_behind_cu
     f.sql("UPDATE compaction_frozen_history SET ready=1 WHERE id='b'")
         .await;
     assert!(
-        !index_quantum(&f.store, &mut after, &mut progress)
+        !index_quantum(&f.store, &mut after, &mut progress, "\u{10ffff}")
             .await
             .unwrap()
     );
@@ -934,7 +945,7 @@ async fn work_cursor_wrap_and_restart_find_new_and_newly_ready_headers_behind_cu
     for _ in 0..2 {
         f.routes.reset();
         assert!(
-            !index_quantum(&f.store, &mut after, &mut progress)
+            !index_quantum(&f.store, &mut after, &mut progress, "\u{10ffff}")
                 .await
                 .unwrap()
         );
@@ -952,7 +963,7 @@ async fn work_cursor_wrap_and_restart_find_new_and_newly_ready_headers_behind_cu
     f.sql("UPDATE compaction_frozen_history SET expired=1 WHERE id='y-expire'")
         .await;
     assert!(
-        !index_quantum(&f.store, &mut after, &mut progress)
+        !index_quantum(&f.store, &mut after, &mut progress, "\u{10ffff}")
             .await
             .unwrap()
     );
@@ -977,7 +988,7 @@ async fn missing_gate_still_backfills_a_legacy_header_without_marker() {
     f.step(&mut after, &mut progress).await;
     assert_eq!(f.marker("legacy").await.complete, 1);
     assert!(
-        !index_quantum(&f.store, &mut after, &mut progress)
+        !index_quantum(&f.store, &mut after, &mut progress, "\u{10ffff}")
             .await
             .unwrap()
     );
@@ -1031,14 +1042,14 @@ async fn failed_completion_is_not_published_and_remains_discoverable_after_wrap(
     let mut after = String::new();
     let mut progress = None;
     assert!(
-        index_quantum(&f.store, &mut after, &mut progress)
+        index_quantum(&f.store, &mut after, &mut progress, "\u{10ffff}")
             .await
             .is_err()
     );
     assert_eq!(f.marker("a").await.complete, 0);
     f.sql("DROP TRIGGER fail_completion").await;
     assert!(
-        !index_quantum(&f.store, &mut after, &mut progress)
+        !index_quantum(&f.store, &mut after, &mut progress, "\u{10ffff}")
             .await
             .unwrap()
     );
@@ -1057,24 +1068,44 @@ async fn input_gate_is_conservative_until_complete_and_quiet_after_completion() 
         f.sql(r#"INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload,created_at) VALUES('old','parent-turn',0,'text','legacy','{"type":"text","text":"legacy"}',CURRENT_TIMESTAMP)"#).await;
         let mut after = String::new();
         f.routes.reset();
-        assert!(input_adoption_quantum(&f.store, &mut after).await.unwrap());
+        assert!(
+            input_adoption_quantum(&f.store, &mut after, "\u{10ffff}")
+                .await
+                .unwrap()
+        );
         assert_eq!(after, "old");
         assert_eq!(f.routes.counts(), (2, 0));
-        assert!(!input_adoption_quantum(&f.store, &mut after).await.unwrap());
+        assert!(
+            !input_adoption_quantum(&f.store, &mut after, "\u{10ffff}")
+                .await
+                .unwrap()
+        );
         if missing {
-            assert!(input_adoption_quantum(&f.store, &mut after).await.unwrap());
+            assert!(
+                input_adoption_quantum(&f.store, &mut after, "\u{10ffff}")
+                    .await
+                    .unwrap()
+            );
             f.sql("INSERT INTO html_preview_index_backfill(singleton,complete,inputs_complete) VALUES(1,0,1)").await;
         }
         for _ in 0..2 {
             f.routes.reset();
-            assert!(!input_adoption_quantum(&f.store, &mut after).await.unwrap());
+            assert!(
+                !input_adoption_quantum(&f.store, &mut after, "\u{10ffff}")
+                    .await
+                    .unwrap()
+            );
             assert!(after.is_empty());
             assert_eq!(f.routes.counts(), (1, 0));
         }
         // A future legacy importer can explicitly reopen the durable gate.
         f.sql("UPDATE html_preview_index_backfill SET inputs_complete=0 WHERE singleton=1")
             .await;
-        assert!(input_adoption_quantum(&f.store, &mut after).await.unwrap());
+        assert!(
+            input_adoption_quantum(&f.store, &mut after, "\u{10ffff}")
+                .await
+                .unwrap()
+        );
         assert_eq!(after, "old");
     }
 }
@@ -1201,7 +1232,11 @@ async fn new_inputs_after_complete_gate_are_adopted_atomically_and_rollback_pres
         );
         let mut after = "~".to_owned();
         f.routes.reset();
-        assert!(!input_adoption_quantum(&f.store, &mut after).await.unwrap());
+        assert!(
+            !input_adoption_quantum(&f.store, &mut after, "\u{10ffff}")
+                .await
+                .unwrap()
+        );
         assert_eq!(f.routes.counts(), (1, 0));
     }
 }
@@ -1220,7 +1255,11 @@ async fn legacy_versionless_input_is_adopted_once_and_protects_later_current_ver
         [serde_json::to_string(&input).unwrap().into()],
     )).await.unwrap();
     let mut after = String::new();
-    assert!(input_adoption_quantum(&f.store, &mut after).await.unwrap());
+    assert!(
+        input_adoption_quantum(&f.store, &mut after, "\u{10ffff}")
+            .await
+            .unwrap()
+    );
     assert!(!preview_is_temporary(&f).await);
     let binding = artifact_binding::Entity::find()
         .filter(artifact_binding::Column::BindingKind.eq("user_input"))
@@ -1229,12 +1268,20 @@ async fn legacy_versionless_input_is_adopted_once_and_protects_later_current_ver
         .unwrap()
         .unwrap();
     assert_eq!(binding.artifact_version_id.as_deref(), Some("v1"));
-    assert!(!input_adoption_quantum(&f.store, &mut after).await.unwrap());
+    assert!(
+        !input_adoption_quantum(&f.store, &mut after, "\u{10ffff}")
+            .await
+            .unwrap()
+    );
     f.sql("UPDATE artifact SET current_version_id='v2' WHERE id='preview'")
         .await;
     assert!(!preview_is_temporary(&f).await);
     f.routes.reset();
-    assert!(!input_adoption_quantum(&f.store, &mut after).await.unwrap());
+    assert!(
+        !input_adoption_quantum(&f.store, &mut after, "\u{10ffff}")
+            .await
+            .unwrap()
+    );
     assert_eq!(f.routes.counts(), (1, 0));
     let bindings = artifact_binding::Entity::find()
         .filter(artifact_binding::Column::BindingKind.eq("user_input"))
@@ -1253,7 +1300,11 @@ async fn concurrent_reader_sees_new_input_and_adoption_only_after_the_same_commi
         f.sql("UPDATE html_preview_index_backfill SET inputs_complete=1 WHERE singleton=1")
             .await;
         let mut after = "~".to_owned();
-        assert!(!input_adoption_quantum(&f.store, &mut after).await.unwrap());
+        assert!(
+            !input_adoption_quantum(&f.store, &mut after, "\u{10ffff}")
+                .await
+                .unwrap()
+        );
         let prepared = super::super::turn::prepare_turn_input_projection(
             "parent-turn",
             &[pioneer_protocol::UserInput::Artifact {
@@ -1311,6 +1362,7 @@ async fn retirement_page_keeps_individual_metadata_budget_and_empty_reader_only_
         )).await.unwrap();
     }
     let mut progress = HtmlPreviewRetentionProgress::default();
+    progress.upper[2] = Some(f.store.html_preview_artifact_frontier().await.unwrap());
     f.routes.reset();
     for _ in 0..17 {
         assert!(progress.artifact_quantum(&f.store).await.unwrap());
@@ -1868,10 +1920,18 @@ async fn io_witness_zero_cas_corrupt_expired_and_unavailable_are_distinct() {
                 panic!("restored body must become ready");
             };
             let hash = "a".repeat(64);
+            let database = f.store.database_connection();
+            let mut wake = database.work_signal("maintenance.html").subscribe();
+            wake.begin_pass(&database).await.unwrap();
             f.store
                 .record_html_preview_archive_witness(&witness, &hash)
                 .await
                 .unwrap();
+            assert!(
+                wake.wait(None).now_or_never().is_some(),
+                "new witness must revisit retirement"
+            );
+            wake.begin_pass(&database).await.unwrap();
             let tx = f.store.connection.begin().await.unwrap();
             request(&tx, HtmlPreviewIoFamily::Witness, "w", 0, "ws")
                 .await
@@ -1889,6 +1949,10 @@ async fn io_witness_zero_cas_corrupt_expired_and_unavailable_are_distinct() {
                     .await
                     .unwrap(),
                 "zero-row publication requires verified reread before ACK"
+            );
+            assert!(
+                wake.wait(None).now_or_never().is_none(),
+                "verified replay ACK must stay quiet"
             );
             assert!(
                 work::Entity::find_by_id(("witness".to_owned(), io_queue_key("w"), 0_i64))
@@ -2243,6 +2307,49 @@ async fn io_legacy_copy_callback_commits_source_and_ack_atomically() {
             .unwrap()
             .metadata_json,
         "{}"
+    );
+}
+
+#[tokio::test]
+async fn gc_deadline_crossing_behind_a_finished_page_is_retained_for_the_next_pass() {
+    let f = fixture().await;
+    f.sql(r#"INSERT INTO artifact_blob(id,workspace_id,sha256,size_bytes,storage_backend,storage_key,created_at,metadata_json)
+        VALUES('deadline-blob','ws','deadline-sha',1,'local','deadline-key','2020-01-01 00:00:00 +00:00','{"htmlToolTemporary":1}')"#).await;
+    let created_ms = 1_577_836_800_000_i64;
+    let grace_ms = 60_000_i64;
+    let cutoff = created_ms - 1;
+    let (after, candidates) = f.store.html_preview_gc_blob_page("", cutoff).await.unwrap();
+    assert!(candidates.is_empty());
+    assert!(
+        f.store
+            .html_preview_gc_blob_page(&after, cutoff)
+            .await
+            .unwrap()
+            .0
+            .is_empty()
+    );
+    // The real clock is already later than this fixture's grace deadline.
+    // Recomputing a "future only" cutoff at EOF would silently lose it.
+    assert_eq!(
+        f.store
+            .html_preview_gc_deadline(grace_ms, cutoff)
+            .await
+            .unwrap(),
+        Some(1_577_836_860)
+    );
+    let (_, candidates) = f
+        .store
+        .html_preview_gc_blob_page("", created_ms)
+        .await
+        .unwrap();
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].1.blob_id, "deadline-blob");
+    assert_eq!(
+        f.store
+            .html_preview_gc_deadline(grace_ms, created_ms)
+            .await
+            .unwrap(),
+        None
     );
 }
 
@@ -2648,7 +2755,7 @@ async fn io_index_enqueue_failure_rolls_back_result_and_progress() {
     let mut after = String::new();
     let mut imports = None;
     assert!(
-        index_quantum(&f.store, &mut after, &mut imports)
+        index_quantum(&f.store, &mut after, &mut imports, "\u{10ffff}")
             .await
             .is_err()
     );
@@ -2674,7 +2781,7 @@ async fn io_index_enqueue_failure_rolls_back_result_and_progress() {
     f.sql("DROP TRIGGER reject_io_enqueue").await;
     after.clear();
     assert!(
-        index_quantum(&f.store, &mut after, &mut imports)
+        index_quantum(&f.store, &mut after, &mut imports, "\u{10ffff}")
             .await
             .unwrap()
     );
@@ -2839,4 +2946,190 @@ async fn io_business_retry_preserves_cas_class_through_artifact_error_boundary()
         let tx = f.store.connection.begin().await.unwrap();
         tx.rollback().await.unwrap();
     }
+}
+
+#[tokio::test]
+async fn retention_pass_finishes_with_a_continuously_growing_artifact_suffix() {
+    let f = fixture().await;
+    io_copy_source(&f, "a", "{}").await;
+    io_copy_source(&f, "m", "{}").await;
+    let mut progress = HtmlPreviewRetentionProgress::default();
+    // Visit every family once, so each has captured its initial frontier.
+    for _ in 0..3 {
+        assert!(progress.quantum(&f.store).await.unwrap());
+    }
+    let mut finished = false;
+    for suffix in 0..12 {
+        io_copy_source(&f, &format!("z-{suffix:02}"), "{}").await;
+        if !progress.quantum(&f.store).await.unwrap() {
+            finished = true;
+            break;
+        }
+    }
+    assert!(
+        finished,
+        "new suffix rows must not extend an already captured pass"
+    );
+}
+
+#[tokio::test]
+async fn finite_copy_and_gc_pages_revisit_older_candidates_despite_new_suffix_rows() {
+    let f = fixture().await;
+    for id in ["a", "m"] {
+        io_copy_source(&f, id, "{}").await;
+    }
+    let upper = f.store.html_preview_artifact_frontier().await.unwrap();
+    let (mut after, _) = f
+        .store
+        .html_preview_released_copies_page_through("", &upper)
+        .await
+        .unwrap();
+    let metadata = r#"{"htmlTool":{"retention":"released","releasedCopies":["old.html"]}}"#;
+    f.store
+        .connection
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE artifact SET metadata_json=? WHERE id='a'",
+            [metadata.into()],
+        ))
+        .await
+        .unwrap();
+    let mut finished = false;
+    for suffix in 0..4 {
+        io_copy_source(&f, &format!("z-{suffix}"), "{}").await;
+        let (next, _) = f
+            .store
+            .html_preview_released_copies_page_through(&after, &upper)
+            .await
+            .unwrap();
+        after = next;
+        if after.is_empty() {
+            finished = true;
+            break;
+        }
+    }
+    assert!(finished);
+    let next_upper = f.store.html_preview_artifact_frontier().await.unwrap();
+    let (id, cleanup) = f
+        .store
+        .html_preview_released_copies_page_through("", &next_upper)
+        .await
+        .unwrap();
+    assert_eq!(id, "a");
+    assert_eq!(cleanup, Some(("ws".to_owned(), metadata.to_owned())));
+
+    f.sql(r#"INSERT INTO artifact_blob(id,workspace_id,sha256,size_bytes,storage_backend,storage_key,created_at,metadata_json)
+        VALUES('a','ws','a',1,'local','a','2020-01-01 00:00:00 +00:00','{}')"#).await;
+    let upper = f.store.html_preview_blob_frontier().await.unwrap();
+    let cutoff = 1_577_836_800_000_i64;
+    let (after, candidates) = f
+        .store
+        .html_preview_gc_blob_page_through("", cutoff, &upper)
+        .await
+        .unwrap();
+    assert!(candidates.is_empty());
+    f.sql(r#"UPDATE artifact_blob SET metadata_json='{"htmlToolTemporary":1}' WHERE id='a'"#)
+        .await;
+    f.sql("INSERT INTO artifact_blob(id,workspace_id,sha256,size_bytes,storage_backend,storage_key) VALUES('z','ws','z',1,'local','z')").await;
+    assert!(
+        f.store
+            .html_preview_gc_blob_page_through(&after, cutoff, &upper)
+            .await
+            .unwrap()
+            .0
+            .is_empty()
+    );
+    let next_upper = f.store.html_preview_blob_frontier().await.unwrap();
+    let (_, candidates) = f
+        .store
+        .html_preview_gc_blob_page_through("", cutoff, &next_upper)
+        .await
+        .unwrap();
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].1.blob_id, "a");
+}
+
+#[tokio::test]
+async fn blocked_io_recovery_revisits_an_older_row_with_a_growing_suffix() {
+    use super::super::html_preview_io_work::{HtmlPreviewIoFamily, request};
+    use pioneer_entity::html_preview_io_work as work;
+    let f = fixture().await;
+    f.sql("UPDATE html_preview_io_work SET state='done',due_at=NULL,seed_version=1")
+        .await;
+    let tx = f.store.connection.begin().await.unwrap();
+    for i in 0..17 {
+        request(
+            &tx,
+            HtmlPreviewIoFamily::Copies,
+            &format!("copy-{i}"),
+            0,
+            "ws",
+        )
+        .await
+        .unwrap();
+    }
+    tx.commit().await.unwrap();
+    f.sql("UPDATE html_preview_io_work SET state='blocked' WHERE family='copies'")
+        .await;
+    let upper = f.store.html_preview_io_recovery_frontier().await.unwrap();
+    let mut after = f
+        .store
+        .recover_html_preview_io_blocked_through(&Default::default(), &upper)
+        .await
+        .unwrap()
+        .unwrap();
+    let first = work::Entity::find()
+        .filter(work::Column::Family.eq("copies"))
+        .order_by_asc(work::Column::ObjectId)
+        .one(&f.store.connection)
+        .await
+        .unwrap()
+        .unwrap();
+    f.store
+        .connection
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE html_preview_io_work SET state='blocked' WHERE family='copies' AND object_id=?",
+            [first.object_id.clone().into()],
+        ))
+        .await
+        .unwrap();
+    let mut finished = false;
+    for i in 0..4 {
+        let tx = f.store.connection.begin().await.unwrap();
+        request(
+            &tx,
+            HtmlPreviewIoFamily::Witness,
+            &format!("new-{i}"),
+            0,
+            "ws",
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        match f
+            .store
+            .recover_html_preview_io_blocked_through(&after, &upper)
+            .await
+            .unwrap()
+        {
+            Some(next) => after = next,
+            None => {
+                finished = true;
+                break;
+            }
+        }
+    }
+    assert!(finished);
+    let upper = f.store.html_preview_io_recovery_frontier().await.unwrap();
+    f.store
+        .recover_html_preview_io_blocked_through(&Default::default(), &upper)
+        .await
+        .unwrap();
+    let row = work::Entity::find_by_id((first.family, first.object_id, first.ordinal))
+        .one(&f.store.connection)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.state, "ready");
 }

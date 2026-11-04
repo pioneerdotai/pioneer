@@ -510,6 +510,20 @@ impl TimeoutSupervisor {
             .await
     }
 
+    pub async fn list_timeout_candidate_page(
+        &self,
+        now_unix: i64,
+        limit: u64,
+        after: Option<&pioneer_crud::TimeoutCandidateCursor>,
+    ) -> Result<(
+        Vec<TimeoutCandidate>,
+        Option<pioneer_crud::TimeoutCandidateCursor>,
+    )> {
+        self.crud_store
+            .list_timeout_candidate_page(now_unix, limit, after)
+            .await
+    }
+
     pub async fn transition_timeout_candidate(
         &self,
         candidate: &TimeoutCandidate,

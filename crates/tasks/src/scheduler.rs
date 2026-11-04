@@ -4,9 +4,7 @@ use crate::event_bus::{TaskEventBus, TaskEventSubscription, TaskEventWakeDeliver
 use crate::executor::{
     TaskExecutionContext, TaskExecutionHandle, TaskExecutorRegistry, TaskExecutorStartOutcome,
 };
-use crate::service::{
-    LIVE_RECONCILIATION_INTERVAL, is_terminal_task, now_timestamp_secs, task_error,
-};
+use crate::service::{is_terminal_task, now_timestamp_secs, task_error};
 use crate::trigger::{TaskTriggerCalculator, TaskTriggerCatchUpPlan};
 use anyhow::Context;
 use pioneer_crud::CrudStore;
@@ -22,7 +20,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{Mutex, Notify};
-use tokio::time::{Duration, sleep};
+use tokio::time::Duration;
 use tracing::{debug, error, warn};
 
 const ID_LEN: usize = 21;
@@ -177,36 +175,59 @@ impl TaskScheduler {
     }
 
     pub async fn run(self: Arc<Self>) {
+        let database = self.store.database_connection();
+        let mut changes = database.work_signal("tasks.scheduler").subscribe();
+        let mut capacity = self.executors.work_signal().subscribe();
+        let mut begin = true;
         loop {
+            // The Notify and runtime signal can both be ready. Whichever
+            // branch wins, a direct CRUD commit must refresh cached future
+            // deadlines before begin_pass acknowledges its runtime signal.
+            if begin {
+                self.needs_rebuild.store(true, Ordering::Release);
+            }
             let now = now_timestamp_secs();
-            let processing = self
-                .process_due_once_with_transient_storage_retry(now)
-                .await;
-            let sleep_duration = match processing {
-                Ok(_) => self.next_sleep_duration(now).await,
-                Err(error) => {
-                    // SchedulerPass already records unknown outcomes. Partial row
-                    // errors preserve discovery progress and addressed retries.
-                    let is_transient_storage = is_transient_scheduler_storage_error(&error);
-                    if is_transient_storage {
-                        warn!(
-                            failure_class = "task_scheduler_transient_storage_failure",
-                            "task scheduler due processing deferred by transient storage access failure"
-                        );
-                        Duration::from_secs(TASK_SCHEDULER_MAX_SLEEP_SECONDS)
-                    } else {
-                        error!(
-                            failure_class = "task_scheduler_due_processing_failed",
-                            "task scheduler due processing failed"
-                        );
-                        self.next_sleep_duration(now).await
-                    }
+            let result: TaskRuntimeResult<Option<i64>> = async {
+                if begin {
+                    changes.begin_pass(&database).await?;
+                }
+                begin = false;
+                self.process_due_once_with_transient_storage_retry(now)
+                    .await?;
+                self.next_wake_deadline(now).await
+            }
+            .await;
+            let deadline = match result {
+                Ok(deadline) => deadline,
+                Err(_) => {
+                    warn!(
+                        failure_class = "task_scheduler_due_processing_failed",
+                        "task scheduler due processing deferred"
+                    );
+                    // A failed mutation may itself publish UNKNOWN. It must
+                    // not bypass bounded storage backoff with its own wake.
+                    tokio::time::sleep(Duration::from_secs(TASK_SCHEDULER_MAX_SLEEP_SECONDS)).await;
+                    continue;
                 }
             };
-            tokio::select! {
-                _ = self.notify.notified() => {}
-                _ = sleep(sleep_duration) => {}
+            // Keep invalidations unacknowledged for the whole finite scan,
+            // including changes to keys behind its current cursor. Finish its
+            // captured upper fence before reopening any family.
+            if self.has_discovery_continuation().await {
+                tokio::task::yield_now().await;
+                continue;
             }
+            tokio::select! {
+                _ = changes.wait(deadline) => {
+                    // A separately constructed CrudStore does not publish on
+                    // this service's bus; reload its durable scheduling inputs.
+                    self.needs_rebuild.store(true, Ordering::Release);
+                }
+                _ = self.notify.notified() => {}
+                _ = capacity.changed() => { self.needs_rebuild.store(true, Ordering::Release); }
+            }
+            begin = true;
+            tokio::task::yield_now().await;
         }
     }
 
@@ -734,26 +755,40 @@ impl TaskScheduler {
         Ok(failures)
     }
 
-    pub(crate) async fn next_sleep_duration(&self, now: i64) -> Duration {
-        self.due_queue
+    async fn has_discovery_continuation(&self) -> bool {
+        if self.due_run_cursor.lock().await.is_some()
+            || self.due_trigger_cursor.lock().await.is_some()
+            || self.expired_task_cursor.lock().await.is_some()
+        {
+            return true;
+        }
+        false
+    }
+
+    async fn next_wake_deadline(&self, now: i64) -> TaskRuntimeResult<Option<i64>> {
+        if self.has_discovery_continuation().await {
+            return Ok(Some(now));
+        }
+        // Ready runs that could not claim capacity wait for the terminal
+        // transition that frees their slot. Their old ready_at is not a retry.
+        let queued = self.store.next_queued_task_ready_deadline(now).await?;
+        Ok(self
+            .due_queue
             .lock()
             .await
-            .first()
-            .map(|item| {
-                if item.next_fire_at <= now {
-                    Duration::ZERO
-                } else {
-                    Duration::from_secs(
-                        u64::try_from(item.next_fire_at.saturating_sub(now)).unwrap_or(u64::MAX),
-                    )
-                }
-            })
-            .map(|duration| duration.min(Duration::from_secs(TASK_SCHEDULER_MAX_SLEEP_SECONDS)))
-            .unwrap_or_else(|| Duration::from_secs(TASK_SCHEDULER_MAX_SLEEP_SECONDS))
-            // The former unconditional live-reconcile pulse supplied this
-            // foreign-writer discovery ceiling. Keep it without empty wakes.
-            // Transient storage backoff in run() retains its separate 60s path.
-            .min(LIVE_RECONCILIATION_INTERVAL)
+            .iter()
+            .filter(|item| item.next_fire_at > now)
+            .map(|item| item.next_fire_at)
+            .chain(queued)
+            .min())
+    }
+
+    pub(crate) async fn next_sleep_duration(&self, now: i64) -> Duration {
+        match self.next_wake_deadline(now).await {
+            Ok(Some(at)) => Duration::from_secs(at.saturating_sub(now).max(0) as u64),
+            Ok(None) => Duration::MAX,
+            Err(_) => Duration::from_secs(TASK_SCHEDULER_MAX_SLEEP_SECONDS),
+        }
     }
 
     async fn process_trigger(

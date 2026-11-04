@@ -18,7 +18,9 @@ use serde::Serialize;
 
 pub use pioneer_keystore::{SecretPermissionHealthReport, SecretPermissionHealthStatus};
 
-use crate::database::{gateway_database_path, initialize_existing_for_operations};
+use crate::database::{
+    gateway_database_path, initialize_existing_for_operations, read_existing_for_operations,
+};
 use crate::mcp_secrets::garbage_collection_orphan_mcp_secrets;
 use crate::secrets::GatewaySecrets;
 
@@ -99,7 +101,7 @@ pub async fn secrets_status(
     permissions.push(inspect_private_runtime_dir(runtime_home));
     permissions.extend(inspect_keystore_sqlite_files(storage_path.as_path()));
 
-    let mcp_orphans = match initialize_existing_for_operations(runtime_home, config).await? {
+    let mcp_orphans = match read_existing_for_operations(runtime_home, config).await? {
         Some(database) => {
             let crud_store = CrudStore::new(database);
             let report = garbage_collection_orphan_mcp_secrets(&crud_store, &gateway_secrets, true)
@@ -144,7 +146,7 @@ pub async fn secrets_garbage_collection(
     dry_run: bool,
 ) -> Result<McpSecretGarbageCollectionReport> {
     let gateway_db_path = gateway_database_path(runtime_home, config)?;
-    let Some(database) = initialize_existing_for_operations(runtime_home, config).await? else {
+    let Some(database) = read_existing_for_operations(runtime_home, config).await? else {
         bail!(
             "gateway database `{}` is missing; refusing to garbage collect MCP secrets",
             gateway_db_path.display()
@@ -212,8 +214,26 @@ pub async fn artifact_gc_execute(
     if !execute {
         bail!("artifact GC execute requires execute=true; call dry-run first for visibility");
     }
-    let service = open_artifact_service_for_operations(config, runtime_home).await?;
-    service
+    let database = match initialize_existing_for_operations(runtime_home, config).await {
+        Err(error) if error.downcast_ref::<pioneer_sqlite::WriterBusy>().is_some() => {
+            return crate::transport::local_operations::request(
+                runtime_home,
+                config,
+                crate::transport::local_operations::Operation::ArtifactGc {
+                    workspace_id: workspace_id.to_owned(),
+                    now_unix_ms,
+                    policy: pioneer_artifacts::ArtifactGcPolicy {
+                        grace_secs: config.gateway.artifacts.gc_grace_secs,
+                        output_dir_ttl_secs: config.gateway.artifacts.output_dir_ttl_secs,
+                        readable_copy_ttl_secs: config.gateway.artifacts.readable_copy_ttl_secs,
+                    },
+                },
+            )
+            .await;
+        }
+        result => result?.context("Gateway database missing; refusing artifact GC")?,
+    };
+    artifact_service_for_database(config, runtime_home, database)
         .gc_execute(workspace_id, now_unix_ms)
         .await
         .with_context(|| format!("failed to execute artifact GC for `{workspace_id}`"))
@@ -224,13 +244,25 @@ async fn open_artifact_service_for_operations(
     runtime_home: &Path,
 ) -> Result<ArtifactService> {
     let gateway_db_path = gateway_database_path(runtime_home, config)?;
-    let Some(database) = initialize_existing_for_operations(runtime_home, config).await? else {
+    let Some(database) = read_existing_for_operations(runtime_home, config).await? else {
         bail!(
             "gateway database `{}` is missing; refusing artifact operations",
             gateway_db_path.display()
         );
     };
-    Ok(ArtifactService::new_with_policies(
+    Ok(artifact_service_for_database(
+        config,
+        runtime_home,
+        database,
+    ))
+}
+
+fn artifact_service_for_database(
+    config: &AppConfig,
+    runtime_home: &Path,
+    database: pioneer_sqlite::SqliteDatabase,
+) -> ArtifactService {
+    ArtifactService::new_with_policies(
         Arc::new(CrudStore::new(database.maintenance())),
         Arc::new(LocalArtifactBlobStore::new(runtime_home.to_path_buf())),
         ArtifactQuotaPolicy {
@@ -244,7 +276,7 @@ async fn open_artifact_service_for_operations(
             output_dir_ttl_secs: config.gateway.artifacts.output_dir_ttl_secs,
             readable_copy_ttl_secs: config.gateway.artifacts.readable_copy_ttl_secs,
         },
-    ))
+    )
 }
 
 fn count_secret_kinds(entries: &[SecretEntryMeta]) -> SecretKindCounts {

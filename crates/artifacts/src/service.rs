@@ -76,6 +76,34 @@ pub struct HtmlPreviewMaintenanceProgress {
     copies: String,
     finished: [bool; 3],
     io_seeded: bool,
+    // Earliest GC cutoff observed in this bounded pass. A grace deadline can
+    // expire behind the cursor before EOF; it must still trigger a fresh pass.
+    gc_cutoff_ms: Option<i64>,
+    blob_upper: Option<String>,
+    copies_upper: Option<String>,
+}
+
+impl HtmlPreviewMaintenanceProgress {
+    /// Reopen completed families without destroying an unrelated preparation
+    /// still waiting for an activity/read hold. The caller retains invalidation
+    /// for unfinished keysets until their captured pass finishes as well.
+    pub fn invalidate_completed(&mut self) {
+        if self.finished[0] {
+            self.previews = Default::default();
+            self.finished[0] = false;
+        }
+        if self.finished[1] {
+            self.blobs.clear();
+            self.blob_upper = None;
+            self.gc_cutoff_ms = None;
+            self.finished[1] = false;
+        }
+        if self.finished[2] {
+            self.copies.clear();
+            self.copies_upper = None;
+            self.finished[2] = false;
+        }
+    }
 }
 
 /// Domain-owned bounded read used by the agent artifact tool.
@@ -220,6 +248,22 @@ struct ArtifactReadBlobDescriptor {
 }
 
 impl ArtifactService {
+    /// Preserve shared activity/read-hold state while selecting the database
+    /// class at an operator/background operation boundary.
+    pub fn with_maintenance_access(&self) -> Self {
+        let mut service = self.clone();
+        service.store = Arc::new(self.store.with_maintenance_access());
+        service
+    }
+
+    /// Preserve the operator invocation's existing GC policy while sharing the
+    /// running owner's store, blob root and preview activity fences.
+    pub fn with_gc_policy(&self, policy: ArtifactGcPolicy) -> Self {
+        let mut service = self.clone();
+        service.gc_policy = policy;
+        service
+    }
+
     pub fn new(store: Arc<CrudStore>, blob_store: Arc<dyn ArtifactBlobStore>) -> Self {
         Self {
             store,
@@ -264,8 +308,8 @@ impl ArtifactService {
 
     /// In-process execution/delivery complements durable runtime/frozen owners.
     /// Shared by this service and its maintenance owner; never a DB permit.
-    pub async fn html_preview_activity(&self) -> tokio::sync::OwnedRwLockReadGuard<()> {
-        self.preview_activity.clone().read_owned().await
+    pub async fn html_preview_activity(&self) -> HtmlPreviewActivityGuard {
+        self.html_preview_activity_signaled().await
     }
 
     pub async fn html_preview_activity_signaled(&self) -> HtmlPreviewActivityGuard {
@@ -833,6 +877,23 @@ impl ArtifactService {
             != HtmlPreviewMaintenanceOutcome::Idle)
     }
 
+    pub async fn html_preview_maintenance_deadline(
+        &self,
+        progress: &HtmlPreviewMaintenanceProgress,
+    ) -> ArtifactResult<Option<i64>> {
+        let store = self.store.with_maintenance_access();
+        let grace =
+            i64::try_from(self.gc_policy.grace_secs.saturating_mul(1000)).unwrap_or(i64::MAX);
+        let io = store.html_preview_io_deadline().await?;
+        let cutoff = progress
+            .gc_cutoff_ms
+            .ok_or(ArtifactError::ContentInvariant {
+                reason: "HTML GC discovery is incomplete",
+            })?;
+        let gc = store.html_preview_gc_deadline(grace, cutoff).await?;
+        Ok(io.into_iter().chain(gc).min())
+    }
+
     pub async fn html_preview_maintenance_outcome(
         &self,
         progress: &mut HtmlPreviewMaintenanceProgress,
@@ -840,6 +901,9 @@ impl ArtifactService {
         let store = self.store.with_maintenance_access();
         if progress.finished.iter().all(|done| *done) {
             progress.finished = [false; 3];
+            progress.gc_cutoff_ms = None;
+            progress.blob_upper = None;
+            progress.copies_upper = None;
         }
         let mut deferred = false;
         let mut copies_deferred = false;
@@ -862,10 +926,17 @@ impl ArtifactService {
         let (next, candidates) = if progress.finished[1] {
             (String::new(), Vec::new())
         } else {
+            if progress.blob_upper.is_none() {
+                progress.blob_upper = Some(store.html_preview_blob_frontier().await?);
+            }
+            let cutoff = Utc::now().timestamp_millis().saturating_sub(grace_ms);
+            progress.gc_cutoff_ms =
+                Some(progress.gc_cutoff_ms.map_or(cutoff, |old| old.min(cutoff)));
             store
-                .html_preview_gc_blob_page(
+                .html_preview_gc_blob_page_through(
                     &progress.blobs,
-                    Utc::now().timestamp_millis().saturating_sub(grace_ms),
+                    cutoff,
+                    progress.blob_upper.as_deref().expect("captured frontier"),
                 )
                 .await?
         };
@@ -902,8 +973,14 @@ impl ArtifactService {
         let (id, copy) = if progress.finished[2] || progress.io_seeded {
             (String::new(), None)
         } else {
+            if progress.copies_upper.is_none() {
+                progress.copies_upper = Some(store.html_preview_artifact_frontier().await?);
+            }
             store
-                .html_preview_released_copies_page(&progress.copies)
+                .html_preview_released_copies_page_through(
+                    &progress.copies,
+                    progress.copies_upper.as_deref().expect("captured frontier"),
+                )
                 .await?
         };
         progress.finished[2] = id.is_empty();

@@ -41,6 +41,7 @@ const SCOPE_PAGE_KEY_BYTES: i64 = FRAGMENT_BYTES;
 #[derive(Default)]
 pub struct FrozenStorageLifetimeProgress {
     phase: usize,
+    release_only: bool,
     pass_done: [bool; 6],
     // Reconciliation/sealing can release holds discovered earlier this pass.
     pass_changed: bool,
@@ -52,11 +53,14 @@ pub struct FrozenStorageLifetimeProgress {
     locators: [String; 4],
     locator_kind: usize,
     locator_pending: [VecDeque<(String, String, i64)>; 4],
+    locator_upper: [Option<String>; 4],
     locator: Option<LocatorRead>,
     proof_after: String,
+    proof_upper: Option<String>,
     proof_pending: VecDeque<String>,
     proof: Option<checkpoint_proofs::GraphPreparation>,
     expiry_after: String,
+    expiry_upper: Option<String>,
     expiry_pending: VecDeque<history::Model>,
     expiry: Option<ExpiryPreparation>,
     sweep: Option<SweepPreparation>,
@@ -67,9 +71,13 @@ pub struct FrozenStorageLifetimeProgress {
     sweep_round: [frozen_sweep_work::ServiceRound; 2],
     accounting: SweepAccounting,
     discard_after: String,
+    discard_upper: Option<String>,
     discard_pending: VecDeque<Option<String>>,
     discard: Option<DiscardPreparation>,
     pub(super) conversion: Option<super::compaction_frozen_storage::StagedCopyCheck>,
+    pub(super) conversion_upper: Option<String>,
+    pub(super) conversion_after: [String; 2],
+    pub(super) conversion_register_after: String,
 }
 const ROOTS: [(&str, &str, &str); 4] = [
     ("task_run_conversation_snapshot", "run_id", "history_json"),
@@ -821,7 +829,14 @@ fn healthy(alias: &str) -> String {
     )
 }
 async fn expire(store: &CrudStore, header: &history::Model) -> Result<bool> {
-    store
+    let changes = [
+        store
+            .connection
+            .work_signal("maintenance.portable")
+            .changing(),
+        store.connection.work_signal("maintenance.html").changing(),
+    ];
+    let result = store
         .run_serialized_write(|| async {
             let tx = store.connection.begin().await?;
             let h = history::Entity::find_by_id(&header.id)
@@ -1019,7 +1034,13 @@ async fn expire(store: &CrudStore, header: &history::Model) -> Result<bool> {
             tx.commit().await?;
             Ok(expired.rows_affected > 0)
         })
-        .await
+        .await;
+    if let Ok(changed) = &result {
+        for change in changes {
+            change.completed(*changed);
+        }
+    }
+    result
 }
 
 /// Metadata-only geometry walk; no frozen payload is read. Complete headers
@@ -1114,6 +1135,7 @@ struct CheckedGeometry {
 }
 #[derive(Debug, PartialEq, Eq)]
 enum SweepStep {
+    Blocked,
     Continue,
     Complete,
     Retry,
@@ -1385,7 +1407,7 @@ impl SweepPreparation {
                     .acknowledge(self.kind, PhysicalDeleteResult::refused())
                     .await;
                 // Refusal is never successful completion of a generation.
-                return Ok(SweepStep::Retry);
+                return Ok(SweepStep::Blocked);
             };
             accounting.acknowledge(self.kind, deleted).await;
         }
@@ -1722,6 +1744,16 @@ AND NOT EXISTS(SELECT 1 FROM compaction_frozen_span s JOIN compaction_frozen_his
 }
 
 impl FrozenStorageLifetimeProgress {
+    /// Called only after worker EOF. A hold release changes cleanup eligibility,
+    /// not legacy proof/locator validity. Keep scope and conversion knowledge.
+    pub fn recheck_released_holds(&mut self) {
+        self.release_only = true;
+        self.pass_done = [true, true, false, false, false, true];
+        self.sweep_round = Default::default();
+    }
+    pub async fn next_retry_deadline(&self, store: &CrudStore) -> Result<Option<i64>> {
+        frozen_sweep_work::next_retry_deadline(store).await
+    }
     /// One eligible bounded phase step; skip at most one rotation of finished
     /// or scope-blocked phases without making the worker sleep for each skip.
     /// False means every discovery family has
@@ -1804,8 +1836,13 @@ impl FrozenStorageLifetimeProgress {
             self.pass_done[phase] = true;
         }
         if self.pass_done.iter().all(|done| *done) {
-            self.pass_done = [false; 6];
+            self.pass_done = if self.release_only {
+                [true, true, false, false, false, true]
+            } else {
+                [false; 6]
+            };
             self.locator_done = [false; 4];
+            self.sweep_round = Default::default();
             tracing::debug!(
                 message_rows = self.accounting.rows[0],
                 message_bytes = self.accounting.bytes[0],
@@ -1887,6 +1924,26 @@ impl FrozenStorageLifetimeProgress {
         };
         let (table, key, field) = ROOTS[kind];
         if self.locator_pending[kind].is_empty() {
+            if self.locator_upper[kind].is_none() {
+                // This existing dynamic root inventory has no common Entity.
+                // Capture one metadata key, never a root payload, per family.
+                self.locator_upper[kind] = Some(
+                    store
+                        .connection
+                        .query_one(
+                            &Query::select()
+                                .from(Alias::new(table))
+                                .column(Alias::new(key))
+                                .order_by(Alias::new(key), Order::Desc)
+                                .limit(1)
+                                .to_owned(),
+                        )
+                        .await?
+                        .map(|row| row.try_get::<String>("", key))
+                        .transpose()?
+                        .unwrap_or_default(),
+                );
+            }
             // Seek only unknown roots through (frozen_manifest_id, PK), so
             // verified ID/NULL rows do not consume this bounded metadata page.
             let query = Query::select()
@@ -1899,12 +1956,17 @@ impl FrozenStorageLifetimeProgress {
                 )
                 .and_where(Expr::col(Alias::new("frozen_manifest_id")).eq(""))
                 .and_where(Expr::col(Alias::new(key)).gt(&self.locators[kind]))
+                .and_where(
+                    Expr::col(Alias::new(key))
+                        .lte(self.locator_upper[kind].as_deref().unwrap_or_default()),
+                )
                 .order_by(Alias::new(key), Order::Asc)
                 .limit(META_ROWS)
                 .to_owned();
             let page = store.connection.query_all(&query).await?;
             if page.is_empty() {
                 self.locators[kind].clear();
+                self.locator_upper[kind] = None;
                 self.locator_done[kind] = true;
                 return Ok(!self.locator_done.iter().all(|done| *done));
             }
@@ -1949,6 +2011,18 @@ impl FrozenStorageLifetimeProgress {
         // Seek unsealed headers through checkpoint_proof_discovery before
         // choosing roots. The page is advisory; dequeue rechecks current state.
         if self.proof_pending.is_empty() {
+            if self.proof_upper.is_none() {
+                self.proof_upper = Some(
+                    checkpoint::Entity::find()
+                        .select_only()
+                        .column(checkpoint::Column::Id)
+                        .order_by_desc(checkpoint::Column::Id)
+                        .into_tuple::<String>()
+                        .one(&store.connection)
+                        .await?
+                        .unwrap_or_default(),
+                );
+            }
             let query = Query::select()
                 .from(checkpoint::Entity)
                 .columns(
@@ -1991,12 +2065,17 @@ impl FrozenStorageLifetimeProgress {
                 .and_where(
                     Expr::col((checkpoint::Entity, checkpoint::Column::Id)).gt(&self.proof_after),
                 )
+                .and_where(
+                    Expr::col((checkpoint::Entity, checkpoint::Column::Id))
+                        .lte(self.proof_upper.as_deref().unwrap_or_default()),
+                )
                 .order_by((checkpoint::Entity, checkpoint::Column::Id), Order::Asc)
                 .limit(META_ROWS)
                 .to_owned();
             let page = store.connection.query_all(&query).await?;
             if page.is_empty() {
                 self.proof_after.clear();
+                self.proof_upper = None;
                 return Ok(false);
             }
             for row in page {
@@ -2094,10 +2173,23 @@ impl FrozenStorageLifetimeProgress {
         // separate tables. Prefetch is advisory: ExpiryPreparation and expire
         // preserve individual root/hold checks and exact writer revalidation.
         if self.expiry_pending.is_empty() {
+            if self.expiry_upper.is_none() {
+                self.expiry_upper = Some(
+                    history::Entity::find()
+                        .select_only()
+                        .column(history::Column::Id)
+                        .order_by_desc(history::Column::Id)
+                        .into_tuple::<String>()
+                        .one(&store.connection)
+                        .await?
+                        .unwrap_or_default(),
+                );
+            }
             self.expiry_pending = history::Entity::find()
                 .filter(history::Column::Expired.eq(0))
                 .filter(history::Column::Ready.eq(1))
                 .filter(history::Column::Id.gt(&self.expiry_after))
+                .filter(history::Column::Id.lte(self.expiry_upper.as_deref().unwrap_or_default()))
                 .order_by_asc(history::Column::Id)
                 .limit(16)
                 .all(&store.connection)
@@ -2112,6 +2204,7 @@ impl FrozenStorageLifetimeProgress {
             Ok(true)
         } else {
             self.expiry_after.clear();
+            self.expiry_upper = None;
             Ok(false)
         }
     }
@@ -2127,9 +2220,12 @@ impl FrozenStorageLifetimeProgress {
             // Keep ownership until the durable finish succeeds. DB errors and
             // cancellation cannot turn a dropped continuation into a clean key.
             let finish = match &result {
-                Ok(SweepStep::Complete) => Some(Some(sweep.completion_guard())),
-                Ok(SweepStep::Retry) => Some(None),
-                Err(_) => Some(None),
+                Ok(SweepStep::Complete) => Some(frozen_sweep_work::Completion::Complete(
+                    sweep.completion_guard(),
+                )),
+                Ok(SweepStep::Blocked) => Some(frozen_sweep_work::Completion::Blocked),
+                Ok(SweepStep::Retry) => Some(frozen_sweep_work::Completion::Retry),
+                Err(_) => Some(frozen_sweep_work::Completion::Retry),
                 _ => None,
             };
             if let Some(validation) = finish {
@@ -2196,9 +2292,12 @@ impl FrozenStorageLifetimeProgress {
             frozen_sweep_work::Admission::Continue => return Ok(true),
             frozen_sweep_work::Admission::Idle => {
                 // Empty physical admission is not EOF while propagation continues.
-                return Ok(
-                    (!fanout_checked && frozen_sweep_work::fanout_step(store).await?) || active > 0,
-                );
+                let more =
+                    (!fanout_checked && frozen_sweep_work::fanout_step(store).await?) || active > 0;
+                if !more {
+                    self.sweep_round = Default::default();
+                }
+                return Ok(more);
             }
         };
         let (data, _) = physical_table(work.kind);
@@ -2221,13 +2320,15 @@ impl FrozenStorageLifetimeProgress {
         if let Some(last) = last {
             if last.try_get::<String>("", "ordinal_type")? != "integer" {
                 self.accounting.poison += 1;
-                work.finish(store, None).await?;
+                work.finish(store, frozen_sweep_work::Completion::Retry)
+                    .await?;
                 return Ok(true);
             }
             let until: i64 = last.try_get("", "ordinal")?;
             if until < 0 {
                 self.accounting.poison += 1;
-                work.finish(store, None).await?;
+                work.finish(store, frozen_sweep_work::Completion::Retry)
+                    .await?;
                 return Ok(true);
             }
             let mut sweep = SweepPreparation::new(
@@ -2247,7 +2348,9 @@ impl FrozenStorageLifetimeProgress {
             // protects a concurrent append after the inventory read.
             work.finish(
                 store,
-                Some(DbBackend::Sqlite.build(&Query::select().expr(Expr::val(1)).to_owned())),
+                frozen_sweep_work::Completion::Complete(
+                    DbBackend::Sqlite.build(&Query::select().expr(Expr::val(1)).to_owned()),
+                ),
             )
             .await?;
         }
@@ -2268,6 +2371,18 @@ impl FrozenStorageLifetimeProgress {
             return Ok(true);
         }
         if self.discard_pending.is_empty() {
+            if self.discard_upper.is_none() {
+                self.discard_upper = Some(
+                    checkpoint::Entity::find()
+                        .select_only()
+                        .column(checkpoint::Column::Id)
+                        .order_by_desc(checkpoint::Column::Id)
+                        .into_tuple::<String>()
+                        .one(&store.connection)
+                        .await?
+                        .unwrap_or_default(),
+                );
+            }
             // Physical PK seek only: no eligibility predicate/JOIN can make
             // SQLite search past this page to fill it. Bound actual UTF-8 key
             // bytes as well as rows, like ScopeDiscovery's metadata pages.
@@ -2283,6 +2398,9 @@ impl FrozenStorageLifetimeProgress {
                 .select_only()
                 .column_as(key, "id")
                 .filter(checkpoint::Column::Id.gt(&self.discard_after))
+                .filter(
+                    checkpoint::Column::Id.lte(self.discard_upper.as_deref().unwrap_or_default()),
+                )
                 .order_by_asc(checkpoint::Column::Id)
                 .limit(META_ROWS)
                 .into_tuple::<Option<String>>()
@@ -2301,6 +2419,10 @@ impl FrozenStorageLifetimeProgress {
                     .select_only()
                     .column(checkpoint::Column::Id)
                     .filter(checkpoint::Column::Id.gt(&self.discard_after))
+                    .filter(
+                        checkpoint::Column::Id
+                            .lte(self.discard_upper.as_deref().unwrap_or_default()),
+                    )
                     .order_by_asc(checkpoint::Column::Id)
                     .into_tuple::<String>()
                     .one(&store.connection)
@@ -2313,6 +2435,7 @@ impl FrozenStorageLifetimeProgress {
             // nonempty page always returns more; the existing pass/revisit
             // policy later rediscovers eligibility changes behind the cursor.
             self.discard_after.clear();
+            self.discard_upper = None;
             return Ok(false);
         };
         // One exact-key eligibility/preflight read, after physical selection.
@@ -2704,6 +2827,7 @@ struct ScopeDiscovery {
     kind: i64,
     done: bool,
     pending: VecDeque<(Option<String>, i64)>,
+    upper: Option<String>,
 }
 impl ScopeDiscovery {
     fn discovery_query(&self, page: bool) -> sea_orm::sea_query::SelectStatement {
@@ -2752,6 +2876,9 @@ impl ScopeDiscovery {
                     .gt(Expr::tuple([Expr::val(&self.after), Expr::val(self.kind)]));
             }
             query.and_where(after);
+        }
+        if let Some(upper) = &self.upper {
+            query.and_where(Expr::col(Alias::new(key)).lte(upper));
         }
         query.order_by((Alias::new(table), Alias::new(key)), Order::Asc);
         if self.family == 1 {
@@ -2804,6 +2931,30 @@ impl ScopeDiscovery {
             self.started = false;
         }
         if self.pending.is_empty() {
+            if self.upper.is_none() {
+                let (table, key) = match self.family {
+                    0 => ("compaction_frozen_history", "id"),
+                    1 => ("compaction_frozen_layout", "manifest_id"),
+                    4 => ("compaction_operation", "id"),
+                    _ => ("compaction_checkpoint", "id"),
+                };
+                self.upper = Some(
+                    store
+                        .connection
+                        .query_one(
+                            &Query::select()
+                                .from(Alias::new(table))
+                                .column(Alias::new(key))
+                                .order_by(Alias::new(key), Order::Desc)
+                                .limit(1)
+                                .to_owned(),
+                        )
+                        .await?
+                        .map(|row| row.try_get::<String>("", key))
+                        .transpose()?
+                        .unwrap_or_default(),
+                );
+            }
             self.pending = self.fetch_page(store).await?;
         }
         let key = match self.pending.front() {
@@ -2833,6 +2984,7 @@ impl ScopeDiscovery {
             self.after.clear();
             self.kind = -1;
             self.started = false;
+            self.upper = None;
             if self.family == 6 {
                 self.done = true;
             }
@@ -3182,7 +3334,7 @@ mod tests {
             let mut accounting = SweepAccounting::default();
             assert_eq!(
                 sweep.step(&store, &mut accounting).await.unwrap(),
-                SweepStep::Retry
+                SweepStep::Blocked
             );
             assert_eq!(accounting.rows, [0, 0]);
             assert_eq!(accounting.refused, 1);
@@ -3193,7 +3345,7 @@ mod tests {
             store.connection.execute_unprepared("UPDATE compaction_frozen_history SET ready=0,message_count=4,import_count=4,next_ordinal=2,next_import=1 WHERE id='batch-physical'").await.unwrap();
             assert_eq!(
                 sweep.step(&store, &mut accounting).await.unwrap(),
-                SweepStep::Retry
+                SweepStep::Blocked
             );
             assert_eq!(accounting.rows, [0, 0]);
             assert_eq!(accounting.refused, 2);
@@ -6663,6 +6815,89 @@ mod tests {
         }
         assert!(!restart.discard_quantum(&store).await.unwrap());
         assert!(restart.discard_after.is_empty());
+    }
+
+    // The graph-refusal tests protect retained data; they do not exercise the
+    // release invalidation that used to reopen the same unchanged proof.
+    #[tokio::test]
+    async fn refused_proof_release_rechecks_cleanup_without_revalidating_origin() {
+        use futures_util::FutureExt;
+        let (store, _) = fixture(true).await;
+        // Model pre-existing damaged legacy input; the production identity
+        // guard correctly prevents creating it after publication today.
+        store
+            .connection
+            .execute_unprepared("DROP TRIGGER frozen_complete_identity")
+            .await
+            .unwrap();
+        store.connection.execute_unprepared(
+            "UPDATE compaction_frozen_history SET identity_sha256=printf('%064d',0) WHERE id='origin'"
+        ).await.unwrap();
+        store.connection.execute_unprepared(
+            "UPDATE compaction_operation_projection SET identity_sha256=printf('%064d',0) WHERE manifest_id='origin'"
+        ).await.unwrap();
+        let database = store.database_connection();
+        let mut source = database.work_signal("maintenance.frozen").subscribe();
+        let mut html = database.work_signal("maintenance.html").subscribe();
+        let mut released = database
+            .work_signal("maintenance.frozen.release")
+            .subscribe();
+        source.begin_pass(&database).await.unwrap();
+        html.begin_pass(&database).await.unwrap();
+        let mut progress = FrozenStorageLifetimeProgress::default();
+        let mut idle = false;
+        for _ in 0..4000 {
+            if !progress.quantum(&store).await.unwrap() {
+                idle = true;
+                break;
+            }
+        }
+        assert!(idle && progress.accounting.refused > 0);
+        assert!(store.frozen_readers.lock().unwrap().is_empty());
+        assert!(source.wait(None).now_or_never().is_none());
+        assert!(released.wait(None).now_or_never().is_some());
+        // Expiry may have notified HTML for unrelated rows. Acknowledge before
+        // the release-only pass whose proof reads must stay parked.
+        html.begin_pass(&database).await.unwrap();
+        let refusals = progress.accounting.refused;
+        progress.recheck_released_holds();
+        idle = false;
+        for _ in 0..4000 {
+            if !progress.quantum(&store).await.unwrap() {
+                idle = true;
+                break;
+            }
+        }
+        assert!(idle);
+        assert_eq!(progress.accounting.refused, refusals);
+        assert!(released.wait(None).now_or_never().is_none());
+        assert!(source.wait(None).now_or_never().is_none());
+        assert!(html.wait(None).now_or_never().is_none());
+        // An internal reader can be the last holder after an external reader.
+        // Both workers must still observe the final protection release.
+        let header = history::Entity::find_by_id("origin")
+            .one(&store.connection)
+            .await
+            .unwrap()
+            .unwrap();
+        let descriptor = FrozenHistoryRef {
+            format: 1,
+            manifest_id: header.id,
+            messages: header.message_count as u64,
+            identity_sha256: header.identity_sha256,
+        };
+        let external = store
+            .compaction_acquire_frozen_history("ws", &descriptor)
+            .await
+            .unwrap();
+        let (_, internal) = store
+            .acquire_frozen_header("ws", &descriptor)
+            .await
+            .unwrap();
+        drop(external);
+        assert!(released.wait(None).now_or_never().is_none());
+        drop(internal);
+        assert!(released.wait(None).now_or_never().is_some());
     }
 
     #[tokio::test]

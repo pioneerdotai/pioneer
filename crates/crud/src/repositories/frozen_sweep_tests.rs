@@ -502,7 +502,7 @@ mod durable_sweep {
         .await;
         header(&store, "key", 1, 1, 0).await;
         drain_metadata(&store).await;
-        old.finish(&store, Some(sweep.completion_guard()))
+        old.finish(&store, frozen_sweep_work::Completion::Complete(sweep.completion_guard()))
             .await
             .unwrap();
         assert_eq!(pending(&store, "key", 0).await, 1);
@@ -556,10 +556,11 @@ mod durable_sweep {
                 .step(&store, &mut SweepAccounting::default())
                 .await
                 .unwrap(),
-            SweepStep::Retry
+            SweepStep::Blocked
         );
-        selected.finish(&store, None).await.unwrap();
+        selected.finish(&store, frozen_sweep_work::Completion::Blocked).await.unwrap();
         assert_eq!(pending(&store, "batch-physical", 0).await, 1);
+        assert!(frozen_sweep_work::next_retry_deadline(&store).await.unwrap().is_none());
         assert_eq!(batch_ordinals(&store, 0).await, vec![0, 1, 2, 3]);
         drain_metadata(&store).await;
         let selected = work(&store, "batch-physical", 0).await;
@@ -573,7 +574,7 @@ mod durable_sweep {
         {}
         row(&store, "batch-physical", 0, 4).await; // between terminal step and ack
         selected
-            .finish(&store, Some(sweep.completion_guard()))
+            .finish(&store, frozen_sweep_work::Completion::Complete(sweep.completion_guard()))
             .await
             .unwrap();
         assert_eq!(pending(&store, "batch-physical", 0).await, 1);
@@ -777,9 +778,9 @@ mod durable_sweep {
         .await;
         assert_eq!(
             sweep.step(&store, &mut accounting).await.unwrap(),
-            SweepStep::Retry
+            SweepStep::Blocked
         );
-        selected.finish(&store, None).await.unwrap();
+        selected.finish(&store, frozen_sweep_work::Completion::Blocked).await.unwrap();
         assert_eq!(accounting.rows[0], 209);
         assert_eq!(
             batch_ordinals(&store, 0).await,

@@ -102,6 +102,9 @@ pub(crate) struct ZstdColumnCompressionSummary {
     pub(crate) stale_rows: u64,
     pub(crate) source_bytes: u64,
     pub(crate) maintenance_more_pending: bool,
+    /// Runnable continuation differs from data awaiting a source change.
+    #[serde(skip)]
+    pub(crate) maintenance_runnable: bool,
     /// Exact row counts are intentionally collected only by explicit test and
     /// diagnostic entry points. Production cooperative maintenance must not
     /// turn telemetry into an unbounded full-table scan while it owns the
@@ -130,6 +133,7 @@ struct ColumnMaintenanceProgress {
     stale_rows: u64,
     source_bytes: u64,
     more_pending: bool,
+    runnable: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -533,6 +537,7 @@ async fn run_periodic_maintenance_inner(
             stale_rows: progress.stale_rows,
             source_bytes: progress.source_bytes,
             maintenance_more_pending: progress.more_pending,
+            maintenance_runnable: progress.runnable,
             counts_exact: ensure.counts_exact,
         });
     }
@@ -562,15 +567,23 @@ async fn run_cooperative_maintenance(
     let mut columns = configs
         .iter()
         .copied()
-        .map(|config| (config, ColumnMaintenanceProgress::default()))
+        .map(|config| {
+            (
+                config,
+                ColumnMaintenanceProgress {
+                    more_pending: true,
+                    runnable: true,
+                    ..Default::default()
+                },
+            )
+        })
         .collect::<Vec<_>>();
-    let mut active = vec![true; configs.len()];
 
     loop {
         let mut attempted = false;
         let mut made_progress = false;
         for (index, config) in configs.iter().copied().enumerate() {
-            if !active[index] {
+            if !columns[index].1.runnable {
                 continue;
             }
             if cancellation.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
@@ -602,7 +615,7 @@ async fn run_cooperative_maintenance(
             // dictionary does not yet have enough bounded training input, or
             // every CAS became stale) remains pending but is not retried in a
             // tight loop during the same maintenance cycle.
-            active[index] = batch.more_pending && batch.applied_rows != 0;
+            progress.runnable = batch.more_pending && batch.applied_rows != 0;
             made_progress |= batch.applied_rows != 0;
 
             if cancellation.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
@@ -618,7 +631,7 @@ async fn run_cooperative_maintenance(
             }
         }
 
-        if !active.iter().any(|active| *active) || !attempted || !made_progress {
+        if !columns.iter().any(|(_, progress)| progress.runnable) || !attempted || !made_progress {
             return Ok(CooperativeMaintenanceOutcome {
                 deferred: false,
                 cancelled: false,
@@ -1386,6 +1399,7 @@ fn summary_without_maintenance(
         stale_rows: 0,
         source_bytes: 0,
         maintenance_more_pending: false,
+        maintenance_runnable: false,
         counts_exact: ensure.counts_exact,
     }
 }
@@ -1843,6 +1857,51 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn bounded_continuation_differs_from_payloads_awaiting_more_training_input() {
+        let fixture = budget_fixture(&["tiny"; DICTIONARY_MIN_SAMPLE_ROWS]).await;
+        let mut cache = PreparedDictionaryCache::new(&fixture.store);
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let bounded = run_cooperative_maintenance_cycle(
+            &fixture.store,
+            &mut cache,
+            ZSTD_PAYLOAD_COLUMNS,
+            Some(0.0),
+            1.0,
+            &cancellation,
+        )
+        .await
+        .unwrap();
+        assert_eq!(bounded.summaries.len(), ZSTD_PAYLOAD_COLUMNS.len());
+        assert!(
+            bounded
+                .summaries
+                .iter()
+                .all(|summary| summary.maintenance_runnable),
+            "an unvisited column is a continuation, not verified empty"
+        );
+        let blocked = run_cooperative_maintenance_cycle(
+            &fixture.store,
+            &mut cache,
+            ZSTD_PAYLOAD_COLUMNS,
+            None,
+            1.0,
+            &cancellation,
+        )
+        .await
+        .unwrap();
+        assert!(
+            blocked
+                .summaries
+                .iter()
+                .all(|summary| summary.maintenance_more_pending
+                    && !summary.maintenance_runnable
+                    && summary.compressed_rows == 0
+                    && summary.pending_after > 0),
+            "unchanged insufficient training data waits for a source change"
+        );
+    }
+
     // Observe actual CDict copies in the blocking miss path, rather than
     // counting calls to cache/compressor constructors.
     async fn prepare_cached_fixture(
@@ -2286,6 +2345,37 @@ mod tests {
             owner.upgrade().is_none(),
             "supervisor shutdown releases the worker cache and completed CPU references"
         );
+    }
+
+    #[tokio::test]
+    async fn cancellation_of_unknown_zstd_fence_finishes_before_writer_release() {
+        let fixture = budget_fixture(&[]).await;
+        let store = Arc::new(fixture.store.with_maintenance_access());
+        let cache = super::PreparedDictionaryCache::new(&store);
+        let interactive = fixture.store.database_connection();
+        let held_writer = interactive.begin().await.unwrap();
+        fixture.observer.writes.lock().unwrap().clear();
+        // Model cancellation of a source writer with an unknown outcome. The
+        // worker must settle that uncertainty before any new discovery.
+        drop(interactive.work_signal("maintenance.zstd").changing());
+        let mut supervisor =
+            crate::post_startup::PostStartupSupervisor::start(move |scope| async move {
+                crate::database::maintenance::run_zstd_worker_for_test(
+                    store,
+                    scope.cancellation(),
+                    cache,
+                )
+                .await;
+            });
+        fixture.observer.wait_for_writer_queue().await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), supervisor.shutdown())
+            .await
+            .unwrap();
+        fixture.observer.assert_writer_queue_cancelled();
+        held_writer.rollback().await.unwrap();
+        let next_writer = interactive.begin().await.unwrap();
+        next_writer.rollback().await.unwrap();
+        fixture.observer.assert_writer_queue_cancelled();
     }
 
     #[tokio::test]

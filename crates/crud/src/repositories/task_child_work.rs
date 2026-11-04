@@ -1405,3 +1405,33 @@ impl CrudStore {
         }
     }
 }
+
+impl CrudStore {
+    pub async fn next_task_child_work_deadline(&self, now: i64) -> Result<Option<i64>> {
+        let seed = match self.child_seed_outcome(now).await? {
+            ChildSeedOutcome::CommittedDone => None,
+            ChildSeedOutcome::Deferred { retry_at } => Some(retry_at),
+            ChildSeedOutcome::Claimed { expires_at } => Some(expires_at),
+            ChildSeedOutcome::Progress | ChildSeedOutcome::Missing => Some(now),
+        };
+        let point = point::Entity::find()
+            .select_only()
+            .column(point::Column::NextAttemptAt)
+            .filter(point::Column::NextAttemptAt.is_not_null())
+            .order_by_asc(point::Column::NextAttemptAt)
+            .limit(1)
+            .into_tuple::<i64>()
+            .one(&self.connection)
+            .await?;
+        let scope = scope::Entity::find()
+            .select_only()
+            .column(scope::Column::NextAttemptAt)
+            .filter(scope::Column::NextAttemptAt.is_not_null())
+            .order_by_asc(scope::Column::NextAttemptAt)
+            .limit(1)
+            .into_tuple::<i64>()
+            .one(&self.connection)
+            .await?;
+        Ok(seed.into_iter().chain(point).chain(scope).min())
+    }
+}
