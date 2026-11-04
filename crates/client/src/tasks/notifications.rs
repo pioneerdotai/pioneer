@@ -1673,7 +1673,11 @@ mod tests {
             .unwrap()
             .revision;
         let dismiss = store
-            .begin(identity("p"), "workspace".into(), Some(("a".into(), revision)))
+            .begin(
+                identity("p"),
+                "workspace".into(),
+                Some(("a".into(), revision)),
+            )
             .unwrap();
         core.publish_task_inbox(&mut store, "workspace");
         packet.revision = 2;
