@@ -2429,6 +2429,14 @@ impl ClientCore {
         if let Some(handled) = self.capture_cold_thread_notification(&notification) {
             return handled;
         }
+        // Ordinary ingress can also arrive in the short retirement handoff.
+        // Complete the old local cleanup before its normal reducer may create
+        // a new owner; do not drop an otherwise accepted metadata/live event.
+        if let Some(id) = notification_thread_id(&notification)
+            && !self.finish_pending_thread_retirement(id)
+        {
+            return true;
+        }
         let startup_key = match &notification {
             pioneer_protocol::GatewayNotification::ItemDelta(n)
                 if !n.delta.is_empty()
