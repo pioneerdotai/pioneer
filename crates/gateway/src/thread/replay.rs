@@ -452,7 +452,7 @@ impl ReplayReservation {
         self.started = true;
         let token = self.token.clone();
         let capture = self.capture.take();
-        let mut running = RunningReplay {
+        let running = RunningReplay {
             owns_replay: self.owns_replay,
             token: token.clone(),
             complete: false,
@@ -461,6 +461,10 @@ impl ReplayReservation {
             return;
         }
         state.tasks.spawn(async move {
+            // Move the whole guard, not just its `complete` field. Otherwise
+            // precise closure capture leaves the Drop owner outside the task.
+            // Construct it before spawn so dropping an unpolled task recovers too.
+            let mut running = running;
             let _capture = capture;
             let cancelled = token.cancel.clone();
             let work = REPLAY_SCOPE.scope(token, future);
@@ -473,6 +477,7 @@ impl ReplayReservation {
             if result.is_err() {
                 tracing::warn!("post-open replay panicked; socket recovery required");
             }
+            drop(running);
         });
     }
 }
