@@ -1,5 +1,8 @@
 //! Process-local thread ownership. A transaction can mutate only its named thread.
 
+#[path = "cold_open.rs"]
+mod cold_open;
+
 use super::{coordinator::ThreadCoordinator, start::ThreadStartCoordinator};
 use crate::{
     cli_runtime::approvals::{PendingRequest, PendingRequestRegistry, PendingRequestsReduction},
@@ -222,6 +225,67 @@ impl ThreadDomainStore {
         if let Some(request) = &self.subscription_request {
             request.retire();
         }
+    }
+    fn apply_conversation_event(
+        &mut self,
+        workspace: &str,
+        event: crate::conversation::ConversationEvent,
+        mode: Option<pioneer_protocol::ThreadComposerExecutionMode>,
+    ) -> crate::timeline::semantic::SemanticTimelineCachePatch {
+        let store = self;
+        if let crate::conversation::ConversationEvent::ItemDelta {
+            turn_id,
+            delta,
+            payload,
+            markdown,
+            ..
+        } = &event
+        {
+            use crate::conversation::reducer::TurnPhase;
+            if (delta.is_empty() && payload.is_none() && markdown.is_none())
+                || store
+                    .coordinator
+                    .conversation
+                    .projection()
+                    .turns
+                    .iter()
+                    .any(|turn| {
+                        turn.id == *turn_id
+                            && matches!(
+                                turn.phase,
+                                TurnPhase::Completed
+                                    | TurnPhase::Failed
+                                    | TurnPhase::Cancelled
+                                    | TurnPhase::Blocked
+                            )
+                    })
+            {
+                return Default::default();
+            }
+        }
+        if store
+            .coordinator
+            .conversation
+            .ignores_admission_response(&event)
+        {
+            return Default::default();
+        }
+        store.coordinator.conversation.apply(event.clone());
+        let execution_mode = store
+            .coordinator
+            .thread()
+            .map(|thread| thread.origin_kind.composer_execution_mode())
+            .or(mode)
+            .unwrap_or(pioneer_protocol::ThreadComposerExecutionMode::ForegroundTurn);
+        let patch =
+            crate::timeline::semantic::apply_local_composer_event_to_semantic_timeline_with_patch(
+                &mut store.semantic,
+                workspace,
+                &event,
+                execution_mode,
+                crate::timeline::labels::now_unix_ms(),
+            );
+        patch
     }
     fn set_snapshot(&mut self, thread: Thread) {
         if self.coordinator.thread() == Some(&thread) {
@@ -545,9 +609,23 @@ impl ThreadRegistry {
     pub(crate) fn apply_push_summaries(
         &mut self,
         threads: &[pioneer_protocol::ThreadMetadataPatch],
+        encoded_bytes: &[usize],
     ) -> Vec<ClientPublicationDraft> {
         let mut drafts = Vec::new();
-        for patch in threads {
+        for (index, patch) in threads.iter().enumerate() {
+            if let Some(request) = self
+                .stores
+                .get(&patch.thread.id)
+                .and_then(|store| store.subscription_request.as_ref())
+            {
+                let mut flight = request.flight.lock().expect("subscription flight poisoned");
+                if let Some(staged) = &mut flight.cold_staging {
+                    staged.push(
+                        cold_open::ColdIngress::Metadata(patch.clone()),
+                        encoded_bytes.get(index).copied().unwrap_or(usize::MAX),
+                    );
+                }
+            }
             let summary = &patch.thread;
             if self
                 .stores
@@ -964,6 +1042,24 @@ impl ClientCore {
     }
 
     pub fn upsert_thread(&self, thread: Thread) {
+        let notification =
+            GatewayNotification::ThreadUpdated(pioneer_protocol::ThreadUpdatedNotification {
+                thread,
+                placement: None,
+            });
+        if self
+            .capture_cold_thread_notification(&notification)
+            .is_some()
+        {
+            return;
+        }
+        let GatewayNotification::ThreadUpdated(pioneer_protocol::ThreadUpdatedNotification {
+            thread,
+            ..
+        }) = notification
+        else {
+            unreachable!()
+        };
         let id = thread.id.clone();
         let workspace = thread.workspace_id.clone();
         if let Some(mut mutation) = self.thread_mutation(&id, &workspace) {
@@ -1055,9 +1151,37 @@ impl ClientCore {
                 return false;
             }
         }
-        let before = registry.pending_requests.requests().to_vec();
-        if !registry.pending_requests.apply(reduction) {
+        let (changed, drafts) = self.apply_pending_requests_locked(&mut registry, reduction);
+        if !changed {
             return false;
+        }
+        self.transition_directory(
+            &mut registry,
+            &ClientMutationAuthority { _private: () },
+            drafts,
+            Vec::new(),
+        );
+        changed
+    }
+    fn apply_pending_requests_locked(
+        &self,
+        registry: &mut ThreadRegistry,
+        reduction: PendingRequestsReduction,
+    ) -> (bool, Vec<ClientPublicationDraft>) {
+        self.apply_pending_requests_batch_locked(registry, [reduction])
+    }
+    fn apply_pending_requests_batch_locked(
+        &self,
+        registry: &mut ThreadRegistry,
+        reductions: impl IntoIterator<Item = PendingRequestsReduction>,
+    ) -> (bool, Vec<ClientPublicationDraft>) {
+        let before = registry.pending_requests.requests().to_vec();
+        let mut changed = false;
+        for reduction in reductions {
+            changed |= registry.pending_requests.apply(reduction);
+        }
+        if !changed {
+            return (false, vec![]);
         }
         let after = registry.pending_requests.requests();
         let mut scopes = HashSet::new();
@@ -1119,13 +1243,7 @@ impl ClientCore {
                 Arc::new(projection),
             ));
         }
-        self.transition_directory(
-            &mut registry,
-            &ClientMutationAuthority { _private: () },
-            drafts,
-            Vec::new(),
-        );
-        true
+        (true, drafts)
     }
 }
 
@@ -1871,58 +1989,7 @@ impl ClientCore {
             return Default::default();
         }
         let store = registry.stores.get_mut(&id).expect("retained thread");
-        if let crate::conversation::ConversationEvent::ItemDelta {
-            turn_id,
-            delta,
-            payload,
-            markdown,
-            ..
-        } = &event
-        {
-            use crate::conversation::reducer::TurnPhase;
-            if (delta.is_empty() && payload.is_none() && markdown.is_none())
-                || store
-                    .coordinator
-                    .conversation
-                    .projection()
-                    .turns
-                    .iter()
-                    .any(|turn| {
-                        turn.id == *turn_id
-                            && matches!(
-                                turn.phase,
-                                TurnPhase::Completed
-                                    | TurnPhase::Failed
-                                    | TurnPhase::Cancelled
-                                    | TurnPhase::Blocked
-                            )
-                    })
-            {
-                return Default::default();
-            }
-        }
-        if store
-            .coordinator
-            .conversation
-            .ignores_admission_response(&event)
-        {
-            return Default::default();
-        }
-        store.coordinator.conversation.apply(event.clone());
-        let execution_mode = store
-            .coordinator
-            .thread()
-            .map(|thread| thread.origin_kind.composer_execution_mode())
-            .or(mode)
-            .unwrap_or(pioneer_protocol::ThreadComposerExecutionMode::ForegroundTurn);
-        let patch =
-            crate::timeline::semantic::apply_local_composer_event_to_semantic_timeline_with_patch(
-                &mut store.semantic,
-                workspace,
-                &event,
-                execution_mode,
-                crate::timeline::labels::now_unix_ms(),
-            );
+        let patch = store.apply_conversation_event(workspace, event, mode);
         let drafts = registry.publish(&id);
         self.transition_directory(
             &mut registry,
@@ -2314,6 +2381,9 @@ impl ClientCore {
         &self,
         notification: pioneer_protocol::GatewayNotification,
     ) -> bool {
+        if let Some(handled) = self.capture_cold_thread_notification(&notification) {
+            return handled;
+        }
         let startup_key = match &notification {
             pioneer_protocol::GatewayNotification::ItemDelta(n)
                 if !n.delta.is_empty()
@@ -14130,6 +14200,179 @@ mod tests {
     }
 
     #[test]
+    fn cold_open_preserves_live_metadata_terminal_and_item_before_ack() {
+        let (core, _transport, responses, _requests) = shared_subscription_core();
+        core.remove_thread_store("a");
+        let open = {
+            let core = core.clone();
+            std::thread::spawn(move || core.open_thread_by_id("a"))
+        };
+        let response = responses.recv_timeout(Duration::from_secs(2)).unwrap();
+        let mut stale = thread("a", "ws");
+        let mut turn = running_turn("cold-turn");
+        turn.mode = ThreadMode::Chat;
+        stale.turns = vec![turn.clone()];
+        let mut live = stale.clone();
+        live.preview = "new live metadata".into();
+        live.updated_at = 3;
+        core.upsert_thread(live);
+        core.apply_thread_notification(GatewayNotification::TurnStarted(TurnStartedNotification {
+            workspace_id: "ws".into(),
+            thread_id: "a".into(),
+            turn: turn.clone(),
+        }));
+        core.apply_thread_notification(GatewayNotification::ItemCompleted(
+            ItemCompletedNotification {
+                workspace_id: "ws".into(),
+                thread_id: "a".into(),
+                turn_id: turn.id.clone(),
+                item: TurnItem::AgentMessage {
+                    id: "answer".into(),
+                    text: "final live answer".into(),
+                    phase: pioneer_protocol::AgentMessagePhase::FinalAnswer,
+                    markdown: None,
+                    markdown_version: None,
+                },
+            },
+        ));
+        turn.status = TurnStatus::Completed;
+        core.apply_thread_notification(GatewayNotification::TurnCompleted(
+            TurnCompletedNotification {
+                workspace_id: "ws".into(),
+                thread_id: "a".into(),
+                turn,
+            },
+        ));
+        let mut foreign = thread("a", "wrong");
+        foreign.preview = "must not publish".into();
+        foreign.updated_at = 9;
+        core.upsert_thread(foreign);
+        assert!(
+            core.thread_snapshot("a").is_none(),
+            "unconfirmed ingress is not a domain snapshot"
+        );
+        response
+            .send(Ok(serde_json::to_value(ThreadStartResponse {
+                thread: stale,
+                sandbox: SandboxPolicy::from_mode(SandboxMode::FullAccess),
+            })
+            .unwrap()))
+            .unwrap();
+        open.join().unwrap().unwrap();
+        let snapshot = core.thread_snapshot("a").unwrap();
+        let coordinator = snapshot.coordinator();
+        assert_eq!(coordinator.thread().unwrap().preview, "new live metadata");
+        let conversation = coordinator.conversation.projection();
+        assert_eq!(
+            conversation
+                .turns
+                .iter()
+                .find(|turn| turn.id == "cold-turn")
+                .unwrap()
+                .phase,
+            crate::conversation::TurnPhase::Completed
+        );
+        assert!(conversation.items.iter().any(|item| matches!(&item.item, TurnItem::AgentMessage { id, text, .. } if id == "answer" && text == "final live answer")));
+        let mut later = thread("a", "ws");
+        later.updated_at = 4;
+        later.preview = "newer after ACK".into();
+        core.upsert_thread(later);
+        assert_eq!(
+            core.thread_snapshot("a")
+                .unwrap()
+                .coordinator()
+                .thread()
+                .unwrap()
+                .preview,
+            "newer after ACK"
+        );
+    }
+
+    #[test]
+    fn cold_staging_retires_on_error_overflow_or_store_replacement() {
+        for outcome in [
+            "error", "overflow", "count", "replace", "auth", "socket", "closed",
+        ] {
+            let (core, _transport, responses, _requests) = shared_subscription_core();
+            core.remove_thread_store("a");
+            let open = {
+                let core = core.clone();
+                std::thread::spawn(move || core.open_thread_by_id("a"))
+            };
+            let response = responses.recv_timeout(Duration::from_secs(2)).unwrap();
+            let mut live = thread("a", "ws");
+            live.preview = "staged".into();
+            core.upsert_thread(live);
+            match outcome {
+                "error" => {
+                    response
+                        .send(Err(crate::rpc::JsonRpcResponseError::transport(
+                            "transient",
+                        )))
+                        .unwrap();
+                }
+                "overflow" => {
+                    let mut too_large = thread("a", "ws");
+                    too_large.preview = "x".repeat(2 * 1024 * 1024);
+                    core.upsert_thread(too_large);
+                    subscription_reply(&response);
+                }
+                "count" => {
+                    for _ in 0..128 {
+                        core.upsert_thread(thread("a", "ws"));
+                    }
+                    subscription_reply(&response);
+                }
+                "socket" => {
+                    core.transport_runtime()
+                        .ws_command_sender()
+                        .set_http_session_access_for_test(None);
+                    let _ = response.send(Ok(serde_json::json!({})));
+                }
+                "replace" => {
+                    core.remove_thread_store("a");
+                    let mut replacement = thread("a", "ws");
+                    replacement.preview = "replacement".into();
+                    core.upsert_thread(replacement);
+                    let _ = response.send(Ok(serde_json::to_value(ThreadStartResponse {
+                        thread: thread("a", "ws"),
+                        sandbox: SandboxPolicy::from_mode(SandboxMode::FullAccess),
+                    })
+                    .unwrap()));
+                }
+                "auth" => {
+                    core.begin_authorization_epoch(None);
+                    let _ = response.send(Ok(serde_json::json!({})));
+                }
+                "closed" => {
+                    core.apply_thread_notification(GatewayNotification::ThreadClosed(
+                        pioneer_protocol::ThreadClosedNotification {
+                            workspace_id: "ws".into(),
+                            thread_id: "a".into(),
+                        },
+                    ));
+                    subscription_reply(&response);
+                }
+                _ => unreachable!(),
+            }
+            assert!(open.join().unwrap().is_err());
+            if outcome == "replace" {
+                assert_eq!(
+                    core.thread_snapshot("a")
+                        .unwrap()
+                        .coordinator()
+                        .thread()
+                        .unwrap()
+                        .preview,
+                    "replacement"
+                );
+            } else {
+                assert!(core.thread_snapshot("a").is_none());
+            }
+        }
+    }
+
+    #[test]
     fn cold_waiters_validate_their_own_workspace_without_poisoning_receipt() {
         let (core, transport, responses, _requests) = shared_subscription_core();
         core.remove_thread_store("a");
@@ -16653,6 +16896,7 @@ struct ThreadSubscriptionFlight {
     result: Option<Result<(), ThreadSubscriptionFailure>>,
     hydrate: bool,
     hydration_claimed: bool,
+    cold_staging: Option<cold_open::ColdOpenStaging>,
 }
 impl Drop for ThreadSubscriptionFlight {
     fn drop(&mut self) {
@@ -18012,6 +18256,16 @@ impl ClientCore {
             workspace.to_owned()
         };
         if open_existing && !registry.stores.contains_key(id) {
+            anyhow::ensure!(
+                registry
+                    .stores
+                    .values()
+                    .filter(|store| store.coordinator.workspace_id.is_empty()
+                        && store.subscription_request.is_some())
+                    .count()
+                    < cold_open::MAX_COLD_OPEN_FLIGHTS,
+                "Cold thread open capacity exhausted"
+            );
             registry.clock = registry.clock.saturating_add(1);
             let mut store = ThreadDomainStore::new(id, "");
             store.generation = registry.clock;
@@ -18097,7 +18351,7 @@ impl ClientCore {
         let request = ThreadSubscriptionRequest {
             open_existing,
             id: id.into(),
-            workspace: workspace.into(),
+            workspace: workspace.clone(),
             generation: store.generation,
             transport_revision: scope.transport_revision,
             auth,
@@ -18114,6 +18368,7 @@ impl ClientCore {
                 result: ready.then_some(Ok(())),
                 hydrate,
                 hydration_claimed: false,
+                cold_staging: (open_existing && workspace.is_empty()).then(Default::default),
             })),
             attempt: 0,
         };
@@ -18498,7 +18753,48 @@ impl ClientCore {
             let mut flight = request.flight.lock().expect("subscription flight poisoned");
             anyhow::ensure!(flight.result.is_none(), "Thread subscription retired");
             let workspace = response.thread.workspace_id.clone();
+            let staged = flight.cold_staging.take();
+            anyhow::ensure!(
+                staged.as_ref().is_none_or(|staged| !staged.overflow),
+                "Cold thread open ingress capacity exhausted"
+            );
+            if let Some(staged) = &staged {
+                anyhow::ensure!(
+                    !staged.contains_closed(&request.id, &workspace),
+                    "Thread closed during open"
+                );
+            }
             store.reconcile_subscription_snapshot(flight.baseline.take().as_ref(), response.thread);
+            // The snapshot and all captured LIVE state share this one registry
+            // commit. No independently locking ClientCore helper runs here.
+            drop(flight);
+            let mut pending_reductions = vec![];
+            let mut staged_drafts = vec![];
+            if let Some(staged) = staged {
+                for event in staged.events {
+                    let effects = self.apply_cold_ingress_locked(
+                        &mut registry,
+                        &request.id,
+                        &workspace,
+                        event,
+                    );
+                    pending_reductions.extend(effects.pending);
+                    staged_drafts.extend(effects.drafts);
+                }
+                request
+                    .flight
+                    .lock()
+                    .expect("subscription flight poisoned")
+                    .hydrate = true;
+            }
+            staged_drafts.extend(
+                self.apply_pending_requests_batch_locked(&mut registry, pending_reductions)
+                    .1,
+            );
+            let store = registry
+                .stores
+                .get_mut(&request.id)
+                .expect("exact open store");
             store.subscription_receipt = request.scope().map(|mut scope| {
                 scope.workspace = workspace;
                 ThreadSubscriptionReceipt {
@@ -18506,9 +18802,20 @@ impl ClientCore {
                     live: request.live.clone(),
                 }
             });
+            drop(_transport_guard);
+            self.transition_directory(
+                &mut registry,
+                &ClientMutationAuthority { _private: () },
+                staged_drafts,
+                vec![],
+            );
             Ok(())
         });
+        let applied = result.is_ok();
         self.finish_thread_subscription_request(request, result);
+        if applied {
+            self.refresh_approval_actions();
+        }
     }
 
     fn finish_thread_subscription_request(
@@ -18540,6 +18847,9 @@ impl ClientCore {
             }
             // Promotion marks queued under this same lock, before installing a
             // response. Claim capacity failure here or leave that active flight alone.
+            if result.is_err() {
+                flight.cold_staging = None;
+            }
             flight.result = Some(
                 result
                     .as_ref()
@@ -18598,6 +18908,7 @@ impl ClientCore {
                     result: None,
                     hydrate,
                     hydration_claimed: false,
+                    cold_staging: None,
                 }));
                 store.subscription_retry_at = Some(
                     std::time::Instant::now()
