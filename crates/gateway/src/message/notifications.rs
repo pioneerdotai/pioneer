@@ -726,6 +726,9 @@ impl MessageProcessor {
                     error.code(),
                     crate::auth::AuthErrorCode::TemporarilyUnavailable
                         | crate::auth::AuthErrorCode::AuthNotReady
+                        // Lease validation also maps a failed clock read to
+                        // InvalidCredential: it is not proof of safe delivery.
+                        | crate::auth::AuthErrorCode::InvalidCredential
                 ) {
                     record_authorization_unavailable(
                         action.safe_name(),
