@@ -1507,6 +1507,15 @@ impl ClientCore {
             .thread_registry
             .lock()
             .expect("thread registry poisoned");
+        // A concurrent cold Closed already owns this state retirement. Do not
+        // remove its private barrier while its captured cleanup is still running.
+        if registry
+            .stores
+            .get(id)
+            .is_some_and(|store| store.retirement.is_some())
+        {
+            return;
+        }
         let drafts = self.retire_thread_state_locked(&mut registry, id, remove_navigation);
         self.transition_directory(
             &mut registry,
@@ -2938,6 +2947,7 @@ mod tests {
         pub(super) static COLD_CAPTURE_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = Default::default();
         pub(super) static COLD_RETIREMENT_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = Default::default();
         pub(super) static SUBSCRIPTION_FINISH_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = Default::default();
+        pub(super) static SUBSCRIPTION_ADMISSION_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = Default::default();
         pub(super) static SUBSCRIPTION_PROMOTION_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = Default::default();
     }
 
@@ -14492,6 +14502,163 @@ mod tests {
     }
 
     #[test]
+    fn retirement_between_helping_and_admission_refuses_rpc_and_cannot_confirm_private_slot() {
+        let (core, transport, responses, _requests) = shared_subscription_core();
+        core.remove_thread_store("a");
+        let opening = {
+            let core = core.clone();
+            std::thread::spawn(move || core.open_thread_by_id("a"))
+        };
+        let ack = responses.recv_timeout(Duration::from_secs(2)).unwrap();
+        let (captured, capture) = std::sync::mpsc::channel();
+        let (release_capture, captured_release) = std::sync::mpsc::channel();
+        let (retired, retirement) = std::sync::mpsc::channel();
+        let (release_cleanup, cleanup_release) = std::sync::mpsc::channel();
+        let closing = {
+            let core = core.clone();
+            std::thread::spawn(move || {
+                COLD_CAPTURE_HOOK.with(|slot| {
+                    *slot.borrow_mut() = Some(Box::new(move || {
+                        captured.send(()).unwrap();
+                        captured_release
+                            .recv_timeout(Duration::from_secs(2))
+                            .unwrap();
+                    }))
+                });
+                COLD_RETIREMENT_HOOK.with(|slot| {
+                    *slot.borrow_mut() = Some(Box::new(move || {
+                        retired.send(()).unwrap();
+                        cleanup_release
+                            .recv_timeout(Duration::from_secs(2))
+                            .unwrap();
+                    }))
+                });
+                core.apply_thread_notification(GatewayNotification::ThreadClosed(
+                    pioneer_protocol::ThreadClosedNotification {
+                        thread_id: "a".into(),
+                        workspace_id: "ws".into(),
+                    },
+                ));
+            })
+        };
+        capture.recv_timeout(Duration::from_secs(2)).unwrap();
+        subscription_reply(&ack);
+        opening.join().unwrap().unwrap();
+        core.upsert_thread(thread("x", "ws"));
+        core.activate_thread(Some("x"), Some("ws"));
+        let (revision, intent) = {
+            let registry = core.thread_registry.lock().unwrap();
+            (
+                registry.navigation_revision,
+                registry.open_intent.as_ref().unwrap().1,
+            )
+        };
+        let (mut probe, ready) = core
+            .admit_thread_subscription("a", "ws", None, false, Some((revision, intent)))
+            .unwrap();
+        assert!(ready);
+        let (helped, after_help) = std::sync::mpsc::channel();
+        let (release_admission, admission_release) = std::sync::mpsc::channel();
+        let racing = {
+            let core = core.clone();
+            std::thread::spawn(move || {
+                SUBSCRIPTION_ADMISSION_HOOK.with(|slot| {
+                    *slot.borrow_mut() = Some(Box::new(move || {
+                        helped.send(()).unwrap();
+                        admission_release
+                            .recv_timeout(Duration::from_secs(2))
+                            .unwrap();
+                    }))
+                });
+                core.open_thread_by_id("a")
+            })
+        };
+        after_help.recv_timeout(Duration::from_secs(2)).unwrap();
+        release_capture.send(()).unwrap();
+        retirement.recv_timeout(Duration::from_secs(2)).unwrap();
+        // Closing an inactive target must not accidentally hide the race behind
+        // navigation_revision invalidation.
+        assert_eq!(
+            core.thread_registry.lock().unwrap().navigation_revision,
+            revision
+        );
+        assert_eq!(core.active_thread_id().as_deref(), Some("x"));
+        release_admission.send(()).unwrap();
+        assert_eq!(
+            racing.join().unwrap().unwrap_err().to_string(),
+            "Thread retirement in progress"
+        );
+        assert!(responses.try_recv().is_err());
+        assert_eq!(transport.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        {
+            let mut registry = core.thread_registry.lock().unwrap();
+            let slot = registry.stores.get_mut("a").unwrap();
+            assert!(slot.retirement.is_some());
+            assert!(slot.subscription_request.is_none());
+            assert!(slot.subscription_receipt.is_none());
+            // Defense-in-depth: even a captured descriptor with matching exact
+            // request/generation and live socket cannot authorize a private slot.
+            probe.generation = slot.generation;
+            probe.live = Arc::new(std::sync::Mutex::new(true));
+            probe.transport = probe.transport.with_subscription_scope(probe.live.clone());
+            slot.subscription_request = Some(probe.clone());
+        }
+        assert!(!core.subscription_scope_current(&probe));
+        assert!(!core.thread_subscription_request_current(&probe));
+        core.execute_thread_subscription_request(probe.clone());
+        assert!(responses.try_recv().is_err());
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(Ok(serde_json::to_value(ThreadStartResponse {
+            thread: thread("a", "ws"),
+            sandbox: SandboxPolicy::from_mode(SandboxMode::FullAccess),
+        })
+        .unwrap()))
+            .unwrap();
+        {
+            let mut flight = probe.flight.lock().unwrap();
+            flight.result = None;
+            flight.receiver = Some(rx);
+        }
+        core.complete_ready_thread_subscription(&probe);
+        assert!(
+            probe
+                .flight
+                .lock()
+                .unwrap()
+                .result
+                .as_ref()
+                .unwrap()
+                .is_err()
+        );
+        assert!(core.thread_snapshot("a").is_none());
+        assert!(
+            core.thread_registry.lock().unwrap().stores["a"]
+                .subscription_receipt
+                .is_none()
+        );
+        release_cleanup.send(()).unwrap();
+        closing.join().unwrap();
+        let replacement = {
+            let core = core.clone();
+            std::thread::spawn(move || core.open_thread_by_id("a"))
+        };
+        let ack = responses.recv_timeout(Duration::from_secs(2)).unwrap();
+        subscription_reply(&ack);
+        replacement.join().unwrap().unwrap();
+        let receipt = core
+            .ensure_thread_subscription(
+                "a",
+                "ws",
+                &crate::rpc::RequestBudget::new(Instant::now() + Duration::from_secs(2)),
+            )
+            .unwrap();
+        assert!(receipt.is_current());
+        assert!(core.thread_snapshot("a").is_some());
+        assert_eq!(core.active_thread_id().as_deref(), Some("a"));
+        assert_eq!(transport.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[test]
     fn cold_open_capacity_rejects_before_rpc_and_is_released_on_error() {
         let (core, transport, responses, _requests) = shared_subscription_core();
         core.remove_thread_store("a");
@@ -18309,7 +18476,7 @@ impl ClientCore {
         let store = registry
             .stores
             .get(id)
-            .filter(|store| store.generation == request.generation)
+            .filter(|store| store.retirement.is_none() && store.generation == request.generation)
             .ok_or_else(|| anyhow::anyhow!("thread_open_stale"))?;
         let workspace = store.coordinator.workspace_id.clone();
         registry
@@ -18453,6 +18620,12 @@ impl ClientCore {
             self.finish_pending_thread_retirement(id),
             "Thread retirement in progress"
         );
+        #[cfg(test)]
+        tests::SUBSCRIPTION_ADMISSION_HOOK.with(|slot| {
+            if let Some(hook) = slot.borrow_mut().take() {
+                hook();
+            }
+        });
         let open_existing = expected_navigation_revision.is_some();
         anyhow::ensure!(
             open_existing || !workspace.trim().is_empty(),
@@ -18496,6 +18669,16 @@ impl ClientCore {
                         .is_some_and(|(_, generation)| *generation == intent)),
             "Thread subscription cancelled"
         );
+        // Helping above is not an admission fence: Closed may have installed a
+        // private slot while auth/transport was captured. Refuse before creating
+        // or joining any flight; the next caller can help outside core locks.
+        anyhow::ensure!(
+            registry
+                .stores
+                .get(id)
+                .is_none_or(|store| store.retirement.is_none()),
+            "Thread retirement in progress"
+        );
         // An ID-only open reserves the existing store/flight owner before IO.
         // A cold reservation has no domain snapshot or authoritative workspace.
         let workspace = if open_existing {
@@ -18534,8 +18717,9 @@ impl ClientCore {
             registry.stores.insert(id.to_owned(), store);
         }
         let pending_open = registry.stores.get(id).is_some_and(|store| {
-            (store.coordinator.workspace_id.is_empty()
-                || store.coordinator.workspace_id == workspace)
+            store.retirement.is_none()
+                && (store.coordinator.workspace_id.is_empty()
+                    || store.coordinator.workspace_id == workspace)
                 && store
                     .subscription_request
                     .as_ref()
@@ -18685,7 +18869,8 @@ impl ClientCore {
         anyhow::ensure!(
             !expected.trim().is_empty()
                 && registry.stores.get(&request.id).is_some_and(|store| {
-                    store.generation == request.generation
+                    store.retirement.is_none()
+                        && store.generation == request.generation
                         && store.coordinator.workspace_id == expected
                 }),
             "Thread subscription workspace mismatch"
@@ -18782,7 +18967,8 @@ impl ClientCore {
                     .expect("thread registry poisoned");
                 registry.start.pending_thread_id.as_ref() != Some(&request.id)
                     && registry.stores.get(&request.id).is_some_and(|store| {
-                        store.generation == request.generation
+                        store.retirement.is_none()
+                            && store.generation == request.generation
                             && (request.open_existing
                                 || store.coordinator.workspace_id == request.workspace)
                     })
@@ -18797,7 +18983,10 @@ impl ClientCore {
                 .expect("thread registry poisoned")
                 .stores
                 .get(&request.id)
-                .is_some_and(|store| store.subscription_request.as_ref() == Some(request))
+                .is_some_and(|store| {
+                    store.retirement.is_none()
+                        && store.subscription_request.as_ref() == Some(request)
+                })
     }
 
     pub(crate) fn execute_thread_subscription_request(&self, request: ThreadSubscriptionRequest) {
@@ -18832,7 +19021,8 @@ impl ClientCore {
                 .stores
                 .get_mut(&request.id)
                 .filter(|store| {
-                    store.generation == request.generation
+                    store.retirement.is_none()
+                        && store.generation == request.generation
                         && store.subscription_request.as_ref() == Some(request)
                 })
                 .map(|store| {
@@ -18999,7 +19189,8 @@ impl ClientCore {
                 .stores
                 .get_mut(&request.id)
                 .filter(|store| {
-                    store.generation == request.generation
+                    store.retirement.is_none()
+                        && store.generation == request.generation
                         && store.subscription_request.as_ref() == Some(request)
                 })
                 .ok_or_else(|| anyhow::anyhow!("Thread subscription retired"))?;
@@ -19141,7 +19332,8 @@ impl ClientCore {
         // Rollback belongs to this exact request, not just the store generation.
         let mut rollback_reservation = false;
         if let Some(store) = registry.stores.get_mut(&request.id).filter(|store| {
-            store.generation == request.generation
+            store.retirement.is_none()
+                && store.generation == request.generation
                 && store.subscription_request.as_ref() == Some(request)
         }) {
             rollback_reservation = result.is_err()

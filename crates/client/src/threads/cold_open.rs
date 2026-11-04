@@ -122,7 +122,8 @@ impl ClientCore {
             return Some(true);
         }
         let Some(store) = registry.stores.get(id).filter(|store| {
-            store.generation == request.generation
+            store.retirement.is_none()
+                && store.generation == request.generation
                 && (store.subscription_request.as_ref() == Some(&request)
                     || store
                         .subscription_receipt
