@@ -14225,7 +14225,17 @@ mod tests {
         let mut live = stale.clone();
         live.preview = "new live metadata".into();
         live.updated_at = 3;
-        core.upsert_thread(live);
+        let placement = pioneer_protocol::ThreadPlacement {
+            thread_id: "a".into(),
+            workspace_id: "ws".into(),
+            folder_id: Some("live-folder".into()),
+        };
+        core.apply_thread_notification(GatewayNotification::ThreadUpdated(
+            pioneer_protocol::ThreadUpdatedNotification {
+                thread: live,
+                placement: Some(placement.clone()),
+            },
+        ));
         core.apply_thread_notification(GatewayNotification::TurnStarted(TurnStartedNotification {
             workspace_id: "ws".into(),
             thread_id: "a".into(),
@@ -14278,6 +14288,15 @@ mod tests {
         let snapshot = core.thread_snapshot("a").unwrap();
         let coordinator = snapshot.coordinator();
         assert_eq!(coordinator.thread().unwrap().preview, "newer after ACK");
+        assert_eq!(
+            core.thread_registry
+                .lock()
+                .unwrap()
+                .directory
+                .placements
+                .get("a"),
+            Some(&placement)
+        );
         let conversation = coordinator.conversation.projection();
         assert_eq!(
             conversation

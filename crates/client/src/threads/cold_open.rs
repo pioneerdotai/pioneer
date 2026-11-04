@@ -234,7 +234,13 @@ impl ClientCore {
                     .placement
                     .filter(|p| p.thread_id == id && p.workspace_id == workspace)
                 {
-                    registry.directory.upsert_placement(placement);
+                    if registry.directory.placements.get(id) != Some(&placement) {
+                        registry.directory.upsert_placement(placement);
+                        registry
+                            .directory
+                            .dirty_workspaces
+                            .insert(workspace.to_owned());
+                    }
                 }
             }
             Some(ThreadClosed(r)) => {
