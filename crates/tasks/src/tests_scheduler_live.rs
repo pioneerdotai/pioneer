@@ -1671,6 +1671,44 @@ async fn waiting_review_with_current_execution_lease_does_not_recover_or_wake() 
                 .is_err()
         );
     }
+    // A normal heartbeat may shorten the wall-clock lease. It must wake the
+    // parked owner and replace its cached lease without waiting for that lease.
+    let db = store.database_connection();
+    let mut wake = db.work_signal("tasks.lifecycle").subscribe();
+    wake.begin_pass(&db).await.unwrap();
+    store
+        .heartbeat_execution(&lease.id, now + 12, Some(now + 20))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(futures_util::FutureExt::now_or_never(wake.wait(None)).is_some());
+    reconciler.reconcile(now + 13).await.unwrap();
+    assert_eq!(
+        reconciler.next_wake_deadline(now + 13).await.unwrap(),
+        Some(now + 20)
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    wake.begin_pass(&db).await.unwrap();
+    store
+        .heartbeat_execution(&lease.id, now + 14, Some(now + 21))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        futures_util::FutureExt::now_or_never(wake.wait(None)).is_none(),
+        "ordinary extension stays quiet"
+    );
+    store
+        .heartbeat_execution(&lease.id, now + 14, Some(now + 20))
+        .await
+        .unwrap()
+        .unwrap();
+    reconciler.reconcile(now + 20).await.unwrap();
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "durable earlier lease releases recovery"
+    );
 }
 
 #[tokio::test]
@@ -1788,6 +1826,10 @@ async fn waiting_review_recovery_error_retries_without_another_recovery_event() 
         reconciler.next_wake_deadline(now).await.unwrap(),
         Some(now + 5)
     );
+    store
+        .database_connection()
+        .work_signal("tasks.lifecycle")
+        .notify();
     reconciler.reconcile(now + 1).await.unwrap();
     assert_eq!(
         calls.load(Ordering::SeqCst),

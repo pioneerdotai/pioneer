@@ -333,6 +333,10 @@ async fn publish(
             .changing(),
         store.connection.work_signal("maintenance.html").changing(),
     ];
+    let frozen_change = store
+        .connection
+        .work_signal("maintenance.frozen")
+        .changing();
     let mut published = false;
     let result = async {
         let prefix = l.copy_to.unwrap_or(prefix);
@@ -498,6 +502,8 @@ async fn publish(
     }
     .await;
     if result.is_ok() {
+        // Only activation without remaining cleanup releases lifetime protection.
+        frozen_change.completed(published && (h.ready == 0 || l.copy_to.unwrap_or(prefix) == 0));
         for change in changes {
             change.completed(published);
         }
@@ -949,6 +955,10 @@ async fn maintain_layout(
         }
         let statements =
             super::frozen_storage_lifetime::duplicate_cleanup_statements(&h, l, &keys)?;
+        let frozen_change = store
+            .connection
+            .work_signal("maintenance.frozen")
+            .changing();
         let tx = store.connection.begin().await?;
         let current = layout::Entity::find_by_id((h.id.clone(), l.kind))
             .one(&tx)
@@ -956,6 +966,7 @@ async fn maintain_layout(
             .ok_or_else(|| anyhow::anyhow!("cleanup layout removed"))?;
         if current.cleanup_next != l.cleanup_next {
             tx.commit().await?;
+            frozen_change.completed(false);
             return Ok(None);
         }
         // The generic lifetime sweep separately validates all reverse layouts
@@ -978,7 +989,7 @@ async fn maintain_layout(
                 super::frozen_storage_lifetime::PhysicalDeleteResult::refused()
             });
         }
-        layout::Entity::update_many()
+        let changed = layout::Entity::update_many()
             .col_expr(layout::Column::CleanupNext, Expr::val(end))
             .col_expr(
                 layout::Column::Pending,
@@ -989,6 +1000,8 @@ async fn maintain_layout(
             .exec(&tx)
             .await?;
         tx.commit().await?;
+        frozen_change
+            .completed(changed.rows_affected > 0 && current.pending != 0 && end >= l.cleanup_to);
         return Ok(deleted);
     }
     Ok(None)

@@ -562,6 +562,89 @@ mod tests {
         }
     }
     #[tokio::test]
+    async fn conversion_release_reopens_lifetime_after_eof() {
+        use pioneer_entity::compaction_frozen_history as history;
+        use sea_orm::EntityTrait;
+        let (_directory, store, _) = fixture_with_metadata(0).await;
+        let db = store.database_connection();
+        // Remove the fixture's logical owner before either finite traversal.
+        db.execute_unprepared("DELETE FROM thread_cli_runtime_binding")
+            .await
+            .unwrap();
+        let mut progress = FrozenStorageLifetimeProgress::default();
+        // Establish conversion scope/layouts but stop before activation.
+        for _ in 0..64 {
+            store
+                .compact_frozen_storage_quantum(&mut progress)
+                .await
+                .unwrap();
+            let row = db.query_one_raw(Statement::from_string(DbBackend::Sqlite,
+                "SELECT count(*) AS n FROM compaction_frozen_layout WHERE manifest_id='live' AND pending=1".to_owned())).await.unwrap().unwrap();
+            if row.try_get::<i64>("", "n").unwrap() > 0 {
+                break;
+            }
+        }
+        let mut eof = false;
+        for _ in 0..512 {
+            if !progress.quantum(&store).await.unwrap() {
+                eof = true;
+                break;
+            }
+        }
+        assert!(eof);
+        assert_eq!(
+            history::Entity::find_by_id("live")
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap()
+                .expired,
+            0
+        );
+        let mut wake = db.work_signal("maintenance.frozen").subscribe();
+        wake.begin_pass(&db).await.unwrap();
+        for _ in 0..128 {
+            if !store
+                .compact_frozen_storage_quantum(&mut progress)
+                .await
+                .unwrap()
+            {
+                break;
+            }
+        }
+        assert!(futures_util::FutureExt::now_or_never(wake.wait(None)).is_some());
+        wake.begin_pass(&db).await.unwrap();
+        assert!(
+            !store
+                .compact_frozen_storage_quantum(&mut progress)
+                .await
+                .unwrap()
+        );
+        assert!(
+            futures_util::FutureExt::now_or_never(wake.wait(None)).is_none(),
+            "completed conversion must stay quiet"
+        );
+        // Same owner follows the production invalidation boundary. No producer,
+        // timer, hold release or restart is needed to make expiry eligible.
+        wake.begin_pass(&db).await.unwrap();
+        progress = FrozenStorageLifetimeProgress::default();
+        for _ in 0..512 {
+            if !progress.quantum(&store).await.unwrap() {
+                break;
+            }
+        }
+        assert_eq!(
+            history::Entity::find_by_id("live")
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap()
+                .expired,
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn conversion_eof_survives_batches_and_invalidation_discovers_new_work() {
         use pioneer_entity::{
             compaction_frozen_history as history, compaction_frozen_layout as layout,

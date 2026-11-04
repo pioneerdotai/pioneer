@@ -63,6 +63,8 @@ struct SchedulerRecovery {
     run_cursors: [Option<String>; 4],
     run_uppers: [Option<String>; 4],
     retry_at: HashMap<String, i64>,
+    // Lease waits are refreshed on source wakes; failures retain their own backoff.
+    lease_at: HashMap<String, i64>,
     trigger_retry: HashMap<String, i64>,
 }
 
@@ -99,6 +101,7 @@ impl TaskStartupReconciler {
                 run_cursors: Default::default(),
                 run_uppers: Default::default(),
                 retry_at: HashMap::new(),
+                lease_at: HashMap::new(),
                 trigger_retry: Default::default(),
             }),
         }
@@ -125,6 +128,13 @@ impl TaskStartupReconciler {
         let retry = recovery
             .retry_at
             .values()
+            .chain(
+                recovery
+                    .lease_at
+                    .iter()
+                    .filter(|(id, _)| !recovery.retry_at.contains_key(*id))
+                    .map(|(_, at)| at),
+            )
             .chain(recovery.trigger_retry.values())
             .copied()
             .min();
@@ -333,19 +343,28 @@ impl TaskStartupReconciler {
                     candidates.insert(run.id.clone(), run);
                 } else {
                     recovery.retry_at.remove(&run_id);
+                    recovery.lease_at.remove(&run_id);
                 }
             } else {
                 recovery.retry_at.remove(&run_id);
+                recovery.lease_at.remove(&run_id);
             }
         }
         let mut local = recovery
             .retry_at
             .iter()
+            .chain(
+                recovery
+                    .lease_at
+                    .iter()
+                    .filter(|(id, _)| !recovery.retry_at.contains_key(*id)),
+            )
             .filter(|(_, retry_at)| **retry_at <= now)
             .map(|(id, retry_at)| (*retry_at, id.clone()))
             .collect::<Vec<_>>();
         local.sort();
         for (_, run_id) in local.into_iter().take(1024) {
+            recovery.lease_at.remove(&run_id);
             let page = match self.store.task_scheduler_run_partial(&run_id).await {
                 Ok(page) => page,
                 Err(error) => {
@@ -372,9 +391,11 @@ impl TaskStartupReconciler {
                     candidates.insert(run.id.clone(), run);
                 } else {
                     recovery.retry_at.remove(&run_id);
+                    recovery.lease_at.remove(&run_id);
                 }
             } else {
                 recovery.retry_at.remove(&run_id);
+                recovery.lease_at.remove(&run_id);
             }
         }
         // Discovery is complete independently of row recovery and occurrence
@@ -477,6 +498,7 @@ impl TaskStartupReconciler {
             recovery
                 .retry_at
                 .insert(run.id.clone(), now.saturating_add(5));
+            recovery.lease_at.remove(&run.id);
             // A live execution has a concrete lease, not a five-second
             // discovery obligation. Heartbeat extension is reloaded at expiry.
             if matches!(
@@ -491,7 +513,8 @@ impl TaskStartupReconciler {
                     .and_then(|execution| execution.lease_until)
                     .filter(|until| *until > now)
                 {
-                    recovery.retry_at.insert(run.id.clone(), until);
+                    recovery.retry_at.remove(&run.id);
+                    recovery.lease_at.insert(run.id.clone(), until);
                     continue;
                 }
             }
@@ -506,7 +529,8 @@ impl TaskStartupReconciler {
                             .and_then(|execution| execution.lease_until)
                             .filter(|until| *until > now)
                         {
-                            recovery.retry_at.insert(run.id.clone(), until);
+                            recovery.retry_at.remove(&run.id);
+                            recovery.lease_at.insert(run.id.clone(), until);
                         } else {
                             recovery.retry_at.remove(&run.id);
                         }

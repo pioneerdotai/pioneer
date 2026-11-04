@@ -19172,45 +19172,62 @@ impl CrudStore {
         heartbeat_at: i64,
         lease_until: Option<i64>,
     ) -> Result<Option<TaskRunExecution>> {
-        self.run_serialized_write(|| async {
-            let transaction = self
-                .connection
-                .begin()
-                .await
-                .context("failed to begin execution heartbeat transition")?;
-            if let Some(expected_attempt_generation) = expected_attempt_generation {
-                let current = crate::repositories::agent_domain::heartbeat_agent_execution(
+        let change = self.connection.work_signal("tasks.lifecycle").changing();
+        let result = self
+            .run_serialized_write(|| async {
+                let transaction = self
+                    .connection
+                    .begin()
+                    .await
+                    .context("failed to begin execution heartbeat transition")?;
+                if let Some(expected_attempt_generation) = expected_attempt_generation {
+                    let current = crate::repositories::agent_domain::heartbeat_agent_execution(
+                        &transaction,
+                        execution_id,
+                        expected_attempt_generation,
+                        unix_to_datetime(heartbeat_at),
+                        lease_until.map(unix_to_datetime),
+                    )
+                    .await?;
+                    if !current {
+                        transaction
+                            .rollback()
+                            .await
+                            .context("failed to roll back stale agent heartbeat")?;
+                        return Ok((None, false));
+                    }
+                }
+                // Compare under the same writer transaction as the heartbeat CAS.
+                let before =
+                    task_run_execution::find_execution_by_id(&transaction, execution_id).await?;
+                let task_execution = task_run_execution::heartbeat_execution(
                     &transaction,
                     execution_id,
-                    expected_attempt_generation,
                     unix_to_datetime(heartbeat_at),
                     lease_until.map(unix_to_datetime),
                 )
                 .await?;
-                if !current {
-                    transaction
-                        .rollback()
-                        .await
-                        .context("failed to roll back stale agent heartbeat")?;
-                    return Ok(None);
-                }
-            }
-            let task_execution = task_run_execution::heartbeat_execution(
-                &transaction,
-                execution_id,
-                unix_to_datetime(heartbeat_at),
-                lease_until.map(unix_to_datetime),
-            )
-            .await?;
-            transaction
-                .commit()
-                .await
-                .context("failed to commit execution heartbeat transition")?;
-            task_execution
-                .map(task_run_execution_from_db_model)
-                .transpose()
-        })
-        .await
+                transaction
+                    .commit()
+                    .await
+                    .context("failed to commit execution heartbeat transition")?;
+                let earlier = before
+                    .as_ref()
+                    .and_then(|row| row.lease_until)
+                    .zip(task_execution.as_ref().and_then(|row| row.lease_until))
+                    .is_some_and(|(old, new)| new < old);
+                Ok((
+                    task_execution
+                        .map(task_run_execution_from_db_model)
+                        .transpose()?,
+                    earlier,
+                ))
+            })
+            .await;
+        if let Ok((_, earlier)) = &result {
+            change.completed(*earlier);
+        }
+        result.map(|(execution, _)| execution)
     }
 
     pub async fn record_agent_execution_progress(
