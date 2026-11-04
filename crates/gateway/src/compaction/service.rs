@@ -466,7 +466,10 @@ pub(crate) fn finish_cli_summary(
     raw: &serde_json::Value,
 ) -> SummaryCompletion {
     apply_cli_usage(observed, raw);
-    if observed.provider.as_deref() != Some("opencode-cli") {
+    if !matches!(
+        observed.provider.as_deref(),
+        Some("opencode-cli" | "claude-cli")
+    ) {
         observed.input_tokens = input_tokens;
         observed.output_tokens = output_tokens;
     }
@@ -482,6 +485,14 @@ pub(crate) fn apply_cli_usage(
     observed: &mut pioneer_provider::TokenUsage,
     raw: &serde_json::Value,
 ) {
+    // An error/final envelope may be partial. Enrich the previous observation;
+    // missing counters must not erase usage already reported by this attempt.
+    let previous = observed;
+    let mut snapshot = pioneer_provider::TokenUsage {
+        provider: previous.provider.clone(),
+        ..Default::default()
+    };
+    let observed = &mut snapshot;
     let opencode = observed.provider.as_deref() == Some("opencode-cli");
     observed.uncached_input_tokens = if opencode {
         raw["uncached_input_tokens"].as_u64()
@@ -491,7 +502,9 @@ pub(crate) fn apply_cli_usage(
     observed.cache_read_input_tokens = raw["cache_read_input_tokens"]
         .as_u64()
         .or_else(|| raw["cached_input_tokens"].as_u64());
-    observed.cache_write_input_tokens = raw["cache_creation_input_tokens"].as_u64();
+    observed.cache_write_input_tokens = raw["cache_creation_input_tokens"]
+        .as_u64()
+        .or_else(|| raw["cache_write_input_tokens"].as_u64());
     let claude = observed.provider.as_deref() == Some("claude-cli");
     observed.input_tokens = if claude {
         observed.uncached_input_tokens.and_then(|input| {
@@ -524,7 +537,7 @@ pub(crate) fn apply_cli_usage(
         .into(),
     );
     observed.accounting = Some(
-        serde_json::json!({"reported_cost":null,"sdk_estimated_cost":raw["total_cost_usd"].as_f64().filter(|_|claude).map(|amount|serde_json::json!({"amount":amount,"currency":"USD","provenance":"cli_sdk_price_table_estimate","source":"https://code.claude.com/docs/en/agent-sdk/cost-tracking","scope":"isolated_cli_summary_result","sdk_version":null})),"estimated_cost":null,"price_status":"external_cli_route_not_attested"}),
+        serde_json::json!({"reported_cost":null,"sdk_estimated_cost":raw["total_cost_usd"].as_f64().filter(|amount|claude && amount.is_finite() && *amount >= 0.).map(|amount|serde_json::json!({"amount":amount,"currency":"USD","provenance":"cli_sdk_price_table_estimate","source":"https://code.claude.com/docs/en/agent-sdk/cost-tracking","scope":"isolated_cli_summary_result","sdk_version":null})),"estimated_cost":null,"price_status":"external_cli_route_not_attested"}),
     );
     if observed.provider.as_deref() == Some("codex-cli") {
         let accounting = observed.accounting.as_mut().unwrap();
@@ -541,11 +554,100 @@ pub(crate) fn apply_cli_usage(
                 _ => serde_json::Value::Null,
             };
     }
-    observed.raw_usage = Some(raw.clone());
+    let mut bounded = pioneer_provider::usage::bounded_usage(raw);
+    bounded["cli_statistics"] = pioneer_provider::usage::bounded_cli_statistics(raw);
+    observed.raw_usage = Some(bounded);
+    if let (Some(accounting), Some(prior)) =
+        (observed.accounting.as_mut(), previous.accounting.as_ref())
+    {
+        for key in [
+            "sdk_estimated_cost",
+            "reasoning_source",
+            "reasoning_alias_conflict",
+        ] {
+            if accounting[key].is_null() && !prior[key].is_null() {
+                accounting[key] = prior[key].clone();
+            }
+        }
+    }
+    previous.update(&snapshot);
+    // TokenUsage.update recomputes exclusive-cache input from the merged
+    // native categories (including zero and checked overflow).
 }
 
 #[cfg(all(test, unix))]
 mod tests {
+    #[test]
+    fn cli_service_usage_preserves_partial_counters_and_cost_provenance() {
+        let mut codex = pioneer_provider::TokenUsage {
+            provider: Some("codex-cli".into()),
+            ..Default::default()
+        };
+        super::apply_cli_usage(
+            &mut codex,
+            &serde_json::json!({"input_tokens":100,"cached_input_tokens":80,"cache_write_input_tokens":4,"output_tokens":10,"reasoning_output_tokens":3}),
+        );
+        super::apply_cli_usage(&mut codex, &serde_json::json!({"output_tokens":12}));
+        assert_eq!(codex.input_tokens, Some(100));
+        assert_eq!(codex.cache_write_input_tokens, Some(4));
+        assert_eq!(codex.output_tokens, Some(12));
+        assert_eq!(codex.reasoning_tokens, Some(3));
+        let mut claude = pioneer_provider::TokenUsage {
+            provider: Some("claude-cli".into()),
+            ..Default::default()
+        };
+        super::apply_cli_usage(
+            &mut claude,
+            &serde_json::json!({"input_tokens":1,"cache_read_input_tokens":2,"cache_creation_input_tokens":3,"output_tokens":0,"total_cost_usd":0.1}),
+        );
+        super::apply_cli_usage(&mut claude, &serde_json::json!({"duration_ms":20}));
+        assert_eq!(claude.input_tokens, Some(6));
+        assert_eq!(claude.output_tokens, Some(0));
+        super::apply_cli_usage(
+            &mut claude,
+            &serde_json::json!({"cache_read_input_tokens":4}),
+        );
+        assert_eq!(claude.input_tokens, Some(8));
+        let completion = super::finish_cli_summary(
+            &mut claude,
+            "summary".into(),
+            None,
+            None,
+            &serde_json::json!({"duration_ms":21}),
+        );
+        assert_eq!(completion.input_tokens, Some(8));
+        assert_eq!(completion.output_tokens, Some(0));
+        // A new isolated call cannot borrow missing categories from another call.
+        let mut partial = pioneer_provider::TokenUsage {
+            provider: Some("claude-cli".into()),
+            ..Default::default()
+        };
+        for (fragment, expected) in [
+            (serde_json::json!({"input_tokens":1}), None),
+            (serde_json::json!({"cache_read_input_tokens":0}), None),
+            (
+                serde_json::json!({"cache_creation_input_tokens":3}),
+                Some(4),
+            ),
+            (serde_json::json!({"cache_read_input_tokens":4}), Some(8)),
+            (serde_json::json!({"input_tokens":u64::MAX}), None),
+            (
+                serde_json::json!({"input_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}),
+                Some(0),
+            ),
+        ] {
+            super::apply_cli_usage(&mut partial, &fragment);
+            assert_eq!(partial.input_tokens, expected);
+        }
+        let accounting = claude.accounting.unwrap();
+        assert_eq!(accounting["sdk_estimated_cost"]["amount"], 0.1);
+        assert_eq!(
+            accounting["sdk_estimated_cost"]["provenance"],
+            "cli_sdk_price_table_estimate"
+        );
+        assert!(accounting["reported_cost"].is_null());
+    }
+
     #[test]
     fn nonzero_terminal_usage_preserves_gateway_failure_contract() {
         use pioneer_cli_agent_runtime::{

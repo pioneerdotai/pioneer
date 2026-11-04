@@ -4200,7 +4200,7 @@ async fn agent_dispatch_starts_with_main_prompt() {
             .as_ref()
             .unwrap()
             .full_system_text
-            .contains("## Memory Recall")
+            .contains("### Memory Recall")
     );
 }
 
@@ -5337,9 +5337,9 @@ async fn phase_07_no_and_empty_hook_runtime_preserve_agent_request() {
 
     let empty_runtime_observed = start_simple_turn(
         &empty_runtime_manager,
-        "thr_phase07_empty_runtime",
+        "thr_phase07_no_runtime",
         "ws_phase07_request",
-        "turn_phase07_empty_runtime",
+        "turn_phase07_no_runtime",
         ThreadMode::Agent,
         "capture",
         "phase 07 request baseline",
@@ -5700,9 +5700,9 @@ async fn phase_07_non_prompt_section_contributions_do_not_affect_agent_request()
 
     let hook_observed = start_simple_turn(
         &hook_manager,
-        "thr_phase07_contrib_hook",
+        "thr_phase07_contrib_baseline",
         "ws_phase07_contrib",
-        "turn_phase07_contrib_hook",
+        "turn_phase07_contrib_baseline",
         ThreadMode::Agent,
         "capture",
         "phase 07 ignored contributions",
@@ -6007,6 +6007,11 @@ async fn terminal_effect_execution_uses_the_origin_runtime_generation() {
         .await
         .expect("thread should expose one durable receiver");
 
+    let source = format!(
+        "  {}middle{}tail\n",
+        "я".repeat(6000),
+        "я".repeat(12_000 - 6000 - "  middletail\n".chars().count())
+    );
     manager
         .start_test_turn_with_default_profile(
             thread_id,
@@ -6016,7 +6021,7 @@ async fn terminal_effect_execution_uses_the_origin_runtime_generation() {
             "capture",
             HashMap::new(),
             vec![UserInput::Text {
-                text: "Complete with the origin hook runtime.".to_owned(),
+                text: source.clone(),
                 text_elements: Vec::new(),
             }],
             Vec::new(),
@@ -6035,6 +6040,18 @@ async fn terminal_effect_execution_uses_the_origin_runtime_generation() {
         .into_iter()
         .next()
         .expect("post-turn effect should be prepared");
+
+    let pioneer_protocol::NativeTerminalEffectPayload::PostTurnHook { request, .. } =
+        &effect.payload
+    else {
+        panic!("post-turn payload");
+    };
+    assert_eq!(
+        request
+            .pointer("/input/payload/value/extraction_user_text/text")
+            .and_then(serde_json::Value::as_str),
+        Some(source.as_str())
+    );
 
     manager
         .set_hook_runtime(Some(recording_hook_runtime_for_phase(
@@ -7545,7 +7562,7 @@ async fn phase_08_policy_contributions_do_not_change_memory_policy_yet() {
         .compiled_prompt
         .as_ref()
         .expect("agent request should include compiled prompt");
-    assert!(prompt.full_system_text.contains("## Memory Recall"));
+    assert!(prompt.full_system_text.contains("### Memory Recall"));
     assert!(!prompt.full_system_text.contains("User likes Porto."));
     let calls = snapshot_hook_calls(&calls);
     let pre_prompt_context = calls
@@ -7812,9 +7829,9 @@ async fn phase_09_context_contribution_does_not_change_provider_prompt_yet() {
 
     let hook_observed = start_simple_turn(
         &hook_manager,
-        "thr_phase09_prompt_hook",
+        "thr_phase09_prompt_baseline",
         "ws_phase09_prompt",
-        "turn_phase09_prompt_hook",
+        "turn_phase09_prompt_baseline",
         ThreadMode::Agent,
         "capture",
         "phase 09 prompt stability",
@@ -7942,7 +7959,7 @@ async fn phase_09_memory_tool_materialization_preserves_hook_context() {
         .compiled_prompt
         .as_ref()
         .expect("agent request should include compiled prompt");
-    assert!(prompt.full_system_text.contains("## Memory Recall"));
+    assert!(prompt.full_system_text.contains("### Memory Recall"));
     assert!(
         prompt
             .full_system_text
@@ -8126,6 +8143,16 @@ async fn phase_10_prompt_compile_receives_final_visible_tools_not_registered_mem
     assert!(
         prompt
             .full_system_text
+            .contains("When request_tools is available, open hidden tools by domain")
+    );
+    let user_input = requests[0]
+        .messages
+        .iter()
+        .find(|message| message.role == Role::User)
+        .expect("prepared user input");
+    assert!(
+        user_input
+            .content
             .contains("For hidden tools, call request_tools to open their domain.")
     );
     assert!(
@@ -9111,6 +9138,133 @@ async fn phase_10_required_prompt_section_failure_fails_turn() {
 }
 
 #[tokio::test]
+async fn api_dispatch_requires_durable_input_and_exact_system_snapshot_ack() {
+    for rejected_source in ["turn_input_projection_v1", "system_snapshot_v1"] {
+        let provider = Arc::new(CaptureAgentProvider::default());
+        let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
+        let manager = AgentManager::new(registry, test_tool_loop_config());
+        let thread = format!("rejected-{rejected_source}");
+        manager
+            .ensure_thread(&thread, "snapshot-workspace")
+            .await
+            .unwrap();
+        let mut receiver = manager.take_durable_receiver(&thread).await.unwrap();
+        manager
+            .start_test_turn_with_default_profile_and_capabilities(
+                &thread,
+                "snapshot-turn",
+                ThreadMode::Agent,
+                "test-model",
+                "capture",
+                HashMap::new(),
+                vec![UserInput::Text {
+                    text: "must not dispatch".to_owned(),
+                    text_elements: Vec::new(),
+                }],
+                Vec::new(),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        let mut rejected = false;
+        let mut terminal = false;
+        for _ in 0..160 {
+            let event = timeout(Duration::from_secs(2), receiver.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let target = matches!(&event, AgentDurableEvent::TurnLlmContextAppended { source, .. } if source == rejected_source);
+            if target {
+                assert!(
+                    provider.snapshot_requests().is_empty(),
+                    "dispatch must wait for mandatory context ACK"
+                );
+                receiver.acknowledge_last(Err(
+                    pioneer_runtime_events::DurableCommitRejection::permanent(
+                        "fixture_persistence_failed",
+                        "mandatory snapshot rejected",
+                    ),
+                ));
+                rejected = true;
+            } else {
+                terminal = matches!(
+                    event,
+                    AgentDurableEvent::TurnFailed { .. }
+                        | AgentDurableEvent::TurnBlocked { .. }
+                        | AgentDurableEvent::TurnInterrupted { .. }
+                );
+                receiver.acknowledge_last(Ok(()));
+            }
+            if terminal {
+                break;
+            }
+        }
+        assert!(rejected && terminal);
+        assert!(provider.snapshot_requests().is_empty());
+        manager.remove_thread(&thread).await;
+    }
+}
+
+#[tokio::test]
+async fn chat_request_carries_current_context_before_original_user_input() {
+    let provider = Arc::new(CaptureAgentProvider::default());
+    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    let observed = start_simple_turn(
+        &manager,
+        "thr_chat_context",
+        "ws_chat_context",
+        "turn_chat_context",
+        ThreadMode::Chat,
+        "capture",
+        "original chat input",
+    )
+    .await;
+    assert_turn_completed(&observed);
+    let requests = provider.snapshot_requests();
+    assert_eq!(requests.len(), 1);
+    let request = &requests[0];
+    assert!(request.tools.is_none());
+    assert!(request.compiled_prompt.is_none());
+    assert_eq!(request.messages.len(), 1);
+    let user = &request.messages[0];
+    assert_eq!(user.role, Role::User);
+    assert!(
+        user.content
+            .starts_with("<pioneer_turn_context>\n## Execution\n\nDate: ")
+    );
+    assert!(user.content.contains("Workspace: ws_chat_context"));
+    assert!(user.content.contains("Thread: thr_chat_context"));
+    assert!(user.content.contains("Turn: turn_chat_context"));
+    assert!(user.content.contains("Explicit selection: []"));
+    assert!(
+        user.content
+            .contains("\nRuntime: API\nModel: test-model\nProvider: capture")
+    );
+    assert!(user.content.contains("\n\n## Environment\n\nCwd: "));
+    assert!(
+        user.content
+            .contains("\nPermission mode: FullAccess\nApproval prompts: unavailable")
+    );
+    assert!(
+        user.content
+            .contains("\n\n## Conversation\n\nWorkspace: ws_chat_context")
+    );
+    assert!(
+        user.content
+            .contains("\nActor: unavailable\n\n## Skills\n\nExplicit selection: []")
+    );
+    assert!(!user.content.contains("Provider instance:"));
+    assert!(!user.content.contains("TurnApprovalScopePolicySnapshot"));
+    assert!(!user.content.contains("## Tools"));
+
+    assert!(
+        user.content
+            .ends_with("</pioneer_turn_context>\n\noriginal chat input")
+    );
+}
+
+#[tokio::test]
 async fn no_memory_provider_keeps_agent_request_unchanged() {
     let provider = Arc::new(CaptureAgentProvider::default());
     let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
@@ -9133,7 +9287,16 @@ async fn no_memory_provider_keeps_agent_request_unchanged() {
     let request = &requests[0];
     assert_eq!(request.messages.len(), 1);
     assert_eq!(request.messages[0].role, Role::User);
-    assert_eq!(request.messages[0].content, "hello without memory");
+    assert!(
+        request.messages[0]
+            .content
+            .starts_with("<pioneer_turn_context>\n")
+    );
+    assert!(
+        request.messages[0]
+            .content
+            .ends_with("</pioneer_turn_context>\n\nhello without memory")
+    );
     let prompt = request
         .compiled_prompt
         .as_ref()
@@ -9186,7 +9349,7 @@ async fn memory_provider_tool_materialization_error_degrades_gracefully() {
         .compiled_prompt
         .as_ref()
         .expect("agent request should include compiled prompt");
-    assert!(!prompt.full_system_text.contains("## Memory Recall"));
+    assert!(!prompt.full_system_text.contains("### Memory Recall"));
 }
 
 #[tokio::test]
@@ -9328,8 +9491,111 @@ async fn memory_tool_materialization_bundles_are_merged_when_provider_returns_th
             .as_ref()
             .unwrap()
             .full_system_text
-            .contains("## Memory Recall")
+            .contains("### Memory Recall")
     );
+    for request in &requests {
+        let expected = serde_json::to_value(request.compiled_prompt.as_ref().unwrap()).unwrap();
+        assert!(observed.iter().any(|event| matches!(event,
+            AgentEvent::TurnLlmContextAppended { source, payload: pioneer_tools::ToolResultView::Json { value, truncated: false }, .. }
+                if source == "system_snapshot_v1" && value["application_context"]["system"] == expected
+        )), "every dispatched request must retain exact system bytes, including the post-discovery contract");
+        let system = &request.compiled_prompt.as_ref().unwrap().full_system_text;
+        let mut previous = None;
+        for heading in [
+            "## Safety and authority\n",
+            "## Agent profile\n",
+            "### Tool Usage\n",
+            "### Filesystem Operations\n",
+            "### Tasks\n",
+            "### Subagents\n",
+            "### Threads\n",
+            "### Artifact output contract\n",
+            "### Inline HTML\n",
+            "## Error recovery\n",
+        ] {
+            let position = system
+                .find(heading)
+                .unwrap_or_else(|| panic!("missing {heading}"));
+            assert!(
+                previous.is_none_or(|previous| previous < position),
+                "out of order: {heading}"
+            );
+            previous = Some(position);
+        }
+        assert_eq!(
+            system
+                .matches("call read_skill before specialized actions")
+                .count(),
+            1
+        );
+        assert!(!system.contains("## Extra System"));
+        assert!(!system.contains("Provider filesystem projection:"));
+        assert!(!system.contains("Available memory tools:"));
+    }
+    let initial_user = requests[0]
+        .messages
+        .iter()
+        .find(|message| message.role == Role::User)
+        .unwrap();
+    let after_discovery_user = requests[1]
+        .messages
+        .iter()
+        .find(|message| message.role == Role::User)
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(initial_user).unwrap(),
+        serde_json::to_value(after_discovery_user).unwrap()
+    );
+    assert_eq!(
+        initial_user
+            .content
+            .matches("<pioneer_turn_context>")
+            .count(),
+        1
+    );
+    assert!(initial_user.content.contains("Explicit selection: []"));
+    let mut previous = 0;
+    for heading in [
+        "## Execution",
+        "## Environment",
+        "## Conversation",
+        "## Skills",
+        "## Tools",
+    ] {
+        let position = initial_user
+            .content
+            .find(&format!("\n{heading}\n\n"))
+            .unwrap();
+        assert!(position > previous);
+        previous = position;
+    }
+    assert_eq!(initial_user.content.matches("## Skills\n").count(), 1);
+    assert!(!initial_user.content.contains("Provider instance:"));
+    assert!(
+        !initial_user
+            .content
+            .contains("Actual visibility and authorization are determined")
+    );
+    assert!(
+        !initial_user
+            .content
+            .contains("TurnApprovalScopePolicySnapshot")
+    );
+
+    assert!(initial_user.content.contains("Workspace: ws_memory_bundle"));
+    assert!(
+        initial_user
+            .content
+            .ends_with("</pioneer_turn_context>\n\nshow memory test tool")
+    );
+    assert!(requests.iter().all(|request| {
+        !request
+            .compiled_prompt
+            .as_ref()
+            .unwrap()
+            .full_system_text
+            .contains("Workspace: ws_memory_bundle")
+    }));
     let tools = requests[1]
         .tools
         .as_ref()
@@ -9343,7 +9609,10 @@ async fn memory_tool_materialization_bundles_are_merged_when_provider_returns_th
         .compiled_prompt
         .as_ref()
         .expect("agent request should include compiled prompt");
-    assert!(prompt.full_system_text.contains("## Memory Recall"));
+    assert!(prompt.full_system_text.contains("### Memory Recall"));
+    let system = &prompt.full_system_text;
+    assert!(system.find("### Tool Usage\n").unwrap() < system.find("### Memory Recall\n").unwrap());
+    assert!(system.find("### Threads\n").unwrap() < system.find("### Memory Recall\n").unwrap());
     for instruction in [
         "call `read_skill` with that exact reference",
         "pioneer/memory",
@@ -10519,21 +10788,155 @@ async fn production_regression_repeated_failed_tools_continue_without_final_no_t
 
 #[tokio::test]
 async fn execution_window_continuation_restarts_same_turn_and_completes_next_window() {
+    // Exercise the real collector and agent_loop window transfer. The controller
+    // removes only a historical v2 announcer, never filters restoration events.
+    struct DropAnnouncer {
+        inputs: std::sync::Mutex<Vec<ChatRequest>>,
+        unit_id: String,
+    }
+    #[async_trait::async_trait]
+    impl crate::compaction::controller::NativeContextController for DropAnnouncer {
+        async fn stop(
+            &self,
+            _: &crate::compaction::controller::NativeContext,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn prepare(
+            &self,
+            context: &crate::compaction::controller::NativeContext,
+            mut request: ChatRequest,
+            _: Option<crate::compaction::controller::NativeUsageMeasurement>,
+            _: bool,
+        ) -> anyhow::Result<crate::compaction::controller::NativePreparedRequest> {
+            self.inputs.lock().unwrap().push(request.clone());
+            request.messages.retain(|message| {
+                message
+                    .provenance
+                    .as_ref()
+                    .is_none_or(|origin| origin.unit_id != self.unit_id)
+            });
+            let receipt = crate::compaction::controller::NativeInputReceipt::for_request(
+                &request,
+                &context.provider_instance,
+                "fixture",
+                1,
+                None,
+            )?;
+            Ok(crate::compaction::controller::NativePreparedRequest {
+                request,
+                receipt,
+                history_check: crate::compaction::controller::NativeHistoryCheckMetadata {
+                    target_output_cap: 100,
+                    fixed_input_tokens: 1,
+                },
+            })
+        }
+    }
     let provider = Arc::new(LoopBudgetProvider::new(
         LoopBudgetProviderMode::TwoToolRoundsThenFinal,
         1,
     ));
+    let skill_root = unique_temp_dir("continuation_inventory");
+    fs::create_dir_all(&skill_root).unwrap();
+    fs::write(
+        skill_root.join("SKILL.md"),
+        "---\nname: Inventory\nslug: inventory\ndescription: Inventory v2\n---\nBody.",
+    )
+    .unwrap();
     let mut config = test_tool_loop_config();
+    config.skills.user_roots = vec![skill_root.display().to_string()];
     set_execution_window_budget(&mut config, 2, 16);
     config.retry.max_recoverable_retry_rounds_per_episode = 16;
     config.retry.max_same_tool_error_retries_per_episode = 16;
     let manager = loop_budget_manager(provider.clone(), config);
-    let mut events = start_loop_budget_turn(
+    // Obtain a real saved v2 input from the compiler rather than fabricating
+    // current inventory requirements in the controller.
+    provider.next_index.store(2, Ordering::SeqCst);
+    let mut seed_events = start_loop_budget_turn(
         &manager,
         "thr_loop_budget_multi_window",
-        "turn_loop_budget_multi_window",
+        "turn_inventory_seed",
     )
     .await;
+    assert_turn_completed(&recv_events_until_terminal(&mut seed_events).await);
+    let seed_requests = provider.snapshot_requests();
+    let announcer = seed_requests[0]
+        .messages
+        .iter()
+        .find(|message| {
+            message
+                .application_context
+                .as_ref()
+                .and_then(|m| m.get("kind"))
+                .and_then(|v| v.as_str())
+                == Some("turn_input")
+        })
+        .unwrap()
+        .clone();
+    let inventory_v2 = announcer.application_context.as_ref().unwrap()["inventory"].clone();
+    assert!(!inventory_v2.as_array().unwrap().is_empty());
+    let mut v1: Vec<pioneer_promt::PromptSection> =
+        serde_json::from_value(inventory_v2.clone()).unwrap();
+    for section in &mut v1 {
+        section.content = "Previous inventory v1".into();
+    }
+    let text = v1
+        .iter()
+        .map(pioneer_promt::PromptSection::as_rendered_text)
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let mut historical = ChatMessage::user(text.clone());
+    historical.application_context = Some(json!({
+        "version":1, "kind":"inventory_baseline", "context":text,
+        "inventory":v1, "diagnostics":[],
+        "announced":v1.iter().map(|s| s.id.manifest_id()).collect::<Vec<_>>()
+    }));
+    historical.provenance = Some(crate::compaction::history::pending_origin(
+        "ws_loop_budget",
+        "thr_loop_budget_multi_window",
+        "turn_A",
+        "baseline_A",
+        crate::compaction::history::PendingOriginKind::RuntimeContext,
+        "baseline_A",
+    ));
+    historical.application_context.as_mut().unwrap()["origin"] =
+        serde_json::to_value(&historical.provenance).unwrap();
+    let original_historical = serde_json::to_value(&historical).unwrap();
+    let announcer_unit = announcer.provenance.as_ref().unwrap().unit_id.clone();
+    let original_announcer = serde_json::to_value(&announcer).unwrap();
+    provider.requests.lock().unwrap().clear();
+    provider.next_index.store(0, Ordering::SeqCst);
+    let controller = Arc::new(DropAnnouncer {
+        inputs: std::sync::Mutex::new(Vec::new()),
+        unit_id: announcer_unit.clone(),
+    });
+    manager
+        .set_context_controller(Some(controller.clone()))
+        .await;
+    let thread = "thr_loop_budget_multi_window";
+    manager
+        .ensure_thread(thread, "ws_loop_budget")
+        .await
+        .unwrap();
+    let mut events = seed_events;
+    manager
+        .start_test_turn_with_default_profile_and_capabilities(
+            thread,
+            "turn_loop_budget_multi_window",
+            ThreadMode::Agent,
+            "test-model",
+            "loop-budget",
+            HashMap::new(),
+            vec![UserInput::Text {
+                text: "run loop budget test".into(),
+                text_elements: Vec::new(),
+            }],
+            Vec::new(),
+            vec![historical.clone(), announcer],
+        )
+        .await
+        .unwrap();
 
     let observed_events = recv_events_until_terminal(&mut events).await;
     assert!(matches!(
@@ -10631,6 +11034,161 @@ async fn execution_window_continuation_restarts_same_turn_and_completes_next_win
 
     let requests = provider.snapshot_requests();
     assert_eq!(requests.len(), 3);
+    let prepared_inputs = controller.inputs.lock().unwrap();
+    let original_current = prepared_inputs[0]
+        .messages
+        .iter()
+        .find(|message| {
+            message
+                .application_context
+                .as_ref()
+                .and_then(|m| m.get("kind"))
+                .and_then(|v| v.as_str())
+                == Some("turn_input")
+                && message
+                    .provenance
+                    .as_ref()
+                    .is_some_and(|p| p.unit_id != announcer_unit)
+        })
+        .unwrap();
+    assert_eq!(
+        original_current.application_context.as_ref().unwrap()["inventory"],
+        inventory_v2
+    );
+    assert_eq!(
+        serde_json::to_value(
+            prepared_inputs[0]
+                .messages
+                .iter()
+                .find(|m| {
+                    m.provenance
+                        .as_ref()
+                        .is_some_and(|p| p.unit_id == announcer_unit)
+                })
+                .unwrap()
+        )
+        .unwrap(),
+        original_announcer
+    );
+    let restorations: Vec<ChatMessage> = observed_events
+        .iter()
+        .filter_map(|event| {
+            if let AgentEvent::TurnLlmContextAppended {
+                payload: pioneer_tools::ToolResultView::Json { value, .. },
+                ..
+            } = event
+            {
+                let message: ChatMessage = serde_json::from_value(value.clone()).unwrap();
+                if message
+                    .application_context
+                    .as_ref()
+                    .and_then(|m| m.get("kind"))
+                    .and_then(|v| v.as_str())
+                    == Some("inventory_baseline")
+                {
+                    return Some(message);
+                }
+            }
+            None
+        })
+        .collect();
+    assert_eq!(
+        restorations.len(),
+        1,
+        "B must persist its own v2 restoration exactly once"
+    );
+    let restored = &restorations[0];
+    let restored_origin: pioneer_provider::MessageProvenance =
+        serde_json::from_value(restored.application_context.as_ref().unwrap()["origin"].clone())
+            .unwrap();
+    assert_eq!(restored_origin.workspace_id, "ws_loop_budget");
+    assert_eq!(restored_origin.thread_id, "thr_loop_budget_multi_window");
+    assert!(
+        restored_origin.sources.iter().any(|source| {
+            source.scope == "pending-runtime-context:turn_loop_budget_multi_window"
+        })
+    );
+    // Observe the resumed request before any controller refresh can repair it.
+    for request in prepared_inputs.iter() {
+        assert_eq!(
+            request
+                .messages
+                .iter()
+                .filter(|m| { m.application_context == historical.application_context })
+                .count(),
+            1,
+            "foreign A must never be appended to B retained history"
+        );
+    }
+    assert_eq!(
+        restored.application_context.as_ref().unwrap()["inventory"],
+        inventory_v2
+    );
+    for request in &requests {
+        let historical_positions: Vec<_> = request
+            .messages
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.application_context == historical.application_context)
+            .collect();
+        assert_eq!(
+            historical_positions.len(),
+            1,
+            "A must not be copied into B continuation"
+        );
+        assert_eq!(
+            historical_positions[0].0,
+            requests[0]
+                .messages
+                .iter()
+                .position(|m| m.application_context == historical.application_context)
+                .unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(historical_positions[0].1).unwrap(),
+            original_historical
+        );
+        let current = request
+            .messages
+            .iter()
+            .find(|m| m.application_context == original_current.application_context)
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(current).unwrap(),
+            serde_json::to_value(original_current).unwrap()
+        );
+        assert_eq!(
+            request
+                .messages
+                .iter()
+                .filter(|m| m.application_context == restored.application_context)
+                .count(),
+            1
+        );
+    }
+    for id in ["call_loop_budget_0", "call_loop_budget_1"] {
+        let call = requests[2]
+            .messages
+            .iter()
+            .position(|m| {
+                m.tool_calls
+                    .as_ref()
+                    .is_some_and(|calls| calls.iter().any(|c| c.id == id))
+            })
+            .unwrap();
+        let result = requests[2]
+            .messages
+            .iter()
+            .position(|m| m.tool_call_id.as_deref() == Some(id))
+            .unwrap();
+        assert_eq!(
+            result,
+            call + 1,
+            "completed tool groups retain call/result order"
+        );
+    }
+    fs::remove_dir_all(skill_root).unwrap();
+
     assert!(
         requests[2]
             .tools
@@ -11106,7 +11664,7 @@ async fn requested_memory_tools_remain_available_for_budget_continuation() {
             .as_ref()
             .expect("first round should include prompt")
             .full_system_text
-            .contains("## Memory Recall")
+            .contains("### Memory Recall")
     );
     assert!(
         requests.iter().all(|request| request.tools.is_some()),
@@ -12060,7 +12618,7 @@ async fn non_tool_recovery_request_restarts_turn_without_failing() {
 }
 
 #[tokio::test]
-async fn continue_generation_recovery_is_compiled_into_system_prompt() {
+async fn continue_generation_recovery_reuses_saved_system_and_adds_context_at_tail() {
     let provider = Arc::new(CaptureStandardProvider::default());
     let registry = Arc::new(ProviderRegistry::with_provider(
         "capture-standard",
@@ -12095,12 +12653,33 @@ async fn continue_generation_recovery_is_compiled_into_system_prompt() {
         .await
         .expect("turn should start");
 
+    let mut retained = Vec::new();
     for _ in 0..40 {
         let event = timeout(Duration::from_secs(2), events.recv())
             .await
             .expect("must receive agent event in time")
             .expect("broadcast should remain open");
 
+        if let AgentEvent::TurnLlmContextAppended {
+            source,
+            payload:
+                pioneer_tools::ToolResultView::Json {
+                    value,
+                    truncated: false,
+                },
+            ..
+        } = &event
+        {
+            if matches!(
+                source.as_str(),
+                "turn_input_projection_v1" | "runtime_context_v1" | "system_snapshot_v1"
+            ) {
+                retained.push(super::RetainedProviderHistoryMessage {
+                    sequence: retained.len() as i64,
+                    message: serde_json::from_value(value.clone()).unwrap(),
+                });
+            }
+        }
         if matches!(event, AgentEvent::TurnCompleted { .. }) {
             break;
         }
@@ -12125,7 +12704,7 @@ async fn continue_generation_recovery_is_compiled_into_system_prompt() {
                 compact_history: false,
                 continue_generation: true,
                 model_override: None,
-                retained_provider_history: Vec::new(),
+                retained_provider_history: retained,
                 execution_checkpoint_context: None,
             },
         )
@@ -12165,22 +12744,37 @@ async fn continue_generation_recovery_is_compiled_into_system_prompt() {
         .compiled_prompt
         .as_ref()
         .expect("recovery request should include compiled prompt payload");
-    assert!(
+    assert_eq!(
+        requests[0].compiled_prompt.as_ref().unwrap(),
         continuation_prompt
-            .full_system_text
-            .contains("Continue from where it stopped without repeating prior text.")
+    );
+    let initial_user = requests[0]
+        .messages
+        .iter()
+        .find(|message| message.role == Role::User)
+        .unwrap();
+    let recovered_user = recovery_request
+        .messages
+        .iter()
+        .find(|message| message.role == Role::User)
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(initial_user).unwrap(),
+        serde_json::to_value(recovered_user).unwrap()
     );
     assert!(
-        continuation_prompt
+        !continuation_prompt
             .full_system_text
             .contains("Recovery Continuation")
     );
+    let tail = recovery_request.messages.last().unwrap();
+    assert_eq!(tail.role, Role::User);
     assert!(
-        continuation_prompt
-            .full_system_text
-            .contains("Current date/time:")
+        tail.content
+            .contains("Continue from where it stopped without repeating prior text.")
     );
-    assert!(continuation_prompt.full_system_text.contains("OS:"));
+    assert!(tail.content.contains("Recovery Continuation"));
+    assert!(!tail.content.contains("<pioneer_turn_context>"));
 }
 
 #[tokio::test]
@@ -12419,8 +13013,19 @@ async fn explicit_skill_input_injects_compact_skill_prompt_and_binding() {
         .compiled_prompt
         .as_ref()
         .expect("compiled prompt should be attached to provider request");
+    assert!(
+        !compiled_prompt
+            .full_system_text
+            .contains(test_skill_ref("my-skill").as_str())
+    );
     assert_compact_skill_prompt(
-        compiled_prompt.full_system_text.as_str(),
+        requests[0]
+            .messages
+            .iter()
+            .find(|message| message.role == Role::User)
+            .unwrap()
+            .content
+            .as_str(),
         &test_skill_ref("my-skill"),
         "My Skill",
         "Follow the skill.",
@@ -12641,8 +13246,19 @@ async fn explicit_skill_input_injects_compact_prompt_for_non_tool_calling_provid
         .compiled_prompt
         .as_ref()
         .expect("compiled prompt should be attached to provider request");
+    assert!(
+        !compiled_prompt
+            .full_system_text
+            .contains(test_skill_ref("my-skill").as_str())
+    );
     assert_compact_skill_prompt(
-        compiled_prompt.full_system_text.as_str(),
+        requests[0]
+            .messages
+            .iter()
+            .find(|message| message.role == Role::User)
+            .unwrap()
+            .content
+            .as_str(),
         &test_skill_ref("my-skill"),
         "My Skill",
         "Follow the skill.",
@@ -13068,7 +13684,12 @@ async fn mixed_skill_mcp_text_file_capabilities_use_exact_projected_dependency()
         .iter()
         .find(|message| message.role == Role::User)
         .expect("request should include user message");
-    assert_eq!(user_message.content, "use the file, skill, and resend");
+    assert!(user_message.content.starts_with("<pioneer_turn_context>\n"));
+    assert!(
+        user_message
+            .content
+            .ends_with("</pioneer_turn_context>\n\nuse the file, skill, and resend")
+    );
     assert_eq!(user_message.content_parts.len(), 1);
     match &user_message.content_parts[0] {
         MessageContentPart::File { file } => {
@@ -13088,7 +13709,7 @@ async fn mixed_skill_mcp_text_file_capabilities_use_exact_projected_dependency()
         .as_ref()
         .expect("agent request should include compiled prompt");
     assert_compact_skill_prompt(
-        prompt.full_system_text.as_str(),
+        user_message.content.as_str(),
         &test_skill_ref("my-skill"),
         "My Skill",
         "Follow the skill.",

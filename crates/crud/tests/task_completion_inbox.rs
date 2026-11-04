@@ -2726,3 +2726,647 @@ async fn activity_discovery_pages_survive_filtered_scopes_and_duplicate_active_r
     assert_eq!(second.scopes.len(), 1);
     assert_eq!(second.scopes[0].0.task_id, "active-0513");
 }
+
+// Durable facts are deliberately seeded independently of current Task policy.
+// These storage fixtures also allow corrupt legacy links with runtime FK OFF.
+async fn inbox_contracts(
+    store: &CrudStore,
+    task_id: &str,
+    run_id: &str,
+    creator: &str,
+    plan: Option<&str>,
+    generation: i64,
+) {
+    let db = store.with_maintenance_access().database_connection();
+    db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+        "INSERT OR IGNORE INTO task_actor_contract(task_id,workspace_id,creator_json,reviewer_json,delivery_json,revision,created_at,updated_at) VALUES(?,'W0000000000000000000I',?,'\"runtime_auto\"','{}',1,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        [task_id.into(), creator.into()])).await.unwrap();
+    db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+        "INSERT INTO task_occurrence_contract(occurrence_id,task_id,run_id,occurrence_key,execution_generation,status,retry_attempt,action_idempotency_key,delivery_plan_json,created_at,updated_at) VALUES(?,?,?,?,?,'delivered',0,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        [run_id.into(), task_id.into(), run_id.into(), run_id.into(), generation.into(), run_id.into(), plan.into()])).await.unwrap();
+}
+
+fn inbox_plan(mode: pioneer_protocol::TaskDeliveryMode, target: Option<&str>) -> String {
+    use pioneer_protocol::{
+        TaskDeliveryFormat, TaskDeliveryPolicy, TaskDeliveryThreadTarget,
+        TaskOccurrenceDeliveryPlan,
+    };
+    serde_json::to_string(&TaskOccurrenceDeliveryPlan::from_normalized_policy(
+        TaskDeliveryPolicy {
+            mode,
+            thread_target: target.map(|_| TaskDeliveryThreadTarget::ExactThread),
+            thread_id: target.map(str::to_owned),
+            webhook_url: (mode == pioneer_protocol::TaskDeliveryMode::Webhook)
+                .then(|| "https://example.test/hook".to_owned()),
+            include_result: true,
+            format: TaskDeliveryFormat::Summary,
+        },
+    ))
+    .unwrap()
+}
+
+#[tokio::test]
+async fn durable_internal_destinations_share_inbox_membership_across_statuses_and_reads() {
+    use pioneer_protocol::{AgentExecutionId, PersistedActorRef, TaskDeliveryMode as M};
+    let (_dir, store, _writer) = fixture(false).await;
+    let agent = serde_json::to_string(&PersistedActorRef::AgentExecution(
+        AgentExecutionId::new("E00000000000000000001").unwrap(),
+    ))
+    .unwrap();
+    let human = serde_json::to_string(&PersistedActorRef::Principal(
+        pioneer_protocol::PrincipalId::new(A).unwrap(),
+    ))
+    .unwrap();
+    let system = serde_json::to_string(&PersistedActorRef::System).unwrap();
+    let mut hidden = Vec::new();
+    let mut visible = Vec::new();
+    for (i, status) in ["succeeded", "failed", "blocked", "cancelled", "timed_out"]
+        .into_iter()
+        .enumerate()
+    {
+        for (j, (creator, mode, target, included)) in [
+            (&agent, M::None, None, false),
+            (&agent, M::Thread, Some("T0000000000000000000I"), false),
+            // Detached Composer/background/scheduled output to a user thread.
+            (&agent, M::Thread, Some("T0000000000000000000P"), true),
+            (&agent, M::UserNotification, None, true),
+            (&agent, M::Webhook, None, true),
+            (&human, M::None, None, true),
+            (&human, M::Thread, Some("T0000000000000000000I"), true),
+            (&system, M::None, None, true),
+            (&system, M::Thread, Some("T0000000000000000000I"), true),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let task_id = format!("contract-task-{i}-{j}");
+            let run_id = format!("contract-run-{i}-{j}");
+            task(
+                &store,
+                &task_id,
+                Some("T0000000000000000000P"),
+                None,
+                "agent",
+                "none",
+                "detached",
+            )
+            .await;
+            run(&store, &run_id, &task_id, status, 1).await;
+            inbox_contracts(
+                &store,
+                &task_id,
+                &run_id,
+                creator,
+                Some(&inbox_plan(mode, target)),
+                1,
+            )
+            .await;
+            if included {
+                visible.push(run_id);
+            } else {
+                hidden.push(run_id);
+            }
+        }
+    }
+    let db = store.database_connection();
+    // Opposite current policy cannot rewrite old occurrences' classification.
+    db.execute_unprepared("UPDATE task SET delivery_policy_json='{\"mode\":\"user_notification\",\"includeResult\":true,\"format\":\"summary\"}'").await.unwrap();
+    assert_eq!(unread(&store, A).await, visible.len() as u64);
+    let page = list_task_completion_inbox(&db, &access(A), None, 3)
+        .await
+        .unwrap();
+    assert_eq!(page.len(), 3, "internal rows must be filtered before LIMIT");
+    let mut paged = Vec::new();
+    let mut cursor: Option<(String, String)> = None;
+    loop {
+        let page = list_task_completion_inbox(
+            &db,
+            &access(A),
+            cursor.as_ref().map(|(at, id)| (at.as_str(), id.as_str())),
+            3,
+        )
+        .await
+        .unwrap();
+        if page.is_empty() {
+            break;
+        }
+        cursor = page
+            .last()
+            .map(|row| (row.completed_key.clone(), row.run_id.clone()));
+        paged.extend(page.into_iter().map(|row| row.run_id));
+    }
+    paged.sort();
+    visible.sort();
+    assert_eq!(paged, visible);
+    let ids: Vec<_> = visible.iter().chain(&hidden).cloned().collect();
+    let (entries, total) = store
+        .task_completion_inbox_patch(&access(A), &ids)
+        .await
+        .unwrap();
+    assert_eq!(total, visible.len() as u64);
+    assert_eq!(entries.len(), visible.len());
+    assert!(entries.iter().all(|row| visible.contains(&row.run_id)));
+    for id in &hidden {
+        assert!(
+            find_task_completion_inbox_entry(&db, &access(A), id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        read(&store, A, id).await;
+    }
+    let params = pioneer_protocol::TaskCompletionInboxViewedParams {
+        workspace_id: access(A).workspace_id.to_owned(),
+        thread_id: "T0000000000000000000P".to_owned(),
+        run_ids: hidden.clone(),
+        result_turn_ids: vec![],
+        result_items: vec![],
+    };
+    assert!(
+        pioneer_crud::mark_viewed_task_completion_inbox_read(
+            &db,
+            &access(A),
+            &params,
+            "2026-10-16T11:00:00Z"
+        )
+        .await
+        .unwrap()
+        .is_empty()
+    );
+    pioneer_crud::mark_all_task_completion_inbox_read(&db, &access(A), "2026-10-16T11:00:00Z")
+        .await
+        .unwrap();
+    assert_eq!(unread(&store, A).await, 0);
+    assert_eq!(unread(&store, B).await, visible.len() as u64);
+    let receipts = pioneer_entity::task_run_read::Entity::find()
+        .all(&db)
+        .await
+        .unwrap();
+    assert_eq!(receipts.len(), visible.len());
+    assert!(receipts.iter().all(|row| visible.contains(&row.run_id)));
+}
+
+#[tokio::test]
+async fn occurrence_evidence_is_per_run_and_untrusted_legacy_links_remain_visible() {
+    use pioneer_protocol::TaskDeliveryMode as M;
+    let (_dir, store, _writer) = fixture(false).await;
+    let agent = r#"{"kind":"agent_execution","id":"E00000000000000000001"}"#;
+    task(
+        &store,
+        "history",
+        Some("T0000000000000000000P"),
+        None,
+        "agent",
+        "none",
+        "attached",
+    )
+    .await;
+    let none = inbox_plan(M::None, None);
+    let user = inbox_plan(M::Thread, Some("T0000000000000000000P"));
+    let unknown_version = none.replace("\"routingVersion\":1", "\"routingVersion\":99");
+    let wrong_boolean = none.replace("\"includeResult\":true", "\"includeResult\":\"true\"");
+    let unknown_format = none.replace("\"summary\"", "\"future_format\"");
+    let mismatched_target = inbox_plan(M::Thread, Some("T0000000000000000000I")).replace(
+        "\"presentationThreadId\":\"T0000000000000000000I\"",
+        "\"presentationThreadId\":\"T0000000000000000000P\"",
+    );
+    for (i, plan) in [
+        Some(none.as_str()),
+        Some(user.as_str()),
+        None,
+        Some("null"),
+        Some("{"),
+        Some("{}"),
+        Some(unknown_version.as_str()),
+        Some(wrong_boolean.as_str()),
+        Some(unknown_format.as_str()),
+        Some(mismatched_target.as_str()),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let id = format!("history-{i}");
+        run(&store, &id, "history", "succeeded", i as i64 + 1).await;
+        inbox_contracts(&store, "history", &id, agent, plan, i as i64 + 1).await;
+    }
+    for (i, corruption) in [
+        "actor-workspace",
+        "occurrence-task",
+        "target-workspace",
+        "invalid-creator",
+        "missing-actor",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        task(
+            &store,
+            corruption,
+            Some("T0000000000000000000P"),
+            None,
+            "agent",
+            "none",
+            "detached",
+        )
+        .await;
+        run(&store, corruption, corruption, "succeeded", 1).await;
+        let plan = if i == 2 {
+            inbox_plan(M::Thread, Some("foreign-internal"))
+        } else {
+            none.clone()
+        };
+        inbox_contracts(&store, corruption, corruption, agent, Some(&plan), 1).await;
+    }
+    let db = store.database_connection();
+    for sql in [
+        "UPDATE task_actor_contract SET workspace_id='W0000000000000000000O' WHERE task_id='actor-workspace'",
+        "UPDATE task_occurrence_contract SET task_id='other-task' WHERE run_id='occurrence-task'",
+        "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class) VALUES('foreign-internal','W0000000000000000000O','','agent','m','p','active','task_run','internal')",
+        "UPDATE task_actor_contract SET creator_json='{\"kind\":\"agent_execution\",\"id\":7}' WHERE task_id='invalid-creator'",
+        "DELETE FROM task_actor_contract WHERE task_id='missing-actor'",
+    ] {
+        db.execute_unprepared(sql).await.unwrap();
+    }
+    assert_eq!(unread(&store, A).await, 14);
+    assert!(
+        find_task_completion_inbox_entry(&db, &access(A), "history-0")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let ids = [
+        "history-0",
+        "history-1",
+        "actor-workspace",
+        "occurrence-task",
+        "target-workspace",
+        "invalid-creator",
+        "missing-actor",
+    ]
+    .map(str::to_owned);
+    let (entries, total) = store
+        .task_completion_inbox_patch(&access(A), &ids)
+        .await
+        .unwrap();
+    assert_eq!(total, 14);
+    assert_eq!(entries.len(), 6);
+}
+
+#[tokio::test]
+async fn retry_rebinding_keeps_all_internal_attempts_out_of_the_inbox() {
+    use pioneer_protocol::{TaskDeliveryMode as M, TaskOccurrenceStatus};
+    for (mode, target) in [(M::None, None), (M::Thread, Some("T0000000000000000000I"))] {
+        let (_dir, store, _writer) = fixture(false).await;
+        let db = store.with_maintenance_access().database_connection();
+        task(
+            &store,
+            "retry-task",
+            Some("T0000000000000000000P"),
+            None,
+            "agent",
+            "none",
+            "detached",
+        )
+        .await;
+        run(&store, "attempt-1", "retry-task", "failed", 1).await;
+        inbox_contracts(
+            &store,
+            "retry-task",
+            "attempt-1",
+            r#"{"kind":"agent_execution","id":"E00000000000000000001"}"#,
+            Some(&inbox_plan(mode, target)),
+            1,
+        )
+        .await;
+        db.execute_unprepared("UPDATE task SET status='active' WHERE id='retry-task'")
+            .await
+            .unwrap();
+        db.execute_unprepared("UPDATE task_occurrence_contract SET status='failed',action_idempotency_key='task:retry-task:attempt-1' WHERE occurrence_id='attempt-1'").await.unwrap();
+        // A separate logical occurrence of the SAME Task delivers to the user.
+        // A recurrence may point parent_run_id at the preceding group's run.
+        run(&store, "user-occurrence", "retry-task", "succeeded", 2).await;
+        db.execute_unprepared(
+            "UPDATE task_run SET parent_run_id='attempt-1' WHERE id='user-occurrence'",
+        )
+        .await
+        .unwrap();
+        inbox_contracts(
+            &store,
+            "retry-task",
+            "user-occurrence",
+            "unused",
+            Some(&inbox_plan(M::Thread, Some("T0000000000000000000P"))),
+            2,
+        )
+        .await;
+        db.execute_unprepared("UPDATE task SET delivery_policy_json='{\"mode\":\"thread\",\"threadTarget\":\"exact_thread\",\"threadId\":\"T0000000000000000000P\",\"includeResult\":true,\"format\":\"summary\"}' WHERE id='retry-task'").await.unwrap();
+        let mut attempts = Vec::new();
+        for attempt in 1..=3 {
+            let id = format!("attempt-{attempt}");
+            if attempt > 1 {
+                let previous_id = format!("attempt-{}", attempt - 1);
+                // Storage side of task_terminal::retry_run: one group, sequential
+                // attempts, both source links, monotonically increasing run number.
+                run(&store, &id, "retry-task", "queued", attempt + 1).await;
+                db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+                    "UPDATE task_run SET run_group_id='attempt-1',attempt_number=?,retry_of_run_id=?,parent_run_id=?,completed_at=NULL,result_json=NULL WHERE id=?",
+                    [attempt.into(), previous_id.clone().into(), previous_id.clone().into(), id.clone().into()])).await.unwrap();
+                let previous = store
+                    .get_task_occurrence_contract_by_run(&previous_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let mut next = previous.retry(attempt as u32).unwrap();
+                next.run_id = id.clone();
+                // Same repository upsert used by retry dispatch; this updates
+                // one occurrence_id, preserving its plan, generation and key.
+                store
+                    .upsert_task_occurrence_contract(&next, 1792144800 + attempt)
+                    .await
+                    .unwrap();
+                assert!(
+                    store
+                        .get_task_occurrence_contract_by_run(&previous_id)
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+                db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+                    "UPDATE task_run SET status='failed',completed_at='2026-10-16 10:00:00 +00:00' WHERE id=?",
+                    [id.clone().into()])).await.unwrap();
+                next.status = TaskOccurrenceStatus::Failed;
+                store
+                    .upsert_task_occurrence_contract(&next, 1792144801 + attempt)
+                    .await
+                    .unwrap();
+            }
+            attempts.push(id);
+            assert_eq!(unread(&store, A).await, 1, "{mode:?}, attempt {attempt}");
+            let page = list_task_completion_inbox(&db, &access(A), None, 1)
+                .await
+                .unwrap();
+            assert_eq!(
+                page.iter().map(|r| r.run_id.as_str()).collect::<Vec<_>>(),
+                ["user-occurrence"]
+            );
+            let ids = attempts
+                .iter()
+                .cloned()
+                .chain(["user-occurrence".to_owned()])
+                .collect::<Vec<_>>();
+            let (entries, total) = store
+                .task_completion_inbox_patch(&access(A), &ids)
+                .await
+                .unwrap();
+            assert_eq!(total, 1);
+            assert_eq!(
+                entries
+                    .iter()
+                    .map(|r| r.run_id.as_str())
+                    .collect::<Vec<_>>(),
+                ["user-occurrence"]
+            );
+            for hidden in &attempts {
+                assert!(
+                    find_task_completion_inbox_entry(&db, &access(A), hidden)
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+                read(&store, A, hidden).await;
+            }
+            pioneer_crud::mark_all_task_completion_inbox_read(
+                &db,
+                &access(B),
+                "2026-10-16T11:00:00Z",
+            )
+            .await
+            .unwrap();
+            let receipts = pioneer_entity::task_run_read::Entity::find()
+                .all(&db)
+                .await
+                .unwrap();
+            assert_eq!(receipts.len(), 1);
+            assert_eq!(receipts[0].run_id, "user-occurrence");
+            let occurrences = pioneer_entity::task_occurrence_contract::Entity::find()
+                .all(&db)
+                .await
+                .unwrap();
+            assert_eq!(
+                occurrences.len(),
+                2,
+                "one row per logical occurrence, not per attempt"
+            );
+        }
+        // Corrupt links cannot borrow the old group's durable plan. The current
+        // attempt still has its direct contract; these probes address older ones.
+        for (damage, restore, visible) in [
+            (
+                "UPDATE task_run SET run_group_id='foreign-group' WHERE id='attempt-3'",
+                "UPDATE task_run SET run_group_id='attempt-1' WHERE id='attempt-3'",
+                "attempt-1",
+            ),
+            (
+                "UPDATE task_run SET task_id='foreign-task' WHERE id='attempt-3'",
+                "UPDATE task_run SET task_id='retry-task' WHERE id='attempt-3'",
+                "attempt-1",
+            ),
+            (
+                "UPDATE task_occurrence_contract SET occurrence_id='unrelated-occurrence' WHERE occurrence_id='attempt-1'",
+                "UPDATE task_occurrence_contract SET occurrence_id='attempt-1' WHERE occurrence_id='unrelated-occurrence'",
+                "attempt-2",
+            ),
+            (
+                "UPDATE task_occurrence_contract SET task_id='foreign-task' WHERE occurrence_id='attempt-1'",
+                "UPDATE task_occurrence_contract SET task_id='retry-task' WHERE occurrence_id='attempt-1'",
+                "attempt-1",
+            ),
+            (
+                "UPDATE task_run SET retry_of_run_id='user-occurrence',parent_run_id='user-occurrence' WHERE id='attempt-2'",
+                "UPDATE task_run SET retry_of_run_id='attempt-1',parent_run_id='attempt-1' WHERE id='attempt-2'",
+                "attempt-2",
+            ),
+            (
+                "UPDATE task_run SET attempt_number=4 WHERE id='attempt-3'",
+                "UPDATE task_run SET attempt_number=3 WHERE id='attempt-3'",
+                "attempt-1",
+            ),
+            (
+                "UPDATE task_run SET attempt_number=9 WHERE id='attempt-1'",
+                "UPDATE task_run SET attempt_number=1 WHERE id='attempt-1'",
+                "attempt-2",
+            ),
+        ] {
+            db.execute_unprepared(damage).await.unwrap();
+            assert!(
+                find_task_completion_inbox_entry(&db, &access(A), visible)
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "{damage}"
+            );
+            db.execute_unprepared(restore).await.unwrap();
+            assert_eq!(unread(&store, A).await, 1);
+        }
+        db.execute_unprepared(
+            "DELETE FROM task_occurrence_contract WHERE occurrence_id='attempt-1'",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            unread(&store, A).await,
+            4,
+            "missing durable evidence retains legacy eligibility"
+        );
+    }
+}
+
+#[tokio::test]
+async fn same_run_recovery_preserves_internal_retry_history_membership() {
+    use pioneer_protocol::{TaskDeliveryMode as M, TaskOccurrenceStatus as O};
+    for (mode, target) in [(M::None, None), (M::Thread, Some("T0000000000000000000I"))] {
+        let (_dir, store, _writer) = fixture(false).await;
+        let db = store.with_maintenance_access().database_connection();
+        task(
+            &store,
+            "resume-task",
+            Some("T0000000000000000000P"),
+            None,
+            "agent",
+            "none",
+            "detached",
+        )
+        .await;
+        run(&store, "resume-first", "resume-task", "failed", 1).await;
+        inbox_contracts(
+            &store,
+            "resume-task",
+            "resume-first",
+            r#"{"kind":"agent_execution","id":"E00000000000000000001"}"#,
+            Some(&inbox_plan(mode, target)),
+            1,
+        )
+        .await;
+        db.execute_unprepared("UPDATE task_occurrence_contract SET status='failed',action_idempotency_key='task:resume-task:resume-first' WHERE occurrence_id='resume-first'").await.unwrap();
+        run(&store, "resume-second", "resume-task", "blocked", 2).await;
+        db.execute_unprepared("UPDATE task_run SET run_group_id='resume-first',attempt_number=2,retry_of_run_id='resume-first',parent_run_id='resume-first' WHERE id='resume-second'").await.unwrap();
+        let original = store
+            .get_task_occurrence_contract_by_run("resume-first")
+            .await
+            .unwrap()
+            .unwrap();
+        let mut bound = original.retry(2).unwrap();
+        bound.run_id = "resume-second".to_owned();
+        bound.status = O::Failed; // Blocked TaskRuns map to Failed occurrences.
+        store
+            .upsert_task_occurrence_contract(&bound, 1792144800)
+            .await
+            .unwrap();
+        run(&store, "resume-user", "resume-task", "succeeded", 3).await;
+        inbox_contracts(
+            &store,
+            "resume-task",
+            "resume-user",
+            "unused",
+            Some(&inbox_plan(M::Thread, Some("T0000000000000000000P"))),
+            2,
+        )
+        .await;
+        db.execute_unprepared("UPDATE task SET status='blocked' WHERE id='resume-task'")
+            .await
+            .unwrap();
+        let ids = ["resume-first", "resume-second", "resume-user"].map(str::to_owned);
+        for stage in 0..3 {
+            if stage == 1 {
+                // Contract side of resume_task_owned_turn: checked generation
+                // increment + retry(), Recovering, immutable same run binding.
+                // Use public protocol/repository APIs without new test seams.
+                let generation = bound.retry_attempt.checked_add(1).unwrap();
+                let mut resumed = bound.retry(generation).unwrap();
+                resumed.status = O::Recovering;
+                assert_eq!(resumed.run_id, bound.run_id);
+                store
+                    .upsert_task_occurrence_contract(&resumed, 1792144801)
+                    .await
+                    .unwrap();
+                bound = resumed;
+                db.execute_unprepared("UPDATE task SET status='running' WHERE id='resume-task'")
+                    .await
+                    .unwrap();
+                // Storage side of reopening the same blocked run. Neither its
+                // identity nor attempt_number is changed by this transition.
+                db.execute_unprepared("UPDATE task_run SET status='running',completed_at=NULL,result_json=NULL,error_json=NULL WHERE id='resume-second'").await.unwrap();
+            } else if stage == 2 {
+                db.execute_unprepared("UPDATE task_run SET status='succeeded',completed_at='2026-10-16 10:00:00 +00:00' WHERE id='resume-second'").await.unwrap();
+                bound.status = O::Delivered;
+                store
+                    .upsert_task_occurrence_contract(&bound, 1792144802)
+                    .await
+                    .unwrap();
+            }
+            let saved = store
+                .get_task_occurrence_contract_by_run("resume-second")
+                .await
+                .unwrap()
+                .unwrap();
+            let run = pioneer_entity::task_run::Entity::find_by_id("resume-second")
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(saved.occurrence_id, "resume-first");
+            assert_eq!(saved.run_id, run.id);
+            assert_eq!(run.id, "resume-second");
+            assert_eq!(run.attempt_number, 2);
+            assert_eq!(saved.retry_attempt, if stage == 0 { 2 } else { 3 });
+            assert_eq!(saved.delivery_plan, original.delivery_plan);
+            assert_eq!(unread(&store, A).await, 1, "{mode:?} stage {stage}");
+            let page = list_task_completion_inbox(&db, &access(A), None, 1)
+                .await
+                .unwrap();
+            assert_eq!(
+                page.iter().map(|r| r.run_id.as_str()).collect::<Vec<_>>(),
+                ["resume-user"]
+            );
+            let (entries, total) = store
+                .task_completion_inbox_patch(&access(A), &ids)
+                .await
+                .unwrap();
+            assert_eq!(total, 1);
+            assert_eq!(
+                entries
+                    .iter()
+                    .map(|r| r.run_id.as_str())
+                    .collect::<Vec<_>>(),
+                ["resume-user"]
+            );
+            for hidden in &ids[..2] {
+                assert!(
+                    find_task_completion_inbox_entry(&db, &access(A), hidden)
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+                read(&store, A, hidden).await;
+            }
+            pioneer_crud::mark_all_task_completion_inbox_read(
+                &db,
+                &access(B),
+                "2026-10-16T11:00:00Z",
+            )
+            .await
+            .unwrap();
+            let receipts = pioneer_entity::task_run_read::Entity::find()
+                .all(&db)
+                .await
+                .unwrap();
+            assert_eq!(receipts.len(), 1);
+            assert_eq!(receipts[0].run_id, "resume-user");
+            let occurrences = pioneer_entity::task_occurrence_contract::Entity::find()
+                .all(&db)
+                .await
+                .unwrap();
+            assert_eq!(occurrences.len(), 2);
+        }
+    }
+}

@@ -113,7 +113,7 @@ fn register_member_principal() -> Arc<crate::auth::AuthenticatedSessionPrincipal
 async fn start_member_thread(
     processor: &MessageProcessor,
     connection_id: ConnectionId,
-    rx: &mut mpsc::Receiver<Message>,
+    rx: &mut crate::session::test_support::OutboundTestReceiver,
     workspace_id: &str,
     thread_id: &str,
     visibility: ThreadVisibility,
@@ -213,7 +213,7 @@ async fn hermetic_member_shared_client_covers_policy_and_access_loss_without_log
         .expect("materialize internal Member client grants");
 
     let session_manager = Arc::new(SessionManager::new());
-    let (member_tx, mut member_rx) = mpsc::channel(32);
+    let (member_tx, mut member_rx) = crate::session::test_support::outbound_channel(32);
     let member_principal = register_member_principal();
     let connection_id = session_manager
         .register_connection(member_tx, member_principal.clone())
@@ -837,7 +837,9 @@ async fn member_full_access_cli_request_is_capped_before_codex_permissions_adapt
     );
 }
 
-async fn recv_turn_terminal_notification(rx: &mut mpsc::Receiver<Message>) -> JsonRpcNotification {
+async fn recv_turn_terminal_notification(
+    rx: &mut crate::session::test_support::OutboundTestReceiver,
+) -> JsonRpcNotification {
     for _ in 0..200 {
         let payload = recv_text_timeout_context(
             rx,

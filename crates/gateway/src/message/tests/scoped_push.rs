@@ -6,8 +6,8 @@ use super::*;
 async fn scoped_push_delivers_committed_answer_and_read_without_tree_hint() {
     const THREAD: &str = "thrPushEvent000000001";
     const TURN: &str = "trnPushEvent000000001";
-    let (source_tx, mut source_rx) = mpsc::channel(128);
-    let (observer_tx, mut observer_rx) = mpsc::channel(128);
+    let (source_tx, mut source_rx) = crate::session::test_support::outbound_channel(128);
+    let (observer_tx, mut observer_rx) = crate::session::test_support::outbound_channel(128);
     let sessions = Arc::new(SessionManager::new());
     let source = register_authenticated_test_connection(&sessions, source_tx).await;
     let observer = register_authenticated_test_connection(&sessions, observer_tx).await;
@@ -223,7 +223,7 @@ async fn private_dirty_during_bootstrap_does_not_disclose_or_retire_member_scope
     const PRIVATE: &str = "T0000000000000000000B";
     let (workspaces, store, workspace) = setup_workspace_manager().await;
     let sessions = Arc::new(SessionManager::new());
-    let (source_tx, mut source_rx) = mpsc::channel(128);
+    let (source_tx, mut source_rx) = crate::session::test_support::outbound_channel(128);
     let source = register_authenticated_test_connection(&sessions, source_tx).await;
     let processor = MessageProcessor::new(
         Arc::new(ThreadManager::new("o4-mini", "openai")),
@@ -280,7 +280,7 @@ async fn private_dirty_during_bootstrap_does_not_disclose_or_retire_member_scope
     principal.principal_id = PrincipalId::new(MEMBER).unwrap();
     principal.kind = PrincipalKind::User;
     principal.role_key = Some(RoleKey::member());
-    let (member_tx, mut member_rx) = mpsc::channel(128);
+    let (member_tx, mut member_rx) = crate::session::test_support::outbound_channel(128);
     let member = sessions
         .register_connection(member_tx, Arc::new(principal))
         .await
@@ -443,7 +443,7 @@ async fn inbox_reset_keeps_delivered_coverage_and_point_ack_cannot_hide_reset() 
     use sea_orm::ConnectionTrait;
     let (workspaces, store, workspace) = setup_workspace_manager().await;
     let sessions = Arc::new(SessionManager::new());
-    let (tx, mut rx) = mpsc::channel(128);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(128);
     let connection = register_authenticated_test_connection(&sessions, tx).await;
     sessions
         .set_connection_workspace(connection, Some(workspace.clone()))

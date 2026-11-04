@@ -27,6 +27,11 @@ async fn cli_post_turn_extracts_user_memory_through_shared_provider_and_durable_
     let harness =
         setup_memory_agent_e2e_harness_with_tool_loop_config("cli_post_turn", registry, config)
             .await;
+    let source = format!(
+        "{}Меня зовут Александр{}tail",
+        "я".repeat(6000),
+        "я".repeat(12_000 - 6000 - "Меня зовут Александр".chars().count() - 4)
+    );
     // Both external adapters enter the same Pioneer turn completion path.
     for (kind, turn_id) in [
         ("codex", "cli-memory-codex"),
@@ -41,7 +46,7 @@ async fn cli_post_turn_extracts_user_memory_through_shared_provider_and_durable_
             &thread_id,
             turn_id,
             &format!("native-{turn_id}"),
-            "Меня зовут Александр",
+            &source,
         )
         .await;
         let binding = harness
@@ -82,20 +87,22 @@ async fn cli_post_turn_extracts_user_memory_through_shared_provider_and_durable_
     assert_eq!(
         records.len(),
         1,
-        "canonical user fact is updated, not duplicated across CLI turns"
+        "direct assertions follow the existing explicit-evidence candidate policy"
     );
     assert_eq!(
         records[0].source_turn_id.as_deref(),
         Some("cli-memory-codex"),
-        "an unchanged duplicate preserves the original evidence, just like native extraction"
+        "an unchanged duplicate preserves its original provenance"
     );
     let requests = provider.snapshot_requests();
-    assert!(
-        requests[0]
-            .messages
-            .iter()
-            .any(|m| m.content.contains("Меня зовут Александр"))
-    );
+    for request in requests {
+        assert!(request.tools.is_none());
+        assert_eq!(request.messages.len(), 2);
+        assert_eq!(request.messages[0].role, pioneer_provider::Role::System);
+        assert_eq!(request.messages[1].role, pioneer_provider::Role::User);
+        let data: serde_json::Value = serde_json::from_str(&request.messages[1].content).unwrap();
+        assert_eq!(data["user_text"], source);
+    }
 }
 
 fn final_answer(text: &str) -> TurnItem {

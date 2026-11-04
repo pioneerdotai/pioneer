@@ -3785,7 +3785,7 @@ mod tests {
             .unwrap();
         let old = authenticate_access_token(&service, &old_token).await;
         let sessions = crate::session::SessionManager::new();
-        let (outbound, mut responses) = tokio::sync::mpsc::channel(4);
+        let (outbound, mut responses) = crate::session::test_support::outbound_channel(4);
         let id = sessions
             .register_connection(outbound.clone(), old.clone())
             .await
@@ -3829,7 +3829,7 @@ mod tests {
                 release.notified().await;
             }
         };
-        let outbound = crate::session::SessionOutbound::from(outbound);
+
         let mut handlers = crate::transport::ConnectionHandlers::default();
         let pump = crate::transport::process_with_access_renewals(
             std::future::pending(),
@@ -3893,7 +3893,7 @@ mod tests {
             .unwrap();
         let old = authenticate_access_token(&service, &old_token).await;
         let sessions = crate::session::SessionManager::new();
-        let (outbound, mut responses) = tokio::sync::mpsc::channel(4);
+        let (outbound, mut responses) = crate::session::test_support::outbound_channel(4);
         let id = sessions
             .register_connection(outbound.clone(), old.clone())
             .await
@@ -3928,7 +3928,7 @@ mod tests {
         // no database capacity survives into the outbound acknowledgement.
         let transaction = service.database.begin().await.unwrap();
         let mut deferred = std::collections::VecDeque::new();
-        let outbound = crate::session::SessionOutbound::from(outbound);
+
         let mut handlers = crate::transport::ConnectionHandlers::default();
         let dispatch = |_, _| async { panic!("renewal fixture contains no domain RPC") };
         let processing = crate::transport::process_with_access_renewals(

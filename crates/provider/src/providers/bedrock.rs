@@ -2141,7 +2141,7 @@ mod tests {
             model: "anthropic.claude-3-sonnet-20240229-v1:0".to_owned(),
             messages: vec![
                 ChatMessage::system("legacy prompt should be ignored"),
-                ChatMessage::user("Hello"),
+                ChatMessage::user("turn-facts-2026-11-02\nHello"),
             ],
             temperature: None,
             max_tokens: None,
@@ -2165,6 +2165,16 @@ mod tests {
         assert_eq!(system_blocks.len(), 2);
         assert_eq!(system_blocks[0].text, "Stable rules");
         assert_eq!(system_blocks[1].text, "Dynamic runtime");
+        assert!(
+            serde_json::to_string(&_bedrock_msgs)
+                .unwrap()
+                .contains("turn-facts-2026-11-02")
+        );
+        assert!(
+            !serde_json::to_string(&system_blocks)
+                .unwrap()
+                .contains("turn-facts-2026-11-02")
+        );
     }
 
     #[test]

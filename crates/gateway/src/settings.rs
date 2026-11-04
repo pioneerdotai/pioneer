@@ -5211,6 +5211,7 @@ stderr_ring_lines = 73
             listen_addr: "0.0.0.0:17878".to_owned(),
             trusted_proxy_peers: Vec::new(),
             outbound_queue_capacity: 128,
+            outbound: Default::default(),
             keepawake,
             telemetry: Default::default(),
             thread: GatewayThreadConfig {

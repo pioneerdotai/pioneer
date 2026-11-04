@@ -872,7 +872,7 @@ async fn legacy_manifest_without_checkpoint_reclassifies_saved_candidate() {
 }
 
 #[tokio::test]
-async fn legacy_manifest_failure_stops_real_checkpoint_replay() {
+async fn legacy_manifest_failure_does_not_block_saved_checkpoint_replay() {
     let fixture = legacy_recovery_fixture(
         "manifest-checkpoint",
         vec![name_fact()],
@@ -883,12 +883,9 @@ async fn legacy_manifest_failure_stops_real_checkpoint_replay() {
     .await;
     corrupt_manifest_candidate(&fixture).await;
     execute_legacy_manifest(&fixture).await;
-    assert_eq!(
-        fixture.status().await.last_error_code.as_deref(),
-        Some("memory.post_turn_extractor.manifest_invalid_stored_data")
-    );
+    assert_eq!(fixture.status().await.status, "succeeded");
     assert_eq!(fixture.model.call_count(), 0);
-    assert!(fixture.writes.attempts.lock().unwrap().is_empty());
+    assert_eq!(fixture.writes.attempts.lock().unwrap().len(), 1);
 }
 
 #[tokio::test]
@@ -1892,4 +1889,62 @@ async fn legacy_manifest_worker_timeout_keeps_single_budget_after_database_reope
         drop(restarted);
         database.close().await.unwrap();
     }
+}
+
+#[tokio::test]
+async fn manifest_reports_further_pages_and_clipped_items_without_claiming_global_coverage() {
+    let fixture =
+        legacy_recovery_fixture("manifest-bounds", vec![], WriteMode::Pass, true, false).await;
+    let runtime = fixture.background.memory_runtime();
+    let operation = runtime.operation_context(Some(fixture._harness.workspace_id.clone()), None);
+    for index in 0..3 {
+        runtime
+            .service()
+            .remember(
+                operation.clone(),
+                memory_remember_params(
+                    user_memory_scope(),
+                    MemoryCategory::ProjectFact,
+                    Some(&format!("manifest-{index}")),
+                    "bounded content with a longer tail",
+                ),
+            )
+            .await
+            .unwrap();
+    }
+    let provider = GatewayMemoryProvider::new(Arc::downgrade(&fixture.background));
+    let manifest = provider
+        .load_memory_manifest(
+            MemoryTurnContext {
+                workspace_id: fixture._harness.workspace_id.clone(),
+                thread_id: "thread-manifest-bounds".into(),
+                conversation_thread_id: None,
+                turn_id: fixture.turn_id.clone(),
+                mode: ThreadMode::Agent,
+                input_text: String::new(),
+                task_id: None,
+                agent_id: None,
+                principal_id: None,
+            },
+            MemoryManifestRequest {
+                max_items: 2,
+                max_item_chars: 8,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(manifest.active.len(), 2);
+    assert!(manifest.truncated);
+    assert!(
+        manifest
+            .active
+            .iter()
+            .all(|item| item.content_truncated && item.content_preview == "bounded ...")
+    );
+    assert!(
+        manifest
+            .diagnostics
+            .iter()
+            .any(|reason| reason == "bounded_manifest_coverage_unknown")
+    );
 }

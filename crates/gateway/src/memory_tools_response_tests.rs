@@ -83,9 +83,13 @@ async fn extractor_completion_policy_stream_and_non_stream() {
                     StreamChunk::final_chunk_with(termination.clone()),
                 ],
             };
-            let result =
-                request_post_turn_extractor_json(&provider, "selected-model", "extract".to_owned())
-                    .await;
+            let result = request_post_turn_extractor_json(
+                &provider,
+                "selected-model",
+                "extract".to_owned(),
+                None,
+            )
+            .await;
             if let Some(class) = class {
                 let error = result.unwrap_err();
                 assert!(!error.retryable);
@@ -109,9 +113,10 @@ async fn extractor_eof_even_after_valid_json_is_retryable_but_missing_final_term
             response: response(ProviderTermination::Complete),
             chunks: vec![StreamChunk::delta(text)],
         };
-        let error = request_post_turn_extractor_json(&provider, "model", "extract".to_owned())
-            .await
-            .unwrap_err();
+        let error =
+            request_post_turn_extractor_json(&provider, "model", "extract".to_owned(), None)
+                .await
+                .unwrap_err();
         assert!(error.retryable);
         assert_eq!(metadata(&error, "failure_class"), "stream_truncated");
     }
@@ -122,7 +127,7 @@ async fn extractor_eof_even_after_valid_json_is_retryable_but_missing_final_term
         response: response(ProviderTermination::Complete),
         chunks: vec![final_chunk],
     };
-    let error = request_post_turn_extractor_json(&provider, "model", "extract".to_owned())
+    let error = request_post_turn_extractor_json(&provider, "model", "extract".to_owned(), None)
         .await
         .unwrap_err();
     assert!(!error.retryable);
@@ -147,9 +152,10 @@ async fn extractor_unexpected_tools_and_byte_limit_fail_closed() {
                 StreamChunk::final_chunk_with(ProviderTermination::Complete),
             ],
         };
-        let error = request_post_turn_extractor_json(&provider, "model", "extract".to_owned())
-            .await
-            .unwrap_err();
+        let error =
+            request_post_turn_extractor_json(&provider, "model", "extract".to_owned(), None)
+                .await
+                .unwrap_err();
         assert_eq!(metadata(&error, "failure_class"), "unexpected_tool_calls");
         assert!(!error.retryable);
         assert!(!format!("{error:?}").contains("PRIVATE_TOOL_CANARY"));
@@ -165,9 +171,10 @@ async fn extractor_unexpected_tools_and_byte_limit_fail_closed() {
                 StreamChunk::final_chunk_with(ProviderTermination::Complete),
             ],
         };
-        let error = request_post_turn_extractor_json(&provider, "model", "extract".to_owned())
-            .await
-            .unwrap_err();
+        let error =
+            request_post_turn_extractor_json(&provider, "model", "extract".to_owned(), None)
+                .await
+                .unwrap_err();
         assert_eq!(metadata(&error, "failure_class"), "response_too_large");
         assert!(!error.retryable);
     }
@@ -280,7 +287,7 @@ async fn extractor_uses_result_projection_and_drains_after_phased_terminal() {
             chunks,
         };
         assert_eq!(
-            request_post_turn_extractor_json(&provider, "selected-model", "extract".into())
+            request_post_turn_extractor_json(&provider, "selected-model", "extract".into(), None)
                 .await
                 .unwrap(),
             r#"{"facts":[]}"#

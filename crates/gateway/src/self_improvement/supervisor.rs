@@ -3088,21 +3088,27 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(native_requests.len() >= 2);
         let first = &native_requests[0];
-        let compiled = first
-            .compiled_prompt
-            .as_ref()
-            .expect("native request must use production prompt compiler");
         assert!(
-            compiled
-                .full_system_text
+            first.compiled_prompt.is_some(),
+            "native request must use production prompt compiler"
+        );
+        let prepared_input = first
+            .messages
+            .iter()
+            .find(|message| {
+                message
+                    .application_context
+                    .as_ref()
+                    .is_some_and(|metadata| metadata["kind"] == "turn_input")
+            })
+            .expect("native request must carry prepared turn input");
+        assert!(
+            prepared_input
+                .content
                 .contains(&format!("skill:{skill_id}"))
         );
-        assert!(compiled.full_system_text.contains(version_id.as_str()));
-        assert!(
-            compiled
-                .full_system_text
-                .contains("Verify release checksum")
-        );
+        assert!(prepared_input.content.contains(version_id.as_str()));
+        assert!(prepared_input.content.contains("Verify release checksum"));
         assert!(
             first
                 .tools

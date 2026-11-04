@@ -525,7 +525,7 @@ async fn detached_work_tombstones_require_current_authorization_and_authoritativ
     thread.update(&store.database_connection()).await.unwrap();
     materialize_test_member_collaborator(store.as_ref(), &harness.workspace_id, &harness.thread_id)
         .await;
-    let (tx, mut rx) = mpsc::channel(32);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(32);
     let member = harness
         .processor
         .session_manager

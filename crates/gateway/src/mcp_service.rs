@@ -2632,7 +2632,7 @@ impl McpService {
             if let Err(error) = self
                 .inner
                 .session_manager
-                .send_text(connection_id, serialized.clone())
+                .try_send_notification_text(connection_id, serialized.clone())
                 .await
             {
                 warn!(
@@ -5723,11 +5723,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn management_notification_overload_retires_instead_of_using_reply_reserve() {
+        let (service, _, _) = test_mcp_service().await;
+        let sessions = &service.inner.session_manager;
+        let (sender, _receiver) = crate::session::test_support::outbound_channel(2);
+        let id = sessions
+            .register_connection(sender.clone(), authenticated_test_superuser())
+            .await
+            .unwrap();
+        sender
+            .try_send_data(axum::extract::ws::Message::Text("occupied".into()))
+            .unwrap();
+        service
+            .send_management_notification("test/mcp-management", &json!({"name":"private-server"}))
+            .await;
+        assert!(sessions.connection_principal(id).await.is_err());
+        assert!(
+            sender
+                .send(axum::extract::ws::Message::Close(None))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
     async fn management_notifications_are_superuser_only() {
         let (service, _, _) = test_mcp_service().await;
         let session_manager = service.inner.session_manager.clone();
 
-        let (superuser_tx, mut superuser_rx) = mpsc::channel(2);
+        let (superuser_tx, mut superuser_rx) = crate::session::test_support::outbound_channel(2);
         session_manager
             .register_connection(superuser_tx, authenticated_test_superuser())
             .await
@@ -5740,7 +5764,7 @@ mod tests {
         member.role_key = Some(RoleKey::member());
         member.device_id = DeviceId::new("D0000000000000000000A").expect("Member device id");
         member.session_id = AuthSessionId::new("S0000000000000000000A").expect("Member session id");
-        let (member_tx, mut member_rx) = mpsc::channel(2);
+        let (member_tx, mut member_rx) = crate::session::test_support::outbound_channel(2);
         session_manager
             .register_connection(member_tx, Arc::new(member))
             .await
@@ -7902,7 +7926,8 @@ mod tests {
             let (old, store, workspace, secrets) = test_mcp_service_with_secrets().await;
             old.shutdown().await;
             let sessions = Arc::new(SessionManager::new());
-            let (recipient_tx, mut recipient) = mpsc::channel(1024);
+            let (recipient_tx, mut recipient) =
+                crate::session::test_support::outbound_channel(1024);
             let mut principal = (*authenticated_test_superuser()).clone();
             principal.access_expires_at_unix = now_timestamp_secs() as u64 + 3600;
             let client = sessions
@@ -8113,7 +8138,8 @@ mod tests {
             let (old, store, workspace, secrets) = test_mcp_service_with_secrets().await;
             old.shutdown().await;
             let sessions = Arc::new(SessionManager::new());
-            let (recipient_tx, mut recipient) = mpsc::channel(1024);
+            let (recipient_tx, mut recipient) =
+                crate::session::test_support::outbound_channel(1024);
             let mut principal = (*authenticated_test_superuser()).clone();
             principal.access_expires_at_unix = now_timestamp_secs() as u64 + 3600;
             let client = sessions
@@ -8261,7 +8287,7 @@ mod tests {
             .unwrap();
             if deadline {
                 async fn wire_state(
-                    recipient: &mut mpsc::Receiver<axum::extract::ws::Message>,
+                    recipient: &mut crate::session::test_support::OutboundTestReceiver,
                     state: &str,
                 ) -> JsonValue {
                     tokio::time::timeout(Duration::from_secs(3), async {
@@ -8283,7 +8309,8 @@ mod tests {
                 let resolving = wire_state(&mut recipient, "resolving").await;
                 assert_eq!(resolving["flow_id"], browser["flow_id"]);
                 assert!(resolving["authorization_url"].is_null());
-                let (second_tx, mut second_rx) = mpsc::channel(1024);
+                let (second_tx, mut second_rx) =
+                    crate::session::test_support::outbound_channel(1024);
                 let mut second_principal = (*authenticated_test_superuser()).clone();
                 second_principal.access_expires_at_unix = now_timestamp_secs() as u64 + 3600;
                 let second = sessions

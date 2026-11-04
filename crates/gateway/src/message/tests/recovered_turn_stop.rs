@@ -105,7 +105,7 @@ fn recovered_turn_stop_active_observation_restore_failure_does_not_succeed_recov
 async fn open(
     processor: &MessageProcessor,
     connection_id: ConnectionId,
-    rx: &mut mpsc::Receiver<Message>,
+    rx: &mut crate::session::test_support::OutboundTestReceiver,
     client: &ClientCore,
     thread_id: &str,
     workspace_id: &str,
@@ -136,7 +136,10 @@ fn active(client: &ClientCore, thread_id: &str) -> ActiveThreadSnapshot {
     ActiveThreadSnapshot::from_coordinator(Some(thread_id), Some(&coordinator), false)
 }
 
-async fn receive_update(rx: &mut mpsc::Receiver<Message>, client: &ClientCore) -> Thread {
+async fn receive_update(
+    rx: &mut crate::session::test_support::OutboundTestReceiver,
+    client: &ClientCore,
+) -> Thread {
     let notification = recv_notification_by_method(rx, events::THREAD_UPDATED).await;
     let GatewayNotification::ThreadUpdated(update) =
         GatewayNotification::from_jsonrpc(notification).unwrap()
@@ -151,7 +154,7 @@ async fn receive_update(rx: &mut mpsc::Receiver<Message>, client: &ClientCore) -
 pub(super) async fn exercise(
     mut processor: MessageProcessor,
     connection_id: ConnectionId,
-    rx: &mut mpsc::Receiver<Message>,
+    rx: &mut crate::session::test_support::OutboundTestReceiver,
     cli_session: Arc<RecordingCliRuntimeSession>,
     event: crate::resilience::RecoveryCoordinatorEvent,
     scenario: Scenario,
@@ -230,6 +233,55 @@ pub(super) async fn exercise(
 
     if matches!(scenario, Scenario::ExecutionChild) {
         assert_ne!(thread_id, binding.continuation_thread_id);
+        use crate::cli_runtime::skills::{
+            CliRuntimeSkillInstallResult, CliRuntimeSkillInstallStatus,
+        };
+        use pioneer_cli_agent_runtime::input::{
+            CLIRuntimeTurnInputItem, CLIRuntimeTurnInputMapping,
+        };
+        let installed =
+            ["pioneer-system-tasks", "selected"].map(|name| CliRuntimeSkillInstallResult {
+                status: CliRuntimeSkillInstallStatus::Current,
+                install_name: name.into(),
+                source_folder_hash: format!("hash-{name}"),
+                installed_path: std::path::PathBuf::from(format!("/recorded-skills/{name}")),
+                receipt_updated_at_unix_ms: 1,
+            });
+        let mut mapping = CLIRuntimeTurnInputMapping {
+            input: vec![CLIRuntimeTurnInputItem::Text {
+                text: "saved dispatch request".into(),
+            }],
+            diagnostics: Vec::new(),
+        };
+        crate::cli_runtime::skills::prepend_cli_skill_delivery(
+            &installed,
+            &["selected".into()],
+            &mut mapping,
+        );
+        let saved_input = serde_json::to_value(&mapping.input).unwrap();
+        let now = chrono::Utc::now().fixed_offset();
+        let receipt_id = pioneer_protocol::generate_id(24);
+        // Existing recovery reads this saved dispatch receipt; it does not
+        // reconstruct skill delivery from installation state or call the helper
+        // again. The recording session never loads actual skill bodies.
+        processor
+            .crud_store
+            .append_cli_runtime_native_event_if_absent(pioneer_crud::NewCliRuntimeNativeEvent {
+                id: receipt_id.clone(),
+                runtime_id: binding.runtime_id.clone(),
+                runtime_kind: binding.runtime_kind.clone(),
+                workspace_id: Some(workspace_id.clone()),
+                thread_id: Some(thread_id.clone()),
+                turn_id: Some(turn_id.clone()),
+                native_thread_id: Some(binding.native_thread_id.clone()),
+                native_turn_id: None,
+                native_method: "gateway/task_continuation".into(),
+                payload_redacted_json: json!({"input":saved_input}).to_string(),
+                sequence: now.timestamp_millis(),
+                created_at: now,
+            })
+            .await
+            .unwrap();
         assert!(matches!(
             processor
                 .start_cli_runtime_recovery_attempt(request.clone())
@@ -256,7 +308,41 @@ pub(super) async fn exercise(
             manager.thread_get(&thread_id).await.unwrap().turns,
             vec![saved_turn]
         );
-        assert_eq!(cli_session.turn_starts.lock().await.len(), 1);
+        let starts = cli_session.turn_starts.lock().await;
+        assert_eq!(starts.len(), 1);
+        let sent = starts[0].input.as_array().unwrap();
+        let saved_items = saved_input.as_array().unwrap();
+        assert!(
+            sent.windows(saved_items.len())
+                .any(|items| items == saved_items.as_slice())
+        );
+        assert_eq!(
+            sent.iter().filter(|item| item["type"] == "skill").count(),
+            1
+        );
+        assert_eq!(
+            sent.iter()
+                .filter(|item| item["text"]
+                    .as_str()
+                    .is_some_and(|text| text.starts_with("Current required Pioneer skill exports")))
+                .count(),
+            1
+        );
+        assert!(
+            sent.iter()
+                .filter_map(|item| item["text"].as_str())
+                .any(|text| text.contains("hash-pioneer-system-tasks"))
+        );
+        drop(starts);
+        let reopened = CrudStore::new(processor.crud_store.database_connection());
+        let receipt = reopened
+            .get_cli_runtime_native_event(&receipt_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let saved_payload: JsonValue =
+            serde_json::from_str(&receipt.payload_redacted_json).unwrap();
+        assert_eq!(saved_payload["input"], saved_input);
         return;
     }
 
@@ -603,7 +689,7 @@ pub(super) async fn exercise(
 async fn exercise_active_observation(
     mut processor: MessageProcessor,
     connection_id: ConnectionId,
-    rx: &mut mpsc::Receiver<Message>,
+    rx: &mut crate::session::test_support::OutboundTestReceiver,
     cli_session: Arc<RecordingCliRuntimeSession>,
     event: crate::resilience::RecoveryCoordinatorEvent,
     scenario: Scenario,

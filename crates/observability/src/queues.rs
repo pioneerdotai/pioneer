@@ -92,13 +92,14 @@ fn record(epoch: u64, kind: QueueKind, event: &'static str, count: u64) {
     let Some(index) = EVENTS_CATALOG.iter().position(|s| *s == event) else {
         return;
     };
-    live::with_store(epoch, |state| {
-        let dest = &mut state.queue_counts[kind as usize * 15 + index];
-        if dest.checked_add(count).is_none() {
-            state.metric_overflow = true;
-        }
-        *dest = dest.saturating_add(count);
-    });
+    live::with_store(epoch, |state| record_in_store(state, kind, index, count));
+}
+fn record_in_store(state: &mut LiveStore, kind: QueueKind, index: usize, count: u64) {
+    let dest = &mut state.queue_counts[kind as usize * 15 + index];
+    if dest.checked_add(count).is_none() {
+        state.metric_overflow = true;
+    }
+    *dest = dest.saturating_add(count);
 }
 pub(crate) fn emit_pending() {
     let (enabled, epoch) = crate::telemetry_consent_snapshot();
@@ -129,6 +130,15 @@ pub(crate) fn emit_pending() {
         }
     }
 }
+/// Closed native database admission milestones.
+#[derive(Clone, Copy, Debug)]
+pub enum AdmissionTransition {
+    Enqueued,
+    Acquired,
+    Released,
+    Cancelled,
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[serde(tag = "quality", content = "bytes", rename_all = "snake_case")]
 pub enum QueueBytes {
@@ -483,6 +493,23 @@ impl QueueObserver {
         sampled_ms: Option<u64>,
         callback: impl FnOnce(&mut QueueState) -> bool,
     ) {
+        self.with_registered_store(epoch, |state, id| {
+            if let Some(queue) = id.and_then(|id| state.queues.get_mut(&id)) {
+                if callback(queue) {
+                    if let Some(at) = sampled_ms {
+                        queue.snapshot.last_observed_ms = at;
+                    } else if !queue.has_owner_current() {
+                        queue.snapshot.last_observed_ms = monotonic_ms();
+                    }
+                }
+            }
+        });
+    }
+    fn with_registered_store(
+        &self,
+        epoch: u64,
+        callback: impl FnOnce(&mut LiveStore, Option<u64>),
+    ) {
         if !crate::telemetry_sample_allowed(Some(epoch)) {
             return;
         }
@@ -526,18 +553,10 @@ impl QueueObserver {
             .flatten();
             *lease = id.map(|id| QueueLease { id, epoch });
         }
-        let Some(lease) = lease.as_ref() else { return };
-        live::with_store(lease.epoch, |state| {
-            if let Some(queue) = state.queues.get_mut(&lease.id) {
-                if callback(queue) {
-                    if let Some(at) = sampled_ms {
-                        queue.snapshot.last_observed_ms = at;
-                    } else if !queue.has_owner_current() {
-                        queue.snapshot.last_observed_ms = monotonic_ms();
-                    }
-                }
-            }
-        });
+        // Registration exhaustion loses owner metadata, not aggregate events
+        // or the work wait lifecycle. No second source of queue truth.
+        let id = lease.as_ref().map(|lease| lease.id);
+        live::with_store(epoch, |state| callback(state, id));
     }
     pub fn enqueued(&self, bytes: QueueBytes) {
         let Some(epoch) = self.observation_epoch() else {
@@ -676,6 +695,77 @@ impl QueueObserver {
             true
         });
     }
+    /// One registry visit for a native admission milestone, event counters,
+    /// source-ordered current state and the current work's paired wait state.
+    /// A stale revision rejects only current state, never a legitimate event.
+    pub fn native_admission_transition(
+        &self,
+        event: AdmissionTransition,
+        expected_epoch: u64,
+        revision: u64,
+        sampled_ms: u64,
+        depth: usize,
+        oldest_waited_ms: Option<u64>,
+    ) {
+        if self
+            .expected_epoch
+            .is_some_and(|epoch| epoch != expected_epoch)
+        {
+            return;
+        }
+        let context =
+            crate::work::current().filter(|context| context.consent_generation == expected_epoch);
+        self.with_registered_store(expected_epoch, |state, id| {
+            if let Some(queue) = id.and_then(|id| state.queues.get_mut(&id)) {
+                match event {
+                    AdmissionTransition::Enqueued => {
+                        queue.enqueue(QueueBytes::Unsupported, sampled_ms)
+                    }
+                    AdmissionTransition::Acquired => queue.dequeue(QueueBytes::Unsupported),
+                    AdmissionTransition::Released => queue.outcome(QueueOutcome::Processed, 1),
+                    AdmissionTransition::Cancelled => {
+                        queue.dequeue(QueueBytes::Unsupported);
+                        queue.outcome(QueueOutcome::Cancelled, 1);
+                    }
+                }
+                if revision == u64::MAX {
+                    queue.snapshot.metadata_overflow =
+                        queue.snapshot.metadata_overflow.saturating_add(1);
+                } else if queue
+                    .native_revision
+                    .is_none_or(|current| revision > current)
+                {
+                    queue.native_revision = Some(revision);
+                    queue.snapshot.initial_depth_known = true;
+                    queue.snapshot.depth = depth as u64;
+                    queue.native_oldest_recorded = depth == 0 || oldest_waited_ms.is_some();
+                    queue.native_oldest = oldest_waited_ms.map(|age| (sampled_ms, age));
+                    queue.snapshot.last_observed_ms = sampled_ms;
+                }
+            }
+            // Catalog indices are shared with emit_pending; cancellation has
+            // both a dequeue and a terminal outcome, as on the separate path.
+            match event {
+                AdmissionTransition::Enqueued => record_in_store(state, self.inner.kind, 0, 1),
+                AdmissionTransition::Acquired => record_in_store(state, self.inner.kind, 1, 1),
+                AdmissionTransition::Released => record_in_store(state, self.inner.kind, 2, 1),
+                AdmissionTransition::Cancelled => {
+                    record_in_store(state, self.inner.kind, 1, 1);
+                    record_in_store(state, self.inner.kind, 4, 1);
+                }
+            }
+            if let Some(context) = context {
+                if !matches!(event, AdmissionTransition::Released) {
+                    live::admission_wait_in_store(
+                        state,
+                        context,
+                        matches!(event, AdmissionTransition::Enqueued),
+                        sampled_ms,
+                    );
+                }
+            }
+        });
+    }
     /// The owner holds its native queue lock and supplies its actual front.
     /// Depth alone does not establish age. Old-epoch fronts remain unavailable.
     pub fn native_item_head<T>(&self, depth: usize, head: Option<&crate::work::WorkItem<T>>) {
@@ -805,6 +895,123 @@ thread_local! { static MUTATION_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn fused_admission_keeps_late_events_wait_nesting_and_journal() {
+        use crate::work::{Boundary, ExecutorRole, Trigger, WorkCarrier, WorkKind};
+        let _lock = crate::telemetry::tests::TELEMETRY_TEST_LOCK.lock().unwrap();
+        let previous = crate::telemetry_enabled();
+        crate::set_telemetry_enabled(false);
+        crate::set_telemetry_enabled(true);
+        let epoch = crate::telemetry_consent_snapshot().1;
+        let queue = QueueObserver::new(QueueKind::DatabaseReadAdmission, None, "fused fixture");
+        let carrier = WorkCarrier::independent(
+            Boundary::Timer,
+            WorkKind::Maintenance,
+            Trigger::Timer,
+            ExecutorRole::Gateway,
+        );
+        let context = carrier.context().unwrap();
+        let _work = live::WorkGuard::start(Some(context), false);
+        let _scope = carrier.enter();
+        let now = monotonic_ms();
+        let before = live::snapshot().unwrap();
+        let initial_state = before.active[0].state;
+        let initial_stage = before.active[0].stage;
+        // Newer owner state arrives before delayed event callbacks.
+        queue.native_admission_snapshot(epoch, 100, now, 0, None);
+        for revision in 1..=6 {
+            queue.native_admission_transition(
+                AdmissionTransition::Enqueued,
+                epoch,
+                revision,
+                now,
+                1,
+                None,
+            );
+        }
+        let waiting = live::snapshot().unwrap();
+        assert_eq!(
+            waiting.active[0].state,
+            live::WorkState::Waiting(live::WaitKind::DatabaseAdmission)
+        );
+        assert_eq!(waiting.active[0].wait_overflow, 2);
+        for revision in 7..=12 {
+            queue.native_admission_transition(
+                AdmissionTransition::Cancelled,
+                epoch,
+                revision,
+                now,
+                0,
+                None,
+            );
+        }
+        let after = live::snapshot().unwrap();
+        let q = &after.queues[0];
+        assert_eq!(
+            (
+                q.offered,
+                q.enqueued,
+                q.dequeued,
+                q.cancelled,
+                q.in_processing
+            ),
+            (6, 6, 6, 6, 0)
+        );
+        assert_eq!(
+            (q.depth, q.oldest_age_ms, q.last_observed_ms),
+            (0, None, now)
+        );
+        assert_eq!(after.active[0].state, initial_state);
+        assert_eq!(after.active[0].stage, initial_stage);
+        assert_eq!(after.active[0].wait_overflow, 0);
+        assert_eq!(after.journal.len(), before.journal.len() + 12);
+        live::with_store(epoch, |state| {
+            let base = QueueKind::DatabaseReadAdmission as usize * 15;
+            assert_eq!(
+                (
+                    state.queue_counts[base],
+                    state.queue_counts[base + 1],
+                    state.queue_counts[base + 4]
+                ),
+                (6, 6, 6)
+            );
+        });
+        crate::set_telemetry_enabled(false);
+        crate::set_telemetry_enabled(true);
+        queue.native_admission_transition(AdmissionTransition::Enqueued, epoch, 101, now, 1, None);
+        assert!(live::snapshot().unwrap().queues.is_empty());
+        let fresh_epoch = crate::telemetry_consent_snapshot().1;
+        live::with_store(fresh_epoch, |state| {
+            assert!(state.queue_counts.iter().all(|n| *n == 0))
+        });
+        crate::set_telemetry_enabled(previous);
+    }
+
+    #[test]
+    fn fused_admission_retains_aggregate_events_when_registration_is_exhausted() {
+        let _lock = crate::telemetry::tests::TELEMETRY_TEST_LOCK.lock().unwrap();
+        let previous = crate::telemetry_enabled();
+        crate::set_telemetry_enabled(false);
+        crate::set_telemetry_enabled(true);
+        let epoch = crate::telemetry_consent_snapshot().1;
+        live::with_store(epoch, |state| state.next_queue = u64::MAX);
+        let queue = QueueObserver::new(QueueKind::DatabaseAdmission, None, "exhausted fixture");
+        for event in [
+            AdmissionTransition::Enqueued,
+            AdmissionTransition::Acquired,
+            AdmissionTransition::Released,
+        ] {
+            queue.native_admission_transition(event, epoch, 1, monotonic_ms(), 0, None);
+        }
+        live::with_store(epoch, |state| {
+            assert!(state.queues.is_empty());
+            assert!(state.queue_overflow > 0);
+            let base = QueueKind::DatabaseAdmission as usize * 15;
+            assert_eq!(&state.queue_counts[base..base + 3], &[1, 1, 1]);
+        });
+        crate::set_telemetry_enabled(previous);
+    }
+
     #[test]
     fn owner_current_event_milestones_preserve_depth_head_and_source_freshness() {
         let _lock = crate::telemetry::tests::TELEMETRY_TEST_LOCK.lock().unwrap();

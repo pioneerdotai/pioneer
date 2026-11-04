@@ -1,9 +1,12 @@
-use pioneer_observability::queues::{QueueBytes, QueueKind, QueueObserver, QueueOutcome};
+use pioneer_observability::queues::{
+    AdmissionTransition, QueueBytes, QueueKind, QueueObserver, QueueOutcome,
+};
 use std::sync::Arc;
 
 use pioneer_observability::{
     DatabaseAdmissionMetric, DatabaseReadAdmissionMetric, DatabaseReadMetric,
-    record_database_admission, record_database_read, record_database_read_admission,
+    record_database_admission_for_consent, record_database_read_admission_for_consent,
+    record_database_read_for_consent,
 };
 use pioneer_sqlite::{
     SqliteAdmissionSnapshot, SqliteReadEvent, SqliteReadObserver, SqliteWriteEvent,
@@ -26,10 +29,38 @@ impl Default for GatewaySqliteReadObserver {
 }
 
 impl SqliteReadObserver for GatewaySqliteReadObserver {
+    fn observe_admission(&self, event: SqliteReadEvent, snapshot: SqliteAdmissionSnapshot) {
+        if pioneer_observability::telemetry_consent_snapshot()
+            != (true, snapshot.consent_generation)
+        {
+            return;
+        }
+        let transition = match event {
+            SqliteReadEvent::AdmissionEnqueued { .. } => AdmissionTransition::Enqueued,
+            SqliteReadEvent::AdmissionAcquired { .. } => AdmissionTransition::Acquired,
+            SqliteReadEvent::AdmissionReleased { .. } => AdmissionTransition::Released,
+            SqliteReadEvent::AdmissionCancelled { .. } => AdmissionTransition::Cancelled,
+            SqliteReadEvent::OperationFinished { .. } => {
+                self.record_metric(event, Some(snapshot.consent_generation));
+                return;
+            }
+        };
+        self.queue.native_admission_transition(
+            transition,
+            snapshot.consent_generation,
+            snapshot.revision,
+            snapshot.sampled_monotonic_ms,
+            snapshot.depth,
+            snapshot.oldest_waited_ms,
+        );
+        self.record_metric(event, Some(snapshot.consent_generation));
+    }
     fn observe_queue_snapshot(&self, snapshot: SqliteAdmissionSnapshot) {
         apply_current(&self.queue, snapshot);
     }
     fn observe(&self, event: SqliteReadEvent) {
+        let (enabled, epoch) = pioneer_observability::telemetry_consent_snapshot();
+        let generation = enabled.then_some(epoch);
         match event {
             SqliteReadEvent::AdmissionEnqueued { .. } => {
                 self.queue.enqueued(QueueBytes::Unsupported);
@@ -50,27 +81,45 @@ impl SqliteReadObserver for GatewaySqliteReadObserver {
             _ => {}
         }
 
+        self.record_metric(event, generation);
+    }
+}
+
+impl GatewaySqliteReadObserver {
+    fn record_metric(&self, event: SqliteReadEvent, generation: Option<u64>) {
         match event {
             SqliteReadEvent::OperationFinished {
                 class,
                 outcome,
                 elapsed,
-            } => record_database_read(DatabaseReadMetric {
-                class: class.as_str(),
-                outcome: outcome.as_str(),
-                elapsed,
-            }),
+            } => record_database_read_for_consent(
+                DatabaseReadMetric {
+                    class: class.as_str(),
+                    outcome: outcome.as_str(),
+                    elapsed,
+                },
+                generation,
+            ),
             SqliteReadEvent::AdmissionEnqueued {
                 class,
                 queue_depth,
                 active,
-            } => record_read_admission("enqueued", class.as_str(), queue_depth, active, None, None),
+            } => record_read_admission(
+                generation,
+                "enqueued",
+                class.as_str(),
+                queue_depth,
+                active,
+                None,
+                None,
+            ),
             SqliteReadEvent::AdmissionAcquired {
                 class,
                 waited,
                 queue_depth,
                 active,
             } => record_read_admission(
+                generation,
                 "acquired",
                 class.as_str(),
                 queue_depth,
@@ -84,6 +133,7 @@ impl SqliteReadObserver for GatewaySqliteReadObserver {
                 queue_depth,
                 active,
             } => record_read_admission(
+                generation,
                 "released",
                 class.as_str(),
                 queue_depth,
@@ -97,6 +147,7 @@ impl SqliteReadObserver for GatewaySqliteReadObserver {
                 queue_depth,
                 active,
             } => record_read_admission(
+                generation,
                 "cancelled",
                 class.as_str(),
                 queue_depth,
@@ -109,6 +160,7 @@ impl SqliteReadObserver for GatewaySqliteReadObserver {
 }
 
 fn record_read_admission(
+    generation: Option<u64>,
     event: &'static str,
     class: &'static str,
     queue_depth: usize,
@@ -116,14 +168,17 @@ fn record_read_admission(
     waited: Option<std::time::Duration>,
     held: Option<std::time::Duration>,
 ) {
-    record_database_read_admission(DatabaseReadAdmissionMetric {
-        event,
-        class,
-        queue_depth: u64::try_from(queue_depth).unwrap_or(u64::MAX),
-        active: u64::try_from(active).unwrap_or(u64::MAX),
-        waited,
-        held,
-    });
+    record_database_read_admission_for_consent(
+        DatabaseReadAdmissionMetric {
+            event,
+            class,
+            queue_depth: u64::try_from(queue_depth).unwrap_or(u64::MAX),
+            active: u64::try_from(active).unwrap_or(u64::MAX),
+            waited,
+            held,
+        },
+        generation,
+    );
 }
 
 struct GatewaySqliteWriteObserver {
@@ -142,10 +197,34 @@ impl Default for GatewaySqliteWriteObserver {
 }
 
 impl SqliteWriteObserver for GatewaySqliteWriteObserver {
+    fn observe_admission(&self, event: SqliteWriteEvent, snapshot: SqliteAdmissionSnapshot) {
+        if pioneer_observability::telemetry_consent_snapshot()
+            != (true, snapshot.consent_generation)
+        {
+            return;
+        }
+        let transition = match event {
+            SqliteWriteEvent::Enqueued { .. } => AdmissionTransition::Enqueued,
+            SqliteWriteEvent::Acquired { .. } => AdmissionTransition::Acquired,
+            SqliteWriteEvent::Released { .. } => AdmissionTransition::Released,
+            SqliteWriteEvent::Cancelled { .. } => AdmissionTransition::Cancelled,
+        };
+        self.queue.native_admission_transition(
+            transition,
+            snapshot.consent_generation,
+            snapshot.revision,
+            snapshot.sampled_monotonic_ms,
+            snapshot.depth,
+            snapshot.oldest_waited_ms,
+        );
+        self.record_metric(event, Some(snapshot.consent_generation));
+    }
     fn observe_queue_snapshot(&self, snapshot: SqliteAdmissionSnapshot) {
         apply_current(&self.queue, snapshot);
     }
     fn observe(&self, event: SqliteWriteEvent) {
+        let (enabled, epoch) = pioneer_observability::telemetry_consent_snapshot();
+        let generation = enabled.then_some(epoch);
         let queue = match event {
             SqliteWriteEvent::Enqueued { queue, .. } => {
                 self.queue.enqueued(QueueBytes::Unsupported);
@@ -170,6 +249,12 @@ impl SqliteWriteObserver for GatewaySqliteWriteObserver {
         };
         let _ = queue; // current depth comes from the owner snapshot callback below.
 
+        self.record_metric(event, generation);
+    }
+}
+
+impl GatewaySqliteWriteObserver {
+    fn record_metric(&self, event: SqliteWriteEvent, generation: Option<u64>) {
         let metric = match event {
             SqliteWriteEvent::Enqueued { class, queue } => {
                 admission_metric("enqueued", class.as_str(), "none", queue, None, None)
@@ -203,7 +288,7 @@ impl SqliteWriteObserver for GatewaySqliteWriteObserver {
                 None,
             ),
         };
-        record_database_admission(metric);
+        record_database_admission_for_consent(metric, generation);
     }
 }
 
@@ -282,24 +367,28 @@ mod current_tests {
             ..old
         };
         writer.observe_queue_snapshot(new);
-        writer.observe(SqliteWriteEvent::Enqueued {
-            class: pioneer_sqlite::SqliteWriteClass::Maintenance,
-            queue: SqliteWriteQueueSnapshot {
-                maintenance: 1,
-                ..Default::default()
+        writer.observe_admission(
+            SqliteWriteEvent::Enqueued {
+                class: pioneer_sqlite::SqliteWriteClass::Maintenance,
+                queue: SqliteWriteQueueSnapshot {
+                    maintenance: 1,
+                    ..Default::default()
+                },
             },
-        });
-        writer.observe_queue_snapshot(old);
+            old,
+        );
         reader.observe_queue_snapshot(new);
-        reader.observe(SqliteReadEvent::AdmissionEnqueued {
-            class: pioneer_sqlite::SqliteReadClass::Maintenance,
-            queue_depth: 1,
-            active: 0,
-        });
-        reader.observe_queue_snapshot(SqliteAdmissionSnapshot {
-            oldest_waited_ms: None,
-            ..old
-        });
+        reader.observe_admission(
+            SqliteReadEvent::AdmissionEnqueued {
+                class: pioneer_sqlite::SqliteReadClass::Maintenance,
+                queue_depth: 1,
+                active: 0,
+            },
+            SqliteAdmissionSnapshot {
+                oldest_waited_ms: None,
+                ..old
+            },
+        );
         let s = pioneer_observability::live::snapshot().unwrap();
         for definition in ["fixture versioned writer", "fixture versioned reader"] {
             let q = s

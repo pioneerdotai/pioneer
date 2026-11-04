@@ -1531,7 +1531,7 @@ fn supported_test_cli_mcp_readiness(
 }
 
 struct CliRuntimeSecurityHarness {
-    rx: mpsc::Receiver<Message>,
+    rx: crate::session::test_support::OutboundTestReceiver,
     connection_id: ConnectionId,
     thread_manager: Arc<ThreadManager>,
     provider_registry: Arc<pioneer_provider::ProviderRegistry>,
@@ -1559,7 +1559,7 @@ async fn setup_cli_runtime_security_harness_for_principal(
     // Composer children running at once. Keep the test transport bounded but
     // large enough that durable lifecycle notifications cannot deadlock the
     // producer before the next response drain.
-    let (tx, rx) = mpsc::channel(512);
+    let (tx, rx) = crate::session::test_support::outbound_channel(512);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = match principal {
         Some(principal) => session_manager
@@ -2115,7 +2115,7 @@ fn skill_pack_turn_normalization_is_authoritative_ordered_and_fail_closed() {
 
 pub(super) struct CliRuntimeSkillPreflightHarness {
     _temp: tempfile::TempDir,
-    rx: mpsc::Receiver<Message>,
+    rx: crate::session::test_support::OutboundTestReceiver,
     pub(super) connection_id: ConnectionId,
     thread_manager: Arc<ThreadManager>,
     pub(super) crud_store: Arc<CrudStore>,
@@ -2183,7 +2183,7 @@ pub(super) async fn setup_cli_runtime_skill_preflight_harness(
         .unwrap();
     crate::settings::save_gateway_settings(&settings_path, &settings).unwrap();
 
-    let (tx, rx) = mpsc::channel(512);
+    let (tx, rx) = crate::session::test_support::outbound_channel(512);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -2639,6 +2639,64 @@ async fn capability_persistence_order_impl() {
             runtime_kind,
             CLIAgentRuntimeKind::Codex | CLIAgentRuntimeKind::OpenCode
         ) {
+            // Read the actual dispatch saved before native start, using a fresh
+            // repository handle rather than serializing the helper result.
+            let reopened = CrudStore::new(harness.crud_store.database_connection());
+            let saved = reopened
+                .get_cli_runtime_turn_binding(&turn_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let saved_mapping: JsonValue = serde_json::from_str(&saved.input_mapping_json).unwrap();
+            assert_eq!(saved_mapping["input"], native_turn.input);
+            let required = saved_mapping["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|item| item["text"].as_str())
+                .find(|text| text.starts_with("Current required Pioneer skill exports"))
+                .expect("required references must cross dispatch persistence");
+            for name in [
+                "pioneer-system-tasks",
+                "pioneer-system-subagents",
+                "pioneer-system-html",
+                "pioneer-system-threads",
+            ] {
+                assert!(required.contains(name));
+            }
+            assert!(!required.contains("# alpha"));
+            assert!(!required.contains("# beta"));
+            let saved_skills = saved_mapping["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|item| item["type"] == "skill")
+                .collect::<Vec<_>>();
+            assert_eq!(
+                saved_skills.len(),
+                2,
+                "required exports must remain references"
+            );
+            // Duplicate admission must use the persisted logical Turn, without
+            // invoking skills again or rewriting the saved dispatch payload.
+            let starts_before = harness.cli_session.turn_starts.lock().await.len();
+            harness
+                .processor
+                .process_request_for_connection(harness.connection_id, &request)
+                .await;
+            assert_eq!(
+                harness.cli_session.turn_starts.lock().await.len(),
+                starts_before
+            );
+            assert_eq!(
+                reopened
+                    .get_cli_runtime_turn_binding(&turn_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .input_mapping_json,
+                saved.input_mapping_json
+            );
             let input = native_turn.input.as_array().unwrap();
             let skill_items = input
                 .iter()
@@ -2671,7 +2729,10 @@ async fn capability_persistence_order_impl() {
                     }),
                 ]
             );
-            let instructions = native_turn.elevated_instructions.text();
+            let context = input
+                .first()
+                .and_then(|item| item["text"].as_str())
+                .expect("turn context should precede native user input");
             let (directive, beta_label, alpha_label, runtime_label) = match runtime_kind {
                 CLIAgentRuntimeKind::Codex => {
                     ("selected Skill input", "- $beta", "- $alpha", "Codex")
@@ -2679,44 +2740,56 @@ async fn capability_persistence_order_impl() {
                 CLIAgentRuntimeKind::OpenCode => ("OpenCode turn", "- beta", "- alpha", "OpenCode"),
                 CLIAgentRuntimeKind::Claude => unreachable!(),
             };
-            assert!(instructions.contains(directive));
-            let beta = instructions
+            assert!(context.contains(directive));
+            assert!(!native_turn.elevated_instructions.text().contains(directive));
+            let beta = context
                 .find(beta_label)
-                .unwrap_or_else(|| panic!("{runtime_label} instructions should include beta"));
-            let alpha = instructions
+                .unwrap_or_else(|| panic!("{runtime_label} turn context should include beta"));
+            let alpha = context
                 .find(alpha_label)
-                .unwrap_or_else(|| panic!("{runtime_label} instructions should include alpha"));
+                .unwrap_or_else(|| panic!("{runtime_label} turn context should include alpha"));
             assert!(
                 beta < alpha,
                 "selected {runtime_label} skill order must be preserved"
             );
-            assert!(input.iter().all(|item| {
-                item["type"] != "text"
-                    || item["text"]
-                        .as_str()
-                        .is_none_or(|text| !text.contains(directive))
-            }));
+            assert_eq!(
+                input
+                    .iter()
+                    .filter_map(|item| item["text"].as_str())
+                    .filter(|text| text.contains(directive))
+                    .count(),
+                1,
+                "selected-skill directive should appear once in turn input"
+            );
         } else {
             let input = native_turn.input.as_array().unwrap();
             assert!(input.iter().all(|item| item["type"] != "skill"));
-            let instructions = native_turn.elevated_instructions.text();
-            assert!(instructions.contains("native Skill tool"));
-            let beta = instructions
+            let context = input
+                .first()
+                .and_then(|item| item["text"].as_str())
+                .expect("turn context should precede native user input");
+            let directive = "Invoke every selected skill through Claude's native Skill tool";
+            assert!(context.contains(directive));
+            assert!(!native_turn.elevated_instructions.text().contains(directive));
+            let beta = context
                 .find("- beta")
-                .expect("Claude elevated instructions should include beta");
-            let alpha = instructions
+                .expect("Claude turn context should include beta");
+            let alpha = context
                 .find("- alpha")
-                .expect("Claude elevated instructions should include alpha");
+                .expect("Claude turn context should include alpha");
             assert!(
                 beta < alpha,
                 "selected Claude skill order must be preserved"
             );
-            assert!(input.iter().all(|item| {
-                item["type"] != "text"
-                    || item["text"]
-                        .as_str()
-                        .is_none_or(|text| !text.contains("native Skill tool"))
-            }));
+            assert_eq!(
+                input
+                    .iter()
+                    .filter_map(|item| item["text"].as_str())
+                    .filter(|text| text.contains(directive))
+                    .count(),
+                1,
+                "selected-skill directive should appear once in turn input"
+            );
         }
     }
 }
@@ -3166,19 +3239,25 @@ async fn claude_cli_runtime_new_skill_closes_one_cached_session_before_restart_i
         .await;
     let native = wait_for_recorded_cli_runtime_turn_start(&harness.cli_session).await;
     assert_eq!(harness.cli_session.closes.load(Ordering::SeqCst), 1);
-    assert!(
-        native
-            .elevated_instructions
-            .text()
-            .contains("native Skill tool")
+    let input = native.input.as_array().unwrap();
+    let context = input
+        .first()
+        .and_then(|item| item["text"].as_str())
+        .expect("turn context should precede native user input after session restart");
+    let directive = "Invoke every selected skill through Claude's native Skill tool";
+    assert!(context.contains(directive));
+    assert!(context.contains("- refresh"));
+    assert!(!native.elevated_instructions.text().contains(directive));
+    assert!(!native.elevated_instructions.text().contains("- refresh"));
+    assert_eq!(
+        input
+            .iter()
+            .filter_map(|item| item["text"].as_str())
+            .filter(|text| text.contains(directive))
+            .count(),
+        1,
+        "selected skill should be delivered once after session restart"
     );
-    assert!(native.elevated_instructions.text().contains("- refresh"));
-    assert!(native.input.as_array().unwrap().iter().all(|item| {
-        item["type"] != "text"
-            || item["text"]
-                .as_str()
-                .is_none_or(|text| !text.contains("native Skill tool"))
-    }));
 }
 
 #[test]
@@ -4820,7 +4899,8 @@ impl Provider for ConcurrentComposerHistoryProvider {
 
     async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
         let current_command = request.messages.last().and_then(|message| {
-            (message.role == pioneer_provider::Role::User).then(|| message.content.clone())
+            (message.role == pioneer_provider::Role::User)
+                .then(|| prepared_user_text(message).to_owned())
         });
         self.requests
             .lock()
@@ -5579,8 +5659,8 @@ async fn memory_settings_update_reinstalls_memory_hook_runtime() {
 async fn self_improvement_settings_response_waits_for_durable_live_transition() {
     let runtime_home = unique_temp_dir("self_improvement_live_settings");
     std::fs::create_dir_all(&runtime_home).expect("runtime home");
-    let (tx, mut rx) = mpsc::channel(16);
-    let (other_tx, mut other_rx) = mpsc::channel(16);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(16);
+    let (other_tx, mut other_rx) = crate::session::test_support::outbound_channel(16);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let other_connection_id =
@@ -5769,7 +5849,7 @@ async fn self_improvement_settings_response_waits_for_durable_live_transition() 
 async fn self_improvement_settings_fail_closed_without_runtime_supervisor() {
     let runtime_home = unique_temp_dir("self_improvement_missing_supervisor");
     std::fs::create_dir_all(&runtime_home).expect("runtime home");
-    let (tx, mut rx) = mpsc::channel(16);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(16);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
@@ -6437,6 +6517,17 @@ fn canonical_provider_messages_for_artifact_parity(
             message.content =
                 canonical_prompt_text_for_parity(message.content.as_str(), turn_private_paths);
         }
+        if let Some(metadata) = message.application_context.as_mut() {
+            if metadata["kind"] == "turn_input" {
+                let context = metadata["context"].as_str().expect("prepared context");
+                metadata["context"] = json!(canonical_prompt_text_for_parity(
+                    context,
+                    turn_private_paths
+                ));
+                message.content =
+                    canonical_prompt_text_for_parity(&message.content, turn_private_paths);
+            }
+        }
         for content_part in &mut message.content_parts {
             let attachment = match content_part {
                 pioneer_provider::MessageContentPart::File { file } => file,
@@ -6471,6 +6562,36 @@ fn canonical_provider_messages_for_artifact_parity(
         }
     }
     messages
+}
+
+fn prepared_user_text(message: &pioneer_provider::ChatMessage) -> &str {
+    let Some(metadata) = message
+        .application_context
+        .as_ref()
+        .filter(|metadata| metadata["kind"] == "turn_input")
+    else {
+        return &message.content;
+    };
+    let context = metadata["context"].as_str().expect("turn context text");
+    message
+        .content
+        .strip_prefix(&format!(
+            "<pioneer_turn_context>\n{context}\n</pioneer_turn_context>\n\n"
+        ))
+        .expect("prepared input must contain its exact saved context prefix")
+}
+
+fn assert_prepared_user_text(message: &pioneer_provider::ChatMessage, original: &str) {
+    let metadata = message
+        .application_context
+        .as_ref()
+        .expect("prepared input metadata");
+    assert_eq!(metadata["kind"], "turn_input");
+    let context = metadata["context"].as_str().expect("turn context text");
+    assert_eq!(
+        message.content,
+        format!("<pioneer_turn_context>\n{context}\n</pioneer_turn_context>\n\n{original}")
+    );
 }
 
 fn canonical_prompt_text_for_parity(text: &str, turn_private_paths: &[&str]) -> String {
@@ -6515,10 +6636,10 @@ fn assert_exact_chat_request_parity(stage: &str, direct: &ChatRequest, child: &C
 }
 
 fn canonical_execution_thread_for_parity(text: &str, expected_thread_id: &str) -> String {
-    let expected = format!("Execution thread: {expected_thread_id}");
+    let expected = format!("Thread: {expected_thread_id}");
     assert_eq!(
         text.lines()
-            .filter(|line| line.starts_with("Execution thread: "))
+            .filter(|line| line.starts_with("Thread: "))
             .collect::<Vec<_>>(),
         vec![expected.as_str()],
         "runtime prompt must identify the actual execution thread before parity normalization"
@@ -6526,7 +6647,7 @@ fn canonical_execution_thread_for_parity(text: &str, expected_thread_id: &str) -
     text.split('\n')
         .map(|line| {
             if line == expected {
-                "Execution thread: <verified execution thread>"
+                "Thread: <verified execution thread>"
             } else {
                 line
             }
@@ -6612,20 +6733,131 @@ fn canonical_main_request_execution_thread_for_parity(
     expected_thread_id: &str,
     history_thread_id: &str,
     history_turn_id: &str,
+    expected_actor_id: Option<&str>,
 ) -> ChatRequest {
     // Independent executions must advertise their own thread, not the same ID.
     // Validate that identity against the fixture/lineage before comparing content.
     let mut request = request.clone();
-    let prompt = request
-        .compiled_prompt
-        .as_mut()
-        .expect("main parity request must have a compiled prompt");
-    prompt.dynamic_system_text =
-        canonical_execution_thread_for_parity(&prompt.dynamic_system_text, expected_thread_id);
-    prompt.full_system_text =
-        canonical_execution_thread_for_parity(&prompt.full_system_text, expected_thread_id);
+    assert!(
+        request.compiled_prompt.is_some(),
+        "main parity request must have a compiled prompt"
+    );
+    let current_turn = request
+        .messages
+        .iter()
+        .rev()
+        .find_map(|message| {
+            let metadata = message.application_context.as_ref()?;
+            (metadata["kind"] == "turn_input").then(|| {
+                let context = metadata["context"].as_str().expect("prepared context");
+                assert_eq!(
+                    context
+                        .lines()
+                        .find_map(|line| line.strip_prefix("Thread: ")),
+                    Some(expected_thread_id)
+                );
+                context
+                    .lines()
+                    .find_map(|line| line.strip_prefix("Turn: "))
+                    .expect("current turn identity")
+                    .to_owned()
+            })
+        })
+        .expect("main parity request must carry turn input");
     for message in &mut request.messages {
         canonical_recorded_history_identity_for_parity(message, history_thread_id, history_turn_id);
+        let Some(metadata) = message.application_context.as_ref() else {
+            continue;
+        };
+        // Origins are runtime ownership metadata rather than provider-wire content.
+        // Verify the owner before removing this copy from the wire comparison.
+        if let Some(origin) = metadata.get("origin") {
+            let owner = origin["thread_id"].as_str().expect("context origin thread");
+            assert!(owner == expected_thread_id || owner == history_thread_id);
+            let unit = origin["unit_id"].as_str().expect("context origin unit");
+            assert!(
+                unit.starts_with(&format!("{current_turn}:"))
+                    || unit.starts_with(&format!("{history_turn_id}:"))
+            );
+        }
+        if metadata["kind"] == "turn_input" {
+            let original = prepared_user_text(message).to_owned();
+            let context = metadata["context"].as_str().expect("prepared context");
+            let actual_thread = context
+                .lines()
+                .find_map(|line| line.strip_prefix("Thread: "))
+                .expect("context thread");
+            let actual_turn = context
+                .lines()
+                .find_map(|line| line.strip_prefix("Turn: "))
+                .expect("context turn");
+            assert!(actual_thread == expected_thread_id || actual_thread == history_thread_id);
+            assert!(actual_turn == current_turn || actual_turn == history_turn_id);
+            let origin = &metadata["origin"];
+            assert_eq!(origin["thread_id"].as_str(), Some(actual_thread));
+            assert_eq!(
+                origin["unit_id"],
+                format!("{actual_turn}:turn-input-projection")
+            );
+            let initiator = format!("Initiating thread: {history_thread_id}");
+            assert_eq!(
+                context
+                    .lines()
+                    .filter(|line| line.starts_with("Initiating thread: "))
+                    .collect::<Vec<_>>(),
+                vec![initiator.as_str()]
+            );
+            let actor = format!(
+                "Actor: {}",
+                if actual_turn == history_turn_id {
+                    "unavailable"
+                } else {
+                    expected_actor_id.unwrap_or("unavailable")
+                }
+            );
+            assert_eq!(
+                context
+                    .lines()
+                    .filter(|line| line.starts_with("Actor: "))
+                    .collect::<Vec<_>>(),
+                vec![actor.as_str()]
+            );
+            let thread_canonical = canonical_execution_thread_for_parity(context, actual_thread);
+            let expected_turn_line = format!("Turn: {actual_turn}");
+            assert_eq!(
+                context
+                    .lines()
+                    .filter(|line| line.starts_with("Turn: "))
+                    .collect::<Vec<_>>(),
+                vec![expected_turn_line.as_str()]
+            );
+            let canonical = thread_canonical
+                .split('\n')
+                .map(|line| {
+                    if line == expected_turn_line {
+                        "Turn: <verified execution turn>"
+                    } else if line == initiator {
+                        "Initiating thread: <verified initiating thread>"
+                    } else if line == actor {
+                        "Actor: <verified execution actor>"
+                    } else {
+                        line
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            message.content = format!(
+                "<pioneer_turn_context>\n{canonical}\n</pioneer_turn_context>\n\n{original}"
+            );
+            message.application_context.as_mut().unwrap()["context"] = json!(canonical);
+        }
+        message
+            .application_context
+            .as_mut()
+            .unwrap()
+            .as_object_mut()
+            .expect("application metadata object")
+            .remove("origin");
     }
     request
 }
@@ -6634,17 +6866,17 @@ fn canonical_main_request_execution_thread_for_parity(
 fn prompt_parity_normalizes_only_verified_execution_identity() {
     assert_eq!(
         canonical_execution_thread_for_parity(
-            "Initiating thread: unavailable\nExecution thread: actual\nOther: actual\n",
+            "Initiating thread: unavailable\nThread: actual\nOther: actual\n",
             "actual",
         ),
-        "Initiating thread: unavailable\nExecution thread: <verified execution thread>\nOther: actual\n"
+        "Initiating thread: unavailable\nThread: <verified execution thread>\nOther: actual\n"
     );
 }
 
 #[test]
 #[should_panic(expected = "runtime prompt must identify the actual execution thread")]
 fn prompt_parity_rejects_wrong_execution_identity() {
-    canonical_execution_thread_for_parity("Execution thread: unrelated", "actual");
+    canonical_execution_thread_for_parity("Thread: unrelated", "actual");
 }
 
 fn assert_exact_chat_request_parity_with_turn_private_paths(
@@ -7127,14 +7359,14 @@ async fn setup_provider_api_key_processor(
 ) -> (
     MessageProcessor,
     Arc<MemorySecretStore>,
-    mpsc::Receiver<Message>,
+    crate::session::test_support::OutboundTestReceiver,
     u64,
     Arc<WorkspaceManager>,
     String,
     std::path::PathBuf,
 ) {
     let session_manager = Arc::new(SessionManager::new());
-    let (tx, rx) = mpsc::channel(16);
+    let (tx, rx) = crate::session::test_support::outbound_channel(16);
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
@@ -8950,7 +9182,7 @@ async fn create_task_for_test(
 async fn open_persisted_child_for_test(
     processor: &Arc<MessageProcessor>,
     connection: ConnectionId,
-    rx: &mut mpsc::Receiver<Message>,
+    rx: &mut crate::session::test_support::OutboundTestReceiver,
     workspace_id: &str,
     child_thread_id: &str,
     request_id: &str,
@@ -9524,7 +9756,7 @@ async fn seed_test_skill_installation(
 
 async fn create_finalized_skill_upload(
     processor: &MessageProcessor,
-    rx: &mut mpsc::Receiver<Message>,
+    rx: &mut crate::session::test_support::OutboundTestReceiver,
     connection_id: u64,
     workspace_id: &str,
     source_path: &std::path::Path,
@@ -9548,7 +9780,7 @@ async fn create_finalized_skill_upload(
 
 async fn create_finalized_archive_upload(
     processor: &MessageProcessor,
-    rx: &mut mpsc::Receiver<Message>,
+    rx: &mut crate::session::test_support::OutboundTestReceiver,
     connection_id: u64,
     workspace_id: &str,
     archive: Vec<u8>,
@@ -9624,7 +9856,7 @@ async fn create_finalized_archive_upload(
 
 async fn install_test_skill_pack(
     processor: &MessageProcessor,
-    rx: &mut mpsc::Receiver<Message>,
+    rx: &mut crate::session::test_support::OutboundTestReceiver,
     connection_id: u64,
     workspace_id: &str,
     request_id: &str,
@@ -9835,7 +10067,7 @@ fn progress_item_registry_rate_limits_and_rolls_back_delta_heartbeats() {
 struct ProgressDeltaHarness {
     processor: MessageProcessor,
     crud_store: Arc<CrudStore>,
-    rx: Option<mpsc::Receiver<Message>>,
+    rx: Option<crate::session::test_support::OutboundTestReceiver>,
     connection_id: Option<ConnectionId>,
     workspace_id: String,
     thread_id: String,
@@ -9869,7 +10101,7 @@ async fn setup_progress_delta_harness(
     let item_id = item.item_id().to_owned();
 
     let (connection_id, rx) = if subscribe {
-        let (tx, rx) = mpsc::channel(16);
+        let (tx, rx) = crate::session::test_support::outbound_channel(16);
         let connection_id =
             register_authenticated_test_connection(session_manager.as_ref(), tx).await;
         thread_manager
@@ -12438,7 +12670,7 @@ async fn child_thread_scope_skips_auto_title_generation() {
 async fn start_thread_for_artifact_test(
     processor: &MessageProcessor,
     connection_id: u64,
-    _rx: &mut mpsc::Receiver<Message>,
+    _rx: &mut crate::session::test_support::OutboundTestReceiver,
     workspace_id: &str,
     thread_id: &str,
 ) -> ThreadStartResponse {
@@ -12584,7 +12816,7 @@ async fn collaborative_composer_admits_message_and_detached_task_while_task_chil
     let first_skill_path = write_test_skill(&user_root, "pack-first", "", "first body");
     let second_skill_path = write_test_skill(&user_root, "pack-second", "", "second body");
 
-    let (tx, mut rx) = mpsc::channel(64);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(64);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
@@ -12864,7 +13096,7 @@ fn concurrent_collaborative_tasks_receive_independent_frozen_commands() {
 
 async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_commands() {
     pioneer_sqlite::zstd::register_auto_extension_once().unwrap();
-    let (tx, mut rx) = mpsc::channel(256);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(256);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
@@ -12997,14 +13229,14 @@ async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_comman
             request
                 .messages
                 .last()
-                .is_some_and(|message| message.content == "ASYNC_TASK_B")
+                .is_some_and(|message| prepared_user_text(message) == "ASYNC_TASK_B")
         })
         .expect("Task B main request should be captured");
     assert_eq!(
         task_b_request
             .messages
             .iter()
-            .filter(|message| message.content == "ASYNC_TASK_B")
+            .filter(|message| prepared_user_text(message) == "ASYNC_TASK_B")
             .count(),
         1,
         "Task B must receive exactly one actionable current command"
@@ -13301,9 +13533,9 @@ async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_comman
         later
             .iter()
             .filter(|message| {
-                matches!(message.content.as_str(), "ASYNC_TASK_A" | "ASYNC_TASK_B")
+                matches!(prepared_user_text(message), "ASYNC_TASK_A" | "ASYNC_TASK_B")
             })
-            .map(|message| message.content.as_str())
+            .map(prepared_user_text)
             .collect::<Vec<_>>(),
         vec!["ASYNC_TASK_A", "ASYNC_TASK_B"]
     );
@@ -13338,7 +13570,9 @@ async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_comman
     .await
     .unwrap();
     assert_eq!(
-        last.iter().filter(|m| m.content == "ASYNC_TASK_B").count(),
+        last.iter()
+            .filter(|m| prepared_user_text(m) == "ASYNC_TASK_B")
+            .count(),
         1
     );
     assert_eq!(
@@ -13349,7 +13583,7 @@ async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_comman
     );
     assert!(
         last.iter()
-            .all(|m| m.content != "ASYNC_TASK_A" && !m.content.contains("A complete"))
+            .all(|m| prepared_user_text(m) != "ASYNC_TASK_A" && !m.content.contains("A complete"))
     );
     assert!(last.iter().any(
         |m| m.provenance.as_ref().unwrap().logical_turn_id.as_deref()
@@ -13897,7 +14131,7 @@ async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_comman
         assert_eq!(
             output_messages
                 .iter()
-                .filter(|m| m.content == command)
+                .filter(|m| prepared_user_text(m) == command)
                 .count(),
             1
         );
@@ -13980,7 +14214,7 @@ async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_comman
             if let Some(request) = provider.snapshot_requests().into_iter().find(|r| {
                 r.messages
                     .last()
-                    .is_some_and(|m| m.content == "ASYNC_TASK_C")
+                    .is_some_and(|m| prepared_user_text(m) == "ASYNC_TASK_C")
             }) {
                 break request;
             }
@@ -14330,7 +14564,7 @@ fn collaborative_child_stop_cancels_task_and_survives_late_delivery() {
 }
 
 async fn assert_collaborative_child_stop_cancels_task_and_survives_late_delivery() {
-    let (tx, mut rx) = mpsc::channel(256);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(256);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("test-model", "delayed"));
@@ -14470,7 +14704,7 @@ async fn assert_collaborative_child_stop_cancels_task_and_survives_late_delivery
 
     // Keep an observer subscribed to the parent timeline while the primary
     // connection operates on the child.
-    let (observer_tx, mut observer_rx) = mpsc::channel(256);
+    let (observer_tx, mut observer_rx) = crate::session::test_support::outbound_channel(256);
     let observer_connection_id =
         register_authenticated_test_connection(session_manager.as_ref(), observer_tx).await;
     session_manager
@@ -15042,7 +15276,7 @@ fn detached_composer_publishes_committed_message_before_task_with_delayed_outbox
 }
 
 async fn detached_composer_live_ordering_impl() {
-    let (tx, mut rx) = mpsc::channel(128);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(128);
     let sessions = Arc::new(SessionManager::new());
     let connection = register_authenticated_test_connection(sessions.as_ref(), tx).await;
     let threads = Arc::new(ThreadManager::new("test-model", "openai"));
@@ -15414,7 +15648,7 @@ async fn detached_composer_live_ordering_impl() {
         .first()
         .expect("large Composer input must reach the recording provider");
     let user = main.messages.last().unwrap();
-    assert_eq!(user.content, full_text);
+    assert_prepared_user_text(user, &full_text);
     assert!(matches!(user.content_parts.as_slice(),
         [pioneer_provider::MessageContentPart::File { file }]
             if file.name.as_deref() == Some("large-composer-context.pdf")));
@@ -15465,7 +15699,7 @@ async fn detached_composer_live_ordering_impl() {
 async fn assert_composer_durable_size_admission(
     processor: &Arc<MessageProcessor>,
     connection: ConnectionId,
-    rx: &mut mpsc::Receiver<Message>,
+    rx: &mut crate::session::test_support::OutboundTestReceiver,
     prototype: &pioneer_protocol::TaskGetResponse,
 ) {
     let task = &prototype.task;
@@ -15724,7 +15958,7 @@ async fn assert_composer_durable_size_admission(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn turn_start_with_artifact_input_materializes_user_message_attachment_and_binding() {
-    let (tx, mut rx) = mpsc::channel(16);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(16);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -15840,7 +16074,7 @@ async fn turn_start_with_artifact_input_materializes_user_message_attachment_and
         .messages
         .last()
         .expect("provider request should include user message");
-    assert_eq!(user_message.content, "summarize");
+    assert_prepared_user_text(user_message, "summarize");
     assert!(matches!(
         user_message.content_parts.as_slice(),
         [pioneer_provider::MessageContentPart::File { file }]
@@ -15853,7 +16087,7 @@ async fn turn_start_with_artifact_input_materializes_user_message_attachment_and
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn followup_history_preserves_typed_recorded_artifact_version() {
-    let (tx, mut rx) = mpsc::channel(32);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(32);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -15998,20 +16232,15 @@ async fn followup_history_preserves_typed_recorded_artifact_version() {
         .iter()
         .find(|message| !message.content_parts.is_empty())
         .expect("the recorded attachment must survive as typed canonical history");
-    let input_reference = second_request
-        .messages
-        .iter()
-        .find_map(|message| {
-            message
-                .content
-                .strip_prefix("Что за машина?\nHistorical input reference: ")
-        })
-        .expect("the original question and typed artifact input must remain together");
     assert_eq!(
-        serde_json::from_str::<serde_json::Value>(input_reference).unwrap(),
-        json!({
-            "type": "artifact", "artifactId": artifact.artifact_id, "versionId": artifact.version_id,
-        })
+        prepared_user_text(artifact_history_message),
+        "Что за машина?",
+        "the original question and typed artifact input must remain together"
+    );
+    assert_eq!(
+        artifact_history_message.content,
+        requests[0].messages.last().unwrap().content,
+        "history must retain the exact prepared input sent on the first turn"
     );
     assert!(
         matches!(
@@ -16033,7 +16262,7 @@ async fn followup_history_preserves_typed_recorded_artifact_version() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn followup_history_rejects_unavailable_accepted_artifact_before_provider() {
-    let (tx, mut rx) = mpsc::channel(32);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(32);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -16206,7 +16435,7 @@ async fn followup_history_rejects_unavailable_accepted_artifact_before_provider(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn followup_history_does_not_inject_late_assistant_artifact_registration() {
-    let (tx, mut rx) = mpsc::channel(32);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(32);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -16347,7 +16576,7 @@ async fn turn_start_with_capabilities_materializes_user_message_attachments() {
         write_test_skill(&user_root, "full-member-two", "", "second full member body");
     let partial_member_path =
         write_test_skill(&user_root, "partial-member", "", "partial member body");
-    let (tx, mut rx) = mpsc::channel(16);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(16);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -17008,11 +17237,11 @@ fn owned_voice_ingress_case(
 ) -> MessageFuture<'static, ()> {
     message_future(async move {
         use crate::voice::transcription::{VoiceTranscriptionErrorKind, transcription_error};
-        let (tx, mut rx) = mpsc::channel(128);
+        let (tx, mut rx) = crate::session::test_support::outbound_channel(128);
         let sessions = Arc::new(SessionManager::new());
         let mut connection_id = register_authenticated_test_connection(&sessions, tx).await;
         let mut context = sessions.connection_context(connection_id).await.unwrap();
-        let (foreign_tx, mut foreign_rx) = mpsc::channel(16);
+        let (foreign_tx, mut foreign_rx) = crate::session::test_support::outbound_channel(16);
         let foreign_id = register_authenticated_test_connection(&sessions, foreign_tx).await;
         let foreign_context = sessions.connection_context(foreign_id).await.unwrap();
         let (workspace_manager, crud, workspace_id) = setup_workspace_manager().await;
@@ -17189,7 +17418,7 @@ fn owned_voice_ingress_case(
         if action.starts_with("revocation") {
             ensure_test_superuser_execution_authority(crud.as_ref()).await;
             materialize_test_member_collaborator(crud.as_ref(), &workspace_id, thread_id).await;
-            let (member_tx, member_rx) = mpsc::channel(128);
+            let (member_tx, member_rx) = crate::session::test_support::outbound_channel(128);
             connection_id = processor
                 .session_manager
                 .register_connection(member_tx, authenticated_test_member_collaborator())
@@ -18068,7 +18297,7 @@ fn test_gateway_voice_supervisor() -> Arc<crate::voice::supervisor::VoiceInputSu
 async fn submit_test_voice_turn(
     processor: &Arc<MessageProcessor>,
     connection_id: ConnectionId,
-    rx: &mut mpsc::Receiver<Message>,
+    rx: &mut crate::session::test_support::OutboundTestReceiver,
     workspace_id: &str,
     thread_id: &str,
     turn_id: &str,
@@ -18149,7 +18378,7 @@ async fn submit_test_voice_turn(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn first_voice_turn_materializes_runtime_draft() {
-    let (tx, mut rx) = mpsc::channel(64);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(64);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
@@ -18239,7 +18468,7 @@ fn voice_turn_start_replay_does_not_dispatch_provider_again() {
 }
 
 async fn voice_turn_start_replay_does_not_dispatch_provider_again_impl() {
-    let (tx, mut rx) = mpsc::channel(128);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(128);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
@@ -18348,7 +18577,7 @@ async fn voice_turn_start_replay_does_not_dispatch_provider_again_impl() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn collaborative_voice_composer_admits_detached_task() {
-    let (tx, mut rx) = mpsc::channel(128);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(128);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
@@ -18457,7 +18686,7 @@ async fn collaborative_voice_composer_admits_detached_task() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn task_run_voice_composer_stays_foreground() {
-    let (tx, mut rx) = mpsc::channel(128);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(128);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
@@ -18634,7 +18863,7 @@ async fn voice_session_transcript_starts_turn_and_preserves_authorized_context_a
     std::fs::create_dir_all(&workspace_root).expect("create workspace root");
     std::fs::create_dir_all(&registry_root).expect("create registry root");
     let weather_path = write_test_skill(&user_root, "weather", "", "weather body");
-    let (tx, mut rx) = mpsc::channel(32);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(32);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -18888,7 +19117,7 @@ async fn voice_session_transcript_starts_turn_and_preserves_authorized_context_a
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn voice_session_cancel_drops_session_without_creating_turn() {
-    let (tx, mut rx) = mpsc::channel(16);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(16);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -18954,7 +19183,7 @@ async fn voice_session_cancel_drops_session_without_creating_turn() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn voice_session_finalize_without_speech_does_not_create_turn() {
-    let (tx, mut rx) = mpsc::channel(16);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(16);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -19064,7 +19293,7 @@ async fn voice_integrity_barrier_blocks_incomplete_prefix_without_poisoning_a_ne
         "legacy",
         "late_old",
     ] {
-        let (tx, mut rx) = mpsc::channel(32);
+        let (tx, mut rx) = crate::session::test_support::outbound_channel(32);
         let sessions = Arc::new(SessionManager::new());
         let connection_id = register_authenticated_test_connection(&sessions, tx).await;
         let (workspaces, crud, workspace_id) = setup_workspace_manager().await;
@@ -19273,7 +19502,7 @@ async fn voice_integrity_barrier_blocks_incomplete_prefix_without_poisoning_a_ne
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn voice_status_disabled_and_start_report_model_unavailable() {
-    let (tx, mut rx) = mpsc::channel(16);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(16);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -19341,7 +19570,7 @@ async fn voice_status_disabled_and_start_report_model_unavailable() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn voice_session_requires_ready_for_every_non_ready_phase() {
-    let (tx, mut rx) = mpsc::channel(32);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(32);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
@@ -19368,7 +19597,7 @@ async fn voice_session_requires_ready_for_every_non_ready_phase() {
     async fn assert_rejected(
         processor: &MessageProcessor,
         connection_id: ConnectionId,
-        rx: &mut mpsc::Receiver<Message>,
+        rx: &mut crate::session::test_support::OutboundTestReceiver,
         workspace_id: &str,
         suffix: &str,
     ) {
@@ -19521,7 +19750,7 @@ async fn voice_input_status_notification_reports_transitions_and_coalesces_progr
         })
         .unwrap();
     crate::settings::save_gateway_settings(&settings_path, &persisted).unwrap();
-    let (tx, mut rx) = mpsc::channel(32);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(32);
     let session_manager = Arc::new(SessionManager::new());
     let _connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let (workspace_manager, crud_store, _workspace_id) = setup_workspace_manager().await;
@@ -19595,7 +19824,7 @@ async fn voice_input_status_notification_reports_transitions_and_coalesces_progr
 async fn start_test_voice_session(
     processor: &MessageProcessor,
     connection_id: ConnectionId,
-    rx: &mut mpsc::Receiver<Message>,
+    rx: &mut crate::session::test_support::OutboundTestReceiver,
     workspace_id: &str,
     thread_id: &str,
     turn_id: &str,
@@ -19629,10 +19858,10 @@ async fn start_test_voice_session(
 async fn voice_reconfiguration_busy_blocks_all_active_states_before_persistence() {
     let runtime_home = unique_temp_dir("voice_reconfiguration_busy");
     std::fs::create_dir_all(&runtime_home).expect("runtime home");
-    let (tx, mut rx) = mpsc::channel(32);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(32);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
-    let (peer_tx, mut peer_rx) = mpsc::channel(32);
+    let (peer_tx, mut peer_rx) = crate::session::test_support::outbound_channel(32);
     let _peer = register_authenticated_test_connection(session_manager.as_ref(), peer_tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
@@ -19853,7 +20082,7 @@ async fn voice_reconfiguration_busy_blocks_all_active_states_before_persistence(
 async fn voice_mode_save_failure_preserves_persistence_and_does_not_notify_peers() {
     let runtime_home = unique_temp_dir("voice_mode_save_failure");
     std::fs::create_dir_all(&runtime_home).unwrap();
-    let (tx, mut rx) = mpsc::channel(32);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(32);
     let sessions = Arc::new(SessionManager::new());
     let connection = register_authenticated_test_connection(sessions.as_ref(), tx).await;
     let (workspaces, crud, _) = setup_workspace_manager().await;
@@ -19982,7 +20211,7 @@ async fn voice_settings_disable_removes_model_files_and_preserves_selection() {
         )
         .expect("mark voice model ready");
 
-    let (tx, mut rx) = mpsc::channel(16);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(16);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
@@ -20072,8 +20301,8 @@ async fn voice_settings_two_client_race_serializes_to_one_consistent_outcome() {
     crate::settings::save_gateway_settings(settings_path.as_path(), &settings)
         .expect("save enabled Voice Input");
 
-    let (tx_a, mut rx_a) = mpsc::channel(32);
-    let (tx_b, mut rx_b) = mpsc::channel(32);
+    let (tx_a, mut rx_a) = crate::session::test_support::outbound_channel(32);
+    let (tx_b, mut rx_b) = crate::session::test_support::outbound_channel(32);
     let session_manager = Arc::new(SessionManager::new());
     let connection_a = register_authenticated_test_connection(session_manager.as_ref(), tx_a).await;
     let connection_b = register_authenticated_test_connection(session_manager.as_ref(), tx_b).await;
@@ -20271,15 +20500,15 @@ async fn setup_binary_ingress_processor() -> (
     MessageProcessor,
     Arc<SessionManager>,
     ConnectionId,
-    mpsc::Receiver<Message>,
+    crate::session::test_support::OutboundTestReceiver,
     ConnectionId,
-    mpsc::Receiver<Message>,
+    crate::session::test_support::OutboundTestReceiver,
     Arc<CrudStore>,
     String,
     tempfile::TempDir,
 ) {
-    let (owner_tx, owner_rx) = mpsc::channel(32);
-    let (foreign_tx, foreign_rx) = mpsc::channel(32);
+    let (owner_tx, owner_rx) = crate::session::test_support::outbound_channel(32);
+    let (foreign_tx, foreign_rx) = crate::session::test_support::outbound_channel(32);
     let session_manager = Arc::new(SessionManager::new());
     let owner_connection_id =
         register_authenticated_test_connection(session_manager.as_ref(), owner_tx).await;
@@ -20372,9 +20601,9 @@ async fn binary_ingress_rejects_unregistered_connections_before_decoding_every_f
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn authorization_gate_allows_superuser_and_denies_user_text_and_binary_dispatch() {
-    let (superuser_tx, mut superuser_rx) = mpsc::channel(16);
-    let (user_tx, mut user_rx) = mpsc::channel(16);
-    let (roleless_tx, mut roleless_rx) = mpsc::channel(16);
+    let (superuser_tx, mut superuser_rx) = crate::session::test_support::outbound_channel(16);
+    let (user_tx, mut user_rx) = crate::session::test_support::outbound_channel(16);
+    let (roleless_tx, mut roleless_rx) = crate::session::test_support::outbound_channel(16);
     let session_manager = Arc::new(SessionManager::new());
     let superuser_connection_id =
         register_authenticated_test_connection(session_manager.as_ref(), superuser_tx).await;
@@ -20640,10 +20869,10 @@ async fn member_workspace_discovery_default_and_selection_are_membership_scoped(
         .expect("materialize Member workspace grant");
 
     let session_manager = Arc::new(SessionManager::new());
-    let (superuser_tx, mut superuser_rx) = mpsc::channel(16);
+    let (superuser_tx, mut superuser_rx) = crate::session::test_support::outbound_channel(16);
     let superuser_connection_id =
         register_authenticated_test_connection(session_manager.as_ref(), superuser_tx).await;
-    let (member_tx, mut member_rx) = mpsc::channel(16);
+    let (member_tx, mut member_rx) = crate::session::test_support::outbound_channel(16);
     let mut member_principal = (*authenticated_test_superuser()).clone();
     member_principal.principal_id =
         pioneer_protocol::PrincipalId::new(MEMBER_ID).expect("Member principal id");
@@ -21196,10 +21425,10 @@ async fn workspace_notification_fanout_revalidates_membership_before_serializati
         .expect("materialize notification recipient ACL");
 
     let session_manager = Arc::new(SessionManager::new());
-    let (superuser_tx, mut superuser_rx) = mpsc::channel(8);
+    let (superuser_tx, mut superuser_rx) = crate::session::test_support::outbound_channel(8);
     let superuser_connection_id =
         register_authenticated_test_connection(session_manager.as_ref(), superuser_tx).await;
-    let (allowed_tx, mut allowed_rx) = mpsc::channel(8);
+    let (allowed_tx, mut allowed_rx) = crate::session::test_support::outbound_channel(8);
     let allowed_connection_id = session_manager
         .register_connection(
             allowed_tx,
@@ -21211,7 +21440,7 @@ async fn workspace_notification_fanout_revalidates_membership_before_serializati
         )
         .await
         .expect("register allowed Member");
-    let (denied_tx, mut denied_rx) = mpsc::channel(8);
+    let (denied_tx, mut denied_rx) = crate::session::test_support::outbound_channel(8);
     let denied_connection_id = session_manager
         .register_connection(
             denied_tx,
@@ -21223,7 +21452,7 @@ async fn workspace_notification_fanout_revalidates_membership_before_serializati
         )
         .await
         .expect("register denied Member");
-    let (unselected_tx, mut unselected_rx) = mpsc::channel(8);
+    let (unselected_tx, mut unselected_rx) = crate::session::test_support::outbound_channel(8);
     let _unselected_connection_id = session_manager
         .register_connection(
             unselected_tx,
@@ -21328,7 +21557,8 @@ async fn workspace_notification_fanout_revalidates_membership_before_serializati
         "invitation changes are visible only to Superuser and the owning inviter"
     );
 
-    let (second_device_tx, mut second_device_rx) = mpsc::channel(8);
+    let (second_device_tx, mut second_device_rx) =
+        crate::session::test_support::outbound_channel(8);
     let second_device_connection_id = session_manager
         .register_connection(
             second_device_tx,
@@ -21681,7 +21911,7 @@ async fn task_user_notification_inbox_rpc_is_durable_exact_recipient_and_acknowl
     .expect("persist durable exact-recipient notification");
 
     let session_manager = Arc::new(SessionManager::new());
-    let (recipient_tx, mut recipient_rx) = mpsc::channel(8);
+    let (recipient_tx, mut recipient_rx) = crate::session::test_support::outbound_channel(8);
     let recipient_connection = session_manager
         .register_connection(
             recipient_tx,
@@ -21693,7 +21923,7 @@ async fn task_user_notification_inbox_rpc_is_durable_exact_recipient_and_acknowl
         )
         .await
         .expect("register notification recipient");
-    let (foreign_tx, mut foreign_rx) = mpsc::channel(8);
+    let (foreign_tx, mut foreign_rx) = crate::session::test_support::outbound_channel(8);
     let foreign_connection = session_manager
         .register_connection(
             foreign_tx,
@@ -21807,7 +22037,7 @@ async fn task_user_notification_inbox_rpc_is_durable_exact_recipient_and_acknowl
 async fn gateway_management_notifications_are_superuser_only() {
     let (workspace_manager, crud_store, _) = setup_workspace_manager().await;
     let session_manager = Arc::new(SessionManager::new());
-    let (superuser_tx, mut superuser_rx) = mpsc::channel(4);
+    let (superuser_tx, mut superuser_rx) = crate::session::test_support::outbound_channel(4);
     let _superuser_connection_id =
         register_authenticated_test_connection(session_manager.as_ref(), superuser_tx).await;
 
@@ -21820,7 +22050,7 @@ async fn gateway_management_notifications_are_superuser_only() {
         pioneer_protocol::DeviceId::new("D0000000000000000000A").expect("Member device id");
     member_principal.session_id =
         pioneer_protocol::AuthSessionId::new("S0000000000000000000A").expect("Member session id");
-    let (member_tx, mut member_rx) = mpsc::channel(4);
+    let (member_tx, mut member_rx) = crate::session::test_support::outbound_channel(4);
     session_manager
         .register_connection(member_tx, Arc::new(member_principal))
         .await
@@ -21910,10 +22140,10 @@ async fn thread_subscriptions_bind_identity_and_revalidate_current_visibility() 
         .expect("materialize realtime Member principals and workspace grants");
 
     let session_manager = Arc::new(SessionManager::new());
-    let (superuser_tx, mut superuser_rx) = mpsc::channel(16);
+    let (superuser_tx, mut superuser_rx) = crate::session::test_support::outbound_channel(16);
     let superuser_connection_id =
         register_authenticated_test_connection(session_manager.as_ref(), superuser_tx).await;
-    let (allowed_tx, mut allowed_rx) = mpsc::channel(16);
+    let (allowed_tx, mut allowed_rx) = crate::session::test_support::outbound_channel(16);
     let allowed_connection_id = session_manager
         .register_connection(
             allowed_tx,
@@ -21925,7 +22155,7 @@ async fn thread_subscriptions_bind_identity_and_revalidate_current_visibility() 
         )
         .await
         .expect("register allowed Member");
-    let (denied_tx, mut denied_rx) = mpsc::channel(16);
+    let (denied_tx, mut denied_rx) = crate::session::test_support::outbound_channel(16);
     let denied_connection_id = session_manager
         .register_connection(
             denied_tx,
@@ -22032,7 +22262,8 @@ async fn thread_subscriptions_bind_identity_and_revalidate_current_visibility() 
     let _ = recv_response_by_id(&mut superuser_rx, superuser_open_id.as_str()).await;
     let _ = recv_notification_by_method(&mut superuser_rx, events::THREAD_STARTED).await;
 
-    let (other_session_tx, mut other_session_rx) = mpsc::channel(16);
+    let (other_session_tx, mut other_session_rx) =
+        crate::session::test_support::outbound_channel(16);
     processor
         .session_manager
         .register_connection(
@@ -22710,7 +22941,7 @@ async fn thread_subscriptions_bind_identity_and_revalidate_current_visibility() 
         .session_manager
         .unregister_connection(allowed_connection_id)
         .await;
-    let (replacement_tx, mut replacement_rx) = mpsc::channel(8);
+    let (replacement_tx, mut replacement_rx) = crate::session::test_support::outbound_channel(8);
     let replacement_principal = member_principal(
         MEMBER_DENIED_ID,
         "D0000000000000000000E",
@@ -22802,7 +23033,7 @@ async fn committed_workspace_revoke_evicts_only_affected_live_state() {
         pioneer_protocol::AuthSessionId::new("S0000000000000000000A").expect("Member session id");
     let member_principal = Arc::new(member_principal);
     let session_manager = Arc::new(SessionManager::new());
-    let (member_tx, mut member_rx) = mpsc::channel(32);
+    let (member_tx, mut member_rx) = crate::session::test_support::outbound_channel(32);
     let connection_id = session_manager
         .register_connection(member_tx, member_principal.clone())
         .await
@@ -23184,6 +23415,12 @@ async fn committed_workspace_revoke_evicts_only_affected_live_state() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn artifact_binary_ingress_is_context_bound_and_rejects_malformed_frames_without_mutation() {
+    for overloaded in [false, true] {
+        artifact_binary_ingress_case(overloaded).await;
+    }
+}
+
+async fn artifact_binary_ingress_case(overloaded: bool) {
     let (
         processor,
         _session_manager,
@@ -23195,6 +23432,13 @@ async fn artifact_binary_ingress_is_context_bound_and_rejects_malformed_frames_w
         workspace_id,
         _skills_runtime,
     ) = setup_binary_ingress_processor().await;
+    let (owner_connection_id, mut owner_rx) = if overloaded {
+        let (sender, receiver) = crate::session::test_support::outbound_channel(2);
+        let id = register_authenticated_test_connection(_session_manager.as_ref(), sender).await;
+        (id, receiver)
+    } else {
+        (owner_connection_id, owner_rx)
+    };
     let chunk = b"artifact binary ingress";
     let principal = authenticated_test_superuser();
     let owner = AuthenticatedTransferOwner {
@@ -23286,10 +23530,26 @@ async fn artifact_binary_ingress_is_context_bound_and_rejects_malformed_frames_w
             .contains("incomplete")
     );
 
+    if overloaded {
+        _session_manager
+            .try_send_notification_text(owner_connection_id, "occupied-data-slot".to_owned())
+            .await
+            .unwrap();
+    }
     processor
         .process_binary_frame_for_connection(owner_connection_id, valid_frame.as_slice())
         .await
         .expect("registered owner connection reaches principal-aware dispatch");
+    if overloaded {
+        assert!(
+            _session_manager
+                .connection_principal(owner_connection_id)
+                .await
+                .is_err(),
+            "upload ACK is a data notification and must retire instead of consuming reply reserve"
+        );
+        return;
+    }
     let ack = recv_notification_by_method(&mut owner_rx, events::ARTIFACT_UPLOAD_CHUNK_ACK).await;
     let ack: pioneer_protocol::ArtifactUploadChunkAckNotification =
         serde_json::from_value(ack.params.expect("artifact ack params"))
@@ -23313,6 +23573,12 @@ async fn artifact_binary_ingress_is_context_bound_and_rejects_malformed_frames_w
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn skill_binary_ingress_is_context_bound_and_rejects_malformed_frames_without_mutation() {
+    for overloaded in [false, true] {
+        skill_binary_ingress_case(overloaded).await;
+    }
+}
+
+async fn skill_binary_ingress_case(overloaded: bool) {
     let (
         processor,
         _session_manager,
@@ -23324,6 +23590,13 @@ async fn skill_binary_ingress_is_context_bound_and_rejects_malformed_frames_with
         workspace_id,
         _skills_runtime,
     ) = setup_binary_ingress_processor().await;
+    let (owner_connection_id, mut owner_rx) = if overloaded {
+        let (sender, receiver) = crate::session::test_support::outbound_channel(2);
+        let id = register_authenticated_test_connection(_session_manager.as_ref(), sender).await;
+        (id, receiver)
+    } else {
+        (owner_connection_id, owner_rx)
+    };
     let chunk = b"skill binary ingress";
     let start_request_id = generate_test_request_id("skillbinary", "start");
     processor
@@ -23398,10 +23671,26 @@ async fn skill_binary_ingress_is_context_bound_and_rejects_malformed_frames_with
     assert_eq!(after_malformed.status, "receiving");
     assert_eq!(after_malformed.received_bytes, 0);
 
+    if overloaded {
+        _session_manager
+            .try_send_notification_text(owner_connection_id, "occupied-data-slot".to_owned())
+            .await
+            .unwrap();
+    }
     processor
         .process_binary_frame_for_connection(owner_connection_id, valid_frame.as_slice())
         .await
         .expect("registered owner connection reaches principal-aware dispatch");
+    if overloaded {
+        assert!(
+            _session_manager
+                .connection_principal(owner_connection_id)
+                .await
+                .is_err(),
+            "upload ACK is a data notification and must retire instead of consuming reply reserve"
+        );
+        return;
+    }
     let ack = recv_notification_by_method(&mut owner_rx, events::SKILLS_UPLOAD_CHUNK_ACK).await;
     let ack: pioneer_protocol::SkillsUploadChunkAckNotification =
         serde_json::from_value(ack.params.expect("skill ack params"))
@@ -23515,7 +23804,7 @@ async fn voice_binary_ingress_is_context_bound_and_rejects_malformed_frames_with
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn turn_start_rejects_artifact_from_another_workspace() {
-    let (tx, mut rx) = mpsc::channel(16);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(16);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -23576,7 +23865,7 @@ async fn turn_start_rejects_artifact_from_another_workspace() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn artifact_list_get_delete_restore_bind_api_roundtrip() {
-    let (tx, mut rx) = mpsc::channel(32);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(32);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -23788,7 +24077,7 @@ async fn artifact_list_get_delete_restore_bind_api_roundtrip() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn artifact_list_for_thread_includes_child_thread_subtree() {
-    let (tx, mut rx) = mpsc::channel(32);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(32);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -23965,7 +24254,7 @@ async fn artifact_list_for_thread_includes_child_thread_subtree() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn artifact_get_rejects_cross_workspace_artifact() {
-    let (tx, mut rx) = mpsc::channel(8);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(8);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -24090,7 +24379,7 @@ fn review_disabled_immediate_task_agent_run_creates_child_thread_and_wait_return
 async fn review_disabled_immediate_task_agent_run_creates_child_thread_and_wait_returns_result_impl()
  {
     let session_manager = Arc::new(SessionManager::new());
-    let (tx, _rx) = mpsc::channel(8);
+    let (tx, _rx) = crate::session::test_support::outbound_channel(8);
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
@@ -24839,7 +25128,7 @@ async fn task_accept_rpc_finalizes_review_candidate_and_queues_delivery_impl(
         "openai", provider,
     ));
     let session_manager = Arc::new(SessionManager::new());
-    let (tx, mut rx) = mpsc::channel(8);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(8);
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
     let processor = review_enabled_processor(
@@ -25374,7 +25663,7 @@ async fn task_revise_rpc_rejects_candidate_and_dispatches_same_thread_revision_i
         provider.clone(),
     ));
     let session_manager = Arc::new(SessionManager::new());
-    let (tx, mut rx) = mpsc::channel(8);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(8);
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     // Initial and revision child turns can overlap task_wait on separate pool
     // connections. `sqlite::memory:` gives each such connection an unrelated
@@ -27059,7 +27348,7 @@ async fn recovered_hidden_task_run_dispatches_restored_child_main_without_planne
             Some(&saved_manifest),
         );
         assert!(recovery_provider.snapshot_requests().is_empty());
-        let (tx, mut rx) = mpsc::channel(256);
+        let (tx, mut rx) = crate::session::test_support::outbound_channel(256);
         let connection =
             register_authenticated_test_connection(recovery_processor.session_manager.as_ref(), tx)
                 .await;
@@ -27245,27 +27534,25 @@ async fn recovered_hidden_task_run_dispatches_restored_child_main_without_planne
         "main dispatch must be the first provider request"
     );
     assert!(requests[child_main_pos].compiled_prompt.is_some());
-    let restored_prompt = requests[child_main_pos]
-        .compiled_prompt
-        .as_ref()
-        .expect("restored child main request should have compiled prompt");
+    let restored_context = requests[child_main_pos]
+        .messages
+        .iter()
+        .filter(|message| {
+            message
+                .application_context
+                .as_ref()
+                .is_some_and(|metadata| metadata["kind"] == "continuation_context")
+        })
+        .map(|message| message.content.as_str())
+        .find(|context| context.contains("Execution Continuation"))
+        .expect("restored child input should include execution continuation context");
     assert!(
-        restored_prompt
-            .full_system_text
-            .contains("Execution Continuation"),
-        "restored child prompt should include execution continuation section"
+        restored_context.contains("Completed window: index=1"),
+        "restored child input should include checkpoint window facts"
     );
     assert!(
-        restored_prompt
-            .full_system_text
-            .contains("Completed window: index=1"),
-        "restored child prompt should include checkpoint window facts"
-    );
-    assert!(
-        restored_prompt
-            .full_system_text
-            .contains("Original request preview: Recovered hidden preflight child"),
-        "restored child prompt should include checkpoint original request facts"
+        restored_context.contains("Original request preview: Recovered hidden preflight child"),
+        "restored child input should include checkpoint original request facts"
     );
     let recovered_main_request = &requests[child_main_pos];
     assert!(
@@ -27287,7 +27574,7 @@ async fn recovered_hidden_task_run_dispatches_restored_child_main_without_planne
             recovered_main_request
                 .messages
                 .iter()
-                .any(|message| &message.content == text),
+                .any(|message| prepared_user_text(message) == text),
             "recovery must send the entire Composer request, not its short Task goal"
         );
         assert_eq!(
@@ -29493,7 +29780,7 @@ async fn assert_composer_work_replays_exact_launch_payload_for_permission(
         .messages
         .last()
         .expect("main request should include composer user input");
-    assert_eq!(user_message.content, "Use the exact composer request");
+    assert_prepared_user_text(user_message, "Use the exact composer request");
     assert!(matches!(
         user_message.content_parts.as_slice(),
         [pioneer_provider::MessageContentPart::File { file }]
@@ -29503,9 +29790,8 @@ async fn assert_composer_work_replays_exact_launch_payload_for_permission(
         .compiled_prompt
         .as_ref()
         .expect("child main request should carry a compiled prompt");
-    assert!(compiled_prompt.full_system_text.contains("[Skills]"));
-    assert!(compiled_prompt.full_system_text.contains("composer-launch"));
-    assert!(compiled_prompt.full_system_text.contains(&format!(
+    assert!(user_message.content.contains("composer-launch"));
+    assert!(user_message.content.contains(&format!(
         "Exact skill reference for read_skill: `skill:{skill_id}`"
     )));
     assert!(
@@ -29796,7 +30082,7 @@ async fn collaborative_composer_dispatches_codex_and_claude_without_api_provider
         ("codex", CLIAgentRuntimeKind::Codex, "gpt-5"),
         ("claude", CLIAgentRuntimeKind::Claude, "claude-sonnet"),
     ] {
-        let (tx, mut rx) = mpsc::channel(128);
+        let (tx, mut rx) = crate::session::test_support::outbound_channel(128);
         let session_manager = Arc::new(SessionManager::new());
         let connection_id =
             register_authenticated_test_connection(session_manager.as_ref(), tx).await;
@@ -30399,7 +30685,7 @@ async fn a_child_first_continued_by_another_provider_or_after_source_edit_transf
             true,
         ),
     ] {
-        let (tx, mut rx) = mpsc::channel(128);
+        let (tx, mut rx) = crate::session::test_support::outbound_channel(128);
         let sessions = Arc::new(SessionManager::new());
         let connection = register_authenticated_test_connection(sessions.as_ref(), tx).await;
         let (workspaces, store, workspace) = setup_workspace_manager().await;
@@ -30741,7 +31027,7 @@ fn first_composer_cli_answer_has_no_parent_predecessor() {
 }
 
 async fn first_composer_cli_answer_has_no_parent_predecessor_impl() {
-    let (tx, _rx) = mpsc::channel(128);
+    let (tx, _rx) = crate::session::test_support::outbound_channel(128);
     let sessions = Arc::new(SessionManager::new());
     let connection = register_authenticated_test_connection(sessions.as_ref(), tx).await;
     let (workspaces, store, workspace) = setup_workspace_manager().await;
@@ -30860,7 +31146,7 @@ enum CliInputAdmissionCase {
 }
 
 async fn cli_input_admission_impl(case: CliInputAdmissionCase) {
-    let (tx, mut rx) = mpsc::channel(128);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(128);
     let sessions = Arc::new(SessionManager::new());
     let connection = register_authenticated_test_connection(sessions.as_ref(), tx).await;
     let (workspaces, store, workspace) = setup_workspace_manager().await;
@@ -31668,7 +31954,7 @@ async fn accepted_task_cli_transfer_compacts_without_later_parent_history_impl(
     edit_after_capture: bool,
     cancel_during_selected_restore: bool,
 ) {
-    let (tx, mut rx) = mpsc::channel(256);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(256);
     let sessions = Arc::new(SessionManager::new());
     let connection = register_authenticated_test_connection(sessions.as_ref(), tx).await;
     let (workspaces, store, workspace) = setup_workspace_manager().await;
@@ -32465,7 +32751,7 @@ async fn pending_cli_heartbeat_writer_is_dropped_before_compaction_cleanup_impl(
             workload: Some(pioneer_observability::DatabaseWorkload::AgentProgress),
             ..Default::default()
         });
-        let (tx, mut rx) = mpsc::channel(128);
+        let (tx, mut rx) = crate::session::test_support::outbound_channel(128);
         let sessions = Arc::new(SessionManager::new());
         let connection = register_authenticated_test_connection(sessions.as_ref(), tx).await;
         let (_database_directory, workspaces, store, workspace) =
@@ -32800,7 +33086,7 @@ fn cli_predispatch_read_failure_cancel_and_shutdown_release_session_lease() {
 
 async fn cli_predispatch_read_failure_cancel_and_shutdown_release_session_lease_impl() {
     for case in ["read_error", "cancel", "shutdown"] {
-        let (tx, mut rx) = mpsc::channel(128);
+        let (tx, mut rx) = crate::session::test_support::outbound_channel(128);
         let sessions = Arc::new(SessionManager::new());
         let connection = register_authenticated_test_connection(sessions.as_ref(), tx).await;
         let (workspaces, store, workspace) = setup_workspace_manager().await;
@@ -33036,7 +33322,7 @@ async fn cancelling_cli_history_transfer_stops_before_provider_start_and_release
     pause_summarizer: bool,
     shutdown: bool,
 ) {
-    let (tx, mut rx) = mpsc::channel(128);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(128);
     let sessions = Arc::new(SessionManager::new());
     let connection = register_authenticated_test_connection(sessions.as_ref(), tx).await;
     let (_database_directory, workspaces, store, workspace) =
@@ -33268,7 +33554,7 @@ async fn cancelling_cli_history_transfer_stops_before_provider_start_and_release
 async fn attached_cli_task_starts_while_its_parent_provider_turn_is_active_impl(
     hold_history_pass: bool,
 ) {
-    let (tx, mut rx) = mpsc::channel(128);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(128);
     let sessions = Arc::new(SessionManager::new());
     let connection = register_authenticated_test_connection(sessions.as_ref(), tx).await;
     let (workspaces, store, workspace) = setup_workspace_manager().await;
@@ -33589,7 +33875,7 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
         ("codex", CLIAgentRuntimeKind::Codex, "gpt-5"),
         ("claude", CLIAgentRuntimeKind::Claude, "claude-sonnet"),
     ] {
-        let (tx, mut rx) = mpsc::channel(256);
+        let (tx, mut rx) = crate::session::test_support::outbound_channel(256);
         let session_manager = Arc::new(SessionManager::new());
         let connection = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
         let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
@@ -36062,7 +36348,7 @@ fn nested_cli_children_bootstrap_their_accepted_lineage_only() {
 }
 
 async fn nested_cli_children_bootstrap_their_accepted_lineage_only_impl() {
-    let (tx, mut rx) = mpsc::channel(128);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(128);
     let session_manager = Arc::new(SessionManager::new());
     let connection = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
@@ -37394,8 +37680,30 @@ async fn cli_task_bootstrap_honors_empty_parent_context_policy_impl() {
         .filter(|item| item["type"] == "skill")
         .map(|item| item["name"].as_str().unwrap())
         .collect::<Vec<_>>();
+    assert!(
+        skill_names.is_empty(),
+        "required system exports must not invoke native skills for an empty selection"
+    );
+    let reference_messages = adapter_input
+        .iter()
+        .filter_map(|item| item["text"].as_str())
+        .filter_map(|text| {
+            text.strip_prefix("Current required Pioneer skill exports (replaces earlier required-export references): ")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(reference_messages.len(), 1);
+    let required_exports: JsonValue = serde_json::Deserializer::from_str(reference_messages[0])
+        .into_iter::<JsonValue>()
+        .next()
+        .unwrap()
+        .unwrap();
     assert_eq!(
-        skill_names,
+        required_exports
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|export| export["name"].as_str().unwrap())
+            .collect::<Vec<_>>(),
         vec![
             "pioneer-system-tasks",
             "pioneer-system-subagents",
@@ -37406,18 +37714,30 @@ async fn cli_task_bootstrap_honors_empty_parent_context_policy_impl() {
     let adapter_messages = adapter_input
         .iter()
         .filter(|item| item["type"] == "text")
+        .filter(|item| {
+            !item["text"]
+                .as_str()
+                .unwrap()
+                .starts_with("Current required Pioneer skill exports")
+        })
         .collect::<Vec<_>>();
     assert_eq!(
         adapter_input.len(),
-        adapter_messages.len() + skill_names.len()
+        adapter_messages.len() + reference_messages.len()
     );
-    assert_eq!(adapter_messages.len(), 2);
+    assert_eq!(adapter_messages.len(), 3);
+    assert!(
+        adapter_messages[0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Runtime:")
+    );
     assert!(
         !adapter_messages[0].to_string().contains(current_marker),
         "the current command must not be replayed as accepted history"
     );
     assert!(
-        adapter_messages[1]
+        adapter_messages[2]
             .get("text")
             .and_then(serde_json::Value::as_str)
             .is_some_and(
@@ -37644,7 +37964,7 @@ fn composer_stop_native_api_child_saves_personal_cancellation_receipt() {
 }
 
 async fn assert_detached_native_child_turn_cancellation(native_api: bool) {
-    let (tx, mut rx) = mpsc::channel(64);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(64);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
@@ -37682,7 +38002,8 @@ async fn assert_detached_native_child_turn_cancellation(native_api: bool) {
         .await
         .expect("recording CLI runtimes should seed authoritative readiness");
     processor.bind_task_bridge().await;
-    processor.start_task_event_listener().await;
+    // This fixture drives the durable fanout dispatcher explicitly below.
+    // A competing background listener would make projection order probabilistic.
 
     let parent_thread_id = "thr_native_child_turn_cancel";
     let source_turn_id = "turn_native_child_turn_cancel_source";
@@ -37873,6 +38194,26 @@ async fn assert_detached_native_child_turn_cancellation(native_api: bool) {
         assert_eq!(receipts.iter().filter(|r| r.run_id == run.id).count(), 1);
     }
 
+    let mut fanout_drained = false;
+    for _ in 0..32 {
+        let summary =
+            drain_test_notifications_while(&mut rx, processor.task_event_fanout_quantum())
+                .await
+                .expect("cancellation fanout should run");
+        assert_eq!(
+            summary.errors, 0,
+            "cancellation fanout must not defer errors"
+        );
+        if summary.pending == Some(false) {
+            fanout_drained = true;
+            break;
+        }
+    }
+    assert!(
+        fanout_drained,
+        "cancellation fanout must drain its bounded queue"
+    );
+
     let parent_occurrence_turn_id = lineage
         .created_by_turn_id
         .as_deref()
@@ -37886,11 +38227,16 @@ async fn assert_detached_native_child_turn_cancellation(native_api: bool) {
         "parent TaskRun occurrences are execution-free projections"
     );
 
-    let parent_anchor = wait_for_task_anchor_item_status(
-        crud_store.clone(),
-        parent_occurrence_turn_id,
-        crate::task_tools::task_run_anchor_id(run.id.as_str()).as_str(),
-        TaskStatus::Cancelled,
+    // Keep the subscribed client reading while the fanout worker publishes
+    // cancellation. A full notification queue would stall the card refresh.
+    let parent_anchor = drain_test_notifications_while(
+        &mut rx,
+        wait_for_task_anchor_item_status(
+            crud_store.clone(),
+            parent_occurrence_turn_id,
+            crate::task_tools::task_run_anchor_id(run.id.as_str()).as_str(),
+            TaskStatus::Cancelled,
+        ),
     )
     .await;
     assert_eq!(parent_anchor.status, TaskStatus::Cancelled);
@@ -37945,11 +38291,14 @@ async fn assert_detached_native_child_turn_cancellation(native_api: bool) {
         TurnStatus::Interrupted,
         "late delivery must not turn a cancelled occurrence into Completed"
     );
-    let reloaded_anchor = wait_for_task_anchor_item_status(
-        crud_store,
-        parent_occurrence_turn_id,
-        crate::task_tools::task_run_anchor_id(run.id.as_str()).as_str(),
-        TaskStatus::Cancelled,
+    let reloaded_anchor = drain_test_notifications_while(
+        &mut rx,
+        wait_for_task_anchor_item_status(
+            crud_store,
+            parent_occurrence_turn_id,
+            crate::task_tools::task_run_anchor_id(run.id.as_str()).as_str(),
+            TaskStatus::Cancelled,
+        ),
     )
     .await;
     assert_eq!(reloaded_anchor.status, TaskStatus::Cancelled);
@@ -38173,12 +38522,14 @@ async fn detached_composer_work_matches_parent_llm_prompts_end_to_end_impl() {
         direct_parent_thread_id,
         direct_parent_thread_id,
         direct_seed_turn_id,
+        None,
     );
     let child_main = canonical_main_request_execution_thread_for_parity(
         child_main,
         &lineage.child_thread_id,
         task_parent_thread_id,
         task_seed_turn_id,
+        Some(task.task.id.as_str()),
     );
     assert_exact_chat_request_parity("main turn", &direct_main, &child_main);
 
@@ -38666,12 +39017,14 @@ async fn detached_composer_work_matches_full_parent_llm_request_end_to_end_impl(
         direct_parent_thread_id,
         direct_parent_thread_id,
         direct_seed_turn_id,
+        None,
     );
     let child_main = canonical_main_request_execution_thread_for_parity(
         child_main,
         &lineage.child_thread_id,
         task_parent_thread_id,
         task_seed_turn_id,
+        Some(task.task.id.as_str()),
     );
     assert_exact_chat_request_parity_with_turn_private_paths(
         "full main turn",
@@ -38729,9 +39082,9 @@ async fn detached_composer_work_matches_full_parent_llm_request_end_to_end_impl(
         .messages
         .last()
         .expect("full main request should include a user message");
-    assert_eq!(
-        user_message.content,
-        "Verify the complete parent and detached child LLM request."
+    assert_prepared_user_text(
+        user_message,
+        "Verify the complete parent and detached child LLM request.",
     );
     assert!(matches!(
         user_message.content_parts.as_slice(),
@@ -38742,17 +39095,12 @@ async fn detached_composer_work_matches_full_parent_llm_request_end_to_end_impl(
                         && reference.artifact_version_id == direct_artifact.version_id
                 })
     ));
-    let compiled_prompt = direct_main
-        .compiled_prompt
-        .as_ref()
-        .expect("full main request should include a compiled prompt");
-    assert!(compiled_prompt.full_system_text.contains("[Skills]"));
     assert!(
-        compiled_prompt
-            .full_system_text
-            .contains("full-parity-skill")
+        direct_main.compiled_prompt.is_some(),
+        "full main request should include a compiled prompt"
     );
-    assert!(compiled_prompt.full_system_text.contains(&format!(
+    assert!(user_message.content.contains("full-parity-skill"));
+    assert!(user_message.content.contains(&format!(
         "Exact skill reference for read_skill: `skill:{skill_id}`"
     )));
 
@@ -38801,7 +39149,7 @@ async fn detached_composer_work_matches_full_parent_llm_request_end_to_end_impl(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn task_event_listener_fans_out_notifications_from_committed_event_log() {
     let session_manager = Arc::new(SessionManager::new());
-    let (tx, mut rx) = mpsc::channel(8);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(8);
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
@@ -38863,7 +39211,7 @@ async fn task_event_listener_fans_out_notifications_from_committed_event_log() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn task_event_fanout_cursor_survives_listener_restart_without_replaying_history() {
     let session_manager = Arc::new(SessionManager::new());
-    let (tx, mut rx) = mpsc::channel(16);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(16);
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
@@ -39390,7 +39738,7 @@ async fn supervised_native_task_grant_reaches_the_real_child_sandbox_side_effect
         "supervised-task-native",
         provider,
     ));
-    let (tx, mut rx) = mpsc::channel(128);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(128);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("test-model", "supervised-task-native"));
@@ -39706,7 +40054,7 @@ async fn supervised_native_task_apply_patch_creates_approved_missing_destination
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "openai", provider,
     ));
-    let (tx, mut rx) = mpsc::channel(128);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(128);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
@@ -39960,7 +40308,7 @@ async fn supervised_direct_agent_grant_reaches_the_real_child_sandbox_side_effec
         "openai",
         provider.clone(),
     ));
-    let (tx, mut rx) = mpsc::channel(256);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(256);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
@@ -40377,7 +40725,7 @@ fn agent_mode_materializes_task_tools_and_chat_mode_does_not() {
 }
 
 async fn agent_mode_materializes_task_tools_and_chat_mode_does_not_impl() {
-    let (tx, mut rx) = mpsc::channel(64);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(64);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
@@ -40446,11 +40794,11 @@ async fn agent_mode_materializes_task_tools_and_chat_mode_does_not_impl() {
         .as_ref()
         .expect("agent request should include compiled prompt");
     assert!(
-        agent_prompt.full_system_text.contains("## Subagents"),
+        agent_prompt.full_system_text.contains("### Subagents"),
         "agent mode should explain attached subagents when task tools are available"
     );
     assert!(
-        agent_prompt.full_system_text.contains("## Tasks"),
+        agent_prompt.full_system_text.contains("### Tasks"),
         "agent mode should explain durable tasks when task tools are available"
     );
     let initial_tools = first_agent_request.tools.as_ref().expect("initial tools");
@@ -40521,7 +40869,7 @@ async fn agent_mode_materializes_task_tools_and_chat_mode_does_not_impl() {
         "parent",
         chat_provider.clone(),
     ));
-    let (tx_chat, mut rx_chat) = mpsc::channel(64);
+    let (tx_chat, mut rx_chat) = crate::session::test_support::outbound_channel(64);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id =
         register_authenticated_test_connection(session_manager.as_ref(), tx_chat).await;
@@ -40565,11 +40913,11 @@ async fn agent_mode_materializes_task_tools_and_chat_mode_does_not_impl() {
     );
     if let Some(prompt) = first_chat_request.compiled_prompt.as_ref() {
         assert!(
-            !prompt.full_system_text.contains("## Subagents"),
+            !prompt.full_system_text.contains("### Subagents"),
             "chat mode without task tools should not advertise subagents"
         );
         assert!(
-            !prompt.full_system_text.contains("## Tasks"),
+            !prompt.full_system_text.contains("### Tasks"),
             "chat mode without task tools should not advertise durable tasks"
         );
     }
@@ -40858,14 +41206,17 @@ async fn task_create_inherits_exact_turn_capabilities_for_attached_and_backgroun
                     })
             })
             .expect("child model request should contain its task marker");
-        let compiled_prompt = child_request
-            .compiled_prompt
-            .as_ref()
-            .expect("child model request should contain its compiled prompt");
         assert!(
-            compiled_prompt.full_system_text.contains(&format!(
-                "Exact skill reference for read_skill: `skill:{skill_id}`"
-            )),
+            child_request.compiled_prompt.is_some(),
+            "child model request should contain its compiled prompt"
+        );
+        assert!(
+            child_request
+                .messages
+                .iter()
+                .any(|message| message.content.contains(&format!(
+                    "Exact skill reference for read_skill: `skill:{skill_id}`"
+                ))),
             "selected Skill must appear in the child runtime prompt"
         );
         let tool_names = child_request
@@ -40892,7 +41243,7 @@ async fn task_create_inherits_exact_turn_capabilities_for_attached_and_backgroun
 }
 
 async fn task_create_tool_idempotency_key_deduplicates_parallel_mutations_impl() {
-    let (tx, mut rx) = mpsc::channel(128);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(128);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
@@ -41004,7 +41355,7 @@ async fn task_delivery_worker_uses_lineage_parent_turn_for_origin_thread_impl() 
         .await
         .expect("gateway bootstrap should create default workspace");
 
-    let (tx, mut rx) = mpsc::channel(32);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(32);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -41442,7 +41793,7 @@ async fn task_thread_delivery_materializes_a_system_attributed_turn() {
         .await
         .expect("gateway bootstrap should create default workspace");
 
-    let (tx, _rx) = mpsc::channel(32);
+    let (tx, _rx) = crate::session::test_support::outbound_channel(32);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -41710,7 +42061,7 @@ async fn failed_task_thread_delivery_is_a_sanitized_system_state_without_work_gr
         .await
         .expect("gateway bootstrap should create default workspace");
 
-    let (tx, _rx) = mpsc::channel(32);
+    let (tx, _rx) = crate::session::test_support::outbound_channel(32);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -41896,7 +42247,7 @@ async fn failed_task_thread_delivery_is_a_sanitized_system_state_without_work_gr
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn task_agenda_pause_resume_json_rpc_contracts() {
-    let (tx, mut rx) = mpsc::channel(64);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(64);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
@@ -42101,7 +42452,7 @@ async fn task_agenda_pause_resume_json_rpc_contracts() {
 #[test]
 fn task_parent_turn_guard_forces_wait_cancel_or_detach_before_completion() {
     run_gateway_message_test("task-parent-turn-guard", || async {
-        let (tx, mut rx) = mpsc::channel(128);
+        let (tx, mut rx) = crate::session::test_support::outbound_channel(128);
         let session_manager = Arc::new(SessionManager::new());
         let connection_id =
             register_authenticated_test_connection(session_manager.as_ref(), tx).await;
@@ -42411,7 +42762,7 @@ async fn fanout_task_event_through(processor: &MessageProcessor, task_id: &str, 
 }
 
 async fn task_anchor_publication_scenario(scenario: &str) {
-    let (tx, mut rx) = mpsc::channel(128);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(128);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
@@ -43129,7 +43480,7 @@ async fn task_anchor_publication_scenario(scenario: &str) {
 }
 
 async fn parent_turn_cancel_cancels_attached_child_tasks_through_service_impl() {
-    let (tx, mut rx) = mpsc::channel(128);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(128);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
@@ -43272,7 +43623,7 @@ async fn parent_turn_cancel_cancels_attached_child_tasks_through_service_impl() 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn thread_start_returns_response_and_started_notification() {
-    let (tx, mut rx) = mpsc::channel(8);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(8);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -43319,8 +43670,8 @@ async fn thread_start_returns_response_and_started_notification() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn thread_started_notification_is_not_broadcast_to_foreign_connections() {
-    let (tx_a, mut rx_a) = mpsc::channel(8);
-    let (tx_b, mut rx_b) = mpsc::channel(8);
+    let (tx_a, mut rx_a) = crate::session::test_support::outbound_channel(8);
+    let (tx_b, mut rx_b) = crate::session::test_support::outbound_channel(8);
     let session_manager = Arc::new(SessionManager::new());
     let connection_a = register_authenticated_test_connection(session_manager.as_ref(), tx_a).await;
     let _connection_b =
@@ -43363,8 +43714,8 @@ async fn thread_started_notification_is_not_broadcast_to_foreign_connections() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn thread_tree_hides_foreign_empty_draft_threads() {
-    let (tx_a, mut rx_a) = mpsc::channel(16);
-    let (tx_b, mut rx_b) = mpsc::channel(16);
+    let (tx_a, mut rx_a) = crate::session::test_support::outbound_channel(16);
+    let (tx_b, mut rx_b) = crate::session::test_support::outbound_channel(16);
     let session_manager = Arc::new(SessionManager::new());
     let connection_a = register_authenticated_test_connection(session_manager.as_ref(), tx_a).await;
     let connection_b = register_authenticated_test_connection(session_manager.as_ref(), tx_b).await;
@@ -43438,7 +43789,7 @@ async fn thread_tree_hides_foreign_empty_draft_threads() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn connection_closed_discards_unmaterialized_runtime_draft() {
-    let (tx, mut rx) = mpsc::channel(8);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(8);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -43509,7 +43860,7 @@ async fn connection_closed_discards_unmaterialized_runtime_draft() {
 async fn upload_runtime_draft_attachment(
     processor: &MessageProcessor,
     connection_id: ConnectionId,
-    rx: &mut mpsc::Receiver<Message>,
+    rx: &mut crate::session::test_support::OutboundTestReceiver,
     workspace_id: &str,
     thread_id: &str,
     planned_turn_id: &str,
@@ -43590,7 +43941,7 @@ async fn upload_runtime_draft_attachment(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn runtime_draft_accepts_completed_attachment_upload_without_thread_persistence() {
-    let (tx, mut rx) = mpsc::channel(16);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(16);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -43697,7 +44048,7 @@ async fn runtime_draft_accepts_completed_attachment_upload_without_thread_persis
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn connection_closed_deletes_completed_upload_for_abandoned_runtime_draft() {
-    let (tx, mut rx) = mpsc::channel(16);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(16);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -43775,7 +44126,7 @@ async fn connection_closed_deletes_completed_upload_for_abandoned_runtime_draft(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn materialized_thread_accepts_attachment_for_not_yet_started_planned_turn() {
-    let (tx, mut rx) = mpsc::channel(32);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(32);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -43896,7 +44247,7 @@ async fn materialized_thread_accepts_attachment_for_not_yet_started_planned_turn
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn internal_llm_context_event_persists_without_websocket_notification() {
-    let (tx, mut rx) = mpsc::channel(8);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(8);
     let session_manager = Arc::new(SessionManager::new());
     let _connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -44401,7 +44752,7 @@ async fn user_message_lifecycle_ingests_thread_episodic_source_after_commit() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn turn_start_persists_profile_selected_audit_with_default_full_access() {
-    let (tx, mut rx) = mpsc::channel(32);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(32);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
@@ -45068,7 +45419,7 @@ async fn production_snapshot_save_wakes_idle_runner_and_preserves_draft_unchange
     let (workspace_manager, store, workspace) = setup_workspace_manager().await;
     let root = tempfile::tempdir().unwrap();
     let session_manager = Arc::new(SessionManager::new());
-    let (tx, mut rx) = mpsc::channel(64);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(64);
     let connection = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let mut processor = MessageProcessor::new(
         Arc::new(ThreadManager::new("o4-mini", "openai")),
@@ -45898,7 +46249,7 @@ async fn direct_durable_execution_window_lifecycle_updates_rows() {
 
     let thread_id = "thr_window_lifecycle_1";
     let turn_id = "turn_window_lifecycle1";
-    let (tx, mut rx) = mpsc::channel(16);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(16);
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
 
     let thread_start = thread_manager
@@ -47164,7 +47515,7 @@ async fn durable_recovery_events_reject_ack_without_canonical_persistence() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn connection_closed_keeps_active_turn_running_without_subscribers() {
-    let (tx, mut rx) = mpsc::channel(16);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(16);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -47237,7 +47588,7 @@ async fn connection_closed_keeps_active_turn_running_without_subscribers() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn thread_unsubscribe_returns_status_and_closed_notification() {
-    let (tx, mut rx) = mpsc::channel(8);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(8);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -47347,7 +47698,7 @@ async fn thread_unsubscribe_returns_status_and_closed_notification() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn thread_start_rejects_unknown_workspace_id() {
-    let (tx, mut rx) = mpsc::channel(8);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(8);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -47393,7 +47744,7 @@ fn thread_start_missing_identifiers_report_the_missing_field() {
     for missing_field in ["thread_id", "workspace_id"] {
         // Keep each request's background workers inside a fresh runtime, as in the original tests.
         let body = async {
-            let (tx, mut rx) = mpsc::channel(8);
+            let (tx, mut rx) = crate::session::test_support::outbound_channel(8);
             let session_manager = Arc::new(SessionManager::new());
             let connection_id =
                 register_authenticated_test_connection(session_manager.as_ref(), tx).await;
@@ -47454,7 +47805,7 @@ fn thread_start_missing_identifiers_report_the_missing_field() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn workspace_list_returns_existing_workspaces() {
-    let (tx, mut rx) = mpsc::channel(8);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(8);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -47492,7 +47843,7 @@ async fn workspace_list_returns_existing_workspaces() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn workspace_default_returns_single_active_workspace() {
-    let (tx, mut rx) = mpsc::channel(8);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(8);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -47530,7 +47881,7 @@ async fn workspace_default_returns_single_active_workspace() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn workspace_create_creates_new_workspace() {
-    let (tx, mut rx) = mpsc::channel(8);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(8);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -47573,7 +47924,7 @@ async fn workspace_create_creates_new_workspace() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn workspace_create_rejects_missing_workspace_id() {
-    let (tx, mut rx) = mpsc::channel(8);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(8);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -47737,8 +48088,8 @@ async fn workspace_select_rejects_malformed_params_without_mutating_session_scop
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn workspace_create_broadcasts_changed_to_other_workspace_connections() {
-    let (tx_a, mut rx_a) = mpsc::channel(8);
-    let (tx_b, mut rx_b) = mpsc::channel(8);
+    let (tx_a, mut rx_a) = crate::session::test_support::outbound_channel(8);
+    let (tx_b, mut rx_b) = crate::session::test_support::outbound_channel(8);
     let session_manager = Arc::new(SessionManager::new());
     let connection_a = register_authenticated_test_connection(session_manager.as_ref(), tx_a).await;
     let connection_b = register_authenticated_test_connection(session_manager.as_ref(), tx_b).await;
@@ -47883,7 +48234,7 @@ async fn workspace_select_broadcasts_current_change_only_when_current_changes() 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn message_turn_start_is_immediately_completed_idempotent_and_never_dispatches_provider() {
-    let (tx, mut rx) = mpsc::channel(16);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(16);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -48267,7 +48618,7 @@ async fn message_reply_and_mentions_are_same_thread_scoped_and_directory_scoped(
     member_principal.session_id =
         pioneer_protocol::AuthSessionId::new("S0000000000000000000A").expect("Member session id");
 
-    let (tx, mut rx) = mpsc::channel(32);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(32);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = session_manager
         .register_connection(tx, Arc::new(member_principal))
@@ -48536,7 +48887,7 @@ async fn message_attachment_requires_exact_version_and_current_thread_scope() {
     const SECOND_THREAD_ID: &str = "thrE6ArtifactScopeB01";
     const SECRET_BYTES: &[u8] = b"epic6-secret-file-bytes";
 
-    let (tx, mut rx) = mpsc::channel(32);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(32);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
@@ -48827,7 +49178,7 @@ async fn message_mutation_rpcs_enforce_author_moderation_revision_and_tombstone_
     prepare_post_access_unread_fixture(crud_store.as_ref(), &workspace_id).await;
 
     let session_manager = Arc::new(SessionManager::new());
-    let (author_tx, mut author_rx) = mpsc::channel(64);
+    let (author_tx, mut author_rx) = crate::session::test_support::outbound_channel(64);
     let mut author_principal = (*authenticated_test_superuser()).clone();
     author_principal.principal_id =
         pioneer_protocol::PrincipalId::new(AUTHOR_ID).expect("author principal id");
@@ -48842,7 +49193,7 @@ async fn message_mutation_rpcs_enforce_author_moderation_revision_and_tombstone_
         .await
         .expect("register author connection");
 
-    let (peer_tx, mut peer_rx) = mpsc::channel(32);
+    let (peer_tx, mut peer_rx) = crate::session::test_support::outbound_channel(32);
     let mut peer_principal = (*authenticated_test_superuser()).clone();
     peer_principal.principal_id =
         pioneer_protocol::PrincipalId::new(PEER_ID).expect("peer principal id");
@@ -48857,7 +49208,7 @@ async fn message_mutation_rpcs_enforce_author_moderation_revision_and_tombstone_
         .await
         .expect("register peer connection");
 
-    let (superuser_tx, mut superuser_rx) = mpsc::channel(32);
+    let (superuser_tx, mut superuser_rx) = crate::session::test_support::outbound_channel(32);
     let superuser_connection_id =
         register_authenticated_test_connection(session_manager.as_ref(), superuser_tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -49424,8 +49775,8 @@ async fn thread_read_rpc_is_monotonic_and_converges_all_principal_sessions() {
     const FIRST_TURN_ID: &str = "trnE6ReadRpc00000001";
     const SECOND_TURN_ID: &str = "trnE6ReadRpc00000002";
 
-    let (primary_tx, mut primary_rx) = mpsc::channel(64);
-    let (secondary_tx, mut secondary_rx) = mpsc::channel(32);
+    let (primary_tx, mut primary_rx) = crate::session::test_support::outbound_channel(64);
+    let (secondary_tx, mut secondary_rx) = crate::session::test_support::outbound_channel(32);
     let session_manager = Arc::new(SessionManager::new());
     let primary_connection_id =
         register_authenticated_test_connection(session_manager.as_ref(), primary_tx).await;
@@ -49641,7 +49992,7 @@ async fn concurrent_message_turn_starts_commit_once_and_keep_stable_timeline_ord
         "e6concurrentmsg000040",
     ];
 
-    let (tx, mut rx) = mpsc::channel(64);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(64);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
@@ -49764,7 +50115,7 @@ async fn message_persistence_failure_rolls_back_and_emits_no_realtime() {
     const THREAD_ID: &str = "thrE6AtomicFailure001";
     const TURN_ID: &str = "trnE6AtomicFailure001";
 
-    let (tx, mut rx) = mpsc::channel(16);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(16);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
@@ -49836,7 +50187,7 @@ async fn message_persistence_failure_rolls_back_and_emits_no_realtime() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn turn_start_without_execution_backend_uses_api_provider_path() {
-    let (tx, mut rx) = mpsc::channel(16);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(16);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -49931,7 +50282,7 @@ async fn turn_start_without_execution_backend_uses_api_provider_path() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn turn_start_security_snapshot_native_turn_is_persisted_before_dispatch() {
-    let (tx, mut rx) = mpsc::channel(16);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(16);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -50059,7 +50410,7 @@ async fn turn_start_security_snapshot_native_turn_is_persisted_before_dispatch()
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn native_turn_start_same_request_replays_durable_outcome_without_dispatch() {
-    let (tx, mut rx) = mpsc::channel(16);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(16);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -50192,7 +50543,7 @@ async fn native_turn_start_same_request_replays_durable_outcome_without_dispatch
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn turn_start_security_audit_events_include_snapshot_reference() {
-    let (tx, mut rx) = mpsc::channel(16);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(16);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -50325,7 +50676,7 @@ fn turn_start_cli_runtime_uses_default_stack_and_errors_before_provider_dispatch
 }
 
 async fn turn_start_cli_runtime_backend_disabled_errors_before_provider_dispatch_impl() {
-    let (tx, mut rx) = mpsc::channel(16);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(16);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -51110,9 +51461,7 @@ async fn production_self_improvement_vertical_e2e_reaches_native_and_excludes_cl
             None => None,
         };
         panic!(
-            "native Agent turn must invoke read_skill and continue: {error:?}; transport_len={}; transport_capacity={}; requests={:#?}; snapshot={native_snapshot:#?}; items={native_items:#?}; aggregate={native_aggregate:#?}",
-            harness.rx.len(),
-            harness.rx.capacity(),
+            "native Agent turn must invoke read_skill and continue: {error:?}; requests={:#?}; snapshot={native_snapshot:#?}; items={native_items:#?}; aggregate={native_aggregate:#?}",
             native_provider.snapshot_requests(),
         );
     }
@@ -51733,7 +52082,7 @@ async fn claude_auto_accept_provider_mode_is_persisted_before_runtime_start_impl
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn codex_review_start_uncommitted_changes_is_rejected_without_runtime_call() {
-    let (tx, mut rx) = mpsc::channel(16);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(16);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -51835,7 +52184,7 @@ async fn codex_review_start_uncommitted_changes_is_rejected_without_runtime_call
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn codex_review_start_rejects_before_target_validation() {
-    let (tx, mut rx) = mpsc::channel(8);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(8);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -51909,7 +52258,7 @@ async fn codex_review_start_rejects_before_target_validation() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn codex_compaction_start_is_rejected_without_runtime_call() {
-    let (tx, mut rx) = mpsc::channel(16);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(16);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -52005,7 +52354,7 @@ async fn codex_compaction_start_is_rejected_without_runtime_call() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn codex_thread_ops_name_sync_failure_does_not_break_pioneer_rename() {
-    let (tx, mut rx) = mpsc::channel(16);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(16);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -52261,7 +52610,7 @@ async fn codex_thread_ops_name_sync_failure_does_not_break_pioneer_rename() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn codex_thread_ops_fork_creates_pioneer_thread_and_native_binding() {
-    let (tx, mut rx) = mpsc::channel(16);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(16);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -52436,7 +52785,7 @@ async fn member_codex_thread_fork_commits_private_creator_membership() {
         pioneer_protocol::AuthSessionId::new("S0000000000000000000A").expect("Member session id");
     let member_principal = Arc::new(member_principal);
 
-    let (tx, mut rx) = mpsc::channel(16);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(16);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = session_manager
         .register_connection(tx, member_principal.clone())
@@ -52681,7 +53030,7 @@ async fn seed_running_cli_runtime_binding(
 async fn start_loaded_thread_and_turn_for_cli_runtime_test(
     processor: &MessageProcessor,
     connection_id: ConnectionId,
-    rx: &mut mpsc::Receiver<Message>,
+    rx: &mut crate::session::test_support::OutboundTestReceiver,
     workspace_id: &str,
     thread_id: &str,
     turn_id: &str,
@@ -52709,7 +53058,7 @@ async fn start_loaded_thread_and_turn_for_cli_runtime_test(
 async fn start_loaded_thread_and_turn_for_cli_runtime_test_on_fresh_tasks(
     processor: &Arc<MessageProcessor>,
     connection_id: ConnectionId,
-    rx: &mut mpsc::Receiver<Message>,
+    rx: &mut crate::session::test_support::OutboundTestReceiver,
     workspace_id: &str,
     thread_id: &str,
     turn_id: &str,
@@ -52744,7 +53093,7 @@ async fn start_loaded_thread_and_turn_for_cli_runtime_test_on_fresh_tasks(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_runtime_turn_start_blocker_rejects_active_cli_binding() {
-    let (tx, mut rx) = mpsc::channel(32);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(32);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -52816,7 +53165,7 @@ async fn cli_runtime_turn_start_blocker_rejects_active_cli_binding() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_runtime_turn_start_blocker_rejects_db_only_active_cli_binding() {
-    let (tx, _rx) = mpsc::channel(32);
+    let (tx, _rx) = crate::session::test_support::outbound_channel(32);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -52859,7 +53208,7 @@ async fn cli_runtime_turn_start_blocker_rejects_db_only_active_cli_binding() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_runtime_turn_start_blocker_reconciles_db_only_terminal_binding() {
-    let (tx, _rx) = mpsc::channel(32);
+    let (tx, _rx) = crate::session::test_support::outbound_channel(32);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -52977,7 +53326,7 @@ async fn cli_runtime_turn_start_blocker_reconciles_db_only_terminal_binding() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_runtime_turn_start_blocker_rejects_unbound_server_request() {
-    let (tx, _rx) = mpsc::channel(32);
+    let (tx, _rx) = crate::session::test_support::outbound_channel(32);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -53073,7 +53422,7 @@ fn cli_runtime_stale_silent_running_binding_schedules_recovery() {
 }
 
 async fn cli_runtime_stale_silent_running_binding_schedules_recovery_impl() {
-    let (tx, mut rx) = mpsc::channel(32);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(32);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -53185,7 +53534,7 @@ async fn cli_runtime_stale_silent_running_binding_schedules_recovery_impl() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn codex_transport_observation_gap_enqueues_recovery_without_terminalizing_turn() {
-    let (tx, mut rx) = mpsc::channel(32);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(32);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -53389,7 +53738,7 @@ async fn codex_transport_observation_gap_enqueues_recovery_without_terminalizing
 #[test]
 fn cli_runtime_reconciliation_preserves_active_turn_and_repairs_missed_terminal_events() {
     run_gateway_message_test("cli-runtime-reconciliation", || async {
-        let (tx, mut rx) = mpsc::channel(64);
+        let (tx, mut rx) = crate::session::test_support::outbound_channel(64);
         let session_manager = Arc::new(SessionManager::new());
         let connection_id =
             register_authenticated_test_connection(session_manager.as_ref(), tx).await;
@@ -53744,7 +54093,7 @@ async fn cli_runtime_reconciliation_uses_full_terminal_lifecycle_for_unloaded_th
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_runtime_projection_backlog_does_not_start_agent_recovery() {
-    let (tx, _rx) = mpsc::channel(64);
+    let (tx, _rx) = crate::session::test_support::outbound_channel(64);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -53947,7 +54296,7 @@ async fn cli_runtime_projection_backlog_does_not_start_agent_recovery() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_runtime_snapshot_materialization_failure_keeps_turn_running() {
-    let (tx, mut rx) = mpsc::channel(64);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(64);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -54020,7 +54369,7 @@ async fn cli_runtime_snapshot_materialization_failure_keeps_turn_running() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_runtime_legacy_storage_failure_routes_claude_through_native_recovery() {
-    let (tx, mut rx) = mpsc::channel(64);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(64);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("claude-sonnet", "anthropic"));
@@ -54105,7 +54454,7 @@ async fn cli_runtime_legacy_storage_failure_routes_claude_through_native_recover
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_runtime_failure_keeps_binding_active_while_pioneer_recovery_is_pending() {
-    let (tx, mut rx) = mpsc::channel(64);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(64);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -54242,7 +54591,7 @@ fn codex_goal_segments_share_one_pioneer_turn_and_fence_subagents() {
 }
 
 async fn codex_goal_segments_share_one_pioneer_turn_and_fence_subagents_impl() {
-    let (tx, mut rx) = mpsc::channel(64);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(64);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -54378,17 +54727,23 @@ async fn codex_goal_segments_share_one_pioneer_turn_and_fence_subagents_impl() {
             }),
         )
         .await;
-    processor
-        .handle_cli_runtime_timeline_event(
-            session_handle.instance(),
-            RuntimeEvent::TurnCompleted(RuntimeTurnCompleted {
-                native_thread_id: Some(native_thread_id.to_owned()),
-                native_turn_id: first_segment_id.to_owned(),
-                status: "completed".to_owned(),
-                native: None,
-            }),
-        )
-        .await;
+    let first_completion = RuntimeEvent::TurnCompleted(RuntimeTurnCompleted {
+        native_thread_id: Some(native_thread_id.to_owned()),
+        native_turn_id: first_segment_id.to_owned(),
+        status: "completed".to_owned(),
+        native: Some(pioneer_cli_agent_runtime::event::RuntimeNativeEvent {
+            method: "turn/completed".into(),
+            payload_redacted: Some(
+                json!({"turn":{"startedAt":10,"completedAt":11,"durationMs":1000}}),
+            ),
+            raw_redacted: None,
+        }),
+    });
+    for _ in 0..2 {
+        processor
+            .handle_cli_runtime_timeline_event(session_handle.instance(), first_completion.clone())
+            .await;
+    }
 
     let (_, intermediate_turn) = crud_store
         .get_turn(thread_id, turn_id)
@@ -54430,7 +54785,13 @@ async fn codex_goal_segments_share_one_pioneer_turn_and_fence_subagents_impl() {
                 native_thread_id: Some(native_thread_id.to_owned()),
                 native_turn_id: submission_id.to_owned(),
                 status: "completed".to_owned(),
-                native: None,
+                native: Some(pioneer_cli_agent_runtime::event::RuntimeNativeEvent {
+                    method: "turn/completed".into(),
+                    payload_redacted: Some(
+                        json!({"turn":{"startedAt":10,"completedAt":11,"durationMs":1000}}),
+                    ),
+                    raw_redacted: None,
+                }),
             }),
         )
         .await;
@@ -54546,7 +54907,13 @@ async fn codex_goal_segments_share_one_pioneer_turn_and_fence_subagents_impl() {
                 native_thread_id: Some(native_thread_id.to_owned()),
                 native_turn_id: second_segment_id.to_owned(),
                 status: "completed".to_owned(),
-                native: None,
+                native: Some(pioneer_cli_agent_runtime::event::RuntimeNativeEvent {
+                    method: "turn/completed".into(),
+                    payload_redacted: Some(
+                        json!({"turn":{"startedAt":10,"completedAt":11,"durationMs":1000}}),
+                    ),
+                    raw_redacted: None,
+                }),
             }),
         )
         .await;
@@ -54556,6 +54923,35 @@ async fn codex_goal_segments_share_one_pioneer_turn_and_fence_subagents_impl() {
         .expect("Goal-held turn should load")
         .expect("Goal-held turn should exist");
     assert_eq!(held_turn.status, TurnStatus::InProgress);
+    let items = crud_store
+        .list_turn_items_by_type(turn_id, "system_event")
+        .await
+        .unwrap();
+    let timings = items
+        .iter()
+        .filter_map(|item| match item {
+            TurnItem::SystemEvent {
+                code: Some(code),
+                details: Some(details),
+                ..
+            } if code == "cli_native_turn_timing" => Some(details),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        timings.len(),
+        3,
+        "each intermediate native segment retains timing"
+    );
+    for native_turn in [first_segment_id, submission_id, second_segment_id] {
+        assert!(
+            timings
+                .iter()
+                .any(|details| details["native_turn_id"] == native_turn
+                    && details["native_thread_id"] == native_thread_id
+                    && details["native_timing"]["durationMs"] == 1000)
+        );
+    }
 
     processor
         .handle_cli_runtime_timeline_event(
@@ -54617,7 +55013,7 @@ async fn codex_goal_segments_share_one_pioneer_turn_and_fence_subagents_impl() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn turn_cancel_clears_codex_goal_and_interrupts_latest_execution_segment() {
-    let (tx, mut rx) = mpsc::channel(32);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(32);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "delayed"));
@@ -54808,7 +55204,7 @@ async fn turn_cancel_clears_codex_goal_and_interrupts_latest_execution_segment()
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn closed_cli_runtime_durable_hub_is_replaced() {
-    let (tx, _rx) = mpsc::channel(16);
+    let (tx, _rx) = crate::session::test_support::outbound_channel(16);
     let session_manager = Arc::new(SessionManager::new());
     register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -54865,7 +55261,7 @@ async fn closed_cli_runtime_durable_hub_is_replaced() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn completed_cli_runtime_attempt_reconciles_running_pioneer_turn() {
-    let (tx, mut rx) = mpsc::channel(64);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(64);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -54979,7 +55375,7 @@ async fn completed_cli_runtime_attempt_reconciles_running_pioneer_turn() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_runtime_terminal_attempt_fences_late_native_events() {
-    let (tx, mut rx) = mpsc::channel(64);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(64);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -55202,7 +55598,7 @@ async fn run_interrupted_cli_runtime_turn_recovery_scenario(
     invalid_durable_cwd: bool,
     control_scenario: Option<recovered_turn_stop::Scenario>,
 ) {
-    let (tx, mut rx) = mpsc::channel(64);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(64);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -55923,7 +56319,7 @@ async fn run_interrupted_cli_runtime_turn_recovery_scenario(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_runtime_terminal_cleanup_keeps_session_open_for_other_active_turn() {
-    let (tx, _rx) = mpsc::channel(16);
+    let (tx, _rx) = crate::session::test_support::outbound_channel(16);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -56061,7 +56457,7 @@ async fn cli_runtime_terminal_cleanup_keeps_session_open_for_other_active_turn()
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_runtime_stale_db_only_running_binding_schedules_recovery() {
-    let (tx, _rx) = mpsc::channel(32);
+    let (tx, _rx) = crate::session::test_support::outbound_channel(32);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -56251,7 +56647,7 @@ async fn unbound_native_listener_owns_processor_until_abort() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_runtime_stale_scan_reconciles_db_only_terminal_binding() {
-    let (tx, _rx) = mpsc::channel(32);
+    let (tx, _rx) = crate::session::test_support::outbound_channel(32);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -56368,7 +56764,7 @@ fn codex_steer_allows_another_current_collaborator_user() {
     run_gateway_message_test("codex-steer-test", || async {
         const THREAD_ID: &str = "T00000000000000000034";
         const TURN_ID: &str = "V00000000000000000034";
-        let (tx, mut rx) = mpsc::channel(32);
+        let (tx, mut rx) = crate::session::test_support::outbound_channel(32);
         let session_manager = Arc::new(SessionManager::new());
         let connection_id =
             register_authenticated_test_connection(session_manager.as_ref(), tx).await;
@@ -56416,7 +56812,8 @@ fn codex_steer_allows_another_current_collaborator_user() {
         materialize_test_member_collaborator(crud_store.as_ref(), workspace_id.as_str(), THREAD_ID)
             .await;
 
-        let (collaborator_tx, mut collaborator_rx) = mpsc::channel(8);
+        let (collaborator_tx, mut collaborator_rx) =
+            crate::session::test_support::outbound_channel(8);
         let collaborator_connection_id = session_manager
             .register_connection(collaborator_tx, authenticated_test_member_collaborator())
             .await
@@ -56493,7 +56890,7 @@ fn codex_steer_allows_another_current_collaborator_user() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn codex_steer_rejects_missing_active_runtime_session() {
-    let (tx, mut rx) = mpsc::channel(32);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(32);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -56583,7 +56980,7 @@ async fn codex_steer_rejects_missing_active_runtime_session() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn codex_steer_rejects_missing_active_turn_binding() {
-    let (tx, mut rx) = mpsc::channel(32);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(32);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -56637,7 +57034,7 @@ async fn codex_steer_rejects_missing_active_turn_binding() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn codex_steer_rejects_wrong_backend() {
-    let (tx, mut rx) = mpsc::channel(32);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(32);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -56716,7 +57113,7 @@ async fn codex_steer_rejects_wrong_backend() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_runtime_request_respond_allows_another_current_collaborator_user() {
     const THREAD_ID: &str = "T00000000000000000031";
-    let (tx, mut rx) = mpsc::channel(16);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(16);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -56758,7 +57155,7 @@ async fn cli_runtime_request_respond_allows_another_current_collaborator_user() 
         .await
         .expect("CLI runtime session should be active for native request response");
 
-    let (foreign_tx, mut foreign_rx) = mpsc::channel(8);
+    let (foreign_tx, mut foreign_rx) = crate::session::test_support::outbound_channel(8);
     let foreign_connection_id = session_manager
         .register_connection(foreign_tx, authenticated_test_member_collaborator())
         .await
@@ -56892,7 +57289,7 @@ async fn cli_runtime_pending_request_replays_to_late_collaborator_thread_open() 
     const TURN_ID: &str = "turn_cli_request_late_collaborator";
     const NATIVE_THREAD_ID: &str = "codex-thread-request-late-collaborator";
 
-    let (tx, mut rx) = mpsc::channel(16);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(16);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -56972,7 +57369,7 @@ async fn cli_runtime_pending_request_replays_to_late_collaborator_thread_open() 
 
     // Register only after the provider prompt is already pending. This is the
     // reconnect/late-collaborator path that live fanout cannot satisfy.
-    let (late_tx, mut late_rx) = mpsc::channel(16);
+    let (late_tx, mut late_rx) = crate::session::test_support::outbound_channel(16);
     let late_connection_id = session_manager
         .register_connection(late_tx, authenticated_test_member_collaborator())
         .await
@@ -57068,7 +57465,7 @@ async fn cli_runtime_pending_request_replays_to_late_collaborator_thread_open() 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_runtime_grandchild_request_replays_into_root_capsule_and_resolves_from_root_collaborator()
  {
-    let (tx, mut rx) = mpsc::channel(16);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(16);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -57247,7 +57644,7 @@ async fn cli_runtime_grandchild_request_replays_into_root_capsule_and_resolves_f
         vec![child_thread_id.to_owned(), root_thread_id.to_owned()]
     );
 
-    let (root_tx, mut root_rx) = mpsc::channel(16);
+    let (root_tx, mut root_rx) = crate::session::test_support::outbound_channel(16);
     let root_connection_id = session_manager
         .register_connection(root_tx, authenticated_test_member_collaborator())
         .await
@@ -57339,7 +57736,7 @@ async fn cli_runtime_grandchild_request_replays_into_root_capsule_and_resolves_f
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_runtime_native_request_resolved_cancels_matching_pending_request() {
-    let (tx, mut rx) = mpsc::channel(16);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(16);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("sonnet", "cli_runtime:claude"));
@@ -57450,7 +57847,7 @@ async fn cli_runtime_native_request_resolved_cancels_matching_pending_request() 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn turn_permission_request_respond_allows_another_current_collaborator_user() {
     const THREAD_ID: &str = "T00000000000000000032";
-    let (tx, mut rx) = mpsc::channel(16);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(16);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -57504,7 +57901,7 @@ async fn turn_permission_request_respond_allows_another_current_collaborator_use
         THREAD_ID,
     )
     .await;
-    let (foreign_tx, mut foreign_rx) = mpsc::channel(8);
+    let (foreign_tx, mut foreign_rx) = crate::session::test_support::outbound_channel(8);
     let foreign_connection_id = session_manager
         .register_connection(foreign_tx, authenticated_test_member_collaborator())
         .await
@@ -57661,7 +58058,7 @@ async fn turn_permission_request_respond_allows_another_current_collaborator_use
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn native_permission_request_from_grandchild_is_visible_in_all_ancestor_scopes_and_resolves_from_root()
  {
-    let (tx, mut rx) = mpsc::channel(16);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(16);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -57812,7 +58209,7 @@ async fn native_permission_request_from_grandchild_is_visible_in_all_ancestor_sc
         serde_json::json!([child_thread_id, root_thread_id])
     );
 
-    let (replay_tx, mut replay_rx) = mpsc::channel(16);
+    let (replay_tx, mut replay_rx) = crate::session::test_support::outbound_channel(16);
     let replay_connection_id =
         register_authenticated_test_connection(session_manager.as_ref(), replay_tx).await;
     let replay_start_request_id = "permreplaystart000001";
@@ -57915,7 +58312,7 @@ async fn native_permission_request_from_grandchild_is_visible_in_all_ancestor_sc
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn native_permission_request_cancellation_resolves_and_removes_pending_request() {
-    let (tx, mut rx) = mpsc::channel(16);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(16);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -58015,7 +58412,7 @@ async fn native_permission_request_cancellation_resolves_and_removes_pending_req
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn native_permission_request_replays_and_accepts_durable_response_after_restart() {
-    let (tx, mut rx) = mpsc::channel(16);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(16);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -58098,7 +58495,7 @@ async fn native_permission_request_replays_and_accepts_durable_response_after_re
         .await
         .remove("perm-approval-restart-1");
 
-    let (replay_tx, mut replay_rx) = mpsc::channel(16);
+    let (replay_tx, mut replay_rx) = crate::session::test_support::outbound_channel(16);
     let replay_connection_id = session_manager
         .register_connection(replay_tx, authenticated_test_superuser_secondary_session())
         .await
@@ -58246,7 +58643,7 @@ async fn cli_runtime_request_respond_rejects_stale_request_ids() {
                     Some(cli_session),
                 )
             } else {
-                let (tx, rx) = mpsc::channel(8);
+                let (tx, rx) = crate::session::test_support::outbound_channel(8);
                 let session_manager = Arc::new(SessionManager::new());
                 let connection_id =
                     register_authenticated_test_connection(session_manager.as_ref(), tx).await;
@@ -58288,7 +58685,7 @@ async fn cli_runtime_request_respond_rejects_stale_request_ids() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_runtime_request_respond_rejects_pending_without_turn_binding() {
-    let (tx, mut rx) = mpsc::channel(16);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(16);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -58936,7 +59333,7 @@ async fn grandchild_cli_runtime_approval_projects_to_root_and_root_denial_reache
 
 #[tokio::test]
 async fn cli_runtime_request_claude_approval_roundtrip_preserves_provider_payload() {
-    let (tx, _rx) = mpsc::channel(16);
+    let (tx, _rx) = crate::session::test_support::outbound_channel(16);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("sonnet", "anthropic"));
@@ -59087,7 +59484,7 @@ async fn cli_runtime_request_claude_approval_roundtrip_preserves_provider_payloa
 
 #[tokio::test]
 async fn cli_runtime_request_claude_denial_blocks_provider_action() {
-    let (tx, _rx) = mpsc::channel(16);
+    let (tx, _rx) = crate::session::test_support::outbound_channel(16);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("sonnet", "anthropic"));
@@ -60689,12 +61086,12 @@ async fn materialize_expired_cli_command_attempt(
 async fn cli_runtime_approval_processor() -> (
     MessageProcessor,
     ConnectionId,
-    mpsc::Receiver<Message>,
+    crate::session::test_support::OutboundTestReceiver,
     String,
     Arc<CrudStore>,
     Arc<RecordingCliRuntimeSession>,
 ) {
-    let (tx, rx) = mpsc::channel(16);
+    let (tx, rx) = crate::session::test_support::outbound_channel(16);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -61063,7 +61460,7 @@ async fn materialize_cli_runtime_turn_with_execution(
 
 async fn open_test_codex_command_approval(
     processor: &MessageProcessor,
-    rx: &mut mpsc::Receiver<Message>,
+    rx: &mut crate::session::test_support::OutboundTestReceiver,
     workspace_id: &str,
     native_request_id: JsonValue,
 ) -> CLIRuntimeRequestOpenedNotification {
@@ -61106,7 +61503,7 @@ async fn open_test_codex_command_approval(
 
 async fn open_test_codex_file_change_approval(
     processor: &MessageProcessor,
-    rx: &mut mpsc::Receiver<Message>,
+    rx: &mut crate::session::test_support::OutboundTestReceiver,
     workspace_id: &str,
     native_request_id: JsonValue,
     diff: &str,
@@ -61152,7 +61549,7 @@ async fn open_test_codex_file_change_approval(
 
 async fn open_test_codex_permission_approval(
     processor: &MessageProcessor,
-    rx: &mut mpsc::Receiver<Message>,
+    rx: &mut crate::session::test_support::OutboundTestReceiver,
     workspace_id: &str,
     native_request_id: JsonValue,
     permissions: JsonValue,
@@ -61190,7 +61587,7 @@ async fn open_test_codex_permission_approval(
 
 async fn open_test_codex_user_input_request(
     processor: &MessageProcessor,
-    rx: &mut mpsc::Receiver<Message>,
+    rx: &mut crate::session::test_support::OutboundTestReceiver,
     workspace_id: &str,
     native_request_id: JsonValue,
 ) -> CLIRuntimeRequestOpenedNotification {
@@ -61244,7 +61641,7 @@ async fn open_test_codex_user_input_request(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn turn_start_succeeds_when_skill_roots_are_missing() {
-    let (tx, mut rx) = mpsc::channel(8);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(8);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -61322,7 +61719,7 @@ async fn turn_start_succeeds_when_skill_roots_are_missing() {
 async fn start_agents_doc_prompt_test_thread(
     processor: &MessageProcessor,
     connection_id: crate::session::ConnectionId,
-    rx: &mut mpsc::Receiver<Message>,
+    rx: &mut crate::session::test_support::OutboundTestReceiver,
     workspace_id: &str,
     thread_id: &str,
 ) {
@@ -61347,7 +61744,7 @@ async fn start_agents_doc_prompt_test_thread(
 async fn start_agents_doc_prompt_test_turn(
     processor: &MessageProcessor,
     connection_id: crate::session::ConnectionId,
-    rx: &mut mpsc::Receiver<Message>,
+    rx: &mut crate::session::test_support::OutboundTestReceiver,
     thread_id: &str,
     turn_id: &str,
 ) {
@@ -61386,7 +61783,7 @@ async fn start_agents_doc_prompt_test_turn(
 #[test]
 fn agents_doc_turn_without_doc_omits_agents_md_prompt_section() {
     run_thread_agents_doc_rpc_test(|| async {
-        let (tx, mut rx) = mpsc::channel(64);
+        let (tx, mut rx) = crate::session::test_support::outbound_channel(64);
         let session_manager = Arc::new(SessionManager::new());
         let connection_id =
             register_authenticated_test_connection(session_manager.as_ref(), tx).await;
@@ -61476,7 +61873,7 @@ fn agents_doc_prompt_hook_source<'a>(
 #[test]
 fn agents_doc_turn_prompt_uses_root_inheritance_and_folder_override() {
     run_thread_agents_doc_rpc_test(|| async {
-        let (tx, mut rx) = mpsc::channel(96);
+        let (tx, mut rx) = crate::session::test_support::outbound_channel(96);
         let session_manager = Arc::new(SessionManager::new());
         let connection_id =
             register_authenticated_test_connection(session_manager.as_ref(), tx).await;
@@ -61533,9 +61930,9 @@ fn agents_doc_turn_prompt_uses_root_inheritance_and_folder_override() {
             .last()
             .and_then(|request| request.compiled_prompt.as_ref())
             .expect("root provider request should include compiled prompt")
-            .dynamic_system_text
+            .full_system_text
             .clone();
-        assert!(root_prompt.contains("## AGENTS.md"));
+        assert!(root_prompt.contains("### AGENTS.md"));
         assert!(root_prompt.contains("effective AGENTS.md for this thread tree scope"));
         assert!(root_prompt.contains("Root only instruction"));
 
@@ -61578,7 +61975,7 @@ fn agents_doc_turn_prompt_uses_root_inheritance_and_folder_override() {
             .last()
             .and_then(|request| request.compiled_prompt.as_ref())
             .expect("inherited provider request should include compiled prompt")
-            .dynamic_system_text
+            .full_system_text
             .clone();
         assert!(inherited_prompt.contains("Root only instruction"));
         assert!(inherited_prompt.contains("explicit user messages take precedence"));
@@ -61608,7 +62005,7 @@ fn agents_doc_turn_prompt_uses_root_inheritance_and_folder_override() {
             .last()
             .and_then(|request| request.compiled_prompt.as_ref())
             .expect("folder provider request should include compiled prompt")
-            .dynamic_system_text
+            .full_system_text
             .clone();
         assert!(folder_prompt.contains("effective AGENTS.md for this thread tree scope"));
         assert!(folder_prompt.contains("Folder only instruction"));
@@ -62238,7 +62635,7 @@ async fn agent_skill_audit_event_persists_audit_rows() {
 #[test]
 fn phase_11_prompt_manifest_hook_sources_roundtrip_existing_event() {
     run_gateway_message_test("prompt-manifest-hook-sources", || async {
-        let (tx, mut rx) = mpsc::channel(256);
+        let (tx, mut rx) = crate::session::test_support::outbound_channel(256);
         let session_manager = Arc::new(SessionManager::new());
         let connection_id =
             register_authenticated_test_connection(session_manager.as_ref(), tx).await;
@@ -62425,7 +62822,7 @@ async fn turn_start_materializes_thread_and_turn_state() {
         .await
         .expect("gateway bootstrap should create default workspace");
 
-    let (tx, mut rx) = mpsc::channel(8);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(8);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let expected_principal_id = authenticated_test_superuser().principal_id.to_string();
@@ -62620,7 +63017,7 @@ async fn turn_start_materializes_thread_and_turn_state() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn turn_get_returns_turn_snapshot() {
-    let (tx, mut rx) = mpsc::channel(8);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(8);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -62733,7 +63130,7 @@ async fn assert_turn_cancel_with_optional_busy_native_actor(
     with_effects: bool,
     resume_direct: bool,
 ) {
-    let (tx, mut rx) = mpsc::channel(256);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(256);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "delayed"));
@@ -63494,7 +63891,7 @@ async fn assert_turn_cancel_with_optional_busy_native_actor(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn turn_cancel_cli_runtime_without_active_session_does_not_start_runtime() {
-    let (tx, mut rx) = mpsc::channel(256);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(256);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "delayed"));
@@ -63728,8 +64125,8 @@ async fn turn_cancel_cli_runtime_without_active_session_does_not_start_runtime()
 async fn turn_cancel_allows_authorized_non_subscribed_collaborator_user() {
     const THREAD_ID: &str = "T00000000000000000033";
     const TURN_ID: &str = "V00000000000000000033";
-    let (tx_owner, mut rx_owner) = mpsc::channel(16);
-    let (tx_foreign, mut rx_foreign) = mpsc::channel(16);
+    let (tx_owner, mut rx_owner) = crate::session::test_support::outbound_channel(16);
+    let (tx_foreign, mut rx_foreign) = crate::session::test_support::outbound_channel(16);
     let session_manager = Arc::new(SessionManager::new());
     let owner_connection_id =
         register_authenticated_test_connection(session_manager.as_ref(), tx_owner).await;
@@ -63902,7 +64299,7 @@ async fn task_cancel_allows_another_current_collaborator_user() {
     materialize_test_member_collaborator(crud_store.as_ref(), workspace_id.as_str(), THREAD_ID)
         .await;
 
-    let (collaborator_tx, mut collaborator_rx) = mpsc::channel(8);
+    let (collaborator_tx, mut collaborator_rx) = crate::session::test_support::outbound_channel(8);
     let collaborator_connection_id = session_manager
         .register_connection(collaborator_tx, authenticated_test_member_collaborator())
         .await
@@ -63941,7 +64338,7 @@ async fn task_cancel_allows_another_current_collaborator_user() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn turn_cancel_completed_turn_returns_completed_snapshot() {
-    let (tx, mut rx) = mpsc::channel(32);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(32);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -64019,7 +64416,7 @@ async fn turn_cancel_completed_turn_returns_completed_snapshot() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn thread_tree_returns_folders_and_placements_after_moves() {
     use sea_orm::Statement;
-    let (tx, mut rx) = mpsc::channel(32);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(32);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -64206,7 +64603,7 @@ async fn thread_tree_returns_folders_and_placements_after_moves() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn folder_delete_promotes_nested_contents_to_parent() {
-    let (tx, mut rx) = mpsc::channel(64);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(64);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -64380,7 +64777,7 @@ async fn folder_delete_promotes_nested_contents_to_parent() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn thread_and_folder_move_support_root_target() {
-    let (tx, mut rx) = mpsc::channel(64);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(64);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -64548,8 +64945,8 @@ async fn thread_and_folder_move_support_root_target() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn thread_tree_changed_is_broadcast_to_other_connections() {
-    let (tx_a, mut rx_a) = mpsc::channel(16);
-    let (tx_b, mut rx_b) = mpsc::channel(16);
+    let (tx_a, mut rx_a) = crate::session::test_support::outbound_channel(16);
+    let (tx_b, mut rx_b) = crate::session::test_support::outbound_channel(16);
     let session_manager = Arc::new(SessionManager::new());
     let connection_a = register_authenticated_test_connection(session_manager.as_ref(), tx_a).await;
     let connection_b = register_authenticated_test_connection(session_manager.as_ref(), tx_b).await;
@@ -64609,7 +65006,7 @@ async fn thread_tree_changed_is_broadcast_to_other_connections() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn thread_tree_includes_agents_doc_summaries_without_content() {
-    let (tx, mut rx) = mpsc::channel(32);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(32);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -64801,7 +65198,7 @@ where
 #[test]
 fn thread_agents_doc_rpc_saves_inherits_archives_and_resolves_for_thread() {
     run_thread_agents_doc_rpc_test(|| async {
-        let (tx, mut rx) = mpsc::channel(128);
+        let (tx, mut rx) = crate::session::test_support::outbound_channel(128);
         let session_manager = Arc::new(SessionManager::new());
         let connection_id =
             register_authenticated_test_connection(session_manager.as_ref(), tx).await;
@@ -65029,7 +65426,7 @@ fn thread_agents_doc_rpc_saves_inherits_archives_and_resolves_for_thread() {
 #[test]
 fn thread_agents_doc_rpc_rejects_large_content_and_version_conflicts() {
     run_thread_agents_doc_rpc_test(|| async {
-        let (tx, mut rx) = mpsc::channel(32);
+        let (tx, mut rx) = crate::session::test_support::outbound_channel(32);
         let session_manager = Arc::new(SessionManager::new());
         let connection_id =
             register_authenticated_test_connection(session_manager.as_ref(), tx).await;
@@ -65108,7 +65505,7 @@ fn thread_agents_doc_rpc_rejects_large_content_and_version_conflicts() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn thread_history_is_not_a_reachable_timeline_api() {
-    let (tx, mut rx) = mpsc::channel(16);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(16);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -65154,7 +65551,7 @@ async fn patch_history_rpc_reads_persisted_steps_records_files_and_diffs() {
     let turn_id = "turn_patch_history_rpc";
     let (processor, crud_store, _workspace_id) =
         setup_execution_window_terminal_turn(thread_id, turn_id).await;
-    let (tx, mut rx) = mpsc::channel(16);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(16);
     let connection_id =
         register_authenticated_test_connection(processor.session_manager.as_ref(), tx).await;
 
@@ -65551,7 +65948,7 @@ async fn patch_history_parent_scope_exposes_exact_child_timeline_and_aggregate()
         .await
         .expect("finalize child patch projection");
 
-    let (tx, mut rx) = mpsc::channel(16);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(16);
     let connection_id =
         register_authenticated_test_connection(processor.session_manager.as_ref(), tx).await;
     for request in [
@@ -65643,7 +66040,7 @@ async fn patch_history_rpc_keeps_codex_aggregate_only_provenance() {
     let turn_id = "turn_patch_history_codex";
     let (processor, crud_store, workspace_id) =
         setup_execution_window_terminal_turn(thread_id, turn_id).await;
-    let (tx, mut rx) = mpsc::channel(8);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(8);
     let connection_id =
         register_authenticated_test_connection(processor.session_manager.as_ref(), tx).await;
     let event = pioneer_tools::apply_patch::history::normalize_codex_diff_updated(
@@ -65708,7 +66105,7 @@ async fn patch_history_rpc_keeps_codex_aggregate_only_provenance() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn turn_items_returns_stream_events_for_resume() {
-    let (tx, mut rx) = mpsc::channel(16);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(16);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -65794,7 +66191,7 @@ async fn turn_items_returns_stream_events_for_resume() {
 struct SemanticTimelineQueryHarness {
     processor: MessageProcessor,
     connection_id: ConnectionId,
-    rx: mpsc::Receiver<Message>,
+    rx: crate::session::test_support::OutboundTestReceiver,
     sandbox_thread_id: String,
     sandbox_turn_id: String,
     site_thread_id: String,
@@ -65807,7 +66204,7 @@ struct SemanticTimelineQueryHarness {
 struct LiveSemanticTimelineHarness {
     processor: MessageProcessor,
     connection_id: ConnectionId,
-    rx: mpsc::Receiver<Message>,
+    rx: crate::session::test_support::OutboundTestReceiver,
     workspace_id: String,
     thread_id: String,
     turn_id: String,
@@ -66585,7 +66982,7 @@ async fn codex_retry_notice_is_durable_semantic_work_in_an_internal_execution_th
             &harness.thread_id,
         )
         .await;
-        let (member_tx, mut member_rx) = mpsc::channel(64);
+        let (member_tx, mut member_rx) = crate::session::test_support::outbound_channel(64);
         let member = processor
             .session_manager
             .register_connection(member_tx, authenticated_test_member_collaborator())
@@ -66837,7 +67234,7 @@ async fn codex_retry_notice_is_durable_semantic_work_in_an_internal_execution_th
                 )
                 .permits_resource_resolution()
         );
-        let (restricted_tx, mut restricted_rx) = mpsc::channel(64);
+        let (restricted_tx, mut restricted_rx) = crate::session::test_support::outbound_channel(64);
         let restricted_connection = processor
             .session_manager
             .register_connection(restricted_tx, Arc::new(restricted))
@@ -68121,7 +68518,7 @@ async fn setup_semantic_timeline_query_harness_with_synthetic() -> SemanticTimel
 async fn setup_semantic_timeline_query_harness_inner(
     include_synthetic: bool,
 ) -> SemanticTimelineQueryHarness {
-    let (tx, rx) = mpsc::channel(32);
+    let (tx, rx) = crate::session::test_support::outbound_channel(32);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -68225,7 +68622,7 @@ async fn setup_live_semantic_timeline_harness_on_store(
     thread_id: String,
     (workspace_manager, crud_store, workspace_id): (Arc<WorkspaceManager>, Arc<CrudStore>, String),
 ) -> LiveSemanticTimelineHarness {
-    let (tx, rx) = mpsc::channel(64);
+    let (tx, rx) = crate::session::test_support::outbound_channel(64);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -68540,7 +68937,7 @@ async fn request_live_thread_timeline_page_for_thread_at_anchor(
 async fn request_thread_timeline_page_for_test(
     processor: &MessageProcessor,
     connection_id: ConnectionId,
-    rx: &mut mpsc::Receiver<Message>,
+    rx: &mut crate::session::test_support::OutboundTestReceiver,
     thread_id: &str,
     request_id: &str,
 ) -> pioneer_protocol::ThreadTimelinePageResponse {
@@ -68558,7 +68955,7 @@ async fn request_thread_timeline_page_for_test(
 async fn request_thread_timeline_page_for_test_at_anchor(
     processor: &MessageProcessor,
     connection_id: ConnectionId,
-    rx: &mut mpsc::Receiver<Message>,
+    rx: &mut crate::session::test_support::OutboundTestReceiver,
     thread_id: &str,
     request_id: &str,
     anchor: &str,
@@ -68586,7 +68983,7 @@ async fn request_thread_timeline_page_for_test_at_anchor(
 async fn send_epic6_test_message(
     processor: &MessageProcessor,
     connection_id: ConnectionId,
-    rx: &mut mpsc::Receiver<Message>,
+    rx: &mut crate::session::test_support::OutboundTestReceiver,
     thread_id: &str,
     turn_id: &str,
     text: &str,
@@ -69381,7 +69778,7 @@ fn completed_command_execution_item(item_id: &str) -> TurnItem {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn recovery_lifecycle_notification_is_persisted_for_history_replay() {
-    let (tx, mut rx) = mpsc::channel(16);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(16);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -69867,7 +70264,7 @@ async fn cli_recovery_blocked_event_expires_pending_requests_and_closes_runtime_
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_runtime_request_respond_rejects_pending_for_blocked_turn_without_native_response() {
-    let (tx, mut rx) = mpsc::channel(32);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(32);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -70009,7 +70406,7 @@ async fn cli_runtime_request_respond_rejects_pending_for_blocked_turn_without_na
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_runtime_completed_turn_cleanup_expires_pending_requests_before_response() {
-    let (tx, mut rx) = mpsc::channel(32);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(32);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -70182,7 +70579,7 @@ async fn cli_runtime_completed_turn_cleanup_expires_pending_requests_before_resp
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_runtime_request_respond_rejects_pending_without_active_runtime_session() {
-    let (tx, mut rx) = mpsc::channel(16);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(16);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -70295,7 +70692,7 @@ async fn cli_runtime_request_respond_rejects_pending_without_active_runtime_sess
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_runtime_request_respond_rejects_pending_with_mismatched_native_thread_id() {
-    let (tx, mut rx) = mpsc::channel(32);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(32);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -70416,7 +70813,7 @@ async fn cli_runtime_request_respond_rejects_pending_with_mismatched_native_thre
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_runtime_server_request_without_turn_binding_is_cancelled_without_pending_request() {
-    let (tx, _rx) = mpsc::channel(16);
+    let (tx, _rx) = crate::session::test_support::outbound_channel(16);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -70587,7 +70984,7 @@ fn pending_machine_request_lane_includes_process_generation() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_runtime_server_request_waits_for_starting_turn_binding_native_id() {
-    let (tx, mut rx) = mpsc::channel(16);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(16);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -70754,7 +71151,7 @@ async fn cli_runtime_server_request_waits_for_starting_turn_binding_native_id() 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_runtime_generic_request_event_waits_for_starting_turn_binding_native_id() {
-    let (tx, mut rx) = mpsc::channel(16);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(16);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("sonnet", "cli_runtime:claude"));
@@ -70905,7 +71302,7 @@ async fn cli_runtime_generic_request_event_waits_for_starting_turn_binding_nativ
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_runtime_server_request_buffered_flush_preserves_order_before_terminal_event() {
-    let (tx, _rx) = mpsc::channel(32);
+    let (tx, _rx) = crate::session::test_support::outbound_channel(32);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -71122,7 +71519,7 @@ async fn cli_runtime_server_request_with_mismatched_starting_native_thread_is_ca
             "stale request for another native thread must not close the active bound turn session",
         ),
     ] {
-        let (tx, _rx) = mpsc::channel(16);
+        let (tx, _rx) = crate::session::test_support::outbound_channel(16);
         let session_manager = Arc::new(SessionManager::new());
         let connection_id =
             register_authenticated_test_connection(session_manager.as_ref(), tx).await;
@@ -71281,7 +71678,7 @@ async fn cli_runtime_server_request_without_native_thread_does_not_buffer_on_sta
             "stale request without native thread must not close the active bound turn session",
         ),
     ] {
-        let (tx, _rx) = mpsc::channel(16);
+        let (tx, _rx) = crate::session::test_support::outbound_channel(16);
         let session_manager = Arc::new(SessionManager::new());
         let connection_id =
             register_authenticated_test_connection(session_manager.as_ref(), tx).await;
@@ -71889,7 +72286,7 @@ async fn cli_runtime_late_terminal_event_after_blocked_turn_is_ignored() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tool_retry_notification_is_persisted_for_history_replay_before_live() {
-    let (tx, mut rx) = mpsc::channel(64);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(64);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
@@ -71992,7 +72389,7 @@ async fn tool_retry_notification_is_persisted_for_history_replay_before_live() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn turn_start_emits_full_lifecycle_notifications_and_echoes_text() {
-    let (tx, mut rx) = mpsc::channel(16);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(16);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -72131,7 +72528,12 @@ async fn turn_start_emits_full_lifecycle_notifications_and_echoes_text() {
     let item_delta: ItemDeltaNotification =
         serde_json::from_value(item_delta_params).expect("item delta params must decode");
     assert_eq!(item_delta.item_id, agent_item_id);
-    assert_eq!(item_delta.delta, "Echo this back");
+    assert!(item_delta.delta.starts_with("<pioneer_turn_context>\n"));
+    assert!(
+        item_delta
+            .delta
+            .ends_with("</pioneer_turn_context>\n\nEcho this back")
+    );
 
     assert_eq!(item_completed_notification.method, events::ITEM_COMPLETED);
     let item_completed_params = item_completed_notification
@@ -72142,7 +72544,7 @@ async fn turn_start_emits_full_lifecycle_notifications_and_echoes_text() {
     match item_completed.item {
         pioneer_protocol::TurnItem::AgentMessage { id, text, .. } => {
             assert_eq!(id, agent_item_id);
-            assert_eq!(text, "Echo this back");
+            assert_eq!(text, item_delta.delta);
         }
         other => panic!("expected agent message item, got {other:?}"),
     }
@@ -72160,7 +72562,7 @@ async fn turn_start_emits_full_lifecycle_notifications_and_echoes_text() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn turn_start_executes_dynamic_skill_tool_end_to_end() {
-    let (tx, mut rx) = mpsc::channel(256);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(256);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -72492,7 +72894,7 @@ async fn turn_start_materializes_mcp_tool_bindings_and_executes_tool() {
 async fn dynamic_http_body_is_retained_for_context_without_timeline_or_broadcast_leak() {
     const SECRET: &str = "SECRET_DYNAMIC_HTTP_BODY_SENTINEL";
 
-    let (tx, mut rx) = mpsc::channel(64);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(64);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -72686,10 +73088,15 @@ Gateway HTTP skill body"#
         .await
         .expect("turn llm context should load");
     assert!(
-        retained_context
-            .iter()
-            .all(|entry| matches!(entry.source.as_str(), "assistant_round" | "tool_result_v2")),
-        "terminal cleanup should retain only canonical provider context"
+        retained_context.iter().all(|entry| matches!(
+            entry.source.as_str(),
+            "assistant_round"
+                | "tool_result_v2"
+                | "turn_input_projection_v1"
+                | "runtime_context_v1"
+                | "system_snapshot_v1"
+        )),
+        "terminal cleanup should retain canonical provider context and prepared delivery snapshots"
     );
     assert!(
         retained_context
@@ -72700,6 +73107,16 @@ Gateway HTTP skill body"#
         "canonical full result must survive terminal cleanup exactly once for history and result_read"
     );
 
+    assert!(
+        retained_context
+            .iter()
+            .any(|entry| entry.source == "turn_input_projection_v1")
+    );
+    assert!(
+        retained_context
+            .iter()
+            .any(|entry| entry.source == "system_snapshot_v1")
+    );
     let canonical_result = retained_context
         .iter()
         .find(|entry| entry.source == "tool_result_v2" && entry.payload.contains(SECRET))
@@ -72773,7 +73190,7 @@ async fn skills_list_returns_sorted_catalog_snapshot() {
     let registry_path = write_test_skill(&registry_root, "registry-c", "", "registry skill body");
     let packed_path = write_test_skill(&user_root, "packed-member", "", "packed skill body");
 
-    let (tx, mut rx) = mpsc::channel(32);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(32);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -73188,7 +73605,7 @@ async fn skills_policy_set_mutates_policy_and_emits_changed() {
 
     let policy_path = write_test_skill(&user_root, "policy-skill", "", "policy skill body");
 
-    let (tx, mut rx) = mpsc::channel(32);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(32);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -73309,7 +73726,7 @@ async fn skills_policy_set_can_disable_system_skill() {
     )
     .expect("write bundled browser fixture");
 
-    let (tx, mut rx) = mpsc::channel(32);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(32);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -73416,7 +73833,7 @@ async fn skills_policy_set_rejects_locked_system_implicit_disable() {
     )
     .expect("write bundled tasks fixture");
 
-    let (tx, mut rx) = mpsc::channel(32);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(32);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -73541,7 +73958,7 @@ async fn skills_pack_install_persists_children_atomically_and_emits_one_change()
         .expect("write pack member");
     }
 
-    let (tx, mut rx) = mpsc::channel(64);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(64);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -73759,7 +74176,7 @@ async fn concurrent_pack_install_consumes_one_upload_exactly_once() {
     )
     .expect("write pack member");
 
-    let (tx, mut rx) = mpsc::channel(64);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(64);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -73892,7 +74309,7 @@ async fn pack_install_upload_races_and_existing_terminal_states_never_publish_tw
     )
     .expect("write pack member");
 
-    let (tx, mut rx) = mpsc::channel(64);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(64);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -74194,7 +74611,7 @@ async fn upload_expiry_waits_for_the_shared_lifecycle_guard() {
     let payload_path = base_dir.join("expired-upload.tar.gz");
     std::fs::write(payload_path.as_path(), b"payload").expect("write upload payload");
 
-    let (tx, _rx) = mpsc::channel(8);
+    let (tx, _rx) = crate::session::test_support::outbound_channel(8);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -74292,7 +74709,7 @@ async fn pack_install_commit_failure_rolls_back_all_published_children() {
         .expect("write pack member");
     }
 
-    let (tx, mut rx) = mpsc::channel(64);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(64);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -74522,7 +74939,7 @@ async fn skills_pack_update_preserves_retained_identity_policy_and_rolls_back_fa
     write_member(&original_root, "removed", "removed", "removed body");
     write_member(&original_root, "rename-old", "renamed", "same metadata");
 
-    let (tx, mut rx) = mpsc::channel(96);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(96);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -74897,7 +75314,7 @@ async fn skills_pack_uninstall_is_ordered_atomic_and_supports_empty_parents() {
         pack_root
     };
 
-    let (tx, mut rx) = mpsc::channel(128);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(128);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -75151,7 +75568,7 @@ async fn packed_skill_individual_update_and_uninstall_preserve_parent_contract()
     )
     .expect("write initial member");
 
-    let (tx, mut rx) = mpsc::channel(96);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(96);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -75414,7 +75831,7 @@ async fn skills_install_update_uninstall_round_trip_persists_and_notifies() {
         "registry skill body v2",
     );
 
-    let (tx, mut rx) = mpsc::channel(64);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(64);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -75770,7 +76187,7 @@ async fn skills_uninstall_removes_pending_identity_without_deleting_external_sou
         "external source must survive uninstall",
     );
 
-    let (tx, mut rx) = mpsc::channel(32);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(32);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -75859,7 +76276,7 @@ async fn skills_lifecycle_rejects_system_install_and_unknown_mutation_id() {
         "system lifecycle body",
     );
 
-    let (tx, mut rx) = mpsc::channel(32);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(32);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -76012,7 +76429,7 @@ async fn skills_health_returns_dependency_diagnostics() {
             .expect("create system skill symlink");
     }
 
-    let (tx, mut rx) = mpsc::channel(32);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(32);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -76131,7 +76548,7 @@ async fn skills_install_rejects_relative_path_with_structured_error_code() {
     std::fs::create_dir_all(&workspace_root).expect("must create workspace root");
     std::fs::create_dir_all(&registry_root).expect("must create registry root");
 
-    let (tx, mut rx) = mpsc::channel(32);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(32);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -76199,7 +76616,7 @@ async fn skills_upload_abort_is_connection_bound() {
     let archive = build_test_skill_archive(source_path.as_path());
     let archive_sha = hex::encode(Sha256::digest(archive.as_slice()));
 
-    let (tx, mut rx) = mpsc::channel(32);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(32);
     let session_manager = Arc::new(SessionManager::new());
     let owner_connection_id =
         register_authenticated_test_connection(session_manager.as_ref(), tx.clone()).await;
@@ -76324,7 +76741,7 @@ async fn skills_upload_chunk_digest_mismatch_aborts_session() {
     let archive = build_test_skill_archive(source_path.as_path());
     let archive_sha = hex::encode(Sha256::digest(archive.as_slice()));
 
-    let (tx, mut rx) = mpsc::channel(32);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(32);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -76426,7 +76843,7 @@ async fn skills_install_with_user_target_persists_user_source_kind() {
         "user target skill body",
     );
 
-    let (tx, mut rx) = mpsc::channel(32);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(32);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -76555,7 +76972,7 @@ async fn skills_install_defaults_to_user_source_and_isolates_workspaces() {
         "user default skill body",
     );
 
-    let (tx, mut rx) = mpsc::channel(64);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(64);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -76698,7 +77115,7 @@ async fn skills_install_blocks_dependency_failure_under_default_policy() {
         "dependency blocked body",
     );
 
-    let (tx, mut rx) = mpsc::channel(32);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(32);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -76912,7 +77329,7 @@ async fn mcp_list_empty_then_install_stdio_persists_redacts_and_notifies() {
     let settings_path = base_dir.join("gateway-settings.toml");
     let (gateway_secrets, secret_store) = test_gateway_secrets_with_store();
 
-    let (tx, mut rx) = mpsc::channel(64);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(64);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -77182,7 +77599,7 @@ async fn mcp_install_http_disabled_persists_and_lists_disabled_state() {
     let settings_path = base_dir.join("gateway-settings.toml");
     let (gateway_secrets, _secret_store) = test_gateway_secrets_with_store();
 
-    let (tx, mut rx) = mpsc::channel(64);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(64);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -77299,7 +77716,7 @@ async fn mcp_update_deletes_stale_keystore_refs_after_success() {
     let settings_path = base_dir.join("gateway-settings.toml");
     let (gateway_secrets, _secret_store) = test_gateway_secrets_with_store();
 
-    let (tx, mut rx) = mpsc::channel(64);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(64);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -77444,7 +77861,7 @@ async fn mcp_details_and_uninstall_return_full_ui_state_and_remove_server() {
     std::fs::create_dir_all(&base_dir).expect("must create test settings dir");
     let (gateway_secrets, _secret_store) = test_gateway_secrets_with_store();
 
-    let (tx, mut rx) = mpsc::channel(64);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(64);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -77708,7 +78125,7 @@ async fn mcp_install_itemizes_valid_and_invalid_servers() {
     let base_dir = unique_temp_dir("mcp_itemized_install");
     std::fs::create_dir_all(&base_dir).expect("must create test settings dir");
 
-    let (tx, mut rx) = mpsc::channel(64);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(64);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -77907,11 +78324,11 @@ pub(super) async fn setup_workspace_message_processor() -> (
     MessageProcessor,
     Arc<SessionManager>,
     crate::session::ConnectionId,
-    mpsc::Receiver<Message>,
+    crate::session::test_support::OutboundTestReceiver,
     Arc<WorkspaceManager>,
     String,
 ) {
-    let (tx, rx) = mpsc::channel(8);
+    let (tx, rx) = crate::session::test_support::outbound_channel(8);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -78828,7 +79245,7 @@ struct MemoryGatewayHarness {
     processor: Arc<MessageProcessor>,
     crud_store: Arc<CrudStore>,
     workspace_manager: Arc<WorkspaceManager>,
-    rx: mpsc::Receiver<Message>,
+    rx: crate::session::test_support::OutboundTestReceiver,
     connection_id: u64,
     workspace_id: String,
     runtime_home: std::path::PathBuf,
@@ -78845,7 +79262,7 @@ struct MemoryAgentE2eHarness {
     crud_store: Arc<CrudStore>,
     workspace_id: String,
     connection_id: u64,
-    rx: mpsc::Receiver<Message>,
+    rx: crate::session::test_support::OutboundTestReceiver,
     runtime_home: std::path::PathBuf,
     _provider_registry: Arc<pioneer_provider::ProviderRegistry>,
 }
@@ -78860,7 +79277,7 @@ async fn setup_memory_gateway_harness_with_backend(
     backend: Option<Arc<dyn pioneer_memory::MemoryBackend>>,
 ) -> MemoryGatewayHarness {
     let session_manager = Arc::new(SessionManager::new());
-    let (tx, rx) = mpsc::channel(32);
+    let (tx, rx) = crate::session::test_support::outbound_channel(32);
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
@@ -78960,7 +79377,7 @@ async fn setup_memory_agent_e2e_harness_on_workspace(
     workspace: (Arc<WorkspaceManager>, Arc<CrudStore>, String),
 ) -> MemoryAgentE2eHarness {
     let session_manager = Arc::new(SessionManager::new());
-    let (tx, rx) = mpsc::channel(128);
+    let (tx, rx) = crate::session::test_support::outbound_channel(128);
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
     let (workspace_manager, crud_store, workspace_id) = workspace;
@@ -80190,7 +80607,7 @@ async fn chat_mode_russian_remember_does_not_mutate_agent_memory_impl() {
             request
                 .compiled_prompt
                 .as_ref()
-                .map(|prompt| !prompt.full_system_text.contains("## Memory Recall"))
+                .map(|prompt| !prompt.full_system_text.contains("### Memory Recall"))
                 .unwrap_or(true),
             "chat request should not include memory recall prompt"
         );
@@ -81191,7 +81608,7 @@ async fn memory_candidates_list_and_decide_use_service_boundary() {
 async fn start_thread_and_turn(
     processor: &Arc<MessageProcessor>,
     connection_id: u64,
-    rx: &mut mpsc::Receiver<Message>,
+    rx: &mut crate::session::test_support::OutboundTestReceiver,
     workspace_id: &str,
     thread_id: &str,
     turn_id: &str,
@@ -81215,7 +81632,7 @@ async fn start_thread_and_turn(
 async fn start_thread_and_turn_with_permission_profile(
     processor: &Arc<MessageProcessor>,
     connection_id: u64,
-    rx: &mut mpsc::Receiver<Message>,
+    rx: &mut crate::session::test_support::OutboundTestReceiver,
     workspace_id: &str,
     thread_id: &str,
     turn_id: &str,
@@ -81339,7 +81756,10 @@ async fn wait_for_task_anchor_item_status(
     item_id: &str,
     expected_status: TaskStatus,
 ) -> TaskTurnItem {
-    for _ in 0..100 {
+    // Fanout uses bounded pages and a five-second periodic wake when a bus
+    // notification is coalesced. Allow multiple quanta, as the turn-status
+    // waiter does, while still requiring the exact durable card status.
+    for _ in 0..1_200 {
         if let Some(TurnItem::Task { item }) = crud_store
             .get_turn_item(turn_id, item_id)
             .await
@@ -81534,7 +81954,7 @@ async fn wait_for_run_status(
 /// Keep client notification backpressure out of waits for durable background work.
 /// Call only after receiving the RPC response; the caller still checks the result.
 async fn drain_test_notifications_while<T>(
-    rx: &mut mpsc::Receiver<Message>,
+    rx: &mut crate::session::test_support::OutboundTestReceiver,
     completion: impl std::future::Future<Output = T>,
 ) -> T {
     tokio::pin!(completion);
@@ -81661,16 +82081,19 @@ async fn wait_for_thread_manager_turn_status(
     );
 }
 
-async fn recv_text(rx: &mut mpsc::Receiver<Message>) -> String {
+async fn recv_text(rx: &mut crate::session::test_support::OutboundTestReceiver) -> String {
     recv_text_timeout(rx, Duration::from_secs(1)).await
 }
 
-async fn recv_text_timeout(rx: &mut mpsc::Receiver<Message>, wait_for: Duration) -> String {
+async fn recv_text_timeout(
+    rx: &mut crate::session::test_support::OutboundTestReceiver,
+    wait_for: Duration,
+) -> String {
     recv_text_timeout_context(rx, wait_for, "websocket message").await
 }
 
 async fn recv_text_timeout_context(
-    rx: &mut mpsc::Receiver<Message>,
+    rx: &mut crate::session::test_support::OutboundTestReceiver,
     wait_for: Duration,
     context: &str,
 ) -> String {
@@ -81685,7 +82108,10 @@ async fn recv_text_timeout_context(
     }
 }
 
-async fn recv_jsonrpc_payload_by_id(rx: &mut mpsc::Receiver<Message>, request_id: &str) -> String {
+async fn recv_jsonrpc_payload_by_id(
+    rx: &mut crate::session::test_support::OutboundTestReceiver,
+    request_id: &str,
+) -> String {
     for _ in 0..200 {
         let payload = recv_text_timeout(rx, Duration::from_secs(2)).await;
         let value: serde_json::Value =
@@ -81699,7 +82125,7 @@ async fn recv_jsonrpc_payload_by_id(rx: &mut mpsc::Receiver<Message>, request_id
 }
 
 async fn recv_response_by_id(
-    rx: &mut mpsc::Receiver<Message>,
+    rx: &mut crate::session::test_support::OutboundTestReceiver,
     request_id: &str,
 ) -> JsonRpcResponse {
     for _ in 0..200 {
@@ -81717,7 +82143,7 @@ async fn recv_response_by_id(
 }
 
 async fn recv_response_and_notification_by_id_method(
-    rx: &mut mpsc::Receiver<Message>,
+    rx: &mut crate::session::test_support::OutboundTestReceiver,
     request_id: &str,
     method: &str,
 ) -> (JsonRpcResponse, JsonRpcNotification) {
@@ -81778,7 +82204,7 @@ async fn recv_response_and_notification_by_id_method(
 }
 
 async fn recv_error_by_id(
-    rx: &mut mpsc::Receiver<Message>,
+    rx: &mut crate::session::test_support::OutboundTestReceiver,
     request_id: &str,
 ) -> JsonRpcErrorResponse {
     for _ in 0..200 {
@@ -81820,7 +82246,7 @@ fn assert_public_error(
 }
 
 async fn recv_notification_by_method(
-    rx: &mut mpsc::Receiver<Message>,
+    rx: &mut crate::session::test_support::OutboundTestReceiver,
     method: &str,
 ) -> JsonRpcNotification {
     recv_notification_by_method_timeout(rx, method, Duration::from_secs(2)).await
@@ -81828,7 +82254,7 @@ async fn recv_notification_by_method(
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 async fn recv_native_task_permission_opened(
-    rx: &mut mpsc::Receiver<Message>,
+    rx: &mut crate::session::test_support::OutboundTestReceiver,
 ) -> JsonRpcNotification {
     // Task creation acknowledges enqueueing, not child readiness. The child must
     // pass scheduler dispatch, preflight and tool admission before this event.
@@ -81843,7 +82269,9 @@ async fn recv_native_task_permission_opened(
     .expect("native Task must reach its permission request within the launch budget")
 }
 
-async fn recv_next_notification(rx: &mut mpsc::Receiver<Message>) -> JsonRpcNotification {
+async fn recv_next_notification(
+    rx: &mut crate::session::test_support::OutboundTestReceiver,
+) -> JsonRpcNotification {
     let payload =
         recv_text_timeout_context(rx, Duration::from_secs(2), "next json-rpc notification").await;
     let value: serde_json::Value =
@@ -81856,7 +82284,7 @@ async fn recv_next_notification(rx: &mut mpsc::Receiver<Message>) -> JsonRpcNoti
 }
 
 async fn recv_notification_by_method_timeout(
-    rx: &mut mpsc::Receiver<Message>,
+    rx: &mut crate::session::test_support::OutboundTestReceiver,
     method: &str,
     wait_for: Duration,
 ) -> JsonRpcNotification {
@@ -81876,7 +82304,7 @@ async fn recv_notification_by_method_timeout(
 }
 
 async fn recv_echo_turn_lifecycle_notifications(
-    rx: &mut mpsc::Receiver<Message>,
+    rx: &mut crate::session::test_support::OutboundTestReceiver,
 ) -> (
     JsonRpcNotification,
     JsonRpcNotification,
@@ -82009,7 +82437,7 @@ async fn recv_echo_turn_lifecycle_notifications(
 async fn compaction_result_reader_pages_exact_source_and_rejects_cross_scope() {
     use pioneer_protocol::{ThreadToolResultReadParams, ThreadToolResultReadResponse};
     let (workspace_manager, store, workspace_id) = setup_workspace_manager().await;
-    let (tx, mut rx) = mpsc::channel(32);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(32);
     let sessions = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(sessions.as_ref(), tx).await;
     let processor = MessageProcessor::new(
@@ -82352,7 +82780,7 @@ print(json.dumps([{'type':'system','subtype':'init','model':'claude-sonnet-4-6'}
 }
 
 async fn check_native_overflow_twice(with_tool: bool, cli_summary: bool) {
-    let (tx, mut rx) = mpsc::channel(256);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(256);
     let sessions = Arc::new(SessionManager::new());
     let connection = register_authenticated_test_connection(sessions.as_ref(), tx).await;
     let threads = Arc::new(ThreadManager::new("test-model", "openai"));
@@ -82912,7 +83340,7 @@ async fn native_foreground_controller_uses_interactive_database_scope() {
     );
     let store = Arc::new(CrudStore::new(database.clone()));
 
-    let (tx, mut rx) = mpsc::channel(256);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(256);
     let sessions = Arc::new(SessionManager::new());
     let connection = register_authenticated_test_connection(sessions.as_ref(), tx).await;
     sessions
@@ -83132,7 +83560,7 @@ async fn native_foreground_controller_uses_interactive_database_scope() {
                 request
                     .messages
                     .iter()
-                    .any(|message| message.content == "small foreground request")
+                    .any(|message| prepared_user_text(message) == "small foreground request")
             }) {
                 break;
             }
@@ -83148,7 +83576,7 @@ async fn native_foreground_controller_uses_interactive_database_scope() {
             request
                 .messages
                 .iter()
-                .any(|message| message.content == "small foreground request")
+                .any(|message| prepared_user_text(message) == "small foreground request")
         })
         .expect("native foreground request was not captured");
     assert!(foreground_request.messages.iter().any(|message| {
@@ -83168,7 +83596,7 @@ async fn native_foreground_controller_uses_interactive_database_scope() {
     let current_index = foreground_request
         .messages
         .iter()
-        .position(|message| message.content == "small foreground request")
+        .position(|message| prepared_user_text(message) == "small foreground request")
         .unwrap();
     assert!(
         prior_index < current_index,
@@ -83445,7 +83873,7 @@ async fn native_foreground_controller_uses_interactive_database_scope() {
 
 #[tokio::test]
 async fn compaction_native_controller_runs_on_real_turn_and_checks_short_completed_history() {
-    let (tx, mut rx) = mpsc::channel(256);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(256);
     let sessions = Arc::new(SessionManager::new());
     let connection = register_authenticated_test_connection(sessions.as_ref(), tx).await;
     let threads = Arc::new(ThreadManager::new("test-model", "openai"));
@@ -83555,10 +83983,17 @@ async fn compaction_native_controller_runs_on_real_turn_and_checks_short_complet
     let request = requests
         .iter()
         .find(|request| {
-            request
-                .messages
-                .iter()
-                .any(|message| message.content == "native controller current input")
+            request.messages.iter().any(|message| {
+                message
+                    .content
+                    .ends_with("\n\nnative controller current input")
+                    && message
+                        .application_context
+                        .as_ref()
+                        .and_then(|value| value.get("kind"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some("turn_input")
+            })
         })
         .unwrap();
     assert!(
@@ -83569,7 +84004,15 @@ async fn compaction_native_controller_runs_on_real_turn_and_checks_short_complet
         request
             .messages
             .iter()
-            .find(|message| message.content == "native controller current input")
+            .find(|message| message
+                .content
+                .ends_with("\n\nnative controller current input")
+                && message
+                    .application_context
+                    .as_ref()
+                    .and_then(|value| value.get("kind"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("turn_input"))
             .unwrap()
             .provenance
             .as_ref()
@@ -88467,7 +88910,7 @@ async fn failed_codex_summary_journal_retains_decoder_numeric_evidence_without_c
     let transcript = concat!(
         "{\"type\":\"thread.started\",\"thread_id\":\"SECRET_SESSION\"}\n",
         "{\"type\":\"turn.started\"}\n",
-        "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":100,\"output_tokens\":0,\"cached_input_tokens\":80,\"prompt\":\"SECRET_PROMPT\"}}\n"
+        "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":100,\"output_tokens\":0,\"cached_input_tokens\":80,\"cache_write_input_tokens\":3,\"reasoning_output_tokens\":0,\"prompt\":\"SECRET_PROMPT\"}}\n"
     );
     let mut observed = pioneer_provider::TokenUsage {
         provider: Some("codex-cli".into()),
@@ -88501,7 +88944,10 @@ async fn failed_codex_summary_journal_retains_decoder_numeric_evidence_without_c
     assert_eq!(retained.input_tokens, Some(100));
     assert_eq!(retained.output_tokens, Some(0));
     assert_eq!(retained.cache_read_input_tokens, Some(80));
-    assert_eq!(retained.cache_write_input_tokens, None);
+    assert_eq!(retained.cache_write_input_tokens, Some(3));
+    let evidence = &retained.raw_usage.as_ref().unwrap()["cli_statistics"];
+    assert_eq!(evidence["cache_write_input_tokens"], 3);
+    assert_eq!(evidence["reasoning_output_tokens"], 0);
     assert_eq!(retained.physical_attempt_id, None);
     assert_eq!(retained.generation_id, None);
     assert_eq!(
@@ -88514,6 +88960,96 @@ async fn failed_codex_summary_journal_retains_decoder_numeric_evidence_without_c
     );
     assert!(!rows[0].usage_json.contains("SECRET"));
     assert!(!rows[0].usage_json.contains("no final answer"));
+}
+
+#[tokio::test]
+async fn claude_service_optional_statistics_survive_normalization_and_journal_readback() {
+    use pioneer_cli_agent_runtime::{
+        claude::service::ensure_process_outcome, service::ObservedServiceUsage,
+    };
+    let (_, store, workspace) =
+        setup_execution_window_terminal_turn("thr_claude_stats", "turn_claude_stats").await;
+    // Old 0.2.79 and expanded 0.3.317 native result contracts, both optional.
+    for expanded in [false, true] {
+        let mut terminal = json!({"type":"result", "subtype":"error_during_execution",
+            "usage":{"input_tokens":1,"cache_read_input_tokens":2,
+                "cache_creation_input_tokens":3,"output_tokens":9,"api_key":"SECRET"},
+            "duration_ms":120,"duration_api_ms":90,"num_turns":2,"total_cost_usd":0.25,
+            "modelUsage":{"claude-sonnet":{"inputTokens":20,"outputTokens":9,
+                "cacheReadInputTokens":2,"cacheCreationInputTokens":3,"costUSD":0.25}},
+            "result":"SECRET_TRANSCRIPT", "credentials":"SECRET_CREDENTIALS"});
+        if expanded {
+            terminal["ttft_ms"] = json!(10);
+            terminal["ttft_stream_ms"] = json!(11);
+            terminal["time_to_request_ms"] = json!(12);
+            terminal["time_to_request_from_spawn_ms"] = json!(13);
+            let model = &mut terminal["modelUsage"]["claude-sonnet"];
+            model["thinkingTokens"] = json!(4);
+            model["cacheCreationEphemeral5mInputTokens"] = json!(1);
+            model["cacheCreationEphemeral1hInputTokens"] = json!(2);
+            model["canonicalModel"] = json!("claude-sonnet");
+            model["provider"] = json!("anthropic");
+            model["costBasis"] = json!("list");
+            model["transcript"] = json!("SECRET_MODEL_TRANSCRIPT");
+        }
+        let error =
+            ensure_process_outcome(&serde_json::to_vec(&terminal).unwrap(), false).unwrap_err();
+        let raw = &error.downcast_ref::<ObservedServiceUsage>().unwrap().0;
+        let owner = format!("claude-stats-{expanded}");
+        let mut observed = pioneer_provider::TokenUsage {
+            provider: Some("claude-cli".into()),
+            ..Default::default()
+        };
+        let call =
+            crate::usage_journal::Call::start(&store, &workspace, "summary", &owner, &observed)
+                .await
+                .unwrap();
+        crate::compaction::apply_cli_usage(&mut observed, raw);
+        // Partial same-call enrichment must recompute the complete input.
+        crate::compaction::apply_cli_usage(&mut observed, &json!({"cache_read_input_tokens":4}));
+        call.record("failed", &observed).await.unwrap();
+        call.record("failed", &observed).await.unwrap();
+        let reopened = CrudStore::new(store.database_connection());
+        let rows = reopened
+            .provider_usage_page(&workspace, &owner, "", 100)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        let retained: pioneer_provider::TokenUsage =
+            serde_json::from_str(&rows[0].usage_json).unwrap();
+        assert_eq!(retained.input_tokens, Some(8));
+        assert_eq!(retained.output_tokens, Some(9));
+        let stats = &retained.raw_usage.as_ref().unwrap()["cli_statistics"];
+        assert_eq!(stats["duration_ms"], 120);
+        assert_eq!(stats["duration_api_ms"], 90);
+        assert_eq!(stats["num_turns"], 2);
+        assert_eq!(
+            stats["model_usage_scope"],
+            "session_snapshot_including_subagents"
+        );
+        assert_eq!(stats["model_usage"]["claude-sonnet"]["inputTokens"], 20);
+        assert_eq!(stats["model_usage"]["claude-sonnet"]["costUSD"], 0.25);
+        if expanded {
+            assert_eq!(stats["ttft_ms"], 10);
+            assert_eq!(stats["ttft_stream_ms"], 11);
+            assert_eq!(stats["time_to_request_ms"], 12);
+            assert_eq!(stats["time_to_request_from_spawn_ms"], 13);
+            let model = &stats["model_usage"]["claude-sonnet"];
+            assert_eq!(model["thinkingTokens"], 4);
+            assert_eq!(model["cacheCreationEphemeral5mInputTokens"], 1);
+            assert_eq!(model["cacheCreationEphemeral1hInputTokens"], 2);
+            assert_eq!(model["canonicalModel"], "claude-sonnet");
+            assert_eq!(model["provider"], "anthropic");
+            assert_eq!(model["costBasis"], "list");
+        } else {
+            assert_eq!(stats["ttft_ms"], serde_json::Value::Null);
+            assert_eq!(
+                stats["model_usage"]["claude-sonnet"]["thinkingTokens"],
+                serde_json::Value::Null
+            );
+        }
+        assert!(!rows[0].usage_json.contains("SECRET"));
+    }
 }
 
 #[tokio::test]
@@ -89274,7 +89810,7 @@ fn native_cancellation_race_fallback_preserves_materialization_error_and_require
         contender.close().await.unwrap();
         for case in 0..3 {
             let busy_native = false;
-            let (tx, mut rx) = mpsc::channel(256);
+            let (tx, mut rx) = crate::session::test_support::outbound_channel(256);
             let session_manager = Arc::new(SessionManager::new());
             let connection_id =
                 register_authenticated_test_connection(session_manager.as_ref(), tx).await;
@@ -89575,14 +90111,17 @@ async fn task_completion_inbox_rpc_uses_root_acl_and_syncs_personal_reads_withou
         device: &str,
         session: &str,
         workspace: &str,
-    ) -> (crate::session::ConnectionId, mpsc::Receiver<Message>) {
+    ) -> (
+        crate::session::ConnectionId,
+        crate::session::test_support::OutboundTestReceiver,
+    ) {
         let mut p = (*authenticated_test_superuser()).clone();
         p.kind = pioneer_protocol::PrincipalKind::User;
         p.role_key = Some(RoleKey::member());
         p.principal_id = PrincipalId::new(principal).unwrap();
         p.device_id = pioneer_protocol::DeviceId::new(device).unwrap();
         p.session_id = pioneer_protocol::AuthSessionId::new(session).unwrap();
-        let (tx, rx) = mpsc::channel(32);
+        let (tx, rx) = crate::session::test_support::outbound_channel(32);
         let id = sessions.register_connection(tx, Arc::new(p)).await.unwrap();
         sessions
             .set_connection_workspace(id, Some(workspace.to_owned()))
@@ -89634,7 +90173,7 @@ async fn task_completion_inbox_rpc_uses_root_acl_and_syncs_personal_reads_withou
     async fn rpc(
         processor: &MessageProcessor,
         connection: crate::session::ConnectionId,
-        rx: &mut mpsc::Receiver<Message>,
+        rx: &mut crate::session::test_support::OutboundTestReceiver,
         method: &str,
         params: serde_json::Value,
     ) -> JsonRpcResponse {
@@ -89891,14 +90430,33 @@ async fn opencode_v2_summary_totals_and_native_categories_reach_completion_and_j
     )
     .await;
     let selected = serde_json::json!({"providerID":"local","id":"model"});
-    let step = serde_json::json!({"type":"assistant","model":selected,"content":[{"type":"text","text":"Summary"}],"tokens":{"input":10,"output":3,"reasoning":7,"cache":{"read":80,"write":20}}});
+    let step = serde_json::json!({"type":"assistant","id":"response-id","sessionID":"session-id","model":selected,"cost":0.25,"time":{"created":100,"streamed":105,"completed":130},"api_key":"SECRET","content":[{"type":"text","text":"Summary"}],"tokens":{"input":10,"output":3,"reasoning":7,"cache":{"read":80,"write":20}}});
+    let mut partial_steps = vec![step.clone(); 64];
+    partial_steps[63]["tokens"]["cache"]
+        .as_object_mut()
+        .unwrap()
+        .remove("read");
     let cases = [
+        (
+            serde_json::json!(partial_steps),
+            None,
+            Some(640),
+            Some(640),
+            Some(448),
+        ),
         (
             serde_json::json!([step]),
             Some(110_u64),
             Some(10_u64),
             Some(10_u64),
             Some(7_u64),
+        ),
+        (
+            serde_json::json!(vec![step.clone(); 64]),
+            Some(7040),
+            Some(640),
+            Some(640),
+            Some(448),
         ),
         (
             serde_json::json!([step, step]),
@@ -89976,14 +90534,37 @@ async fn opencode_v2_summary_totals_and_native_categories_reach_completion_and_j
         assert_eq!(rows[0].status, "completed");
         let retained: pioneer_provider::TokenUsage =
             serde_json::from_str(&rows[0].usage_json).unwrap();
+        let statistics = &retained.raw_usage.as_ref().unwrap()["cli_statistics"];
+        if messages
+            .as_array()
+            .unwrap()
+            .first()
+            .is_some_and(|m| m["id"] == "response-id")
+        {
+            let response = &statistics["responses"][0];
+            assert_eq!(response["id"], "response-id");
+            assert_eq!(response["sessionID"], "session-id");
+            assert_eq!(response["model"]["id"], "model");
+            assert_eq!(response["model"]["providerID"], "local");
+            assert_eq!(response["cost_usd"], 0.25);
+            assert_eq!(response["time"]["created"], 100);
+            assert_eq!(response["time"]["streamed"], 105);
+            assert_eq!(response["time"]["completed"], 130);
+            assert_eq!(response["duration_ms"], 30);
+        }
+        if messages.as_array().unwrap().len() == 64 {
+            assert_eq!(statistics["responses"].as_array().unwrap().len(), 8);
+            assert_eq!(statistics["responses_truncated"], true);
+            assert_eq!(statistics["cost_usd"], 16.0);
+        }
+        assert!(rows[0].usage_json.len() <= 32768);
+        assert!(!rows[0].usage_json.contains("SECRET"));
+        assert!(!rows[0].usage_json.contains("Summary"));
         assert_eq!(retained.input_tokens, completion.input_tokens);
         assert_eq!(retained.output_tokens, completion.output_tokens);
         assert_eq!(retained.uncached_input_tokens, uncached);
         assert_eq!(retained.reasoning_tokens, reasoning);
-        assert_eq!(
-            retained.raw_usage.as_ref().unwrap()["native_tokens"],
-            raw["native_tokens"]
-        );
+        assert_eq!(statistics["native_tokens"], raw["native_tokens"]);
         assert_eq!(
             retained.cache_read_input_tokens,
             raw["cache_read_input_tokens"].as_u64()
@@ -89992,6 +90573,22 @@ async fn opencode_v2_summary_totals_and_native_categories_reach_completion_and_j
             retained.cache_write_input_tokens,
             raw["cache_creation_input_tokens"].as_u64()
         );
+        assert_eq!(
+            statistics["known_partial_tokens"],
+            raw["known_partial_tokens"]
+        );
+        assert_eq!(
+            statistics["visible_output_tokens"],
+            raw["visible_output_tokens"]
+        );
+        if messages.as_array().unwrap().len() == 64 && input.is_none() {
+            assert_eq!(
+                statistics["native_tokens"]["cache"]["read"],
+                serde_json::Value::Null
+            );
+            assert_eq!(statistics["known_partial_tokens"]["cache_read"], 5040);
+            assert_eq!(statistics["known_partial_tokens"]["input"], 640);
+        }
         crate::compaction::apply_cli_usage(&mut observed, &raw);
         assert_eq!(observed.input_tokens, input);
         assert_eq!(observed.output_tokens, output);

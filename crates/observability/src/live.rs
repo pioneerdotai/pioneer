@@ -888,28 +888,38 @@ pub fn admission_wait(enter: bool) {
     };
     let now = monotonic_ms();
     with_store(context.consent_generation, |state| {
-        if let Some(entry) = state.active.get_mut(&context.token) {
-            if enter {
-                if let Some(slot) = entry.wait_stack.iter_mut().find(|s| s.is_none()) {
-                    *slot = Some((entry.state, entry.stage));
-                    entry.state = WorkState::Waiting(WaitKind::DatabaseAdmission);
-                    entry.stage = Stage::Admission;
-                } else {
-                    entry.wait_overflow = entry.wait_overflow.saturating_add(1);
-                }
-            } else if entry.wait_overflow > 0 {
-                entry.wait_overflow -= 1;
-            } else if let Some(slot) = entry.wait_stack.iter_mut().rev().find(|s| s.is_some()) {
-                let (previous, stage) = slot.take().unwrap();
-                entry.state = previous;
-                entry.stage = stage;
-            }
-            entry.state_since_ms = now;
-            entry.last_progress_ms = now;
-            let entry = *entry;
-            record_work(state, entry, now);
-        }
+        admission_wait_in_store(state, context, enter, now);
     });
+}
+
+/// Shares the admission transition registry visit; never acquires STORE itself.
+pub(crate) fn admission_wait_in_store(
+    state: &mut LiveStore,
+    context: crate::work::WorkContext,
+    enter: bool,
+    now: u64,
+) {
+    if let Some(entry) = state.active.get_mut(&context.token) {
+        if enter {
+            if let Some(slot) = entry.wait_stack.iter_mut().find(|s| s.is_none()) {
+                *slot = Some((entry.state, entry.stage));
+                entry.state = WorkState::Waiting(WaitKind::DatabaseAdmission);
+                entry.stage = Stage::Admission;
+            } else {
+                entry.wait_overflow = entry.wait_overflow.saturating_add(1);
+            }
+        } else if entry.wait_overflow > 0 {
+            entry.wait_overflow -= 1;
+        } else if let Some(slot) = entry.wait_stack.iter_mut().rev().find(|s| s.is_some()) {
+            let (previous, stage) = slot.take().unwrap();
+            entry.state = previous;
+            entry.stage = stage;
+        }
+        entry.state_since_ms = now;
+        entry.last_progress_ms = now;
+        let entry = *entry;
+        record_work(state, entry, now);
+    }
 }
 
 #[cfg(test)]

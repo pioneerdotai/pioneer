@@ -820,6 +820,7 @@ mod tests {
     #[test]
     fn prepares_text_and_attachment_context_without_inlining_binary() {
         let message = ChatMessage {
+            application_context: None,
             provenance: None,
             role: Role::User,
             content: "analyze".to_owned(),

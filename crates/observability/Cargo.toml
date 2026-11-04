@@ -18,7 +18,7 @@ opentelemetry-http = { version = "0.32", default-features = false }
 reqwest.workspace = true
 dotenvy.workspace = true
 opentelemetry.workspace = true
-opentelemetry_sdk.workspace = true
+opentelemetry_sdk = { workspace = true, features = ["experimental_metrics_bound_instruments"] }
 opentelemetry-otlp.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -45,3 +45,7 @@ serde_json.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 sentry = { workspace = true, features = ["test"] }
+
+# Real SQLx acquisitions through the exact SQLite attribution adapter in unit tests.
+sea-orm = { workspace = true, features = ["sqlx-sqlite", "runtime-tokio-rustls"] }
+futures-util.workspace = true

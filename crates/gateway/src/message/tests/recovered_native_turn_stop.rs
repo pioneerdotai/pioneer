@@ -123,7 +123,7 @@ impl Provider for RecoveryProvider {
 async fn open(
     processor: &MessageProcessor,
     connection: ConnectionId,
-    rx: &mut mpsc::Receiver<Message>,
+    rx: &mut crate::session::test_support::OutboundTestReceiver,
     client: &ClientCore,
     workspace: &str,
     thread: &str,
@@ -150,7 +150,10 @@ fn active(client: &ClientCore, thread: &str) -> ActiveThreadSnapshot {
     let coordinator = client.thread_coordinator_snapshot(thread).unwrap();
     ActiveThreadSnapshot::from_coordinator(Some(thread), Some(&coordinator), false)
 }
-async fn update(rx: &mut mpsc::Receiver<Message>, client: &ClientCore) -> Thread {
+async fn update(
+    rx: &mut crate::session::test_support::OutboundTestReceiver,
+    client: &ClientCore,
+) -> Thread {
     let notification = recv_notification_by_method(rx, events::THREAD_UPDATED).await;
     let GatewayNotification::ThreadUpdated(update) =
         GatewayNotification::from_jsonrpc(notification).unwrap()
@@ -162,7 +165,10 @@ async fn update(rx: &mut mpsc::Receiver<Message>, client: &ClientCore) -> Thread
     thread
 }
 
-fn assert_no_interruption_fanout(rx: &mut mpsc::Receiver<Message>, turn_id: &str) {
+fn assert_no_interruption_fanout(
+    rx: &mut crate::session::test_support::OutboundTestReceiver,
+    turn_id: &str,
+) {
     while let Ok(message) = rx.try_recv() {
         let Message::Text(text) = message else {
             continue;
@@ -295,7 +301,7 @@ async fn deliver_completion_live(
 async fn cancel(
     processor: &MessageProcessor,
     connection: ConnectionId,
-    rx: &mut mpsc::Receiver<Message>,
+    rx: &mut crate::session::test_support::OutboundTestReceiver,
     client: &ClientCore,
     thread: &str,
     turn: &str,
@@ -364,7 +370,7 @@ async fn exercise(kind: TurnExecutorKind, scenario: Scenario, delivery_before_ro
     let thread = "thread_recovered_native_control";
     let turn = "turn_recovered_native_control";
     let old_owner = "gateway-before-restart";
-    let (tx, mut rx) = mpsc::channel(256);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(256);
     let sessions = Arc::new(SessionManager::new());
     let connection = register_authenticated_test_connection(sessions.as_ref(), tx).await;
     let (workspaces, store, workspace) = setup_workspace_manager().await;
@@ -1647,7 +1653,7 @@ async fn public_root_stop_retries_a_direct_child_after_real_projection_failure()
 async fn exercise_initial_native_stop(phase: InitialStopPhase) {
     let thread = "thread_initial_native_stop";
     let turn = "turn_initial_native_stop";
-    let (tx, mut rx) = mpsc::channel(256);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(256);
     let sessions = Arc::new(SessionManager::new());
     let connection = register_authenticated_test_connection(sessions.as_ref(), tx).await;
     let (workspaces, store, workspace) = setup_workspace_manager().await;

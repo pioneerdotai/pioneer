@@ -5756,7 +5756,7 @@ async fn detached_admission_early_stop_preserves_live_source_graph_on_both_sides
             "stop-detached-thread",
         )
         .await;
-        let (tx, mut rx) = mpsc::channel(128);
+        let (tx, mut rx) = crate::session::test_support::outbound_channel(128);
         let connection =
             register_authenticated_test_connection(processor.session_manager.as_ref(), tx).await;
         // Model Stop from an open conversation. Keep its subscription alive
@@ -5913,7 +5913,7 @@ async fn fresh_detached_rpc_completes_after_task_commit_when_authority_reload_fa
         "fresh-lease-thread",
     )
     .await;
-    let (tx, mut rx) = mpsc::channel(128);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(128);
     let connection =
         register_authenticated_test_connection(processor.session_manager.as_ref(), tx).await;
     let turn_id = "fresh-lease-admission";
@@ -6169,7 +6169,7 @@ async fn replaced_gateway_resolves_detached_admission_before_commit_and_after_us
                 .id;
             // Drop the interrupted delivery before the Task/action transaction.
         } else {
-            let (tx, mut rx) = mpsc::channel(128);
+            let (tx, mut rx) = crate::session::test_support::outbound_channel(128);
             let connection =
                 register_authenticated_test_connection(processor.session_manager.as_ref(), tx)
                     .await;

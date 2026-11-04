@@ -16,6 +16,8 @@ settings_version = 1
 settings_file_name = "gateway-settings.toml"
 service_name = "com.pioneer.gateway"
 listen_addr = "0.0.0.0:17878"
+# Total admitted envelopes, queue plus writer. Reply/control reserve is
+# min(16, max(1, capacity / 8)); capacity must be >= 2. One FIFO, no overtaking.
 outbound_queue_capacity = 128
 # Forwarded client-address headers are ignored unless the immediate peer IP is
 # listed here. Keep empty for direct/LAN use. A trusted edge must replace (not
@@ -321,3 +323,13 @@ ws_reconnect_max_ms = 10000
 ws_reconnect_jitter_percent = 20
 registry_file_name = "gateway-registry.toml"
 local_gateway_id = "local"
+
+# Protective per-connection policy, subject to operational review; not an RSS
+# or global memory budget. Includes payload retained by the socket writer.
+# Notifications may consume total minus reserved bytes (48 MiB by default).
+# Replies/control may use all 64 MiB. Larger envelopes retire the connection;
+# no truncation, automatic pagination, or promise that reconnect will help.
+[gateway.outbound]
+payload_bytes = 67108864
+reserved_payload_bytes = 16777216
+write_timeout_ms = 30000
