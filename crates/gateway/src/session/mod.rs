@@ -748,6 +748,7 @@ mod tests {
     use super::{SessionManager, SessionOutbound, TERMINATED_SESSION_TOMBSTONE_TTL};
     use anyhow::anyhow;
     use axum::extract::ws::Message;
+    use pioneer_protocol::constants::events;
     use std::sync::Arc;
     use tokio::sync::mpsc;
 
