@@ -509,15 +509,15 @@ impl MessageProcessor {
             .await;
         for connection in connection_ids {
             if let Some(principal) = expected.get(&connection) {
-                let _ = self
-                    .session_manager
-                    .try_send_execution_notification(
-                        connection,
-                        principal,
-                        serialized.clone(),
-                        method,
-                    )
-                    .await;
+                self.deliver_execution_notification_current(
+                    thread_ids,
+                    action,
+                    method,
+                    &serialized,
+                    connection,
+                    principal.clone(),
+                )
+                .await;
             }
         }
     }
@@ -568,17 +568,81 @@ impl MessageProcessor {
             .await;
         for connection in connection_ids {
             if let Some(principal) = expected.get(&connection) {
-                let _ = self
-                    .session_manager
-                    .try_send_execution_notification(
-                        connection,
-                        principal,
-                        serialized.clone(),
-                        method,
-                    )
-                    .await;
+                self.deliver_execution_notification_current(
+                    &[thread_id],
+                    action,
+                    method,
+                    &serialized,
+                    connection,
+                    principal.clone(),
+                )
+                .await;
             }
         }
+    }
+
+    async fn deliver_execution_notification_current(
+        &self,
+        thread_ids: &[&str],
+        action: crate::authorization::ResourceAction,
+        method: &str,
+        serialized: &str,
+        connection: ConnectionId,
+        mut expected: Arc<crate::auth::AuthenticatedSessionPrincipal>,
+    ) {
+        use crate::session::NotificationDelivery;
+        let subject = expected.clone();
+        // One original attempt plus two fresh resource authorizations. Rotation
+        // never permits reuse of an old role decision or an unbounded retry.
+        for attempt in 0..3 {
+            if attempt != 0 {
+                let Ok(current) = self.session_manager.connection_principal(connection).await
+                else {
+                    return;
+                };
+                if !current.same_subject(&subject) {
+                    return;
+                }
+                expected = current;
+                let recipients = self
+                    .authorized_execution_collaborator_notification_recipients_for_threads(
+                        thread_ids,
+                        action,
+                        vec![connection],
+                    )
+                    .await;
+                if !recipients.contains(&connection) {
+                    // Denial/unavailability is fail-closed; the same observation
+                    // cannot be silently marked complete after a lost frame.
+                    self.session_manager
+                        .recover_execution_delivery(connection, &subject, method)
+                        .await;
+                    return;
+                }
+            }
+            match self
+                .session_manager
+                .try_send_execution_notification(
+                    connection,
+                    &expected,
+                    serialized.to_owned(),
+                    method,
+                )
+                .await
+            {
+                Ok(NotificationDelivery::Enqueued | NotificationDelivery::Discarded) => return,
+                Ok(NotificationDelivery::Reauthorize) => {}
+                Err(_) => {
+                    self.session_manager
+                        .recover_execution_delivery(connection, &subject, method)
+                        .await;
+                    return;
+                }
+            }
+        }
+        self.session_manager
+            .recover_execution_delivery(connection, &subject, method)
+            .await;
     }
 
     pub(super) async fn retire_pending_delivery_observers(&self, thread_id: &str) {
@@ -2031,15 +2095,15 @@ impl MessageProcessor {
                     target_connection_id,
                 );
             }
-            if let Err(error) = self
+            let outcome = self
                 .session_manager
                 .try_send_classified_notification_text(
                     target_connection_id,
                     serialized.to_owned(),
                     method,
                 )
-                .await
-            {
+                .await;
+            if let Err(error) = &outcome {
                 crate::epic5_observability::record_outcome(
                     crate::epic5_observability::Epic5Operation::Notification,
                     crate::epic5_observability::Epic5Outcome::Unavailable,
@@ -2050,9 +2114,9 @@ impl MessageProcessor {
                     error = %format!("{error:#}"),
                     "failed to send notification"
                 );
-            } else {
+            } else if matches!(outcome, Ok(crate::session::NotificationDelivery::Enqueued)) {
                 accepted = accepted.saturating_add(1);
-            }
+            } // Retired token/lease or terminal/revision/TTL supersession is not enqueue.
         }
         accepted
     }

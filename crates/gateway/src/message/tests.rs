@@ -57824,23 +57824,119 @@ async fn cli_runtime_grandchild_request_replays_into_root_capsule_and_resolves_f
         .set_connection_workspace(racing_connection, Some("unrelated-selection".into()))
         .await;
 
-    processor
-        .process_request_for_connection(
-            root_connection_id,
-            &json!({
-                "jsonrpc": "2.0",
-                "id": "cliparentresp00000001",
-                "method": pioneer_protocol::constants::methods::CLI_RUNTIME_REQUEST_RESPOND,
-                "params": {
-                    "workspace_id": workspace_id,
-                    "runtime_id": "codex",
-                    "request_id": pending_request_id,
-                    "resolution": { "status": "approved" }
-                }
-            })
-            .to_string(),
-        )
+    // A third observer keeps the original late-opened/terminal oracle above,
+    // and independently exercises valid OPENED and LIVE terminal across renewal.
+    let (renewing_tx, mut renewing_rx) = crate::session::test_support::outbound_channel(32);
+    let renewing_outbound = renewing_tx.clone();
+    let renewing_connection = session_manager
+        .register_connection(renewing_tx, authenticated_test_member_collaborator())
+        .await
+        .unwrap();
+    let (renew_entered, renew_captured) = tokio::sync::oneshot::channel();
+    let (renew_release, renew_released) = tokio::sync::oneshot::channel();
+    *session_manager.replay_delivery_pause.lock().unwrap() =
+        Some(crate::session::test_support::DeliveryPause {
+            connection: renewing_connection,
+            method: events::CLI_RUNTIME_REQUEST_OPENED,
+            entered: renew_entered,
+            release: renew_released,
+        });
+    let renewing_open = generate_test_request_id("cliancestor", "renewingopen");
+    processor.process_request_for_connection(renewing_connection, &json!({
+        "jsonrpc":"2.0", "id":renewing_open, "method":"thread/open", "params":{"thread_id":root_thread_id}
+    }).to_string()).await;
+    tokio::time::timeout(Duration::from_secs(10), renew_captured)
+        .await
+        .unwrap()
+        .unwrap();
+    recv_response_by_id(&mut renewing_rx, &renewing_open).await;
+    recv_notification_by_method(&mut renewing_rx, events::THREAD_STARTED).await;
+    session_manager
+        .set_connection_workspace(renewing_connection, Some("unrelated-selection".into()))
         .await;
+    post_open_replay::renew_same_subject(&session_manager, renewing_connection).await;
+    renew_release.send(()).unwrap();
+    let renewal_opened =
+        recv_notification_by_method(&mut renewing_rx, events::CLI_RUNTIME_REQUEST_OPENED).await;
+    let renewal_opened: CLIRuntimeRequestOpenedNotification =
+        serde_json::from_value(renewal_opened.params.unwrap()).unwrap();
+    assert_eq!(renewal_opened.request_id, pending_request_id);
+    assert_eq!(
+        renewal_opened.visible_thread_ids,
+        vec![child_thread_id.to_owned(), root_thread_id.to_owned()]
+    );
+    let client = pioneer_client::core::ClientCore::new();
+    client.upsert_thread(
+        crud_store
+            .get_thread_model(root_thread_id)
+            .await
+            .unwrap()
+            .unwrap(),
+    );
+    client.apply_thread_notification(
+        pioneer_protocol::GatewayNotification::CLIRuntimeRequestOpened(renewal_opened),
+    );
+    assert_eq!(
+        client
+            .pending_requests_for_scope(Some(&workspace_id), Some(root_thread_id))
+            .len(),
+        1
+    );
+    session_manager
+        .drain_thread_replays(renewing_connection)
+        .await;
+    let membership = processor
+        .thread_manager
+        .subscription_incarnation(renewing_connection, root_thread_id)
+        .await
+        .unwrap();
+    let repeat = generate_test_request_id("cliancestor", "renewaldedup");
+    processor.process_request_for_connection(renewing_connection, &json!({
+        "jsonrpc":"2.0", "id":repeat, "method":"thread/open", "params":{"thread_id":root_thread_id}
+    }).to_string()).await;
+    recv_response_by_id(&mut renewing_rx, &repeat).await;
+    recv_notification_by_method(&mut renewing_rx, events::THREAD_STARTED).await;
+    session_manager
+        .drain_thread_replays(renewing_connection)
+        .await;
+    assert!(
+        renewing_rx.try_recv().is_err(),
+        "delivered pending replay stays deduplicated"
+    );
+    assert!(Arc::ptr_eq(
+        &membership,
+        &processor
+            .thread_manager
+            .subscription_incarnation(renewing_connection, root_thread_id)
+            .await
+            .unwrap()
+    ));
+    let (terminal_entered, terminal_captured) = tokio::sync::oneshot::channel();
+    let (terminal_release, terminal_released) = tokio::sync::oneshot::channel();
+    *session_manager.replay_delivery_pause.lock().unwrap() =
+        Some(crate::session::test_support::DeliveryPause {
+            connection: renewing_connection,
+            method: events::CLI_RUNTIME_REQUEST_RESOLVED,
+            entered: terminal_entered,
+            release: terminal_released,
+        });
+    let resolve_payload = json!({
+        "jsonrpc":"2.0", "id":"cliparentresp00000001",
+        "method":pioneer_protocol::constants::methods::CLI_RUNTIME_REQUEST_RESPOND,
+        "params":{"workspace_id":workspace_id,"runtime_id":"codex","request_id":pending_request_id,
+            "resolution":{"status":"approved"}}
+    })
+    .to_string();
+    let resolving = processor.process_request_for_connection(root_connection_id, &resolve_payload);
+    let renewal = async {
+        tokio::time::timeout(Duration::from_secs(10), terminal_captured)
+            .await
+            .unwrap()
+            .unwrap();
+        post_open_replay::renew_same_subject(&session_manager, renewing_connection).await;
+        terminal_release.send(()).unwrap();
+    };
+    tokio::join!(resolving, renewal);
     let (response, resolved) = recv_response_and_notification_by_id_method(
         &mut root_rx,
         "cliparentresp00000001",
@@ -57859,6 +57955,26 @@ async fn cli_runtime_grandchild_request_replays_into_root_capsule_and_resolves_f
         vec![child_thread_id.to_owned(), root_thread_id.to_owned()]
     );
     assert_eq!(resolved.resolution, CLIRuntimeRequestResolution::Approved);
+
+    let renewal_terminal =
+        recv_notification_by_method(&mut renewing_rx, events::CLI_RUNTIME_REQUEST_RESOLVED).await;
+    let renewal_terminal: CLIRuntimeRequestResolvedNotification =
+        serde_json::from_value(renewal_terminal.params.unwrap()).unwrap();
+    assert_eq!(
+        renewal_terminal.resolution,
+        CLIRuntimeRequestResolution::Approved
+    );
+    client.apply_thread_notification(
+        pioneer_protocol::GatewayNotification::CLIRuntimeRequestResolved(renewal_terminal),
+    );
+    assert!(
+        client
+            .pending_requests_for_scope(Some(&workspace_id), Some(root_thread_id))
+            .is_empty()
+    );
+    renewing_outbound
+        .try_send_data(Message::Text("same ancestor socket remains live".into()))
+        .unwrap();
 
     let racing_terminal =
         recv_notification_by_method(&mut racing_rx, events::CLI_RUNTIME_REQUEST_RESOLVED).await;

@@ -16,6 +16,7 @@ struct Fixture {
     connection: ConnectionId,
     workspace: String,
     rx: OutboundTestReceiver,
+    outbound: crate::session::SessionOutbound,
     responder: tokio::sync::oneshot::Receiver<pioneer_tools::PermissionApprovalResolution>,
 }
 impl Fixture {
@@ -23,7 +24,7 @@ impl Fixture {
         let (workspaces, store, workspace) = setup_workspace_manager().await;
         let sessions = Arc::new(SessionManager::new());
         let (outbound, mut rx) = outbound_channel(128);
-        let connection = register_authenticated_test_connection(&sessions, outbound).await;
+        let connection = register_authenticated_test_connection(&sessions, outbound.clone()).await;
         let processor = Arc::new(MessageProcessor::new(
             Arc::new(ThreadManager::new("test-model", "openai")),
             test_provider(),
@@ -85,12 +86,22 @@ impl Fixture {
             connection,
             workspace,
             rx,
+            outbound,
             responder,
         }
     }
 
     fn pause(
         &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        self.pause_method(events::TURN_PERMISSION_REQUEST_OPENED)
+    }
+    fn pause_method(
+        &self,
+        method: &'static str,
     ) -> (
         tokio::sync::oneshot::Receiver<()>,
         tokio::sync::oneshot::Sender<()>,
@@ -104,7 +115,7 @@ impl Fixture {
             .lock()
             .unwrap() = Some(DeliveryPause {
             connection: self.connection,
-            method: events::TURN_PERMISSION_REQUEST_OPENED,
+            method,
             entered,
             release: released,
         });
@@ -171,7 +182,21 @@ async fn held_native_live_and_orphan_replay_release_dispatcher_and_cannot_reopen
                 terminal.resolution,
                 TurnPermissionApprovalResolution::AllowOnce
             );
+            let (correction_entered, correction_release) =
+                f.pause_method(events::TURN_PERMISSION_REQUEST_RESOLVED);
             release.send(()).unwrap();
+            correction_entered.await.unwrap();
+            renew_same_subject(&f.processor.session_manager, f.connection).await;
+            correction_release.send(()).unwrap();
+            let corrected =
+                recv_notification_by_method(&mut f.rx, events::TURN_PERMISSION_REQUEST_RESOLVED)
+                    .await;
+            let corrected: TurnPermissionRequestResolvedNotification =
+                serde_json::from_value(corrected.params.unwrap()).unwrap();
+            assert_eq!(
+                corrected.resolution,
+                TurnPermissionApprovalResolution::AllowOnce
+            );
             f.processor
                 .session_manager
                 .drain_thread_replays(f.connection)
@@ -332,7 +357,9 @@ async fn failed_reply_handoff_releases_obligation_without_cancelling_durable_req
         );
         let (outbound, rx) = outbound_channel(128);
         f.connection =
-            register_authenticated_test_connection(&f.processor.session_manager, outbound).await;
+            register_authenticated_test_connection(&f.processor.session_manager, outbound.clone())
+                .await;
+        f.outbound = outbound;
         f.rx = rx;
         let (retry, mut opening) = f.open("reconnect").await;
         opening.join().await.unwrap();
@@ -348,4 +375,238 @@ async fn failed_reply_handoff_releases_obligation_without_cancelling_durable_req
     })
     .await
     .expect("failed reply/reconnect watchdog");
+}
+
+pub(super) async fn renew_same_subject(sessions: &SessionManager, connection: ConnectionId) {
+    let before = sessions.connection_principal(connection).await.unwrap();
+    let mut renewed = (*before).clone();
+    renewed.access_jti.push_str("-rotated");
+    renewed.access_expires_at_unix -= 1;
+    sessions
+        .renew_connection_principal(connection, &before, Arc::new(renewed))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn native_replay_and_live_terminal_survive_same_socket_renewal_without_lost_cards() {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        for orphan in [false, true] {
+            let mut f = Fixture::new(orphan).await;
+            let (entered, release) = f.pause();
+            let (id, mut opening) = f.open("renewal").await;
+            entered.await.unwrap();
+            opening.join().await.unwrap();
+            let response = recv_response_by_id(&mut f.rx, &id).await;
+            let response: pioneer_protocol::ThreadStartResponse =
+                serde_json::from_value(response.result).unwrap();
+            recv_notification_by_method(&mut f.rx, events::THREAD_STARTED).await;
+            renew_same_subject(&f.processor.session_manager, f.connection).await;
+            release.send(()).unwrap();
+            let opened =
+                recv_notification_by_method(&mut f.rx, events::TURN_PERMISSION_REQUEST_OPENED)
+                    .await;
+            let opened: pioneer_protocol::TurnPermissionRequestOpenedNotification =
+                serde_json::from_value(opened.params.unwrap()).unwrap();
+            let client = pioneer_client::core::ClientCore::new();
+            client.upsert_thread(response.thread);
+            client.apply_thread_notification(
+                pioneer_protocol::GatewayNotification::TurnPermissionRequestOpened(opened),
+            );
+            assert_eq!(
+                client
+                    .pending_requests_for_scope(Some(&f.workspace), Some(THREAD))
+                    .len(),
+                1
+            );
+            f.processor
+                .session_manager
+                .drain_thread_replays(f.connection)
+                .await;
+            let token = f
+                .processor
+                .thread_manager
+                .subscription_incarnation(f.connection, THREAD)
+                .await
+                .unwrap();
+            let (repeat, mut repeated) = f.open("renewaldedup").await;
+            repeated.join().await.unwrap();
+            recv_response_by_id(&mut f.rx, &repeat).await;
+            recv_notification_by_method(&mut f.rx, events::THREAD_STARTED).await;
+            f.processor
+                .session_manager
+                .drain_thread_replays(f.connection)
+                .await;
+            assert!(
+                f.rx.try_recv().is_err(),
+                "a delivered pending replay remains deduplicated"
+            );
+            assert!(Arc::ptr_eq(
+                &token,
+                &f.processor
+                    .thread_manager
+                    .subscription_incarnation(f.connection, THREAD)
+                    .await
+                    .unwrap()
+            ));
+            let (entered, release) = f.pause_method(events::TURN_PERMISSION_REQUEST_RESOLVED);
+            let context = f
+                .processor
+                .session_manager
+                .connection_context(f.connection)
+                .await
+                .unwrap();
+            let id = generate_test_request_id("postopen", "renewedterminal");
+            let mut resolving = f.processor.clone().start_owned_request(
+                context,
+                json!({
+                    "jsonrpc":"2.0","id":id,"method":"turn/permission/request/respond",
+                    "params":{"request_id":REQUEST,"resolution":"allow_once"}
+                })
+                .to_string(),
+            );
+            entered.await.unwrap();
+            renew_same_subject(&f.processor.session_manager, f.connection).await;
+            release.send(()).unwrap();
+            resolving.join().await.unwrap();
+            let (_, terminal) = recv_response_and_notification_by_id_method(
+                &mut f.rx,
+                &id,
+                events::TURN_PERMISSION_REQUEST_RESOLVED,
+            )
+            .await;
+            let terminal: TurnPermissionRequestResolvedNotification =
+                serde_json::from_value(terminal.params.unwrap()).unwrap();
+            assert_eq!(
+                terminal.resolution,
+                TurnPermissionApprovalResolution::AllowOnce
+            );
+            client.apply_thread_notification(
+                pioneer_protocol::GatewayNotification::TurnPermissionRequestResolved(terminal),
+            );
+            assert!(
+                client
+                    .pending_requests_for_scope(Some(&f.workspace), Some(THREAD))
+                    .is_empty()
+            );
+            // A normal rotation keeps the same socket usable, rather than
+            // hiding a failed delivery behind forced reconnect on every renewal.
+            f.outbound
+                .try_send_data(Message::Text("same socket remains live".into()))
+                .unwrap();
+        }
+    })
+    .await
+    .expect("native renewal watchdog");
+}
+
+#[tokio::test]
+async fn renewal_to_denied_role_does_not_reuse_old_execution_authorization() {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let mut f = Fixture::new(false).await;
+        let (entered, release) = f.pause();
+        let (id, mut opening) = f.open("deniedrenewal").await;
+        entered.await.unwrap();
+        opening.join().await.unwrap();
+        recv_response_by_id(&mut f.rx, &id).await;
+        recv_notification_by_method(&mut f.rx, events::THREAD_STARTED).await;
+        let old = f
+            .processor
+            .session_manager
+            .connection_principal(f.connection)
+            .await
+            .unwrap();
+        let mut changed = (*old).clone();
+        changed.kind = pioneer_protocol::PrincipalKind::User;
+        changed.role_key = Some(pioneer_protocol::RoleKey::member());
+        changed.access_jti.push_str("-role-change");
+        f.processor
+            .session_manager
+            .renew_connection_principal(f.connection, &old, Arc::new(changed))
+            .await
+            .unwrap();
+        release.send(()).unwrap();
+        f.processor
+            .session_manager
+            .drain_thread_replays(f.connection)
+            .await;
+        // This principal has no Member workspace grant. Fresh authorization
+        // must fail closed, and the lost observation must require recovery.
+        f.outbound.writer_stopped().await;
+        assert!(
+            f.outbound
+                .try_send_data(Message::Text("forbidden".into()))
+                .is_err()
+        );
+        while let Ok(Message::Text(text)) = f.rx.try_recv() {
+            let frame: JsonValue = serde_json::from_str(&text).unwrap();
+            assert_ne!(frame["method"], events::TURN_PERMISSION_REQUEST_OPENED);
+        }
+        assert_eq!(
+            f.processor
+                .crud_store
+                .get_cli_runtime_pending_request(REQUEST)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            pioneer_crud::CliRuntimePendingRequestStatus::Pending
+        );
+    })
+    .await
+    .expect("denied renewal watchdog");
+}
+
+#[tokio::test]
+async fn repeated_rotation_exhausts_bounded_delivery_and_forces_recoverable_socket_teardown() {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let mut f = Fixture::new(false).await;
+        let (entered, mut release) = f.pause();
+        let (id, mut opening) = f.open("rotationexhaustion").await;
+        entered.await.unwrap();
+        opening.join().await.unwrap();
+        recv_response_by_id(&mut f.rx, &id).await;
+        recv_notification_by_method(&mut f.rx, events::THREAD_STARTED).await;
+        for attempt in 0..3 {
+            renew_same_subject(&f.processor.session_manager, f.connection).await;
+            if attempt == 2 {
+                release.send(()).unwrap();
+                break;
+            }
+            let (entered, next_release) = f.pause();
+            release.send(()).unwrap();
+            entered.await.unwrap();
+            release = next_release;
+        }
+        f.processor
+            .session_manager
+            .drain_thread_replays(f.connection)
+            .await;
+        f.outbound.writer_stopped().await;
+        assert!(
+            f.outbound
+                .try_send_data(Message::Text("must reconnect".into()))
+                .is_err()
+        );
+        while let Ok(Message::Text(text)) = f.rx.try_recv() {
+            let frame: JsonValue = serde_json::from_str(&text).unwrap();
+            assert_ne!(frame["method"], events::TURN_PERMISSION_REQUEST_OPENED);
+        }
+        assert_eq!(
+            f.processor
+                .crud_store
+                .get_cli_runtime_pending_request(REQUEST)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            pioneer_crud::CliRuntimePendingRequestStatus::Pending
+        );
+        assert!(matches!(
+            f.responder.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+    })
+    .await
+    .expect("bounded rotation watchdog");
 }

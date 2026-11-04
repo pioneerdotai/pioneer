@@ -23,6 +23,15 @@ pub(crate) const OUTBOUND_CLOSE_GRACE: Duration = Duration::from_millis(250);
 
 pub type ConnectionId = u64;
 
+/// `Discarded` means retired scope/lease or superseded terminal/TTL data, never
+/// a principal rotation that leaves a current obligation undelivered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NotificationDelivery {
+    Enqueued,
+    Discarded,
+    Reauthorize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ConnectionRenewalError {
     Terminated(AuthSessionTerminationReason),
@@ -505,19 +514,27 @@ impl SessionManager {
         expected: &AuthenticatedSessionPrincipal,
         payload: String,
         method: &str,
-    ) -> Result<()> {
+    ) -> Result<NotificationDelivery> {
         #[cfg(test)]
         self.pause_delivery(id, method).await;
         let result = {
             let connections = self.connections.read().await;
-            let connection = connections
-                .get(&id)
-                .ok_or_else(|| anyhow!("connection retired"))?;
-            if connection.principal.as_ref() != expected
-                || connection.termination_tx.borrow().is_some()
-                || crate::helpers::unix_timestamp_secs()? >= expected.access_expires_at_unix
+            let Some(connection) = connections.get(&id) else {
+                return Ok(NotificationDelivery::Discarded);
+            };
+            if connection.termination_tx.borrow().is_some()
+                || crate::helpers::unix_timestamp_secs()?
+                    >= connection.principal.access_expires_at_unix
             {
-                return Ok(());
+                connection.sender.abort();
+                return Ok(NotificationDelivery::Discarded);
+            }
+            if connection.principal.as_ref() != expected {
+                return Ok(if connection.principal.same_subject(expected) {
+                    NotificationDelivery::Reauthorize
+                } else {
+                    NotificationDelivery::Discarded
+                });
             }
             crate::thread::replay::admit_delivery(id, method, &connection.principal, || {
                 let result = connection
@@ -530,11 +547,31 @@ impl SessionManager {
             })
         };
         match result {
-            None | Some(Ok(())) => Ok(()),
+            None => Ok(NotificationDelivery::Discarded),
+            Some(Ok(())) => Ok(NotificationDelivery::Enqueued),
             Some(Err(_)) => {
                 self.unregister_connection(id).await;
                 Err(anyhow!("execution notification outbound full or closed"))
             }
+        }
+    }
+
+    /// Exhausted reauthorization cannot be acknowledged as delivered. Abort
+    /// only the still-current subject and (for replay) exact membership token.
+    pub(crate) async fn recover_execution_delivery(
+        &self,
+        id: ConnectionId,
+        expected: &AuthenticatedSessionPrincipal,
+        method: &str,
+    ) {
+        let connections = self.connections.read().await;
+        if let Some(connection) = connections.get(&id)
+            && connection.principal.same_subject(expected)
+        {
+            let _ =
+                crate::thread::replay::admit_delivery(id, method, &connection.principal, || {
+                    connection.sender.abort()
+                });
         }
     }
 
@@ -546,13 +583,14 @@ impl SessionManager {
     ) -> Result<()> {
         self.try_send_classified_notification_text(connection_id, payload, "")
             .await
+            .map(|_| ())
     }
     pub(crate) async fn try_send_classified_notification_text(
         &self,
         connection_id: ConnectionId,
         payload: String,
         method: &str,
-    ) -> Result<()> {
+    ) -> Result<NotificationDelivery> {
         let (sender, admitted) = {
             let connections = self.connections.read().await;
             let connection = connections
@@ -562,7 +600,8 @@ impl SessionManager {
                 || crate::helpers::unix_timestamp_secs()?
                     >= connection.principal.access_expires_at_unix
             {
-                return Ok(());
+                connection.sender.abort();
+                return Ok(NotificationDelivery::Discarded);
             }
             let sender = connection.sender.clone();
             let admitted = crate::thread::replay::admit_delivery(
@@ -574,10 +613,10 @@ impl SessionManager {
             (sender, admitted)
         };
         let Some(admitted) = admitted else {
-            return Ok(());
+            return Ok(NotificationDelivery::Discarded);
         };
         match admitted {
-            Ok(()) => Ok(()),
+            Ok(()) => Ok(NotificationDelivery::Enqueued),
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                 sender.abort();
                 record_outbound_queue_saturation("notification_connection_evicted");
@@ -1137,6 +1176,79 @@ mod tests {
         );
         assert!(manager.connection_principal(connection_id).await.is_err());
     }
+    #[tokio::test]
+    async fn execution_delivery_retired_subject_and_lease_cannot_enqueue_or_abort_replacement() {
+        use crate::thread::{ThreadSubscriptionIdentity, replay::SubscriptionIncarnation};
+        let manager = SessionManager::new();
+        let principal = authenticated_test_superuser();
+        let (tx, mut rx) = crate::session::test_support::outbound_channel(8);
+        let connection = manager
+            .register_connection(tx.clone(), principal.clone())
+            .await
+            .unwrap();
+        let old = SubscriptionIncarnation::new(
+            connection,
+            ThreadSubscriptionIdentity::new(
+                principal.principal_id.clone(),
+                principal.session_id.clone(),
+            ),
+        );
+        old.retire();
+        old.run(manager.recover_execution_delivery(
+            connection,
+            &principal,
+            events::TURN_PERMISSION_REQUEST_OPENED,
+        ))
+        .await;
+        // The old scope's recovery cannot terminally seal the current socket.
+        manager
+            .try_send_execution_notification(
+                connection,
+                &principal,
+                "replacement".into(),
+                events::TURN_PERMISSION_REQUEST_OPENED,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(rx.recv().await, Some(Message::Text(text)) if text == "replacement"));
+        let mut foreign = (*principal).clone();
+        foreign.session_id = pioneer_protocol::AuthSessionId::new("S00000000000000000002").unwrap();
+        manager
+            .try_send_execution_notification(
+                connection,
+                &foreign,
+                "foreign".into(),
+                events::TURN_PERMISSION_REQUEST_OPENED,
+            )
+            .await
+            .unwrap();
+        assert!(rx.try_recv().is_err());
+        tx.try_send_data(Message::Text("still current".into()))
+            .unwrap();
+        assert!(matches!(rx.recv().await, Some(Message::Text(text)) if text == "still current"));
+        let mut expired = (*principal).clone();
+        expired.access_jti.push_str("-expired");
+        expired.access_expires_at_unix = 0;
+        manager
+            .renew_connection_principal(connection, &principal, Arc::new(expired.clone()))
+            .await
+            .unwrap();
+        manager
+            .try_send_execution_notification(
+                connection,
+                &expired,
+                "expired".into(),
+                events::TURN_PERMISSION_REQUEST_RESOLVED,
+            )
+            .await
+            .unwrap();
+        assert!(rx.try_recv().is_err());
+        assert!(
+            tx.try_send_data(Message::Text("expired lease is terminal".into()))
+                .is_err()
+        );
+    }
+
     #[tokio::test]
     async fn queued_derived_payload_checks_current_workspace_identity_and_expiry_at_enqueue() {
         let manager = SessionManager::new();
