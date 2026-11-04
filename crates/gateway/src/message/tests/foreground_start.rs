@@ -12,7 +12,7 @@ struct Fixture {
     store: Arc<CrudStore>,
     workspace: String,
     connection: ConnectionId,
-    rx: mpsc::Receiver<Message>,
+    rx: crate::session::test_support::OutboundTestReceiver,
     entered: Arc<Notify>,
     release: Arc<Notify>,
     calls: Arc<AtomicU64>,
@@ -20,7 +20,7 @@ struct Fixture {
 
 impl Fixture {
     async fn new() -> Self {
-        let (tx, mut rx) = mpsc::channel(256);
+        let (tx, mut rx) = crate::session::test_support::outbound_channel(256);
         let sessions = Arc::new(SessionManager::new());
         let connection = register_authenticated_test_connection(&sessions, tx).await;
         let (workspaces, store, workspace) = setup_workspace_manager().await;
@@ -1054,7 +1054,7 @@ async fn fresh_processor_replays_the_committed_turn_without_starting_provider_ag
     .await;
     let original = f.store.get_turn_execution(TURN).await.unwrap().unwrap();
     f.close().await;
-    let (tx, _rx) = mpsc::channel(256);
+    let (tx, _rx) = crate::session::test_support::outbound_channel(256);
     let sessions = Arc::new(SessionManager::new());
     let connection = register_authenticated_test_connection(&sessions, tx).await;
     let restored = MessageProcessor::new(
