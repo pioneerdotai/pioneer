@@ -1279,6 +1279,12 @@ impl MessageProcessor {
         payload: &T,
         subscribers: Vec<crate::thread::ThreadSubscriber>,
     ) {
+        // A full Thread snapshot can carry a terminal Turn outside LIVE.
+        // Its metadata invalidation is replaceable; the foreground publisher
+        // dirties the thread after the start, and snapshot RPCs join that start.
+        if method == events::THREAD_UPDATED && self.foreground_starts.pending_thread(thread_id) {
+            return;
+        }
         // Bound the state embedded in task/CLI callers across both authorization
         // stages and delivery. Poll inline so cancellation retains ownership.
         Box::pin(async move {

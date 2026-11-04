@@ -443,6 +443,18 @@ impl MessageProcessor {
                 })
                 .collect()
         };
+        #[cfg(test)]
+        if super::turn_handlers::foreground_start::FOREGROUND_UNREAD_EXTRAS
+            .try_with(|_| ())
+            .is_ok()
+        {
+            self.completed_history_preparation_barrier
+                .wait_if_armed(
+                    "__foreground_start_unread_extras__",
+                    &tokio_util::sync::CancellationToken::new(),
+                )
+                .await;
+        }
         self.send_notification_to_reauthorized_workspace_connections(
             workspace,
             events::THREAD_TREE_CHANGED,

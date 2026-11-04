@@ -1552,6 +1552,7 @@ async fn exercise(kind: TurnExecutorKind, scenario: Scenario, delivery_before_ro
 
 #[derive(Clone, Copy)]
 enum InitialStopPhase {
+    ActorRemovedBeforeDispatch,
     ActorBeforeRegistration,
     RegistrationWinsEarlyCommit,
     ActorAppearsBeforeRegistration,
@@ -1566,6 +1567,14 @@ enum InitialStopPhase {
     ProjectionStorageUnavailable,
     BeforeActorProjectionStorageUnavailable,
     GraphFenceProjectionUnavailable,
+}
+
+// Preparation is real admission, including the runtime snapshot and listener.
+// Retiring that actor before dispatch must produce a failure outcome even if
+// the dispatcher's existing recovery path successfully schedules recovery.
+#[tokio::test]
+async fn prepared_native_dispatch_reports_retired_actor_instead_of_success() {
+    exercise_initial_native_stop(InitialStopPhase::ActorRemovedBeforeDispatch).await;
 }
 
 // These phase tests use one executor thread: observing the control registry's
@@ -1713,6 +1722,7 @@ async fn exercise_initial_native_stop(phase: InitialStopPhase) {
             params,
             None,
             crate::authorization::ExecutionAdmissionEntryPoint::InteractiveTurn,
+            crate::message::turn_handlers::ApiProviderTurnPreparation::AllowNew,
             admission,
         )
         .await
@@ -1720,6 +1730,30 @@ async fn exercise_initial_native_stop(phase: InitialStopPhase) {
     let crate::message::turn_handlers::ApiProviderTurnAdmission::New(prepared) = prepared else {
         panic!("first admission must prepare a new runtime");
     };
+    if matches!(phase, InitialStopPhase::ActorRemovedBeforeDispatch) {
+        processor.agent_manager.remove_thread(thread).await;
+        let result = processor
+            .dispatch_prepared_api_provider_turn_start(prepared)
+            .await;
+        assert!(matches!(
+            result,
+            Err(
+                crate::message::turn_handlers::ApiProviderTurnDispatchFailure::ActorStart(
+                    pioneer_agent::AgentStartError::ThreadNotFound
+                )
+            )
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        // The failure remains owned by the existing durable recovery path.
+        assert!(
+            store
+                .find_unresolved_recovery_job_for_turn(turn)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        return;
+    }
     let owner = store.get_turn_execution(turn).await.unwrap().unwrap();
     let db = store.database_connection();
     let response = pioneer_crud::load_agent_turn_response(&db, turn)
@@ -1740,6 +1774,7 @@ async fn exercise_initial_native_stop(phase: InitialStopPhase) {
         "params":{"thread_id":thread,"turn_id":turn}})
     .to_string();
     match phase {
+        InitialStopPhase::ActorRemovedBeforeDispatch => unreachable!(),
         InitialStopPhase::BeforeActorProjectionStorageUnavailable => {
             drop(prepared);
             // Preparation creates an idle actor before dispatch. Remove that
@@ -2453,7 +2488,9 @@ async fn exercise_initial_native_stop(phase: InitialStopPhase) {
             processor.arm_completed_history_preparation_barrier(
                 "__native_initial_control_before_registration__",
             );
-            processor
+            // Stop may win the running CAS after actor acceptance. The
+            // assertions below inspect canonical cancellation, not dispatch.
+            let _dispatch_result = processor
                 .dispatch_prepared_api_provider_turn_start(prepared)
                 .await;
             timeout(
@@ -2751,7 +2788,9 @@ async fn exercise_initial_native_stop(phase: InitialStopPhase) {
             } else {
                 "__native_initial_control_after_registration__"
             });
-            processor
+            // Stop may win the running CAS after actor acceptance. The
+            // assertions below inspect canonical cancellation, not dispatch.
+            let _dispatch_result = processor
                 .dispatch_prepared_api_provider_turn_start(prepared)
                 .await;
             timeout(
@@ -2890,3 +2929,6 @@ async fn exercise_initial_native_stop(phase: InitialStopPhase) {
     assert_eq!(repeat.turn, terminal);
     assert_eq!(calls.load(Ordering::SeqCst), expected_calls);
 }
+
+#[path = "foreground_start.rs"]
+mod foreground_start;

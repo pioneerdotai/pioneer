@@ -4285,11 +4285,15 @@ async fn dispatch_agent_action_outbox_row_inner(
                     &tokio_util::sync::CancellationToken::new(),
                 )
                 .await;
-            processor
+            let dispatch_result = processor
                 .dispatch_prepared_api_provider_turn_start(prepared)
                 .await;
-            // The shared helper also serves ordinary callers and may fail to
-            // persist either recovery or a terminal result. Its return is not ACK.
+            if let Err(failure) = dispatch_result {
+                tracing::warn!(failure = %failure, "Agent turn dispatch requires durable reconciliation");
+            }
+            // A failed dispatch may still have committed a terminal or recovery
+            // obligation. Reconcile durable state before completing the action;
+            // neither a dispatch result nor a runtime observation replaces it.
             if processor
                 .crud_store
                 .native_turn_has_accepted_terminal(&dispatch.turn_id)

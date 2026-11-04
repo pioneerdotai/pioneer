@@ -4251,6 +4251,7 @@ async fn start_agent_skill_delivery_turn(
             None,
             pioneer_protocol::default_turn_permission_profile_snapshot(),
             test_full_access_security_snapshot(),
+            None,
         )
         .await
         .expect("turn should start");
@@ -6665,7 +6666,7 @@ async fn stale_terminal_retirement_preserves_replacement_generation_ownership() 
     control_outcomes.complete(
         &pending_start,
         replacement_generation,
-        StoredControlOutcome::Start(Ok(())),
+        StoredControlOutcome::Start(Ok(1)),
     );
     retirement.await;
     assert_eq!(
@@ -6783,7 +6784,7 @@ async fn terminal_retirement_preserves_generation_with_accepted_next_turn() {
         takeover_outcomes.complete(
             &operation_id,
             generation,
-            StoredControlOutcome::Start(Ok(())),
+            StoredControlOutcome::Start(Ok(1)),
         );
     });
 
@@ -15748,4 +15749,88 @@ async fn phased_rejected_final_keeps_native_candidate_and_commentary_before_retr
     );
     assert!(native[0].provenance.is_some());
     assert!(requests[1].temperature.is_none());
+}
+
+#[tokio::test]
+async fn initial_start_receipt_cannot_cancel_a_later_run_in_the_same_actor() {
+    use super::AgentStartReceipt;
+
+    let manager = AgentManager::new(
+        Arc::new(ProviderRegistry::new(|_| String::new())),
+        test_tool_loop_config(),
+    );
+    let thread_id = "thread_start_receipt_run_fence";
+    let turn_id = "turn_start_receipt_run_fence";
+    manager
+        .ensure_thread(thread_id, "workspace_start_receipt")
+        .await
+        .unwrap();
+    let (generation, current_control) = {
+        let state = manager.state.read().await;
+        let thread = state.threads.get(thread_id).unwrap();
+        let current_control = TurnExecutionControl::new(thread.command_tx.clone(), 2);
+        thread
+            .control_plane
+            .activate(turn_id.into(), 2, current_control.clone());
+        (thread.generation, current_control)
+    };
+    let original = AgentStartReceipt {
+        turn_id: turn_id.into(),
+        actor_generation: generation,
+        run_id: 1,
+    };
+    assert!(!manager.start_receipt_is_current(thread_id, &original).await);
+    assert!(matches!(
+        manager
+            .cancel_started_turn(thread_id, &original, "stale initial dispatch", None)
+            .await,
+        Err(AgentControlError::TurnMismatch)
+    ));
+    assert!(!current_control.turn_cancellation_token.is_cancelled());
+    manager.remove_thread(thread_id).await;
+}
+
+#[tokio::test]
+async fn initial_start_ack_timeout_keeps_generation_evidence_and_retires_the_actor() {
+    let manager = Arc::new(AgentManager::new_with_mcp_memory_and_control_config(
+        Arc::new(ProviderRegistry::new(|_| String::new())),
+        test_tool_loop_config(),
+        None,
+        None,
+        AgentControlPlaneConfig {
+            enqueue_timeout: Duration::from_millis(5),
+            acknowledgement_timeout: Duration::from_millis(5),
+            outcome_capacity_per_thread: 4,
+        },
+    ));
+    let thread = "thread_start_ack_timeout";
+    manager
+        .ensure_thread(thread, "workspace_start_ack_timeout")
+        .await
+        .unwrap();
+    let generation = manager.thread_generation(thread).await.unwrap();
+    // Block actual actor preparation, after mailbox admission is available.
+    let held_dependencies = manager.runtime_dependencies.state.write().await;
+    let start = {
+        let manager = manager.clone();
+        tokio::spawn(async move {
+            manager.start_turn_with_resolved_artifacts_environment_reasoning_permission_profile_security_snapshot_and_agent_skill_overlay(
+                thread, "turn_start_ack_timeout", ThreadMode::Agent, "test-model", "openai",
+                HashMap::new(), SkillCatalogSnapshot { version: 0, generated_at_unix: 0, skills: Vec::new() },
+                Vec::new(), Vec::new(), Vec::new(), Vec::new(), HashMap::new(), Vec::new(), None,
+                pioneer_protocol::default_turn_permission_profile_snapshot(), test_full_access_security_snapshot(),
+                None,
+            ).await
+        })
+    };
+    let error = timeout(Duration::from_secs(5), start)
+        .await
+        .unwrap()
+        .unwrap()
+        .expect_err("no actor acceptance may be invented after the ACK deadline");
+    assert!(
+        matches!(error, AgentStartError::AcknowledgementTimeout { actor_generation, .. } if actor_generation == generation)
+    );
+    assert_eq!(manager.thread_generation(thread).await, None);
+    drop(held_dependencies);
 }

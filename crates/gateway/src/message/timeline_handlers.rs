@@ -629,6 +629,9 @@ impl MessageProcessor {
         };
         let response_encode_stage =
             trace.stage(pioneer_observability::GatewayOperationStage::ThreadTimelineResponseEncode);
+        self.foreground_starts
+            .before_thread_snapshot(&response_payload.thread_id)
+            .await;
         let response = match JsonRpcResponse::from_result(request_id, &response_payload) {
             Ok(response) => {
                 response_encode_stage.succeed();
@@ -803,6 +806,9 @@ impl MessageProcessor {
                 items: Vec::new(),
                 page: TimelinePageInfo::default(),
             };
+            self.foreground_starts
+                .before_turn_snapshot(&response_payload.thread_id, &response_payload.turn_id)
+                .await;
             let response = match JsonRpcResponse::from_result(request_id, &response_payload) {
                 Ok(response) => response,
                 Err(error) => {
@@ -900,6 +906,9 @@ impl MessageProcessor {
             items: snapshot.items,
             page: page_info,
         };
+        self.foreground_starts
+            .before_turn_snapshot(&response_payload.thread_id, &response_payload.turn_id)
+            .await;
         let response = match JsonRpcResponse::from_result(request_id, &response_payload) {
             Ok(response) => response,
             Err(error) => {
@@ -994,6 +1003,9 @@ impl MessageProcessor {
                 return;
             }
         };
+        self.foreground_starts
+            .before_turn_snapshot(&response_payload.thread_id, &response_payload.turn_id)
+            .await;
         let response = match JsonRpcResponse::from_result(request_id, &response_payload) {
             Ok(response) => response,
             Err(error) => {

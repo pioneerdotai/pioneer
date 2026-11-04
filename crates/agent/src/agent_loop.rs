@@ -638,7 +638,7 @@ pub(super) async fn run_agent_loop(
                     run_id,
                 )));
 
-                let _ = ack.send(Ok(()));
+                let _ = ack.send(Ok(run_id));
             }
             AgentCommand::TurnTaskFinished {
                 turn_id,
@@ -1794,6 +1794,10 @@ fn spawn_turn_task(
                 | LoopDurableCommitOutcome::SupersededByDurableInterruption => {
                     return Outcome::Cancelled;
                 }
+            }
+
+            if turn_control.cancellation_token().is_cancelled() {
+                return Outcome::Cancelled;
             }
 
             let NativeTurnRuntimeSnapshot {

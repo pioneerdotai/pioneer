@@ -269,7 +269,7 @@ use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::{Alias, Expr, ExprTrait, Query};
 use sea_orm::{
     ColumnTrait, ConnectionTrait, Database, DatabaseTransaction, EntityTrait, QueryFilter,
-    QueryOrder, Set, TransactionTrait,
+    QueryOrder, QuerySelect, Set, TransactionTrait,
 };
 use serde_json::{Value as JsonValue, json};
 use sha2::{Digest, Sha256};
@@ -4113,8 +4113,10 @@ struct GuardAwareProvider {
 }
 
 struct CreateThenHangProvider {
+    hold_until_cancelled: bool,
     next_index: AtomicUsize,
     root_main_started: Notify,
+    root_after_create: Notify,
 }
 
 #[async_trait::async_trait]
@@ -5210,6 +5212,9 @@ impl Provider for CreateThenHangProvider {
             });
         }
         if is_child_task_request(&request) {
+            if self.hold_until_cancelled {
+                return std::future::pending().await;
+            }
             sleep(Duration::from_secs(10)).await;
             return Ok(ChatResponse {
                 messages: Vec::new(),
@@ -5220,6 +5225,12 @@ impl Provider for CreateThenHangProvider {
                 termination: pioneer_provider::ProviderTermination::Complete,
                 tool_calls: Vec::new(),
             });
+        }
+        // Reaching the next parent request proves task_create returned through
+        // the real tool loop, including its durable item acknowledgement.
+        self.root_after_create.notify_one();
+        if self.hold_until_cancelled {
+            return std::future::pending().await;
         }
         sleep(Duration::from_secs(10)).await;
         Ok(ChatResponse {
@@ -5253,8 +5264,10 @@ impl Provider for CreateThenHangProvider {
 impl CreateThenHangProvider {
     fn new() -> Self {
         Self {
+            hold_until_cancelled: false,
             next_index: AtomicUsize::new(0),
             root_main_started: Notify::new(),
+            root_after_create: Notify::new(),
         }
     }
 
@@ -42714,12 +42727,53 @@ fn task_progress_refreshes_parent_task_anchor_preview() {
 }
 
 async fn task_progress_refreshes_parent_task_anchor_preview_impl() {
+    for scenario in [
+        "ordered",
+        "parent_stop",
+        "foreign_replacement",
+        "semantic_terminal",
+    ] {
+        task_anchor_publication_scenario(scenario).await;
+    }
+}
+
+async fn fanout_task_event_through(processor: &MessageProcessor, task_id: &str, sequence: i64) {
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if processor
+                .crud_store
+                .get_task_event_fanout_cursor(task_id)
+                .await
+                .unwrap()
+                .is_some_and(|cursor| cursor >= sequence)
+            {
+                break;
+            }
+            processor
+                .scoped_for_background_reconciliation()
+                .task_event_fanout_quantum()
+                .await
+                .unwrap();
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("actual task fanout must acknowledge its durable event while optional LIVE is held");
+}
+
+async fn task_anchor_publication_scenario(scenario: &str) {
     let (tx, mut rx) = crate::session::test_support::outbound_channel(128);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
-    let provider = Arc::new(CreateThenHangProvider::new());
+    // Publication and LIVE barriers may outlive the shared provider's ten-second
+    // delay. Keep both turns alive until this scenario explicitly cancels them,
+    // so terminal fanout cannot race the A/B progress snapshots.
+    let provider = Arc::new(CreateThenHangProvider {
+        hold_until_cancelled: true,
+        ..CreateThenHangProvider::new()
+    });
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "openai",
         provider.clone(),
@@ -42742,17 +42796,65 @@ async fn task_progress_refreshes_parent_task_anchor_preview_impl() {
 
     let thread_id = "thr_task_anchor_progress";
     let turn_id = "turn_task_anchor_progress";
-    start_thread_and_turn(
-        &processor,
-        connection_id,
+    let thread_request = json!({"jsonrpc":"2.0", "id":"req_thread_start_0001", "method":"thread/start",
+        "params":{"thread_id":thread_id,"workspace_id":workspace_id,"mode":"Agent","model":"test-model","model_provider":"openai"}});
+    processor
+        .process_request_for_connection(connection_id, &thread_request.to_string())
+        .await;
+    let _ = recv_response_and_notification_by_id_method(
         &mut rx,
-        workspace_id.as_str(),
-        thread_id,
-        turn_id,
-        "Agent",
-        "openai",
+        "req_thread_start_0001",
+        events::THREAD_STARTED,
     )
     .await;
+    while rx.try_recv().is_ok() {}
+    // Existing LIVE worker barrier, independent of the publication barrier.
+    // Keep queued A undrained even when start later releases.
+    let live_wake = processor.native_turn_event_delivery_workers.live.clone();
+    live_wake.claim_barrier.arm("timer");
+    processor.arm_completed_history_preparation_barrier("__foreground_start_before_publication__");
+    let start_id = generate_test_request_id("anchor", "held-start");
+    let request = json!({"jsonrpc":"2.0", "id":start_id,"method":"turn/start", "params":{
+        "thread_id":thread_id,"turn_id":turn_id,"mode":"Agent","model":"test-model","model_provider":"openai",
+        "execution_backend":{"type":"apiProvider","provider":"openai"},
+        "input":[{"type":"text","text":"delegate a task"}]}});
+    timeout(
+        Duration::from_secs(10),
+        processor.process_request_for_connection(connection_id, &request.to_string()),
+    )
+    .await
+    .unwrap();
+    // Inspect every entry while finding the ACK: a helper must not discard an
+    // early anchor emitted by task_create before this response.
+    timeout(Duration::from_secs(10), async {
+        loop {
+            let Message::Text(text) = rx.recv().await.unwrap() else {
+                continue;
+            };
+            let value: JsonValue = serde_json::from_str(&text).unwrap();
+            assert!(
+                !(value["params"]["thread_id"] == thread_id
+                    && value["params"]["turn_id"] == turn_id
+                    && matches!(
+                        value["method"].as_str(),
+                        Some(events::ITEM_COMPLETED | events::ITEM_UPDATED)
+                    )),
+                "anchor bypassed held start: {value}"
+            );
+            if value["id"] == json!(start_id) {
+                assert!(value.get("result").is_some(), "{value}");
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    timeout(
+        Duration::from_secs(10),
+        processor.wait_for_completed_history_preparation_barrier(),
+    )
+    .await
+    .unwrap();
 
     timeout(Duration::from_secs(5), provider.wait_for_root_main())
         .await
@@ -42763,12 +42865,254 @@ async fn task_progress_refreshes_parent_task_anchor_preview_impl() {
     let lineage = wait_for_child_lineage_for_run(crud_store.clone(), run_id.as_str()).await;
     assert_eq!(lineage.parent_thread_id, thread_id);
 
+    timeout(
+        Duration::from_secs(5),
+        provider.root_after_create.notified(),
+    )
+    .await
+    .expect(
+        "task_create must finish and reach the next parent provider request while start is held",
+    );
+
+    timeout(
+        Duration::from_secs(5),
+        live_wake.claim_barrier.wait_until_reached(),
+    )
+    .await
+    .unwrap();
+    if scenario != "ordered" {
+        let detached = detach_task_for_test(
+            &processor,
+            pioneer_protocol::TaskDetachParams {
+                task_id: task_id.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            detached.task.lifecycle_policy.as_ref().unwrap().attachment,
+            TaskAttachmentMode::Detached
+        );
+        if scenario == "semantic_terminal" {
+            assert!(
+                timeout(
+                    Duration::from_secs(5),
+                    processor.mark_turn_blocked(
+                        thread_id.into(),
+                        turn_id.into(),
+                        "semantic fixture blocked".into()
+                    )
+                )
+                .await
+                .unwrap()
+            );
+            assert!(
+                crud_store
+                    .native_turn_has_accepted_terminal(turn_id)
+                    .await
+                    .unwrap()
+            );
+            let terminal_work = crud_store
+                .get_turn_work_projection(turn_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(terminal_work.state, "blocked");
+            timeout(
+                Duration::from_secs(5),
+                processor.task_runtime.service().update_task(
+                    pioneer_tasks::TaskMutationContext::default(),
+                    TaskUpdateParams {
+                        task_id: task_id.clone(),
+                        title: Some("Metadata after source terminal".into()),
+                        ..Default::default()
+                    },
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let metadata = crud_store
+                .list_task_events_after(&task_id, 0)
+                .await
+                .unwrap()
+                .into_iter()
+                .rev()
+                .find(|event| matches!(event.payload, TaskEventPayload::TaskUpdated { .. }))
+                .unwrap();
+            fanout_task_event_through(&processor, &task_id, metadata.sequence).await;
+            let terminal_work = crud_store
+                .get_turn_work_projection(turn_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(terminal_work.state, "blocked");
+            assert_eq!(
+                crud_store
+                    .get_task(&task_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .task
+                    .title,
+                "Metadata after source terminal"
+            );
+            let mut saw_metadata = false;
+            while let Ok(Message::Text(text)) = rx.try_recv() {
+                let value: JsonValue = serde_json::from_str(&text).unwrap();
+                assert_ne!(value["method"], events::TURN_STARTED);
+                if value["method"] == events::TASK_UPDATED
+                    && value["params"]["task"]["id"] == task_id
+                {
+                    saw_metadata = true;
+                }
+                if value["method"] == events::TURN_WORK_STATE_CHANGED {
+                    let snapshot: pioneer_protocol::TurnWorkStateChangedNotification =
+                        serde_json::from_value(value["params"].clone()).unwrap();
+                    if snapshot.thread_id == thread_id && snapshot.turn_id == turn_id {
+                        panic!("Work snapshot escaped initial publication: {value}");
+                    }
+                }
+            }
+            assert!(
+                saw_metadata,
+                "actual task fanout must finish while publisher is held"
+            );
+            processor.release_completed_history_preparation_barrier();
+            // Drain with one LIVE claimant, just as in the ordered scenario below.
+            timeout(Duration::from_secs(10), async {
+                let mut started = false;
+                loop {
+                    for claim in crud_store
+                        .claim_due_turn_event_deliveries(
+                            pioneer_crud::NATIVE_TURN_EVENT_LIVE_CONSUMER,
+                            now_timestamp_secs() + 600,
+                            64,
+                        )
+                        .await
+                        .unwrap()
+                    {
+                        processor
+                            .process_claimed_native_turn_event_delivery(claim)
+                            .await
+                            .unwrap();
+                    }
+                    let mut observed = false;
+                    while let Ok(Message::Text(text)) = rx.try_recv() {
+                        let value: JsonValue = serde_json::from_str(&text).unwrap();
+                        if value["method"] == events::TURN_STARTED
+                            && value["params"]["turn"]["id"] == turn_id
+                        {
+                            assert!(!started);
+                            started = true;
+                        }
+                        if value["method"] == events::TURN_WORK_STATE_CHANGED {
+                            let snapshot: pioneer_protocol::TurnWorkStateChangedNotification =
+                                serde_json::from_value(value["params"].clone()).unwrap();
+                            if snapshot.thread_id == thread_id && snapshot.turn_id == turn_id {
+                                assert!(started, "Work preceded start: {value}");
+                                assert_eq!(snapshot.work.turn_id, turn_id);
+                                assert_eq!(
+                                    snapshot.work.state,
+                                    pioneer_protocol::TurnWorkState::Blocked
+                                );
+                                assert!(
+                                    snapshot.source_high_watermark
+                                        >= terminal_work.source_high_watermark
+                                );
+                                assert_eq!(
+                                    snapshot.work.completed_at_unix_ms,
+                                    terminal_work
+                                        .completed_at
+                                        .as_ref()
+                                        .map(|at| at.timestamp_millis())
+                                );
+                                observed = true;
+                            }
+                        }
+                    }
+                    if observed {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("blocked work snapshot must drain after start while the LIVE worker is parked");
+            live_wake.claim_barrier.release();
+            cancel_task_for_test(
+                &processor,
+                pioneer_protocol::TaskCancelParams {
+                    task_id: task_id.clone(),
+                    reason: Some("fixture cleanup".into()),
+                    scope: pioneer_protocol::TaskCancelScope::AttachedSubtree,
+                },
+            )
+            .await
+            .unwrap();
+            processor.foreground_starts.shutdown().await;
+            processor.agent_manager.remove_thread(thread_id).await;
+            return;
+        }
+        if scenario == "parent_stop" {
+            assert!(
+                timeout(
+                    Duration::from_secs(5),
+                    processor.mark_turn_interrupted(
+                        thread_id.into(),
+                        turn_id.into(),
+                        "Stop with detached task".into()
+                    )
+                )
+                .await
+                .unwrap()
+            );
+        } else {
+            let original = crud_store
+                .get_turn_execution(turn_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let at = original.lease_until.timestamp() + 1;
+            let replacement = crud_store
+                .claim_expired_turn_execution(&original, "foreign-task-anchor-owner", at, at + 60)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_ne!(replacement.owner_id, original.owner_id);
+        }
+        let task = crud_store.get_task(&task_id).await.unwrap().unwrap();
+        assert_ne!(
+            task.task.status,
+            TaskStatus::Cancelled,
+            "detached task survives its parent"
+        );
+    }
+
+    // Progress text is redacted at the public boundary. Use public task titles
+    // to distinguish immutable A/B snapshots without exposing private progress.
+    let title_a = "Task anchor snapshot A";
+    let title_b = "Task anchor snapshot B";
+    processor
+        .task_runtime
+        .service()
+        .update_task(
+            pioneer_tasks::TaskMutationContext::default(),
+            TaskUpdateParams {
+                task_id: task_id.clone(),
+                title: Some(title_a.into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
     let progress_message = "TaskAgentExecutor is checking task anchor projection";
+    let public_progress = "Task progress updated.";
     let progress_event = crud_store
         .append_task_event(
             TaskEventPayload::Progress {
                 task_id: task_id.clone(),
-                run_id: Some(run_id.clone()),
+                run_id: (scenario == "ordered").then(|| run_id.clone()),
                 message: progress_message.to_owned(),
                 details: None,
             },
@@ -42776,27 +43120,251 @@ async fn task_progress_refreshes_parent_task_anchor_preview_impl() {
         )
         .await
         .expect("progress event should append");
-    processor
-        .emit_task_event(progress_event)
-        .await
-        .expect("progress event should refresh parent task anchor");
+    fanout_task_event_through(&processor, &task_id, progress_event.sequence).await;
 
     let anchor = wait_for_task_anchor_progress_preview(
         crud_store.clone(),
         turn_id,
         crate::task_tools::task_anchor_id(task_id.as_str()).as_str(),
-        progress_message,
+        public_progress,
     )
     .await;
-    assert_eq!(anchor.run_id.as_deref(), Some(run_id.as_str()));
-    assert_eq!(
-        anchor.child_thread_id.as_deref(),
-        Some(lineage.child_thread_id.as_str())
-    );
-    assert_eq!(
-        anchor.child_turn_id.as_deref(),
-        Some(lineage.child_turn_id.as_str())
-    );
+    assert_eq!(anchor.title, title_a);
+    assert_eq!(anchor.progress_preview.as_deref(), Some(public_progress));
+    if scenario == "ordered" {
+        assert_eq!(anchor.run_id.as_deref(), Some(run_id.as_str()));
+        assert_eq!(
+            anchor.child_thread_id.as_deref(),
+            Some(lineage.child_thread_id.as_str())
+        );
+        assert_eq!(
+            anchor.child_turn_id.as_deref(),
+            Some(lineage.child_turn_id.as_str())
+        );
+    } else {
+        assert_eq!(anchor.attachment, TaskAttachmentMode::Detached);
+    }
+
+    // task_create persistence and the actual parent progress refresh have both
+    // completed. Neither eager item fanout may bypass the held start.
+    while let Ok(Message::Text(text)) = rx.try_recv() {
+        let value: JsonValue = serde_json::from_str(&text).unwrap();
+        assert_ne!(value["method"], events::TURN_STARTED);
+        assert!(
+            !(value["params"]["thread_id"] == thread_id
+                && value["params"]["turn_id"] == turn_id
+                && matches!(
+                    value["method"].as_str(),
+                    Some(events::ITEM_COMPLETED | events::ITEM_UPDATED)
+                )),
+            "anchor bypassed held start: {value}"
+        );
+    }
+    processor.release_completed_history_preparation_barrier();
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let Message::Text(text) = rx.recv().await.unwrap() else {
+                continue;
+            };
+            let value: JsonValue = serde_json::from_str(&text).unwrap();
+            assert!(
+                !(value["params"]["turn_id"] == turn_id
+                    && matches!(
+                        value["method"].as_str(),
+                        Some(events::ITEM_COMPLETED | events::ITEM_UPDATED)
+                    )),
+                "LIVE must still be held: {value}"
+            );
+            if value["method"] == events::TURN_STARTED && value["params"]["turn"]["id"] == turn_id {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!processor.foreground_starts.pending(thread_id, turn_id));
+    timeout(Duration::from_secs(5), async {
+        while processor
+            .foreground_starts
+            .entry(thread_id, turn_id)
+            .is_some()
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    // Actual B after Pending=false, before any A LIVE delivery. This must retain
+    // A's canonical owner; eager B followed by old A would roll the client back.
+    processor
+        .task_runtime
+        .service()
+        .update_task(
+            pioneer_tasks::TaskMutationContext::default(),
+            TaskUpdateParams {
+                task_id: task_id.clone(),
+                title: Some(title_b.into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let latest_progress = "anchor B after start before LIVE drain";
+    let b = crud_store
+        .append_task_event(
+            TaskEventPayload::Progress {
+                task_id: task_id.clone(),
+                run_id: (scenario == "ordered").then(|| run_id.clone()),
+                message: latest_progress.into(),
+                details: None,
+            },
+            now_timestamp_secs(),
+        )
+        .await
+        .unwrap();
+    fanout_task_event_through(&processor, &task_id, b.sequence).await;
+    while let Ok(Message::Text(text)) = rx.try_recv() {
+        let value: JsonValue = serde_json::from_str(&text).unwrap();
+        assert!(
+            !(value["params"]["thread_id"] == thread_id
+                && value["params"]["turn_id"] == turn_id
+                && matches!(
+                    value["method"].as_str(),
+                    Some(events::ITEM_COMPLETED | events::ITEM_UPDATED)
+                )),
+            "eager update overtook queued A: {value}"
+        );
+    }
+    // Keep the background LIVE owner parked while this fixture drains claims.
+    // Its synthetic future clock must not expire a concurrent worker's lease.
+    let (mut completed, mut a, mut b) = (false, false, false);
+    let mut final_preview = None;
+    let mut final_title = None;
+    let mut last_claim = None;
+    let drain_result = timeout(Duration::from_secs(10), async {
+        loop {
+            for claim in crud_store
+                .claim_due_turn_event_deliveries(
+                    pioneer_crud::NATIVE_TURN_EVENT_LIVE_CONSUMER,
+                    now_timestamp_secs() + 600,
+                    64,
+                )
+                .await
+                .unwrap()
+            {
+                last_claim = Some((claim.event.turn_id.clone(), claim.event.sequence));
+                processor
+                    .process_claimed_native_turn_event_delivery(claim)
+                    .await
+                    .unwrap();
+            }
+            while let Ok(Message::Text(text)) = rx.try_recv() {
+                let value: JsonValue = serde_json::from_str(&text).unwrap();
+                if value["params"]["thread_id"] != thread_id
+                    || value["params"]["turn_id"] != turn_id
+                {
+                    continue;
+                }
+                let item = match value["method"].as_str() {
+                    Some(events::ITEM_COMPLETED) => {
+                        let n: ItemCompletedNotification =
+                            serde_json::from_value(value["params"].clone()).unwrap();
+                        if matches!(&n.item, TurnItem::Task { item } if item.task_id == task_id) {
+                            assert!(!b);
+                            completed = true;
+                        }
+                        n.item
+                    }
+                    Some(events::ITEM_UPDATED) => {
+                        serde_json::from_value::<ItemUpdatedNotification>(value["params"].clone())
+                            .unwrap()
+                            .item
+                    }
+                    _ => continue,
+                };
+                if let TurnItem::Task { item } = item
+                    && item.task_id == task_id
+                {
+                    if item.title == title_a
+                        && item.progress_preview.as_deref() == Some(public_progress)
+                    {
+                        assert!(completed, "A preceded initial task completion");
+                        assert!(!b, "A rolled back B");
+                        a = true;
+                    }
+                    if item.title == title_b
+                        && item.progress_preview.as_deref() == Some(public_progress)
+                    {
+                        assert!(completed && a);
+                        b = true;
+                    }
+                    final_title = Some(item.title);
+                    final_preview = item.progress_preview;
+                }
+            }
+            let queued = pioneer_entity::turn_event_delivery::Entity::find()
+                .filter(pioneer_entity::turn_event_delivery::Column::TurnId.eq(turn_id))
+                .filter(
+                    pioneer_entity::turn_event_delivery::Column::Consumer
+                        .eq(pioneer_crud::NATIVE_TURN_EVENT_LIVE_CONSUMER),
+                )
+                .filter(pioneer_entity::turn_event_delivery::Column::Status.is_in([
+                    "pending",
+                    "delivering",
+                    "failed",
+                ]))
+                .one(&crud_store.database_connection())
+                .await
+                .unwrap()
+                .is_some();
+            if b && !queued {
+                assert_eq!(final_title.as_deref(), Some(title_b));
+                assert_eq!(final_preview.as_deref(), Some(public_progress));
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    if drain_result.is_err() {
+        let pending = pioneer_entity::turn_event_delivery::Entity::find()
+            .filter(pioneer_entity::turn_event_delivery::Column::TurnId.eq(turn_id))
+            .filter(
+                pioneer_entity::turn_event_delivery::Column::Consumer
+                    .eq(pioneer_crud::NATIVE_TURN_EVENT_LIVE_CONSUMER),
+            )
+            .filter(pioneer_entity::turn_event_delivery::Column::Status.is_in([
+                "pending",
+                "delivering",
+                "failed",
+            ]))
+            .order_by_asc(pioneer_entity::turn_event_delivery::Column::Sequence)
+            .limit(64)
+            .all(&crud_store.database_connection())
+            .await
+            .unwrap();
+        panic!(
+            "task anchors must drain with LIVE parked: scenario={scenario}, \
+             completed={completed}, a={a}, b={b}, final_preview={final_preview:?}, \
+             last_claim={last_claim:?}, pending={pending:?}"
+        );
+    }
+    live_wake.claim_barrier.release();
+    if scenario != "ordered" {
+        cancel_task_for_test(
+            &processor,
+            pioneer_protocol::TaskCancelParams {
+                task_id: task_id.clone(),
+                reason: Some("fixture cleanup".into()),
+                scope: pioneer_protocol::TaskCancelScope::AttachedSubtree,
+            },
+        )
+        .await
+        .unwrap();
+        processor.foreground_starts.shutdown().await;
+        processor.agent_manager.remove_thread(thread_id).await;
+        return;
+    }
 
     // Exercise the real child lineage/resolver and parent subscription path.
     wait_for_thread_manager_turn_status(
@@ -42855,6 +43423,43 @@ async fn task_progress_refreshes_parent_task_anchor_preview_impl() {
     assert_eq!(forwarded.thread_id, thread_id);
     assert_eq!(forwarded.turn_id, turn_id);
     assert_eq!(forwarded.delta, " 🦀**");
+
+    // Exercise the actual forwarding resolver against a pending target startup.
+    // The source child is running; checking only its turn misses this dependency.
+    let pending_parent = timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok(entry) = processor.foreground_starts.admit(thread_id, turn_id) {
+                break entry;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    processor
+        .handle_progress_agent_event(AgentProgressEvent::ItemDelta {
+            notification: ItemDeltaNotification {
+                workspace_id: workspace_id.clone(),
+                thread_id: lineage.child_thread_id.clone(),
+                turn_id: lineage.child_turn_id.clone(),
+                item_id: reasoning_id.into(),
+                delta: "withheld-parent-progress".into(),
+                stream: Some(ItemDeltaStream::AgentMessage),
+                payload: None,
+                markdown: None,
+                markdown_version: None,
+            },
+        })
+        .await;
+    while let Ok(Message::Text(text)) = rx.try_recv() {
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert!(
+            value["params"]["delta"] != "withheld-parent-progress",
+            "child reasoning bypassed its actual parent's startup dependency"
+        );
+    }
+    drop(pending_parent);
+
     assert_eq!(
         forwarded.markdown,
         Some(super::markdown::parse_markdown_document("**проверка 🦀**"))
@@ -49741,6 +50346,7 @@ async fn turn_start_security_snapshot_native_turn_is_persisted_before_dispatch()
             },
             None,
             crate::authorization::ExecutionAdmissionEntryPoint::InteractiveTurn,
+            crate::message::turn_handlers::ApiProviderTurnPreparation::AllowNew,
             execution_admission,
         )
         .await
@@ -49869,6 +50475,7 @@ async fn native_turn_start_same_request_replays_durable_outcome_without_dispatch
             params.clone(),
             None,
             crate::authorization::ExecutionAdmissionEntryPoint::InteractiveTurn,
+            crate::message::turn_handlers::ApiProviderTurnPreparation::AllowNew,
             execution_admission.clone(),
         )
         .await
@@ -49886,6 +50493,7 @@ async fn native_turn_start_same_request_replays_durable_outcome_without_dispatch
             params.clone(),
             None,
             crate::authorization::ExecutionAdmissionEntryPoint::InteractiveTurn,
+            crate::message::turn_handlers::ApiProviderTurnPreparation::AllowNew,
             execution_admission.clone(),
         )
         .await
@@ -49909,6 +50517,7 @@ async fn native_turn_start_same_request_replays_durable_outcome_without_dispatch
             conflicting,
             None,
             crate::authorization::ExecutionAdmissionEntryPoint::InteractiveTurn,
+            crate::message::turn_handlers::ApiProviderTurnPreparation::AllowNew,
             execution_admission,
         )
         .await
@@ -49999,6 +50608,7 @@ async fn turn_start_security_audit_events_include_snapshot_reference() {
             },
             None,
             crate::authorization::ExecutionAdmissionEntryPoint::InteractiveTurn,
+            crate::message::turn_handlers::ApiProviderTurnPreparation::AllowNew,
             execution_admission,
         )
         .await

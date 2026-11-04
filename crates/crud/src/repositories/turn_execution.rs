@@ -275,6 +275,35 @@ pub async fn mark_running_owned<C: ConnectionTrait>(
     Ok(result.rows_affected == 1)
 }
 
+/// Running transition for an exact captured startup ownership receipt.
+pub async fn mark_running_current<C: ConnectionTrait>(
+    db: &C,
+    expected: &TurnExecutionRecord,
+    started_at: DateTimeWithTimeZone,
+    lease_until: DateTimeWithTimeZone,
+) -> Result<bool> {
+    let generation = i64::try_from(expected.owner_generation)?;
+    let result = turn_execution::Entity::update_many()
+        .filter(turn_execution::Column::TurnId.eq(&expected.turn_id))
+        .filter(turn_execution::Column::ThreadId.eq(&expected.thread_id))
+        .filter(turn_execution::Column::WorkspaceId.eq(&expected.workspace_id))
+        .filter(turn_execution::Column::OwnerId.eq(&expected.owner_id))
+        .filter(turn_execution::Column::OwnerGeneration.eq(generation))
+        .filter(turn_execution::Column::LeaseUntil.gt(started_at))
+        .filter(turn_execution::Column::Status.is_in(["starting", "running"]))
+        .col_expr(turn_execution::Column::Status, Expr::value("running"))
+        .col_expr(
+            turn_execution::Column::StartedAt,
+            Expr::value(Some(started_at)),
+        )
+        .col_expr(turn_execution::Column::HeartbeatAt, Expr::value(started_at))
+        .col_expr(turn_execution::Column::LeaseUntil, Expr::value(lease_until))
+        .col_expr(turn_execution::Column::UpdatedAt, Expr::value(started_at))
+        .exec(db)
+        .await?;
+    Ok(result.rows_affected == 1)
+}
+
 pub async fn claim_unactivated<C: ConnectionTrait>(
     db: &C,
     expected: &TurnExecutionRecord,

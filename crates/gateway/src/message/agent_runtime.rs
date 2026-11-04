@@ -995,10 +995,10 @@ impl MessageProcessor {
                                     ));
                                 };
                                 let this = this.with_database_class(SqliteWriteClass::Critical);
-                                this.commit_durable_agent_event(event).await
+                                this.commit_leased_durable_agent_event(event, actor_generation).await
                             } else {
                                 #[cfg(test)]
-                                { test_this.as_ref().expect("test listener owner").commit_durable_agent_event(event).await }
+                                { test_this.as_ref().expect("test listener owner").commit_leased_durable_agent_event(event, actor_generation).await }
                                 #[cfg(not(test))]
                                 { Err(DurableCommitRejection::permanent(
                                     "processor_stopped",
@@ -1554,6 +1554,7 @@ impl MessageProcessor {
         &self,
         preparation: pioneer_protocol::NativeTerminalEffectPreparation,
         initial_turn: bool,
+        foreground: Option<Arc<super::turn_handlers::foreground_start::StartObligation>>,
     ) -> Result<(), DurableCommitRejection> {
         if initial_turn {
             #[cfg(test)]
@@ -1563,15 +1564,43 @@ impl MessageProcessor {
                     &tokio_util::sync::CancellationToken::new(),
                 )
                 .await;
-            let result = self
-                .crud_store
-                .persist_native_cancellation_context(
-                    preparation.clone(),
-                    self.turn_execution_owner_id.as_ref(),
-                    now_timestamp_secs(),
-                    true,
-                )
-                .await;
+            let result = if let Some(entry) = foreground.as_ref() {
+                let expected = entry
+                    .execution
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+                let generation = *entry
+                    .actor_generation
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let source = self.agent_manager.initial_start_receipt(&preparation).await;
+                match (expected, generation, source) {
+                    (Some(expected), Some(generation), Some(source))
+                        if source.actor_generation == generation =>
+                    {
+                        self.crud_store
+                            .confirm_foreground_start_cancellation_context(
+                                preparation.clone(),
+                                &expected,
+                                now_timestamp_secs(),
+                            )
+                            .await
+                    }
+                    _ => Err(anyhow::anyhow!(
+                        "foreground activation actor retired or cancelled"
+                    )),
+                }
+            } else {
+                self.crud_store
+                    .persist_native_cancellation_context(
+                        preparation.clone(),
+                        self.turn_execution_owner_id.as_ref(),
+                        now_timestamp_secs(),
+                        true,
+                    )
+                    .await
+            };
             let result = match result {
                 Err(error) => {
                     // A handed-off initial Stop still owns this registration
@@ -1605,6 +1634,17 @@ impl MessageProcessor {
                         &tokio_util::sync::CancellationToken::new(),
                     )
                     .await;
+            }
+            if let Some(entry) = foreground {
+                // Retryable storage failures retain the obligation; a definitive
+                // outcome wakes only this startup, never optional publication.
+                if result.is_ok() {
+                    entry.activation_result(Ok(()));
+                } else if let Err(error) = &result {
+                    if !error.is_retryable() {
+                        entry.activation_result(Err(format!("{error:?}")));
+                    }
+                }
             }
             return result;
         }
@@ -1678,15 +1718,20 @@ impl MessageProcessor {
                 self.defer_native_turn_control_transition(&preparation)
                     .await?;
             }
-            self.send_notification_to_thread_subscribers(
-                &preparation.thread_id,
-                events::THREAD_UPDATED,
-                &ThreadUpdatedNotification {
-                    thread,
-                    placement: None,
-                },
-            )
-            .await;
+            if !self
+                .foreground_starts
+                .pending(&preparation.thread_id, &preparation.turn_id)
+            {
+                self.send_notification_to_thread_subscribers(
+                    &preparation.thread_id,
+                    events::THREAD_UPDATED,
+                    &ThreadUpdatedNotification {
+                        thread,
+                        placement: None,
+                    },
+                )
+                .await;
+            }
             #[cfg(test)]
             self.completed_history_preparation_barrier
                 .wait_if_armed(
@@ -1904,6 +1949,37 @@ impl MessageProcessor {
         message_future(async move { self.commit_durable_agent_event(event).await.is_ok() })
     }
 
+    async fn commit_leased_durable_agent_event(
+        &self,
+        event: AgentDurableEvent,
+        actor_generation: u64,
+    ) -> Result<(), DurableCommitRejection> {
+        let initial = match &event {
+            AgentDurableEvent::NativeCancellationContextPrepared {
+                preparation,
+                initial_turn: true,
+            } => Some(preparation.clone()),
+            _ => None,
+        };
+        // Construct before the first await: the canonical owner captures any
+        // foreground obligation, including across retirement while guards wait.
+        let commit = self.commit_durable_agent_event(event);
+        if let Some(preparation) = initial {
+            if self
+                .agent_manager
+                .initial_start_receipt(&preparation)
+                .await
+                .is_none_or(|receipt| receipt.actor_generation != actor_generation)
+            {
+                return Err(DurableCommitRejection::permanent(
+                    "stale_initial_actor",
+                    "initial registration actor was retired",
+                ));
+            }
+        }
+        commit.await
+    }
+
     pub(crate) fn commit_durable_agent_event<'a>(
         &'a self,
         event: AgentDurableEvent,
@@ -1917,6 +1993,15 @@ impl MessageProcessor {
         cli_blocked_guard: Option<pioneer_protocol::CliRuntimeBlockedTurnGuard>,
         mut turn_transition: Option<Arc<tokio::sync::OwnedMutexGuard<()>>>,
     ) -> MessageFuture<'a, Result<(), DurableCommitRejection>> {
+        let foreground_activation = match &event {
+            AgentDurableEvent::NativeCancellationContextPrepared {
+                preparation,
+                initial_turn: true,
+            } => self
+                .foreground_starts
+                .entry(&preparation.thread_id, &preparation.turn_id),
+            _ => None,
+        };
         let terminal_delivery = cli_blocked_guard
             .as_ref()
             .filter(|guard| guard.terminal_delivery_id.is_some())
@@ -2228,8 +2313,12 @@ impl MessageProcessor {
                     } => Some(if already_committed {
                         Ok(())
                     } else {
-                        self.prepare_native_turn_control(preparation.clone(), *initial_turn)
-                            .await
+                        self.prepare_native_turn_control(
+                            preparation.clone(),
+                            *initial_turn,
+                            foreground_activation.clone(),
+                        )
+                        .await
                     }),
                     AgentDurableEvent::NativeTerminalEffectsPrepared { preparation } => Some(
                         match self
@@ -3105,12 +3194,17 @@ impl MessageProcessor {
 
                 // Source/job is already committed atomically; wake only advances execution.
                 self.spawn_thread_episodic_index_run();
-                self.send_notification_to_thread_subscribers(
-                    notification.thread_id.as_str(),
-                    events::ITEM_UPDATED,
-                    &notification,
-                )
-                .await;
+                if !self
+                    .foreground_starts
+                    .pending(&notification.thread_id, &notification.turn_id)
+                {
+                    self.send_notification_to_thread_subscribers(
+                        notification.thread_id.as_str(),
+                        events::ITEM_UPDATED,
+                        &notification,
+                    )
+                    .await;
+                }
                 self.notify_semantic_timeline_item_changed(
                     notification.workspace_id.as_str(),
                     notification.thread_id.as_str(),
@@ -4618,6 +4712,21 @@ impl MessageProcessor {
         &self,
         delivery: pioneer_crud::ClaimedTurnEventDeliveryRecord,
     ) -> Result<()> {
+        if delivery.consumer == pioneer_crud::NATIVE_TURN_EVENT_LIVE_CONSUMER
+            && self.foreground_starts.pending(
+                delivery.event.payload.thread_id(),
+                delivery.event.payload.turn_id(),
+            )
+        {
+            self.crud_store
+                .defer_turn_event_delivery_for_foreground_start(
+                    &delivery.id,
+                    &delivery.claim_token,
+                    now_timestamp_secs(),
+                )
+                .await?;
+            return Ok(());
+        }
         let result = tokio::time::timeout(
             Duration::from_secs(5),
             self.deliver_native_turn_event(&delivery),
@@ -4784,6 +4893,14 @@ impl MessageProcessor {
         &self,
         payload: &pioneer_crud::CanonicalTurnEventPayload,
     ) -> Result<()> {
+        // A pending foreground publisher never occupies a delivery slot while
+        // waiting. Existing claimed-delivery failure/retry owns the event body.
+        if self
+            .foreground_starts
+            .pending(payload.thread_id(), payload.turn_id())
+        {
+            bail!("foreground start publication is pending");
+        }
         use pioneer_crud::CanonicalTurnEventPayload as Event;
 
         let terminal = match payload {
@@ -5954,11 +6071,16 @@ impl MessageProcessor {
             AgentDurableEvent::NativeCancellationContextPrepared {
                 preparation,
                 initial_turn,
-            } => message_future(async move {
-                self.prepare_native_turn_control(preparation, initial_turn)
-                    .await
-                    .is_ok()
-            }),
+            } => {
+                let foreground = self
+                    .foreground_starts
+                    .entry(&preparation.thread_id, &preparation.turn_id);
+                message_future(async move {
+                    self.prepare_native_turn_control(preparation, initial_turn, foreground)
+                        .await
+                        .is_ok()
+                })
+            }
             AgentDurableEvent::NativeTerminalEffectsPrepared { preparation } => {
                 message_future(async move {
                     let thread_id = preparation.thread_id.clone();
@@ -6302,12 +6424,17 @@ impl MessageProcessor {
                 self.enrich_item_delta_markdown(&mut notification, item_type)
                     .await;
                 let delta_method = Self::item_delta_event_method(notification.stream);
-                self.send_progress_notification_to_thread_subscribers(
-                    notification.thread_id.as_str(),
-                    delta_method,
-                    &notification,
-                )
-                .await;
+                if !self
+                    .foreground_starts
+                    .pending(&notification.thread_id, &notification.turn_id)
+                {
+                    self.send_progress_notification_to_thread_subscribers(
+                        notification.thread_id.as_str(),
+                        delta_method,
+                        &notification,
+                    )
+                    .await;
+                }
 
                 if matches!(item_type, Some(TurnItemType::Reasoning)) {
                     self.forward_child_reasoning_delta_to_parent_turn(&notification)
@@ -6396,22 +6523,24 @@ impl MessageProcessor {
                 delta,
                 payload,
             } => {
-                self.send_progress_notification_to_thread_subscribers(
-                    &thread_id,
-                    Self::item_delta_event_method(Some(stream)),
-                    &pioneer_protocol::ItemDeltaNotification {
-                        workspace_id,
-                        thread_id: thread_id.clone(),
-                        turn_id,
-                        item_id,
-                        stream: Some(stream),
-                        delta,
-                        payload,
-                        markdown: None,
-                        markdown_version: None,
-                    },
-                )
-                .await;
+                if !self.foreground_starts.pending(&thread_id, &turn_id) {
+                    self.send_progress_notification_to_thread_subscribers(
+                        &thread_id,
+                        Self::item_delta_event_method(Some(stream)),
+                        &pioneer_protocol::ItemDeltaNotification {
+                            workspace_id,
+                            thread_id: thread_id.clone(),
+                            turn_id,
+                            item_id,
+                            stream: Some(stream),
+                            delta,
+                            payload,
+                            markdown: None,
+                            markdown_version: None,
+                        },
+                    )
+                    .await;
+                }
             }
             AgentProgressEvent::TaskProgress { .. } => {}
         }
@@ -7458,17 +7587,21 @@ impl MessageProcessor {
                     item: failed_item,
                 };
                 match self
-                    .crud_store
-                    .materialize_item_completed(completed.clone(), event_timestamp)
+                    .materialize_independent_item_lifecycle(
+                        pioneer_crud::CanonicalTurnEventPayload::ItemCompleted(completed.clone()),
+                        event_timestamp,
+                    )
                     .await
                 {
-                    Ok(()) => {
-                        self.send_notification_to_thread_subscribers(
-                            thread_id.as_str(),
-                            events::ITEM_COMPLETED,
-                            &completed,
-                        )
-                        .await;
+                    Ok(live) => {
+                        if !live {
+                            self.send_notification_to_thread_subscribers(
+                                thread_id.as_str(),
+                                events::ITEM_COMPLETED,
+                                &completed,
+                            )
+                            .await;
+                        }
                         self.notify_semantic_timeline_item_changed(
                             completed.workspace_id.as_str(),
                             completed.thread_id.as_str(),
@@ -9066,32 +9199,87 @@ impl MessageProcessor {
             .await
     }
 
+    /// Task service/recovery own these mutations independently of provider
+    /// execution. Choosing LIVE changes only optional delivery, not authority.
+    /// Once a completion/timeout joined LIVE, its durable receipt keeps later
+    /// updates behind the same canonical sequence even after Pending releases.
+    pub(super) async fn materialize_independent_item_lifecycle(
+        &self,
+        event: pioneer_crud::CanonicalTurnEventPayload,
+        timestamp: i64,
+    ) -> Result<bool> {
+        use pioneer_crud::CanonicalTurnEventPayload as Event;
+        let item_id = match &event {
+            Event::ItemCompleted(n) => n.item.item_id(),
+            Event::ItemUpdated(n) => n.item.item_id(),
+            Event::ItemTimeoutDetected(n) => n.item_id.as_str(),
+            _ => bail!("independent item lifecycle requires completion, update or timeout"),
+        };
+        let live = self
+            .foreground_starts
+            .pending(event.thread_id(), event.turn_id())
+            || self
+                .crud_store
+                .independent_item_uses_live_delivery(event.thread_id(), event.turn_id(), item_id)
+                .await?;
+        if live {
+            // The unowned CRUD API preserves task/recovery authority after
+            // parent Stop/replacement. Provider-owned append remains fenced.
+            self.crud_store
+                .materialize_native_agent_turn_event(event, timestamp, None)
+                .await?;
+            self.kick_native_turn_event_deliveries();
+        } else {
+            match event {
+                Event::ItemCompleted(n) => {
+                    self.crud_store
+                        .materialize_item_completed(n, timestamp)
+                        .await?
+                }
+                Event::ItemUpdated(n) => {
+                    self.crud_store
+                        .materialize_item_updated(n, timestamp)
+                        .await?
+                }
+                Event::ItemTimeoutDetected(n) => {
+                    self.crud_store
+                        .materialize_item_timeout_detected(n, timestamp)
+                        .await?
+                }
+                _ => unreachable!(),
+            }
+        }
+        Ok(live)
+    }
+
     async fn persist_and_send_item_timeout_detected(
         &self,
         notification: pioneer_protocol::ItemTimeoutDetectedNotification,
         event_timestamp: i64,
     ) {
-        if let Err(error) = self
-            .crud_store
-            .materialize_item_timeout_detected(notification.clone(), event_timestamp)
+        let live = match self
+            .materialize_independent_item_lifecycle(
+                pioneer_crud::CanonicalTurnEventPayload::ItemTimeoutDetected(notification.clone()),
+                event_timestamp,
+            )
             .await
         {
-            warn!(
-                thread_id = notification.thread_id.as_str(),
-                turn_id = notification.turn_id.as_str(),
-                item_id = notification.item_id.as_str(),
-                error = %format!("{error:#}"),
-                "failed to persist item timeout recovery timeline event; skipping live notification"
-            );
-            return;
+            Ok(live) => live,
+            Err(error) => {
+                warn!(thread_id = notification.thread_id, turn_id = notification.turn_id,
+                    item_id = notification.item_id, error = %format!("{error:#}"),
+                    "failed to persist item timeout recovery timeline event; skipping live notification");
+                return;
+            }
+        };
+        if !live {
+            self.send_notification_to_thread_subscribers(
+                notification.thread_id.as_str(),
+                events::ITEM_TIMEOUT_DETECTED,
+                &notification,
+            )
+            .await;
         }
-
-        self.send_notification_to_thread_subscribers(
-            notification.thread_id.as_str(),
-            events::ITEM_TIMEOUT_DETECTED,
-            &notification,
-        )
-        .await;
         self.notify_semantic_timeline_work_item_id_changed(
             notification.workspace_id.as_str(),
             notification.thread_id.as_str(),
@@ -9474,6 +9662,12 @@ impl MessageProcessor {
         parent_delta.thread_id = target.parent_thread_id;
         parent_delta.turn_id = target.parent_turn_id;
 
+        if self
+            .foreground_starts
+            .pending(&parent_delta.thread_id, &parent_delta.turn_id)
+        {
+            return;
+        }
         let delta_method = Self::item_delta_event_method(parent_delta.stream);
         self.send_progress_notification_to_thread_subscribers(
             parent_delta.thread_id.as_str(),
@@ -10911,12 +11105,15 @@ impl MessageProcessor {
             return false;
         }
 
-        self.send_notification_to_thread_subscribers(
-            thread_id.as_str(),
-            events::TURN_BLOCKED,
-            &turn_blocked,
-        )
-        .await;
+        // The canonical blocked event already owns retry through LIVE.
+        if !self.foreground_starts.pending(&thread_id, &turn_id) {
+            self.send_notification_to_thread_subscribers(
+                thread_id.as_str(),
+                events::TURN_BLOCKED,
+                &turn_blocked,
+            )
+            .await;
+        }
         self.notify_semantic_timeline_turn_state_changed(
             turn_blocked.workspace_id.as_str(),
             turn_blocked.thread_id.as_str(),
@@ -12319,12 +12516,14 @@ impl MessageProcessor {
             placement: None,
         };
 
-        self.send_notification_to_thread_subscribers(
-            thread_id,
-            events::THREAD_UPDATED,
-            &notification,
-        )
-        .await;
+        if !self.foreground_starts.pending_thread(thread_id) {
+            self.send_notification_to_thread_subscribers(
+                thread_id,
+                events::THREAD_UPDATED,
+                &notification,
+            )
+            .await;
+        }
         self.notify_thread_tree_changed(notification.thread.workspace_id)
             .await;
     }
