@@ -212,7 +212,8 @@ mod tests {
                 .unwrap() = Some(transport.clone());
             let _error = core.open_thread_by_id("thread").unwrap_err();
             assert_eq!(transport.calls.load(Ordering::SeqCst), 1);
-            assert!(core.thread_snapshot("thread").is_none());
+            // Navigation retirement does not invalidate a successful shared subscription.
+            assert_eq!(core.thread_snapshot("thread").is_some(), replace_route > 0);
             assert!(core.thread_snapshot("other").is_none());
             assert_eq!(
                 core.navigation_snapshot().workspace_id(),
