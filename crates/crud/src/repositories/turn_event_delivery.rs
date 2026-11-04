@@ -194,6 +194,7 @@ pub async fn discover<C: ConnectionTrait>(
         .context("failed to discover eligible event work")
 }
 
+#[cfg(test)]
 pub async fn claim_due<C: ConnectionTrait>(
     db: &C,
     consumer: &str,
@@ -306,6 +307,7 @@ fn projection_ready(consumer: &str) -> SimpleExpr {
     }
 }
 
+#[cfg(test)]
 pub async fn list_due<C: ConnectionTrait>(
     db: &C,
     consumer: &str,

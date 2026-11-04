@@ -1698,8 +1698,8 @@ impl RecoveryCoordinator {
             }))
     }
 
-    /// Compatibility entry point for explicit reconstruction callers. Live
-    /// workers select the independent audit and due phases below.
+    /// Test helper that runs both independent worker phases.
+    #[cfg(test)]
     pub async fn run_ready_jobs(
         &self,
         now_unix: i64,
