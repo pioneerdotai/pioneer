@@ -220,8 +220,14 @@ impl Fixture {
         Arc::new(principal)
     }
 
-    async fn connect(&self, principal: Principal) -> (ConnectionId, mpsc::Receiver<Message>) {
-        let (tx, rx) = mpsc::channel(4);
+    async fn connect(
+        &self,
+        principal: Principal,
+    ) -> (
+        ConnectionId,
+        crate::session::test_support::OutboundTestReceiver,
+    ) {
+        let (tx, rx) = crate::session::test_support::outbound_channel(4);
         let identity = crate::thread::ThreadSubscriptionIdentity::new(
             principal.principal_id.clone(),
             principal.session_id.clone(),
@@ -305,7 +311,7 @@ impl Fixture {
     }
 }
 
-fn delivered(rx: &mut mpsc::Receiver<Message>) {
+fn delivered(rx: &mut crate::session::test_support::OutboundTestReceiver) {
     let Message::Text(text) = rx.try_recv().expect("authorized notification") else {
         panic!("text notification expected")
     };

@@ -580,7 +580,7 @@ async fn worker_window_uses_original_activity_and_late_answer_opens_a_fresh_wind
 async fn accept_candidate(
     harness: &Phase13CompactionHarness,
     connection: ConnectionId,
-    rx: &mut mpsc::Receiver<Message>,
+    rx: &mut crate::session::test_support::OutboundTestReceiver,
     task_id: &str,
     run_id: &str,
     candidate: &TaskResultCandidate,
@@ -660,7 +660,7 @@ async fn accepted_deliveries_coalesce_keep_frozen_outputs_and_preserve_work_arri
         r#"<task_result>{"summary":"accepted task fact","data":{"answer":"ok"}}</task_result>"#,
     ));
     let sessions = Arc::new(SessionManager::new());
-    let (tx, mut rx) = mpsc::channel(256);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(256);
     let connection = register_authenticated_test_connection(&sessions, tx).await;
     let (manager, store, workspace) = setup_workspace_manager().await;
     sessions
@@ -1071,7 +1071,7 @@ async fn hidden_composer_defers_root_warmup_until_its_answer_is_delivered_impl()
         r#"<task_result>{"summary":"composer and ordinary work","data":{"answer":"ready"}}</task_result>"#,
     ));
     let sessions = Arc::new(SessionManager::new());
-    let (tx, mut rx) = mpsc::channel(256);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(256);
     let connection = register_authenticated_test_connection(sessions.as_ref(), tx).await;
     let (manager, store, workspace) = setup_workspace_manager().await;
     let processor = review_enabled_processor(
@@ -1523,7 +1523,7 @@ async fn real_composer_native_start_preempts_background_owned_by_the_visible_roo
         r#"<task_result>{"summary":"foreground completed","data":{"answer":"ready"}}</task_result>"#,
     ).with_valid_summary_completion());
     let sessions = Arc::new(SessionManager::new());
-    let (tx, mut rx) = mpsc::channel(256);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(256);
     let connection = register_authenticated_test_connection(sessions.as_ref(), tx).await;
     let (manager, store, workspace) = setup_workspace_manager().await;
     let processor = review_enabled_processor(

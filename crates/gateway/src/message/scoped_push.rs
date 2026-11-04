@@ -708,8 +708,14 @@ impl MessageProcessor {
                             text
                         };
                         outbound
-                            .try_send(Message::Text(payload.into()))
-                            .map_err(|_| anyhow!("push outbound full or closed"))?;
+                            .try_send_data(Message::Text(payload.into()))
+                            .map_err(|error| {
+                                if matches!(error, tokio::sync::mpsc::error::TrySendError::Full(_))
+                                {
+                                    outbound.abort();
+                                }
+                                anyhow!("push outbound full or closed")
+                            })?;
                         if !recover {
                             if let Some(inbox) = &packet.inbox {
                                 if inbox.replace || packet.snapshot {

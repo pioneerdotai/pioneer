@@ -4,7 +4,6 @@ use axum::extract::ws::Message;
 use pioneer_crud::CrudStore;
 use pioneer_protocol::{AuthSessionId, DeviceId, GatewayId, PrincipalId, PrincipalKind};
 use sea_orm::ConnectionTrait;
-use tokio::sync::mpsc;
 
 use super::{ConnectionId, SessionManager};
 use crate::auth::AuthenticatedSessionPrincipal;
@@ -136,10 +135,39 @@ pub(crate) async fn ensure_test_superuser_secondary_session_authority(crud_store
 
 pub(crate) async fn register_authenticated_test_connection(
     manager: &SessionManager,
-    sender: mpsc::Sender<Message>,
+    sender: super::SessionOutbound,
 ) -> ConnectionId {
     manager
         .register_connection(sender, authenticated_test_superuser())
         .await
         .expect("test auth session must be registerable")
+}
+
+/// Test sink for the real outbound envelope. Dequeue consumes the frame as a
+/// completed write; tests needing writer retention use OutboundReceiver itself.
+pub(crate) struct OutboundTestReceiver(super::outbound::OutboundReceiver);
+impl OutboundTestReceiver {
+    pub(crate) async fn recv(&mut self) -> Option<Message> {
+        let envelope = self.0.recv().await?;
+        let (message, _) = envelope.item.received(
+            pioneer_observability::work::Boundary::EventLane,
+            pioneer_observability::work::WorkKind::Event,
+            pioneer_observability::work::ExecutorRole::Gateway,
+        );
+        Some(message)
+    }
+    pub(crate) fn try_recv(&mut self) -> Result<Message, tokio::sync::mpsc::error::TryRecvError> {
+        let envelope = self.0.try_recv()?;
+        let (message, _) = envelope.item.received(
+            pioneer_observability::work::Boundary::EventLane,
+            pioneer_observability::work::WorkKind::Event,
+            pioneer_observability::work::ExecutorRole::Gateway,
+        );
+        Ok(message)
+    }
+}
+pub(crate) fn outbound_channel(capacity: usize) -> (super::SessionOutbound, OutboundTestReceiver) {
+    let (sender, receiver) =
+        super::SessionOutbound::channel(capacity, 64 * 1024 * 1024, 16 * 1024 * 1024);
+    (sender, OutboundTestReceiver(receiver))
 }

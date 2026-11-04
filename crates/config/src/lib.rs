@@ -44,6 +44,8 @@ pub struct GatewayConfig {
     pub listen_addr: String,
     pub outbound_queue_capacity: usize,
     #[serde(default)]
+    pub outbound: GatewayOutboundConfig,
+    #[serde(default)]
     pub trusted_proxy_peers: Vec<IpAddr>,
     #[serde(default = "default_gateway_keepawake")]
     pub keepawake: bool,
@@ -1417,6 +1419,46 @@ impl<'de> Deserialize<'de> for GatewayCliAgentRuntimeConfig {
             command_heartbeat: wire.command_heartbeat,
         })
     }
+}
+
+/// Per-connection admitted payload, including the writer; not an RSS limit.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GatewayOutboundConfig {
+    pub payload_bytes: usize,
+    pub reserved_payload_bytes: usize,
+    pub write_timeout_ms: u64,
+}
+impl Default for GatewayOutboundConfig {
+    fn default() -> Self {
+        Self {
+            payload_bytes: 64 * 1024 * 1024,
+            reserved_payload_bytes: 16 * 1024 * 1024,
+            write_timeout_ms: 30_000,
+        }
+    }
+}
+impl GatewayConfig {
+    pub fn validate_outbound(&self) -> Result<()> {
+        if self.outbound_queue_capacity < 2
+            || self.outbound_queue_capacity > max_outbound_capacity()
+        {
+            bail!("gateway.outbound_queue_capacity must be between 2 and usize::MAX / 8");
+        }
+        if self.outbound.reserved_payload_bytes == 0
+            || self.outbound.reserved_payload_bytes >= self.outbound.payload_bytes
+        {
+            bail!("gateway.outbound reserved bytes must be positive and below total payload bytes");
+        }
+        if self.outbound.write_timeout_ms == 0 || self.outbound.write_timeout_ms > 86_400_000 {
+            bail!("gateway.outbound.write_timeout_ms must be between 1 and 86400000");
+        }
+        Ok(())
+    }
+}
+// Tokio semaphore's maximum permits, without adding a runtime dependency here.
+const fn max_outbound_capacity() -> usize {
+    usize::MAX >> 3
 }
 
 impl GatewayConfig {
@@ -5381,5 +5423,32 @@ token_refresh_leeway_seconds = 300
             )
             .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod outbound_policy_tests {
+    use super::*;
+    #[test]
+    fn outbound_custom_policy_rejects_impossible_reserves_and_overflow() {
+        let mut config: AppConfig = toml::from_str(DEFAULT_CONFIG_TOML).unwrap();
+        config.gateway.validate_outbound().unwrap();
+        for capacity in [0, 1, usize::MAX] {
+            config.gateway.outbound_queue_capacity = capacity;
+            assert!(config.gateway.validate_outbound().is_err());
+        }
+        config.gateway.outbound_queue_capacity = 2;
+        config.gateway.outbound.payload_bytes = usize::MAX;
+        config.gateway.outbound.reserved_payload_bytes = 1;
+        config.gateway.validate_outbound().unwrap();
+        for reserved in [0, usize::MAX] {
+            config.gateway.outbound.reserved_payload_bytes = reserved;
+            assert!(config.gateway.validate_outbound().is_err());
+        }
+        config.gateway.outbound.reserved_payload_bytes = 1;
+        for timeout in [0, u64::MAX] {
+            config.gateway.outbound.write_timeout_ms = timeout;
+            assert!(config.gateway.validate_outbound().is_err());
+        }
     }
 }

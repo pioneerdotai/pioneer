@@ -408,7 +408,7 @@ async fn collaborative_title_recovers_on_hidden_composer_result_delivery_once() 
     ));
     provider.pause_first.store(true, Ordering::SeqCst);
     let sessions = Arc::new(SessionManager::new());
-    let (tx, mut rx) = mpsc::channel(256);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(256);
     let connection = register_authenticated_test_connection(&sessions, tx).await;
     let (manager, store, workspace) = setup_workspace_manager().await;
     let original = review_enabled_processor(

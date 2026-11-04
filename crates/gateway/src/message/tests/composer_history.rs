@@ -3,7 +3,7 @@ use super::*;
 async fn start_runtime_switch_composer_turn(
     processor: &Arc<MessageProcessor>,
     connection: ConnectionId,
-    rx: &mut mpsc::Receiver<Message>,
+    rx: &mut crate::session::test_support::OutboundTestReceiver,
     store: Arc<CrudStore>,
     workspace_id: &str,
     parent_thread_id: &str,
@@ -78,7 +78,7 @@ fn composer_runtime_can_switch_cli_native_cli_without_blocking_history() {
 }
 
 async fn check_composer_runtime_can_switch_cli_native_cli_without_blocking_history() {
-    let (tx, mut rx) = mpsc::channel(256);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(256);
     let sessions = Arc::new(SessionManager::new());
     let connection = register_authenticated_test_connection(sessions.as_ref(), tx).await;
     let threads = Arc::new(ThreadManager::new("test-model", "openai"));
@@ -292,7 +292,7 @@ async fn check_composer_history_failure_stays_in_task_without_rejecting_parent()
         Some(("codex", CLIAgentRuntimeKind::Codex, "gpt-5")),
         Some(("claude", CLIAgentRuntimeKind::Claude, "claude-sonnet")),
     ] {
-        let (tx, mut rx) = mpsc::channel(256);
+        let (tx, mut rx) = crate::session::test_support::outbound_channel(256);
         let sessions = Arc::new(SessionManager::new());
         let connection = register_authenticated_test_connection(sessions.as_ref(), tx).await;
         let threads = Arc::new(ThreadManager::new("test-model", "openai"));

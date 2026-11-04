@@ -706,7 +706,7 @@ fn sequential_detached_executions_keep_the_sent_input_prefix_on_both_wires() {
             let processor = &harness.processor;
             let store = &harness.crud_store;
             let workspace = &harness.workspace_id;
-            let (tx, mut rx) = mpsc::channel(256);
+            let (tx, mut rx) = crate::session::test_support::outbound_channel(256);
             let connection =
                 register_authenticated_test_connection(processor.session_manager.as_ref(), tx)
                     .await;

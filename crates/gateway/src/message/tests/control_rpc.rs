@@ -18,6 +18,13 @@ const RUN: &str = "runControl00000000001";
 struct ModelGate {
     entered: Notify,
     release: Notify,
+    exited: Notify,
+}
+struct ModelGateDrop<'a>(&'a Notify);
+impl Drop for ModelGateDrop<'_> {
+    fn drop(&mut self) {
+        self.0.notify_one();
+    }
 }
 #[async_trait::async_trait]
 impl Provider for ModelGate {
@@ -25,6 +32,7 @@ impl Provider for ModelGate {
         "openai"
     }
     async fn list_models(&self) -> anyhow::Result<Vec<pioneer_protocol::ProviderModelInfo>> {
+        let _drop = ModelGateDrop(&self.exited);
         self.entered.notify_one();
         self.release.notified().await;
         Ok(vec![])
@@ -44,7 +52,7 @@ struct Fixture {
     processor: Arc<MessageProcessor>,
     auth: Arc<crate::auth::GatewayAuthService>,
     connection: ConnectionId,
-    responses: mpsc::Receiver<Message>,
+    responses: crate::session::test_support::OutboundTestReceiver,
     outbound: crate::session::SessionOutbound,
     workspace: String,
     gate: Arc<ModelGate>,
@@ -117,10 +125,11 @@ impl Fixture {
         let gate = Arc::new(ModelGate {
             entered: Notify::new(),
             release: Notify::new(),
+            exited: Notify::new(),
         });
         processor.provider_registry =
             Arc::new(ProviderRegistry::with_provider("openai", gate.clone()));
-        let (outbound, responses) = mpsc::channel(128);
+        let (outbound, responses) = crate::session::test_support::outbound_channel(128);
         let connection = processor
             .session_manager
             .register_connection(outbound.clone(), authenticated_test_superuser())
@@ -582,7 +591,7 @@ async fn wait_reauthorizes_original_task_and_run_targets_after_initial_proof() {
                         .unwrap()
                         + if matches!(loss, Loss::Expiry) { 1 } else { 60 };
                 }
-                let (tx, mut responses) = mpsc::channel(16);
+                let (tx, mut responses) = crate::session::test_support::outbound_channel(16);
                 let connection = f
                     .processor
                     .session_manager
@@ -683,7 +692,7 @@ async fn wait_reauthorizes_original_task_and_run_targets_after_initial_proof() {
                         Loss::None => {}
                     }
                     let replacement = if matches!(loss, Loss::Disconnect) {
-                        let (new_tx, new_rx) = mpsc::channel(4);
+                        let (new_tx, new_rx) = crate::session::test_support::outbound_channel(4);
                         let new = f
                             .processor
                             .session_manager
@@ -1278,4 +1287,300 @@ async fn socket_serial_predecessors_finish_before_explicit_and_implicit_reads() 
         drop(socket);
         server.abort_and_join().await;
     }).await.expect("actual connection FIFO, selection freshness and write/read barrier");
+}
+
+/// The real normal owner and real WebSocket, with only scheduling/fault gates
+/// injected at the writer boundary. Tests never perform connection cleanup.
+struct OutboundSocket {
+    socket: tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    connection: ConnectionId,
+    outbound: crate::session::SessionOutbound,
+    start_writer: tokio::sync::oneshot::Sender<()>,
+    completion: tokio::sync::oneshot::Receiver<anyhow::Result<()>>,
+    stop: watch::Sender<bool>,
+    server: crate::message::AbortOnDropMessageTask<()>,
+    _home: tempfile::TempDir,
+}
+impl OutboundSocket {
+    async fn new(
+        f: &Fixture,
+        stalled: bool,
+    ) -> (
+        Self,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    ) {
+        use axum::{Router, extract::ws::WebSocketUpgrade, routing::get};
+        let (stop, stop_rx) = watch::channel(false);
+        let (finished, completion) = tokio::sync::oneshot::channel();
+        let finished = Arc::new(std::sync::Mutex::new(Some(finished)));
+        let (registered, registration) = tokio::sync::oneshot::channel();
+        let (start_writer, writer_start) = tokio::sync::oneshot::channel();
+        let (block, write_block) = tokio::sync::oneshot::channel();
+        let (write_entered, entered) = tokio::sync::oneshot::channel();
+        let hooks = Arc::new(std::sync::Mutex::new(Some(
+            crate::transport::NormalConnectionTestHooks {
+                registered,
+                writer_start,
+                write_block: stalled.then_some(write_block),
+                write_entered: Some(write_entered),
+            },
+        )));
+        let home = tempfile::tempdir().unwrap();
+        let processor = Arc::new(
+            (*f.processor)
+                .clone()
+                .with_runtime_home_for_tests(home.path().to_path_buf()),
+        );
+        let auth = f.auth.clone();
+        let router = Router::new().route(
+            "/ws",
+            get(move |upgrade: WebSocketUpgrade| {
+                let processor = processor.clone();
+                let auth = auth.clone();
+                let stop_rx = stop_rx.clone();
+                let finished = finished.clone();
+                let hooks = hooks.lock().unwrap().take().expect("one test connection");
+                async move {
+                    upgrade.on_upgrade(move |socket| async move {
+                        let mut principal = (*authenticated_test_superuser()).clone();
+                        principal.access_expires_at_unix =
+                            crate::helpers::unix_timestamp_secs().unwrap() + 3600;
+                        let mut config: pioneer_config::AppConfig = toml::from_str(include_str!(
+                            concat!(env!("CARGO_MANIFEST_DIR"), "/../../config/default.toml")
+                        ))
+                        .unwrap();
+                        if stalled {
+                            config.gateway.outbound.write_timeout_ms = 50;
+                        }
+                        let result = crate::transport::run_normal_connection_inner(
+                            socket,
+                            config,
+                            Arc::new(principal),
+                            auth,
+                            processor.clone(),
+                            processor.session_manager.clone(),
+                            stop_rx,
+                            Some(hooks),
+                        )
+                        .await;
+                        let _ = finished.lock().unwrap().take().unwrap().send(result);
+                    })
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = crate::message::spawn_message_task(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let (socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}/ws"))
+            .await
+            .unwrap();
+        let (connection, outbound) = registration.await.unwrap();
+        (
+            Self {
+                socket,
+                connection,
+                outbound,
+                start_writer,
+                completion,
+                stop,
+                server,
+                _home: home,
+            },
+            block,
+            entered,
+        )
+    }
+}
+
+#[tokio::test]
+async fn sealed_normal_writer_delivers_shutdown_and_revoke_fifo_before_close() {
+    use tokio_tungstenite::tungstenite::Message as ClientMessage;
+    tokio::time::timeout(Duration::from_secs(15), async {
+        for revoke in [false, true] {
+            let f = Fixture::new().await;
+            let (mut wire, _block, _entered) = OutboundSocket::new(&f, false).await;
+            if revoke {
+                wire.outbound
+                    .send(Message::Text("committed-revoke-response".into()))
+                    .await
+                    .unwrap();
+                f.processor
+                    .session_manager
+                    .disconnect_session(
+                        &authenticated_test_superuser().session_id,
+                        pioneer_protocol::AuthSessionTerminationReason::SessionRevoked,
+                    )
+                    .await;
+            } else {
+                wire.stop.send(true).unwrap();
+            }
+            // No writer poll has occurred. Seal must not cancel the accepted FIFO.
+            wire.outbound.closed().await;
+            assert!(
+                wire.outbound
+                    .send(Message::Text("late".into()))
+                    .await
+                    .is_err()
+            );
+            wire.start_writer.send(()).unwrap();
+            if revoke {
+                let first = wire.socket.next().await.unwrap().unwrap();
+                assert!(
+                    matches!(first, ClientMessage::Text(t) if t == "committed-revoke-response")
+                );
+                let notification = wire
+                    .socket
+                    .next()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .into_text()
+                    .unwrap();
+                let value: JsonValue = serde_json::from_str(&notification).unwrap();
+                assert_eq!(value["method"], events::AUTH_SESSION_REVOKED);
+            }
+            let close = wire.socket.next().await.unwrap().unwrap();
+            let ClientMessage::Close(Some(close)) = close else {
+                panic!("terminal Close required: {close:?}");
+            };
+            assert_eq!(u16::from(close.code), if revoke { 4403 } else { 1012 });
+            assert_eq!(
+                close.reason.as_str(),
+                if revoke {
+                    "session_revoked"
+                } else {
+                    "server_shutdown"
+                }
+            );
+            wire.completion.await.unwrap().unwrap();
+            assert!(
+                f.processor
+                    .session_manager
+                    .connection_principal(wire.connection)
+                    .await
+                    .is_err()
+            );
+            wire.server.abort_and_join().await;
+        }
+    })
+    .await
+    .expect("sealed writer must attempt terminal control within the existing grace");
+}
+
+#[tokio::test]
+async fn normal_writer_deadline_joins_pending_handler_and_cleans_connection_resources() {
+    use futures_util::SinkExt;
+    use tokio_tungstenite::tungstenite::Message as ClientMessage;
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let f = Fixture::new().await;
+        let (mut wire, block, entered) = OutboundSocket::new(&f, true).await;
+        let principal = authenticated_test_superuser();
+        let owner = AuthenticatedTransferOwner {
+            principal_id: principal.principal_id.clone(),
+            auth_session_id: principal.session_id.clone(),
+            connection_id: wire.connection,
+        };
+        let upload = f
+            .processor
+            .artifact_uploads
+            .start(
+                &owner,
+                ArtifactUploadStartParams {
+                    workspace_id: f.workspace.clone(),
+                    thread_id: None,
+                    planned_turn_id: None,
+                    client_attachment_id: "writer-cleanup".to_owned(),
+                    file_name: "cleanup.txt".to_owned(),
+                    mime_type: Some("text/plain".to_owned()),
+                    size_bytes: 1,
+                    sha256: hex::encode(Sha256::digest(b"x")),
+                    source_kind: ArtifactUploadSourceKind::UserComposer,
+                },
+                now_timestamp_secs(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            upload.temp_path.exists(),
+            "fixture must own a real upload file before failure"
+        );
+        wire.socket
+            .send(ClientMessage::Text(
+                rpc(
+                    "writer-pending",
+                    methods::PROVIDER_MODELS_LIST,
+                    json!({"workspace_id":f.workspace,"provider":"openai"}),
+                )
+                .into(),
+            ))
+            .await
+            .unwrap();
+        f.gate.entered.notified().await;
+        assert!(f.gate.exited.notified().now_or_never().is_none());
+        wire.outbound
+            .send(Message::Text("writer-trigger".into()))
+            .await
+            .unwrap();
+        wire.start_writer.send(()).unwrap();
+        entered.await.unwrap();
+        // The first real writer send is pending inside the production timeout.
+        // Neither the provider nor the write gate is released by this test.
+        let result = wire.completion.await.unwrap();
+        assert!(result.unwrap_err().to_string().contains("deadline"));
+        assert!(
+            block.is_closed(),
+            "writer must have dropped the cancelled write future"
+        );
+        f.gate
+            .exited
+            .notified()
+            .now_or_never()
+            .expect("owner must abort AND join the pending handler before returning");
+        assert!(
+            f.processor
+                .session_manager
+                .connection_principal(wire.connection)
+                .await
+                .is_err()
+        );
+        assert!(
+            wire.outbound
+                .send(Message::Text("late".into()))
+                .await
+                .is_err()
+        );
+        let error = f
+            .processor
+            .artifact_uploads
+            .append_chunk(
+                &owner,
+                &ArtifactUploadChunkHeader {
+                    workspace_id: f.workspace.clone(),
+                    upload_id: upload.upload_id,
+                    offset: 0,
+                    len: 1,
+                    chunk_sha256: None,
+                },
+                b"x",
+                now_timestamp_secs(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("artifact upload not found"),
+            "MessageProcessor::connection_closed must remove the real upload: {error}"
+        );
+        assert!(
+            !upload.temp_path.exists(),
+            "connection cleanup must remove the upload file"
+        );
+        wire.server.abort_and_join().await;
+    })
+    .await
+    .expect("writer deadline must terminate the normal owner and its pending children");
 }

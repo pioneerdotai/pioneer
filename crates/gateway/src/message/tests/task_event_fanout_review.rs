@@ -618,7 +618,7 @@ async fn cutover_quantum_never_reads_history_and_only_delivers_post_install_even
     );
     let store = Arc::new(CrudStore::new(database.clone()));
     let sessions = Arc::new(SessionManager::new());
-    let (tx, mut rx) = mpsc::channel(32);
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(32);
     let connection = register_authenticated_test_connection(&sessions, tx).await;
     sessions
         .set_connection_workspace(connection, Some(workspace.clone()))

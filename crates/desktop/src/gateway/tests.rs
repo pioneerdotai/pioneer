@@ -322,6 +322,7 @@ pub(crate) fn test_config() -> AppConfig {
             listen_addr: "0.0.0.0:17878".to_owned(),
             trusted_proxy_peers: Vec::new(),
             outbound_queue_capacity: 128,
+            outbound: Default::default(),
             keepawake: false,
             telemetry: Default::default(),
             thread: GatewayThreadConfig {

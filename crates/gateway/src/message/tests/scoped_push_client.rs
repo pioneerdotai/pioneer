@@ -226,8 +226,8 @@ async fn committed_push_client_fixture(hidden_cli_start: bool) {
         let (_directory, workspaces, store, workspace) = setup_pooled_file_workspace_manager().await;
         prepare_post_access_unread_fixture(&store, &workspace).await;
         let sessions = Arc::new(SessionManager::new());
-        let (source_tx, mut source_wire_rx) = mpsc::channel(128);
-        let (source_forward_tx, mut source_rx) = mpsc::channel(128);
+        let (source_tx, mut source_wire_rx) = crate::session::test_support::outbound_channel(128);
+        let (source_forward_tx, mut source_rx) = crate::session::test_support::outbound_channel(128);
         let source_packets = Arc::new(std::sync::Mutex::new(Vec::<pioneer_protocol::WorkspacePushNotification>::new()));
         let source_recording = source_packets.clone();
         let source_relay = tokio::spawn(async move {
@@ -333,7 +333,7 @@ async fn committed_push_client_fixture(hidden_cli_start: bool) {
         let domain_connections = Arc::new(AtomicUsize::new(0));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let (outbound_tx, mut outbound_rx) = mpsc::channel(128);
+        let (outbound_tx, mut outbound_rx) = crate::session::test_support::outbound_channel(128);
         let observer = register_authenticated_test_connection(&sessions, outbound_tx.clone()).await;
         sessions.set_connection_workspace(observer, Some(workspace.clone())).await;
         let tree_requests = Arc::new(AtomicUsize::new(0));
