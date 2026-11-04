@@ -394,6 +394,7 @@ pub struct ThreadRegistry {
     pending_requests: PendingRequestRegistry,
     pub(crate) navigation: crate::navigation::ClientNavigationState,
     pub(crate) navigation_revision: u64,
+    open_intent: Option<(String, u64)>,
     pub(crate) navigation_publication: Option<Arc<crate::navigation::ClientNavigationState>>,
     start: ThreadStartCoordinator,
     start_generation: u64,
@@ -7458,7 +7459,6 @@ mod tests {
         let transport = Arc::new(SubscriptionRecorder {
             starts,
             calls: std::sync::atomic::AtomicUsize::new(0),
-            thread: thread("a", "ws"),
         });
         *core
             .transport_runtime()
@@ -14000,7 +14000,7 @@ mod tests {
 
     fn acknowledge_subscription(core: &ClientCore, id: &str, workspace: &str) {
         let (request, ready) = core
-            .admit_thread_subscription(id, workspace, None, false)
+            .admit_thread_subscription(id, workspace, None, false, None)
             .unwrap();
         assert!(!ready);
         let snapshot = core
@@ -14031,8 +14031,13 @@ mod tests {
         token: ThreadOperationToken,
         workspace: &str,
     ) -> anyhow::Result<()> {
-        let (request, _) =
-            core.admit_thread_subscription(&token.id, workspace, Some(token.generation), true)?;
+        let (request, _) = core.admit_thread_subscription(
+            &token.id,
+            workspace,
+            Some(token.generation),
+            true,
+            None,
+        )?;
         core.execute_thread_subscription_request_using(&request, transport);
         let result = request
             .flight
@@ -14047,7 +14052,6 @@ mod tests {
     struct SubscriptionRecorder {
         starts: std::sync::mpsc::Sender<crate::rpc::JsonRpcResponseSender>,
         calls: std::sync::atomic::AtomicUsize,
-        thread: Thread,
     }
     impl crate::rpc::JsonRpcRequestTransport for SubscriptionRecorder {
         fn send_json_rpc_request(
@@ -14058,15 +14062,12 @@ mod tests {
         ) -> Result<(), String> {
             let request: pioneer_protocol::JsonRpcRequest = serde_json::from_str(&payload).unwrap();
             match request.method.as_str() {
-                "thread/start" => {
+                "thread/start" | "thread/open" => {
                     self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     self.starts
                         .send(response)
                         .map_err(|error| error.to_string())
                 }
-                "thread/get" => response
-                    .send(Ok(serde_json::json!({"thread": self.thread})))
-                    .map_err(|error| error.to_string()),
                 method => panic!("unexpected subscription fixture RPC: {method}"),
             }
         }
@@ -14084,7 +14085,6 @@ mod tests {
         let transport = Arc::new(SubscriptionRecorder {
             starts,
             calls: std::sync::atomic::AtomicUsize::new(0),
-            thread: thread("a", "ws"),
         });
         *core
             .transport_runtime()
@@ -14128,6 +14128,63 @@ mod tests {
     }
 
     #[test]
+    fn newer_open_intent_wins_over_late_response() {
+        let (core, _transport, responses, _requests) = shared_subscription_core();
+        core.upsert_thread(thread("b", "ws"));
+        let a = {
+            let core = core.clone();
+            std::thread::spawn(move || core.open_thread_by_id("a"))
+        };
+        let old = responses.recv_timeout(Duration::from_secs(2)).unwrap();
+        let b = {
+            let core = core.clone();
+            std::thread::spawn(move || core.open_thread_by_id("b"))
+        };
+        let latest = responses.recv_timeout(Duration::from_secs(2)).unwrap();
+        latest
+            .send(Ok(serde_json::to_value(ThreadStartResponse {
+                thread: thread("b", "ws"),
+                sandbox: SandboxPolicy::from_mode(SandboxMode::FullAccess),
+            })
+            .unwrap()))
+            .unwrap();
+        b.join().unwrap().unwrap();
+        subscription_reply(&old);
+        assert!(a.join().unwrap().is_err());
+        assert_eq!(core.navigation_snapshot().active_thread_id(), Some("b"));
+    }
+
+    #[test]
+    fn open_leading_send_joins_real_open_receipt() {
+        let (core, transport, responses, _requests) = shared_subscription_core();
+        let opened = {
+            let core = core.clone();
+            std::thread::spawn(move || core.open_thread_by_id("a"))
+        };
+        let response = responses.recv_timeout(Duration::from_secs(2)).unwrap();
+        let (admitted_tx, admitted_rx) = std::sync::mpsc::channel();
+        let sending = {
+            let core = core.clone();
+            std::thread::spawn(move || {
+                SUBSCRIPTION_PROMOTION_HOOK.with(|slot| {
+                    *slot.borrow_mut() = Some(Box::new(move || admitted_tx.send(()).unwrap()))
+                });
+                let budget =
+                    crate::rpc::RequestBudget::new(Instant::now() + Duration::from_secs(2));
+                core.ensure_thread_subscription("a", "ws", &budget)
+            })
+        };
+        admitted_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        subscription_reply(&response);
+        assert!(sending.join().unwrap().unwrap().is_current());
+        opened.join().unwrap().unwrap();
+        assert_eq!(transport.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let budget = crate::rpc::RequestBudget::new(Instant::now() + Duration::from_secs(2));
+        core.ensure_thread_subscription("a", "ws", &budget).unwrap();
+        assert_eq!(transport.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn scheduled_open_and_send_share_subscription_and_open_keeps_hydration() {
         for scheduled in [false, true] {
             let (core, transport, responses, requests) = shared_subscription_core();
@@ -14148,9 +14205,7 @@ mod tests {
             let response = responses.recv_timeout(Duration::from_secs(2)).unwrap();
             let opened = {
                 let core = core.clone();
-                std::thread::spawn(move || {
-                    core.open_thread_by_id(&core.transport_runtime().ws_command_sender(), "a")
-                })
+                std::thread::spawn(move || core.open_thread_by_id("a"))
             };
             subscription_reply(&response);
             let binding = waiter.join().unwrap().unwrap();
@@ -14311,7 +14366,7 @@ mod tests {
                     },
             );
             let (request, _) = core
-                .admit_thread_subscription("a", "ws", None, false)
+                .admit_thread_subscription("a", "ws", None, false, None)
                 .unwrap();
             core.execute_thread_subscription_request(request.clone());
             let first =
@@ -14342,7 +14397,7 @@ mod tests {
         for outcome in ["failure", "deadline", "retire", "shutdown"] {
             let (core, _transport, responses, _requests) = shared_subscription_core();
             let (request, _) = core
-                .admit_thread_subscription("a", "ws", None, false)
+                .admit_thread_subscription("a", "ws", None, false, None)
                 .unwrap();
             core.execute_thread_subscription_request(request.clone());
             let first = spawn_admitted_subscription_waiter(
@@ -16397,6 +16452,9 @@ impl ThreadSubscriptionFailure {
 }
 #[derive(Clone)]
 pub(crate) struct ThreadSubscriptionRequest {
+    open_existing: bool,
+    open_navigation_revision: Option<u64>,
+    open_intent_generation: Option<u64>,
     pub(crate) id: String,
     pub(crate) workspace: String,
     pub(crate) generation: u64,
@@ -17464,70 +17522,95 @@ impl ClientCore {
 }
 
 impl ClientCore {
-    pub(crate) fn admit_opened_thread(
-        &self,
-        thread: Thread,
-        navigation: &crate::navigation::ClientNavigationState,
-    ) -> anyhow::Result<ThreadOperationToken> {
+    pub(crate) fn open_existing_thread_subscription(&self, id: &str) -> anyhow::Result<()> {
+        let (revision, intent) = {
+            let mut registry = self
+                .thread_registry
+                .lock()
+                .expect("thread registry poisoned");
+            if registry
+                .open_intent
+                .as_ref()
+                .is_none_or(|(target, _)| target != id)
+            {
+                registry.clock = registry
+                    .clock
+                    .checked_add(1)
+                    .expect("thread generation exhausted");
+                registry.open_intent = Some((id.to_owned(), registry.clock));
+            }
+            (
+                registry.navigation_revision,
+                registry.open_intent.as_ref().expect("open intent").1,
+            )
+        };
+        let budget = crate::rpc::RequestBudget::new(
+            std::time::Instant::now() + crate::rpc::RPC_REQUEST_TIMEOUT,
+        );
+        let (request, ready) =
+            self.admit_thread_subscription(id, "", None, false, Some((revision, intent)))?;
+        if !ready {
+            self.execute_thread_subscription_request(request.clone());
+        }
+        self.wait_thread_subscription(&request, false, &budget)?;
+        anyhow::ensure!(
+            self.subscription_scope_current(&request),
+            "thread_open_stale"
+        );
+        let identity = self
+            .identity_authorization
+            .lock()
+            .expect("identity owner poisoned");
+        anyhow::ensure!(
+            identity.authorization_epoch() == request.authority
+                && identity.history_ticket_matches(request.auth.0)
+                && request.transport.is_current(),
+            "thread_open_stale"
+        );
         let mut registry = self
             .thread_registry
             .lock()
             .expect("thread registry poisoned");
         anyhow::ensure!(
-            !self.is_stopped() && &registry.navigation == navigation,
+            registry.navigation_revision == revision
+                && registry
+                    .open_intent
+                    .as_ref()
+                    .is_some_and(|(_, generation)| *generation == intent),
             "thread_open_stale"
         );
-        let id = thread.id.clone();
-        let workspace = thread.workspace_id.clone();
-        anyhow::ensure!(registry.require(&id, &workspace), "thread_open_stale");
-        let store = registry.stores.get_mut(&id).expect("admitted thread");
-        if store
-            .coordinator
-            .thread()
-            .is_none_or(|previous| previous.updated_at <= thread.updated_at)
-        {
-            store.set_snapshot(thread);
-        }
-        let token = ThreadOperationToken {
-            id: id.clone(),
-            generation: store.generation,
-        };
+        let (transport_guard, transport_current) =
+            request.transport.history_apply_fence(request.auth.1);
+        anyhow::ensure!(transport_current && !self.is_stopped(), "thread_open_stale");
+        let store = registry
+            .stores
+            .get(id)
+            .filter(|store| store.generation == request.generation)
+            .ok_or_else(|| anyhow::anyhow!("thread_open_stale"))?;
+        let workspace = store.coordinator.workspace_id.clone();
         registry
             .navigation
             .apply(crate::navigation::NavigationIntent::SelectThread {
                 workspace_id: Some(workspace),
-                thread_id: Some(id.clone()),
+                thread_id: Some(id.to_owned()),
             });
-        let mut drafts = registry.publish(&id);
-        drafts.extend(registry.navigation_change());
+        let drafts = registry.navigation_change().into_iter().collect();
+        drop(transport_guard);
         self.transition_directory(
             &mut registry,
             &ClientMutationAuthority { _private: () },
             drafts,
             vec![],
         );
-        Ok(token)
-    }
-
-    pub(crate) fn refresh_opened_thread_subscription(
-        &self,
-        token: ThreadOperationToken,
-        workspace: &str,
-    ) -> anyhow::Result<()> {
-        let budget = crate::rpc::RequestBudget::new(
-            std::time::Instant::now() + crate::rpc::RPC_REQUEST_TIMEOUT,
-        );
-        let result = self.ensure_thread_subscription_generation(
-            &token.id,
-            workspace,
-            Some(token.generation),
-            true,
-            &budget,
-        );
-        if result.is_err() {
-            self.schedule_thread_subscription(&token.id, workspace);
-        }
-        result.map(|_| ())
+        drop(registry);
+        drop(identity);
+        request
+            .flight
+            .lock()
+            .expect("subscription flight poisoned")
+            .hydrate = true;
+        self.hydrate_thread_subscription_once(&request);
+        Ok(())
     }
 
     fn resume_created_thread_delivery(&self, id: &str, workspace: &str) {
@@ -17570,7 +17653,8 @@ impl ClientCore {
         let Some(sender) = sender else {
             return;
         };
-        let Ok((request, ready)) = self.admit_thread_subscription(id, workspace, None, true) else {
+        let Ok((request, ready)) = self.admit_thread_subscription(id, workspace, None, true, None)
+        else {
             return;
         };
         self.retire_thread_controller_jobs();
@@ -17639,7 +17723,9 @@ impl ClientCore {
         workspace: &str,
         expected: Option<u64>,
         hydrate: bool,
+        expected_navigation_revision: Option<(u64, u64)>,
     ) -> anyhow::Result<(ThreadSubscriptionRequest, bool)> {
+        let open_existing = expected_navigation_revision.is_some();
         let session = self.gateway_session();
         let auth = self.current_auth_ticket();
         let authority = self.subscription_authority();
@@ -17667,8 +17753,61 @@ impl ClientCore {
             .expect("thread registry poisoned");
         anyhow::ensure!(
             !self.is_stopped()
+                && !id.is_empty()
                 && registry.start.pending_thread_id.as_deref() != Some(id)
-                && registry.require(id, workspace),
+                && expected_navigation_revision.is_none_or(|(revision, intent)| registry
+                    .navigation_revision
+                    == revision
+                    && registry
+                        .open_intent
+                        .as_ref()
+                        .is_some_and(|(_, generation)| *generation == intent)),
+            "Thread subscription cancelled"
+        );
+        // An ID-only open reserves the existing store/flight owner before IO.
+        // A cold reservation has no domain snapshot or authoritative workspace.
+        let workspace = if open_existing {
+            registry
+                .stores
+                .get(id)
+                .map(|store| store.coordinator.workspace_id.clone())
+                .unwrap_or_default()
+        } else {
+            workspace.to_owned()
+        };
+        if open_existing && !registry.stores.contains_key(id) {
+            registry.clock = registry.clock.saturating_add(1);
+            let mut store = ThreadDomainStore::new(id, "");
+            store.generation = registry.clock;
+            store.subscriptions = registry.subscription_counts.get(id).copied().unwrap_or(0);
+            store.demand = timeline_demand(
+                &registry.demands,
+                id,
+                registry
+                    .timeline_subscription_counts
+                    .get(id)
+                    .copied()
+                    .unwrap_or(0),
+            );
+            registry.stores.insert(id.to_owned(), store);
+        }
+        let pending_open = registry.stores.get(id).is_some_and(|store| {
+            (store.coordinator.workspace_id.is_empty()
+                || store.coordinator.workspace_id == workspace)
+                && store
+                    .subscription_request
+                    .as_ref()
+                    .is_some_and(|request| request.open_existing)
+        });
+        let navigation_revision = registry.navigation_revision;
+        let open_intent_generation = registry
+            .open_intent
+            .as_ref()
+            .map(|(_, generation)| *generation);
+        anyhow::ensure!(
+            !self.is_stopped()
+                && registry.start.pending_thread_id.as_deref() != Some(id)
+                && (open_existing || pending_open || registry.require(id, &workspace)),
             "Thread subscription cancelled"
         );
         let store = registry.stores.get_mut(id).expect("retained thread");
@@ -17677,7 +17816,7 @@ impl ClientCore {
             "Thread subscription cancelled"
         );
         let scope = ThreadSubscriptionScope {
-            workspace: workspace.into(),
+            workspace: workspace.clone(),
             generation: store.generation,
             transport_revision: session.startup.transport_revision,
             auth,
@@ -17687,11 +17826,20 @@ impl ClientCore {
         let ready = store.subscription_receipt.as_ref().is_some_and(|receipt| {
             receipt.scope == scope && *receipt.live.lock().expect("subscription receipt poisoned")
         });
-        if let Some(request) = store
-            .subscription_request
-            .as_ref()
-            .filter(|request| request.scope().as_ref() == Some(&scope))
-        {
+        if let Some(request) = store.subscription_request.as_ref().filter(|request| {
+            request.scope().is_some_and(|mut current| {
+                if request.open_existing {
+                    current.workspace = scope.workspace.clone();
+                }
+                current == scope
+                    && request
+                        .open_intent_generation
+                        .is_none_or(|generation| Some(generation) == open_intent_generation)
+                    && request
+                        .open_navigation_revision
+                        .is_none_or(|revision| revision == navigation_revision)
+            })
+        }) {
             request
                 .flight
                 .lock()
@@ -17713,7 +17861,13 @@ impl ClientCore {
             Arc::new(std::sync::Mutex::new(true))
         };
         let transport = transport.with_subscription_scope(live.clone());
+        let open_navigation_revision = expected_navigation_revision.map(|(revision, _)| revision);
+        let open_intent_generation = expected_navigation_revision.map(|(_, intent)| intent);
+        let store = registry.stores.get_mut(id).expect("retained thread");
         let request = ThreadSubscriptionRequest {
+            open_existing,
+            open_navigation_revision,
+            open_intent_generation,
             id: id.into(),
             workspace: workspace.into(),
             generation: store.generation,
@@ -17743,7 +17897,11 @@ impl ClientCore {
             store.subscription_retry_at = None;
             store.coordinator.history_loading = true;
             store.subscription_failed = false;
-            let drafts = registry.publish(id);
+            let drafts = if store.coordinator.workspace_id.is_empty() {
+                vec![]
+            } else {
+                registry.publish(id)
+            };
             self.transition_directory(
                 &mut registry,
                 &ClientMutationAuthority { _private: () },
@@ -17765,7 +17923,8 @@ impl ClientCore {
         budget: &crate::rpc::RequestBudget,
     ) -> anyhow::Result<crate::transport::ws::runtime::ConnectionRequestTransport> {
         budget.check()?;
-        let (request, ready) = self.admit_thread_subscription(id, workspace, expected, hydrate)?;
+        let (request, ready) =
+            self.admit_thread_subscription(id, workspace, expected, hydrate, None)?;
         if !ready {
             // A foreground caller starts queued work directly. Admission is
             // nonblocking, so the thread worker never waits for its own queue.
@@ -17864,7 +18023,8 @@ impl ClientCore {
                 registry.start.pending_thread_id.as_ref() != Some(&request.id)
                     && registry.stores.get(&request.id).is_some_and(|store| {
                         store.generation == request.generation
-                            && store.coordinator.workspace_id == request.workspace
+                            && (request.open_existing
+                                || store.coordinator.workspace_id == request.workspace)
                     })
             }
     }
@@ -17978,12 +18138,23 @@ impl ClientCore {
             response
         };
         let result = (|| -> anyhow::Result<()> {
-            let params =
-                super::start::thread_start_params(request.id.clone(), request.workspace.clone());
-            let payload = crate::rpc::build_json_rpc_request_payload(
-                pioneer_protocol::constants::methods::THREAD_START,
-                serde_json::to_value(params)?,
-            )?;
+            let (method, params) = if request.open_existing {
+                (
+                    pioneer_protocol::constants::methods::THREAD_OPEN,
+                    serde_json::to_value(pioneer_protocol::ThreadGetParams {
+                        thread_id: request.id.clone(),
+                    })?,
+                )
+            } else {
+                (
+                    pioneer_protocol::constants::methods::THREAD_START,
+                    serde_json::to_value(super::start::thread_start_params(
+                        request.id.clone(),
+                        request.workspace.clone(),
+                    ))?,
+                )
+            };
+            let payload = crate::rpc::build_json_rpc_request_payload(method, params)?;
             transport
                 .send_json_rpc_request(payload.request_id, payload.payload, response.clone())
                 .map_err(anyhow::Error::msg)
@@ -18026,22 +18197,58 @@ impl ClientCore {
         let result = response.map_err(anyhow::Error::new).and_then(|value| {
             let response: pioneer_protocol::ThreadStartResponse =
                 crate::rpc::deserialize_json_rpc_result(
-                    pioneer_protocol::constants::methods::THREAD_START,
+                    if request.open_existing {
+                        pioneer_protocol::constants::methods::THREAD_OPEN
+                    } else {
+                        pioneer_protocol::constants::methods::THREAD_START
+                    },
                     value,
                 )?;
             anyhow::ensure!(
                 response.thread.id == request.id
-                    && response.thread.workspace_id == request.workspace,
+                    && (request.open_existing || response.thread.workspace_id == request.workspace)
+                    && !response.thread.workspace_id.is_empty(),
                 "Thread subscription response scope mismatch"
             );
             anyhow::ensure!(
                 self.thread_subscription_request_current(request),
                 "Thread subscription retired"
             );
+            let identity = self
+                .identity_authorization
+                .lock()
+                .expect("identity owner poisoned");
+            anyhow::ensure!(
+                identity.authorization_epoch() == request.authority
+                    && identity.history_ticket_matches(request.auth.0)
+                    && request.transport.is_current(),
+                "Thread subscription retired"
+            );
             let mut registry = self
                 .thread_registry
                 .lock()
                 .expect("thread registry poisoned");
+            anyhow::ensure!(
+                request
+                    .open_navigation_revision
+                    .is_none_or(|revision| registry.navigation_revision == revision),
+                "thread_open_stale"
+            );
+            anyhow::ensure!(
+                request
+                    .open_intent_generation
+                    .is_none_or(|generation| registry
+                        .open_intent
+                        .as_ref()
+                        .is_some_and(|(_, current)| *current == generation)),
+                "thread_open_stale"
+            );
+            let (_transport_guard, transport_current) =
+                request.transport.history_apply_fence(request.auth.1);
+            anyhow::ensure!(
+                transport_current && !self.is_stopped(),
+                "Thread subscription retired"
+            );
             let store = registry
                 .stores
                 .get_mut(&request.id)
@@ -18052,10 +18259,14 @@ impl ClientCore {
                 .ok_or_else(|| anyhow::anyhow!("Thread subscription retired"))?;
             let mut flight = request.flight.lock().expect("subscription flight poisoned");
             anyhow::ensure!(flight.result.is_none(), "Thread subscription retired");
+            let workspace = response.thread.workspace_id.clone();
             store.reconcile_subscription_snapshot(flight.baseline.take().as_ref(), response.thread);
-            store.subscription_receipt = request.scope().map(|scope| ThreadSubscriptionReceipt {
-                scope,
-                live: request.live.clone(),
+            store.subscription_receipt = request.scope().map(|mut scope| {
+                scope.workspace = workspace;
+                ThreadSubscriptionReceipt {
+                    scope,
+                    live: request.live.clone(),
+                }
             });
             Ok(())
         });
@@ -18109,13 +18320,22 @@ impl ClientCore {
             .thread_registry
             .lock()
             .expect("thread registry poisoned");
+        let navigation_revision = registry.navigation_revision;
         if let Some(store) = registry.stores.get_mut(&request.id).filter(|store| {
             store.generation == request.generation
                 && store.subscription_request.as_ref() == Some(request)
         }) {
             store.coordinator.history_loading = false;
             store.subscription_failed = result.is_err();
-            if current && retryable && request.attempt < 2 && store.demand == ClientDemand::Visible
+            if current
+                && retryable
+                && !store.coordinator.workspace_id.is_empty()
+                && !(request.open_existing && request.workspace.is_empty())
+                && request
+                    .open_navigation_revision
+                    .is_none_or(|revision| navigation_revision == revision)
+                && request.attempt < 2
+                && store.demand == ClientDemand::Visible
             {
                 let mut next = request.clone();
                 next.attempt += 1;
@@ -18141,7 +18361,31 @@ impl ClientCore {
                 store.subscription_request = None;
                 store.subscription_retry_at = None;
             }
-            let drafts = registry.publish(&request.id);
+            let drafts = if result.is_err() && request.open_existing && request.workspace.is_empty()
+            {
+                vec![]
+            } else {
+                registry.publish(&request.id)
+            };
+            self.transition_directory(
+                &mut registry,
+                &ClientMutationAuthority { _private: () },
+                drafts,
+                vec![],
+            );
+        }
+        if result.is_err()
+            && registry.stores.get(&request.id).is_some_and(|store| {
+                store.generation == request.generation
+                    && request.open_existing
+                    && request.workspace.is_empty()
+                    && store.subscription_request.is_none()
+            })
+        {
+            registry.stores.remove(&request.id);
+            registry.directory.remove_thread(&request.id);
+            let mut drafts = registry.retire(&request.id);
+            drafts.extend(registry.retire_summary(&request.id));
             self.transition_directory(
                 &mut registry,
                 &ClientMutationAuthority { _private: () },

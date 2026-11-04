@@ -3,57 +3,18 @@ use crate::{core::ClientCore, rpc::JsonRpcRequestTransport};
 use pioneer_protocol::Thread;
 
 impl ClientCore {
-    pub fn open_thread_by_id(
-        &self,
-        transport: &impl JsonRpcRequestTransport,
-        id: &str,
-    ) -> anyhow::Result<()> {
+    pub fn open_thread_by_id(&self, id: &str) -> anyhow::Result<()> {
         anyhow::ensure!(
             !id.trim().is_empty() && !self.is_stopped(),
             "thread_open_cancelled"
         );
-        let authorization = self
-            .identity_authorization
-            .lock()
-            .expect("identity owner poisoned")
-            .authorization_epoch();
-        let connection = self.gateway_http_generation();
-        let navigation = self.navigation_snapshot();
-        let thread = self
-            .refresh_thread_metadata(transport, id)
-            .map_err(|error| {
-                if crate::rpc::json_rpc_response_error(&error).is_some() {
-                    error
-                } else {
-                    error.context("thread_open_stale")
-                }
-            })?;
-        let workspace = thread.workspace_id.clone();
-        let token = {
-            let identity = self
-                .identity_authorization
-                .lock()
-                .expect("identity owner poisoned");
-            anyhow::ensure!(
-                thread.id == id
-                    && authorization == identity.authorization_epoch()
-                    && connection == self.gateway_http_generation()
-                    && !self.is_stopped(),
-                "thread_open_stale"
-            );
-            self.admit_opened_thread(thread, navigation.as_ref())?
-        };
-        self.refresh_opened_thread_subscription(token, &workspace)
+        self.open_existing_thread_subscription(id)
     }
 
     /// A shell's cached record identifies the target; only the authoritative read
     /// may supply domain data for opening it in the current authorization epoch.
-    pub fn open_thread(
-        &self,
-        transport: &impl JsonRpcRequestTransport,
-        thread: Thread,
-    ) -> anyhow::Result<()> {
-        self.open_thread_by_id(transport, &thread.id)
+    pub fn open_thread(&self, thread: Thread) -> anyhow::Result<()> {
+        self.open_thread_by_id(&thread.id)
     }
     /// Reuses the canonical Workspace draft before creating a new one.
     pub fn open_workspace_draft(
@@ -93,7 +54,7 @@ mod tests {
     };
     struct ThreadRead {
         core: std::sync::Weak<ClientCore>,
-        replace_route: bool,
+        replace_route: u8,
         revoke: bool,
         revoke_on_start: bool,
         returned_id: &'static str,
@@ -112,18 +73,21 @@ mod tests {
                 .ok_or_else(|| "fixture core dropped".to_owned())?;
             self.calls.fetch_add(1, Ordering::SeqCst);
             let request: serde_json::Value = serde_json::from_str(&payload).unwrap();
-            assert!(matches!(
-                request["method"].as_str(),
-                Some("thread/get" | "thread/start")
-            ));
-            if self.revoke_on_start && request["method"] == "thread/start" {
+            assert!(matches!(request["method"].as_str(), Some("thread/open")));
+            if self.revoke_on_start && request["method"] == "thread/open" {
                 core.begin_authorization_epoch(None);
             }
-            if self.replace_route {
+            if self.replace_route > 0 {
                 core.navigate(
                     crate::navigation::NavigationIntent::SelectWorkspace {
                         workspace_id: Some("replacement".into()),
                     },
+                    None,
+                );
+            }
+            if self.replace_route == 2 {
+                core.navigate(
+                    crate::navigation::NavigationIntent::SelectWorkspace { workspace_id: None },
                     None,
                 );
             }
@@ -139,47 +103,49 @@ mod tests {
                 .map_err(|error| error.to_string())
         }
     }
-    #[test]
-    fn authoritative_open_selects_once_and_late_subscription_cannot_restore_revoked_data() {
-        for revoke_on_start in [false, true] {
-            let core = crate::catalog_test_support::settings_client();
-            let event = crate::transport::ws::GatewayWsEvent::Connected {
-                connection_id: 7,
-                endpoint_id: "endpoint".into(),
-                endpoint_name: "Synthetic".into(),
+    fn connected_core() -> Arc<ClientCore> {
+        let core = crate::catalog_test_support::settings_client();
+        let event = crate::transport::ws::GatewayWsEvent::Connected {
+            connection_id: 7,
+            endpoint_id: "endpoint".into(),
+            endpoint_name: "Synthetic".into(),
+            gateway_base_url: pioneer_protocol::GatewayBaseUrl::parse_presentation(
+                "https://synthetic.invalid",
+            )
+            .unwrap(),
+        };
+        core.transport_runtime()
+            .ws_command_sender()
+            .set_http_session_access_for_test(Some(crate::transport::http::GatewayHttpAccess {
                 gateway_base_url: pioneer_protocol::GatewayBaseUrl::parse_presentation(
                     "https://synthetic.invalid",
                 )
                 .unwrap(),
-            };
-            core.transport_runtime()
-                .ws_command_sender()
-                .set_http_session_access_for_test(Some(
-                    crate::transport::http::GatewayHttpAccess {
-                        gateway_base_url: pioneer_protocol::GatewayBaseUrl::parse_presentation(
-                            "https://synthetic.invalid",
-                        )
-                        .unwrap(),
-                        gateway_id: pioneer_protocol::GatewayId::new("GAAAAAAAAAAAAAAAAAAAA")
-                            .unwrap(),
-                        session_id: pioneer_protocol::AuthSessionId::new("SAAAAAAAAAAAAAAAAAAAA")
-                            .unwrap(),
-                        generation: 7,
-                        access_expires_at_unix: u64::MAX,
-                        access_token: pioneer_protocol::AuthSecretString::new("synthetic"),
-                    },
-                ));
-            core.transport_runtime().inject_test_event(event.clone());
-            core.transport_runtime().drain_ws_events();
-            {
-                let mut session = core.gateway_session.lock().unwrap();
-                session.observe_transport(&event);
-                core.publish_gateway_session(&session);
-            }
+                gateway_id: pioneer_protocol::GatewayId::new("GAAAAAAAAAAAAAAAAAAAA").unwrap(),
+                session_id: pioneer_protocol::AuthSessionId::new("SAAAAAAAAAAAAAAAAAAAA").unwrap(),
+                generation: 7,
+                access_expires_at_unix: u64::MAX,
+                access_token: pioneer_protocol::AuthSecretString::new("synthetic"),
+            }));
+        core.transport_runtime().inject_test_event(event.clone());
+        core.transport_runtime().drain_ws_events();
+        {
+            let mut session = core.gateway_session.lock().unwrap();
+            session.observe_transport(&event);
+            core.publish_gateway_session(&session);
+        }
+
+        core
+    }
+
+    #[test]
+    fn authoritative_open_selects_once_and_late_subscription_cannot_restore_revoked_data() {
+        for revoke_on_start in [false, true] {
+            let core = connected_core();
 
             let transport = Arc::new(ThreadRead {
                 core: Arc::downgrade(&core),
-                replace_route: false,
+                replace_route: 0,
                 revoke: false,
                 revoke_on_start,
                 returned_id: "thread",
@@ -191,8 +157,8 @@ mod tests {
                 .test_requests
                 .lock()
                 .unwrap() = Some(transport.clone());
-            let result = core.open_thread_by_id(transport.as_ref(), "thread");
-            assert_eq!(transport.calls.load(Ordering::SeqCst), 2);
+            let result = core.open_thread_by_id("thread");
+            assert_eq!(transport.calls.load(Ordering::SeqCst), 1);
             assert_eq!(result.is_err(), revoke_on_start);
             if revoke_on_start {
                 assert!(core.thread_snapshot("thread").is_none());
@@ -202,6 +168,12 @@ mod tests {
                     core.navigation_snapshot().active_thread_id(),
                     Some("thread")
                 );
+                let budget = crate::rpc::RequestBudget::new(
+                    std::time::Instant::now() + crate::rpc::RPC_REQUEST_TIMEOUT,
+                );
+                core.ensure_thread_subscription("thread", "workspace", &budget)
+                    .unwrap();
+                assert_eq!(transport.calls.load(Ordering::SeqCst), 1);
                 assert_eq!(
                     core.thread_snapshot("thread")
                         .unwrap()
@@ -218,27 +190,33 @@ mod tests {
     #[test]
     fn thread_open_cannot_follow_a_replaced_route_or_accept_a_different_thread() {
         for (replace_route, revoke, returned_id) in [
-            (true, false, "thread"),
-            (false, false, "other"),
-            (false, true, "thread"),
+            (1, false, "thread"),
+            (2, false, "thread"),
+            (0, false, "other"),
+            (0, true, "thread"),
         ] {
-            let core = Arc::new(ClientCore::new());
-            let transport = ThreadRead {
+            let core = connected_core();
+            let transport = Arc::new(ThreadRead {
                 core: Arc::downgrade(&core),
                 replace_route,
                 revoke,
                 revoke_on_start: false,
                 returned_id,
                 calls: AtomicUsize::new(0),
-            };
-            let error = core.open_thread_by_id(&transport, "thread").unwrap_err();
-            assert_eq!(error.to_string(), "thread_open_stale");
+            });
+            *core
+                .transport_runtime()
+                .ws_command_sender()
+                .test_requests
+                .lock()
+                .unwrap() = Some(transport.clone());
+            let _error = core.open_thread_by_id("thread").unwrap_err();
             assert_eq!(transport.calls.load(Ordering::SeqCst), 1);
             assert!(core.thread_snapshot("thread").is_none());
             assert!(core.thread_snapshot("other").is_none());
             assert_eq!(
                 core.navigation_snapshot().workspace_id(),
-                replace_route.then_some("replacement")
+                (replace_route == 1).then_some("replacement")
             );
         }
     }
