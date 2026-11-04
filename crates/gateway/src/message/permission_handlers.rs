@@ -366,9 +366,7 @@ impl MessageProcessor {
             {
                 Ok(records) => records,
                 Err(_) => {
-                    self.session_manager
-                        .unregister_connection(connection_id)
-                        .await;
+                    crate::thread::replay::fail_current();
                     return;
                 }
             };
@@ -405,9 +403,7 @@ impl MessageProcessor {
         // A capture owner is reserved before the open reply and before any
         // pending snapshot. LIVE producers register before their durable insert.
         let Some(producer) = self.pending_delivery_order.opened(&request.request_id) else {
-            self.session_manager
-                .unregister_connection(connection_id)
-                .await;
+            crate::thread::replay::fail_current();
             return;
         };
         let current = self
@@ -415,9 +411,7 @@ impl MessageProcessor {
             .get_cli_runtime_pending_request(&request.request_id)
             .await;
         let Ok(Some(current)) = current else {
-            self.session_manager
-                .unregister_connection(connection_id)
-                .await;
+            crate::thread::replay::fail_current();
             return;
         };
         if current.workspace_id != request.workspace_id || current.thread_id != request.thread_id {
@@ -457,16 +451,12 @@ impl MessageProcessor {
             .get_cli_runtime_pending_request(&request.request_id)
             .await
         else {
-            self.session_manager
-                .unregister_connection(connection_id)
-                .await;
+            crate::thread::replay::fail_current();
             return;
         };
         if current.status != StoredCliRuntimePendingRequestStatus::Pending {
             let Some(resolution) = durable_native_permission_resolution(&current) else {
-                self.session_manager
-                    .unregister_connection(connection_id)
-                    .await;
+                crate::thread::replay::fail_current();
                 return;
             };
             correction

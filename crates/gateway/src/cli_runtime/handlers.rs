@@ -11631,9 +11631,7 @@ impl MessageProcessor {
                         error = %format!("{error:#}"),
                         "failed to replay durable CLI human interactions"
                     );
-                    self.session_manager
-                        .unregister_connection(connection_id)
-                        .await;
+                    crate::thread::replay::fail_current();
                     return;
                 }
             };
@@ -11650,9 +11648,7 @@ impl MessageProcessor {
                     continue;
                 }
                 let Some(producer) = self.pending_delivery_order.opened(&request.request_id) else {
-                    self.session_manager
-                        .unregister_connection(connection_id)
-                        .await;
+                    crate::thread::replay::fail_current();
                     return;
                 };
                 let producer = producer.expires_at(
@@ -11708,9 +11704,7 @@ impl MessageProcessor {
                     continue;
                 }
                 let Some(resolved_record) = current.as_ref() else {
-                    self.session_manager
-                        .unregister_connection(connection_id)
-                        .await;
+                    crate::thread::replay::fail_current();
                     return;
                 };
                 let resolved = cli_runtime_request_resolved_notification_from_record(

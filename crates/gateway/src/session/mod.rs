@@ -1193,6 +1193,9 @@ mod tests {
                 principal.session_id.clone(),
             ),
         );
+        let owner = Arc::new(crate::thread::replay::ReplayTasks::default());
+        let order = Arc::new(crate::thread::replay::PendingDeliveryOrder::default());
+        let reservation = owner.reserve(old.clone(), tx.clone(), &order).unwrap();
         old.retire();
         old.run(manager.recover_execution_delivery(
             connection,
@@ -1200,6 +1203,10 @@ mod tests {
             events::TURN_PERMISSION_REQUEST_OPENED,
         ))
         .await;
+        // Replay read/decoding errors use the same exact token failure gate.
+        old.run(async { crate::thread::replay::fail_current() })
+            .await;
+        drop(reservation);
         // The old scope's recovery cannot terminally seal the current socket.
         manager
             .try_send_execution_notification(
