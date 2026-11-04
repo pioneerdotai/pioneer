@@ -45,6 +45,7 @@ pub(super) struct PreparedApiProviderTurnStart {
 #[derive(Debug)]
 pub(super) enum ApiProviderTurnDispatchFailure {
     ActorStart(pioneer_agent::AgentStartError),
+    PluginAdmissionChanged,
     RunningOwnershipNotConfirmed,
     OwnershipPersistence(anyhow::Error),
 }
@@ -53,6 +54,9 @@ impl std::fmt::Display for ApiProviderTurnDispatchFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::ActorStart(error) => write!(f, "actor start failed: {error}"),
+            Self::PluginAdmissionChanged => {
+                f.write_str("plugin admission changed; refresh the selection")
+            }
             Self::RunningOwnershipNotConfirmed => {
                 f.write_str("running execution ownership was not confirmed")
             }
@@ -3929,7 +3933,7 @@ impl MessageProcessor {
                     "plugin admission changed; refresh the selection".into(),
                 )
                 .await;
-                return;
+                return Err(ApiProviderTurnDispatchFailure::PluginAdmissionChanged);
             }
         };
         let start_result = self
