@@ -19,6 +19,9 @@ mod control_rpc;
 #[path = "tests/detached_work_projection.rs"]
 mod detached_work_projection;
 
+#[path = "tests/post_open_replay.rs"]
+mod post_open_replay;
+
 #[path = "tests/workspace_scope.rs"]
 mod workspace_scope;
 
@@ -9194,10 +9197,9 @@ async fn open_persisted_child_for_test(
             &json!({
                 "jsonrpc": "2.0",
                 "id": request_id,
-                "method": "thread/start",
+                "method": "thread/open",
                 "params": {
-                    "thread_id": child_thread_id,
-                    "workspace_id": workspace_id
+                    "thread_id": child_thread_id
                 }
             })
             .to_string(),
@@ -9205,8 +9207,9 @@ async fn open_persisted_child_for_test(
         .await;
     let response = recv_response_by_id(rx, request_id.as_str()).await;
     let opened: ThreadStartResponse = serde_json::from_value(response.result)
-        .expect("persisted child should open through the authorized thread/start path");
+        .expect("persisted child should open through the authorized thread/open path");
     assert_eq!(opened.thread.id, child_thread_id);
+    assert_eq!(opened.thread.workspace_id, workspace_id);
     assert!(processor.thread_manager.has_thread(child_thread_id).await);
 }
 
@@ -22206,6 +22209,115 @@ async fn thread_subscriptions_bind_identity_and_revalidate_current_visibility() 
         "Member thread/start must remain runtime-only before the first turn"
     );
 
+    // Exercise the canonical dispatcher while the resource is still runtime-only.
+    let runtime_open_id = generate_test_request_id("realtimethread", "runtimeowneropen");
+    processor.process_request_for_connection(allowed_connection_id, &json!({
+        "jsonrpc":"2.0", "id":runtime_open_id, "method":"thread/open", "params":{"thread_id":THREAD_ID}
+    }).to_string()).await;
+    let opened = recv_response_by_id(&mut allowed_rx, &runtime_open_id).await;
+    let opened: ThreadStartResponse = serde_json::from_value(opened.result).unwrap();
+    assert_eq!(opened.thread.workspace_id, workspace_id);
+    let _ = recv_notification_by_method(&mut allowed_rx, events::THREAD_STARTED).await;
+    assert!(
+        crud_store
+            .get_thread_model(THREAD_ID)
+            .await
+            .unwrap()
+            .is_none(),
+        "runtime open must not promote draft"
+    );
+    processor
+        .session_manager
+        .set_connection_workspace(denied_connection_id, Some("selected-before-denial".into()))
+        .await;
+    let runtime_denied_id = generate_test_request_id("realtimethread", "runtimeforeignopen");
+    processor.process_request_for_connection(denied_connection_id, &json!({
+        "jsonrpc":"2.0", "id":runtime_denied_id, "method":"thread/open", "params":{"thread_id":THREAD_ID}
+    }).to_string()).await;
+    assert_eq!(
+        recv_error_by_id(&mut denied_rx, &runtime_denied_id)
+            .await
+            .error
+            .message,
+        "not_found"
+    );
+    assert_eq!(
+        processor
+            .session_manager
+            .connection_workspace_id(denied_connection_id)
+            .await
+            .as_deref(),
+        Some("selected-before-denial")
+    );
+    assert!(
+        !thread_manager
+            .subscribed_connection_ids(THREAD_ID)
+            .await
+            .contains(&denied_connection_id)
+    );
+
+    let (other_session_tx, mut other_session_rx) =
+        crate::session::test_support::outbound_channel(16);
+    let other_session_connection = processor
+        .session_manager
+        .register_connection(
+            other_session_tx,
+            member_principal(
+                MEMBER_ALLOWED_ID,
+                "D0000000000000000000C",
+                "S0000000000000000000C",
+            ),
+        )
+        .await
+        .expect("register another session for the allowed Member");
+
+    processor
+        .session_manager
+        .set_connection_workspace(
+            other_session_connection,
+            Some("selected-before-draft-denial".into()),
+        )
+        .await;
+    let same_principal_other_session = generate_test_request_id("realtimethread", "draftsession");
+    processor
+        .process_request_for_connection(
+            other_session_connection,
+            &json!({
+                "jsonrpc":"2.0", "id":same_principal_other_session, "method":"thread/open",
+                "params":{"thread_id":THREAD_ID}
+            })
+            .to_string(),
+        )
+        .await;
+    assert_eq!(
+        recv_error_by_id(&mut other_session_rx, &same_principal_other_session)
+            .await
+            .error
+            .message,
+        "not_found"
+    );
+    assert_eq!(
+        processor
+            .session_manager
+            .connection_workspace_id(other_session_connection)
+            .await
+            .as_deref(),
+        Some("selected-before-draft-denial")
+    );
+    assert!(
+        !thread_manager
+            .subscribed_connection_ids(THREAD_ID)
+            .await
+            .contains(&other_session_connection)
+    );
+    assert!(
+        crud_store
+            .get_thread_model(THREAD_ID)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
     let materialize_id = generate_test_request_id("realtimethread", "firstturn");
     processor
         .process_request_for_connection(
@@ -22250,10 +22362,9 @@ async fn thread_subscriptions_bind_identity_and_revalidate_current_visibility() 
             &json!({
                 "jsonrpc": "2.0",
                 "id": superuser_open_id,
-                "method": "thread/start",
+                "method": "thread/open",
                 "params": {
-                    "thread_id": THREAD_ID,
-                    "workspace_id": workspace_id
+                    "thread_id": THREAD_ID
                 }
             })
             .to_string(),
@@ -22261,21 +22372,6 @@ async fn thread_subscriptions_bind_identity_and_revalidate_current_visibility() 
         .await;
     let _ = recv_response_by_id(&mut superuser_rx, superuser_open_id.as_str()).await;
     let _ = recv_notification_by_method(&mut superuser_rx, events::THREAD_STARTED).await;
-
-    let (other_session_tx, mut other_session_rx) =
-        crate::session::test_support::outbound_channel(16);
-    processor
-        .session_manager
-        .register_connection(
-            other_session_tx,
-            member_principal(
-                MEMBER_ALLOWED_ID,
-                "D0000000000000000000C",
-                "S0000000000000000000C",
-            ),
-        )
-        .await
-        .expect("register another session for the allowed Member");
 
     processor
         .send_execution_collaborator_notification(
@@ -22320,10 +22416,9 @@ async fn thread_subscriptions_bind_identity_and_revalidate_current_visibility() 
             &json!({
                 "jsonrpc": "2.0",
                 "id": denied_open_id,
-                "method": "thread/start",
+                "method": "thread/open",
                 "params": {
-                    "thread_id": THREAD_ID,
-                    "workspace_id": workspace_id
+                    "thread_id": THREAD_ID
                 }
             })
             .to_string(),
@@ -22331,6 +22426,14 @@ async fn thread_subscriptions_bind_identity_and_revalidate_current_visibility() 
         .await;
     let denied = recv_error_by_id(&mut denied_rx, denied_open_id.as_str()).await;
     assert_eq!(denied.error.message, "not_found");
+    assert_eq!(
+        processor
+            .session_manager
+            .connection_workspace_id(denied_connection_id)
+            .await
+            .as_deref(),
+        Some("selected-before-denial")
+    );
     assert!(
         !thread_manager
             .subscribed_connection_ids(THREAD_ID)
@@ -33121,15 +33224,27 @@ async fn cli_predispatch_read_failure_cancel_and_shutdown_release_session_lease_
             .await
             .unwrap();
         let thread = format!("predispatch-{case}");
-        open_persisted_child_for_test(
-            &processor,
-            connection,
-            &mut rx,
-            &workspace,
-            &thread,
-            &format!("open-{case}"),
-        )
-        .await;
+        // This case starts with a fresh thread, so create it before testing
+        // dispatch cleanup. thread/open only subscribes to existing threads.
+        let create_id = generate_test_request_id("predispatch-create", case);
+        processor
+            .process_request_for_connection(
+                connection,
+                &json!({
+                    "jsonrpc": "2.0", "id": create_id, "method": "thread/start",
+                    "params": {
+                        "thread_id": thread, "workspace_id": workspace,
+                        "model": "gpt-5", "model_provider": "openai",
+                        "sandbox": SandboxMode::FullAccess, "mode": "Agent"
+                    }
+                })
+                .to_string(),
+            )
+            .await;
+        let response = recv_response_by_id(&mut rx, &create_id).await;
+        let created: ThreadStartResponse = serde_json::from_value(response.result).unwrap();
+        assert_eq!(created.thread.id, thread);
+        assert_eq!(created.thread.workspace_id, workspace);
         let turn = format!("predispatch-turn-{case}");
         processor.arm_completed_history_preparation_barrier("__cli_predispatch__");
         if case == "read_error" {
@@ -57689,23 +57804,234 @@ async fn cli_runtime_grandchild_request_replays_into_root_capsule_and_resolves_f
         vec![child_thread_id.to_owned(), root_thread_id.to_owned()]
     );
 
-    processor
-        .process_request_for_connection(
-            root_connection_id,
-            &json!({
-                "jsonrpc": "2.0",
-                "id": "cliparentresp00000001",
-                "method": pioneer_protocol::constants::methods::CLI_RUNTIME_REQUEST_RESPOND,
-                "params": {
-                    "workspace_id": workspace_id,
-                    "runtime_id": "codex",
-                    "request_id": pending_request_id,
-                    "resolution": { "status": "approved" }
-                }
-            })
-            .to_string(),
-        )
+    // A failed resource check in the ancestor replay's second pass must
+    // recover, rather than deduplicate a pending request nobody received.
+    let (unavailable_tx, mut unavailable_rx) = crate::session::test_support::outbound_channel(32);
+    let unavailable_outbound = unavailable_tx.clone();
+    let unavailable_connection = session_manager
+        .register_connection(unavailable_tx, authenticated_test_member_collaborator())
+        .await
+        .unwrap();
+    let (auth_entered, auth_release) = post_open_replay::pause_auth_unavailable(
+        &processor,
+        unavailable_connection,
+        events::CLI_RUNTIME_REQUEST_OPENED,
+        root_thread_id,
+        1,
+    );
+    let unavailable_open = generate_test_request_id("cliancestor", "authunavailable");
+    processor.process_request_for_connection(unavailable_connection, &json!({
+        "jsonrpc":"2.0", "id":unavailable_open, "method":"thread/open", "params":{"thread_id":root_thread_id}
+    }).to_string()).await;
+    tokio::time::timeout(Duration::from_secs(10), auth_entered)
+        .await
+        .unwrap()
+        .unwrap();
+    recv_response_by_id(&mut unavailable_rx, &unavailable_open).await;
+    recv_notification_by_method(&mut unavailable_rx, events::THREAD_STARTED).await;
+    auth_release.send(()).unwrap();
+    session_manager
+        .drain_thread_replays(unavailable_connection)
         .await;
+    unavailable_outbound.writer_stopped().await;
+    assert!(
+        unavailable_outbound
+            .try_send_data(Message::Text("requires recovery".into()))
+            .is_err()
+    );
+    assert!(unavailable_rx.try_recv().is_err());
+    assert_eq!(
+        crud_store
+            .get_cli_runtime_pending_request(&pending_request_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        pioneer_crud::CliRuntimePendingRequestStatus::Pending
+    );
+    session_manager
+        .unregister_connection(unavailable_connection)
+        .await;
+    processor
+        .thread_manager
+        .connection_closed(unavailable_connection)
+        .await;
+    let (recovered_tx, mut recovered_rx) = crate::session::test_support::outbound_channel(32);
+    let recovered_connection = session_manager
+        .register_connection(recovered_tx, authenticated_test_member_collaborator())
+        .await
+        .unwrap();
+    let recovered_open = generate_test_request_id("cliancestor", "authrecovered");
+    processor.process_request_for_connection(recovered_connection, &json!({
+        "jsonrpc":"2.0", "id":recovered_open, "method":"thread/open", "params":{"thread_id":root_thread_id}
+    }).to_string()).await;
+    recv_response_by_id(&mut recovered_rx, &recovered_open).await;
+    recv_notification_by_method(&mut recovered_rx, events::THREAD_STARTED).await;
+    let recovered_pending =
+        recv_notification_by_method(&mut recovered_rx, events::CLI_RUNTIME_REQUEST_OPENED).await;
+    let recovered_pending: CLIRuntimeRequestOpenedNotification =
+        serde_json::from_value(recovered_pending.params.unwrap()).unwrap();
+    assert_eq!(recovered_pending.request_id, pending_request_id);
+    assert_eq!(
+        recovered_pending.visible_thread_ids,
+        vec![child_thread_id.to_owned(), root_thread_id.to_owned()]
+    );
+    session_manager
+        .drain_thread_replays(recovered_connection)
+        .await;
+    session_manager
+        .unregister_connection(recovered_connection)
+        .await;
+    processor
+        .thread_manager
+        .connection_closed(recovered_connection)
+        .await;
+
+    let (racing_tx, mut racing_rx) = crate::session::test_support::outbound_channel(32);
+    let racing_connection = session_manager
+        .register_connection(racing_tx, authenticated_test_member_collaborator())
+        .await
+        .unwrap();
+    // Selection deliberately differs: ancestor execution authority is independent.
+    session_manager
+        .set_connection_workspace(racing_connection, Some("unrelated-selection".into()))
+        .await;
+    let (entered, captured) = tokio::sync::oneshot::channel();
+    let (release, released) = tokio::sync::oneshot::channel();
+    *session_manager.replay_delivery_pause.lock().unwrap() =
+        Some(crate::session::test_support::DeliveryPause {
+            connection: racing_connection,
+            method: events::CLI_RUNTIME_REQUEST_OPENED,
+            entered,
+            release: released,
+        });
+    let racing_open = generate_test_request_id("cliancestor", "racingopen");
+    processor.process_request_for_connection(racing_connection, &json!({
+        "jsonrpc":"2.0", "id":racing_open, "method":"thread/open", "params":{"thread_id":root_thread_id}
+    }).to_string()).await;
+    tokio::time::timeout(Duration::from_secs(10), captured)
+        .await
+        .unwrap()
+        .unwrap();
+    recv_response_by_id(&mut racing_rx, &racing_open).await;
+    recv_notification_by_method(&mut racing_rx, events::THREAD_STARTED).await;
+    session_manager
+        .set_connection_workspace(racing_connection, Some("unrelated-selection".into()))
+        .await;
+
+    // A third observer keeps the original late-opened/terminal oracle above,
+    // and independently exercises valid OPENED and LIVE terminal across renewal.
+    let (renewing_tx, mut renewing_rx) = crate::session::test_support::outbound_channel(32);
+    let renewing_outbound = renewing_tx.clone();
+    let renewing_connection = session_manager
+        .register_connection(renewing_tx, authenticated_test_member_collaborator())
+        .await
+        .unwrap();
+    let (renew_entered, renew_captured) = tokio::sync::oneshot::channel();
+    let (renew_release, renew_released) = tokio::sync::oneshot::channel();
+    *session_manager.replay_delivery_pause.lock().unwrap() =
+        Some(crate::session::test_support::DeliveryPause {
+            connection: renewing_connection,
+            method: events::CLI_RUNTIME_REQUEST_OPENED,
+            entered: renew_entered,
+            release: renew_released,
+        });
+    let renewing_open = generate_test_request_id("cliancestor", "renewingopen");
+    processor.process_request_for_connection(renewing_connection, &json!({
+        "jsonrpc":"2.0", "id":renewing_open, "method":"thread/open", "params":{"thread_id":root_thread_id}
+    }).to_string()).await;
+    tokio::time::timeout(Duration::from_secs(10), renew_captured)
+        .await
+        .unwrap()
+        .unwrap();
+    recv_response_by_id(&mut renewing_rx, &renewing_open).await;
+    recv_notification_by_method(&mut renewing_rx, events::THREAD_STARTED).await;
+    session_manager
+        .set_connection_workspace(renewing_connection, Some("unrelated-selection".into()))
+        .await;
+    post_open_replay::renew_same_subject(&session_manager, renewing_connection).await;
+    renew_release.send(()).unwrap();
+    let renewal_opened =
+        recv_notification_by_method(&mut renewing_rx, events::CLI_RUNTIME_REQUEST_OPENED).await;
+    let renewal_opened: CLIRuntimeRequestOpenedNotification =
+        serde_json::from_value(renewal_opened.params.unwrap()).unwrap();
+    assert_eq!(renewal_opened.request_id, pending_request_id);
+    assert_eq!(
+        renewal_opened.visible_thread_ids,
+        vec![child_thread_id.to_owned(), root_thread_id.to_owned()]
+    );
+    let client = pioneer_client::core::ClientCore::new();
+    client.upsert_thread(
+        crud_store
+            .get_thread_model(root_thread_id)
+            .await
+            .unwrap()
+            .unwrap(),
+    );
+    client.apply_thread_notification(
+        pioneer_protocol::GatewayNotification::CLIRuntimeRequestOpened(renewal_opened),
+    );
+    assert_eq!(
+        client
+            .pending_requests_for_scope(Some(&workspace_id), Some(root_thread_id))
+            .len(),
+        1
+    );
+    session_manager
+        .drain_thread_replays(renewing_connection)
+        .await;
+    let membership = processor
+        .thread_manager
+        .subscription_incarnation(renewing_connection, root_thread_id)
+        .await
+        .unwrap();
+    let repeat = generate_test_request_id("cliancestor", "renewaldedup");
+    processor.process_request_for_connection(renewing_connection, &json!({
+        "jsonrpc":"2.0", "id":repeat, "method":"thread/open", "params":{"thread_id":root_thread_id}
+    }).to_string()).await;
+    recv_response_by_id(&mut renewing_rx, &repeat).await;
+    recv_notification_by_method(&mut renewing_rx, events::THREAD_STARTED).await;
+    session_manager
+        .drain_thread_replays(renewing_connection)
+        .await;
+    assert!(
+        renewing_rx.try_recv().is_err(),
+        "delivered pending replay stays deduplicated"
+    );
+    assert!(Arc::ptr_eq(
+        &membership,
+        &processor
+            .thread_manager
+            .subscription_incarnation(renewing_connection, root_thread_id)
+            .await
+            .unwrap()
+    ));
+    let (terminal_entered, terminal_captured) = tokio::sync::oneshot::channel();
+    let (terminal_release, terminal_released) = tokio::sync::oneshot::channel();
+    *session_manager.replay_delivery_pause.lock().unwrap() =
+        Some(crate::session::test_support::DeliveryPause {
+            connection: renewing_connection,
+            method: events::CLI_RUNTIME_REQUEST_RESOLVED,
+            entered: terminal_entered,
+            release: terminal_released,
+        });
+    let resolve_payload = json!({
+        "jsonrpc":"2.0", "id":"cliparentresp00000001",
+        "method":pioneer_protocol::constants::methods::CLI_RUNTIME_REQUEST_RESPOND,
+        "params":{"workspace_id":workspace_id,"runtime_id":"codex","request_id":pending_request_id,
+            "resolution":{"status":"approved"}}
+    })
+    .to_string();
+    let resolving = processor.process_request_for_connection(root_connection_id, &resolve_payload);
+    let renewal = async {
+        tokio::time::timeout(Duration::from_secs(10), terminal_captured)
+            .await
+            .unwrap()
+            .unwrap();
+        post_open_replay::renew_same_subject(&session_manager, renewing_connection).await;
+        terminal_release.send(()).unwrap();
+    };
+    tokio::join!(resolving, renewal);
     let (response, resolved) = recv_response_and_notification_by_id_method(
         &mut root_rx,
         "cliparentresp00000001",
@@ -57724,6 +58050,60 @@ async fn cli_runtime_grandchild_request_replays_into_root_capsule_and_resolves_f
         vec![child_thread_id.to_owned(), root_thread_id.to_owned()]
     );
     assert_eq!(resolved.resolution, CLIRuntimeRequestResolution::Approved);
+
+    let renewal_terminal =
+        recv_notification_by_method(&mut renewing_rx, events::CLI_RUNTIME_REQUEST_RESOLVED).await;
+    let renewal_terminal: CLIRuntimeRequestResolvedNotification =
+        serde_json::from_value(renewal_terminal.params.unwrap()).unwrap();
+    assert_eq!(
+        renewal_terminal.resolution,
+        CLIRuntimeRequestResolution::Approved
+    );
+    client.apply_thread_notification(
+        pioneer_protocol::GatewayNotification::CLIRuntimeRequestResolved(renewal_terminal),
+    );
+    assert!(
+        client
+            .pending_requests_for_scope(Some(&workspace_id), Some(root_thread_id))
+            .is_empty()
+    );
+    renewing_outbound
+        .try_send_data(Message::Text("same ancestor socket remains live".into()))
+        .unwrap();
+
+    let racing_terminal =
+        recv_notification_by_method(&mut racing_rx, events::CLI_RUNTIME_REQUEST_RESOLVED).await;
+    let racing_terminal: CLIRuntimeRequestResolvedNotification =
+        serde_json::from_value(racing_terminal.params.unwrap()).unwrap();
+    assert_eq!(
+        racing_terminal.resolution,
+        CLIRuntimeRequestResolution::Approved
+    );
+    assert_eq!(
+        racing_terminal.thread_id.as_deref(),
+        Some(grandchild_thread_id)
+    );
+    assert_eq!(
+        racing_terminal.visible_thread_ids,
+        vec![child_thread_id.to_owned(), root_thread_id.to_owned()]
+    );
+    release.send(()).unwrap();
+    session_manager
+        .drain_thread_replays(racing_connection)
+        .await;
+    while let Ok(Message::Text(text)) = racing_rx.try_recv() {
+        let frame: JsonValue = serde_json::from_str(&text).unwrap();
+        assert_ne!(
+            frame["method"],
+            events::CLI_RUNTIME_REQUEST_OPENED,
+            "ancestor replay cannot reopen an approved request"
+        );
+        if frame["method"] == events::CLI_RUNTIME_REQUEST_RESOLVED {
+            let resolved: CLIRuntimeRequestResolvedNotification =
+                serde_json::from_value(frame["params"].clone()).unwrap();
+            assert_eq!(resolved.resolution, CLIRuntimeRequestResolution::Approved);
+        }
+    }
 
     let provider_responses = cli_session.responses.lock().await;
     assert_eq!(provider_responses.len(), 1);
