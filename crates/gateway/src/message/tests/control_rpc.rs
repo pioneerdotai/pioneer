@@ -2308,33 +2308,41 @@ async fn domain_finalize_drains_slow_tail_with_recording_and_buffered_recognizer
                 &mut context, &renewals, &f.outbound, &mut handlers, &dispatch);
             let driver = async {
                 phase.set("initial audio ACKs");
-                for sequence in 0..30 {
+                for sequence in 0..31 {
                     input.send(Message::Binary(voice_test_frame(&started.session_id, sequence, 1600, 12000).into())).unwrap();
                     let ack = recv_notification_by_method(&mut f.responses, pioneer_protocol::constants::events::VOICE_CHUNK_ACK).await;
                     assert_eq!(ack.params.unwrap()["sequence"], sequence);
                 }
-                if buffered { assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0); }
+                if buffered {
+                    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+                } else {
+                    // 30 packets reach the 3 s preview stride in source samples,
+                    // but VAD still retains a partial 512-sample frame. The extra
+                    // packet crosses the stride before we gate the final prefix.
+                    phase.set("recording recognizer entry");
+                    native_entered.notified().await;
+                }
                 let (entered, at_proof) = tokio::sync::oneshot::channel();
                 let (release, resumed) = tokio::sync::oneshot::channel();
                 *recording.ingress.proof_pause.lock().unwrap() = Some((entered, resumed));
-                input.send(Message::Binary(voice_test_frame(&started.session_id, 30, 1600, 12000).into())).unwrap();
+                input.send(Message::Binary(voice_test_frame(&started.session_id, 31, 1600, 12000).into())).unwrap();
                 phase.set("active chunk proof gate");
                 at_proof.await.unwrap();
                 let (tail_entered, tail_proof) = tokio::sync::oneshot::channel();
                 let (tail_release, tail_resume) = tokio::sync::oneshot::channel();
                 *recording.ingress.proof_pause.lock().unwrap() = Some((tail_entered, tail_resume));
-                input.send(Message::Binary(voice_test_frame(&started.session_id, 31, 7, 3000).into())).unwrap();
+                input.send(Message::Binary(voice_test_frame(&started.session_id, 32, 7, 3000).into())).unwrap();
                 phase.set("unrelated ACL commit and publication");
                 revoke_unrelated_voice_acl(&f.processor, &other).await;
                 assert!(f.processor.current_authorization_revision().await.unwrap() > policy_before);
                 let payload = rpc("full-finalize", methods::VOICE_SESSION_FINALIZE, json!({
-                    "session_id":started.session_id,"audio_integrity":{"next_sequence":32,"normalized_samples":49607},
+                    "session_id":started.session_id,"audio_integrity":{"next_sequence":33,"normalized_samples":51207},
                     "context":{"workspace_id":f.workspace,"thread_id":THREAD,"turn_id":"turn_transport_finalize_full"}
                 }));
                 // Receive-time seal through the production busy pump, followed
                 // by actual owned domain dispatch of that same finalized input.
                 input.send(Message::Text(payload.clone().into())).unwrap();
-                input.send(Message::Binary(voice_test_frame(&started.session_id,32,7,16000).into())).unwrap();
+                input.send(Message::Binary(voice_test_frame(&started.session_id,33,7,16000).into())).unwrap();
                 input.send(Message::Text(rpc("full-seal-probe", methods::TASK_WAIT,
                     json!({"runIds":[RUN],"timeoutMs":1})).into())).unwrap();
                 phase.set("transport seal probe");
@@ -2345,15 +2353,11 @@ async fn domain_finalize_drains_slow_tail_with_recording_and_buffered_recognizer
                 release.send(()).unwrap();
                 phase.set("queued tail proof gate");
                 tail_proof.await.unwrap();
-                if !buffered {
-                    phase.set("recording recognizer entry");
-                    native_entered.notified().await;
-                }
                 tail_release.send(()).unwrap();
                 let mut reply = None;
-                let mut received = 30;
+                let mut received = 31;
                 phase.set("active and tail audio ACKs");
-                while received < 32 {
+                while received < 33 {
                     let Message::Text(text) = f.responses.recv().await.unwrap() else { panic!("finalize disconnected"); };
                     let value: JsonValue = serde_json::from_str(&text).unwrap();
                     if value["method"] == pioneer_protocol::constants::events::VOICE_CHUNK_ACK {
