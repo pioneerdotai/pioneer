@@ -2024,7 +2024,7 @@ mod tests {
 
     #[test]
     fn live_worker_decodes_finalized_audio_before_stop_and_retains_open_pause() {
-        let store = open_store();
+        let store = GatewayVoiceSessionBufferStore::default();
         let calls = Arc::new(Mutex::new(Vec::new()));
         let captured = calls.clone();
         let fake = TestSpeechTranscriber(Arc::new(move |buffer| {
@@ -2033,7 +2033,24 @@ mod tests {
         }));
         let (detector, reached) = CheckpointDetector::new(vec![1408, 1900]);
         let token = CancellationToken::new();
+        let (_sender, receiver) = oneshot::channel();
+        store
+            .start_processing(
+                "session".to_owned(),
+                VoiceAudioFormat::pioneer_streaming_target(),
+                token.clone(),
+                receiver,
+            )
+            .unwrap();
+        // Wake the inbox waiter before scope joins if feeding or closing panics.
+        struct SessionCleanup<'a>(&'a GatewayVoiceSessionBufferStore);
+        impl Drop for SessionCleanup<'_> {
+            fn drop(&mut self) {
+                let _ = self.0.remove_session("session");
+            }
+        }
         std::thread::scope(|scope| {
+            let _cleanup = SessionCleanup(&store);
             let worker =
                 scope.spawn(|| super::process(&store, "session", &token, &fake, false, detector));
             let mut audio = vec![12000; 34 * RATE];
