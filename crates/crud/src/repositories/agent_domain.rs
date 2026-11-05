@@ -8881,7 +8881,8 @@ mod tests {
         ))
         .await
         .unwrap();
-        let now = utc_now();
+        let now =
+            DateTimeWithTimeZone::parse_from_rfc3339("2026-11-04T12:00:00.250+00:00").unwrap();
         let old = now.clone() - Duration::days(AGENT_ACTION_LEDGER_PAYLOAD_RETENTION_DAYS + 1);
         let recent = now.clone() - Duration::days(AGENT_ACTION_LEDGER_PAYLOAD_RETENTION_DAYS - 1);
         let issued_result = serde_json::json!({
@@ -8981,7 +8982,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             next_agent_ledger_retention_at(&db, now).await.unwrap(),
-            Some((now + Duration::days(1)).timestamp())
+            Some((now + Duration::days(1)).timestamp() + 1)
         );
         let (blocked, cursor) = compact_terminal_agent_action_ledger_page(&db, now, 1, None)
             .await

@@ -50,6 +50,12 @@ async fn fixture(
         test_summary_config(),
         test_tool_loop_config(),
     ));
+    processor
+        .agent_manager
+        .set_context_controller(Some(Arc::new(
+            crate::compaction::GatewayNativeContextController::new(Arc::downgrade(&processor)),
+        )))
+        .await;
     (directory, processor, store, workspace)
 }
 

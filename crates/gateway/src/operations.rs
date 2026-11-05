@@ -523,10 +523,20 @@ mod tests {
                 .expect_err("execute flag should be required");
         assert!(format!("{explicit_error:#}").contains("execute=true"));
 
+        // This fixture exercises the offline command: release its setup writer
+        // before opening another owner, just as a stopped Gateway does.
+        drop(crud_store);
+        database.close().await.expect("close fixture database");
         let report = artifact_gc_execute(&config, &runtime_home, "ws_ops", 200_000_000, true)
             .await
             .expect("execute artifact gc");
         assert_eq!(report.deleted_blobs, 1);
+        let crud_store = CrudStore::new(
+            read_existing_for_operations(&runtime_home, &config)
+                .await
+                .expect("open result reader")
+                .expect("existing gateway database"),
+        );
         assert_eq!(
             crud_store
                 .count_artifact_blobs_by_workspace("ws_ops")

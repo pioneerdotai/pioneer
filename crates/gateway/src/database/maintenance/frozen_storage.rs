@@ -926,8 +926,8 @@ mod tests {
         assert!(progress.quantum(&store).await.unwrap());
         assert_eq!(
             observer.operations() - reads,
-            2,
-            "candidate + exact-key preflight, no reverse read"
+            3,
+            "finite frontier + candidate + exact-key preflight, no reverse read"
         );
         assert_eq!(observer.writes.lock().unwrap().len(), writes);
         assert!(

@@ -633,8 +633,8 @@ async fn expiry_page16_preserves_each_positive_root_and_uses_no_writer() {
     let reads = routes.reads.lock().unwrap().iter().filter(|event|
         matches!(event, SqliteReadEvent::OperationFinished { .. })
     ).count();
-    // Two header pages and the unchanged seventeen individual root queries.
-    assert_eq!(reads, 19);
+    // One finite frontier, two header pages and seventeen individual root queries.
+    assert_eq!(reads, 20);
     assert!(!progress.expiry_quantum(&store).await.unwrap());
     assert_eq!(history::Entity::find().filter(history::Column::Expired.eq(0)).all(&store.connection).await.unwrap().len(), 17);
 }
