@@ -6961,7 +6961,8 @@ impl pioneer_tasks::TaskExecutor for HoldingPlannedSystemExecutor {
 #[test]
 fn extra_run_completion_preserves_and_executes_original_one_shot() {
     run_standard_stack_message_test("Extra run preserves one-shot execution", async {
-        // Heap-allocate dispatch futures so this matrix uses the normal Gateway worker stack.
+        // Heap-allocate setup, dispatch and terminal-transition futures: embedding
+        // them in this matrix adds its large frame to their poll stack in debug builds.
         for scenario in [
             "future",
             "queued",
@@ -6975,7 +6976,7 @@ fn extra_run_completion_preserves_and_executes_original_one_shot() {
             let scheduled_already_queued = scenario == "queued";
             let fails = matches!(scenario, "failed" | "retry");
             let (_harness, processor, turn_id) =
-                start_task_cli_fixture(CLIAgentRuntimeKind::Codex).await;
+                Box::pin(start_task_cli_fixture(CLIAgentRuntimeKind::Codex)).await;
             let binding = processor
                 .crud_store
                 .get_cli_runtime_turn_binding(&turn_id)
@@ -7025,12 +7026,14 @@ fn extra_run_completion_preserves_and_executes_original_one_shot() {
                     on_conflict: pioneer_protocol::TaskConcurrencyConflictPolicy::Queue,
                 });
             }
-            let created = processor
-                .task_runtime
-                .service()
-                .create_task(pioneer_tasks::TaskCreateContext::default(), params)
-                .await
-                .unwrap();
+            let created = Box::pin(
+                processor
+                    .task_runtime
+                    .service()
+                    .create_task(pioneer_tasks::TaskCreateContext::default(), params),
+            )
+            .await
+            .unwrap();
             let task_id = &created.task.id;
             assert_eq!(
                 created.task.lifecycle_policy.as_ref().unwrap().completion,
@@ -7080,11 +7083,13 @@ fn extra_run_completion_preserves_and_executes_original_one_shot() {
                 };
                 // Deliberately prepare before extra admission: the writer must
                 // reload completion facts instead of committing TaskCompleted.
-                let prepared = processor
-                    .crud_store
-                    .prepare_task_terminal_transition(terminal.clone())
-                    .await
-                    .unwrap();
+                let prepared = Box::pin(
+                    processor
+                        .crud_store
+                        .prepare_task_terminal_transition(terminal.clone()),
+                )
+                .await
+                .unwrap();
                 planned_terminal = Some((prepared, terminal));
             }
             let args =
@@ -7117,11 +7122,13 @@ fn extra_run_completion_preserves_and_executes_original_one_shot() {
                 assert_eq!(waiting.runs[0].status, TaskRunStatus::Running);
                 assert_eq!(waiting.runs[1].status, TaskRunStatus::Queued);
                 assert!(waiting.runs[1].trigger_id.is_none());
-                let outcome = processor
-                    .crud_store
-                    .commit_task_terminal_transition(prepared)
-                    .await
-                    .unwrap();
+                let outcome = Box::pin(
+                    processor
+                        .crud_store
+                        .commit_task_terminal_transition(prepared),
+                )
+                .await
+                .unwrap();
                 processor
                     .task_runtime
                     .event_bus()
@@ -7141,16 +7148,14 @@ fn extra_run_completion_preserves_and_executes_original_one_shot() {
                         result,
                         completed_at,
                         ..
-                    } => primary_handle
-                        .complete_run(result.clone(), *completed_at)
+                    } => Box::pin(primary_handle.complete_run(result.clone(), *completed_at))
                         .await
                         .unwrap(),
                     TaskEventPayload::RunFailed {
                         error,
                         completed_at,
                         ..
-                    } => primary_handle
-                        .fail_run(error.clone(), *completed_at)
+                    } => Box::pin(primary_handle.fail_run(error.clone(), *completed_at))
                         .await
                         .unwrap(),
                     _ => unreachable!(),
@@ -7206,13 +7211,12 @@ fn extra_run_completion_preserves_and_executes_original_one_shot() {
                     task_id.clone(),
                     run_id.clone(),
                 );
-                extra_handle
-                    .complete_run(
-                        completed.runs[1].result.clone(),
-                        completed.runs[1].completed_at.unwrap(),
-                    )
-                    .await
-                    .unwrap();
+                Box::pin(extra_handle.complete_run(
+                    completed.runs[1].result.clone(),
+                    completed.runs[1].completed_at.unwrap(),
+                ))
+                .await
+                .unwrap();
                 Box::pin(processor.task_runtime.process_due_once(4_000_000_000))
                     .await
                     .unwrap();
@@ -7267,7 +7271,7 @@ fn extra_run_completion_preserves_and_executes_original_one_shot() {
                     .unwrap();
                     assert!(!stop.is_error, "{stop:?}");
                     if scenario == "finish" {
-                        handle.complete_run(None, now).await.unwrap();
+                        Box::pin(handle.complete_run(None, now)).await.unwrap();
                     }
                     processor
                         .task_runtime
@@ -7304,16 +7308,16 @@ fn extra_run_completion_preserves_and_executes_original_one_shot() {
                 }
                 let before_planned_fire = if scheduled_already_queued {
                     Some(
-                        processor
-                            .crud_store
-                            .prepare_task_terminal_transition(TaskEventPayload::RunCompleted {
+                        Box::pin(processor.crud_store.prepare_task_terminal_transition(
+                            TaskEventPayload::RunCompleted {
                                 task_id: task_id.clone(),
                                 run_id: run_id.clone(),
                                 result: None,
                                 completed_at: now,
-                            })
-                            .await
-                            .unwrap(),
+                            },
+                        ))
+                        .await
+                        .unwrap(),
                     )
                 } else {
                     None
@@ -7335,34 +7339,35 @@ fn extra_run_completion_preserves_and_executes_original_one_shot() {
                     assert_eq!(queued.runs[0].status, TaskRunStatus::Running);
                 }
                 if fails {
-                    handle
-                        .fail_run(
-                            Some(pioneer_protocol::TaskError {
-                                recovery_diagnostic: None,
-                                code: "extra_failed".to_owned(),
-                                message: "extra check failed".to_owned(),
-                                class: pioneer_protocol::TaskErrorClass::Internal,
-                                details: None,
-                                failed_run_id: Some(run_id.clone()),
-                            }),
-                            now,
+                    Box::pin(handle.fail_run(
+                        Some(pioneer_protocol::TaskError {
+                            recovery_diagnostic: None,
+                            code: "extra_failed".to_owned(),
+                            message: "extra check failed".to_owned(),
+                            class: pioneer_protocol::TaskErrorClass::Internal,
+                            details: None,
+                            failed_run_id: Some(run_id.clone()),
+                        }),
+                        now,
+                    ))
+                    .await
+                    .unwrap();
+                } else {
+                    if let Some(prepared) = before_planned_fire {
+                        let outcome = Box::pin(
+                            processor
+                                .crud_store
+                                .commit_task_terminal_transition(prepared),
                         )
                         .await
                         .unwrap();
-                } else {
-                    if let Some(prepared) = before_planned_fire {
-                        let outcome = processor
-                            .crud_store
-                            .commit_task_terminal_transition(prepared)
-                            .await
-                            .unwrap();
                         processor
                             .task_runtime
                             .event_bus()
                             .publish_many(outcome.events)
                             .await;
                     }
-                    handle.complete_run(None, now).await.unwrap();
+                    Box::pin(handle.complete_run(None, now)).await.unwrap();
                 }
             } else {
                 processor
@@ -7413,15 +7418,18 @@ fn extra_run_completion_preserves_and_executes_original_one_shot() {
                 run_id.clone(),
             );
             if fails {
-                recovered
-                    .fail_run(completed.error.clone(), completed.completed_at.unwrap())
-                    .await
-                    .unwrap();
+                Box::pin(
+                    recovered.fail_run(completed.error.clone(), completed.completed_at.unwrap()),
+                )
+                .await
+                .unwrap();
             } else {
-                recovered
-                    .complete_run(completed.result.clone(), completed.completed_at.unwrap())
-                    .await
-                    .unwrap();
+                Box::pin(
+                    recovered
+                        .complete_run(completed.result.clone(), completed.completed_at.unwrap()),
+                )
+                .await
+                .unwrap();
             }
             let replay = invoke_task(
                 &processor,
