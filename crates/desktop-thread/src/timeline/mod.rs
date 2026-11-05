@@ -46,14 +46,11 @@ use std::collections::HashSet;
 use std::rc::Rc;
 
 // Prepared in update, measured during stock draw, committed by the layout store.
+// Keep presentations here: elements created outside draw use GPUI's fallback
+// arena, which is not cleared with the frame and retains their captured data.
 pub(super) struct TimelineLayoutMeasurement {
-    entries: Vec<(layout_store::RowMeasurementKey, AnyElement)>,
+    entries: Vec<(layout_store::RowMeasurementKey, row_view::RowPresentation)>,
     row_width: Pixels,
-    bodies: Vec<(
-        pioneer_client::timeline::presentation::RowId,
-        Pixels,
-        AnyElement,
-    )>,
     row_inputs: Vec<(layout_store::RowMeasurementKey, Option<TurnAuthorSnapshot>)>,
 }
 impl TimelineLayoutMeasurement {
@@ -66,21 +63,23 @@ impl TimelineLayoutMeasurement {
         Vec<(pioneer_client::timeline::presentation::RowId, Pixels)>,
     ) {
         let bodies = self
-            .bodies
-            .into_iter()
-            .map(|(id, width, mut element)| {
+            .entries
+            .iter()
+            .filter_map(|(_, presentation)| {
+                let (id, width, mut element) = presentation.body_measurement(cx)?;
                 let bounds = element.layout_as_root(
                     size(AvailableSpace::Definite(width), AvailableSpace::MaxContent),
                     window,
                     cx,
                 );
-                (id, bounds.height)
+                Some((id, bounds.height))
             })
             .collect();
         let rows = self
             .entries
             .into_iter()
-            .map(|(key, mut element)| {
+            .map(|(key, presentation)| {
+                let mut element = presentation.render(cx);
                 let measured = element.layout_as_root(
                     size(
                         AvailableSpace::Definite(self.row_width),
@@ -353,7 +352,6 @@ impl TimelineView {
     ) -> TimelineLayoutMeasurement {
         let mut entries = Vec::new();
         let mut row_inputs = Vec::new();
-        let mut bodies = Vec::new();
         let expanded = self.thread_timeline_view_state.expanded.borrow();
         let principal = self
             .identity_input
@@ -398,15 +396,11 @@ impl TimelineView {
                         self,
                         cx,
                     );
-                    if let Some(body) = presentation.body_measurement(cx) {
-                        bodies.push(body);
-                    }
-                    entries.push((key, presentation.render(cx)));
+                    entries.push((key, presentation));
                 }
             }
         }
         TimelineLayoutMeasurement {
-            bodies,
             entries,
             row_width,
             row_inputs,
