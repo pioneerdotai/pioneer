@@ -128,8 +128,20 @@ async fn retain_as_task_basis(
 }
 
 async fn drain_preview_worker(store: &CrudStore, service: &ArtifactService) {
-    let mut progress = crate::database::maintenance::html_previews::Progress::default();
-    for _ in 0..3 {
+    use futures_util::FutureExt;
+    let database = store.database_connection().maintenance();
+    let mut changes = database.work_signal("maintenance.html").subscribe();
+    let mut released = database
+        .work_signal("maintenance.frozen.release")
+        .subscribe();
+    let io = store.html_preview_io_work_notification();
+    // Initial discovery covers older notifications; subsequent passes need a
+    // real producer/release wake, as the production owner does after EOF.
+    let _ = io.notified().now_or_never();
+    let _ = service.html_preview_release_notified().now_or_never();
+    for _ in 0..16 {
+        changes.begin_pass(&database).await.unwrap();
+        let mut progress = crate::database::maintenance::html_previews::Progress::default();
         let mut idle = false;
         for _ in 0..256 {
             if !crate::database::maintenance::html_previews::quantum(store, service, &mut progress)
@@ -141,7 +153,18 @@ async fn drain_preview_worker(store: &CrudStore, service: &ArtifactService) {
             }
         }
         assert!(idle);
+        let source = changes.wait(None).now_or_never().is_some();
+        let release = released.changed().now_or_never().is_some();
+        let io_ready = io.notified().now_or_never().is_some();
+        let activity = service
+            .html_preview_release_notified()
+            .now_or_never()
+            .is_some();
+        if !(source || release || io_ready || activity) {
+            return;
+        }
     }
+    panic!("preview maintenance must quiesce after its own source changes");
 }
 
 #[tokio::test]
@@ -719,24 +742,7 @@ async fn preview_history_replay(format_version: u32) {
         .unwrap();
     // A restarted worker reuses persisted receipts and retires only after all
     // temporary owners have released; it never expires/deletes the Task root.
-    let mut progress = crate::database::maintenance::html_previews::Progress::default();
-    for _ in 0..3 {
-        let mut idle = false;
-        for _ in 0..128 {
-            if !crate::database::maintenance::html_previews::quantum(
-                &f.store,
-                &service,
-                &mut progress,
-            )
-            .await
-            .unwrap()
-            {
-                idle = true;
-                break;
-            }
-        }
-        assert!(idle);
-    }
+    drain_preview_worker(&f.store, &service).await;
     assert!(preview_paths.iter().all(|p| !p.exists()));
     for (summary, bytes) in &permanent {
         assert_eq!(

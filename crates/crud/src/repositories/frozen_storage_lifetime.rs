@@ -2256,6 +2256,9 @@ impl FrozenStorageLifetimeProgress {
         if fanout_checked {
             self.sweep_fanout = false;
             if frozen_sweep_work::fanout_step(store).await? {
+                for round in &mut self.sweep_round {
+                    round.invalidate();
+                }
                 return Ok(true);
             }
         }
@@ -2292,8 +2295,13 @@ impl FrozenStorageLifetimeProgress {
             frozen_sweep_work::Admission::Continue => return Ok(true),
             frozen_sweep_work::Admission::Idle => {
                 // Empty physical admission is not EOF while propagation continues.
-                let more =
-                    (!fanout_checked && frozen_sweep_work::fanout_step(store).await?) || active > 0;
+                let propagated = !fanout_checked && frozen_sweep_work::fanout_step(store).await?;
+                if propagated {
+                    for round in &mut self.sweep_round {
+                        round.invalidate();
+                    }
+                }
+                let more = propagated || active > 0;
                 if !more {
                     self.sweep_round = Default::default();
                 }

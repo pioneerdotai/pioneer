@@ -1539,8 +1539,24 @@ mod tests {
 
         let mut immediate = resumable_run("deadline-immediate");
         immediate.queued_at = None;
-        store
+        let immediate = store
             .create_hook_run(immediate, timestamp(100))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.next_hook_recovery_deadline(10_000).await.unwrap(),
+            Some(timestamp(100).timestamp()),
+            "normal creation supplies its queue timestamp"
+        );
+        // Legacy queued rows can lack that timestamp; cover an actual SQL NULL
+        // rather than an input normalized by create_hook_run.
+        hook_run::Entity::update_many()
+            .col_expr(
+                hook_run::Column::QueuedAt,
+                Expr::value(None::<DateTimeWithTimeZone>),
+            )
+            .filter(hook_run::Column::Id.eq(immediate.id.as_str()))
+            .exec(&store.database_connection())
             .await
             .unwrap();
         assert_eq!(

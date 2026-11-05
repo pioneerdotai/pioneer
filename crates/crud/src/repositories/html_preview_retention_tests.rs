@@ -3083,7 +3083,7 @@ async fn blocked_io_recovery_revisits_an_older_row_with_a_growing_suffix() {
         .unwrap();
     }
     tx.commit().await.unwrap();
-    f.sql("UPDATE html_preview_io_work SET state='blocked' WHERE family='copies'")
+    f.sql("UPDATE html_preview_io_work SET state='blocked',due_at=NULL WHERE family='copies'")
         .await;
     let upper = f.store.html_preview_io_recovery_frontier().await.unwrap();
     let mut after = f
@@ -3103,7 +3103,7 @@ async fn blocked_io_recovery_revisits_an_older_row_with_a_growing_suffix() {
         .connection
         .execute_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
-            "UPDATE html_preview_io_work SET state='blocked' WHERE family='copies' AND object_id=?",
+            "UPDATE html_preview_io_work SET state='blocked',due_at=NULL WHERE family='copies' AND object_id=?",
             [first.object_id.clone().into()],
         ))
         .await

@@ -8484,6 +8484,21 @@ async fn history_check_retries_are_durable_bounded_and_cas_protected() {
     );
     publish_history_check_root(&store).await;
     let mut now = 1000;
+    // Finish the real lifecycle bootstrap/scope obligations first. They have
+    // independent deadlines even while this history root is owned.
+    for _ in 0..16 {
+        let seed = store
+            .compaction_expand_lifecycle_scope(true, &|| 1000)
+            .await
+            .unwrap();
+        let scopes = store
+            .compaction_expand_lifecycle_scope(false, &|| 1000)
+            .await
+            .unwrap();
+        if seed + scopes == 0 {
+            break;
+        }
+    }
     let owned_root = [("ws".to_owned(), "thread".to_owned())];
     assert!(
         store

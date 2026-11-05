@@ -29,7 +29,7 @@ impl Routes {
         self.reads.lock().unwrap().clear();
         self.writes.lock().unwrap().clear();
     }
-    fn assert_single_read(&self, outcome: SqliteReadOutcome) {
+    fn assert_reads(&self, outcome: SqliteReadOutcome, count: usize) {
         let reads = self.reads.lock().unwrap();
         let operations: Vec<_> = reads
             .iter()
@@ -40,7 +40,10 @@ impl Routes {
                 _ => None,
             })
             .collect();
-        assert_eq!(operations, [(SqliteReadClass::Maintenance, outcome)]);
+        assert_eq!(
+            operations,
+            vec![(SqliteReadClass::Maintenance, outcome); count]
+        );
         assert!(reads.iter().any(|event| matches!(
             event,
             SqliteReadEvent::AdmissionReleased {
@@ -238,7 +241,7 @@ async fn direct_roots_and_task_release_set_match_final_guard_without_preparation
         assert_unprepared(&preparation);
         assert_eq!(accounting.held, u64::from(held));
         assert_eq!(accounting.expired + accounting.refused, 0);
-        routes.assert_single_read(SqliteReadOutcome::Ok);
+        routes.assert_reads(SqliteReadOutcome::Ok, 1);
         // Independently execute the unchanged final writer guard. Terminal
         // Tasks release an otherwise unreferenced, mature empty history.
         assert_eq!(
@@ -326,9 +329,9 @@ async fn positive_visit_keeps_cursor_accounting_and_periodic_revisit_after_root_
     progress.phase = 2;
     routes.clear();
     assert!(progress.quantum(&store).await.unwrap());
-    // Discovery returns the complete lightweight header in one reader call;
+    // Discovery captures the finite frontier and then the lightweight header;
     // the next quantum still owns the independent root/hold preflight.
-    routes.assert_single_read(SqliteReadOutcome::Ok);
+    routes.assert_reads(SqliteReadOutcome::Ok, 2);
     assert_eq!(
         progress.expiry.as_ref().unwrap().header.id,
         descriptor.manifest_id
@@ -342,7 +345,7 @@ async fn positive_visit_keeps_cursor_accounting_and_periodic_revisit_after_root_
     assert_eq!(progress.expiry_after, "origin");
     assert_eq!(progress.accounting.held, 1);
     assert_eq!(progress.accounting.expired, 0);
-    routes.assert_single_read(SqliteReadOutcome::Ok);
+    routes.assert_reads(SqliteReadOutcome::Ok, 1);
     progress.phase = 2;
     assert!(progress.quantum(&store).await.unwrap());
     assert!(progress.pass_done[2] && progress.expiry_after.is_empty());
@@ -409,7 +412,7 @@ async fn preflight_db_error_preserves_visit_and_retries_before_preparation() {
         progress.accounting.held + progress.accounting.expired + progress.accounting.refused,
         0
     );
-    routes.assert_single_read(SqliteReadOutcome::Error);
+    routes.assert_reads(SqliteReadOutcome::Error, 1);
     store
         .connection
         .execute_unprepared("ALTER TABLE unavailable_output RENAME TO compaction_task_output")
@@ -422,7 +425,7 @@ async fn preflight_db_error_preserves_visit_and_retries_before_preparation() {
     assert!(progress.expiry.is_none() && !progress.pass_done[2]);
     assert_eq!(progress.accounting.held, 1);
     assert_eq!(progress.expiry_after, "origin");
-    routes.assert_single_read(SqliteReadOutcome::Ok);
+    routes.assert_reads(SqliteReadOutcome::Ok, 1);
     assert!(store.frozen_readers.lock().unwrap().is_empty());
 }
 
@@ -622,7 +625,11 @@ async fn expiry_page16_preserves_each_positive_root_and_uses_no_writer() {
         )).await.unwrap();
     }
     // Leave only the seventeen rooted headers in this expiry discovery pass.
-    store.connection.execute_unprepared("UPDATE compaction_frozen_history SET expired=1 WHERE id='origin'").await.unwrap();
+    store
+        .connection
+        .execute_unprepared("UPDATE compaction_frozen_history SET expired=1 WHERE id='origin'")
+        .await
+        .unwrap();
     routes.clear();
     let mut progress = FrozenStorageLifetimeProgress::default();
     for _ in 0..34 {
@@ -630,11 +637,23 @@ async fn expiry_page16_preserves_each_positive_root_and_uses_no_writer() {
     }
     assert_eq!(progress.accounting.held, 17);
     assert!(routes.writes.lock().unwrap().is_empty());
-    let reads = routes.reads.lock().unwrap().iter().filter(|event|
-        matches!(event, SqliteReadEvent::OperationFinished { .. })
-    ).count();
+    let reads = routes
+        .reads
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|event| matches!(event, SqliteReadEvent::OperationFinished { .. }))
+        .count();
     // One finite frontier, two header pages and seventeen individual root queries.
     assert_eq!(reads, 20);
     assert!(!progress.expiry_quantum(&store).await.unwrap());
-    assert_eq!(history::Entity::find().filter(history::Column::Expired.eq(0)).all(&store.connection).await.unwrap().len(), 17);
+    assert_eq!(
+        history::Entity::find()
+            .filter(history::Column::Expired.eq(0))
+            .all(&store.connection)
+            .await
+            .unwrap()
+            .len(),
+        17
+    );
 }

@@ -355,8 +355,8 @@ mod tests {
         );
         assert_eq!(
             observer.operations() - before,
-            2,
-            "time budget stops the NEXT operation, after one complete scope step"
+            3,
+            "time budget stops the NEXT operation after frontier, scope page and witness"
         );
         let before = observer.operations();
         assert!(
@@ -494,8 +494,8 @@ mod tests {
         );
         assert_eq!(
             observer.operations() - operations,
-            2,
-            "only current scope step completes after wait"
+            3,
+            "only current scope step (frontier, page and witness) completes after wait"
         );
 
         let held = store.database_connection().begin_read().await.unwrap();
@@ -707,7 +707,7 @@ mod tests {
             );
 
             admission.done[1] = false;
-            // Initial locator and proof discovery each issue one metadata read.
+            // Locator and proof discovery each capture a frontier and read a page.
             // Repeating the three conversion discovery reads would change the count.
             for _ in 0..2 {
                 let before = observer.operations();
@@ -723,7 +723,7 @@ mod tests {
                     .await
                     .unwrap()
                 );
-                assert_eq!(observer.operations() - before, 1);
+                assert_eq!(observer.operations() - before, 2);
                 assert!(admission.done[0]);
             }
             if finish_lifetime {

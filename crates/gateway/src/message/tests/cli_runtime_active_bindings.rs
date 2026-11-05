@@ -291,10 +291,15 @@ async fn control_owner_restores_command_committed_between_discovery_and_wait() {
                 .list_running_turn_item_attempts_for_turn("codex-turn-command")
                 .await
                 .unwrap();
-            if attempts.iter().any(|attempt| {
+            if let Some(attempt) = attempts.iter().find(|attempt| {
                 attempt.item_id == item
                     && attempt.last_heartbeat_at_unix.is_some_and(|at| at >= now)
             }) {
+                assert_eq!(
+                    attempt.started_at_unix,
+                    now - 120,
+                    "a fresh projection lease must preserve historical business time"
+                );
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;

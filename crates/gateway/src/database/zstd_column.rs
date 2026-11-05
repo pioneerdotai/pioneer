@@ -2032,15 +2032,9 @@ mod tests {
                 .await
                 .unwrap();
         }
-        // Skip the worker's actual idle delay after repopulating both sources.
-        // Resume wall-clock timers before DB/CPU waits, so test timeouts do not
-        // auto-advance while SQLite's native threads complete their work.
-        tokio::time::pause();
-        tokio::time::advance(std::time::Duration::from_secs(
-            super::PERIODIC_MAINTENANCE_INTERVAL_SECONDS,
-        ))
-        .await;
-        tokio::time::resume();
+        // The fixture writes raw view rows above; publish the source wake
+        // supplied by normal CRUD writers. Empty maintenance has no idle timer.
+        db.work_signal("maintenance.zstd").notify();
         tokio::time::timeout(std::time::Duration::from_secs(5), worker)
             .await
             .unwrap()

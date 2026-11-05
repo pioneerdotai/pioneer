@@ -378,6 +378,13 @@ pub(super) struct ServiceRound {
     pub(super) after_row: i64,
     pub(super) until_row: i64,
     complete: bool,
+    propagated: bool,
+}
+
+impl ServiceRound {
+    pub(super) fn invalidate(&mut self) {
+        self.propagated = true;
+    }
 }
 
 pub(super) enum Completion {
@@ -410,12 +417,19 @@ pub(super) async fn discover(
     kind: i64,
     round: &mut ServiceRound,
 ) -> Result<Admission> {
-    if round.complete {
-        return Ok(Admission::Idle);
-    }
-    if round.until_row > 0 && round.after_row >= round.until_row {
-        round.complete = true;
-        return Ok(Admission::Idle);
+    let has_active = active.iter().any(|(_, active_kind)| *active_kind == kind);
+    if round.complete || (round.until_row > 0 && round.after_row >= round.until_row) {
+        if !round.propagated {
+            round.complete = true;
+            return Ok(Admission::Idle);
+        }
+        // Finish the finite frontier before revisiting keys invalidated by
+        // fanout behind it. An ACK can release a pre-fanout deletion fence
+        // without changing that source's work revision again.
+        *round = ServiceRound::default();
+        // The active visit may still carry the old revision. Excluding it
+        // from admission is not proof that its propagated generation is done.
+        round.propagated = has_active;
     }
     let mut due = Query::select();
     due.expr(Expr::val(1))
@@ -453,6 +467,7 @@ pub(super) async fn discover(
     // No due non-active work means idle without walking future-retry pages.
     if store.connection.query_one_raw(due).await?.is_none() {
         round.complete = true;
+        round.propagated &= has_active;
         return Ok(Admission::Idle);
     }
     if round.after_row >= round.until_row {
@@ -471,6 +486,8 @@ pub(super) async fn discover(
             .ok_or_else(|| anyhow::anyhow!("work frontier missing"))?
             .try_get("", "until_row")?;
         round.after_row = 0;
+        // This frontier already includes propagation completed before its capture.
+        round.propagated &= has_active;
     }
     // Stable insertion order, not mutable retry_at or TEXT order. New rows
     // cannot enter this round; re-dirty/retry cannot move a visited row ahead.

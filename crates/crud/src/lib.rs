@@ -33815,7 +33815,7 @@ impl CrudStore {
                 unactivated_terminal: None,
             },
             generate_id(DB_ID_LEN),
-            unix_to_datetime(timestamp + 60),
+            &|| unix_to_datetime(timestamp + 60),
             None,
             None,
         )
@@ -33845,7 +33845,7 @@ impl CrudStore {
             },
             generate_id(DB_ID_LEN),
             // An expired claim models the lost projector, without a timed wait.
-            now,
+            &|| now,
             Some(execution_owner_id),
             None,
         )
@@ -33918,8 +33918,15 @@ impl CrudStore {
     ) -> Result<()> {
         let claim_token = generate_id(DB_ID_LEN);
         let created_at = unix_to_datetime(event_timestamp_secs);
-        let claim_expires_at =
-            unix_to_datetime(event_timestamp_secs.saturating_add(TURN_EVENT_PROJECTION_LEASE_SECS));
+        // Canonical event time may be historical. Start the scheduling lease
+        // only after writer admission, independently of that business timestamp.
+        let claim_expires_at = || {
+            unix_to_datetime(
+                chrono::Utc::now()
+                    .timestamp()
+                    .saturating_add(TURN_EVENT_PROJECTION_LEASE_SECS),
+            )
+        };
         let execution_owner_id = execution_owner_id.map(str::to_owned);
 
         self.run_serialized_turn_event_materialization(|| {
@@ -33929,7 +33936,7 @@ impl CrudStore {
                 projection_context.clone(),
                 claim_token.clone(),
                 created_at,
-                claim_expires_at,
+                &claim_expires_at,
                 execution_owner_id.clone(),
                 operation_guard.clone(),
             )
@@ -33944,7 +33951,7 @@ impl CrudStore {
         projection_context: TurnEventProjectionContext,
         claim_token: String,
         created_at: DateTimeWithTimeZone,
-        claim_expires_at: DateTimeWithTimeZone,
+        claim_expires_at: &(dyn Fn() -> DateTimeWithTimeZone + Send + Sync),
         execution_owner_id: Option<String>,
         operation_guard: Option<sea_orm::Statement>,
     ) -> Result<()> {
@@ -34745,7 +34752,7 @@ impl CrudStore {
         created_at: DateTimeWithTimeZone,
         projection_context: TurnEventProjectionContext,
         claim_token: String,
-        claim_expires_at: DateTimeWithTimeZone,
+        claim_expires_at: &(dyn Fn() -> DateTimeWithTimeZone + Send + Sync),
         execution_owner_id: Option<&str>,
         operation_guard: Option<sea_orm::Statement>,
     ) -> Result<Option<crate::events::AppendedTurnEvent>> {
@@ -34945,7 +34952,7 @@ impl CrudStore {
                     sequence: appended_event.sequence,
                     projection_context_json,
                     claim_token,
-                    claim_expires_at,
+                    claim_expires_at: claim_expires_at(),
                     created_at,
                 },
             )
@@ -55148,7 +55155,7 @@ mod tests {
                 unix_to_datetime(timestamp + 1),
                 context.clone(),
                 "interruption_projection_owner".to_owned(),
-                unix_to_datetime(timestamp + 61),
+                &|| unix_to_datetime(timestamp + 61),
                 None,
                 None,
             )

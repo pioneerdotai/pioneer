@@ -3565,6 +3565,10 @@ impl MessageProcessor {
                     // A failed durable deferral/claim must not spin on coalesced
                     // kicks. The quantum has released all database capacity.
                     tokio::time::sleep(Duration::from_secs(5)).await;
+                    // Retry settlement after one backoff. A failed discovery
+                    // cannot supply a valid deadline head; querying it here
+                    // could add a second backoff before the same retry.
+                    continue;
                 }
 
                 // The raw due head covers quota continuation even if no row
@@ -3581,10 +3585,9 @@ impl MessageProcessor {
                         continue;
                     }
                 };
-                if storage_failed
-                    || this
-                        .native_terminal_effect_kick_pending
-                        .load(Ordering::Acquire)
+                if this
+                    .native_terminal_effect_kick_pending
+                    .load(Ordering::Acquire)
                 {
                     tokio::task::yield_now().await;
                     continue;

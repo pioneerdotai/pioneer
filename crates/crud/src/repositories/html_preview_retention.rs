@@ -1085,7 +1085,10 @@ async fn release(store: &CrudStore, candidate: artifact::Model) -> Result<()> {
             )
         })
         .collect::<std::collections::BTreeMap<_, _>>();
-    let change = store.connection.work_signal("maintenance.zstd").changing();
+    // Retirement releases physical blob references, including when no readable
+    // copy ticket exists. Reopen GC that already passed this source's key.
+    let changes = ["maintenance.zstd", "maintenance.html"]
+        .map(|domain| store.connection.work_signal(domain).changing());
     let changed = store
         .run_serialized_write(|| async {
             let tx = store.connection.begin().await?;
@@ -1231,7 +1234,9 @@ async fn release(store: &CrudStore, candidate: artifact::Model) -> Result<()> {
             Ok(true)
         })
         .await?;
-    change.completed(changed);
+    for change in changes {
+        change.completed(changed);
+    }
     if changed && !copy_obligations.is_empty() {
         store.notify_html_preview_io_work();
     }
