@@ -4,6 +4,23 @@ use crate::reconciliation::TaskStartupReconciler;
 use crate::scheduler::TaskScheduler;
 use sea_orm::{ColumnTrait, QueryFilter};
 
+async fn drain_immediate_reconciliation(reconciler: &TaskStartupReconciler, now: i64) {
+    // Bootstrap occurrence seeding has its own finite continuation. Finish it
+    // before asserting that the owner can park on a run's lease or error retry.
+    for _ in 0..16 {
+        if reconciler
+            .next_wake_deadline(now)
+            .await
+            .unwrap()
+            .is_none_or(|at| at > now)
+        {
+            return;
+        }
+        reconciler.reconcile(now).await.unwrap();
+    }
+    panic!("initial reconciliation did not finish its bounded work");
+}
+
 #[tokio::test]
 async fn due_run_page_filters_future_work_before_limit_and_rotates() {
     let runtime = runtime().await;
@@ -1643,6 +1660,7 @@ async fn waiting_review_with_current_execution_lease_does_not_recover_or_wake() 
     let reconciler =
         TaskStartupReconciler::new(store.clone(), bus.clone(), executors, scheduler.handle());
     reconciler.reconcile(now).await.unwrap();
+    drain_immediate_reconciliation(&reconciler, now).await;
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     let lease = store
         .load_execution_for_run(&run.id)
@@ -1831,6 +1849,7 @@ async fn waiting_review_recovery_error_retries_without_another_recovery_event() 
     let scheduler = TaskScheduler::new(store.clone(), bus.clone(), executors.clone());
     let reconciler = TaskStartupReconciler::new(store.clone(), bus, executors, scheduler.handle());
     assert!(reconciler.reconcile(now).await.is_err());
+    drain_immediate_reconciliation(&reconciler, now).await;
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert_eq!(
         reconciler.next_wake_deadline(now).await.unwrap(),
