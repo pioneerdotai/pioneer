@@ -8818,7 +8818,7 @@ async fn one_shot_replacement_after_prior_runs_is_consumed_once_via_both_inputs(
                     .await
                     .unwrap();
             }
-            runtime.service().process_due_once(100).await.unwrap();
+            runtime.process_due_once(100).await.unwrap();
             let state = runtime
                 .service()
                 .store()
@@ -8828,7 +8828,7 @@ async fn one_shot_replacement_after_prior_runs_is_consumed_once_via_both_inputs(
                 .unwrap();
             assert_eq!(state.runs.len(), assignment + 1);
             assert_eq!(state.triggers[0].status, TaskTriggerStatus::Exhausted);
-            runtime.service().process_due_once(100).await.unwrap();
+            runtime.process_due_once(100).await.unwrap();
             assert_eq!(
                 runtime
                     .service()
