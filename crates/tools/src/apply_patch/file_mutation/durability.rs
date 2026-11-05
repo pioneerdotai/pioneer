@@ -293,10 +293,12 @@ fn unsupported_metadata_presence(path: &Path) -> Result<UnsupportedMetadataPrese
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn is_acl_xattr(name: &[u8]) -> bool {
     name == b"system.posix_acl_access" || name == b"system.posix_acl_default"
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn is_preservation_relevant_extended_attribute(name: &[u8]) -> bool {
     if is_acl_xattr(name) {
         return false;
