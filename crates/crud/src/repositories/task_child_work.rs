@@ -32,6 +32,7 @@ pub enum ChildScope {
     CreatorThread(String),
     AcceptedSource(String),
     ParentThread(String),
+    #[cfg(test)]
     HistoricalSeed,
 }
 impl ChildScope {
@@ -54,6 +55,7 @@ impl ChildScope {
             Self::CreatorThread(k) => ("creator-thread", k.clone()),
             Self::AcceptedSource(k) => ("accepted-source", k.clone()),
             Self::ParentThread(k) => ("parent-thread", k.clone()),
+            #[cfg(test)]
             Self::HistoricalSeed => ("historical-seed", "v1".into()),
         }
     }

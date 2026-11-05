@@ -1533,7 +1533,7 @@ async fn publish(
         "portable publication affected invalid row count"
     );
     if affected == 0 && matches!(family, Family::CliMapping | Family::TaskHistory) {
-        let invalid = target!(family, |Target, Col, key, field, reference| {
+        let invalid = target!(family, |Target, Col, key, _field, _reference| {
             Target::find()
                 .select_only()
                 .expr(Expr::cust(invalid_root_sql(family)))

@@ -46,7 +46,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.67.0"
+version = "0.68.0"
 edition = "2024"
 license = "MIT"
 authors = ["Pioneer Contributors"]
@@ -220,6 +220,6 @@ process-wrap = { version = "10", features = ["tokio1"] }
 
 [patch.crates-io]
 transcribe-rs = { path = "vendor/transcribe-rs/patched" }
-gpui-fast-macos = { git = "https://github.com/pioneerdotai/gpui-fast", rev = "b870cdb1dbc60bf2cb09b04f287aa8ca778ca3d2" }
-gpui-fast-windows = { git = "https://github.com/pioneerdotai/gpui-fast", rev = "b870cdb1dbc60bf2cb09b04f287aa8ca778ca3d2" }
-gpui-fast-linux = { git = "https://github.com/pioneerdotai/gpui-fast", rev = "b870cdb1dbc60bf2cb09b04f287aa8ca778ca3d2" }
+gpui-fast-macos = { git = "https://github.com/pioneerdotai/gpui-fast", rev = "4ade107d5211b8be4aaf8a961d80a03e0cd85116" }
+gpui-fast-windows = { git = "https://github.com/pioneerdotai/gpui-fast", rev = "4ade107d5211b8be4aaf8a961d80a03e0cd85116" }
+gpui-fast-linux = { git = "https://github.com/pioneerdotai/gpui-fast", rev = "4ade107d5211b8be4aaf8a961d80a03e0cd85116" }

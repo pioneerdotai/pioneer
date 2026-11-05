@@ -432,6 +432,7 @@ pub async fn discover<C: ConnectionTrait>(
         .context("failed to discover eligible event work")
 }
 
+#[cfg(test)]
 pub async fn claim_due<C: ConnectionTrait>(
     db: &C,
     now: DateTimeWithTimeZone,
@@ -545,6 +546,7 @@ fn next_for_healthy_stream() -> sea_orm::sea_query::SimpleExpr {
     )
 }
 
+#[cfg(test)]
 pub async fn list_due<C: ConnectionTrait>(
     db: &C,
     now: DateTimeWithTimeZone,

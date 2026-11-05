@@ -122,20 +122,6 @@ pub async fn exists<C: ConnectionTrait>(db: &C, turn_id: &str) -> Result<bool> {
         != 0)
 }
 
-pub async fn list_prepared<C: ConnectionTrait>(
-    db: &C,
-    limit: u64,
-) -> Result<Vec<turn_finalization::Model>> {
-    turn_finalization::Entity::find()
-        .filter(turn_finalization::Column::Status.eq(STATUS_PREPARED))
-        .order_by_asc(turn_finalization::Column::PreparedAt)
-        .order_by_asc(turn_finalization::Column::TurnId)
-        .limit(limit)
-        .all(db)
-        .await
-        .context("failed to list prepared turn finalizations")
-}
-
 pub async fn list_prepared_ids<C: ConnectionTrait>(db: &C, limit: u64) -> Result<Vec<String>> {
     turn_finalization::Entity::find()
         .select_only()
