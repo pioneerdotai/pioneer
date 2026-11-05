@@ -510,27 +510,6 @@ jobs:
             echo 'the prepared release must remain draft until all assets are ready' >&2; exit 1;
           }
 
-          # Keep human-authored draft notes and append the migration notice once.
-          # It also applies to users arriving from older CU installs in later releases.
-          gh release view "${GITHUB_REF_NAME}" --json isDraft,body > release-draft.json
-          python3 <<'PYNOTES'
-          import json
-          from pathlib import Path
-
-          draft = json.loads(Path('release-draft.json').read_text())
-          if draft.get('isDraft') is not True:
-              raise ValueError('the prepared release must remain draft until all assets are ready')
-          body = draft['body']
-          notice = Path('.github/release-notes/0.66.0-computer-use-migration.md').read_text()
-          marker = '<!-- pioneer-computer-use-migration-0.66.0 -->'
-          notes = Path('release-draft-notes.md')
-          notes.unlink(missing_ok=True)
-          if marker not in body:
-              notes.write_text(body + ('\n\n' if body else '') + notice)
-          PYNOTES
-          if [[ -f release-draft-notes.md ]]; then
-            gh release edit "${GITHUB_REF_NAME}" --notes-file release-draft-notes.md
-          fi
           gh release upload "${GITHUB_REF_NAME}" "${files[@]}" --clobber
           gh release view "${GITHUB_REF_NAME}" --json assets > release-remote-inventory.json
           python3 <<'PYREMOTE'

@@ -1,6 +1,5 @@
 [workspace]
 resolver = "3"
-exclude = ["vendor/transcribe-rs/patched"]
 members = [
   "crates/agent",
   "crates/compaction",
@@ -173,7 +172,7 @@ shell-words = "1.1"
 keepawake = "0.6"
 cpal = "0.18"
 tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
-transcribe-rs = { version = "0.3.11", features = ["onnx", "whisper-cpp"] }
+transcribe-rs = { version = "0.3.12", features = ["onnx", "whisper-cpp"] }
 
 # Agent memory capsule store
 memvid-core = { git = "https://github.com/pioneerdotai/memory", tag = "v4.1.0", default-features = false, features = ["lex", "temporal_track", "simd", "vec"] }
@@ -219,7 +218,6 @@ rmcp = { version = "3.5", default-features = false, features = ["auth", "client"
 process-wrap = { version = "10", features = ["tokio1"] }
 
 [patch.crates-io]
-transcribe-rs = { path = "vendor/transcribe-rs/patched" }
 gpui-fast-macos = { git = "https://github.com/pioneerdotai/gpui-fast", rev = "4ade107d5211b8be4aaf8a961d80a03e0cd85116" }
 gpui-fast-windows = { git = "https://github.com/pioneerdotai/gpui-fast", rev = "4ade107d5211b8be4aaf8a961d80a03e0cd85116" }
 gpui-fast-linux = { git = "https://github.com/pioneerdotai/gpui-fast", rev = "4ade107d5211b8be4aaf8a961d80a03e0cd85116" }
