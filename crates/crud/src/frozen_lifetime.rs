@@ -18,8 +18,18 @@ pub(crate) type ReaderCounts = Arc<Mutex<BTreeMap<String, usize>>>;
 pub struct FrozenReadHold {
     readers: ReaderCounts,
     manifest: String,
+    released: Option<pioneer_sqlite::WorkSignal>,
 }
 impl FrozenReadHold {
+    pub(crate) fn register_on(
+        readers: &ReaderCounts,
+        manifest: &str,
+        database: &pioneer_sqlite::SqliteDatabase,
+    ) -> Self {
+        let mut hold = Self::register(readers, manifest);
+        hold.released = Some(database.work_signal("maintenance.frozen.release"));
+        hold
+    }
     pub(crate) fn register(readers: &ReaderCounts, manifest: &str) -> Self {
         *readers
             .lock()
@@ -29,6 +39,7 @@ impl FrozenReadHold {
         Self {
             readers: readers.clone(),
             manifest: manifest.to_owned(),
+            released: None,
         }
     }
 }
@@ -42,6 +53,10 @@ impl Drop for FrozenReadHold {
             *count -= 1;
             if *count == 0 {
                 readers.remove(&self.manifest);
+                drop(readers);
+                if let Some(signal) = &self.released {
+                    signal.notify();
+                }
             }
         }
     }
@@ -325,7 +340,11 @@ impl crate::CrudStore {
         self.run_serialized_write(|| async {
             let tx = self.connection.begin().await?;
             let header = exact_header(&tx, workspace, descriptor).await?;
-            let hold = FrozenReadHold::register(&self.frozen_readers, &descriptor.manifest_id);
+            let hold = FrozenReadHold::register_on(
+                &self.frozen_readers,
+                &descriptor.manifest_id,
+                &self.connection,
+            );
             tx.commit().await?;
             Ok((header, hold))
         })

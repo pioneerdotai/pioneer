@@ -2882,6 +2882,10 @@ mod tests {
             let mut memvid = Memvid::open(&path).unwrap();
             let frame = memvid.frame_by_id(seed_output.frame_id as u64).unwrap();
             let limit = frame.payload_offset + frame.payload_length + 1024;
+            #[expect(
+                deprecated,
+                reason = "The local capacity fixture needs a tiny unsigned ticket; signed tickets require the upstream private key"
+            )]
             memvid
                 .apply_ticket(
                     memvid_core::Ticket::new("batch-capacity-test", 2).capacity_bytes(limit),

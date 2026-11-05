@@ -249,10 +249,8 @@ fn display_name_from_path(path: &str) -> Option<String> {
 mod tests {
     use super::*;
     use pioneer_protocol::{
-        DeltaOutputPolicy, LlmOutputPolicy, LlmRetentionPolicy, RecoveryAction,
-        RecoveryOutputPolicy, StorageOutputPolicy, TimelineOutputPolicy, ToolMetadata,
-        ToolOutputPolicySnapshot, ToolRecoveryIdempotencyMode, ToolRecoveryPolicySnapshot,
-        ToolRecoveryRetryClass,
+        DeltaOutputPolicy, LlmOutputPolicy, LlmRetentionPolicy, RecoveryOutputPolicy,
+        StorageOutputPolicy, TimelineOutputPolicy, ToolOutputPolicySnapshot,
     };
     use serde_json::json;
 
@@ -371,19 +369,6 @@ mod tests {
             storage: StorageOutputPolicy::MetadataOnly,
             recovery: RecoveryOutputPolicy::MetadataOnly,
             deltas: DeltaOutputPolicy::Disabled,
-        }
-    }
-
-    fn recovery_policy() -> ToolRecoveryPolicySnapshot {
-        ToolRecoveryPolicySnapshot {
-            retry_class: ToolRecoveryRetryClass::Never,
-            idempotency_mode: ToolRecoveryIdempotencyMode::None,
-            max_attempts: 0,
-            can_resume: false,
-            resolved_action: RecoveryAction::MarkFailed,
-            base_backoff_secs: 0,
-            max_wall_clock_secs: 0,
-            no_progress_limit: 0,
         }
     }
 }

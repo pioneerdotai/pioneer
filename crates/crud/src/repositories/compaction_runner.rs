@@ -388,8 +388,8 @@ pub(crate) async fn compaction_bind_execution_turn<C: ConnectionTrait>(
     db: &C,
     operation: &str,
     turn: &str,
-) -> Result<()> {
-    compaction_operation::Entity::update_many()
+) -> Result<bool> {
+    let changed = compaction_operation::Entity::update_many()
         .col_expr(
             compaction_operation::Column::ExecutionTurn,
             Expr::Value(turn.into()),
@@ -469,7 +469,7 @@ pub(crate) async fn compaction_bind_execution_turn<C: ConnectionTrait>(
             .is_some(),
         "execution turn binding conflicts with operation scope"
     );
-    Ok(())
+    Ok(changed.rows_affected > 0)
 }
 
 pub(crate) async fn compaction_prepare_runner<C: ConnectionTrait>(
@@ -478,7 +478,7 @@ pub(crate) async fn compaction_prepare_runner<C: ConnectionTrait>(
     budget: &ModelBudget,
     source_count: u64,
     reference_count: u64,
-) -> Result<()> {
+) -> Result<bool> {
     ensure!(
         source_count > 0,
         "compaction needs a selected source or previous checkpoint"
@@ -490,40 +490,41 @@ pub(crate) async fn compaction_prepare_runner<C: ConnectionTrait>(
     );
     let source_count = i64::try_from(source_count)?;
     let reference_count = i64::try_from(reference_count)?;
-    db.execute(
-        &Query::insert()
-            .into_table(compaction_runner_plan::Entity)
-            .columns([
-                compaction_runner_plan::Column::OperationId,
-                compaction_runner_plan::Column::SourceCount,
-                compaction_runner_plan::Column::ReferenceCount,
-                compaction_runner_plan::Column::Descriptor,
-            ])
-            .select_from(
-                compaction_operation::Entity::find()
-                    .select_only()
-                    .expr(Expr::col(compaction_operation::Column::Id))
-                    .expr(Expr::Value(source_count.into()))
-                    .expr(Expr::Value(reference_count.into()))
-                    .expr(Expr::Value(descriptor.clone().into()))
-                    .filter(
-                        Expr::col(compaction_operation::Column::Id)
-                            .eq(Expr::Value(operation.into()))
-                            .and(
-                                Expr::col(compaction_operation::Column::Status)
-                                    .eq(Expr::val("running")),
-                            ),
-                    )
-                    .into_query(),
-            )?
-            .on_conflict(
-                OnConflict::columns(["operation_id"])
-                    .do_nothing()
-                    .to_owned(),
-            )
-            .to_owned(),
-    )
-    .await?;
+    let changed = db
+        .execute(
+            &Query::insert()
+                .into_table(compaction_runner_plan::Entity)
+                .columns([
+                    compaction_runner_plan::Column::OperationId,
+                    compaction_runner_plan::Column::SourceCount,
+                    compaction_runner_plan::Column::ReferenceCount,
+                    compaction_runner_plan::Column::Descriptor,
+                ])
+                .select_from(
+                    compaction_operation::Entity::find()
+                        .select_only()
+                        .expr(Expr::col(compaction_operation::Column::Id))
+                        .expr(Expr::Value(source_count.into()))
+                        .expr(Expr::Value(reference_count.into()))
+                        .expr(Expr::Value(descriptor.clone().into()))
+                        .filter(
+                            Expr::col(compaction_operation::Column::Id)
+                                .eq(Expr::Value(operation.into()))
+                                .and(
+                                    Expr::col(compaction_operation::Column::Status)
+                                        .eq(Expr::val("running")),
+                                ),
+                        )
+                        .into_query(),
+                )?
+                .on_conflict(
+                    OnConflict::columns(["operation_id"])
+                        .do_nothing()
+                        .to_owned(),
+                )
+                .to_owned(),
+        )
+        .await?;
     let exact = compaction_runner_plan::Entity::find()
         .select_only()
         .expr(Expr::col(compaction_runner_plan::Column::OperationId))
@@ -547,7 +548,7 @@ pub(crate) async fn compaction_prepare_runner<C: ConnectionTrait>(
         .one(db)
         .await?;
     ensure!(exact.is_some(), "runner plan idempotency conflict");
-    Ok(())
+    Ok(changed.rows_affected() > 0)
 }
 pub(crate) async fn compaction_runner_plan<C: ConnectionTrait>(
     db: &C,
@@ -854,7 +855,7 @@ pub(crate) async fn compaction_activate_runner(
     store: &CrudStore,
     operation: &str,
     initial: &RunnerState,
-) -> Result<()> {
+) -> Result<bool> {
     ensure!(
         initial.generation == 0
             && initial.attempts == 0
@@ -1006,7 +1007,7 @@ pub(crate) async fn compaction_activate_runner(
                 valid.is_some(),
                 "manifest is incomplete or admission expired"
             );
-            compaction_runner_state::Entity::insert(compaction_runner_state::ActiveModel {
+            let inserted = compaction_runner_state::Entity::insert(compaction_runner_state::ActiveModel {
                 operation_id: sea_orm::Set((operation).to_owned()),
                 generation: sea_orm::Set(0_i64),
                 state: sea_orm::Set((encoded.clone()).to_owned()),
@@ -1018,16 +1019,17 @@ pub(crate) async fn compaction_activate_runner(
             )
             .exec_without_returning(&txn)
             .await?;
-            compaction_runner_plan::Entity::update_many()
+            let ready = compaction_runner_plan::Entity::update_many()
                 .col_expr(compaction_runner_plan::Column::Ready, Expr::val(1_i64))
                 .filter(
                     Expr::col(compaction_runner_plan::Column::OperationId)
                         .eq(Expr::Value(operation.into())),
                 )
+                .filter(compaction_runner_plan::Column::Ready.ne(1_i64))
                 .exec(&txn)
                 .await?;
             txn.commit().await?;
-            Ok(())
+            Ok(inserted > 0 || ready.rows_affected > 0)
         })
         .await
 }
@@ -1287,7 +1289,7 @@ pub(crate) async fn compaction_finish_execution<C: ConnectionTrait>(
     deadline_ms: u64,
     status: &str,
     outcome: &str,
-) -> Result<()> {
+) -> Result<bool> {
     ensure!(
         matches!(
             (status, outcome),
@@ -1295,20 +1297,21 @@ pub(crate) async fn compaction_finish_execution<C: ConnectionTrait>(
         ),
         "invalid reconciliation reason"
     );
-    db.execute_raw(Statement::from_sql_and_values(
-        sea_orm::DbBackend::Sqlite,
-        "UPDATE compaction_operation SET status=?4,outcome=?5 WHERE id=?1 AND status='running'
+    let changed = db
+        .execute_raw(Statement::from_sql_and_values(
+            sea_orm::DbBackend::Sqlite,
+            "UPDATE compaction_operation SET status=?4,outcome=?5 WHERE id=?1 AND status='running'
          AND deadline_ms=?2 AND (?3 IS NULL OR execution_turn=?3)",
-        [
-            operation.into(),
-            i64::try_from(deadline_ms)?.into(),
-            execution_turn.into(),
-            status.into(),
-            outcome.into(),
-        ],
-    ))
-    .await?;
-    Ok(())
+            [
+                operation.into(),
+                i64::try_from(deadline_ms)?.into(),
+                execution_turn.into(),
+                status.into(),
+                outcome.into(),
+            ],
+        ))
+        .await?;
+    Ok(changed.rows_affected() > 0)
 }
 
 /// Shared preparation for foreground reconciliation and pending repair. Decode
@@ -1340,10 +1343,11 @@ pub(super) fn reconciled_terminal_runner(
 /// Complete the state record after a control-plane terminal fence. No
 /// attempt can advance past that fence. Preparation reads one bounded row;
 /// the write revalidates its generation and durable terminal classification.
+/// The internal bool reports the CAS outcome, independently of the state DTO.
 pub(crate) async fn compaction_reconcile_runner_state(
     store: &CrudStore,
     operation: &str,
-) -> Result<Option<RunnerState>> {
+) -> Result<(Option<RunnerState>, bool)> {
     use sea_orm::QuerySelect;
     let row = compaction_runner_state::Entity::find_by_id(operation)
         .inner_join(compaction_operation::Entity)
@@ -1367,12 +1371,12 @@ pub(crate) async fn compaction_reconcile_runner_state(
         .one(&store.connection)
         .await?;
     let Some((state, status, outcome)) = row else {
-        return Ok(None);
+        return Ok((None, false));
     };
     let state: RunnerState = serde_json::from_str(&state)?;
     let terminal = reconciled_terminal_runner(&state, &status, outcome.as_deref())?;
     if terminal == state {
-        return Ok(Some(state));
+        return Ok((Some(state), false));
     }
     let encoded = serde_json::to_string(&terminal)?;
     ensure!(
@@ -1422,10 +1426,10 @@ pub(crate) async fn compaction_reconcile_runner_state(
             .exec(&store.connection)
             .await?;
     if changed.rows_affected == 1 {
-        return Ok(Some(terminal));
+        return Ok((Some(terminal), true));
     }
     // A concurrent reconciler may have won the same idempotent transition.
-    store.compaction_runner_state(operation).await
+    Ok((store.compaction_runner_state(operation).await?, false))
 }
 
 pub(crate) async fn compaction_manifest_page<C: ConnectionTrait>(

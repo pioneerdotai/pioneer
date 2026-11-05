@@ -131,6 +131,30 @@ async fn initialize_inner(
     app_config: &AppConfig,
     startup: Option<&pioneer_observability::GatewayStartupTrace>,
 ) -> Result<SqliteDatabase> {
+    let ownership = pioneer_sqlite::WriterOwnership::acquire(&gateway_database_path(
+        runtime_home,
+        app_config,
+    )?)?;
+    let runtime_home = runtime_home.to_path_buf();
+    let app_config = app_config.clone();
+    let startup = startup.cloned();
+    // This owned, idempotent bootstrap finishes even if its requester leaves.
+    // Otherwise cancelled pool creation could release the process lock while
+    // SQLx is still opening/configuring the physical writer. No services or
+    // watchers are started here; a discarded result closes its pools.
+    tokio::spawn(async move {
+        initialize_owned(&runtime_home, &app_config, startup.as_ref(), ownership).await
+    })
+    .await
+    .context("database initialization owner failed")?
+}
+
+async fn initialize_owned(
+    runtime_home: &Path,
+    app_config: &AppConfig,
+    startup: Option<&pioneer_observability::GatewayStartupTrace>,
+    ownership: Arc<pioneer_sqlite::WriterOwnership>,
+) -> Result<SqliteDatabase> {
     let database_open_stage =
         startup.map(|trace| trace.stage(pioneer_observability::GatewayStartupStage::DatabaseOpen));
     let config = GatewayDatabaseRuntimeConfig::from_app_config(app_config)?;
@@ -141,14 +165,30 @@ async fn initialize_inner(
     let writer_url = sqlite_connection_url(database_path.as_path());
     let query_fingerprints = Arc::new(QueryFingerprintLimiter::default());
 
-    let mut writer = Database::connect(connect_options(
+    let mut writer_options = connect_options(
         writer_url.clone(),
         WRITER_MAX_CONNECTIONS,
         &config,
         "pioneer-sqlite-writer-",
-    ))
-    .await
-    .with_context(|| format!("failed to connect to gateway writer `{writer_url}`"))?;
+    );
+    let weak_ownership = Arc::downgrade(&ownership);
+    writer_options.map_sqlx_sqlite_pool_opts(move |options| {
+        let ownership = weak_ownership.clone();
+        options
+            .acquire_time_level(log::LevelFilter::Trace)
+            .after_connect(move |connection, _| {
+                let ownership = ownership.clone();
+                Box::pin(async move {
+                    let ownership = ownership.upgrade().ok_or_else(|| {
+                        sea_orm::sqlx::Error::Protocol("database writer owner closed".into())
+                    })?;
+                    ownership.retain_on_connection(connection).await
+                })
+            })
+    });
+    let mut writer = Database::connect(writer_options)
+        .await
+        .with_context(|| format!("failed to connect to gateway writer `{writer_url}`"))?;
     if let Some(stage) = database_open_stage {
         stage.succeed();
     }
@@ -162,7 +202,8 @@ async fn initialize_inner(
         query_fingerprints.clone(),
     );
 
-    let writer = SqliteWriteExecutor::with_observer(writer, super::write_observer());
+    let writer = SqliteWriteExecutor::with_observer(writer, super::write_observer())
+        .retain_ownership(ownership);
     writer
         .ping(SqliteWriteClass::Maintenance)
         .await
@@ -289,7 +330,13 @@ fn configure_observability(
     max_connections: u32,
     query_fingerprints: Arc<QueryFingerprintLimiter>,
 ) {
+    // SeaORM's callback belongs to the connection wrapper, not the SQLx pool.
+    // Keep this anchor there; the global metrics registry must not own a pool
+    // (and hence its native writer ownership) after bootstrap is discarded.
+    let pool_lifetime = Arc::new(connection.get_sqlite_connection_pool().clone());
+    let observed_pool = Arc::downgrade(&pool_lifetime);
     connection.set_metric_callback(move |info| {
+        let _pool_lifetime = &pool_lifetime;
         let (enabled, generation) = pioneer_observability::telemetry_consent_snapshot();
         if !enabled {
             return;
@@ -324,13 +371,17 @@ fn configure_observability(
             Some(generation),
         );
     });
-    let pool = connection.get_sqlite_connection_pool().clone();
     pioneer_observability::register_database_pool_observer(
         role,
         u64::from(max_connections),
-        move || pioneer_observability::DatabasePoolSnapshot {
-            size: u64::from(pool.size()),
-            idle: u64::try_from(pool.num_idle()).unwrap_or(u64::MAX),
+        move || {
+            let Some(pool) = observed_pool.upgrade() else {
+                return pioneer_observability::DatabasePoolSnapshot { size: 0, idle: 0 };
+            };
+            pioneer_observability::DatabasePoolSnapshot {
+                size: u64::from(pool.size()),
+                idle: u64::try_from(pool.num_idle()).unwrap_or(u64::MAX),
+            }
         },
     );
 }
@@ -412,6 +463,55 @@ pub(crate) async fn initialize_existing_for_operations(
     }
 
     initialize(runtime_home, app_config).await.map(Some)
+}
+
+/// Preserve operator commands' existing offline migration behavior. Online
+/// reads share no writable connection with the active owner and need no lock.
+pub(crate) async fn read_existing_for_operations(
+    runtime_home: &Path,
+    app_config: &AppConfig,
+) -> Result<Option<SqliteDatabase>> {
+    let path = gateway_database_path(runtime_home, app_config)?;
+    match std::fs::metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+        Ok(_) => {}
+    }
+    match initialize_existing_for_operations(runtime_home, app_config).await {
+        Ok(database) => return Ok(database),
+        Err(error) if error.downcast_ref::<pioneer_sqlite::WriterBusy>().is_some() => {}
+        Err(error) => return Err(error),
+    }
+    pioneer_sqlite::zstd::register_auto_extension_once()
+        .context("failed to register SQLite extensions for operator reads")?;
+    let config = GatewayDatabaseRuntimeConfig::from_app_config(app_config)?;
+    let mut options = connect_options(
+        sqlite_read_only_connection_url(&path),
+        1,
+        &config,
+        "pioneer-sqlite-operator-reader-",
+    );
+    options.map_sqlx_sqlite_opts(|options| {
+        options
+            .read_only(true)
+            .create_if_missing(false)
+            .pragma("query_only", "ON")
+    });
+    let mut reader = Database::connect(options)
+        .await
+        .context("open operator read-only database")?;
+    configure_observability(
+        &mut reader,
+        pioneer_observability::DatabaseRole::Reader,
+        1,
+        Arc::new(QueryFingerprintLimiter::default()),
+    );
+    let writer = SqliteWriteExecutor::with_observer(reader.clone(), super::write_observer());
+    let database =
+        SqliteDatabase::from_executor_with_read_observer(reader, writer, super::read_observer())
+            .maintenance();
+    database.validate_reader().await?;
+    Ok(Some(database))
 }
 
 #[cfg(test)]
@@ -634,6 +734,84 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["select payload from turn_event where sequence=? and id=?"]
         );
+    }
+
+    // Unlike explicit close, bootstrap error/cancellation and discarded task
+    // output must release ownership through pool Drop with metrics registered.
+    #[tokio::test]
+    async fn observed_bootstrap_pool_drops_on_error_cancel_and_discard() {
+        pioneer_observability::init_otlp_observability(
+            pioneer_observability::OtlpTelemetryConfig {
+                metrics_endpoint: "http://127.0.0.1:9/v1/metrics".into(),
+                traces_endpoint: "http://127.0.0.1:9/v1/traces".into(),
+                export_interval: std::time::Duration::from_secs(900),
+                export_timeout: std::time::Duration::from_millis(100),
+                deployment_environment: None,
+                service_version: None,
+            },
+        )
+        .unwrap();
+        assert!(
+            pioneer_observability::register_database_pool_observer(
+                pioneer_observability::DatabaseRole::Writer,
+                1,
+                || pioneer_observability::DatabasePoolSnapshot { size: 0, idle: 0 },
+            ),
+            "the regression requires an active observer registry"
+        );
+        for mode in 0..3 {
+            let runtime = tempfile::tempdir().unwrap();
+            let mut config = pioneer_config::AppConfig::load().unwrap();
+            config.gateway.database.file_name = format!("observed-bootstrap-{mode}.db");
+            let path = super::gateway_database_path(runtime.path(), &config).unwrap();
+            let home = runtime.path().to_owned();
+            let (ready, initialized) = tokio::sync::oneshot::channel();
+            let (release, released) = tokio::sync::oneshot::channel();
+            let task = tokio::spawn(async move {
+                let database = super::initialize(&home, &config).await?;
+                ready.send(()).unwrap();
+                let _ = released.await;
+                if mode == 0 {
+                    anyhow::bail!("bootstrap caller rejected initialized pools");
+                }
+                Ok::<_, anyhow::Error>(database)
+            });
+            initialized.await.unwrap();
+            assert!(pioneer_sqlite::WriterOwnership::acquire(&path).is_err());
+            match mode {
+                0 => {
+                    release.send(()).unwrap();
+                    assert!(task.await.unwrap().is_err());
+                }
+                1 => {
+                    task.abort();
+                    assert!(task.await.unwrap_err().is_cancelled());
+                    drop(release);
+                }
+                _ => {
+                    drop(task);
+                    release.send(()).unwrap();
+                }
+            }
+            // Native dispatched work may still be finishing; never force-unlock
+            // it. The owner must disappear naturally without explicit close.
+            let ownership = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                loop {
+                    match pioneer_sqlite::WriterOwnership::acquire(&path) {
+                        Ok(owner) => break owner,
+                        Err(error)
+                            if error.downcast_ref::<pioneer_sqlite::WriterBusy>().is_some() =>
+                        {
+                            tokio::task::yield_now().await
+                        }
+                        Err(error) => panic!("unexpected reopen failure: {error:#}"),
+                    }
+                }
+            })
+            .await
+            .expect("observer must not retain a writer without Gateway");
+            drop(ownership);
+        }
     }
 
     #[tokio::test]

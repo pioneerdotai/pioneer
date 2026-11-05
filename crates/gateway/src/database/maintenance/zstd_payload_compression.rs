@@ -14,11 +14,25 @@ pub(crate) async fn run(
     cancellation: tokio_util::sync::CancellationToken,
     mut cache: PreparedDictionaryCache,
 ) {
+    let database = crud_store.database_connection();
+    let mut wake = database.work_signal("maintenance.zstd").subscribe();
     loop {
         if cancellation.is_cancelled() {
             return;
         }
+        let pass = tokio::select! {
+            _ = cancellation.cancelled() => return,
+            pass = wake.begin_pass(&database) => pass,
+        };
+        if pass.is_err() {
+            tokio::select! {
+                _ = cancellation.cancelled() => return,
+                _ = tokio::time::sleep(Duration::from_secs(PERIODIC_MAINTENANCE_INTERVAL_SECONDS)) => {},
+            }
+            continue;
+        }
         let mut made_progress_with_backlog = false;
+        let mut idle = false;
         match run_cooperative_maintenance_cycle(
             crud_store.as_ref(),
             &mut cache,
@@ -36,9 +50,12 @@ pub(crate) async fn run(
                 );
             }
             Ok(outcome) => {
+                idle = outcome
+                    .summaries
+                    .iter()
+                    .all(|summary| !summary.maintenance_runnable);
                 for summary in outcome.summaries {
-                    made_progress_with_backlog |= summary.maintenance_more_pending
-                        && summary.pending_before > summary.pending_after;
+                    made_progress_with_backlog |= summary.maintenance_runnable;
                     if summary.pending_before == 0
                         && summary.pending_after == 0
                         && !summary.enabled_now
@@ -76,6 +93,13 @@ pub(crate) async fn run(
             after_cycle(&cache);
         }
 
+        if idle {
+            tokio::select! {
+                _ = cancellation.cancelled() => return,
+                _ = wake.wait(None) => {},
+            }
+            continue;
+        }
         let delay = if made_progress_with_backlog {
             Duration::from_millis(PERIODIC_BACKLOG_RECHECK_MILLIS)
         } else {

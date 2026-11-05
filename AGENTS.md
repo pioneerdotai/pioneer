@@ -73,6 +73,34 @@ repository method, SQL text at the call site, or an arbitrary timeout. Do not
 promote background work to interactive or critical to make a test or latency
 symptom disappear.
 
+## Background Work and Idle
+
+- After startup/backlog reaches EOF, wait for a relevant change or a known
+  domain deadline. Do not add periodic empty database discovery, TTL-based
+  rescans, or longer polling intervals as a substitute for correct wakeups.
+  Timers must serve a concrete obligation: due work, lease, error backoff,
+  active heartbeat, or an explicitly justified periodic duty.
+- Reuse existing domain owners and notification protocols. For shared database
+  invalidation, use runtime-owned `WorkSignal` subscriptions; independent
+  consumers need independent subscriptions. Do not add another job engine,
+  durable queue, or competing worker to repair a missing wakeup.
+- Acknowledge invalidation before discovery, once per finite pass, not between
+  batches. A full batch is not EOF: continue with bounded quanta and yield.
+  Preserve fairness when new work arrives beyond the captured frontier.
+- Notify after the relevant commit and release of database resources. Preserve
+  `WorkChange` handling of unknown outcomes and writer settlement after
+  cancellation; a notification in `Drop` alone cannot cover a late commit.
+  Successful ACK/no-change operations must not cause endless self-wakes.
+- Changes to eligibility, earlier deadlines, dependencies, read holds or
+  capacity must wake the affected owner, including changes behind its cursor.
+  Preserve wall-clock deadline semantics and startup/restart/shutdown recovery.
+- Database state, claims, leases and CAS remain authoritative; signals only
+  request rediscovery. Preserve cooperative writable database ownership:
+  process-local notifications cannot cover an independent process writer.
+- For affected behavior, reuse or extend focused regressions for wake/sleep
+  races, continuation without new input, deadlines, release and cancellation.
+  A successful turn does not establish idle behavior or measured CPU savings.
+
 ## Never Hold Database Capacity During Other Work
 
 A writer reservation, write transaction, read transaction, query stream, or

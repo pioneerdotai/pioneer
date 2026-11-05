@@ -9,11 +9,24 @@ use tokio_util::sync::CancellationToken;
 /// table nor a continuous live backlog monopolizes this maintenance worker.
 pub(super) async fn run(store: Arc<CrudStore>, cancellation: CancellationToken) {
     let store = store.with_maintenance_access();
+    let database = store.database_connection();
+    let mut wake = database.work_signal("maintenance.native").subscribe();
     let mut bootstrap_pending = true;
     let mut bootstrap_next = true;
     let mut last_log = Instant::now();
     let mut progress = Progress::default();
     loop {
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return,
+            result = wake.begin_pass(&database) => if result.is_err() {
+                tokio::select! {
+                    _ = cancellation.cancelled() => return,
+                    _ = tokio::time::sleep(Duration::from_secs(60)) => {},
+                }
+                continue;
+            },
+        }
         let started = Instant::now();
         let bootstrap_phase = bootstrap_pending && bootstrap_next;
         bootstrap_next = !bootstrap_next;
@@ -44,6 +57,7 @@ pub(super) async fn run(store: Arc<CrudStore>, cancellation: CancellationToken) 
             ) => result,
         };
         progress.quanta += 1;
+        let idle = matches!(&result, Ok(true)) && !bootstrap_pending;
         let pause = match result {
             Ok(empty) if empty && !bootstrap_pending => Duration::from_secs(60),
             Ok(_) => started
@@ -91,6 +105,20 @@ pub(super) async fn run(store: Arc<CrudStore>, cancellation: CancellationToken) 
             );
             progress = Progress::default();
             last_log = Instant::now();
+        }
+        if idle {
+            let deadline = tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => return,
+                result = store.native_event_cleanup_deadline() => result,
+            };
+            if let Ok(deadline) = deadline {
+                tokio::select! {
+                    _ = cancellation.cancelled() => return,
+                    _ = wake.wait(deadline) => {},
+                }
+                continue;
+            }
         }
         tokio::select! {
             biased;

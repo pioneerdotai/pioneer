@@ -90,3 +90,151 @@ pub(crate) fn materialize_task_events(
         .map(DeferredAppendedTaskEvent::into_owned)
         .collect()
 }
+
+/// Covers only Task mutations that can create runnable/dependent work. The
+/// guard starts outside DB admission so cancellation retains uncertainty.
+pub(crate) struct TaskWorkChange(Vec<pioneer_sqlite::WorkChange>);
+impl TaskWorkChange {
+    pub(crate) fn new(database: &pioneer_sqlite::SqliteDatabase) -> Self {
+        Self(
+            [
+                "tasks.scheduler",
+                "tasks.lifecycle",
+                "tasks.fanout",
+                "tasks.review",
+                "compaction",
+                "maintenance.frozen",
+                "maintenance.portable",
+                "maintenance.html",
+            ]
+            .into_iter()
+            .map(|domain| database.work_signal(domain).changing())
+            .collect(),
+        )
+    }
+    pub(crate) fn completed(self, changed: bool) {
+        for change in self.0 {
+            change.completed(changed);
+        }
+    }
+}
+
+pub(crate) fn inserted_task_events(events: &[AppendedTaskEvent]) -> bool {
+    events.iter().any(|event| event.append_status.is_inserted())
+}
+
+impl crate::CrudStore {
+    pub async fn next_task_event_fanout_deadline(&self) -> anyhow::Result<Option<i64>> {
+        crate::repositories::task_event_fanout::next_deadline(&self.connection).await
+    }
+    pub async fn next_task_occurrence_reconcile_deadline(
+        &self,
+        now: i64,
+    ) -> anyhow::Result<Option<i64>> {
+        if self.occurrence_compatibility_cursors[1]
+            .lock()
+            .await
+            .has_more()
+        {
+            return Ok(Some(now));
+        }
+        crate::repositories::task_occurrence_reconcile::next_deadline(&self.connection, now).await
+    }
+}
+
+impl crate::CrudStore {
+    pub async fn next_queued_task_ready_deadline(&self, now: i64) -> anyhow::Result<Option<i64>> {
+        crate::repositories::task_run::next_ready_deadline(&self.connection, now).await
+    }
+}
+
+/// Only Turn identity/status facts feed the existing Task dirty-ticket
+/// producers. Keep payloads out of this comparison and never notify for a
+/// repeated finalization or an item-only event.
+pub(crate) struct TaskTurnChange {
+    change: pioneer_sqlite::WorkChange,
+    before: Vec<(String, TurnDependencyFacts)>,
+}
+impl TaskTurnChange {
+    pub(crate) async fn begin(
+        database: &pioneer_sqlite::SqliteDatabase,
+        ids: Vec<String>,
+    ) -> anyhow::Result<Self> {
+        let change = database.work_signal("tasks.lifecycle").changing();
+        let mut ids = ids;
+        ids.sort();
+        ids.dedup();
+        let mut before = Vec::with_capacity(ids.len());
+        for id in ids {
+            before.push((id.clone(), turn_dependency_facts(database, &id).await?));
+        }
+        Ok(Self { change, before })
+    }
+    pub(crate) async fn completed(
+        self,
+        database: &pioneer_sqlite::SqliteDatabase,
+    ) -> anyhow::Result<()> {
+        let mut changed = false;
+        for (id, before) in self.before {
+            changed |= before != turn_dependency_facts(database, &id).await?;
+        }
+        self.change.completed(changed);
+        Ok(())
+    }
+}
+#[derive(PartialEq, Eq)]
+struct TurnDependencyFacts {
+    turn: Option<(String, String, String)>,
+    receipt: Option<(i64, Option<i64>, String)>,
+}
+async fn turn_dependency_facts(
+    database: &pioneer_sqlite::SqliteDatabase,
+    id: &str,
+) -> anyhow::Result<TurnDependencyFacts> {
+    use pioneer_entity::{turn, turn_event_projection_stream_state as stream};
+    use sea_orm::{EntityTrait, QuerySelect};
+    let turn = turn::Entity::find_by_id(id.to_owned())
+        .select_only()
+        .columns([
+            turn::Column::ThreadId,
+            turn::Column::Status,
+            turn::Column::TurnKind,
+        ])
+        .into_tuple::<(String, String, String)>()
+        .one(database)
+        .await?;
+    let receipt = stream::Entity::find_by_id(id.to_owned())
+        .select_only()
+        .columns([
+            stream::Column::ProjectedThroughSequence,
+            stream::Column::AcceptedTerminalSequence,
+            stream::Column::Status,
+        ])
+        .into_tuple::<(i64, Option<i64>, String)>()
+        .one(database)
+        .await?;
+    Ok(TurnDependencyFacts { turn, receipt })
+}
+
+impl crate::CrudStore {
+    /// Call after the existing Gateway child/parent/delivery bounded pass.
+    /// Errors remain errors; a saturated quantum can additionally continue
+    /// immediately before consulting these durable deadlines.
+    pub async fn next_task_lifecycle_deadline(&self, now: i64) -> anyhow::Result<Option<i64>> {
+        if self.occurrence_compatibility_cursors[0]
+            .lock()
+            .await
+            .has_more()
+        {
+            return Ok(Some(now));
+        }
+        let child = self.next_task_child_work_deadline(now).await?;
+        let parent =
+            crate::repositories::task_run_occurrence_reconcile::next_deadline(&self.connection)
+                .await?;
+        let delivery =
+            crate::repositories::task_delivery::next_work_deadline(&self.connection, now, 300)
+                .await?;
+        Ok(child.into_iter().chain(parent).chain(delivery).min())
+    }
+}

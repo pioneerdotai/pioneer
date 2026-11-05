@@ -72,14 +72,28 @@ pub(crate) async fn backfill_ready<C: ConnectionTrait>(db: &C) -> Result<bool> {
 pub(crate) async fn next_stream<C: ConnectionTrait>(
     db: &C,
     after_turn_id: Option<&str>,
+    through_turn_id: Option<&str>,
 ) -> Result<Option<CleanupStream>> {
-    CleanupStream::find_by_statement(discovery_statement(after_turn_id))
+    CleanupStream::find_by_statement(discovery_statement(after_turn_id, through_turn_id, false))
         .one(db)
         .await
         .context("failed to discover receipt cleanup stream")
 }
 
-fn discovery_statement(after_turn_id: Option<&str>) -> Statement {
+pub(crate) async fn upper_bound<C: ConnectionTrait>(db: &C) -> Result<Option<String>> {
+    Ok(
+        CleanupStream::find_by_statement(discovery_statement(None, None, true))
+            .one(db)
+            .await?
+            .map(|row| row.turn_id),
+    )
+}
+
+fn discovery_statement(
+    after_turn_id: Option<&str>,
+    through_turn_id: Option<&str>,
+    reverse: bool,
+) -> Statement {
     // Require the work index: SQLite may otherwise choose the status index
     // and sort healthy history before LIMIT. Keep this predicate identical to
     // the partial index, with literal comparisons for either keyset page.
@@ -90,6 +104,13 @@ fn discovery_statement(after_turn_id: Option<&str>) -> Statement {
     } else {
         ""
     };
+    let bound = if let Some(through) = through_turn_id {
+        values.push(through.to_owned().into());
+        " AND turn_id <= ?"
+    } else {
+        ""
+    };
+    let direction = if reverse { " DESC" } else { "" };
     Statement::from_sql_and_values(
         sea_orm::DbBackend::Sqlite,
         format!(
@@ -98,8 +119,8 @@ fn discovery_statement(after_turn_id: Option<&str>) -> Statement {
              FROM turn_event_projection_stream_state \
              INDEXED BY idx_turn_event_projection_stream_cleanup_work \
              WHERE status = 'healthy' AND receipts_compacted_through_sequence >= 0 \
-             AND projected_through_sequence > receipts_compacted_through_sequence{seek} \
-             ORDER BY turn_id LIMIT 1"
+             AND projected_through_sequence > receipts_compacted_through_sequence{seek}{bound} \
+             ORDER BY turn_id{direction} LIMIT 1"
         ),
         values,
     )

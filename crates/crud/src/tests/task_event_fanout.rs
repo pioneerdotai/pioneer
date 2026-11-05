@@ -51,22 +51,16 @@ async fn progress(store: &CrudStore, task_id: &str, message: &str) -> crate::App
         .await
         .unwrap()
 }
-// Drain through consecutive idle quanta, including each registered family’s EOF.
+// False is EOF for all registered families, not one empty family quantum.
 // Keep the same progress owner so a later append exercises rescan after EOF.
 async fn finish_portable_payload_pass(
     store: &CrudStore,
     worker: &mut crate::PortablePayloadProgress,
 ) {
     let maintenance = store.with_maintenance_access();
-    let mut idle = 0;
     for _ in 0..2048 {
-        if worker.quantum(&maintenance).await.unwrap() {
-            idle = 0;
-        } else {
-            idle += 1;
-            if idle == 16 {
-                return;
-            }
+        if !worker.quantum(&maintenance).await.unwrap() {
+            return;
         }
     }
     panic!("portable payload pass did not finish within fixture budget");

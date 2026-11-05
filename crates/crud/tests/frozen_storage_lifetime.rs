@@ -1561,15 +1561,10 @@ async fn assert_portable_logical_reads(store: &CrudStore, originals: &[String; 5
 
 async fn portable_schema_backfill(store: &CrudStore) {
     let mut progress = pioneer_crud::PortablePayloadProgress::default();
-    let mut idle = 0;
     for _ in 0..1024 {
-        if progress.quantum(store).await.unwrap() {
-            idle = 0;
-        } else {
-            idle += 1;
-            if idle == 16 {
-                return;
-            }
+        // False is EOF for all families, including staged publication and cleanup.
+        if !progress.quantum(store).await.unwrap() {
+            return;
         }
     }
     panic!("portable schema fixture exceeded its maintenance budget");

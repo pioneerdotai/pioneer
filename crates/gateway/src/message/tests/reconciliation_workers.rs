@@ -96,23 +96,18 @@ async fn native_terminal_effect_kick_defers_coalesced_retry_after_storage_failur
             .native_terminal_effect_kick_running
             .load(Ordering::Acquire)
     );
-    tokio::time::advance(Duration::from_millis(1001)).await;
-    timeout(Duration::from_millis(100), async {
-        while processor
-            .native_terminal_effect_kick_running
-            .load(Ordering::Acquire)
-        {
-            sleep(Duration::from_millis(1)).await;
-        }
-    })
-    .await
-    .expect("kick must release running after the second delay");
+    // Persistent failure retains retry authority without another producer.
+    // Shutdown must also cancel a worker parked in an UNKNOWN writer fence.
+    processor.shutdown_resilience_workers().await;
     assert!(
         !processor
             .native_terminal_effect_kick_running
             .load(Ordering::Acquire)
     );
-    assert!(failures_rx.try_recv().is_err(), "only two quanta may run");
+    assert!(
+        failures_rx.try_recv().is_err(),
+        "shutdown admits no later retry"
+    );
 }
 
 async fn assert_native_kick_database_scope(terminal_effects: bool) {

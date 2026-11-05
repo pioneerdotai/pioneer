@@ -67,6 +67,12 @@ pub(crate) struct AuditCursor {
     upper_id: Option<String>,
 }
 
+impl AuditCursor {
+    pub(crate) fn has_more(&self) -> bool {
+        self.upper_id.is_some()
+    }
+}
+
 impl CrudStore {
     pub(crate) async fn audit_legacy_occurrence_producers(&self, contract: bool) -> Result<()> {
         // Unknown metadata never verifies producer readiness. Continue this

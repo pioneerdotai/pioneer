@@ -140,7 +140,7 @@ fn classify_jwt(raw: &str) -> Result<PresentedCredentialKind, AuthError> {
 
 #[cfg(test)]
 mod tests {
-    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
     use super::*;
 

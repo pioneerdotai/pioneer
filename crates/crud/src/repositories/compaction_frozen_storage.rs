@@ -326,165 +326,189 @@ async fn publish(
     prefix: i64,
     verified: bool,
 ) -> Result<bool> {
-    let prefix = l.copy_to.unwrap_or(prefix);
-    if l.copy_to.is_none() {
-        layout::Entity::update_many()
-            .col_expr(layout::Column::CopyTo, Expr::val(prefix))
-            .filter(layout::Column::ManifestId.eq(&h.id))
-            .filter(layout::Column::Kind.eq(l.kind))
-            .filter(layout::Column::CopyTo.is_null())
-            .exec(&store.connection)
-            .await?;
-    }
-    let mut next = l.copy_next;
-    if let Some(base) = &l.candidate {
-        if next < prefix {
-            let spans = span::Entity::find()
-                .filter(span::Column::ManifestId.eq(base))
-                .filter(span::Column::Kind.eq(l.kind))
-                .filter(span::Column::Start.gte(next))
-                .filter(span::Column::Start.lt(prefix))
-                .order_by_asc(span::Column::Start)
-                .limit(ROWS)
-                .all(&store.connection)
-                .await?;
-            ensure!(!spans.is_empty(), "shared prefix range missing");
-            let mut prepared = Vec::new();
-            for s in spans {
-                ensure!(
-                    s.start == next && s.end > s.start,
-                    "shared prefix range gap"
-                );
-                let end = std::cmp::min(s.end, prefix);
-                prepared.push((next, end, s.source_manifest));
-                next = end;
-            }
-            let tx = store.connection.begin().await?;
-            checked_copy_dependencies(&tx, h, l).await?;
-            let state = layout::Entity::find_by_id((h.id.clone(), l.kind))
-                .one(&tx)
-                .await?
-                .ok_or_else(|| anyhow::anyhow!("copy state removed"))?;
-            ensure!(
-                state.active == 0
-                    && state.copy_next == l.copy_next
-                    && state.copy_to == Some(prefix)
-                    && state.candidate == l.candidate,
-                "copy progress changed"
-            );
-            for (start, end, source) in prepared {
-                exact_span_insert(&tx, &h.id, l.kind, start, end, &source).await?;
-            }
+    let changes = [
+        store
+            .connection
+            .work_signal("maintenance.portable")
+            .changing(),
+        store.connection.work_signal("maintenance.html").changing(),
+    ];
+    let frozen_change = store
+        .connection
+        .work_signal("maintenance.frozen")
+        .changing();
+    let mut published = false;
+    let result = async {
+        let prefix = l.copy_to.unwrap_or(prefix);
+        if l.copy_to.is_none() {
             layout::Entity::update_many()
-                .col_expr(layout::Column::CopyNext, Expr::val(next))
+                .col_expr(layout::Column::CopyTo, Expr::val(prefix))
                 .filter(layout::Column::ManifestId.eq(&h.id))
                 .filter(layout::Column::Kind.eq(l.kind))
-                .filter(layout::Column::CopyNext.eq(l.copy_next))
-                .exec(&tx)
+                .filter(layout::Column::CopyTo.is_null())
+                .exec(&store.connection)
                 .await?;
-            tx.commit().await?;
+        }
+        let mut next = l.copy_next;
+        if let Some(base) = &l.candidate {
             if next < prefix {
-                return Ok(false);
+                let spans = span::Entity::find()
+                    .filter(span::Column::ManifestId.eq(base))
+                    .filter(span::Column::Kind.eq(l.kind))
+                    .filter(span::Column::Start.gte(next))
+                    .filter(span::Column::Start.lt(prefix))
+                    .order_by_asc(span::Column::Start)
+                    .limit(ROWS)
+                    .all(&store.connection)
+                    .await?;
+                ensure!(!spans.is_empty(), "shared prefix range missing");
+                let mut prepared = Vec::new();
+                for s in spans {
+                    ensure!(
+                        s.start == next && s.end > s.start,
+                        "shared prefix range gap"
+                    );
+                    let end = std::cmp::min(s.end, prefix);
+                    prepared.push((next, end, s.source_manifest));
+                    next = end;
+                }
+                let tx = store.connection.begin().await?;
+                checked_copy_dependencies(&tx, h, l).await?;
+                let state = layout::Entity::find_by_id((h.id.clone(), l.kind))
+                    .one(&tx)
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("copy state removed"))?;
+                ensure!(
+                    state.active == 0
+                        && state.copy_next == l.copy_next
+                        && state.copy_to == Some(prefix)
+                        && state.candidate == l.candidate,
+                    "copy progress changed"
+                );
+                for (start, end, source) in prepared {
+                    exact_span_insert(&tx, &h.id, l.kind, start, end, &source).await?;
+                }
+                layout::Entity::update_many()
+                    .col_expr(layout::Column::CopyNext, Expr::val(next))
+                    .filter(layout::Column::ManifestId.eq(&h.id))
+                    .filter(layout::Column::Kind.eq(l.kind))
+                    .filter(layout::Column::CopyNext.eq(l.copy_next))
+                    .exec(&tx)
+                    .await?;
+                tx.commit().await?;
+                if next < prefix {
+                    return Ok(false);
+                }
             }
         }
-    }
-    if !verified {
-        return Ok(false);
-    }
-    let count = if l.kind == 0 {
-        h.message_count
-    } else {
-        h.import_count
-    };
-    ensure!(prefix <= count, "shared prefix exceeds capture");
-    let tx = store.connection.begin().await?;
-    let current = history::Entity::find_by_id(&h.id)
-        .one(&tx)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("capture removed"))?;
-    let state = layout::Entity::find_by_id((h.id.clone(), l.kind))
-        .one(&tx)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("capture layout removed"))?;
-    crate::frozen_lifetime::logical_bounds(&current)?;
-    if state.active != 0 {
-        tx.commit().await?;
-        return Ok(true);
-    }
-    ensure!(
-        current.workspace_id == h.workspace_id
-            && current.owner_thread == h.owner_thread
-            && current.identity_sha256 == h.identity_sha256
-            && current.imports_sha256 == h.imports_sha256
-            && current.message_count == h.message_count
-            && current.import_count == h.import_count
-            && current.ready == h.ready,
-        "capture changed before range publication"
-    );
-    if let Some(base) = &l.candidate {
+        if !verified {
+            return Ok(false);
+        }
+        let count = if l.kind == 0 {
+            h.message_count
+        } else {
+            h.import_count
+        };
+        ensure!(prefix <= count, "shared prefix exceeds capture");
+        let tx = store.connection.begin().await?;
+        let current = history::Entity::find_by_id(&h.id)
+            .one(&tx)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("capture removed"))?;
+        let state = layout::Entity::find_by_id((h.id.clone(), l.kind))
+            .one(&tx)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("capture layout removed"))?;
+        crate::frozen_lifetime::logical_bounds(&current)?;
+        if state.active != 0 {
+            tx.commit().await?;
+            return Ok(true);
+        }
         ensure!(
-            history::Entity::find_by_id(base)
-                .filter(history::Column::WorkspaceId.eq(&h.workspace_id))
-                .filter(history::Column::OwnerThread.eq(&h.owner_thread))
-                .filter(history::Column::Ready.eq(1))
-                .filter(history::Column::Expired.eq(0))
-                .filter(
-                    Expr::col((history::Entity, history::Column::NextOrdinal))
-                        .eq(Expr::col((history::Entity, history::Column::MessageCount)))
-                )
-                .filter(
-                    Expr::col((history::Entity, history::Column::NextImport))
-                        .eq(Expr::col((history::Entity, history::Column::ImportCount)))
-                )
-                .one(&tx)
-                .await?
-                .is_some(),
-            "shared prefix scope changed"
+            current.workspace_id == h.workspace_id
+                && current.owner_thread == h.owner_thread
+                && current.identity_sha256 == h.identity_sha256
+                && current.imports_sha256 == h.imports_sha256
+                && current.message_count == h.message_count
+                && current.import_count == h.import_count
+                && current.ready == h.ready,
+            "capture changed before range publication"
         );
-    }
-    ensure!(
-        state.candidate == l.candidate
-            && state.copy_to == Some(prefix)
-            && state.copy_next == prefix
-            && state.failed == 0
-            && state.pending == 1,
-        "range activation progress changed"
-    );
-    if h.ready != 0 && prefix < count {
-        exact_span_insert(&tx, &h.id, l.kind, prefix, count, &h.id).await?;
-    }
-    layout::Entity::update_many()
-        .col_expr(layout::Column::Active, Expr::val(1))
-        .col_expr(
-            layout::Column::Pending,
-            Expr::val(i64::from(h.ready != 0 && prefix > 0)),
-        )
-        .col_expr(layout::Column::Compared, Expr::val(prefix))
-        .col_expr(
-            layout::Column::CleanupTo,
-            Expr::val(if h.ready != 0 { prefix } else { 0 }),
-        )
-        .filter(layout::Column::ManifestId.eq(&h.id))
-        .filter(layout::Column::Kind.eq(l.kind))
-        .filter(layout::Column::Active.eq(0))
-        .exec(&tx)
-        .await?;
-    if h.ready == 0 {
-        history::Entity::update_many()
+        if let Some(base) = &l.candidate {
+            ensure!(
+                history::Entity::find_by_id(base)
+                    .filter(history::Column::WorkspaceId.eq(&h.workspace_id))
+                    .filter(history::Column::OwnerThread.eq(&h.owner_thread))
+                    .filter(history::Column::Ready.eq(1))
+                    .filter(history::Column::Expired.eq(0))
+                    .filter(
+                        Expr::col((history::Entity, history::Column::NextOrdinal))
+                            .eq(Expr::col((history::Entity, history::Column::MessageCount)))
+                    )
+                    .filter(
+                        Expr::col((history::Entity, history::Column::NextImport))
+                            .eq(Expr::col((history::Entity, history::Column::ImportCount)))
+                    )
+                    .one(&tx)
+                    .await?
+                    .is_some(),
+                "shared prefix scope changed"
+            );
+        }
+        ensure!(
+            state.candidate == l.candidate
+                && state.copy_to == Some(prefix)
+                && state.copy_next == prefix
+                && state.failed == 0
+                && state.pending == 1,
+            "range activation progress changed"
+        );
+        if h.ready != 0 && prefix < count {
+            exact_span_insert(&tx, &h.id, l.kind, prefix, count, &h.id).await?;
+        }
+        layout::Entity::update_many()
+            .col_expr(layout::Column::Active, Expr::val(1))
             .col_expr(
-                if l.kind == 0 {
-                    history::Column::NextOrdinal
-                } else {
-                    history::Column::NextImport
-                },
-                Expr::val(prefix),
+                layout::Column::Pending,
+                Expr::val(i64::from(h.ready != 0 && prefix > 0)),
             )
-            .filter(history::Column::Id.eq(&h.id))
+            .col_expr(layout::Column::Compared, Expr::val(prefix))
+            .col_expr(
+                layout::Column::CleanupTo,
+                Expr::val(if h.ready != 0 { prefix } else { 0 }),
+            )
+            .filter(layout::Column::ManifestId.eq(&h.id))
+            .filter(layout::Column::Kind.eq(l.kind))
+            .filter(layout::Column::Active.eq(0))
             .exec(&tx)
             .await?;
+        if h.ready == 0 {
+            history::Entity::update_many()
+                .col_expr(
+                    if l.kind == 0 {
+                        history::Column::NextOrdinal
+                    } else {
+                        history::Column::NextImport
+                    },
+                    Expr::val(prefix),
+                )
+                .filter(history::Column::Id.eq(&h.id))
+                .exec(&tx)
+                .await?;
+        }
+        tx.commit().await?;
+        published = true;
+        Ok(true)
     }
-    tx.commit().await?;
-    Ok(true)
+    .await;
+    if result.is_ok() {
+        // Only activation without remaining cleanup releases lifetime protection.
+        frozen_change.completed(published && (h.ready == 0 || l.copy_to.unwrap_or(prefix) == 0));
+        for change in changes {
+            change.completed(published);
+        }
+    }
+    result
 }
 
 async fn checked_copy_dependencies<C: ConnectionTrait>(
@@ -649,6 +673,18 @@ pub(crate) async fn maintain(
     if !progress.conversion_scope(store).await? {
         return Ok(true);
     }
+    if progress.conversion_upper.is_none() {
+        progress.conversion_upper = Some(
+            history::Entity::find()
+                .select_only()
+                .column(history::Column::Id)
+                .order_by_desc(history::Column::Id)
+                .into_tuple::<String>()
+                .one(&store.connection)
+                .await?
+                .unwrap_or_default(),
+        );
+    }
     if let Some(check) = progress.conversion.as_mut() {
         let result = check.step(store).await;
         match result {
@@ -694,6 +730,11 @@ pub(crate) async fn maintain(
     use sea_orm::QueryTrait;
     for kind in [0, 1] {
         let pending = layout::Entity::find()
+            .filter(layout::Column::ManifestId.gte(&progress.conversion_after[kind as usize]))
+            .filter(
+                layout::Column::ManifestId
+                    .lte(progress.conversion_upper.as_deref().unwrap_or_default()),
+            )
             .filter(layout::Column::Kind.eq(kind))
             .filter(layout::Column::Pending.eq(1))
             .filter(layout::Column::Failed.eq(0))
@@ -724,6 +765,7 @@ pub(crate) async fn maintain(
             .one(&store.connection)
             .await?;
         if let Some(l) = pending {
+            progress.conversion_after[kind as usize] = l.manifest_id.clone();
             if l.active == 0 && l.copy_to.is_some_and(|end| end == l.copy_next) {
                 let h = history::Entity::find_by_id(&l.manifest_id)
                     .one(&store.connection)
@@ -753,6 +795,8 @@ pub(crate) async fn maintain(
         }
     }
     let h = history::Entity::find()
+        .filter(history::Column::Id.gt(&progress.conversion_register_after))
+        .filter(history::Column::Id.lte(progress.conversion_upper.as_deref().unwrap_or_default()))
         .filter(history::Column::Ready.eq(1))
         .filter(history::Column::Expired.eq(0))
         .filter(
@@ -782,8 +826,15 @@ pub(crate) async fn maintain(
             .filter(history::Column::Id.eq(&h.id))
             .exec(&store.connection)
             .await?;
+        progress.conversion_register_after = h.id;
+        // Registration can create work below either layout cursor. Existing
+        // completed layouts are excluded by their durable pending predicate.
+        progress.conversion_after = Default::default();
         return Ok(true);
     }
+    progress.conversion_upper = None;
+    progress.conversion_after = Default::default();
+    progress.conversion_register_after.clear();
     Ok(false)
 }
 
@@ -904,6 +955,10 @@ async fn maintain_layout(
         }
         let statements =
             super::frozen_storage_lifetime::duplicate_cleanup_statements(&h, l, &keys)?;
+        let frozen_change = store
+            .connection
+            .work_signal("maintenance.frozen")
+            .changing();
         let tx = store.connection.begin().await?;
         let current = layout::Entity::find_by_id((h.id.clone(), l.kind))
             .one(&tx)
@@ -911,6 +966,7 @@ async fn maintain_layout(
             .ok_or_else(|| anyhow::anyhow!("cleanup layout removed"))?;
         if current.cleanup_next != l.cleanup_next {
             tx.commit().await?;
+            frozen_change.completed(false);
             return Ok(None);
         }
         // The generic lifetime sweep separately validates all reverse layouts
@@ -933,7 +989,7 @@ async fn maintain_layout(
                 super::frozen_storage_lifetime::PhysicalDeleteResult::refused()
             });
         }
-        layout::Entity::update_many()
+        let changed = layout::Entity::update_many()
             .col_expr(layout::Column::CleanupNext, Expr::val(end))
             .col_expr(
                 layout::Column::Pending,
@@ -944,6 +1000,8 @@ async fn maintain_layout(
             .exec(&tx)
             .await?;
         tx.commit().await?;
+        frozen_change
+            .completed(changed.rows_affected > 0 && current.pending != 0 && end >= l.cleanup_to);
         return Ok(deleted);
     }
     Ok(None)

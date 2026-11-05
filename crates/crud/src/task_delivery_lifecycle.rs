@@ -61,10 +61,18 @@ impl CrudStore {
         transition: TaskDeliveryTransition,
         at: i64,
     ) -> Result<TaskDeliveryTransitionOutcome<AppendedTaskEvent>> {
-        self.run_serialized_write(|| {
-            self.transition_task_delivery_once(event.clone(), transition, at, None)
-        })
-        .await
+        let change = crate::task_events::TaskWorkChange::new(&self.connection);
+        let result = async {
+            self.run_serialized_write(|| {
+                self.transition_task_delivery_once(event.clone(), transition, at, None)
+            })
+            .await
+        }
+        .await;
+        if let Ok(value) = &result {
+            change.completed(matches!(value, TaskDeliveryTransitionOutcome::Applied(event) if event.append_status.is_inserted()));
+        }
+        result
     }
 
     /// Recovery preparation reads a selected delivery, exact attempt and retry.
@@ -76,13 +84,21 @@ impl CrudStore {
         cutoff: i64,
         at: i64,
     ) -> Result<TaskDeliveryTransitionOutcome<AppendedTaskEvent>> {
-        self.transition_task_delivery_once(
-            event,
-            TaskDeliveryTransition::Recover { cutoff },
-            at,
-            Some(snapshot),
-        )
-        .await
+        let change = crate::task_events::TaskWorkChange::new(&self.connection);
+        let result = async {
+            self.transition_task_delivery_once(
+                event,
+                TaskDeliveryTransition::Recover { cutoff },
+                at,
+                Some(snapshot),
+            )
+            .await
+        }
+        .await;
+        if let Ok(value) = &result {
+            change.completed(matches!(value, TaskDeliveryTransitionOutcome::Applied(event) if event.append_status.is_inserted()));
+        }
+        result
     }
 
     async fn transition_task_delivery_once(
@@ -313,19 +329,32 @@ impl CrudStore {
         action: Option<crate::AgentCommitInput>,
         actor_id: Option<String>,
     ) -> Result<Vec<AppendedTaskEvent>> {
-        let mut appended = Vec::new();
-        if action.is_some() {
-            return self
-                .append_task_cancellation_quantum(events, at, action, actor_id)
-                .await;
-        }
-        for chunk in events.chunks(crate::MAX_ATOMIC_TASK_EVENT_BATCH_SIZE) {
-            appended.extend(
-                self.append_task_cancellation_quantum(chunk.to_vec(), at, None, actor_id.clone())
+        let change = crate::task_events::TaskWorkChange::new(&self.connection);
+        let result = async {
+            let mut appended = Vec::new();
+            if action.is_some() {
+                return self
+                    .append_task_cancellation_quantum(events, at, action, actor_id)
+                    .await;
+            }
+            for chunk in events.chunks(crate::MAX_ATOMIC_TASK_EVENT_BATCH_SIZE) {
+                appended.extend(
+                    self.append_task_cancellation_quantum(
+                        chunk.to_vec(),
+                        at,
+                        None,
+                        actor_id.clone(),
+                    )
                     .await?,
-            );
+                );
+            }
+            Ok(appended)
         }
-        Ok(appended)
+        .await;
+        if let Ok(value) = &result {
+            change.completed(crate::task_events::inserted_task_events(value));
+        }
+        result
     }
 
     async fn append_task_cancellation_quantum(
@@ -489,6 +518,8 @@ impl CrudStore {
         #[cfg(any(test, feature = "test-support"))]
         self.pause_delivery_commit_for_test(TaskDeliveryCommitTestKind::Cancellation)
             .await;
+        let control_change = self.connection.work_signal("gateway.control").changing();
+        let mut action_changed = false;
         let tx = self.connection.begin().await?;
         let result = async {
             for (webhook, unmatched) in &run_fences {
@@ -557,6 +588,9 @@ impl CrudStore {
                 }
             }
             if let Some(action) = &action {
+                action_changed =
+                    !crate::repositories::agent_domain::agent_action_commit_exists(&tx, action)
+                        .await?;
                 crate::repositories::agent_domain::commit_agent_action(&tx, action).await?;
             }
             Ok(appended)
@@ -565,6 +599,7 @@ impl CrudStore {
         match result {
             Ok(appended) => {
                 tx.commit().await?;
+                control_change.completed(action_changed);
                 Ok(materialize_task_events(appended))
             }
             Err(error) => {

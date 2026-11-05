@@ -10,7 +10,11 @@ mod database;
 mod query_scope;
 mod reader;
 pub use query_scope::DiagnosticStream;
+mod work_signal;
 mod writer;
+pub use work_signal::{WorkChange, WorkSignal, WorkSubscription, wait_for_unix_deadline};
+mod writer_ownership;
+pub use writer_ownership::{WriterBusy, WriterOwnership};
 
 pub use blob_range::SqliteBlobSource;
 pub use database::{SqliteDatabase, SqliteReadTransaction};

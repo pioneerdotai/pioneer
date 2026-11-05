@@ -502,9 +502,12 @@ mod durable_sweep {
         .await;
         header(&store, "key", 1, 1, 0).await;
         drain_metadata(&store).await;
-        old.finish(&store, Some(sweep.completion_guard()))
-            .await
-            .unwrap();
+        old.finish(
+            &store,
+            frozen_sweep_work::Completion::Complete(sweep.completion_guard()),
+        )
+        .await
+        .unwrap();
         assert_eq!(pending(&store, "key", 0).await, 1);
         assert!(work(&store, "key", 0).await.revision > old.revision);
         assert!(
@@ -556,10 +559,19 @@ mod durable_sweep {
                 .step(&store, &mut SweepAccounting::default())
                 .await
                 .unwrap(),
-            SweepStep::Retry
+            SweepStep::Blocked
         );
-        selected.finish(&store, None).await.unwrap();
+        selected
+            .finish(&store, frozen_sweep_work::Completion::Blocked)
+            .await
+            .unwrap();
         assert_eq!(pending(&store, "batch-physical", 0).await, 1);
+        assert!(
+            frozen_sweep_work::next_retry_deadline(&store)
+                .await
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(batch_ordinals(&store, 0).await, vec![0, 1, 2, 3]);
         drain_metadata(&store).await;
         let selected = work(&store, "batch-physical", 0).await;
@@ -573,7 +585,10 @@ mod durable_sweep {
         {}
         row(&store, "batch-physical", 0, 4).await; // between terminal step and ack
         selected
-            .finish(&store, Some(sweep.completion_guard()))
+            .finish(
+                &store,
+                frozen_sweep_work::Completion::Complete(sweep.completion_guard()),
+            )
             .await
             .unwrap();
         assert_eq!(pending(&store, "batch-physical", 0).await, 1);
@@ -701,7 +716,7 @@ mod durable_sweep {
     }
 
     #[tokio::test]
-    async fn unknown_scope_refusal_is_delayed_and_repair_can_retry_without_domain_invalidation() {
+    async fn unknown_scope_refusal_parks_and_repair_rechecks_pending_generation() {
         let store = blank(false).await;
         header(&store, "free", 0, 0, 0).await;
         row(&store, "free", 0, 0).await;
@@ -717,7 +732,13 @@ mod durable_sweep {
             .await,
             1
         );
-        assert_eq!(query(&store,"SELECT count(*) AS n FROM compaction_frozen_sweep_work WHERE manifest_id='free' AND kind=0 AND pending=1 AND retry_at>unixepoch()").await,1);
+        assert_eq!(query(&store,"SELECT count(*) AS n FROM compaction_frozen_sweep_work WHERE manifest_id='free' AND kind=0 AND pending=1 AND retry_at=0").await,1);
+        assert!(
+            frozen_sweep_work::next_retry_deadline(&store)
+                .await
+                .unwrap()
+                .is_none()
+        );
         let revision = work(&store, "free", 0).await.revision;
         exec(
             &store,
@@ -725,19 +746,9 @@ mod durable_sweep {
         )
         .await;
         assert_eq!(work(&store, "free", 0).await.revision, revision);
-        assert!(
-            !FrozenStorageLifetimeProgress::default()
-                .sweep_quantum(&store)
-                .await
-                .unwrap()
-        );
-        // Advance eligibility only, emulating the worker's next idle admission.
-        // Geometry, readiness, and all production safety triggers remain intact.
-        exec(
-            &store,
-            "UPDATE compaction_frozen_sweep_work SET retry_at=0 WHERE manifest_id='free'",
-        )
-        .await;
+        // Emulate the new discovery pass admitted by repair invalidation.
+        // Expected protection is not an error-owned timed retry; no synthetic
+        // retry_at update or idle timer is needed to make this generation due.
         drain(&store, &mut FrozenStorageLifetimeProgress::default()).await;
         assert_eq!(
             query(
@@ -777,9 +788,12 @@ mod durable_sweep {
         .await;
         assert_eq!(
             sweep.step(&store, &mut accounting).await.unwrap(),
-            SweepStep::Retry
+            SweepStep::Blocked
         );
-        selected.finish(&store, None).await.unwrap();
+        selected
+            .finish(&store, frozen_sweep_work::Completion::Blocked)
+            .await
+            .unwrap();
         assert_eq!(accounting.rows[0], 209);
         assert_eq!(
             batch_ordinals(&store, 0).await,

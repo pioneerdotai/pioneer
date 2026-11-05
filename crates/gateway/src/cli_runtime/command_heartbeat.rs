@@ -69,7 +69,6 @@ impl CliRuntimeCommandHeartbeatDueItem {
 #[derive(Clone, Debug)]
 pub(crate) struct CliRuntimeCommandHeartbeatTracker {
     active: Arc<Mutex<HashMap<CliRuntimeCommandHeartbeatKey, CliRuntimeCommandHeartbeatState>>>,
-    last_rehydrated_at_unix: Arc<Mutex<Option<i64>>>,
     interval_secs: i64,
 }
 
@@ -77,7 +76,6 @@ impl CliRuntimeCommandHeartbeatTracker {
     pub(crate) fn new(interval_secs: u64) -> Self {
         Self {
             active: Arc::new(Mutex::new(HashMap::new())),
-            last_rehydrated_at_unix: Arc::new(Mutex::new(None)),
             interval_secs: i64::try_from(interval_secs.max(1)).unwrap_or(i64::MAX),
         }
     }
@@ -224,17 +222,6 @@ impl CliRuntimeCommandHeartbeatTracker {
         }
     }
 
-    pub(crate) async fn should_rehydrate(&self, now_unix: i64, interval_secs: i64) -> bool {
-        let mut last_rehydrated = self.last_rehydrated_at_unix.lock().await;
-        let due = last_rehydrated.is_none_or(|last| {
-            now_unix < last || now_unix.saturating_sub(last) >= interval_secs.max(1)
-        });
-        if due {
-            *last_rehydrated = Some(now_unix);
-        }
-        due
-    }
-
     pub(crate) async fn remove_key(&self, key: &CliRuntimeCommandHeartbeatKey) {
         self.active.lock().await.remove(key);
     }
@@ -258,6 +245,21 @@ impl CliRuntimeCommandHeartbeatTracker {
             item.last_attempt_at_unix = now_unix;
             item.last_heartbeat_at_unix = now_unix;
         }
+    }
+
+    /// No active command means no heartbeat timer. Failed attempts retain a
+    /// retry deadline without pretending that the durable heartbeat advanced.
+    pub(crate) async fn next_deadline(&self) -> Option<i64> {
+        self.active
+            .lock()
+            .await
+            .values()
+            .map(|item| {
+                item.last_heartbeat_at_unix
+                    .max(item.last_attempt_at_unix)
+                    .saturating_add(self.interval_secs)
+            })
+            .min()
     }
 
     pub(crate) async fn due_items(&self, now_unix: i64) -> Vec<CliRuntimeCommandHeartbeatDueItem> {
@@ -364,6 +366,7 @@ mod tests {
     #[tokio::test]
     async fn due_items_do_not_advance_heartbeat_until_success() {
         let tracker = CliRuntimeCommandHeartbeatTracker::new(60);
+        assert_eq!(tracker.next_deadline().await, None);
         let instance = session_instance();
         let binding = turn_binding(CLI_RUNTIME_TURN_STATUS_RUNNING);
         tracker
@@ -377,6 +380,7 @@ mod tests {
             )
             .await;
 
+        assert_eq!(tracker.next_deadline().await, Some(160));
         let due = tracker.due_items(160).await;
         assert_eq!(due.len(), 1);
         let due_again = tracker.due_items(160).await;
@@ -384,6 +388,9 @@ mod tests {
 
         tracker.mark_heartbeat_succeeded(&due[0].key, 160).await;
         assert!(tracker.due_items(160).await.is_empty());
+        assert_eq!(tracker.next_deadline().await, Some(220));
+        tracker.remove_turn(&instance, "turn").await;
+        assert_eq!(tracker.next_deadline().await, None);
     }
 
     #[tokio::test]
@@ -405,6 +412,7 @@ mod tests {
         let due = tracker.due_items(160).await;
         assert_eq!(due.len(), 1);
         tracker.mark_attempt_failed(&due[0].key, 160).await;
+        assert_eq!(tracker.next_deadline().await, Some(220));
 
         assert!(tracker.due_items(190).await.is_empty());
         assert_eq!(tracker.due_items(220).await.len(), 1);
