@@ -368,7 +368,7 @@ async fn run_gateway_until_shutdown_inner(
             "expired pending device sessions marked terminal"
         );
     }
-    auth_service.spawn_auth_maintenance();
+    let auth_maintenance = auth_service.spawn_auth_maintenance();
     security_stage.succeed();
 
     let services_initialize_stage =
@@ -859,6 +859,13 @@ async fn run_gateway_until_shutdown_inner(
     let listener_bind_stage =
         startup.stage(pioneer_observability::GatewayStartupStage::ListenerBind);
     let post_remote_access_config = config.gateway.remote_access.clone();
+    let local_operations = transport::local_operations::LocalOperations::start(
+        &runtime_home,
+        &config,
+        auth_service.clone(),
+        message_processor.artifact_service.clone(),
+    )
+    .await?;
     let handle = spawn_server(
         config,
         auth,
@@ -1086,6 +1093,7 @@ async fn run_gateway_until_shutdown_inner(
         }
     };
 
+    let local_operations_shutdown_result = local_operations.shutdown().await;
     info!("gateway daemon stopping with telemetry snapshot");
     handle.set_readiness(GatewayReadinessStatus::Starting);
     #[cfg(feature = "computer-use")]
@@ -1128,6 +1136,7 @@ async fn run_gateway_until_shutdown_inner(
     message_processor.shutdown_cli_runtime_manager().await;
     message_processor.shutdown_mcp_service().await;
     self_improvement_supervisor.shutdown().await;
+    auth_maintenance.shutdown().await;
     let database_close_result = database
         .close()
         .await
@@ -1149,6 +1158,7 @@ async fn run_gateway_until_shutdown_inner(
     }
 
     runtime_result?;
+    local_operations_shutdown_result?;
     server_shutdown_result?;
     database_close_result?;
     Ok(())
@@ -1207,10 +1217,20 @@ pub async fn create_device(
     config: &AppConfig,
     runtime_home: &Path,
 ) -> Result<AuthDeviceCreateResponse> {
+    let database = database::initialize_existing_for_operations(runtime_home, config).await;
+    let database = match database {
+        Err(error) if error.downcast_ref::<pioneer_sqlite::WriterBusy>().is_some() => {
+            return transport::local_operations::request(
+                runtime_home,
+                config,
+                transport::local_operations::Operation::DeviceCreate,
+            )
+            .await;
+        }
+        result => result?,
+    }
+    .context("Gateway database must exist before creating a device")?;
     let gateway_secrets = GatewaySecrets::open(runtime_home)?;
-    let database = database::initialize_existing_for_operations(runtime_home, config)
-        .await?
-        .context("Gateway database must exist before creating a device")?;
     let identity = Arc::new(
         bootstrap_identity(&database)
             .await

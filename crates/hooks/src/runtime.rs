@@ -3160,8 +3160,25 @@ mod tests {
         persistence: &mut HookRunPersistence,
     ) -> sentry::protocol::Event<'static> {
         use tracing_subscriber::prelude::*;
-        let subscriber =
-            tracing_subscriber::registry().with(sentry::integrations::tracing::layer());
+        let subscriber = tracing_subscriber::registry()
+            .with(
+                sentry::integrations::tracing::SpanLayer::new()
+                    .with_filter(tracing_subscriber::filter::LevelFilter::INFO),
+            )
+            .with(
+                sentry::integrations::tracing::BreadcrumbLayer::new().with_filter(
+                    tracing_subscriber::filter::filter_fn(|metadata| {
+                        matches!(
+                            *metadata.level(),
+                            tracing::Level::WARN | tracing::Level::INFO
+                        )
+                    }),
+                ),
+            )
+            .with(
+                sentry::integrations::tracing::ErrorLayer::new()
+                    .with_filter(tracing_subscriber::filter::LevelFilter::ERROR),
+            );
         let error = crate::HookRunStoreError::internal_with_diagnostic(
             "failed to append hook audit events",
             crate::HookRunStoreDiagnostic {
@@ -3447,7 +3464,7 @@ mod tests {
         async fn execute(&self, _request: HookHandlerRequest) -> HookResult<HookHandlerResponse> {
             let active = self.active_count.fetch_add(1, Ordering::SeqCst) + 1;
             self.max_active_count
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
                     (active > current).then_some(active)
                 })
                 .ok();
@@ -7168,7 +7185,7 @@ mod tests {
             }
             if self
                 .fail_append_audit_remaining
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
                     remaining.checked_sub(1)
                 })
                 .is_ok()

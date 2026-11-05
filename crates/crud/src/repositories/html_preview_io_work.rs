@@ -595,6 +595,31 @@ impl CrudStore {
         &self,
         after: &(String, String, i64),
     ) -> Result<Option<(String, String, i64)>> {
+        let upper = self.html_preview_io_recovery_frontier().await?;
+        self.recover_html_preview_io_blocked_through(after, &upper)
+            .await
+    }
+    pub async fn html_preview_io_recovery_frontier(&self) -> Result<(String, String, i64)> {
+        Ok(work::Entity::find()
+            .select_only()
+            .columns([
+                work::Column::Family,
+                work::Column::ObjectId,
+                work::Column::Ordinal,
+            ])
+            .order_by_desc(work::Column::Family)
+            .order_by_desc(work::Column::ObjectId)
+            .order_by_desc(work::Column::Ordinal)
+            .into_tuple::<(String, String, i64)>()
+            .one(&self.connection)
+            .await?
+            .unwrap_or_default())
+    }
+    pub async fn recover_html_preview_io_blocked_through(
+        &self,
+        after: &(String, String, i64),
+        upper: &(String, String, i64),
+    ) -> Result<Option<(String, String, i64)>> {
         // Full point locators/workspaces are TEXT; the recovery sweep needs
         // only fixed-width queue keys and fences, never those long values.
         let rows = work::Entity::find()
@@ -605,6 +630,18 @@ impl CrudStore {
             .column(work::Column::State)
             .column(work::Column::Incarnation)
             .filter(after_key(after))
+            .filter(
+                Expr::tuple([
+                    Expr::col(work::Column::Family),
+                    Expr::col(work::Column::ObjectId),
+                    Expr::col(work::Column::Ordinal),
+                ])
+                .lte(Expr::tuple([
+                    Expr::val(upper.0.clone()),
+                    Expr::val(upper.1.clone()),
+                    Expr::val(upper.2),
+                ])),
+            )
             .order_by_asc(work::Column::Family)
             .order_by_asc(work::Column::ObjectId)
             .order_by_asc(work::Column::Ordinal)
@@ -1134,6 +1171,19 @@ pub(super) fn io_bytes(backend: sea_orm::DbBackend, value: Expr) -> Expr {
 }
 
 impl CrudStore {
+    pub async fn html_preview_io_deadline(&self) -> Result<Option<i64>> {
+        let due = work::Entity::find()
+            .select_only()
+            .column(work::Column::DueAt)
+            .filter(work::Column::State.is_in(["ready", "timed", "running"]))
+            .filter(work::Column::DueAt.is_not_null())
+            .order_by_asc(work::Column::DueAt)
+            .into_tuple::<i64>()
+            .one(&self.connection)
+            .await?;
+        Ok(due.map(|ms| ms.div_euclid(1000) + i64::from(ms.rem_euclid(1000) != 0)))
+    }
+
     /// Retained coalesced hint; callers of transactional repair helpers invoke
     /// notify only after their business transaction has committed and dropped.
     pub fn html_preview_io_work_notification(&self) -> std::sync::Arc<tokio::sync::Notify> {
@@ -1141,6 +1191,7 @@ impl CrudStore {
     }
     pub fn notify_html_preview_io_work(&self) {
         self.html_preview_io_work.notify_one();
+        self.connection.work_signal("maintenance.html").notify();
     }
 }
 

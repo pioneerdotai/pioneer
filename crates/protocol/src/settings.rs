@@ -906,12 +906,12 @@ fn normalized_optional_model_selection_text(value: Option<&str>, max_len: usize)
 mod tests {
     use super::{
         GatewayCliRuntimeInstanceSettings, GatewayCliRuntimeSettings, GatewayGeneralSettings,
-        GatewayGeneralSettingsUpdate, GatewayMemoryModelSelection, GatewayMemorySettings,
-        GatewayRemoteAccessSettings, GatewaySelfImprovementModelSelection,
-        GatewaySelfImprovementSettings, GatewaySettingsSnapshot, GatewaySettingsUpdate,
-        GatewayThreadEpisodicSettings, GatewayThreadEpisodicSettingsUpdate,
-        GatewayThreadEpisodicVectorLocalModelStatus, GatewayThreadEpisodicVectorProvider,
-        GatewayThreadEpisodicVectorProviderKeyStatus, GatewayThreadEpisodicVectorRefillStatus,
+        GatewayGeneralSettingsUpdate, GatewayMemorySettings, GatewayRemoteAccessSettings,
+        GatewaySelfImprovementModelSelection, GatewaySelfImprovementSettings,
+        GatewaySettingsSnapshot, GatewaySettingsUpdate, GatewayThreadEpisodicSettings,
+        GatewayThreadEpisodicSettingsUpdate, GatewayThreadEpisodicVectorLocalModelStatus,
+        GatewayThreadEpisodicVectorProvider, GatewayThreadEpisodicVectorProviderKeyStatus,
+        GatewayThreadEpisodicVectorRefillStatus,
         GatewayThreadEpisodicVectorRefillStatusChangedNotification,
         GatewayThreadEpisodicVectorSearchSettings, GatewayThreadEpisodicVectorSearchSettingsUpdate,
         GatewayVoiceInputProvider, GatewayVoiceInputRuntimePhase, GatewayVoiceInputRuntimeSnapshot,

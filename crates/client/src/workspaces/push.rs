@@ -349,6 +349,11 @@ impl ClientCore {
         }
     }
     pub(crate) fn observe_workspace_push(&self, packet: &WorkspacePushNotification) {
+        let encoded_bytes: Vec<usize> = packet
+            .thread_summaries
+            .iter()
+            .map(|patch| serde_json::to_vec(patch).map_or(usize::MAX, |bytes| bytes.len()))
+            .collect();
         let identity = self.push_identity();
         let recover = {
             let mut owner = self
@@ -424,7 +429,8 @@ impl ClientCore {
                 && (!packet.snapshot || !scope.params.inbox || packet.inbox.is_some())
                 && Self::validate_inbox_push(&inbox_owner.store, packet);
             if valid {
-                let mut drafts = registry.apply_push_summaries(&packet.thread_summaries);
+                let mut drafts =
+                    registry.apply_push_summaries(&packet.thread_summaries, &encoded_bytes);
                 if scope.params.tree {
                     // Metadata-only packets also advance the late-RPC fence;
                     // empty indicators never trigger a separate tree projection.

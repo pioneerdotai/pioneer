@@ -68,6 +68,11 @@ async fn cli_active_binding_pages_bound_ties_status_changes_and_restart() {
     }
     let maintenance = store.with_maintenance_access();
     for status in [Starting, Running] {
+        let through = maintenance
+            .active_cli_runtime_turn_binding_frontier(status)
+            .await
+            .unwrap()
+            .unwrap();
         let first = maintenance
             .list_active_cli_runtime_turn_binding_page(status, None)
             .await
@@ -89,6 +94,45 @@ async fn cli_active_binding_pages_bound_ties_status_changes_and_restart() {
             .unwrap();
         assert_eq!(last.len(), 17);
         assert_eq!(last[16].turn_id, format!("{}_144", status.as_str()));
+
+        // New suffix pages must not postpone EOF, while an ordinary fresh
+        // pass sees them. The captured frontier remains inclusive.
+        binding::Entity::insert_many((0..65).map(|i| {
+            let mut row = fixture(
+                format!("{}_suffix_{i:03}", status.as_str()),
+                status.as_str(),
+            );
+            row.created_at = Set(unix_to_datetime(1_700_000_001));
+            row
+        }))
+        .exec(&store.database_connection())
+        .await
+        .unwrap();
+        let bounded = maintenance
+            .list_active_cli_runtime_turn_binding_page_through(status, Some(&end), &through)
+            .await
+            .unwrap();
+        assert_eq!(bounded.len(), 17);
+        let boundary = (bounded[16].created_at, bounded[16].turn_id.clone());
+        assert!(
+            maintenance
+                .list_active_cli_runtime_turn_binding_page_through(
+                    status,
+                    Some(&boundary),
+                    &through,
+                )
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            maintenance
+                .list_active_cli_runtime_turn_binding_page(status, Some(&boundary),)
+                .await
+                .unwrap()
+                .len(),
+            64
+        );
 
         let mut behind = fixture(format!("{}_behind", status.as_str()), status.as_str());
         behind.created_at = Set(unix_to_datetime(1_699_999_999));

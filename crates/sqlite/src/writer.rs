@@ -567,6 +567,8 @@ impl AdmissionInner {
 pub struct SqliteWriteExecutor {
     connection: DatabaseConnection,
     admission: Arc<AdmissionInner>,
+    work_signals: Arc<Mutex<std::collections::BTreeMap<&'static str, crate::WorkSignal>>>,
+    ownership: Arc<Mutex<Option<Arc<crate::WriterOwnership>>>>,
 }
 
 impl std::fmt::Debug for SqliteWriteExecutor {
@@ -602,6 +604,8 @@ impl SqliteWriteExecutor {
     ) -> Self {
         Self {
             connection,
+            work_signals: Default::default(),
+            ownership: Default::default(),
             admission: Arc::new(AdmissionInner {
                 state: Mutex::new(AdmissionState::default()),
                 next_waiter_id: AtomicU64::new(1),
@@ -625,8 +629,26 @@ impl SqliteWriteExecutor {
             .get_max_connections()
     }
 
+    pub(crate) fn work_signal(&self, domain: &'static str) -> crate::WorkSignal {
+        self.work_signals
+            .lock()
+            .unwrap()
+            .entry(domain)
+            .or_default()
+            .clone()
+    }
+
+    pub fn retain_ownership(self, ownership: Arc<crate::WriterOwnership>) -> Self {
+        let previous = self.ownership.lock().unwrap().replace(ownership);
+        drop(previous);
+        self
+    }
+
     pub async fn close(self) -> Result<(), DbErr> {
-        self.connection.close().await
+        let result = self.connection.close().await;
+        let ownership = self.ownership.lock().unwrap().take();
+        drop(ownership);
+        result
     }
 
     /// Validates the physical writer connection under the same typed

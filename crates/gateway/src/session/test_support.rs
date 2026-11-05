@@ -171,3 +171,31 @@ pub(crate) fn outbound_channel(capacity: usize) -> (super::SessionOutbound, Outb
         super::SessionOutbound::channel(capacity, 64 * 1024 * 1024, 16 * 1024 * 1024);
     (sender, OutboundTestReceiver(receiver))
 }
+
+/// One-shot barrier at the real final delivery boundary, outside every lock.
+pub(crate) struct DeliveryPause {
+    pub(crate) connection: ConnectionId,
+    pub(crate) method: &'static str,
+    pub(crate) entered: tokio::sync::oneshot::Sender<()>,
+    pub(crate) release: tokio::sync::oneshot::Receiver<()>,
+}
+
+impl SessionManager {
+    pub(crate) async fn pause_delivery(&self, id: ConnectionId, method: &str) {
+        let pause = {
+            let mut slot = self.replay_delivery_pause.lock().unwrap();
+            if slot
+                .as_ref()
+                .is_some_and(|pause| pause.connection == id && pause.method == method)
+            {
+                slot.take()
+            } else {
+                None
+            }
+        };
+        if let Some(pause) = pause {
+            let _ = pause.entered.send(());
+            let _ = pause.release.await;
+        }
+    }
+}

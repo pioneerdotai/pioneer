@@ -523,3 +523,30 @@ pub(crate) async fn seed_unfinished(
     tx.commit().await?;
     Ok(1 + ids.len() as u64)
 }
+
+/// Existing durable obligations determine whether the owner can park. Scope
+/// expansion and bootstrap are bounded work, so their continuation is immediate.
+pub(crate) async fn next_deadline<C: ConnectionTrait>(db: &C, now: i64) -> Result<Option<i64>> {
+    if scope::Entity::find()
+        .select_only()
+        .column(scope::Column::TaskId)
+        .into_tuple::<String>()
+        .one(db)
+        .await?
+        .is_some()
+        || seed::Entity::find_by_id(1)
+            .one(db)
+            .await?
+            .is_none_or(|row| row.status_index < 5)
+    {
+        return Ok(Some(now));
+    }
+    Ok(pending::Entity::find()
+        .select_only()
+        .column(pending::Column::NextAttemptAt)
+        .order_by_asc(pending::Column::NextAttemptAt)
+        .limit(1)
+        .into_tuple::<i64>()
+        .one(db)
+        .await?)
+}

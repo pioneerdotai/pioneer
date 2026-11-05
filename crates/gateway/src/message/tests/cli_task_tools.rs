@@ -598,40 +598,44 @@ async fn wait_for_task_cli_child(
     .expect("Task run must activate its exact CLI child")
 }
 
-async fn invoke_task(
-    processor: &MessageProcessor,
-    turn_id: &str,
-    call_id: &str,
-    name: &str,
+fn invoke_task<'a>(
+    processor: &'a MessageProcessor,
+    turn_id: &'a str,
+    call_id: &'a str,
+    name: &'a str,
     arguments: JsonValue,
-) -> Result<CanonicalMcpToolResult, crate::turn_mcp::invoker::TurnMcpInvocationError> {
-    let binding = processor
-        .crud_store
-        .get_cli_runtime_turn_binding(turn_id)
-        .await
-        .unwrap()
-        .unwrap();
-    let generation = binding.mcp.as_ref().unwrap().session_generation as u64;
-    processor
-        .mcp_service
-        .turn_mcp_invoker()
-        .invoke(
-            TurnMcpInvocation {
-                workspace_id: binding.workspace_id,
-                thread_id: binding.thread_id,
-                turn_id: turn_id.to_owned(),
-                runtime_id: Some(binding.runtime_id),
-                session_generation: Some(generation),
-                provider_call_id: call_id.to_owned(),
-                native_call: None,
-                admission_deadline: None,
-                canonical_callable_name: name.to_owned(),
-                arguments,
-                origin: TurnMcpInvocationOrigin::CliFacade,
-            },
-            tokio_util::sync::CancellationToken::new(),
-        )
-        .await
+) -> BoxFuture<'a, Result<CanonicalMcpToolResult, crate::turn_mcp::invoker::TurnMcpInvocationError>>
+{
+    // Keep the real MCP invocation future off the scenario matrix's worker stack.
+    Box::pin(async move {
+        let binding = processor
+            .crud_store
+            .get_cli_runtime_turn_binding(turn_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let generation = binding.mcp.as_ref().unwrap().session_generation as u64;
+        processor
+            .mcp_service
+            .turn_mcp_invoker()
+            .invoke(
+                TurnMcpInvocation {
+                    workspace_id: binding.workspace_id,
+                    thread_id: binding.thread_id,
+                    turn_id: turn_id.to_owned(),
+                    runtime_id: Some(binding.runtime_id),
+                    session_generation: Some(generation),
+                    provider_call_id: call_id.to_owned(),
+                    native_call: None,
+                    admission_deadline: None,
+                    canonical_callable_name: name.to_owned(),
+                    arguments,
+                    origin: TurnMcpInvocationOrigin::CliFacade,
+                },
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+    })
 }
 
 // Replay provider-shaped native completions through the existing durable item

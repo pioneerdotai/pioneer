@@ -179,6 +179,11 @@ impl MessageProcessor {
         let upload_dir = workspace_upload_dir.join(upload_id.as_str());
         let payload_path = upload_dir.join("payload.tar.gz");
 
+        let directory_change = self
+            .crud_store
+            .database_connection()
+            .work_signal("gateway.control")
+            .changing();
         if let Err(error) = fs::create_dir_all(workspace_upload_dir.as_path())
             .and_then(|()| fs::create_dir(upload_dir.as_path()))
         {
@@ -196,6 +201,7 @@ impl MessageProcessor {
             return;
         }
 
+        directory_change.completed(true);
         let record = SkillUploadSessionRecord {
             upload_id: upload_id.clone(),
             workspace_id: workspace_id.clone(),
@@ -833,6 +839,11 @@ impl MessageProcessor {
             ));
         }
 
+        let directory_change = self
+            .crud_store
+            .database_connection()
+            .work_signal("gateway.control")
+            .changing();
         let cleanup_root = context.materialized_root.join(request_id.as_str());
         let _ = fs::remove_dir_all(cleanup_root.as_path());
         fs::create_dir_all(cleanup_root.as_path()).map_err(|error| {
@@ -864,6 +875,7 @@ impl MessageProcessor {
             }
         };
 
+        directory_change.completed(true);
         Ok(MaterializedSkillSource {
             source_dir,
             cleanup_root,
@@ -1019,20 +1031,25 @@ impl MessageProcessor {
 
     pub(crate) async fn cleanup_stale_skill_uploads(&self, now: i64) {
         let maintenance = self.scoped_with_database_class(SqliteWriteClass::Maintenance);
-        maintenance.cleanup_stale_skill_uploads_scoped(now).await;
+        if let Err(error) = maintenance
+            .cleanup_stale_skill_uploads_for_control(now)
+            .await
+        {
+            warn!(error = %format!("{error:#}"), "skill upload cleanup failed");
+        }
     }
 
-    async fn cleanup_stale_skill_uploads_scoped(&self, now: i64) {
-        let uploads = match self.crud_store.list_stale_skill_upload_sessions(now).await {
-            Ok(uploads) => uploads,
-            Err(error) => {
-                warn!(
-                    error = %format!("{error:#}"),
-                    "failed to query stale skill upload sessions"
-                );
-                return;
-            }
-        };
+    /// The control owner retains a retry on failure; foreground callers keep
+    /// their existing best-effort cleanup contract through the wrapper above.
+    pub(crate) async fn cleanup_stale_skill_uploads_for_control(
+        &self,
+        now: i64,
+    ) -> anyhow::Result<()> {
+        let uploads = self
+            .crud_store
+            .list_stale_skill_upload_sessions(now)
+            .await?;
+        let mut failed = false;
 
         for upload in uploads {
             let _guard = self
@@ -1046,6 +1063,7 @@ impl MessageProcessor {
                 Ok(Some(current)) => current,
                 Ok(None) => continue,
                 Err(error) => {
+                    failed = true;
                     warn!(
                         upload_id = upload.upload_id.as_str(),
                         error = %format!("{error:#}"),
@@ -1074,7 +1092,7 @@ impl MessageProcessor {
                     .await
                 {
                     Ok(Some(_)) => {
-                        let _ = remove_upload_payload(&current);
+                        failed |= remove_upload_payload(&current).is_err();
                         self.skill_upload_owners
                             .lock()
                             .await
@@ -1082,6 +1100,7 @@ impl MessageProcessor {
                     }
                     Ok(None) => {}
                     Err(error) => {
+                        failed = true;
                         warn!(
                             upload_id = current.upload_id.as_str(),
                             error = %format!("{error:#}"),
@@ -1093,7 +1112,7 @@ impl MessageProcessor {
                 current.status.as_str(),
                 UPLOAD_STATUS_ABORTED | UPLOAD_STATUS_CONSUMED | UPLOAD_STATUS_EXPIRED
             ) {
-                let _ = remove_upload_payload(&current);
+                failed |= remove_upload_payload(&current).is_err();
                 self.skill_upload_owners
                     .lock()
                     .await
@@ -1101,11 +1120,38 @@ impl MessageProcessor {
             }
         }
 
-        self.cleanup_orphaned_upload_dirs(now).await;
-        self.cleanup_orphaned_materialized_dirs(now).await;
+        failed |= self.cleanup_orphaned_upload_dirs(now).await.is_err();
+        failed |= self.cleanup_orphaned_materialized_dirs(now).await.is_err();
+        anyhow::ensure!(!failed, "one or more stale skill upload transitions failed");
+        Ok(())
     }
 
-    async fn cleanup_orphaned_upload_dirs(&self, now: i64) {
+    /// Combine this filesystem head with next_gateway_control_deadline. Without
+    /// it a directory left before session insertion (or before materialization
+    /// completion) would never reach its existing mtime-based retention cutoff.
+    pub(crate) async fn next_skill_cleanup_deadline(&self, now: i64) -> Result<Option<i64>> {
+        let ttl = now.saturating_sub(skill_upload_stale_before(&self.tool_loop_config, now));
+        let workspaces = self
+            .workspace_manager
+            .list_workspaces()
+            .await
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        let mut next = None;
+        for workspace in workspaces
+            .into_iter()
+            .filter(|workspace| workspace.is_active)
+        {
+            let context = self.skills_runtime_context(&workspace.id)?;
+            for (root, depth) in [(context.upload_root, 2), (context.materialized_root, 1)] {
+                if let Some(at) = next_skill_directory_deadline(&root, depth, ttl, now)? {
+                    next = Some(next.map_or(at, |old: i64| old.min(at)));
+                }
+            }
+        }
+        Ok(next)
+    }
+
+    async fn cleanup_orphaned_upload_dirs(&self, now: i64) -> Result<()> {
         let contexts = self.active_skill_runtime_contexts().await;
         let stale_before = skill_upload_stale_before(&self.tool_loop_config, now);
         let mut roots = HashSet::new();
@@ -1114,18 +1160,20 @@ impl MessageProcessor {
         }
 
         for upload_root in roots {
-            let Ok(workspace_dirs) = fs::read_dir(upload_root.as_path()) else {
-                continue;
+            let workspace_dirs = match fs::read_dir(&upload_root) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
             };
-            for workspace_dir in workspace_dirs.flatten() {
+            for workspace_dir in workspace_dirs {
+                let workspace_dir = workspace_dir?;
                 let workspace_path = workspace_dir.path();
                 if !workspace_path.is_dir() {
                     continue;
                 }
-                let Ok(upload_dirs) = fs::read_dir(workspace_path.as_path()) else {
-                    continue;
-                };
-                for upload_dir in upload_dirs.flatten() {
+                let upload_dirs = fs::read_dir(&workspace_path)?;
+                for upload_dir in upload_dirs {
+                    let upload_dir = upload_dir?;
                     let upload_path = upload_dir.path();
                     if !upload_path.is_dir() {
                         continue;
@@ -1154,18 +1202,19 @@ impl MessageProcessor {
                                     error = %format!("{error:#}"),
                                     "failed to inspect skill upload session during orphan cleanup"
                                 );
-                                false
+                                return Err(error);
                             }
                         };
                     if should_remove {
-                        let _ = fs::remove_dir_all(upload_path);
+                        fs::remove_dir_all(upload_path)?;
                     }
                 }
             }
         }
+        Ok(())
     }
 
-    async fn cleanup_orphaned_materialized_dirs(&self, now: i64) {
+    async fn cleanup_orphaned_materialized_dirs(&self, now: i64) -> Result<()> {
         let contexts = self.active_skill_runtime_contexts().await;
         let mut roots = HashSet::new();
         for context in contexts {
@@ -1174,19 +1223,23 @@ impl MessageProcessor {
 
         let stale_before = skill_upload_stale_before(&self.tool_loop_config, now);
         for root in roots {
-            let Ok(entries) = fs::read_dir(root.as_path()) else {
-                continue;
+            let entries = match fs::read_dir(&root) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
             };
-            for entry in entries.flatten() {
+            for entry in entries {
+                let entry = entry?;
                 let path = entry.path();
                 if !path.is_dir() {
                     continue;
                 }
                 if directory_modified_at_or_before(path.as_path(), stale_before) {
-                    let _ = fs::remove_dir_all(path);
+                    fs::remove_dir_all(path)?;
                 }
             }
         }
+        Ok(())
     }
 
     async fn active_skill_runtime_contexts(&self) -> Vec<SkillsRuntimeContext> {
@@ -1491,6 +1544,42 @@ fn remove_upload_payload(upload: &SkillUploadSessionRecord) -> Result<()> {
             .with_context(|| format!("failed to remove upload directory `{}`", parent.display()))?;
     }
     Ok(())
+}
+
+// Fixed-depth directory traversal: no DB snapshot/capacity is retained while
+// reading metadata. Missing roots are Empty; other filesystem errors retain
+// retry authority. Only existing directories create a deadline.
+fn next_skill_directory_deadline(
+    root: &Path,
+    depth: usize,
+    ttl: i64,
+    now: i64,
+) -> Result<Option<i64>> {
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let mut next = None;
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let due = if depth > 1 {
+            next_skill_directory_deadline(&entry.path(), depth - 1, ttl, now)?
+        } else {
+            let modified = entry.metadata()?.modified()?.duration_since(UNIX_EPOCH)?;
+            let due = i64::try_from(modified.as_secs())
+                .unwrap_or(i64::MAX)
+                .saturating_add(ttl);
+            (due > now).then_some(due)
+        };
+        if let Some(due) = due {
+            next = Some(next.map_or(due, |old: i64| old.min(due)));
+        }
+    }
+    Ok(next)
 }
 
 fn skill_upload_stale_before(tool_loop_config: &ToolLoopConfig, now: i64) -> i64 {

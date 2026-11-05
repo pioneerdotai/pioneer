@@ -58,6 +58,328 @@ async fn has_recovery(store: &CrudStore, id: &str) -> bool {
         .is_some()
 }
 
+// Timeout discovery has completed before a deadline matures. Another finite
+// source still needs a second portion; its later clock must not erase the wake.
+// A busy action outbox must also permit fresh timeout/supervision rounds before
+// the outbox empties. The previous test with only a finite CLI tail missed this.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn control_owner_keeps_deadline_that_matures_between_portions() {
+    use pioneer_entity::{agent_action, agent_action_outbox as outbox, agent_identity};
+    use sea_orm::Set;
+
+    let (processor, _, _rx, workspace, store, _session) = cli_runtime_approval_processor().await;
+    binding::Entity::delete_many()
+        .exec(&store.database_connection())
+        .await
+        .unwrap();
+    let at = chrono::Utc::now().fixed_offset();
+    for i in 0..=pioneer_crud::CLI_RUNTIME_ACTIVE_TURN_BINDING_PAGE_MAX {
+        insert_turn(
+            &store,
+            &workspace,
+            &format!("cutoff_healthy_{i:03}"),
+            "running",
+            at,
+            at,
+        )
+        .await;
+    }
+    // Use the same FK-backed owner/action shape as agent_action_outbox's
+    // outbox_fixture. The execution references an existing workspace identity;
+    // each outbox row below gets its own committed action.
+    let database = store.database_connection();
+    let identity = agent_identity::Entity::find()
+        .filter(agent_identity::Column::WorkspaceId.eq(&workspace))
+        .one(&database)
+        .await
+        .unwrap()
+        .unwrap();
+    let owner = "E00000000000000000008";
+    pioneer_crud::insert_agent_execution(
+        &database,
+        &pioneer_crud::AgentExecutionInput {
+            id: owner.into(),
+            workspace_id: workspace.clone(),
+            agent_identity_id: identity.id,
+            identity_source_revision: identity.source_revision,
+            identity_source_fingerprint: identity.source_fingerprint,
+            parent_execution_id: None,
+            parent_task_id: None,
+            parent_thread_id: None,
+            home_root_thread_id: "thread_cli_command_approval".into(),
+            work_graph_root_execution_id: owner.into(),
+            requested_identity_selection_json: "{}".into(),
+            requested_profile_selection_json: "{}".into(),
+            resolved_profile_id: None,
+            resolved_profile_fingerprint: None,
+            presentation_snapshot_id: None,
+            authorization_context_fingerprint: "fixture".into(),
+            execution_generation: 1,
+            status: "running".into(),
+            now: at,
+        },
+    )
+    .await
+    .unwrap();
+    let target = "cutoff_deadline_target";
+    materialize_cli_runtime_turn_with_text(&store, &workspace, target, target, "timeout").await;
+    let now = now_timestamp_secs();
+    let due = now + 5;
+    store
+        .materialize_item_started_with_attempt_deadlines(
+            ItemStartedNotification {
+                workspace_id: workspace,
+                thread_id: target.into(),
+                turn_id: target.into(),
+                item: web_fetch_item("cutoff_deadline_item"),
+            },
+            now,
+            TurnItemAttemptDeadlines {
+                lease_expires_at_unix: Some(due),
+                idle_deadline_at_unix: Some(due),
+                hard_deadline_at_unix: Some(due),
+            },
+        )
+        .await
+        .unwrap();
+    let processor = Arc::new(processor);
+    processor.arm_completed_history_preparation_barrier("__control_after_timeout_phase__");
+    processor.start_resilience_workers().await.unwrap();
+    let outcome = tokio::time::timeout(Duration::from_secs(15), async {
+        processor
+            .wait_for_completed_history_preparation_barrier()
+            .await;
+        assert!(
+            now_timestamp_secs() < due,
+            "the first timeout phase must precede the deadline"
+        );
+        // Persist invalid detached envelopes: dispatch rejects them locally,
+        // with no provider or runtime needed. Twelve raw claim quanta keep the
+        // real outbox runnable throughout the observations below.
+        for batch in 0..12 {
+            agent_action::Entity::insert_many((0..32).map(|row| {
+                let id = format!("A{:020}", batch * 32 + row);
+                agent_action::ActiveModel {
+                    id: Set(id.clone()),
+                    execution_id: Set(owner.into()),
+                    action_kind: Set("send_message".into()),
+                    idempotency_key: Set(id),
+                    request_fingerprint: Set("fixture".into()),
+                    status: Set("committed".into()),
+                    created_at: Set(at),
+                    committed_at: Set(Some(at)),
+                    response_json: Set(Some("{}".into())),
+                }
+            }))
+            .exec(&database)
+            .await
+            .unwrap();
+            outbox::Entity::insert_many((0..32).map(|row| outbox::ActiveModel {
+                id: Set(format!("O{:020}", batch * 32 + row)),
+                action_id: Set(format!("A{:020}", batch * 32 + row)),
+                owner_execution_id: Set(owner.into()),
+                payload_json: Set(r#"{"execution_mode":"detached_task","kind":"invalid"}"#.into()),
+                status: Set("pending".into()),
+                attempts: Set(0),
+                next_attempt_at: Set(None),
+                delivered_at: Set(None),
+                last_error: Set(None),
+                created_at: Set(at),
+            }))
+            .exec(&database)
+            .await
+            .unwrap();
+        }
+        while now_timestamp_secs() <= due {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        // No producer writes or signal injection after release. Observe up to
+        // eight real quanta, keeping the existing phase barrier armed so the
+        // backlog cannot drain before we inspect durable recovery.
+        for quantum in 0..8u64 {
+            processor.arm_completed_history_preparation_barrier("__control_after_timeout_phase__");
+            processor.release_completed_history_preparation_barrier();
+            processor
+                .wait_for_completed_history_preparation_barrier()
+                .await;
+            // Every claimed row must have reached the expected terminal ACK,
+            // rather than a storage error, a retained lease or retry backoff.
+            assert_eq!(
+                outbox::Entity::find()
+                    .filter(outbox::Column::OwnerExecutionId.eq(owner))
+                    .filter(outbox::Column::Status.eq("failed"))
+                    .filter(outbox::Column::LastError.eq(
+                        pioneer_crud::AgentActionOutboxFailure::InvalidDetachedBinding.safe_name()
+                    ))
+                    .filter(outbox::Column::Attempts.eq(1))
+                    .filter(outbox::Column::NextAttemptAt.is_null())
+                    .filter(outbox::Column::DeliveredAt.is_null())
+                    .count(&database)
+                    .await
+                    .unwrap(),
+                32 * (quantum + 1),
+                "a full claim quantum must be rejected as InvalidBinding without retry"
+            );
+            assert!(
+                outbox::Entity::find()
+                    .filter(outbox::Column::OwnerExecutionId.eq(owner))
+                    .filter(outbox::Column::Status.eq("pending"))
+                    .count(&database)
+                    .await
+                    .unwrap()
+                    >= 32,
+                "the outbox must still supply another full claim quantum"
+            );
+            if has_recovery(&store, target).await {
+                return;
+            }
+        }
+        panic!("a matured timeout must establish durable recovery while backlog remains");
+    })
+    .await;
+    processor.release_completed_history_preparation_barrier();
+    processor.shutdown_resilience_workers().await;
+    outcome.unwrap();
+}
+
+// Commit after the owner has discovered its deadlines but before it parks.
+// The retained source signal must restore the command and heartbeat it before
+// the already-expired attempt is handed to destructive timeout processing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn control_owner_restores_command_committed_between_discovery_and_wait() {
+    let (processor, _, _rx, workspace, store, session) = cli_runtime_approval_processor().await;
+    *session.turn_liveness_probe.lock().await =
+        Some(CLIAgentRuntimeTurnLivenessProbe::ConfirmedActive);
+    let processor = Arc::new(processor);
+    processor.arm_completed_history_preparation_barrier("__control_before_wait__");
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        processor.start_resilience_workers(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        processor.wait_for_completed_history_preparation_barrier(),
+    )
+    .await
+    .unwrap();
+    let now = chrono::Utc::now().timestamp();
+    let item = "command_committed_before_control_wait";
+    store
+        .materialize_item_started_with_attempt_deadlines(
+            ItemStartedNotification {
+                workspace_id: workspace,
+                thread_id: "thread_cli_command_approval".into(),
+                turn_id: "codex-turn-command".into(),
+                item: command_execution_item(item),
+            },
+            now - 120,
+            TurnItemAttemptDeadlines {
+                lease_expires_at_unix: Some(now - 10),
+                idle_deadline_at_unix: Some(now - 10),
+                hard_deadline_at_unix: Some(now - 10),
+            },
+        )
+        .await
+        .unwrap();
+    processor.release_completed_history_preparation_barrier();
+    let outcome = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let attempts = store
+                .list_running_turn_item_attempts_for_turn("codex-turn-command")
+                .await
+                .unwrap();
+            if let Some(attempt) = attempts.iter().find(|attempt| {
+                attempt.item_id == item
+                    && attempt.last_heartbeat_at_unix.is_some_and(|at| at >= now)
+            }) {
+                assert_eq!(
+                    attempt.started_at_unix,
+                    now - 120,
+                    "a fresh projection lease must preserve historical business time"
+                );
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(processor.cli_runtime_command_heartbeats
+            .due_items(now + processor.cli_runtime_command_heartbeats.interval_secs() + 30)
+            .await.iter().any(|command| command.key.item_id == item),
+            "a source invalidation must restore the RAM command owner without a 30-second catalog timer");
+        assert!(
+            store
+                .find_unresolved_recovery_job_for_turn("codex-turn-command")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    })
+    .await;
+    processor.shutdown_resilience_workers().await;
+    outcome.expect("retained mutation must wake the owner and heartbeat before timeout");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_deadline_parks_terminal_history_and_tracks_active_liveness() {
+    let (processor, _, rx, workspace, store, _session) = cli_runtime_approval_processor().await;
+    drop(rx);
+    binding::Entity::delete_many()
+        .exec(&store.database_connection())
+        .await
+        .unwrap();
+    let now = chrono::DateTime::<chrono::Utc>::from_timestamp(1_800_000_000, 0)
+        .unwrap()
+        .fixed_offset();
+    assert_eq!(
+        processor
+            .next_cli_background_deadline(now.timestamp())
+            .await
+            .unwrap(),
+        None
+    );
+    let database = store.database_connection();
+    let mut wake = database.work_signal("gateway.cli").subscribe();
+    wake.begin_pass(&database).await.unwrap();
+    insert_turn(&store, &workspace, "deadline_active", "running", now, now).await;
+    tokio::time::timeout(std::time::Duration::from_secs(1), wake.wait(None))
+        .await
+        .unwrap();
+    assert_eq!(
+        processor
+            .next_cli_background_deadline(now.timestamp())
+            .await
+            .unwrap(),
+        Some(now.timestamp() + 15 * 60)
+    );
+    turn_liveness::Entity::delete_many()
+        .filter(turn_liveness::Column::TurnId.eq("deadline_active"))
+        .exec(&database)
+        .await
+        .unwrap();
+    assert_eq!(
+        processor
+            .next_cli_background_deadline(now.timestamp())
+            .await
+            .unwrap(),
+        Some(now.timestamp() + 150)
+    );
+    binding::Entity::update_many()
+        .col_expr(binding::Column::Status, Expr::value("completed"))
+        .filter(binding::Column::TurnId.eq("deadline_active"))
+        .exec(&database)
+        .await
+        .unwrap();
+    assert_eq!(
+        processor
+            .next_cli_background_deadline(now.timestamp())
+            .await
+            .unwrap(),
+        None
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_active_scan_reaches_stale_after_130_healthy_with_errors_and_wrap() {
     let (processor, _, rx, workspace, store, _session) = cli_runtime_approval_processor().await;
@@ -106,6 +428,8 @@ async fn cli_active_scan_reaches_stale_after_130_healthy_with_errors_and_wrap() 
         .await;
     assert_eq!(first.selected, 128);
     assert_eq!(first.processed, 127);
+    assert!(first.has_more);
+    assert!(first.failed);
     for status in ["starting", "running"] {
         assert!(!has_recovery(&store, &format!("{status}_stale")).await);
         // Created behind the cursor after discovery; it waits for the next round.
@@ -116,6 +440,20 @@ async fn cli_active_scan_reaches_stale_after_130_healthy_with_errors_and_wrap() 
             status,
             old,
             old,
+        )
+        .await;
+    }
+    // A new full suffix cannot extend this already captured pass. Its
+    // mutations, like the old rows inserted behind the cursor, belong to the
+    // next round even when the producer can keep supplying full pages.
+    for i in 0..65 {
+        insert_turn(
+            &store,
+            &workspace,
+            &format!("suffix_{i:03}"),
+            "starting",
+            now + chrono::Duration::seconds(1),
+            now,
         )
         .await;
     }
@@ -150,9 +488,11 @@ async fn cli_active_scan_reaches_stale_after_130_healthy_with_errors_and_wrap() 
     let second = processor
         .fail_stale_cli_runtime_turns(now.timestamp_millis(), &mut scan)
         .await;
-    // starting_001 sorts after the running prefix when it changes status.
-    assert_eq!(second.selected, 5);
-    assert_eq!(second.processed, 5);
+    // starting_001 moved beyond the captured Running frontier, and the new
+    // full Starting suffix is deferred. Both original tails still finish.
+    assert_eq!(second.selected, 4);
+    assert_eq!(second.processed, 4);
+    assert!(!second.has_more);
     assert!(!has_recovery(&store, "running_001").await);
     for status in ["starting", "running"] {
         assert!(has_recovery(&store, &format!("{status}_stale")).await);
@@ -1498,6 +1838,7 @@ async fn cli_timeout_and_command_heartbeat_defer_busy_transition_without_timeout
             .poll_timeouts_respecting_human_wait(heartbeat_at, 64)
             .await
             .unwrap();
+        rehydrate_command_registry(&processor).await;
         let heartbeat = processor
             .heartbeat_due_cli_runtime_command_items(heartbeat_at)
             .await;
@@ -1527,6 +1868,7 @@ async fn cli_timeout_and_command_heartbeat_defer_busy_transition_without_timeout
     });
     *session.turn_liveness_probe.lock().await =
         Some(CLIAgentRuntimeTurnLivenessProbe::ConfirmedActive);
+    rehydrate_command_registry(&processor).await;
     assert_eq!(
         processor
             .heartbeat_due_cli_runtime_command_items(heartbeat_at)
@@ -1694,6 +2036,7 @@ async fn cli_timeout_terminal_cleanup_rejects_resume_and_late_effects_after_comp
             .unwrap();
         if scan_first {
             let due = now + processor.cli_runtime_command_heartbeats.interval_secs() + 2;
+            rehydrate_command_registry(&processor).await;
             assert_eq!(
                 tokio::time::timeout(
                     std::time::Duration::from_secs(5),
@@ -4292,6 +4635,7 @@ async fn cli_timeout_poll_and_command_heartbeat_prioritize_saved_native_failure(
         drop(producer);
         let due = now + processor.cli_runtime_command_heartbeats.interval_secs() + 2;
         if heartbeat {
+            rehydrate_command_registry(&processor).await;
             assert_eq!(
                 processor.heartbeat_due_cli_runtime_command_items(due).await,
                 0

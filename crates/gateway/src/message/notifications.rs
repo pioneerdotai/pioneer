@@ -3,6 +3,27 @@ use std::time::Instant;
 
 mod pre_serialization;
 
+// Preserve failed checks until the union of relevant resources is known.
+// An unavailable branch is recoverable unless another thread supplied a proof.
+#[derive(Default)]
+struct ExecutionRecipients {
+    authorized: Vec<ConnectionId>,
+    unavailable: Vec<(
+        ConnectionId,
+        Arc<crate::auth::AuthenticatedSessionPrincipal>,
+    )>,
+}
+
+#[cfg(test)]
+pub(super) struct ExecutionAuthFault {
+    pub(super) connection: ConnectionId,
+    pub(super) method: &'static str,
+    pub(super) thread_id: String,
+    pub(super) skip: usize,
+    pub(super) entered: tokio::sync::oneshot::Sender<()>,
+    pub(super) release: tokio::sync::oneshot::Receiver<()>,
+}
+
 fn markdown_notification_stream(
     method: &str,
 ) -> Option<pioneer_observability::GatewayMarkdownStreamKind> {
@@ -475,6 +496,7 @@ impl MessageProcessor {
             .authorized_execution_collaborator_notification_recipients_for_threads(
                 thread_ids,
                 action,
+                method,
                 candidate_connection_ids,
             )
             .await;
@@ -485,6 +507,7 @@ impl MessageProcessor {
             .authorized_execution_collaborator_notification_recipients_for_threads(
                 thread_ids,
                 action,
+                method,
                 initially_authorized_connection_ids,
             )
             .await;
@@ -494,15 +517,33 @@ impl MessageProcessor {
         let Some(serialized) = self.serialize_notification(method, payload) else {
             return;
         };
+        let mut expected = HashMap::new();
+        for connection in &serialization_connection_ids {
+            if let Ok(principal) = self.session_manager.connection_principal(*connection).await {
+                expected.insert(*connection, principal);
+            }
+        }
         let connection_ids = self
             .authorized_execution_collaborator_notification_recipients_for_threads(
                 thread_ids,
                 action,
+                method,
                 serialization_connection_ids,
             )
             .await;
-        self.send_serialized_notification_to_connections(method, &serialized, connection_ids)
-            .await;
+        for connection in connection_ids {
+            if let Some(principal) = expected.get(&connection) {
+                self.deliver_execution_notification_current(
+                    thread_ids,
+                    action,
+                    method,
+                    &serialized,
+                    connection,
+                    principal.clone(),
+                )
+                .await;
+            }
+        }
     }
 
     async fn send_execution_scoped_notification<T: Serialize>(
@@ -517,6 +558,7 @@ impl MessageProcessor {
             .authorized_execution_collaborator_notification_recipients(
                 thread_id,
                 action,
+                method,
                 candidate_connection_ids,
             )
             .await;
@@ -527,6 +569,7 @@ impl MessageProcessor {
             .authorized_execution_collaborator_notification_recipients(
                 thread_id,
                 action,
+                method,
                 initially_authorized_connection_ids,
             )
             .await;
@@ -536,23 +579,122 @@ impl MessageProcessor {
         let Some(serialized) = self.serialize_notification(method, payload) else {
             return;
         };
+        let mut expected = HashMap::new();
+        for connection in &serialization_connection_ids {
+            if let Ok(principal) = self.session_manager.connection_principal(*connection).await {
+                expected.insert(*connection, principal);
+            }
+        }
         let connection_ids = self
             .authorized_execution_collaborator_notification_recipients(
                 thread_id,
                 action,
+                method,
                 serialization_connection_ids,
             )
             .await;
-        self.send_serialized_notification_to_connections(method, &serialized, connection_ids)
+        for connection in connection_ids {
+            if let Some(principal) = expected.get(&connection) {
+                self.deliver_execution_notification_current(
+                    &[thread_id],
+                    action,
+                    method,
+                    &serialized,
+                    connection,
+                    principal.clone(),
+                )
+                .await;
+            }
+        }
+    }
+
+    async fn deliver_execution_notification_current(
+        &self,
+        thread_ids: &[&str],
+        action: crate::authorization::ResourceAction,
+        method: &str,
+        serialized: &str,
+        connection: ConnectionId,
+        mut expected: Arc<crate::auth::AuthenticatedSessionPrincipal>,
+    ) {
+        use crate::session::NotificationDelivery;
+        let subject = expected.clone();
+        // One original attempt plus two fresh resource authorizations. Rotation
+        // never permits reuse of an old role decision or an unbounded retry.
+        for attempt in 0..3 {
+            if attempt != 0 {
+                let Ok(current) = self.session_manager.connection_principal(connection).await
+                else {
+                    return;
+                };
+                if !current.same_subject(&subject) {
+                    return;
+                }
+                expected = current;
+                let recipients = self
+                    .authorized_execution_collaborator_notification_recipients_for_threads(
+                        thread_ids,
+                        action,
+                        method,
+                        vec![connection],
+                    )
+                    .await;
+                if !recipients.contains(&connection) {
+                    // Denial/unavailability is fail-closed; the same observation
+                    // cannot be silently marked complete after a lost frame.
+                    self.session_manager
+                        .recover_execution_delivery(connection, &subject, method)
+                        .await;
+                    return;
+                }
+            }
+            match self
+                .session_manager
+                .try_send_execution_notification(
+                    connection,
+                    &expected,
+                    serialized.to_owned(),
+                    method,
+                )
+                .await
+            {
+                Ok(NotificationDelivery::Enqueued | NotificationDelivery::Discarded) => return,
+                Ok(NotificationDelivery::Reauthorize) => {}
+                Err(_) => {
+                    self.session_manager
+                        .recover_execution_delivery(connection, &subject, method)
+                        .await;
+                    return;
+                }
+            }
+        }
+        self.session_manager
+            .recover_execution_delivery(connection, &subject, method)
             .await;
     }
 
-    async fn authorized_execution_collaborator_notification_recipients(
+    pub(super) async fn retire_pending_delivery_observers(&self, thread_id: &str) {
+        let candidates = self.session_manager.connection_ids().await;
+        let recipients = self
+            .authorized_execution_collaborator_notification_recipients(
+                thread_id,
+                crate::authorization::ResourceAction::AgentRequestObserve,
+                "",
+                candidates,
+            )
+            .await;
+        for connection in recipients {
+            self.session_manager.unregister_connection(connection).await;
+        }
+    }
+
+    async fn resolve_execution_collaborator_notification_recipients(
         &self,
         thread_id: &str,
         action: crate::authorization::ResourceAction,
+        method: &str,
         candidate_connection_ids: Vec<ConnectionId>,
-    ) -> Vec<ConnectionId> {
+    ) -> ExecutionRecipients {
         use crate::authorization::{
             ActionGateDecision, AuthorizationDecision, AuthorizationResolver, AuthorizationService,
             DenyReason, DisclosurePolicy, ProofResolution, record_authorization_unavailable,
@@ -561,12 +703,12 @@ impl MessageProcessor {
 
         let thread_id = thread_id.trim();
         if thread_id.is_empty() || candidate_connection_ids.is_empty() {
-            return Vec::new();
+            return ExecutionRecipients::default();
         }
 
         let service = AuthorizationService::new();
         let resolver = AuthorizationResolver::new((*self.crud_store).clone());
-        let mut recipients = Vec::with_capacity(candidate_connection_ids.len());
+        let mut recipients = ExecutionRecipients::default();
         for connection_id in candidate_connection_ids {
             let Ok(principal) = self
                 .session_manager
@@ -576,11 +718,26 @@ impl MessageProcessor {
                 continue;
             };
             if let Some(auth_service) = self.auth_service.as_ref()
-                && auth_service
+                && let Err(error) = auth_service
                     .validate_session_lease(principal.as_ref())
                     .await
-                    .is_err()
             {
+                if matches!(
+                    error.code(),
+                    crate::auth::AuthErrorCode::TemporarilyUnavailable
+                        | crate::auth::AuthErrorCode::AuthNotReady
+                        // Lease validation also maps a failed clock read to
+                        // InvalidCredential: it is not proof of safe delivery.
+                        | crate::auth::AuthErrorCode::InvalidCredential
+                ) {
+                    record_authorization_unavailable(
+                        action.safe_name(),
+                        "session",
+                        "execution_notification",
+                    );
+                    recipients.unavailable.push((connection_id, principal));
+                    continue;
+                }
                 let decision = AuthorizationDecision::Deny {
                     reason: DenyReason::InactivePrincipal,
                     disclosure: DisclosurePolicy::AuthenticationTerminal,
@@ -591,7 +748,7 @@ impl MessageProcessor {
             let action_gate =
                 service.authorize_action(principal.kind, principal.role_key.as_ref(), action);
             if action_gate == ActionGateDecision::AllowAbsolute {
-                recipients.push(connection_id);
+                recipients.authorized.push(connection_id);
                 continue;
             }
             if let ActionGateDecision::Deny { reason, disclosure } = &action_gate {
@@ -602,9 +759,15 @@ impl MessageProcessor {
                 record_thread_notification_decision(action, &decision);
                 continue;
             }
-            let mut resolution = match resolver
-                .authorize_thread(principal.as_ref(), &action_gate, action, thread_id, None)
-                .await
+            let mut resolution = match async {
+                #[cfg(test)]
+                self.execution_auth_fault(connection_id, method, thread_id)
+                    .await?;
+                resolver
+                    .authorize_thread(principal.as_ref(), &action_gate, action, thread_id, None)
+                    .await
+            }
+            .await
             {
                 Ok(resolution) => resolution,
                 Err(error) => {
@@ -615,11 +778,13 @@ impl MessageProcessor {
                     );
                     warn!(
                         connection_id,
+                        method,
                         authorization_action = action.safe_name(),
                         authorization_resource_kind = "thread",
                         error = %format!("{error:#}"),
                         "execution notification authorization unavailable"
                     );
+                    recipients.unavailable.push((connection_id, principal));
                     continue;
                 }
             };
@@ -649,11 +814,13 @@ impl MessageProcessor {
                         );
                         warn!(
                             connection_id,
+                            method,
                             authorization_action = action.safe_name(),
                             authorization_resource_kind = "thread_lineage",
                             error = %format!("{error:#}"),
                             "execution notification lineage authorization unavailable"
                         );
+                        recipients.unavailable.push((connection_id, principal));
                         continue;
                     }
                 };
@@ -661,7 +828,7 @@ impl MessageProcessor {
             match resolution {
                 ProofResolution::Authorized(proof) => {
                     record_thread_notification_decision(action, proof.decision());
-                    recipients.push(connection_id);
+                    recipients.authorized.push(connection_id);
                 }
                 ProofResolution::Denied(decision) => {
                     record_thread_notification_decision(action, &decision);
@@ -671,29 +838,95 @@ impl MessageProcessor {
         recipients
     }
 
+    async fn authorized_execution_collaborator_notification_recipients(
+        &self,
+        thread_id: &str,
+        action: crate::authorization::ResourceAction,
+        method: &str,
+        candidates: Vec<ConnectionId>,
+    ) -> Vec<ConnectionId> {
+        self.authorized_execution_collaborator_notification_recipients_for_threads(
+            &[thread_id],
+            action,
+            method,
+            candidates,
+        )
+        .await
+    }
+
     async fn authorized_execution_collaborator_notification_recipients_for_threads(
         &self,
         thread_ids: &[&str],
         action: crate::authorization::ResourceAction,
-        candidate_connection_ids: Vec<ConnectionId>,
+        method: &str,
+        candidates: Vec<ConnectionId>,
     ) -> Vec<ConnectionId> {
         let mut recipients = Vec::new();
         let mut seen = HashSet::new();
+        let mut unavailable = HashMap::new();
         for thread_id in thread_ids {
-            for connection_id in self
-                .authorized_execution_collaborator_notification_recipients(
+            let resolved = self
+                .resolve_execution_collaborator_notification_recipients(
                     thread_id,
                     action,
-                    candidate_connection_ids.clone(),
+                    method,
+                    candidates.clone(),
                 )
-                .await
-            {
-                if seen.insert(connection_id) {
-                    recipients.push(connection_id);
+                .await;
+            for connection in resolved.authorized {
+                if seen.insert(connection) {
+                    recipients.push(connection);
                 }
+            }
+            for (connection, principal) in resolved.unavailable {
+                unavailable.insert(connection, principal);
+            }
+        }
+        for (connection, principal) in unavailable {
+            if !seen.contains(&connection) {
+                // No resource proof: never enqueue. Nor may a current pending
+                // observation disappear as a successful empty recipient list.
+                // The final exact token/producer gate keeps stale recovery from
+                // aborting replacement or already superseded delivery.
+                self.session_manager
+                    .recover_execution_delivery(connection, &principal, method)
+                    .await;
             }
         }
         recipients
+    }
+
+    #[cfg(test)]
+    async fn execution_auth_fault(
+        &self,
+        connection: ConnectionId,
+        method: &str,
+        thread_id: &str,
+    ) -> anyhow::Result<()> {
+        let fault = {
+            let mut slot = self.execution_auth_fault.lock().unwrap();
+            match slot.as_mut() {
+                Some(fault)
+                    if fault.connection == connection
+                        && fault.method == method
+                        && fault.thread_id == thread_id =>
+                {
+                    if fault.skip != 0 {
+                        fault.skip -= 1;
+                        None
+                    } else {
+                        slot.take()
+                    }
+                }
+                _ => None,
+            }
+        };
+        if let Some(fault) = fault {
+            let _ = fault.entered.send(());
+            let _ = fault.release.await;
+            anyhow::bail!("injected execution resource authorization unavailable");
+        }
+        Ok(())
     }
 
     pub(super) async fn send_gateway_management_notification<T: Serialize>(
@@ -1922,6 +2155,7 @@ impl MessageProcessor {
                     crate::epic5_observability::Epic5Operation::Notification,
                     crate::epic5_observability::Epic5Outcome::Unavailable,
                 );
+                crate::thread::replay::fail_current();
                 error!(method, error = %error, "failed to encode notification");
                 return None;
             }
@@ -1960,6 +2194,7 @@ impl MessageProcessor {
                     crate::epic5_observability::Epic5Operation::Notification,
                     crate::epic5_observability::Epic5Outcome::Unavailable,
                 );
+                crate::thread::replay::fail_current();
                 error!(method, error = %error, "failed to serialize notification");
                 None
             }
@@ -1981,11 +2216,15 @@ impl MessageProcessor {
                     target_connection_id,
                 );
             }
-            if let Err(error) = self
+            let outcome = self
                 .session_manager
-                .try_send_notification_text(target_connection_id, serialized.to_owned())
-                .await
-            {
+                .try_send_classified_notification_text(
+                    target_connection_id,
+                    serialized.to_owned(),
+                    method,
+                )
+                .await;
+            if let Err(error) = &outcome {
                 crate::epic5_observability::record_outcome(
                     crate::epic5_observability::Epic5Operation::Notification,
                     crate::epic5_observability::Epic5Outcome::Unavailable,
@@ -1996,9 +2235,9 @@ impl MessageProcessor {
                     error = %format!("{error:#}"),
                     "failed to send notification"
                 );
-            } else {
+            } else if matches!(outcome, Ok(crate::session::NotificationDelivery::Enqueued)) {
                 accepted = accepted.saturating_add(1);
-            }
+            } // Retired token/lease or terminal/revision/TTL supersession is not enqueue.
         }
         accepted
     }

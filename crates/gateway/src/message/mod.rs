@@ -281,7 +281,7 @@ use tokio::sync::{Mutex, OwnedMutexGuard, RwLock, broadcast, oneshot};
 use tokio::task::JoinHandle;
 
 use pioneer_cli_agent_runtime::event::RuntimeEvent;
-use tokio::time::{Duration, MissedTickBehavior, interval, sleep};
+use tokio::time::{Duration, sleep};
 use tracing::{debug, error, info, warn};
 
 use crate::auth::GatewayAuthService;
@@ -459,15 +459,9 @@ const RESILIENCE_WORKER_TRANSIENT_STORAGE_BACKOFF_SECONDS: u64 = 60;
 const PROGRESS_DELTA_HEARTBEAT_INTERVAL_SECONDS: i64 = 5;
 const PROGRESS_ITEM_TYPE_MISS_RETRY_SECONDS: i64 = 1;
 const PROGRESS_ITEM_TYPE_MISS_CACHE_CAPACITY: usize = 1_024;
-const CLI_RUNTIME_COMMAND_REHYDRATION_INTERVAL_SECONDS: i64 = 30;
-const AGENT_ACTION_LEDGER_COMPACTION_INTERVAL_SECONDS: i64 = 24 * 60 * 60;
-const AGENT_ACTION_LEDGER_COMPACTION_RETRY_SECONDS: i64 = 60 * 60;
 const AGENT_ACTION_LEDGER_COMPACTION_BATCH_SIZE: u64 = 256;
 const NATIVE_TERMINAL_EFFECT_RETENTION_SECONDS: i64 = 30 * 24 * 60 * 60;
-const NATIVE_TERMINAL_EFFECT_PURGE_INTERVAL_SECONDS: i64 = 24 * 60 * 60;
-const NATIVE_TERMINAL_EFFECT_PURGE_RETRY_SECONDS: i64 = 60 * 60;
 const NATIVE_TERMINAL_EFFECT_PURGE_BATCH_SIZE: u64 = 256;
-const NATIVE_TERMINAL_EFFECT_RECOVERY_INTERVAL_SECONDS: i64 = 10 * 60;
 const NATIVE_TERMINAL_EFFECT_RECOVERY_RETRY_SECONDS: i64 = 60;
 const NATIVE_TERMINAL_EFFECT_RECOVERY_BATCH_SIZE: u64 = 64;
 
@@ -592,6 +586,9 @@ pub struct MessageProcessor {
     observation_governor: Arc<crate::authorization::ObservationAdmissionGovernor>,
     turn_execution_owner_id: Arc<str>,
     foreground_starts: Arc<turn_handlers::foreground_start::ForegroundStartOwners>,
+    pending_delivery_order: Arc<crate::thread::replay::PendingDeliveryOrder>,
+    #[cfg(test)]
+    execution_auth_fault: Arc<std::sync::Mutex<Option<notifications::ExecutionAuthFault>>>,
     artifact_stream_invalidation:
         Arc<StdRwLock<Option<Weak<dyn ArtifactStreamInvalidation>>>>,
     view_grant_service: Arc<StdRwLock<Option<Weak<crate::view_grants::ViewGrantService>>>>,
@@ -1052,6 +1049,7 @@ struct PendingNativePermissionApprovalRequest {
 
 #[derive(Default)]
 struct TaskEventFanoutSummary {
+    #[cfg(test)]
     selected: usize,
     event_inputs: usize,
     emitted: usize,
@@ -1255,6 +1253,9 @@ impl MessageProcessor {
             observation_governor,
             turn_execution_owner_id,
             foreground_starts: Arc::new(Default::default()),
+            pending_delivery_order: Arc::default(),
+            #[cfg(test)]
+            execution_auth_fault: Arc::default(),
             artifact_stream_invalidation: Arc::new(StdRwLock::new(None)),
             view_grant_service: Arc::new(StdRwLock::new(None)),
             auth_service: None,
@@ -1438,6 +1439,10 @@ impl MessageProcessor {
 
     pub async fn set_hook_recovery_config(&self, config: GatewayHookRecoveryConfig) {
         *self.hook_recovery_config.write().await = config;
+        self.crud_store
+            .database_connection()
+            .work_signal("hooks")
+            .notify();
     }
 
     pub(crate) fn with_remote_access_supervisor(
@@ -1715,7 +1720,7 @@ impl MessageProcessor {
     }
 
     pub async fn shutdown_cli_runtime_manager(&self) {
-        self.cli_history_shutdown.cancel();
+        self.cancel_cli_history_work().await;
         let Some(manager) = self.cli_runtime_manager.as_ref() else {
             return;
         };
@@ -1929,6 +1934,10 @@ impl MessageProcessor {
                 Ok(builder) => {
                     let runtime = builder.build();
                     *self.hook_runtime.write().await = Some(runtime.clone());
+                    self.crud_store
+                        .database_connection()
+                        .work_signal("hooks")
+                        .notify();
                     self.agent_manager.set_hook_runtime(Some(runtime)).await;
                 }
                 Err(error) => {
@@ -1945,6 +1954,10 @@ impl MessageProcessor {
             Ok(builder) => {
                 let runtime = builder.build();
                 *self.hook_runtime.write().await = Some(runtime.clone());
+                self.crud_store
+                    .database_connection()
+                    .work_signal("hooks")
+                    .notify();
                 self.agent_manager.set_hook_runtime(Some(runtime)).await;
             }
             Err(error) => {
@@ -1990,6 +2003,10 @@ impl MessageProcessor {
                 crate::compaction::GatewayNativeContextController::new(Arc::downgrade(self)),
             )))
             .await;
+        self.crud_store
+            .database_connection()
+            .work_signal("compaction")
+            .notify();
     }
 
     /// Resolve the database-backed launch catalog on an isolated Tokio task.
@@ -2147,6 +2164,10 @@ impl MessageProcessor {
             Ok(builder) => {
                 let runtime = builder.build();
                 *self.hook_runtime.write().await = Some(runtime.clone());
+                self.crud_store
+                    .database_connection()
+                    .work_signal("hooks")
+                    .notify();
                 self.agent_manager.set_hook_runtime(Some(runtime)).await;
             }
             Err(error) => {
@@ -2387,6 +2408,10 @@ impl MessageProcessor {
             .workspace_compaction_settings
             .write()
             .map_err(|_| anyhow::anyhow!("workspace compaction settings unavailable"))? = prepared;
+        self.crud_store
+            .database_connection()
+            .work_signal("compaction")
+            .notify();
         Ok(())
     }
 
@@ -2517,6 +2542,12 @@ impl MessageProcessor {
     }
 
     async fn run_recovery_due_worker(processor: Weak<Self>) {
+        let Some(owner) = processor.upgrade() else {
+            return;
+        };
+        let database = owner.crud_store.database_connection().maintenance();
+        let mut work = database.work_signal("recovery.due").subscribe();
+        drop(owner);
         loop {
             let Some(original) = processor.upgrade() else {
                 break;
@@ -2525,9 +2556,15 @@ impl MessageProcessor {
             drop(original);
             #[cfg(test)]
             let wait_barrier = this.recovery_due_wait_barrier.clone();
-            let wake = this.recovery_coordinator.due_wake();
             let mut transient_storage_poll_failed = false;
+            let mut failed = false;
+            let mut deadline = None;
             let cycle = AssertUnwindSafe(async {
+                if let Err(error) = work.begin_pass(&database).await {
+                    error!(error = %error, "failed to settle recovery invalidation");
+                    failed = true;
+                    return;
+                }
                 let now = now_timestamp_secs();
                 match crate::database::attribution::scope_database_workload_result(
                     pioneer_observability::DatabaseWorkload::ExecutionSupervision,
@@ -2543,11 +2580,23 @@ impl MessageProcessor {
                             this.handle_recovery_event(event, now).await;
                         }
                     }
-                    Err(error) => record_resilience_worker_poll_error(
-                        "recovery due jobs",
-                        &error,
-                        &mut transient_storage_poll_failed,
-                    ),
+                    Err(error) => {
+                        failed = true;
+                        record_resilience_worker_poll_error(
+                            "recovery due jobs",
+                            &error,
+                            &mut transient_storage_poll_failed,
+                        );
+                    }
+                }
+                if !failed {
+                    match this.crud_store.next_recovery_job_due_at().await {
+                        Ok(next) => deadline = next,
+                        Err(error) => {
+                            failed = true;
+                            error!(error = %error, "recovery deadline discovery failed");
+                        }
+                    }
                 }
             })
             .catch_unwind()
@@ -2555,8 +2604,8 @@ impl MessageProcessor {
             if cycle.is_err() {
                 error!("contained panic in recovery due worker");
             }
-            // notify_one retains a permit across the drain/wait boundary. No
-            // processor or database resource is held during the fallback wait.
+            // The subscription was acknowledged before discovery. Concurrent
+            // commits remain visible; no processor or DB capacity is held here.
             drop(this);
             #[cfg(test)]
             wait_barrier
@@ -2568,9 +2617,12 @@ impl MessageProcessor {
             if sleep_after_transient_storage_poll_failure(transient_storage_poll_failed).await {
                 continue;
             }
-            tokio::select! {
-                _ = wake.notified() => {},
-                _ = sleep(Duration::from_secs(RESILIENCE_WORKER_POLL_INTERVAL_SECONDS)) => {},
+            if failed || cycle.is_err() {
+                sleep(Duration::from_secs(RESILIENCE_WORKER_POLL_INTERVAL_SECONDS)).await;
+            } else {
+                // A due timestamp also preserves bounded page continuation.
+                tokio::task::yield_now().await;
+                work.wait(deadline).await;
             }
         }
     }
@@ -2579,22 +2631,43 @@ impl MessageProcessor {
         let mut finalization_reporting = reconciliation_diagnostics::Reporter::new(
             reconciliation_diagnostics::Operation::NativeFinalization,
         );
+        let Some(owner) = processor.upgrade() else {
+            return;
+        };
+        let database = owner.crud_store.database_connection().maintenance();
+        let mut changes = database.work_signal("projection").subscribe();
+        drop(owner);
+        let mut begin = true;
         loop {
             let Some(this) = processor.upgrade() else {
                 break;
             };
             let this = this.for_background_reconciliation();
+            let mut failed = false;
+            let mut deadline = None;
             let cycle = AssertUnwindSafe(async {
+                if begin {
+                    if let Err(error) = changes.begin_pass(&database).await {
+                        error!(error = %error, "projection invalidation failed");
+                        failed = true;
+                        return;
+                    }
+                    begin = false;
+                }
                 let now = now_timestamp_secs();
-                match crate::database::attribution::scope_database_workload_result(
+                let replay = crate::database::attribution::scope_database_workload_result(
                     pioneer_observability::DatabaseWorkload::ProjectionRecovery,
                     pioneer_observability::DatabaseOperationSite::ProjectionReplay,
                     retry_transient_storage_access(|| {
                         this.crud_store.replay_due_turn_event_projections(now, 64)
                     }),
                 )
-                .await
-                {
+                .await;
+                match &replay {
+                    Ok(summary) => deadline = summary.next_eligible_at_unix,
+                    Err(_) => failed = true,
+                }
+                match replay {
                     Ok(summary) if summary.quarantined > 0 || summary.missing_events > 0 => warn!(
                         claimed = summary.claimed,
                         projected = summary.projected,
@@ -2626,6 +2699,14 @@ impl MessageProcessor {
                 finalization_reporting.observe_finalizations(&result, Instant::now());
                 match result {
                     Ok(summary) => {
+                        failed |= summary.pass_failed || !summary.failures.is_empty();
+                        // Retain source invalidations across the whole finite
+                        // cursor pass. Only EOF starts a new acknowledgement;
+                        // a commit behind the cursor then causes a fresh pass.
+                        if !summary.pass_complete {
+                            deadline = Some(0);
+                        }
+                        begin = summary.pass_complete;
                         let committed = summary.committed_count();
                         if committed > 0 {
                             info!(
@@ -2647,7 +2728,9 @@ impl MessageProcessor {
                             );
                         }
                     }
-                    Err(_) => {}
+                    Err(_) => {
+                        failed = true;
+                    }
                 }
 
                 #[cfg(test)]
@@ -2657,7 +2740,7 @@ impl MessageProcessor {
                         &this.cli_history_shutdown,
                     )
                     .await;
-                // Periodic recovery shares the same consumer owners as commit
+                // Recovery shares the same consumer owners as commit
                 // kicks; a slow episodic effect cannot hold the next LIVE batch.
                 this.kick_native_turn_event_deliveries();
             })
@@ -2666,9 +2749,13 @@ impl MessageProcessor {
             if cycle.is_err() {
                 error!("contained panic in projection/delivery resilience worker");
             }
-            // Fixed fallback also discovers foreign writes and restored streams.
-            // No second deadline SELECT and no acceleration of shared callbacks.
-            sleep(Duration::from_secs(RESILIENCE_WORKER_POLL_INTERVAL_SECONDS)).await;
+            drop(this);
+            if failed || cycle.is_err() {
+                sleep(Duration::from_secs(RESILIENCE_WORKER_POLL_INTERVAL_SECONDS)).await;
+            } else {
+                changes.wait(deadline).await;
+            }
+            tokio::task::yield_now().await;
         }
     }
 
@@ -2676,12 +2763,25 @@ impl MessageProcessor {
         let mut occurrence_reporting = reconciliation_diagnostics::Reporter::new(
             reconciliation_diagnostics::Operation::TaskRunOccurrence,
         );
+        let Some(owner) = processor.upgrade() else {
+            return;
+        };
+        let database = owner.crud_store.database_connection().maintenance();
+        let mut changes = database.work_signal("tasks.lifecycle").subscribe();
+        drop(owner);
         loop {
             let Some(this) = processor.upgrade() else {
                 break;
             };
             let this = this.for_background_reconciliation();
+            let mut failed = false;
+            let mut deadline = None;
             let cycle = AssertUnwindSafe(async {
+                if let Err(error) = changes.begin_pass(&database).await {
+                    error!(error = %error, "task lifecycle invalidation failed");
+                    failed = true;
+                    return;
+                }
                 let now = now_timestamp_secs();
                 match crate::database::attribution::scope_database_workload_result(
                     pioneer_observability::DatabaseWorkload::TaskReconcile,
@@ -2695,7 +2795,10 @@ impl MessageProcessor {
                         "reconciled terminal child Turns with their TaskRun aggregates"
                     ),
                     Ok(_) => {}
-                    Err(error) => tasks::report_task_child_reconciliation_error(error),
+                    Err(error) => {
+                        failed = true;
+                        tasks::report_task_child_reconciliation_error(error);
+                    }
                 }
 
                 let result = crate::database::attribution::scope_database_workload_result(
@@ -2705,9 +2808,23 @@ impl MessageProcessor {
                 )
                 .await;
                 occurrence_reporting.observe_occurrences(&result, Instant::now());
+                if result.is_err() {
+                    failed = true;
+                }
                 if let Ok(summary) = result
                     && summary.selected > 0
                 {
+                    if summary.unresolved > 0
+                        || summary.claim_errors > 0
+                        || summary.claim_deferral_errors > 0
+                        || summary.claim_commit_unknown > 0
+                        || summary.repair_errors > 0
+                        || summary.storage_errors > 0
+                        || summary.notification_errors > 0
+                        || summary.queue_state_errors > 0
+                    {
+                        failed = true;
+                    }
                     info!(
                         selected = summary.selected,
                         claimed = summary.claimed,
@@ -2737,7 +2854,15 @@ impl MessageProcessor {
                 )
                 .await
                 {
+                    failed = true;
                     error!(error = %format!("{error:#}"), "task delivery worker failed");
+                }
+                match this.crud_store.next_task_lifecycle_deadline(now).await {
+                    Ok(next) => deadline = next,
+                    Err(error) => {
+                        failed = true;
+                        error!(error = %error, "task lifecycle deadline failed");
+                    }
                 }
             })
             .catch_unwind()
@@ -2745,7 +2870,13 @@ impl MessageProcessor {
             if cycle.is_err() {
                 error!("contained panic in task lifecycle resilience worker");
             }
-            sleep(Duration::from_secs(RESILIENCE_WORKER_POLL_INTERVAL_SECONDS)).await;
+            drop(this);
+            if failed || cycle.is_err() {
+                sleep(Duration::from_secs(RESILIENCE_WORKER_POLL_INTERVAL_SECONDS)).await;
+            } else {
+                changes.wait(deadline).await;
+            }
+            tokio::task::yield_now().await;
         }
     }
 
@@ -2997,6 +3128,14 @@ impl MessageProcessor {
                 }
             }
 
+            let Some(owner) = processor.upgrade() else {
+                return;
+            };
+            let database = owner.crud_store.database_connection().maintenance();
+            let mut control_changes = database.work_signal("gateway.control").subscribe();
+            let mut cli_changes = database.work_signal("gateway.cli").subscribe();
+            let mut native_retry_changes = database.work_signal("control.native_retry").subscribe();
+            drop(owner);
             let _isolated_workers = IsolatedWorkerGuard(vec![
                 tokio::spawn(Self::run_turn_execution_owner_heartbeat_worker(
                     processor.clone(),
@@ -3008,12 +3147,24 @@ impl MessageProcessor {
                 tokio::spawn(Self::run_task_lifecycle_resilience_worker(
                     processor.clone(),
                 )),
+                tokio::spawn(Self::run_compaction_background_worker(processor.clone())),
             ]);
             let mut cli_runtime_stale_turn_scan = cli_runtime::CliRuntimeStaleTurnScan::default();
-            let mut next_skill_upload_cleanup = 0;
-            let mut next_agent_action_ledger_compaction = 0;
-            let mut next_native_terminal_effect_purge = 0;
-            let mut next_native_terminal_effect_recovery = 0;
+            let mut command_rehydration_after: Option<String> = None;
+            let mut command_rehydration_upper: Option<String> = None;
+            let mut command_rehydration_failed = false;
+            let mut command_rehydration_pending = true;
+            let mut command_rehydration_retry = None::<i64>;
+            let mut next_native_terminal_effect_recovery = Some(0);
+            let mut begin_round = true;
+            let mut round_failed = false;
+            let mut round_cutoff = now_timestamp_secs();
+            let mut supervision_complete = false;
+            let mut cli_stale_complete = false;
+            let mut timeout_complete = false;
+            let mut timeout_after: Option<pioneer_crud::TimeoutCandidateCursor> = None;
+            let mut ledger_after: Option<pioneer_crud::AgentLedgerCursor> = None;
+            let mut ledger_complete = false;
             loop {
                 let Some(this) = processor.upgrade() else {
                     break;
@@ -3022,24 +3173,110 @@ impl MessageProcessor {
                 let maintenance = this.with_database_class(SqliteWriteClass::Maintenance);
                 let now = now_timestamp_secs();
                 let mut transient_storage_poll_failed = false;
-                #[cfg(test)]
-                this.completed_history_preparation_barrier
-                    .wait_if_armed(
-                        "__resilience_before_history_poll__",
-                        &tokio_util::sync::CancellationToken::new(),
-                    )
-                    .await;
-                if maintenance.poll_completed_history_checks().await.is_err() {
-                    warn!("failed to poll completed history checks");
+                let mut more = false;
+                if begin_round {
+                    // Preserve deadlines that mature after an earlier phase finishes.
+                    round_cutoff = now;
+                    supervision_complete = false;
+                    cli_stale_complete = false;
+                    timeout_complete = false;
+                    timeout_after = None;
+                    ledger_after = None;
+                    ledger_complete = false;
+                    // Acknowledge before discovery, once for the entire bounded
+                    // sweep. Never acknowledge a mutation behind a live cursor.
+                    if control_changes.begin_pass(&database).await.is_err() {
+                        drop(maintenance);
+                        drop(this);
+                        sleep(Duration::from_secs(2)).await;
+                        continue;
+                    }
+                    if cli_changes.changed().now_or_never().is_some() {
+                        command_rehydration_pending = true;
+                        command_rehydration_retry = None;
+                    }
+                    if command_rehydration_pending
+                        && command_rehydration_retry.is_none_or(|at| now >= at)
+                    {
+                        // A new acknowledgement always starts at the head,
+                        // including after a failed page or a concurrent mutation.
+                        command_rehydration_after = None;
+                        command_rehydration_upper = None;
+                        command_rehydration_failed = false;
+                        if cli_changes.begin_pass(&database).await.is_err() {
+                            command_rehydration_retry = Some(now.saturating_add(2));
+                        }
+                    }
+                    if native_retry_changes.changed().now_or_never().is_some() {
+                        next_native_terminal_effect_recovery = Some(0);
+                    }
+                    if next_native_terminal_effect_recovery.is_some_and(|at| now >= at)
+                        && native_retry_changes.begin_pass(&database).await.is_err()
+                    {
+                        next_native_terminal_effect_recovery = Some(now.saturating_add(2));
+                    }
                 }
-                if now >= next_skill_upload_cleanup {
-                    crate::database::attribution::scope_database_workload(
-                        pioneer_observability::DatabaseWorkload::ExecutionSupervision,
-                        pioneer_observability::DatabaseOperationSite::StaleSkillUploadCleanup,
-                        maintenance.cleanup_stale_skill_uploads(now),
-                    )
-                    .await;
-                    next_skill_upload_cleanup = now.saturating_add(60);
+                if let Err(error) = crate::database::attribution::scope_database_workload_result(
+                    pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                    pioneer_observability::DatabaseOperationSite::StaleSkillUploadCleanup,
+                    maintenance.cleanup_stale_skill_uploads_for_control(now),
+                )
+                .await
+                {
+                    warn!(error = %error, "skill upload cleanup failed");
+                    round_failed = true;
+                }
+
+                if command_rehydration_pending
+                    && command_rehydration_retry.is_none_or(|at| now >= at)
+                {
+                    if command_rehydration_upper.is_none() {
+                        match this
+                            .crud_store
+                            .running_turn_item_attempt_upper_id_by_type(
+                                TurnItemType::CommandExecution,
+                            )
+                            .await
+                        {
+                            Ok(upper) => {
+                                command_rehydration_upper = Some(upper.unwrap_or_default())
+                            }
+                            Err(error) => {
+                                warn!(error = %error, "CLI command frontier discovery failed");
+                                command_rehydration_failed = true;
+                                command_rehydration_retry = Some(now.saturating_add(2));
+                                round_failed = true;
+                            }
+                        }
+                    }
+                    if let Some(upper) = command_rehydration_upper.as_deref() {
+                        match this
+                            .rehydrate_cli_runtime_command_items_bounded(
+                                None,
+                                command_rehydration_after.as_deref(),
+                                upper,
+                                1_024,
+                            )
+                            .await
+                        {
+                            Ok((_, next, failed)) => {
+                                command_rehydration_failed |= failed;
+                                command_rehydration_after = next;
+                                more |= command_rehydration_after.is_some();
+                                if command_rehydration_after.is_none() {
+                                    command_rehydration_pending = command_rehydration_failed;
+                                    command_rehydration_retry =
+                                        command_rehydration_failed.then(|| now.saturating_add(2));
+                                    command_rehydration_failed = false;
+                                }
+                            }
+                            Err(error) => {
+                                round_failed = true;
+                                warn!(error = %error, "CLI command rehydration discovery failed");
+                                command_rehydration_retry = Some(now.saturating_add(2));
+                            }
+                        }
+                    }
                 }
 
                 // Confirm live native command activity before timeout polling.
@@ -3071,6 +3308,7 @@ impl MessageProcessor {
                 .await
                 {
                     Ok(promoted) => {
+                        more |= promoted.len() >= 64;
                         let database = this.crud_store.database_connection();
                         for execution in &promoted {
                             if let Err(error) =
@@ -3085,6 +3323,7 @@ impl MessageProcessor {
                                 )
                                 .await
                             {
+                                round_failed = true;
                                 record_resilience_worker_poll_error(
                                     "agent domain promoted agent outbox wake",
                                     &error,
@@ -3107,6 +3346,7 @@ impl MessageProcessor {
                         }
                     }
                     Err(error) => {
+                        round_failed = true;
                         record_resilience_worker_poll_error(
                             "agent domain durable agent queue",
                             &error,
@@ -3114,23 +3354,22 @@ impl MessageProcessor {
                         );
                     }
                 }
-                if sleep_after_transient_storage_poll_failure(transient_storage_poll_failed).await {
-                    continue;
-                }
 
-                if now >= next_agent_action_ledger_compaction {
-                    next_agent_action_ledger_compaction =
-                        now.saturating_add(AGENT_ACTION_LEDGER_COMPACTION_INTERVAL_SECONDS);
+                if !ledger_complete {
                     match crate::database::attribution::scope_database_workload_result(
                         pioneer_observability::DatabaseWorkload::ExecutionSupervision,
                         pioneer_observability::DatabaseOperationSite::TerminalExecutionCompaction,
                         retry_transient_storage_access(|| {
                             let database = maintenance.crud_store.database_connection();
+                            let after = ledger_after.clone();
                             async move {
-                                pioneer_crud::compact_terminal_agent_action_ledger(
+                                pioneer_crud::compact_terminal_agent_action_ledger_page(
                                     &database,
-                                    pioneer_crud::utc_now(),
+                                    chrono::DateTime::from_timestamp(round_cutoff, 0)
+                                        .unwrap_or_default()
+                                        .fixed_offset(),
                                     AGENT_ACTION_LEDGER_COMPACTION_BATCH_SIZE,
+                                    after.as_ref(),
                                 )
                                 .await
                             }
@@ -3138,7 +3377,10 @@ impl MessageProcessor {
                     )
                     .await
                     {
-                        Ok(summary) => {
+                        Ok((summary, next)) => {
+                            ledger_after = next;
+                            ledger_complete = ledger_after.is_none();
+                            more |= !ledger_complete;
                             if summary.compacted_rows > 0 {
                                 info!(
                                     compacted_rows = summary.compacted_rows,
@@ -3146,13 +3388,9 @@ impl MessageProcessor {
                                     "compacted terminal agent domain action ledger payloads"
                                 );
                             }
-                            if summary.candidate_rows >= AGENT_ACTION_LEDGER_COMPACTION_BATCH_SIZE {
-                                next_agent_action_ledger_compaction = now;
-                            }
                         }
                         Err(error) => {
-                            next_agent_action_ledger_compaction =
-                                now.saturating_add(AGENT_ACTION_LEDGER_COMPACTION_RETRY_SECONDS);
+                            round_failed = true;
                             record_resilience_worker_poll_error(
                                 "agent domain action ledger compaction",
                                 &error,
@@ -3161,13 +3399,12 @@ impl MessageProcessor {
                         }
                     }
                 }
-                if sleep_after_transient_storage_poll_failure(transient_storage_poll_failed).await {
-                    continue;
-                }
 
-                if now >= next_native_terminal_effect_recovery {
+                // Exhausted native-effect retries retain their own source and
+                // row deadline; they do not run on unrelated control wakes.
+                if next_native_terminal_effect_recovery.is_some_and(|at| now >= at) {
                     next_native_terminal_effect_recovery =
-                        now.saturating_add(NATIVE_TERMINAL_EFFECT_RECOVERY_INTERVAL_SECONDS);
+                        Some(now.saturating_add(NATIVE_TERMINAL_EFFECT_RECOVERY_RETRY_SECONDS));
                     match crate::database::attribution::scope_database_workload_result(
                         pioneer_observability::DatabaseWorkload::ExecutionSupervision,
                         pioneer_observability::DatabaseOperationSite::NativeTerminalEffectRequeue,
@@ -3190,12 +3427,31 @@ impl MessageProcessor {
                                 );
                             }
                             if requeued >= NATIVE_TERMINAL_EFFECT_RECOVERY_BATCH_SIZE {
-                                next_native_terminal_effect_recovery = now;
+                                next_native_terminal_effect_recovery = Some(now);
+                                more = true;
+                            } else {
+                                match maintenance
+                                    .crud_store
+                                    .next_native_terminal_effect_recovery_deadline(now)
+                                    .await
+                                {
+                                    Ok(next) => next_native_terminal_effect_recovery = next,
+                                    Err(error) => {
+                                        round_failed = true;
+                                        record_resilience_worker_error(
+                                            "native terminal-effect recovery deadline",
+                                            &error,
+                                            ResilienceWorkerFailureImpact::Maintenance,
+                                        );
+                                    }
+                                }
                             }
                         }
                         Err(error) => {
-                            next_native_terminal_effect_recovery =
-                                now.saturating_add(NATIVE_TERMINAL_EFFECT_RECOVERY_RETRY_SECONDS);
+                            round_failed = true;
+                            next_native_terminal_effect_recovery = Some(
+                                now.saturating_add(NATIVE_TERMINAL_EFFECT_RECOVERY_RETRY_SECONDS),
+                            );
                             record_resilience_worker_error(
                                 "native terminal-effect retryable recovery",
                                 &error,
@@ -3204,13 +3460,8 @@ impl MessageProcessor {
                         }
                     }
                 }
-                if sleep_after_transient_storage_poll_failure(transient_storage_poll_failed).await {
-                    continue;
-                }
 
-                if now >= next_native_terminal_effect_purge {
-                    next_native_terminal_effect_purge =
-                        now.saturating_add(NATIVE_TERMINAL_EFFECT_PURGE_INTERVAL_SECONDS);
+                {
                     match crate::database::attribution::scope_database_workload_result(
                         pioneer_observability::DatabaseWorkload::ExecutionSupervision,
                         pioneer_observability::DatabaseOperationSite::NativeTerminalEffectPurge,
@@ -3230,12 +3481,11 @@ impl MessageProcessor {
                                 info!(purged, "purged retained native terminal effects");
                             }
                             if purged >= NATIVE_TERMINAL_EFFECT_PURGE_BATCH_SIZE {
-                                next_native_terminal_effect_purge = now;
+                                more = true;
                             }
                         }
                         Err(error) => {
-                            next_native_terminal_effect_purge =
-                                now.saturating_add(NATIVE_TERMINAL_EFFECT_PURGE_RETRY_SECONDS);
+                            round_failed = true;
                             // Retention is maintenance, not recovery authority.
                             // Its failure must not defer terminalization,
                             // timeout supervision, or either durable outbox.
@@ -3246,9 +3496,6 @@ impl MessageProcessor {
                             );
                         }
                     }
-                }
-                if sleep_after_transient_storage_poll_failure(transient_storage_poll_failed).await {
-                    continue;
                 }
 
                 match crate::database::attribution::scope_database_workload_result(
@@ -3261,6 +3508,7 @@ impl MessageProcessor {
                 .await
                 {
                     Ok(batch) => {
+                        more |= batch.has_more;
                         if !batch.errors.is_empty() {
                             tracing::warn!(
                                 delivered = batch.delivered,
@@ -3278,6 +3526,7 @@ impl MessageProcessor {
                         }
                     }
                     Err(error) => {
+                        round_failed = true;
                         transient_storage_poll_failed = true;
                         record_resilience_worker_poll_error(
                             "agent domain agent action outbox",
@@ -3286,47 +3535,59 @@ impl MessageProcessor {
                         );
                     }
                 }
-                if sleep_after_transient_storage_poll_failure(transient_storage_poll_failed).await {
-                    continue;
-                }
 
                 // Hook/cleanup handlers have their own bounded deadlines and
                 // must never block lease heartbeats, timeout recovery, or the
                 // rest of this global resilience control loop.
                 this.kick_native_terminal_effects();
 
-                match crate::database::attribution::scope_database_workload_result(
-                    pioneer_observability::DatabaseWorkload::ExecutionSupervision,
-                    pioneer_observability::DatabaseOperationSite::ExecutionTimeoutPoll,
-                    retry_transient_storage_access(|| {
-                        this.poll_timeouts_respecting_human_wait(now, 64)
-                    }),
-                )
-                .await
-                {
-                    Ok(candidates) => {
-                        for candidate in candidates {
-                            crate::database::attribution::scope_database_workload(
+                if command_rehydration_after.is_none() && !timeout_complete {
+                    match crate::database::attribution::scope_database_workload_result(
+                        pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                        pioneer_observability::DatabaseOperationSite::ExecutionTimeoutPoll,
+                        retry_transient_storage_access(|| {
+                            this.poll_timeout_candidate_page(
+                                round_cutoff,
+                                64,
+                                timeout_after.as_ref(),
+                            )
+                        }),
+                    )
+                    .await
+                    {
+                        Ok((candidates, next)) => {
+                            timeout_after = next;
+                            timeout_complete = timeout_after.is_none();
+                            more |= !timeout_complete;
+                            for candidate in candidates {
+                                crate::database::attribution::scope_database_workload(
                                 pioneer_observability::DatabaseWorkload::ExecutionSupervision,
                                 pioneer_observability::DatabaseOperationSite::ExecutionTimeoutApply,
                                 this.handle_timeout_candidate(candidate, now),
                             )
                             .await;
+                            }
+                        }
+                        Err(error) => {
+                            round_failed = true;
+                            record_resilience_worker_poll_error(
+                                "timeout supervisor",
+                                &error,
+                                &mut transient_storage_poll_failed,
+                            );
                         }
                     }
-                    Err(error) => {
-                        record_resilience_worker_poll_error(
-                            "timeout supervisor",
-                            &error,
-                            &mut transient_storage_poll_failed,
-                        );
-                    }
-                }
-                if sleep_after_transient_storage_poll_failure(transient_storage_poll_failed).await {
-                    continue;
                 }
 
-                if let Err(error) = crate::database::attribution::scope_database_workload_result(
+                #[cfg(test)]
+                this.completed_history_preparation_barrier
+                    .wait_if_armed(
+                        "__control_after_timeout_phase__",
+                        &tokio_util::sync::CancellationToken::new(),
+                    )
+                    .await;
+
+                match crate::database::attribution::scope_database_workload_result(
                     pioneer_observability::DatabaseWorkload::RecoveryTerminalizationAudit,
                     pioneer_observability::DatabaseOperationSite::RecoveryTerminalizationAudit,
                     retry_transient_storage_access(|| {
@@ -3336,17 +3597,18 @@ impl MessageProcessor {
                 )
                 .await
                 {
-                    record_resilience_worker_poll_error(
-                        "recovery terminalization auditor",
-                        &error,
-                        &mut transient_storage_poll_failed,
-                    );
-                }
-                if sleep_after_transient_storage_poll_failure(transient_storage_poll_failed).await {
-                    continue;
+                    Ok(count) => more |= count >= 64,
+                    Err(error) => {
+                        round_failed = true;
+                        record_resilience_worker_poll_error(
+                            "recovery terminalization auditor",
+                            &error,
+                            &mut transient_storage_poll_failed,
+                        );
+                    }
                 }
 
-                if let Err(error) = crate::database::attribution::scope_database_workload_result(
+                match crate::database::attribution::scope_database_workload_result(
                     pioneer_observability::DatabaseWorkload::RecoveryTerminalizationApply,
                     pioneer_observability::DatabaseOperationSite::RecoveryTerminalizationApply,
                     retry_transient_storage_access(|| {
@@ -3355,63 +3617,144 @@ impl MessageProcessor {
                 )
                 .await
                 {
-                    record_resilience_worker_poll_error(
-                        "recovery terminalization outbox",
-                        &error,
-                        &mut transient_storage_poll_failed,
-                    );
-                }
-                if sleep_after_transient_storage_poll_failure(transient_storage_poll_failed).await {
-                    continue;
-                }
-
-                match crate::database::attribution::scope_database_workload_result(
-                    pioneer_observability::DatabaseWorkload::ExecutionSupervision,
-                    pioneer_observability::DatabaseOperationSite::RecoveryJobs,
-                    retry_transient_storage_access(|| {
-                        this.recovery_coordinator.run_supervision_audits(now, 64)
-                    }),
-                )
-                .await
-                {
-                    Ok(events) => {
-                        for event in events {
-                            crate::database::attribution::scope_database_workload(
-                                pioneer_observability::DatabaseWorkload::ExecutionSupervision,
-                                pioneer_observability::DatabaseOperationSite::RecoveryEventApply,
-                                this.handle_recovery_event(event, now),
-                            )
-                            .await;
-                        }
-                    }
+                    Ok(count) => more |= count >= 64,
                     Err(error) => {
+                        round_failed = true;
                         record_resilience_worker_poll_error(
-                            "recovery coordinator",
+                            "recovery terminalization outbox",
                             &error,
                             &mut transient_storage_poll_failed,
                         );
                     }
                 }
-                if sleep_after_transient_storage_poll_failure(transient_storage_poll_failed).await {
+
+                if !supervision_complete {
+                    let supervision = crate::database::attribution::scope_database_workload(
+                        pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                        pioneer_observability::DatabaseOperationSite::RecoveryJobs,
+                        this.recovery_coordinator
+                            .run_supervision_quantum(round_cutoff, 64),
+                    )
+                    .await;
+                    supervision_complete = !supervision.has_more;
+                    more |= supervision.has_more;
+                    round_failed |= !supervision.errors.is_empty();
+                    for error in supervision.errors {
+                        warn!(error, "recovery supervision phase failed");
+                    }
+                    for event in supervision.events {
+                        crate::database::attribution::scope_database_workload(
+                            pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                            pioneer_observability::DatabaseOperationSite::RecoveryEventApply,
+                            this.handle_recovery_event(event, now),
+                        )
+                        .await;
+                    }
+                }
+                if !cli_stale_complete {
+                    let stale = crate::database::attribution::scope_database_workload(
+                        pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                        pioneer_observability::DatabaseOperationSite::StaleCliTurnFailure,
+                        this.fail_stale_cli_runtime_turns(
+                            now_timestamp_millis(),
+                            &mut cli_runtime_stale_turn_scan,
+                        ),
+                    )
+                    .await;
+                    cli_stale_complete = !stale.has_more;
+                    more |= stale.has_more;
+                    round_failed |= stale.failed;
+                }
+                round_failed |= transient_storage_poll_failed;
+                if more {
+                    let retry_delay = round_failed;
+                    // Queue drains can remain runnable forever. They must not
+                    // pin the cutoff or keep completed discovery phases idle.
+                    // Finish the finite sweep before acknowledging changes so
+                    // a mutation behind any live cursor is rediscovered from
+                    // the head on the next round, even with a busy outbox.
+                    begin_round = ledger_complete
+                        && timeout_complete
+                        && supervision_complete
+                        && cli_stale_complete
+                        && (command_rehydration_after.is_none()
+                            || command_rehydration_retry.is_some());
+                    if begin_round {
+                        round_failed = false;
+                    }
+                    drop(maintenance);
+                    drop(this);
+                    if retry_delay {
+                        sleep(Duration::from_secs(2)).await;
+                    } else {
+                        tokio::task::yield_now().await;
+                    }
                     continue;
                 }
 
-                crate::database::attribution::scope_database_workload(
-                    pioneer_observability::DatabaseWorkload::ExecutionSupervision,
-                    pioneer_observability::DatabaseOperationSite::StaleCliTurnFailure,
-                    this.fail_stale_cli_runtime_turns(
-                        now_timestamp_millis(),
-                        &mut cli_runtime_stale_turn_scan,
-                    ),
-                )
-                .await;
-
-                sleep(Duration::from_secs(RESILIENCE_WORKER_POLL_INTERVAL_SECONDS)).await;
+                let mut deadline = next_native_terminal_effect_recovery;
+                for result in [
+                    maintenance
+                        .crud_store
+                        .next_gateway_control_deadline(round_cutoff)
+                        .await,
+                    this.next_cli_background_deadline(now).await,
+                    maintenance.next_skill_cleanup_deadline(round_cutoff).await,
+                    this.recovery_coordinator
+                        .next_supervision_deadline(round_cutoff)
+                        .await,
+                ] {
+                    match result {
+                        Ok(next) => deadline = deadline.into_iter().chain(next).min(),
+                        Err(error) => {
+                            warn!(error = %error, "control deadline discovery failed");
+                            round_failed = true;
+                        }
+                    }
+                }
+                deadline = deadline.into_iter().chain(command_rehydration_retry).min();
+                if round_failed {
+                    // A failed mutation can itself leave a retained UNKNOWN
+                    // signal. Back off without consuming it; selecting that
+                    // signal here would bypass the error delay indefinitely.
+                    drop(maintenance);
+                    drop(this);
+                    sleep(Duration::from_secs(2)).await;
+                    begin_round = true;
+                    round_failed = false;
+                    continue;
+                }
+                #[cfg(test)]
+                this.completed_history_preparation_barrier
+                    .wait_if_armed(
+                        "__control_before_wait__",
+                        &tokio_util::sync::CancellationToken::new(),
+                    )
+                    .await;
+                drop(maintenance);
+                drop(this);
+                // Keep all cursors and subscriptions unacknowledged across
+                // portions. A retained mutation starts a fresh complete sweep.
+                tokio::select! {
+                    _ = control_changes.wait(deadline) => {},
+                    _ = cli_changes.changed() => {
+                        command_rehydration_pending = true;
+                        command_rehydration_retry = None;
+                    },
+                    _ = native_retry_changes.changed() => {
+                        next_native_terminal_effect_recovery = Some(0);
+                    },
+                }
+                begin_round = true;
+                round_failed = false;
             }
         };
+        let shutdown = self.cli_history_shutdown.clone();
         let handle = tokio::spawn(async move {
             tokio::select! {
+                biased;
                 _ = cancellation.cancelled() => {},
+                _ = shutdown.cancelled() => {},
                 _ = worker => {},
             }
         });
@@ -3421,8 +3764,9 @@ impl MessageProcessor {
     }
 
     pub(crate) async fn shutdown_resilience_workers(&self) {
+        self.session_manager.stop_thread_replays().await;
         self.foreground_starts.shutdown().await;
-        self.cli_history_shutdown.cancel();
+        self.cancel_cli_history_work().await;
         {
             let workers = &self.native_turn_event_delivery_workers;
             let _admission = workers
@@ -3447,6 +3791,15 @@ impl MessageProcessor {
         self.task_runtime.shutdown().await;
     }
 
+    async fn cancel_cli_history_work(&self) {
+        {
+            // The same admission lock protects the shutdown check and spawn
+            // in the compaction owner. Once cancelled, no new job can enter.
+            let _admission = self.completed_history_checks.lock().await;
+            self.cli_history_shutdown.cancel();
+        }
+    }
+
     async fn update_cli_runtime_command_item_registry(
         &self,
         instance: &crate::cli_runtime::session_instance::CliSessionInstanceId,
@@ -3456,6 +3809,10 @@ impl MessageProcessor {
         self.cli_runtime_command_heartbeats
             .update_from_runtime_event(instance, turn_binding, event, now_timestamp_secs())
             .await;
+        self.crud_store
+            .database_connection()
+            .work_signal("gateway.control")
+            .notify();
     }
 
     async fn detach_cli_runtime_command_observer(
@@ -3465,27 +3822,44 @@ impl MessageProcessor {
         self.cli_runtime_command_heartbeats
             .detach_observer(instance)
             .await;
+        self.crud_store
+            .database_connection()
+            .work_signal("gateway.control")
+            .notify();
     }
 
     async fn rehydrate_cli_runtime_command_items(
         &self,
         observer: Option<&crate::cli_runtime::session_instance::CliSessionInstanceId>,
+        after_id: Option<&str>,
         limit: u64,
-    ) -> usize {
-        let attempts = match self
+    ) -> anyhow::Result<(usize, Option<String>, bool)> {
+        let upper = self
             .crud_store
-            .list_running_turn_item_attempts_by_type(TurnItemType::CommandExecution, limit)
+            .running_turn_item_attempt_upper_id_by_type(TurnItemType::CommandExecution)
+            .await?
+            .unwrap_or_default();
+        self.rehydrate_cli_runtime_command_items_bounded(observer, after_id, &upper, limit)
             .await
-        {
-            Ok(attempts) => attempts,
-            Err(error) => {
-                warn!(
-                    error = %format!("{error:#}"),
-                    "failed to load durable CLI runtime command supervision candidates"
-                );
-                return 0;
-            }
-        };
+    }
+
+    async fn rehydrate_cli_runtime_command_items_bounded(
+        &self,
+        observer: Option<&crate::cli_runtime::session_instance::CliSessionInstanceId>,
+        after_id: Option<&str>,
+        upper_id: &str,
+        limit: u64,
+    ) -> anyhow::Result<(usize, Option<String>, bool)> {
+        let (attempts, next) = self
+            .crud_store
+            .list_running_turn_item_attempt_page_by_type_bounded(
+                TurnItemType::CommandExecution,
+                after_id,
+                upper_id,
+                limit,
+            )
+            .await?;
+        let mut failed = false;
         let mut restored = 0usize;
         for attempt in attempts {
             let binding = match self
@@ -3496,6 +3870,7 @@ impl MessageProcessor {
                 Ok(Some(binding)) => binding,
                 Ok(None) => continue,
                 Err(error) => {
+                    failed = true;
                     warn!(
                         turn_id = attempt.turn_id.as_str(),
                         item_id = attempt.item_id.as_str(),
@@ -3527,6 +3902,7 @@ impl MessageProcessor {
                 Ok(Some(owner_attempt)) if owner_attempt.status.is_active() => owner_attempt,
                 Ok(_) => continue,
                 Err(error) => {
+                    failed = true;
                     warn!(
                         turn_id = binding.turn_id.as_str(),
                         item_id = attempt.item_id.as_str(),
@@ -3548,6 +3924,7 @@ impl MessageProcessor {
             {
                 Ok(segment) => segment,
                 Err(error) => {
+                    failed = true;
                     warn!(
                         turn_id = binding.turn_id.as_str(),
                         item_id = attempt.item_id.as_str(),
@@ -3575,6 +3952,7 @@ impl MessageProcessor {
                 Ok(Some(owner)) => owner,
                 Ok(None) => continue,
                 Err(error) => {
+                    failed = true;
                     warn!(
                         turn_id = binding.turn_id.as_str(),
                         item_id = attempt.item_id.as_str(),
@@ -3623,17 +4001,10 @@ impl MessageProcessor {
                 .await;
             restored = restored.saturating_add(1);
         }
-        restored
+        Ok((restored, next, failed))
     }
 
     async fn heartbeat_due_cli_runtime_command_items(&self, now_unix: i64) -> usize {
-        if self
-            .cli_runtime_command_heartbeats
-            .should_rehydrate(now_unix, CLI_RUNTIME_COMMAND_REHYDRATION_INTERVAL_SECONDS)
-            .await
-        {
-            self.rehydrate_cli_runtime_command_items(None, 1_024).await;
-        }
         let due = self
             .cli_runtime_command_heartbeats
             .due_items(now_unix)
@@ -3814,6 +4185,8 @@ impl MessageProcessor {
         }
 
         let processor = Arc::downgrade(self);
+        let database = self.crud_store.database_connection().maintenance();
+        let mut changes = database.work_signal("hooks").subscribe();
         let handle = tokio::spawn(async move {
             let mut first_pass = true;
             loop {
@@ -3822,28 +4195,65 @@ impl MessageProcessor {
                 };
                 let this = this.for_background_reconciliation();
                 let config = this.hook_recovery_config.read().await.clone();
-                if config.enabled && (!first_pass || config.startup_scan) {
-                    crate::database::attribution::scope_database_workload(
-                        pioneer_observability::DatabaseWorkload::HookRecovery,
-                        pioneer_observability::DatabaseOperationSite::HookRecovery,
-                        this.run_hook_recovery_pass(config.clone()),
-                    )
-                    .await;
+                let result: anyhow::Result<Option<i64>> = async {
+                    changes.begin_pass(&database).await?;
+                    if !config.enabled {
+                        return Ok(None);
+                    }
+                    if !this
+                        .hook_runtime
+                        .read()
+                        .await
+                        .as_ref()
+                        .is_some_and(|runtime| runtime.has_run_store())
+                    {
+                        return Ok(None);
+                    }
+                    if !first_pass || config.startup_scan {
+                        crate::database::attribution::scope_database_workload_result(
+                            pioneer_observability::DatabaseWorkload::HookRecovery,
+                            pioneer_observability::DatabaseOperationSite::HookRecovery,
+                            this.run_hook_recovery_pass(config.clone()),
+                        )
+                        .await?;
+                    }
+                    let deadline = this
+                        .crud_store
+                        .next_hook_recovery_deadline(config.stale_running_after_ms)
+                        .await?;
+                    Ok(deadline)
                 }
+                .await;
                 first_pass = false;
-                sleep(Duration::from_millis(config.poll_interval_ms.max(250))).await;
+                drop(this);
+                match result {
+                    Ok(Some(at)) if at <= now_timestamp_secs() => {
+                        // A persisted due head can include a swallowed per-run
+                        // store error. Back off before accepting its own wake.
+                        sleep(Duration::from_millis(config.poll_interval_ms.max(250))).await;
+                    }
+                    Ok(deadline) => changes.wait(deadline).await,
+                    Err(error) => {
+                        error!(error = %error, "hook recovery pass failed");
+                        sleep(Duration::from_millis(config.poll_interval_ms.max(250))).await;
+                    }
+                }
+                tokio::task::yield_now().await;
             }
         });
 
         *guard = Some(handle);
     }
 
-    async fn run_hook_recovery_pass(&self, config: GatewayHookRecoveryConfig) {
+    async fn run_hook_recovery_pass(
+        &self,
+        config: GatewayHookRecoveryConfig,
+    ) -> anyhow::Result<()> {
         let Some(runtime) = self.hook_runtime.read().await.clone() else {
-            return;
+            return Ok(());
         };
         if !runtime.has_run_store() {
-            return;
+            return Ok(());
         }
         let runtime = GatewayHookRuntimeBuilder::from_runtime(self.crud_store.clone(), &runtime)
             .with_crud_run_store()
@@ -3877,9 +4287,10 @@ impl MessageProcessor {
                 }
             }
             Err(error) => {
-                error!(error = %format!("{error:#}"), "hook recovery pass failed");
+                return Err(anyhow::anyhow!("{error:#}"));
             }
         }
+        Ok(())
     }
 
     async fn start_task_event_listener(self: &Arc<Self>) {
@@ -3888,57 +4299,37 @@ impl MessageProcessor {
             return;
         }
         let processor = Arc::downgrade(self);
-        let mut subscription = self
-            .task_runtime
-            .event_bus()
-            .subscribe(pioneer_tasks::TaskEventFilter::default());
+        let database = self.crud_store.database_connection().maintenance();
+        let mut changes = database.work_signal("tasks.fanout").subscribe();
         *guard = Some(tokio::spawn(async move {
-            let mut bus_open = true;
-            let mut periodic = interval(Duration::from_secs(5));
-            periodic.set_missed_tick_behavior(MissedTickBehavior::Delay);
             loop {
-                // The bus is only a wake. This owned dispatcher is the sole
-                // emitter, so even slow Tasks cannot acquire competing lanes.
-                tokio::select! {
-                    delivery=subscription.recv(),if bus_open=>match delivery {
-                        pioneer_tasks::TaskEventWakeDelivery::Wake(_)=>{},
-                        pioneer_tasks::TaskEventWakeDelivery::Lagged(count)=>warn!(missed_wakes=count,"task fanout wake bus lagged"),
-                        pioneer_tasks::TaskEventWakeDelivery::Closed=>bus_open=false,
-                    },
-                    _=periodic.tick()=>{},
-                }
                 let Some(this) = processor.upgrade() else {
                     break;
                 };
-                let result = crate::database::attribution::scope_database_workload_result(
-                    pioneer_observability::DatabaseWorkload::TaskEventFanout,
-                    pioneer_observability::DatabaseOperationSite::TaskEventFanout,
-                    this.for_background_reconciliation()
-                        .task_event_fanout_quantum(),
-                )
+                let this = this.for_background_reconciliation();
+                let result: anyhow::Result<Option<i64>> = async {
+                    changes.begin_pass(&database).await?;
+                    let summary = crate::database::attribution::scope_database_workload_result(
+                        pioneer_observability::DatabaseWorkload::TaskEventFanout,
+                        pioneer_observability::DatabaseOperationSite::TaskEventFanout,
+                        this.task_event_fanout_quantum(),
+                    )
+                    .await?;
+                    anyhow::ensure!(summary.errors == 0, "task fanout quantum incomplete");
+                    // Remaining tickets (including a full last page) retain a
+                    // due timestamp; reaching the quantum budget is not EOF.
+                    this.crud_store.next_task_event_fanout_deadline().await
+                }
                 .await;
+                drop(this);
                 match result {
-                    Ok(summary) => {
-                        debug!(selected=summary.selected,event_inputs=summary.event_inputs,emitted=summary.emitted,errors=summary.errors,pending=?summary.pending,"task fanout quantum completed");
-                        if summary.errors > 0 {
-                            // Storage/claim failures cannot spin via a hot bus.
-                            // Sleep owns no DB resources; cancellation aborts it.
-                            tokio::time::sleep(Duration::from_secs(5)).await;
-                        }
-                    }
+                    Ok(deadline) => changes.wait(deadline).await,
                     Err(error) => {
-                        warn!(
-                            failure_class =
-                                if reconciliation_diagnostics::is_storage_failure(&error) {
-                                    "storage"
-                                } else {
-                                    "candidate"
-                                },
-                            "task fanout discovery failed"
-                        );
+                        warn!(error = %error, "task fanout discovery failed");
                         tokio::time::sleep(Duration::from_secs(5)).await;
                     }
                 }
+                tokio::task::yield_now().await;
             }
         }));
     }
@@ -3961,6 +4352,7 @@ impl MessageProcessor {
             .due_task_event_fanout(clock(), TASK_EVENT_FANOUT_TASK_BUDGET)
             .await?;
         let mut summary = TaskEventFanoutSummary {
+            #[cfg(test)]
             selected: candidates.len(),
             ..Default::default()
         };
@@ -5015,6 +5407,9 @@ impl MessageProcessor {
             observation_governor,
             turn_execution_owner_id,
             foreground_starts: Arc::new(Default::default()),
+            pending_delivery_order: Arc::default(),
+            #[cfg(test)]
+            execution_auth_fault: Arc::default(),
             artifact_stream_invalidation: Arc::new(StdRwLock::new(None)),
             view_grant_service: Arc::new(StdRwLock::new(None)),
             auth_service: None,

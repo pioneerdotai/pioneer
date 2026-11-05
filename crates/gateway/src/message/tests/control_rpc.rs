@@ -7,7 +7,7 @@ use crate::transport::{
 use futures_util::FutureExt;
 use pioneer_protocol::{JsonRpcRequest, constants::methods};
 use pioneer_provider::ProviderRegistry;
-use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
+use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, Set};
 use tokio::sync::watch;
 
 const THREAD: &str = "thrControl00000000001";

@@ -458,9 +458,13 @@ impl CrudStore {
         &self,
         prepared: PreparedTaskTerminalTransition,
     ) -> Result<TaskTerminalCommitOutcome> {
-        // Finish reconciliation includes both commit and fresh preparation;
-        // heap-allocate that state machine on ordinary Gateway worker stacks.
-        Box::pin(self.commit_task_terminal_transition_inner(prepared)).await
+        let change = crate::task_events::TaskWorkChange::new(&self.connection);
+        // Keep the existing bounded terminal state machine off the worker stack.
+        let result = Box::pin(self.commit_task_terminal_transition_inner(prepared)).await;
+        if let Ok(outcome) = &result {
+            change.completed(crate::task_events::inserted_task_events(&outcome.events));
+        }
+        result
     }
 
     async fn commit_task_terminal_transition_inner(

@@ -95,7 +95,7 @@ async fn episodic_pending_delivery_survives_real_receipt_cleanup_and_reopen() {
     .unwrap();
     // Use the actual cleanup quantum, including its atomic durable boundary.
     let cleanup = store
-        .cleanup_projection_receipts_quantum(None)
+        .cleanup_projection_receipts_quantum(None, None)
         .await
         .unwrap();
     assert_eq!(cleanup.rows_deleted, 4); // Turn start and three completed items.

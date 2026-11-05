@@ -74,6 +74,9 @@ const CLI_RUNTIME_PENDING_TURN_EVENT_MAX_PER_TURN: usize = 512;
 #[derive(Default)]
 pub(super) struct CliRuntimeStaleTurnScan {
     after: [Option<(chrono::DateTime<chrono::FixedOffset>, String)>; 2],
+    through: [Option<(chrono::DateTime<chrono::FixedOffset>, String)>; 2],
+    initialized: [bool; 2],
+    complete: [bool; 2],
 }
 
 #[derive(Debug, Default)]
@@ -81,6 +84,8 @@ pub(super) struct CliRuntimeStaleTurnScanSummary {
     pub selected: usize,
     /// Successful validator returns, including healthy/no-op results.
     pub processed: usize,
+    pub has_more: bool,
+    pub failed: bool,
 }
 const CLI_RUNTIME_SILENT_TURN_STALE_AFTER_MS: i64 = 150_000;
 const CLI_RUNTIME_EVENTED_TURN_STALE_AFTER_MS: i64 = 15 * 60 * 1_000;
@@ -2981,6 +2986,7 @@ impl MessageProcessor {
         &self,
         request: NewCliRuntimePendingRequest,
     ) -> anyhow::Result<CliRuntimePendingRequestRecord> {
+        let opened_producer = self.pending_delivery_order.opened(&request.request_id);
         let interaction = pioneer_crud::deserialize_cli_runtime_json::<CLIRuntimePendingRequest>(
             request.payload_json.as_str(),
         )
@@ -3047,7 +3053,20 @@ impl MessageProcessor {
                 .await?
         };
         if opened.status == StoredCliRuntimePendingRequestStatus::Pending {
-            self.emit_cli_runtime_request_opened(opened.clone()).await;
+            if let Some(producer) = opened_producer {
+                producer
+                    .expires_at(
+                        opened
+                            .created_at
+                            .timestamp_millis()
+                            .saturating_add(CLI_RUNTIME_HUMAN_RESPONSE_TIMEOUT_MS),
+                    )
+                    .run(self.emit_cli_runtime_request_opened(opened.clone()))
+                    .await;
+            } else {
+                self.retire_pending_delivery_observers(&opened.thread_id)
+                    .await;
+            }
         }
         Ok(opened)
     }
@@ -3436,8 +3455,12 @@ impl MessageProcessor {
         }
 
         self.ensure_cli_runtime_execution_event_hub(instance).await;
-        self.rehydrate_cli_runtime_command_items(Some(instance), 1_024)
-            .await;
+        if let Err(error) = self
+            .rehydrate_cli_runtime_command_items(Some(instance), None, 1_024)
+            .await
+        {
+            warn!(error = %error, "failed to restore CLI command observers");
+        }
         if let Some(receivers) = event_receivers {
             self.spawn_cli_runtime_event_pump(
                 instance.clone(),
@@ -8008,6 +8031,159 @@ impl MessageProcessor {
         }
     }
 
+    /// Compute deadlines from active work only. Each read releases its bounded
+    /// page before validation; completed history never supplies a timer.
+    pub(super) async fn next_cli_background_deadline(
+        &self,
+        now: i64,
+    ) -> anyhow::Result<Option<i64>> {
+        use pioneer_crud::CliRuntimeActiveTurnBindingStatus::{Running, Starting};
+        let discovery = self.crud_store.with_maintenance_access();
+        let mut next_ms = None::<i64>;
+        let mut include = |deadline: i64| {
+            next_ms = Some(next_ms.map_or(deadline, |current| current.min(deadline)));
+        };
+        for status in [Starting, Running] {
+            let Some(through) = discovery
+                .active_cli_runtime_turn_binding_frontier(status)
+                .await?
+            else {
+                continue;
+            };
+            let mut after = None;
+            loop {
+                let bindings = discovery
+                    .list_active_cli_runtime_turn_binding_page_through(
+                        status,
+                        after.as_ref(),
+                        &through,
+                    )
+                    .await?;
+                let full = bindings.len()
+                    == pioneer_crud::CLI_RUNTIME_ACTIVE_TURN_BINDING_PAGE_MAX as usize;
+                after = bindings
+                    .last()
+                    .map(|binding| (binding.created_at, binding.turn_id.clone()));
+                for binding in bindings {
+                    let request_through = discovery
+                        .cli_runtime_pending_request_frontier_for_turn(&binding.turn_id)
+                        .await?;
+                    let mut request_after = None;
+                    let mut human_wait = false;
+                    while request_through.is_some() {
+                        let requests = discovery
+                            .list_cli_runtime_pending_requests(
+                                pioneer_crud::CliRuntimePendingRequestListFilter {
+                                    turn_id: Some(binding.turn_id.clone()),
+                                    open_only: true,
+                                    after: request_after.clone(),
+                                    through: request_through.clone(),
+                                    ..Default::default()
+                                },
+                            )
+                            .await?;
+                        let full = requests.len()
+                            == pioneer_crud::CLI_RUNTIME_PENDING_REQUEST_PAGE_MAX as usize;
+                        request_after = requests
+                            .last()
+                            .map(|request| (request.created_at, request.request_id.clone()));
+                        for request in requests {
+                            if request.workspace_id == binding.workspace_id
+                                && request.runtime_id == binding.runtime_id
+                                && request.thread_id == binding.thread_id
+                                && cli_runtime_pending_request_is_human_wait(&request.request_kind)
+                            {
+                                human_wait = true;
+                                include(
+                                    request
+                                        .created_at
+                                        .timestamp_millis()
+                                        .saturating_add(CLI_RUNTIME_HUMAN_RESPONSE_TIMEOUT_MS),
+                                );
+                                if matches!(
+                                    request.status,
+                                    StoredCliRuntimePendingRequestStatus::ResponseAccepted
+                                        | StoredCliRuntimePendingRequestStatus::Delivering
+                                ) {
+                                    include(
+                                        request
+                                            .updated_at
+                                            .timestamp_millis()
+                                            .saturating_add(30_000),
+                                    );
+                                }
+                            }
+                        }
+                        if !full {
+                            break;
+                        }
+                    }
+                    // Reconciliation defers stale runtime observation while a
+                    // human response is pending; its own deadline owns the wake.
+                    if !human_wait {
+                        let observed =
+                            self.latest_cli_runtime_native_event_timestamp_ms(&binding)
+                                .await?
+                                .into_iter()
+                                .chain(
+                                    discovery.get_turn_liveness(&binding.turn_id).await?.map(
+                                        |value| value.last_activity_at_unix.saturating_mul(1000),
+                                    ),
+                                )
+                                .max();
+                        include(
+                            observed
+                                .unwrap_or(binding.updated_at.timestamp_millis())
+                                .saturating_add(if observed.is_some() {
+                                    CLI_RUNTIME_EVENTED_TURN_STALE_AFTER_MS
+                                } else {
+                                    CLI_RUNTIME_SILENT_TURN_STALE_AFTER_MS
+                                }),
+                        );
+                    }
+                }
+                if !full {
+                    break;
+                }
+            }
+        }
+        for events in self.cli_runtime_pending_turn_events.lock().await.values() {
+            if let Some(last) = events.iter().map(|event| event.received_at_unix_ms).max() {
+                include(last.saturating_add(CLI_RUNTIME_PENDING_UNBOUND_EVENT_TTL_MS));
+            }
+        }
+        for requests in self
+            .cli_runtime_pending_turn_server_requests
+            .lock()
+            .await
+            .values()
+        {
+            if let Some(last) = requests
+                .iter()
+                .map(|request| request.received_at_unix_ms)
+                .max()
+            {
+                include(last.saturating_add(CLI_RUNTIME_PENDING_UNBOUND_EVENT_TTL_MS));
+            }
+        }
+        // A due obligation that remains after reconciliation needs a bounded
+        // retry (observation unavailable, transition lock busy, etc.). It is
+        // active work, never an empty-catalog fallback.
+        let durable = next_ms
+            .map(|ms| ms.saturating_add(999).div_euclid(1000))
+            .map(|deadline| {
+                if deadline <= now {
+                    now.saturating_add(2)
+                } else {
+                    deadline
+                }
+            });
+        Ok(durable
+            .into_iter()
+            .chain(self.cli_runtime_command_heartbeats.next_deadline().await)
+            .min())
+    }
+
     pub(super) async fn fail_stale_cli_runtime_turns(
         &self,
         now_unix_ms: i64,
@@ -8031,8 +8207,35 @@ impl MessageProcessor {
         let discovery = self.crud_store.with_maintenance_access();
         let mut summary = CliRuntimeStaleTurnScanSummary::default();
         for (slot, status) in [Starting, Running].into_iter().enumerate() {
+            if scan.complete[slot] {
+                continue;
+            }
+            if !scan.initialized[slot] {
+                match discovery
+                    .active_cli_runtime_turn_binding_frontier(status)
+                    .await
+                {
+                    Ok(through) => {
+                        scan.through[slot] = through;
+                        scan.initialized[slot] = true;
+                    }
+                    Err(error) => {
+                        warn!(error = %error, "failed to capture CLI binding frontier");
+                        failed = true;
+                        continue;
+                    }
+                }
+            }
+            let Some(through) = scan.through[slot].as_ref() else {
+                scan.complete[slot] = true;
+                continue;
+            };
             let bindings = match discovery
-                .list_active_cli_runtime_turn_binding_page(status, scan.after[slot].as_ref())
+                .list_active_cli_runtime_turn_binding_page_through(
+                    status,
+                    scan.after[slot].as_ref(),
+                    through,
+                )
                 .await
             {
                 Ok(bindings) => bindings,
@@ -8063,6 +8266,7 @@ impl MessageProcessor {
             } else {
                 None
             };
+            scan.complete[slot] = scan.after[slot].is_none();
             for binding in bindings {
                 match self
                     .fail_stale_cli_runtime_turn_binding(binding, now_unix_ms)
@@ -8094,6 +8298,11 @@ impl MessageProcessor {
             .await;
         self.prune_stale_cli_runtime_pending_turn_server_requests(now_unix_ms)
             .await;
+        summary.has_more = scan.complete.iter().any(|complete| !complete);
+        if !summary.has_more {
+            *scan = CliRuntimeStaleTurnScan::default();
+        }
+        summary.failed = failed;
         if failed {
             trace.finish_failure();
         } else {
@@ -9085,6 +9294,11 @@ impl MessageProcessor {
                 .cli_runtime_pending_turn_activity_sequence
                 .fetch_add(1, Ordering::Relaxed),
         });
+        drop(buffer);
+        self.crud_store
+            .database_connection()
+            .work_signal("gateway.control")
+            .notify();
     }
 
     async fn buffer_cli_runtime_codex_server_request_until_turn_binding(
@@ -9127,6 +9341,10 @@ impl MessageProcessor {
                 .fetch_add(1, Ordering::Relaxed),
         });
         drop(buffer);
+        self.crud_store
+            .database_connection()
+            .work_signal("gateway.control")
+            .notify();
         for request in evicted {
             self.fail_codex_machine_request(
                 &request.responder,
@@ -11617,7 +11835,8 @@ impl MessageProcessor {
                         error = %format!("{error:#}"),
                         "failed to replay durable CLI human interactions"
                     );
-                    break;
+                    crate::thread::replay::fail_current();
+                    return;
                 }
             };
             let next = requests
@@ -11632,6 +11851,16 @@ impl MessageProcessor {
                 {
                     continue;
                 }
+                let Some(producer) = self.pending_delivery_order.opened(&request.request_id) else {
+                    crate::thread::replay::fail_current();
+                    return;
+                };
+                let producer = producer.expires_at(
+                    request
+                        .created_at
+                        .timestamp_millis()
+                        .saturating_add(CLI_RUNTIME_HUMAN_RESPONSE_TIMEOUT_MS),
+                );
                 let visible_thread_ids = self.pending_request_ancestor_thread_ids(&request).await;
                 if request.thread_id != thread_id
                     && !visible_thread_ids
@@ -11643,16 +11872,7 @@ impl MessageProcessor {
                 if now_unix_ms.saturating_sub(request.created_at.timestamp_millis())
                     >= CLI_RUNTIME_HUMAN_RESPONSE_TIMEOUT_MS
                 {
-                    if let Err(error) = self
-                        .expire_cli_runtime_pending_request_as_stale(&request)
-                        .await
-                    {
-                        warn!(
-                            request_id = request.request_id,
-                            error = %format!("{error:#}"),
-                            "failed to expire stale CLI human interaction during replay"
-                        );
-                    }
+                    // The existing runtime timeout/recovery sweep owns expiry.
                     continue;
                 }
 
@@ -11660,17 +11880,22 @@ impl MessageProcessor {
                     &request,
                     visible_thread_ids.clone(),
                 );
-                self.send_execution_collaborator_notification_to_connections(
-                    thread_id,
-                    crate::authorization::ResourceAction::AgentRequestObserve,
-                    events::CLI_RUNTIME_REQUEST_OPENED,
-                    &opened,
-                    vec![connection_id],
-                )
-                .await;
+                producer
+                    .run(async {
+                        self.send_execution_collaborator_notification_to_connections(
+                            thread_id,
+                            crate::authorization::ResourceAction::AgentRequestObserve,
+                            events::CLI_RUNTIME_REQUEST_OPENED,
+                            &opened,
+                            vec![connection_id],
+                        )
+                        .await;
+                    })
+                    .await;
 
                 // Resolution may race the replay. Never leave a late client
                 // with an opened card after the durable request was consumed.
+                let correction = producer.correction();
                 let current = self
                     .crud_store
                     .get_cli_runtime_pending_request(request.request_id.as_str())
@@ -11682,20 +11907,26 @@ impl MessageProcessor {
                 }) {
                     continue;
                 }
-                let resolved_record = current.as_ref().unwrap_or(&request);
+                let Some(resolved_record) = current.as_ref() else {
+                    crate::thread::replay::fail_current();
+                    return;
+                };
                 let resolved = cli_runtime_request_resolved_notification_from_record(
                     resolved_record,
                     visible_thread_ids,
                     cli_runtime_replay_resolution(resolved_record),
                 );
-                self.send_execution_collaborator_notification_to_connections(
-                    thread_id,
-                    crate::authorization::ResourceAction::AgentRequestObserve,
-                    events::CLI_RUNTIME_REQUEST_RESOLVED,
-                    &resolved,
-                    vec![connection_id],
-                )
-                .await;
+                correction
+                    .run(
+                        self.send_execution_collaborator_notification_to_connections(
+                            thread_id,
+                            crate::authorization::ResourceAction::AgentRequestObserve,
+                            events::CLI_RUNTIME_REQUEST_RESOLVED,
+                            &resolved,
+                            vec![connection_id],
+                        ),
+                    )
+                    .await;
             }
 
             let Some(next) = next else {
@@ -11730,19 +11961,24 @@ impl MessageProcessor {
         request: CliRuntimePendingRequestRecord,
         resolution: CLIRuntimeRequestResolution,
     ) {
+        let terminal = self.pending_delivery_order.terminal(&request.request_id);
         let visible_thread_ids = self.pending_request_ancestor_thread_ids(&request).await;
         let notification = cli_runtime_request_resolved_notification_from_record(
             &request,
             visible_thread_ids.clone(),
             resolution,
         );
-        self.send_cli_runtime_request_notification(
+        let delivery = self.send_cli_runtime_request_notification(
             &request,
             visible_thread_ids.as_slice(),
             events::CLI_RUNTIME_REQUEST_RESOLVED,
             &notification,
-        )
-        .await;
+        );
+        if let Some(terminal) = terminal {
+            terminal.run(delivery).await;
+        } else {
+            delivery.await;
+        }
         self.notify_semantic_timeline_pending_request_changed(&request)
             .await;
     }

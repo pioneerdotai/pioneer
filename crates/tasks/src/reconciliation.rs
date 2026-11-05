@@ -63,7 +63,17 @@ struct SchedulerRecovery {
     run_cursors: [Option<String>; 4],
     run_uppers: [Option<String>; 4],
     retry_at: HashMap<String, i64>,
+    // Lease waits are refreshed on source wakes; failures retain their own backoff.
+    lease_at: HashMap<String, i64>,
     trigger_retry: HashMap<String, i64>,
+}
+
+impl SchedulerRecovery {
+    fn has_discovery_continuation(&self) -> bool {
+        !self.startup_complete
+            || self.dormant_cursor.is_some()
+            || self.run_cursors.iter().any(Option::is_some)
+    }
 }
 
 impl TaskStartupReconciler {
@@ -91,9 +101,60 @@ impl TaskStartupReconciler {
                 run_cursors: Default::default(),
                 run_uppers: Default::default(),
                 retry_at: HashMap::new(),
+                lease_at: HashMap::new(),
                 trigger_retry: Default::default(),
             }),
         }
+    }
+
+    pub(crate) fn capacity_signal(&self) -> pioneer_sqlite::WorkSignal {
+        self.executors.work_signal()
+    }
+
+    pub(crate) fn database(&self) -> pioneer_sqlite::SqliteDatabase {
+        self.store.database_connection()
+    }
+
+    pub(crate) async fn has_discovery_continuation(&self) -> bool {
+        let recovery = self.scheduler_recovery.lock().await;
+        recovery.has_discovery_continuation()
+    }
+
+    pub(crate) async fn next_wake_deadline(&self, now: i64) -> TaskRuntimeResult<Option<i64>> {
+        let recovery = self.scheduler_recovery.lock().await;
+        if recovery.has_discovery_continuation() {
+            return Ok(Some(now));
+        }
+        let retry = recovery
+            .retry_at
+            .values()
+            .chain(
+                recovery
+                    .lease_at
+                    .iter()
+                    .filter(|(id, _)| !recovery.retry_at.contains_key(*id))
+                    .map(|(_, at)| at),
+            )
+            .chain(recovery.trigger_retry.values())
+            .copied()
+            .min();
+        drop(recovery);
+        let durable = self
+            .store
+            .next_task_occurrence_reconcile_deadline(now)
+            .await?;
+        let storage_retry = self.terminal_occurrence_retry_at.lock().await.map(|at| {
+            now.saturating_add(
+                at.saturating_duration_since(Instant::now())
+                    .as_secs()
+                    .max(1) as i64,
+            )
+        });
+        let durable = match storage_retry {
+            Some(at) => Some(durable.map_or(at, |due| due.max(at))),
+            None => durable,
+        };
+        Ok(retry.into_iter().chain(durable).min())
     }
 
     pub async fn reconcile(&self, now: i64) -> TaskRuntimeResult<ReconciliationReport> {
@@ -282,19 +343,28 @@ impl TaskStartupReconciler {
                     candidates.insert(run.id.clone(), run);
                 } else {
                     recovery.retry_at.remove(&run_id);
+                    recovery.lease_at.remove(&run_id);
                 }
             } else {
                 recovery.retry_at.remove(&run_id);
+                recovery.lease_at.remove(&run_id);
             }
         }
         let mut local = recovery
             .retry_at
             .iter()
+            .chain(
+                recovery
+                    .lease_at
+                    .iter()
+                    .filter(|(id, _)| !recovery.retry_at.contains_key(*id)),
+            )
             .filter(|(_, retry_at)| **retry_at <= now)
             .map(|(id, retry_at)| (*retry_at, id.clone()))
             .collect::<Vec<_>>();
         local.sort();
         for (_, run_id) in local.into_iter().take(1024) {
+            recovery.lease_at.remove(&run_id);
             let page = match self.store.task_scheduler_run_partial(&run_id).await {
                 Ok(page) => page,
                 Err(error) => {
@@ -321,9 +391,11 @@ impl TaskStartupReconciler {
                     candidates.insert(run.id.clone(), run);
                 } else {
                     recovery.retry_at.remove(&run_id);
+                    recovery.lease_at.remove(&run_id);
                 }
             } else {
                 recovery.retry_at.remove(&run_id);
+                recovery.lease_at.remove(&run_id);
             }
         }
         // Discovery is complete independently of row recovery and occurrence
@@ -426,9 +498,46 @@ impl TaskStartupReconciler {
             recovery
                 .retry_at
                 .insert(run.id.clone(), now.saturating_add(5));
+            recovery.lease_at.remove(&run.id);
+            // A live execution has a concrete lease, not a five-second
+            // discovery obligation. Heartbeat extension is reloaded at expiry.
+            if matches!(
+                run.status,
+                TaskRunStatus::Starting | TaskRunStatus::Running | TaskRunStatus::WaitingReview
+            ) {
+                if let Some(until) = self
+                    .store
+                    .load_execution_for_run(&run.id)
+                    .await?
+                    .filter(|execution| execution.worker_id.is_some())
+                    .and_then(|execution| execution.lease_until)
+                    .filter(|until| *until > now)
+                {
+                    recovery.retry_at.remove(&run.id);
+                    recovery.lease_at.insert(run.id.clone(), until);
+                    continue;
+                }
+            }
             match self.recover_run(run, now).await {
-                Ok(true) => recovered_events = recovered_events.saturating_add(1),
-                Ok(false) => {}
+                Ok(changed) => {
+                    recovered_events = recovered_events.saturating_add(usize::from(changed));
+                    if matches!(run.status, TaskRunStatus::Starting | TaskRunStatus::Running) {
+                        if let Some(until) = self
+                            .store
+                            .load_execution_for_run(&run.id)
+                            .await?
+                            .and_then(|execution| execution.lease_until)
+                            .filter(|until| *until > now)
+                        {
+                            recovery.retry_at.remove(&run.id);
+                            recovery.lease_at.insert(run.id.clone(), until);
+                        } else {
+                            recovery.retry_at.remove(&run.id);
+                        }
+                    } else {
+                        recovery.retry_at.remove(&run.id);
+                    }
+                }
                 Err(error) => {
                     partial_only = false;
                     discovery_errors.push(error);
@@ -575,20 +684,6 @@ impl TaskStartupReconciler {
         let Some(executor) = self.executors.get(run.executor_kind).await else {
             return Ok(false);
         };
-        if matches!(
-            run.status,
-            TaskRunStatus::Starting | TaskRunStatus::Running | TaskRunStatus::WaitingReview
-        ) && self
-            .store
-            .load_execution_for_run(&run.id)
-            .await?
-            .is_some_and(|execution| {
-                execution.worker_id.is_some()
-                    && execution.lease_until.is_some_and(|until| until > now)
-            })
-        {
-            return Ok(false);
-        }
         let Some(task_record) = self.store.get_task_record(run.task_id.as_str()).await? else {
             return Ok(false);
         };
@@ -643,7 +738,7 @@ impl TaskStartupReconciler {
                 run.task_id.clone(),
                 run.id.clone(),
             );
-            if let Err(_error) = executor
+            if let Err(error) = executor
                 .recover_run(
                     TaskExecutionContext {
                         workspace_id: task_record.workspace_id,
@@ -662,6 +757,7 @@ impl TaskStartupReconciler {
                     failure_class = "task_waiting_review_recovery_failed",
                     "task executor waiting-review recovery failed"
                 );
+                return Err(error);
             }
             return Ok(emitted_recovery_event);
         }
@@ -723,6 +819,7 @@ impl TaskStartupReconciler {
                 failure_class = "task_execution_recovery_failed",
                 "task executor run recovery failed"
             );
+            return Err(error);
         }
 
         Ok(emitted_recovery_event)

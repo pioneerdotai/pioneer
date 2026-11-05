@@ -32,6 +32,7 @@ pub mod methods {
     pub const WORKSPACE_DEFAULT: &str = "workspace/default";
     pub const WORKSPACE_SELECT: &str = "workspace/select";
     pub const WORKSPACE_UPDATE: &str = "workspace/update";
+    pub const THREAD_OPEN: &str = "thread/open";
     pub const THREAD_START: &str = "thread/start";
     pub const THREAD_TREE: &str = "thread/tree";
     pub const WORKSPACE_PUSH: &str = "workspace/push";
@@ -202,6 +203,7 @@ pub mod methods {
         WORKSPACE_DEFAULT,
         WORKSPACE_SELECT,
         WORKSPACE_UPDATE,
+        THREAD_OPEN,
         THREAD_START,
         THREAD_TREE,
         WORKSPACE_PUSH,

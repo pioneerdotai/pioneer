@@ -57,7 +57,7 @@ use pioneer_skills::{
 use pioneer_tools::{
     ComputerUseToolsConfig, ConfiguredToolSpec, ExecutionClass, ExecutionWindowsConfig,
     FunctionToolOutput, PayloadKind, ToolError, ToolEventTrace, ToolExtensionBundle, ToolHandler,
-    ToolIdempotencyMode, ToolInvocation, ToolLoopBudgetConfig, ToolPayload, ToolRecoveryMetadata,
+    ToolIdempotencyMode, ToolInvocation, ToolLoopBudgetConfig, ToolRecoveryMetadata,
     ToolRetryBudgetConfig, ToolRetryClass, ToolSpec, WebToolsConfig, dynamic_unknown_output_policy,
 };
 use serde_json::json;
@@ -493,15 +493,6 @@ fn set_execution_window_budget(
     config.budget.max_tool_calls_per_turn = max_tool_calls_per_window;
     config.execution_windows.window.max_agent_rounds_per_window = max_agent_rounds_per_window;
     config.execution_windows.window.max_tool_calls_per_window = max_tool_calls_per_window;
-}
-
-fn test_tools_permission_context(turn_id: &str) -> pioneer_tools::PermissionEvaluationContext {
-    pioneer_tools::PermissionEvaluationContext::for_turn(
-        "workspace_test",
-        "thread_test",
-        turn_id,
-        pioneer_protocol::default_turn_permission_profile_snapshot(),
-    )
 }
 
 fn test_full_access_security_snapshot() -> pioneer_protocol::TurnExecutionSecuritySnapshot {
@@ -4011,7 +4002,6 @@ async fn start_simple_turn_with_terminal_effects(
 // Preparation must precede the real agent inventory, not just dispatch.
 #[tokio::test]
 async fn connection_owned_model_preparation_precedes_agent_tool_inventory() {
-    use crate::compaction::controller::NativeContextController;
     #[derive(Default)]
     struct AdmissionBoundary {
         inner: RecordingContextBoundary,
@@ -8153,7 +8143,7 @@ async fn phase_10_prompt_compile_receives_final_visible_tools_not_registered_mem
     assert!(
         user_input
             .content
-            .contains("For hidden tools, call request_tools to open their domain.")
+            .contains("For hidden tools, call request_tools to open a domain.")
     );
     assert!(
         !prompt.full_system_text.contains("Available memory tools:"),
