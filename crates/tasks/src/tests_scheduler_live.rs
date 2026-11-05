@@ -795,11 +795,11 @@ async fn foreign_expired_cache_refresh_replaces_deadlines_without_rebuild() {
         }
         scheduler.process_due_once(4_000_000_000).await.unwrap();
         assert_eq!(
-            scheduler.next_sleep_duration(4_000_000_000).await,
+            scheduler.next_wake_deadline(4_000_000_000).await.unwrap(),
             if change == "later" {
-                Duration::from_secs(40)
+                Some(4_000_000_040)
             } else {
-                Duration::MAX
+                None
             },
             "{change}"
         );
@@ -867,8 +867,8 @@ async fn foreign_expired_cache_refresh_replaces_deadlines_without_rebuild() {
     // a local hint, so only expired-cache addressed refresh can remove the entry.
     scheduler.process_due_once(4_000_000_000).await.unwrap();
     assert_eq!(
-        scheduler.next_sleep_duration(4_000_000_000).await,
-        Duration::MAX
+        scheduler.next_wake_deadline(4_000_000_000).await.unwrap(),
+        None
     );
 }
 
@@ -1135,8 +1135,8 @@ async fn finite_due_trigger_pass_returns_behind_cursor_under_suffix_growth() {
     );
     scheduler.process_due_once(now).await.unwrap();
     assert_eq!(
-        scheduler.next_sleep_duration(now).await,
-        Duration::ZERO,
+        scheduler.next_wake_deadline(now).await.unwrap(),
+        Some(now),
         "an overdue cached backlog preserves base immediate scheduling between finite pages"
     );
     let missed = runtime
@@ -1681,7 +1681,13 @@ async fn waiting_review_with_current_execution_lease_does_not_recover_or_wake() 
         .await
         .unwrap()
         .unwrap();
-    assert!(futures_util::FutureExt::now_or_never(wake.wait(None)).is_some());
+    assert!(
+        std::future::Future::poll(
+            std::pin::pin!(wake.wait(None)),
+            &mut std::task::Context::from_waker(std::task::Waker::noop()),
+        )
+        .is_ready()
+    );
     reconciler.reconcile(now + 13).await.unwrap();
     assert_eq!(
         reconciler.next_wake_deadline(now + 13).await.unwrap(),
@@ -1695,7 +1701,11 @@ async fn waiting_review_with_current_execution_lease_does_not_recover_or_wake() 
         .unwrap()
         .unwrap();
     assert!(
-        futures_util::FutureExt::now_or_never(wake.wait(None)).is_none(),
+        std::future::Future::poll(
+            std::pin::pin!(wake.wait(None)),
+            &mut std::task::Context::from_waker(std::task::Waker::noop()),
+        )
+        .is_pending(),
         "ordinary extension stays quiet"
     );
     store

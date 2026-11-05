@@ -500,6 +500,7 @@ impl TimeoutSupervisor {
         Ok(())
     }
 
+    #[cfg(test)]
     pub async fn list_timeout_candidates(
         &self,
         now_unix: i64,

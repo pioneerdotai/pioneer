@@ -25,7 +25,7 @@ use pioneer_provider::{ChatMessage, ModelInputItem, ProviderRegistry, Role};
 use pioneer_tools::{ExecutionWindowAdmissionDecision, decide_execution_window_admission};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use tokio::sync::{Notify, RwLock};
+use tokio::sync::RwLock;
 use tracing::warn;
 
 use super::timeout::{
@@ -518,7 +518,6 @@ pub struct RecoveryCoordinator {
     execution_leases: Arc<crate::authorization::ExecutionLeaseRegistry>,
     turn_execution_owner_id: Arc<str>,
     listener_starter: Arc<RwLock<Option<RecoveryListenerStarter>>>,
-    due_wake: Arc<Notify>,
     active_scan: Arc<tokio::sync::Mutex<(Option<String>, Option<String>)>>,
     orphan_scan: Arc<tokio::sync::Mutex<OrphanExecutionScan>>,
     terminal_scan: Arc<tokio::sync::Mutex<(Option<String>, Option<String>)>>,
@@ -764,7 +763,6 @@ impl RecoveryCoordinator {
         let authorization_invalidation_hub = Arc::new(
             crate::authorization::AuthorizationInvalidationHub::durable(crud_store.clone()),
         );
-        let due_wake = crud_store.recovery_job_notification();
         Self {
             crud_store,
             agent_manager,
@@ -778,7 +776,6 @@ impl RecoveryCoordinator {
             )
             .into(),
             listener_starter: Arc::new(RwLock::new(None)),
-            due_wake,
             active_scan: Default::default(),
             orphan_scan: Default::default(),
             terminal_scan: Default::default(),
@@ -1718,6 +1715,7 @@ impl RecoveryCoordinator {
         finish_recovery_phases(events, errors)
     }
 
+    #[cfg(test)]
     pub async fn run_supervision_audits(
         &self,
         now_unix: i64,
@@ -1851,10 +1849,6 @@ impl RecoveryCoordinator {
             after = Some(last);
         }
         Ok(next)
-    }
-
-    pub(crate) fn due_wake(&self) -> Arc<Notify> {
-        self.due_wake.clone()
     }
 
     /// Due work never invokes discovery/backfill or active supervision. A
@@ -2196,6 +2190,7 @@ impl RecoveryCoordinator {
         Ok(Some(job))
     }
 
+    #[cfg(test)]
     pub async fn repair_due_terminal_recovery_jobs(
         &self,
         now_unix: i64,

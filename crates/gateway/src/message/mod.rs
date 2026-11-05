@@ -1046,6 +1046,7 @@ struct PendingNativePermissionApprovalRequest {
 
 #[derive(Default)]
 struct TaskEventFanoutSummary {
+    #[cfg(test)]
     selected: usize,
     event_inputs: usize,
     emitted: usize,
@@ -3208,7 +3209,6 @@ impl MessageProcessor {
                     {
                         next_native_terminal_effect_recovery = Some(now.saturating_add(2));
                     }
-                    begin_round = false;
                 }
                 if let Err(error) = crate::database::attribution::scope_database_workload_result(
                     pioneer_observability::DatabaseWorkload::ExecutionSupervision,
@@ -4280,7 +4280,7 @@ impl MessageProcessor {
                 }
             }
             Err(error) => {
-                return Err(anyhow!("{error:#}"));
+                return Err(anyhow::anyhow!("{error:#}"));
             }
         }
         Ok(())
@@ -4345,6 +4345,7 @@ impl MessageProcessor {
             .due_task_event_fanout(clock(), TASK_EVENT_FANOUT_TASK_BUDGET)
             .await?;
         let mut summary = TaskEventFanoutSummary {
+            #[cfg(test)]
             selected: candidates.len(),
             ..Default::default()
         };

@@ -2,9 +2,9 @@
 //! external acceptance. Remote cases require a disposable, provisioned MySQL
 //! schema (including work tables/migration marker) and workspace `ws_task`.
 use super::*;
-use crate::repositories::{task_child_producers as producers, turn_llm_context as context};
-use pioneer_entity::{task_child_reconcile_pending as point, task_child_reconcile_scope as scope};
-use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, TransactionTrait};
+use crate::repositories::turn_llm_context as context;
+use pioneer_entity::task_child_reconcile_pending as point;
+use sea_orm::{ConnectionTrait, EntityTrait, TransactionTrait};
 
 const AT: i64 = 1_700_000_000;
 

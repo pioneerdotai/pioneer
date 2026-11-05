@@ -38938,14 +38938,15 @@ mod tests {
     mod unread_start;
     use crate::{
         NewThreadEpisodicExclusionRecord, NewTurnExecution, PROJECTION_META_STATUS_PENDING,
-        ProjectionMetaConfigRecord, ProjectionMetaRecord, THREAD_EPISODIC_PROJECTION_CHANGED_ERROR,
-        THREAD_EPISODIC_SOURCE_VERSION_SUPERSEDED_ERROR, THREAD_EPISODIC_USER_DELETED_ERROR,
-        THREAD_EPISODIC_USER_EXCLUDED_ERROR, ThreadEpisodicExclusionReason,
-        ThreadEpisodicIndexAttemptOutcome, ThreadEpisodicIndexJobFailureUpdate,
-        ThreadEpisodicIndexJobRecord, ThreadEpisodicIndexJobStatus,
-        ThreadEpisodicProjectionResetProgress, TurnExecutionStatus, TurnExecutorKind,
-        find_projection_meta, thread_episodic_projection_reset_key, turn_execution,
-        upsert_projection_meta_with_config, utc_now,
+        ProjectionMetaConfigRecord, ProjectionMetaRecord, SkillUploadSessionRecord,
+        THREAD_EPISODIC_PROJECTION_CHANGED_ERROR, THREAD_EPISODIC_SOURCE_VERSION_SUPERSEDED_ERROR,
+        THREAD_EPISODIC_USER_DELETED_ERROR, THREAD_EPISODIC_USER_EXCLUDED_ERROR,
+        ThreadEpisodicExclusionReason, ThreadEpisodicIndexAttemptOutcome,
+        ThreadEpisodicIndexJobFailureUpdate, ThreadEpisodicIndexJobRecord,
+        ThreadEpisodicIndexJobStatus, ThreadEpisodicProjectionResetProgress, TurnEventPayload,
+        TurnExecutionStatus, TurnExecutorKind, find_projection_meta,
+        thread_episodic_projection_reset_key, turn_execution, upsert_projection_meta_with_config,
+        utc_now,
     };
     use std::time::Duration;
     #[path = "cli_runtime_active_bindings.rs"]

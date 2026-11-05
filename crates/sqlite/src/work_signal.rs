@@ -132,7 +132,6 @@ pub async fn wait_for_unix_deadline(deadline: i64) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use futures_util::FutureExt;
     use sea_orm::{ConnectionTrait, Database, DbBackend, Statement};
 

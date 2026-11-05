@@ -200,7 +200,11 @@ class CuaPayloadTests(unittest.TestCase):
                         entry = zipfile.ZipInfo("safe-file" if defect == "duplicate" else defect)
                         entry.create_system = 3
                         entry.external_attr = ((stat.S_IFLNK if defect == "link" else stat.S_IFREG) | 0o644) << 16
-                        output.writestr(entry, b"../outside")
+                        if defect == "duplicate":
+                            with self.assertWarnsRegex(UserWarning, "Duplicate name"):
+                                output.writestr(entry, b"../outside")
+                        else:
+                            output.writestr(entry, b"../outside")
                     staging = root / f"staging-{index}"
                     with self.assertRaises(ValueError):
                         CUA["extract"](archive, staging)

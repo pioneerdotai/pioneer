@@ -2200,7 +2200,7 @@ mod tests {
                 ThreadAudioCompletion, ThreadAudioRequest, ThreadPresentationOperation,
             };
             use pioneer_client::composer::store::ComposerOperationCompletion;
-            let mut fixture = Fixture::new(cx);
+            let fixture = Fixture::new(cx);
             let voice = fixture
                 .composer
                 .read_with(fixture.cx, |view, _| view.voice.clone());

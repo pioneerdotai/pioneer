@@ -459,8 +459,25 @@ fn terminal_failures_emit_one_secret_free_sentry_error_per_generation() {
     use tracing_subscriber::prelude::*;
     // TestTransport captures locally. No production Sentry client or network transport is used.
     let events = sentry::test::with_captured_events(|| {
-        let subscriber =
-            tracing_subscriber::registry().with(sentry::integrations::tracing::layer());
+        let subscriber = tracing_subscriber::registry()
+            .with(
+                sentry::integrations::tracing::SpanLayer::new()
+                    .with_filter(tracing_subscriber::filter::LevelFilter::INFO),
+            )
+            .with(
+                sentry::integrations::tracing::BreadcrumbLayer::new().with_filter(
+                    tracing_subscriber::filter::filter_fn(|metadata| {
+                        matches!(
+                            *metadata.level(),
+                            tracing::Level::WARN | tracing::Level::INFO
+                        )
+                    }),
+                ),
+            )
+            .with(
+                sentry::integrations::tracing::ErrorLayer::new()
+                    .with_filter(tracing_subscriber::filter::LevelFilter::ERROR),
+            );
         tracing::subscriber::with_default(subscriber, || {
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()

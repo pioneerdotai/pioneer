@@ -1670,11 +1670,13 @@ fn now_datetime() -> DateTimeWithTimeZone {
 #[cfg(test)]
 mod tests {
     use super::{
-        COMPRESSION_BATCH_MAX_ROWS, COMPRESSION_BATCH_MAX_SOURCE_BYTES, DICTIONARY_SAMPLE_MAX_ROWS,
-        DICTIONARY_SAMPLE_MAX_SOURCE_BYTES, PERIODIC_MAINTENANCE_SLICE_SECONDS, TURN_EVENT_PAYLOAD,
+        COMPRESSION_BATCH_MAX_ROWS, COMPRESSION_BATCH_MAX_SOURCE_BYTES, DICTIONARY_MIN_SAMPLE_ROWS,
+        DICTIONARY_SAMPLE_MAX_ROWS, DICTIONARY_SAMPLE_MAX_SOURCE_BYTES,
+        PERIODIC_MAINTENANCE_SLICE_SECONDS, PreparedDictionaryCache, TURN_EVENT_PAYLOAD,
         TURN_ITEM_PAYLOAD, ZSTD_PAYLOAD_COLUMNS, apply_prepared_payload_rows,
         ensure_compression_schema, load_compression_dictionary, load_pending_payload_rows,
-        prepare_payload_rows, run_periodic_maintenance_once, run_startup_once,
+        prepare_payload_rows, run_cooperative_maintenance_cycle, run_periodic_maintenance_once,
+        run_startup_once,
     };
     use migration::{Migrator, MigratorTrait};
     use pioneer_crud::{CrudStore, find_projection_meta};

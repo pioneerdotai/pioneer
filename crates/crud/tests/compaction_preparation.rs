@@ -898,7 +898,6 @@ async fn history_check_retry_survives_disk_reopen_and_cancelled_writer_admission
     drop(database);
     drop(setup);
     let reopened = CrudStore::new(Database::connect(url).await.unwrap()).with_maintenance_access();
-    let mut frozen_conversion_progress = pioneer_crud::FrozenStorageLifetimeProgress::default();
     assert!(
         reopened
             .compaction_due_history_checks(60999)

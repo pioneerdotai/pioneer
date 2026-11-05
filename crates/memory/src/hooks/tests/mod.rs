@@ -59,39 +59,6 @@ fn install_memory_hook_package_for_test(
     Ok(())
 }
 
-struct SingleDefinitionHookPackage {
-    handler: Arc<dyn HookHandler>,
-    subscription: HookSubscription,
-}
-
-impl HookPackage for SingleDefinitionHookPackage {
-    fn id(&self) -> &'static str {
-        "test.memory.single_definition"
-    }
-
-    fn definitions(&self) -> Result<Vec<HookDefinition>, HookRegistryError> {
-        Ok(vec![HookDefinition::new(
-            self.handler.clone(),
-            [self.subscription.clone()],
-            "test.memory",
-        )])
-    }
-}
-
-fn install_single_hook_definition_for_test(
-    runtime: &Arc<HookRuntime>,
-    handler: Arc<dyn HookHandler>,
-    subscription: HookSubscription,
-) -> Result<(), HookRegistryError> {
-    let _runtime = HookRuntimeBuilder::from_runtime(runtime.as_ref())
-        .install(SingleDefinitionHookPackage {
-            handler,
-            subscription,
-        })?
-        .build();
-    Ok(())
-}
-
 fn user_scope() -> MemoryScope {
     MemoryScope {
         kind: MemoryScopeKind::User,
@@ -239,16 +206,6 @@ fn test_post_turn_domain_event(
 
 fn memory_policy_set(policy: &MemoryTurnPolicy) -> HookPolicySet {
     HookPolicySet::merge_contributions([memory_policy_contribution(policy)])
-}
-
-fn malformed_memory_policy_set() -> HookPolicySet {
-    HookPolicySet::merge_contributions([PolicyContribution {
-        domain: memory_policy_domain(),
-        key: memory_turn_policy_key(),
-        value: HookValue::Text("memory_no_use".to_owned()),
-        priority: 500,
-        diagnostics: Vec::new(),
-    }])
 }
 
 fn valid_post_turn_extractor_json() -> String {

@@ -454,16 +454,6 @@ fn clears_attempt_payload(status: TurnItemAttemptStatus) -> bool {
     )
 }
 
-pub async fn list_expired_running_attempts<C: ConnectionTrait>(
-    db: &C,
-    now: DateTimeWithTimeZone,
-    limit: u64,
-) -> Result<Vec<RunningAttemptSnapshot>> {
-    list_expired_running_attempt_page(db, now, limit, None)
-        .await
-        .map(|(rows, _)| rows)
-}
-
 pub async fn list_expired_running_attempt_page<C: ConnectionTrait>(
     db: &C,
     now: DateTimeWithTimeZone,
@@ -1233,21 +1223,6 @@ pub async fn list_running_attempts_by_item_type<C: ConnectionTrait>(
     rows.into_iter().map(running_snapshot_from_model).collect()
 }
 
-/// Stable bounded discovery for command supervision. The continuation is taken
-/// from raw rows before decoding/filtering, so skipped legacy rows cannot turn a
-/// full page into a false end of scan.
-pub async fn list_running_attempt_page_by_item_type<C: ConnectionTrait>(
-    db: &C,
-    item_type: TurnItemType,
-    after_id: Option<&str>,
-    limit: u64,
-) -> Result<(Vec<RunningAttemptSnapshot>, Option<String>)> {
-    let upper = running_attempt_upper_id_by_item_type(db, item_type)
-        .await?
-        .unwrap_or_default();
-    list_running_attempt_page_by_item_type_bounded(db, item_type, after_id, &upper, limit).await
-}
-
 pub async fn running_attempt_upper_id_by_item_type<C: ConnectionTrait>(
     db: &C,
     item_type: TurnItemType,
@@ -1263,6 +1238,8 @@ pub async fn running_attempt_upper_id_by_item_type<C: ConnectionTrait>(
         .await?)
 }
 
+/// Stable bounded discovery for command supervision. Continue from raw rows,
+/// including skipped legacy rows, within the captured upper frontier.
 pub async fn list_running_attempt_page_by_item_type_bounded<C: ConnectionTrait>(
     db: &C,
     item_type: TurnItemType,
@@ -1309,15 +1286,6 @@ pub async fn find_latest_running_attempt<C: ConnectionTrait>(
         .await?
         .map(running_snapshot_from_model)
         .transpose()
-}
-
-pub async fn list_timed_out_without_recovery<C: ConnectionTrait>(
-    db: &C,
-    limit: u64,
-) -> Result<Vec<TimedOutAttemptSnapshot>> {
-    list_timed_out_without_recovery_page(db, limit, None, None)
-        .await
-        .map(|(rows, _)| rows)
 }
 
 /// Fixed-ceiling discovery for a finite timeout backfill pass. Cursor progress

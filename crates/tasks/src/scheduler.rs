@@ -765,7 +765,7 @@ impl TaskScheduler {
         false
     }
 
-    async fn next_wake_deadline(&self, now: i64) -> TaskRuntimeResult<Option<i64>> {
+    pub(crate) async fn next_wake_deadline(&self, now: i64) -> TaskRuntimeResult<Option<i64>> {
         if self.has_discovery_continuation().await {
             return Ok(Some(now));
         }
@@ -781,14 +781,6 @@ impl TaskScheduler {
             .map(|item| item.next_fire_at)
             .chain(queued)
             .min())
-    }
-
-    pub(crate) async fn next_sleep_duration(&self, now: i64) -> Duration {
-        match self.next_wake_deadline(now).await {
-            Ok(Some(at)) => Duration::from_secs(at.saturating_sub(now).max(0) as u64),
-            Ok(None) => Duration::MAX,
-            Err(_) => Duration::from_secs(TASK_SCHEDULER_MAX_SLEEP_SECONDS),
-        }
     }
 
     async fn process_trigger(

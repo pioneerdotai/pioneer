@@ -4,27 +4,18 @@
 //! API. Phase-specific tests materialize these records through internal test
 //! seams after the corresponding schema and authorization layers exist.
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::fmt;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use migration::{Migrator, MigratorTrait};
 use sea_orm::{ConnectionTrait, Database, DatabaseConnection, TransactionTrait};
 
 use crate::auth::test_support::{IsolatedAuthRuntime, TEST_GATEWAY_ID, TEST_SUPERUSER_ID};
-use crate::authorization::ThreadAccessClass;
 use crate::identity::{
     GatewayIdentitySnapshot, IdentityBootstrapSnapshot, SuperuserIdentitySnapshot,
 };
-use pioneer_protocol::{
-    ClientInstallationDescriptor, ClientKind, GatewayId, PrincipalId, PrincipalKind,
-    PrincipalStatus, RoleKey,
-};
+use pioneer_protocol::{GatewayId, PrincipalId, PrincipalKind, PrincipalStatus};
 
 pub(crate) const EPIC5_TEST_NOW_UNIX: u64 = 1_800_000_000;
-
-static FIXTURE_SECRET_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) const MEMBER_A_ID: &str = "P0000000000000000000A";
 pub(crate) const MEMBER_B_ID: &str = "P0000000000000000000B";
@@ -42,244 +33,9 @@ pub(crate) const THREAD_RED_INTERNAL_ID: &str = "T00000000000000000004";
 pub(crate) const THREAD_BLUE_PRIVATE_A_ID: &str = "T00000000000000000005";
 pub(crate) const THREAD_GREEN_PRIVATE_B_ID: &str = "T00000000000000000006";
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum FixturePrincipalKind {
-    Superuser,
-    User,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum FixturePrincipalStatus {
-    Active,
-    Suspended,
-    Removed,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct PrincipalFixture {
-    pub id: &'static str,
-    pub kind: FixturePrincipalKind,
-    pub role_key: Option<RoleKey>,
-    pub status: FixturePrincipalStatus,
-}
-
-#[derive(Clone, PartialEq, Eq)]
-pub(crate) struct FixtureSecret(String);
-
-impl FixtureSecret {
-    fn generated(label: &str) -> Self {
-        let sequence = FIXTURE_SECRET_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        Self(format!("epic5-test-{label}-{sequence}"))
-    }
-}
-
-impl fmt::Debug for FixtureSecret {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("FixtureSecret([REDACTED])")
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct DeviceSessionFixture {
-    pub principal_id: &'static str,
-    pub device_id: &'static str,
-    pub session_id: &'static str,
-    pub installation: ClientInstallationDescriptor,
-    pub access_credential: FixtureSecret,
-    pub refresh_credential: FixtureSecret,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ThreadFixture {
-    pub id: &'static str,
-    pub workspace_id: &'static str,
-    pub visibility: ThreadAccessClass,
-    pub creator_principal_id: Option<&'static str>,
-    pub participant_principal_ids: BTreeSet<&'static str>,
-    pub child_resources: ChildResourceFixture,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ChildResourceFixture {
-    pub turn_id: String,
-    pub timeline_event_id: String,
-    pub artifact_id: String,
-    pub memory_id: String,
-    pub episodic_item_id: String,
-    pub agents_document_id: String,
-    pub task_id: String,
-    pub task_run_id: String,
-    pub task_candidate_id: String,
-    pub task_delivery_id: String,
-}
-
-impl ChildResourceFixture {
-    fn for_thread(thread_id: &str) -> Self {
-        Self {
-            turn_id: format!("{thread_id}-turn"),
-            timeline_event_id: format!("{thread_id}-event"),
-            artifact_id: format!("{thread_id}-artifact"),
-            memory_id: format!("{thread_id}-memory"),
-            episodic_item_id: format!("{thread_id}-episodic"),
-            agents_document_id: format!("{thread_id}-agents-doc"),
-            task_id: format!("{thread_id}-task"),
-            task_run_id: format!("{thread_id}-task-run"),
-            task_candidate_id: format!("{thread_id}-task-candidate"),
-            task_delivery_id: format!("{thread_id}-task-delivery"),
-        }
-    }
-}
-
-#[derive(Debug)]
-pub(crate) struct Epic4Fixture {
-    pub gateway_id: &'static str,
-    pub principals: BTreeMap<&'static str, PrincipalFixture>,
-    pub sessions: BTreeMap<&'static str, DeviceSessionFixture>,
-    pub workspace_memberships: BTreeMap<&'static str, BTreeSet<&'static str>>,
-    pub threads: BTreeMap<&'static str, ThreadFixture>,
-}
-
-impl Epic4Fixture {
-    pub(crate) fn deterministic() -> Self {
-        let principals = [
-            PrincipalFixture {
-                id: TEST_SUPERUSER_ID,
-                kind: FixturePrincipalKind::Superuser,
-                role_key: None,
-                status: FixturePrincipalStatus::Active,
-            },
-            PrincipalFixture {
-                id: MEMBER_A_ID,
-                kind: FixturePrincipalKind::User,
-                role_key: Some(RoleKey::member()),
-                status: FixturePrincipalStatus::Active,
-            },
-            PrincipalFixture {
-                id: MEMBER_B_ID,
-                kind: FixturePrincipalKind::User,
-                role_key: Some(RoleKey::member()),
-                status: FixturePrincipalStatus::Active,
-            },
-            PrincipalFixture {
-                id: SUSPENDED_MEMBER_ID,
-                kind: FixturePrincipalKind::User,
-                role_key: Some(RoleKey::member()),
-                status: FixturePrincipalStatus::Suspended,
-            },
-            PrincipalFixture {
-                id: REMOVED_MEMBER_ID,
-                kind: FixturePrincipalKind::User,
-                role_key: Some(RoleKey::member()),
-                status: FixturePrincipalStatus::Removed,
-            },
-        ]
-        .into_iter()
-        .map(|principal| (principal.id, principal))
-        .collect();
-
-        let sessions = [
-            DeviceSessionFixture {
-                principal_id: MEMBER_A_ID,
-                device_id: "D0000000000000000000A",
-                session_id: "S0000000000000000000A",
-                installation: ClientInstallationDescriptor {
-                    installation_id: "fixture-member-a".to_owned(),
-                    display_name: "Member A Desktop".to_owned(),
-                    client_kind: ClientKind::Desktop,
-                    platform: Some("test".to_owned()),
-                    client_version: Some("1".to_owned()),
-                },
-                access_credential: FixtureSecret::generated("access-member-a"),
-                refresh_credential: FixtureSecret::generated("refresh-member-a"),
-            },
-            DeviceSessionFixture {
-                principal_id: MEMBER_B_ID,
-                device_id: "D0000000000000000000B",
-                session_id: "S0000000000000000000B",
-                installation: ClientInstallationDescriptor {
-                    installation_id: "fixture-member-b".to_owned(),
-                    display_name: "Member B Desktop".to_owned(),
-                    client_kind: ClientKind::Desktop,
-                    platform: Some("test".to_owned()),
-                    client_version: Some("1".to_owned()),
-                },
-                access_credential: FixtureSecret::generated("access-member-b"),
-                refresh_credential: FixtureSecret::generated("refresh-member-b"),
-            },
-        ]
-        .into_iter()
-        .map(|session| (session.principal_id, session))
-        .collect();
-
-        // Red deliberately overlaps. Blue and Green are non-overlapping.
-        let workspace_memberships = [
-            (
-                MEMBER_A_ID,
-                BTreeSet::from([WORKSPACE_RED_ID, WORKSPACE_BLUE_ID]),
-            ),
-            (
-                MEMBER_B_ID,
-                BTreeSet::from([WORKSPACE_RED_ID, WORKSPACE_GREEN_ID]),
-            ),
-        ]
-        .into_iter()
-        .collect();
-
-        let threads = [
-            private_thread(THREAD_RED_PRIVATE_A_ID, WORKSPACE_RED_ID, MEMBER_A_ID),
-            private_thread(THREAD_RED_PRIVATE_B_ID, WORKSPACE_RED_ID, MEMBER_B_ID),
-            ThreadFixture {
-                id: THREAD_RED_WORKSPACE_ID,
-                workspace_id: WORKSPACE_RED_ID,
-                visibility: ThreadAccessClass::Workspace,
-                creator_principal_id: Some(MEMBER_A_ID),
-                participant_principal_ids: BTreeSet::from([MEMBER_A_ID]),
-                child_resources: ChildResourceFixture::for_thread(THREAD_RED_WORKSPACE_ID),
-            },
-            ThreadFixture {
-                id: THREAD_RED_INTERNAL_ID,
-                workspace_id: WORKSPACE_RED_ID,
-                visibility: ThreadAccessClass::Internal,
-                creator_principal_id: None,
-                participant_principal_ids: BTreeSet::new(),
-                child_resources: ChildResourceFixture::for_thread(THREAD_RED_INTERNAL_ID),
-            },
-            private_thread(THREAD_BLUE_PRIVATE_A_ID, WORKSPACE_BLUE_ID, MEMBER_A_ID),
-            private_thread(THREAD_GREEN_PRIVATE_B_ID, WORKSPACE_GREEN_ID, MEMBER_B_ID),
-        ]
-        .into_iter()
-        .map(|thread| (thread.id, thread))
-        .collect();
-
-        Self {
-            gateway_id: TEST_GATEWAY_ID,
-            principals,
-            sessions,
-            workspace_memberships,
-            threads,
-        }
-    }
-}
-
-fn private_thread(
-    id: &'static str,
-    workspace_id: &'static str,
-    creator_principal_id: &'static str,
-) -> ThreadFixture {
-    ThreadFixture {
-        id,
-        workspace_id,
-        visibility: ThreadAccessClass::Private,
-        creator_principal_id: Some(creator_principal_id),
-        participant_principal_ids: BTreeSet::from([creator_principal_id]),
-        child_resources: ChildResourceFixture::for_thread(id),
-    }
-}
-
 pub(crate) struct IsolatedEpic4Harness {
     runtime: IsolatedAuthRuntime,
     pub database: DatabaseConnection,
-    pub fixture: Epic4Fixture,
     pub identity: IdentityBootstrapSnapshot,
 }
 
@@ -324,7 +80,6 @@ impl IsolatedEpic4Harness {
         Ok(Self {
             runtime,
             database,
-            fixture: Epic4Fixture::deterministic(),
             identity,
         })
     }
@@ -563,7 +318,7 @@ mod tests {
             .ping()
             .await
             .expect("in-memory database is isolated and live");
-        assert_eq!(harness.fixture.gateway_id, TEST_GATEWAY_ID);
+        assert_eq!(harness.identity.gateway.id.as_str(), TEST_GATEWAY_ID);
         harness
             .database
             .execute_unprepared(

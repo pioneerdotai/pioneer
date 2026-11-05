@@ -7393,6 +7393,7 @@ impl MessageProcessor {
         }
     }
 
+    #[cfg(test)]
     pub(super) async fn poll_timeouts_respecting_human_wait(
         &self,
         now_unix: i64,

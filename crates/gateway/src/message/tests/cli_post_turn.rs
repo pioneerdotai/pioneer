@@ -521,7 +521,7 @@ async fn failed_gate_bookkeeping_dispatches_independent_hooks_and_defers_worker(
         .unwrap();
     timeout(Duration::from_secs(10), async {
         loop {
-            let row = effect::Entity::find_by_id(poison.clone())
+            let row = effect::Entity::find_by_id(poison)
                 .one(&store.database_connection())
                 .await
                 .unwrap()

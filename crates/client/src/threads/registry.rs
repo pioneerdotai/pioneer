@@ -9178,7 +9178,8 @@ mod tests {
                         action: action.clone(),
                         generation,
                     },
-                );
+                )
+                .expect_err("closed controller rejects the planned request");
             } else {
                 core.apply_thread_notification(reconciliation_notification(&["result-140"]));
             }
@@ -9931,7 +9932,8 @@ mod tests {
             );
             assert_eq!(retry.pages.len(), 1);
             assert!(retry.pages[0].generation > owner);
-            core.schedule_planned_timeline_request(retry.pages[0].clone());
+            core.schedule_planned_timeline_request(retry.pages[0].clone())
+                .expect("timeline retry is admitted");
             let request = reconciliation_request(&receiver);
             assert_eq!(receiver.try_iter().count(), 0, "Retry queues one walk");
             let mut history = reconciliation_history();
@@ -10326,7 +10328,8 @@ mod tests {
                             .contains("Work history changed")
                     );
                     let retry = retry_initial_work(&core);
-                    core.schedule_planned_timeline_request(retry.pages[0].clone());
+                    core.schedule_planned_timeline_request(retry.pages[0].clone())
+                        .expect("timeline retry is admitted");
                     let ThreadControllerRequest::Semantic(request) =
                         receiver.try_recv().unwrap().value
                     else {
@@ -10569,7 +10572,8 @@ mod tests {
                 core.set_thread_turn_work_expanded("a", "turn", true);
                 core.materialize_demanded_timelines();
                 let retry = retry_initial_work(&core);
-                core.schedule_planned_timeline_request(retry.pages[0].clone());
+                core.schedule_planned_timeline_request(retry.pages[0].clone())
+                    .expect("timeline retry is admitted");
                 let ThreadControllerRequest::Semantic(request) = receiver.try_recv().unwrap().value
                 else {
                     panic!()
@@ -10792,7 +10796,8 @@ mod tests {
                 assert_eq!(receiver.try_iter().count(), 0);
             }
             let retry = retry_initial_work(&core);
-            core.schedule_planned_timeline_request(retry.pages[0].clone());
+            core.schedule_planned_timeline_request(retry.pages[0].clone())
+                .expect("timeline retry is admitted");
             let semantic = core.thread_semantic_snapshot("a");
             let range = semantic.thread("a").unwrap().work_range("turn").unwrap();
             assert!(!range.has_loaded_page);
