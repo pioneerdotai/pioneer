@@ -18,6 +18,7 @@ pub(crate) struct SocketReceipt {
     live: Arc<Mutex<bool>>,
     cancels: tokio::sync::mpsc::Sender<SocketCancel>,
     cancel_slots: Arc<tokio::sync::Semaphore>,
+    voice: tokio::sync::mpsc::Sender<super::voice_budget::QueuedVoiceAudio>,
 }
 impl SocketReceipt {
     pub(crate) fn new(connection: u64) -> (Self, SocketCancelReceiver) {
@@ -25,8 +26,10 @@ impl SocketReceipt {
         let (cancels, receiver) = tokio::sync::mpsc::channel(SOCKET_CANCEL_CAPACITY);
         let cancel_slots = Arc::new(tokio::sync::Semaphore::new(SOCKET_CANCEL_CAPACITY));
         let live = Arc::new(Mutex::new(true));
+        let (voice, voice_rx) = tokio::sync::mpsc::channel(128);
         let owner = SocketCancelReceiver {
             receiver,
+            voice: Some(voice_rx),
             live: live.clone(),
             slots: cancel_slots.clone(),
         };
@@ -43,9 +46,21 @@ impl SocketReceipt {
                 live,
                 cancels,
                 cancel_slots,
+                voice,
             },
             owner,
         )
+    }
+
+    pub(crate) fn admit_voice(
+        &self,
+        payload: super::voice_budget::QueuedVoiceAudio,
+    ) -> anyhow::Result<()> {
+        let live = self.live.lock().unwrap();
+        anyhow::ensure!(*live, "voice socket retired");
+        self.voice
+            .try_send(payload)
+            .map_err(|_| anyhow::anyhow!("voice socket capacity full or retired"))
     }
 
     pub(crate) fn admit_cancel(
@@ -99,16 +114,21 @@ impl SocketReceipt {
         *self.live.lock().unwrap()
     }
 }
-/// Only this exact canonical method bypasses queued ordinary commands. This
+/// Only exact turn/voice Cancel methods bypass queued ordinary commands. This
 /// selects transport admission, not request validity or gateway authorization.
-pub(super) fn is_turn_cancel(payload: &str) -> bool {
+pub(super) fn is_domain_cancel(payload: &str) -> bool {
     #[derive(serde::Deserialize)]
     struct Method<'a> {
         #[serde(borrow)]
         method: std::borrow::Cow<'a, str>,
     }
-    serde_json::from_str::<Method<'_>>(payload)
-        .is_ok_and(|request| request.method == pioneer_protocol::constants::methods::TURN_CANCEL)
+    serde_json::from_str::<Method<'_>>(payload).is_ok_and(|request| {
+        matches!(
+            request.method.as_ref(),
+            pioneer_protocol::constants::methods::TURN_CANCEL
+                | pioneer_protocol::constants::methods::VOICE_SESSION_CANCEL
+        )
+    })
 }
 
 pub(crate) struct SocketCancel {
@@ -119,6 +139,7 @@ pub(crate) struct SocketCancel {
 
 pub(crate) struct SocketCancelReceiver {
     pub(super) receiver: tokio::sync::mpsc::Receiver<SocketCancel>,
+    pub(super) voice: Option<tokio::sync::mpsc::Receiver<super::voice_budget::QueuedVoiceAudio>>,
     live: Arc<Mutex<bool>>,
     slots: Arc<tokio::sync::Semaphore>,
 }

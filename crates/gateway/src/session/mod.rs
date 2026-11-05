@@ -339,6 +339,33 @@ impl SessionManager {
         connection_ids
     }
 
+    /// Revalidate the mutable physical owner after async voice authorization.
+    /// The synchronous effect may take short in-memory locks, but must never
+    /// perform I/O, send, join, or await while the registry read guard is held.
+    pub(crate) async fn with_voice_ingress_connection<T>(
+        &self,
+        connection_id: ConnectionId,
+        expected: &AuthenticatedSessionPrincipal,
+        effect: impl FnOnce() -> T,
+    ) -> Option<T> {
+        let connections = self.connections.read().await;
+        let connection = connections.get(&connection_id)?;
+        let current = connection.principal.as_ref();
+        let now = crate::helpers::unix_timestamp_secs().ok()?;
+        if current.gateway_id != expected.gateway_id
+            || current.principal_id != expected.principal_id
+            || current.device_id != expected.device_id
+            || current.session_id != expected.session_id
+            || current.kind != expected.kind
+            || current.role_key != expected.role_key
+            || connection.termination_tx.borrow().is_some()
+            || now >= current.access_expires_at_unix
+        {
+            return None;
+        }
+        Some(effect())
+    }
+
     pub(crate) async fn connection_context(
         &self,
         connection_id: ConnectionId,

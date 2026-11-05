@@ -89,6 +89,7 @@ impl MessageProcessor {
         let span = context.request_span();
 
         async {
+            let policy_generation = crate::authorization::observed_policy_generation();
             let decision = match kind {
                 BinaryIngressKind::ArtifactUploadChunk => {
                     self.authorize_artifact_upload_chunk(&context, payload)
@@ -135,12 +136,102 @@ impl MessageProcessor {
                         .await;
                 }
                 BinaryIngressKind::VoiceChunk => {
-                    self.process_voice_chunk_frame(&context, payload).await;
+                    self.process_voice_chunk_frame(&context, payload, policy_generation)
+                        .await;
                 }
             }
         }
         .instrument(span)
         .await;
+    }
+
+    pub(crate) fn voice_ingress_session(
+        &self,
+        connection: &crate::request_context::ConnectionContext,
+        payload: &[u8],
+    ) -> Option<crate::voice::session_store::GatewayVoiceSession> {
+        let chunk = match decode_gateway_voice_chunk_frame(payload) {
+            Ok(chunk) => chunk,
+            Err(_) => {
+                let context = RequestContext::new(
+                    connection,
+                    None,
+                    crate::request_context::CanonicalMethod::binary("voice/chunk"),
+                );
+                self.reject_owned_voice_ingress(&context, payload);
+                return None;
+            }
+        };
+        let context = RequestContext::new(
+            connection,
+            None,
+            crate::request_context::CanonicalMethod::binary("voice/chunk"),
+        );
+        let owner = AuthenticatedTransferOwner::from_request_context(&context);
+        let session = self
+            .voice_sessions
+            .lookup_authenticated_session(&chunk.header.session_id, &owner)
+            .ok()?;
+        (session.state == crate::voice::session_store::GatewayVoiceSessionState::Recording)
+            .then_some(session)
+    }
+
+    pub(crate) fn seal_voice_ingress(
+        &self,
+        connection: &crate::request_context::ConnectionContext,
+        payload: &str,
+    ) {
+        let Ok(request) = serde_json::from_str::<pioneer_protocol::JsonRpcRequest>(payload) else {
+            return;
+        };
+        if request.jsonrpc != pioneer_protocol::JSONRPC_VERSION
+            || request.method != pioneer_protocol::constants::methods::VOICE_SESSION_FINALIZE
+        {
+            return;
+        }
+        let Ok(params) = serde_json::from_value::<pioneer_protocol::VoiceSessionFinalizeParams>(
+            request.params.unwrap_or_default(),
+        ) else {
+            return;
+        };
+        let context = RequestContext::new(
+            connection,
+            None,
+            crate::request_context::CanonicalMethod::binary("voice/chunk"),
+        );
+        let owner = AuthenticatedTransferOwner::from_request_context(&context);
+        if let Ok(session) = self
+            .voice_sessions
+            .lookup_authenticated_session(&params.session_id, &owner)
+        {
+            if session.workspace_id == params.context.workspace_id
+                && session.thread_id == params.context.thread_id
+                && session.turn_id == params.context.turn_id
+            {
+                session.ingress.seal();
+            }
+        }
+    }
+
+    pub(crate) fn fail_voice_ingress(
+        &self,
+        session: &crate::voice::session_store::GatewayVoiceSession,
+    ) {
+        session.ingress.cancel();
+        let _ = self
+            .voice_session_buffers
+            .remove_session(&session.session_id);
+    }
+
+    pub(crate) fn retire_failed_voice_ingress(
+        &self,
+        session: &crate::voice::session_store::GatewayVoiceSession,
+    ) {
+        if let Some(owner) = &session.owner {
+            let _ = self
+                .voice_sessions
+                .remove_authenticated_session(&session.session_id, owner);
+        }
     }
 
     async fn authorize_artifact_upload_chunk(
@@ -330,15 +421,16 @@ impl MessageProcessor {
         Ok(())
     }
 
-    pub(crate) async fn process_voice_chunk_frame(
+    async fn process_voice_chunk_frame(
         &self,
         request_context: &RequestContext,
         payload: &[u8],
+        policy_generation: u64,
     ) {
         let connection_id = request_context.connection_id();
         match decode_gateway_voice_chunk_frame(payload) {
             Ok(chunk) => {
-                self.forward_decoded_voice_chunk(request_context, chunk)
+                self.forward_decoded_voice_chunk(request_context, chunk, policy_generation)
                     .await;
             }
             Err(error) => {
@@ -397,8 +489,30 @@ impl MessageProcessor {
         &self,
         request_context: &RequestContext,
         chunk: GatewayVoiceChunkFrame,
+        policy_generation: u64,
     ) {
         let connection_id = request_context.connection_id();
+        let Ok(current) = self.session_manager.connection_context(connection_id).await else {
+            return;
+        };
+        let old = request_context.principal();
+        let new = current.principal();
+        if old.gateway_id != new.gateway_id
+            || old.principal_id != new.principal_id
+            || old.device_id != new.device_id
+            || old.session_id != new.session_id
+        {
+            return;
+        }
+        if let Some(auth) = &self.auth_service {
+            if auth
+                .validate_session_lease(current.principal())
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
         let owner = AuthenticatedTransferOwner::from_request_context(request_context);
         let session = match self
             .voice_sessions
@@ -428,10 +542,32 @@ impl MessageProcessor {
             return;
         }
 
-        match self
-            .voice_session_buffers
-            .append_chunk(chunk.header, chunk.audio_payload)
-        {
+        let Some(ingested) = self
+            .session_manager
+            .with_voice_ingress_connection(connection_id, request_context.principal(), || {
+                session
+                    .ingress
+                    .effect(|| {
+                        if crate::authorization::observed_policy_generation() != policy_generation {
+                            self.voice_session_buffers
+                                .reject_ingress(&session.session_id);
+                            return None;
+                        }
+                        Some(
+                            self.voice_session_buffers
+                                .append_chunk(chunk.header, chunk.audio_payload),
+                        )
+                    })
+                    .flatten()
+            })
+            .await
+        else {
+            return;
+        };
+        let Some(ingested) = ingested else {
+            return;
+        };
+        match ingested {
             Ok(report) => {
                 if report.already_buffered {
                     debug!(

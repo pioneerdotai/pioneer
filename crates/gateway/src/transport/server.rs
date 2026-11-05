@@ -71,7 +71,9 @@ fn connection_request_class(
 ) -> Option<ConnectionRequestClass> {
     use pioneer_protocol::constants::methods;
     match request.method.as_str() {
-        methods::TURN_CANCEL => Some(ConnectionRequestClass::Cancel),
+        methods::TURN_CANCEL | methods::VOICE_SESSION_CANCEL => {
+            Some(ConnectionRequestClass::Cancel)
+        }
         methods::TASK_WAIT => Some(ConnectionRequestClass::TaskWait),
         _ => None,
     }
@@ -87,14 +89,45 @@ pub(crate) struct ConnectionHandlers {
     waits: JoinSet<()>,
     reads: JoinSet<()>,
     closed: bool,
+    audio: Option<super::voice_ingress::VoiceIngressOwner>,
 }
 
 impl ConnectionHandlers {
+    pub(crate) fn enable_audio(
+        &mut self,
+        processor: Arc<MessageProcessor>,
+        sessions: Arc<SessionManager>,
+        auth: Arc<GatewayAuthService>,
+        connection_id: crate::session::ConnectionId,
+        outbound: SessionOutbound,
+    ) {
+        self.audio = Some(super::voice_ingress::VoiceIngressOwner::new(
+            processor,
+            sessions,
+            auth,
+            connection_id,
+            outbound,
+        ));
+    }
+    #[cfg(test)]
+    pub(crate) fn pause_audio_once(
+        &self,
+        entered: tokio::sync::oneshot::Sender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        self.audio.as_ref().unwrap().pause_once(entered, release);
+    }
     fn is_empty(&self) -> bool {
-        self.cancels.is_empty() && self.waits.is_empty() && self.reads.is_empty()
+        self.cancels.is_empty()
+            && self.waits.is_empty()
+            && self.reads.is_empty()
+            && self.audio.is_none()
     }
 
     fn reap(&mut self) -> Result<()> {
+        if let Some(audio) = &mut self.audio {
+            audio.reap()?;
+        }
         while let Some(result) = self.cancels.try_join_next() {
             result?;
         }
@@ -109,6 +142,7 @@ impl ConnectionHandlers {
 
     async fn next(&mut self) -> Result<()> {
         tokio::select! {
+            result = async { self.audio.as_mut().expect("audio owner").next().await }, if self.audio.is_some() => { result?; }
             result = self.cancels.join_next(), if !self.cancels.is_empty() => { result.expect("active cancel")?; }
             result = self.waits.join_next(), if !self.waits.is_empty() => { result.expect("active wait")?; }
             result = self.reads.join_next(), if !self.reads.is_empty() => { result.expect("active read")?; }
@@ -142,6 +176,9 @@ impl ConnectionHandlers {
 
     pub(crate) async fn shutdown(&mut self) {
         self.closed = true;
+        if let Some(mut audio) = self.audio.take() {
+            audio.shutdown().await;
+        }
         self.cancels.abort_all();
         self.waits.abort_all();
         self.reads.abort_all();
@@ -563,6 +600,13 @@ pub(crate) async fn run_normal_connection_inner(
     let mut writer_completion = None;
     let mut deferred_ingress = VecDeque::new();
     let mut handlers = ConnectionHandlers::default();
+    handlers.enable_audio(
+        message_processor.clone(),
+        session_manager.clone(),
+        auth_service.clone(),
+        connection_id,
+        outbound_tx.clone(),
+    );
     let dispatch_owned = |context: crate::request_context::ConnectionContext, payload: String| {
         let processor = message_processor.clone();
         let auth = auth_service.clone();
@@ -643,6 +687,13 @@ pub(crate) async fn run_normal_connection_inner(
             };
             let message = payload.context("websocket read failed")?;
 
+            if let Some(audio) = &handlers.audio {
+                match &message {
+                    Message::Binary(payload) if audio.admit(&connection_context, payload) => continue,
+                    Message::Text(text) => audio.seal(&connection_context, text),
+                    _ => {},
+                }
+            }
             match message {
                 Message::Text(payload) => {
                     // This transport control request deliberately bypasses domain dispatch;
@@ -1011,6 +1062,13 @@ where
                 if bytes > MAX_DEFERRED_BYTES {
                     send_close_bounded(outbound, 1009, "ingress_message_too_large").await;
                     return false;
+                }
+                if let Some(audio) = &handlers.audio {
+                    match &message {
+                        Message::Binary(payload) if audio.admit(connection, payload) => continue,
+                        Message::Text(text) => audio.seal(connection, text),
+                        _ => {},
+                    }
                 }
                 if let Message::Text(payload) = &message {
                     if let Ok(request) = serde_json::from_str::<pioneer_protocol::JsonRpcRequest>(payload) {

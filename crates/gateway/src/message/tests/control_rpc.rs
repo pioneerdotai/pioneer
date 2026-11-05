@@ -1584,3 +1584,576 @@ async fn normal_writer_deadline_joins_pending_handler_and_cleans_connection_reso
     .await
     .expect("writer deadline must terminate the normal owner and its pending children");
 }
+
+#[tokio::test]
+async fn blocked_ordinary_accepts_eighty_voice_frames_without_using_deferred_fifo() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let mut f = Fixture::new().await;
+        let mut ordinary = f.ordinary().await;
+        let mut context = f
+            .processor
+            .session_manager
+            .connection_context(f.connection)
+            .await
+            .unwrap();
+        let request_context = RequestContext::new(
+            &context,
+            None,
+            crate::request_context::CanonicalMethod::binary("voice/chunk"),
+        );
+        let owner = AuthenticatedTransferOwner::from_request_context(&request_context);
+        let format = pioneer_protocol::VoiceAudioFormat::pioneer_streaming_target();
+        let session = f
+            .processor
+            .voice_sessions
+            .create_authenticated_session(
+                "voice_ingress_regression",
+                owner.clone(),
+                pioneer_protocol::VoiceSessionStartContext {
+                    workspace_id: f.workspace.clone(),
+                    thread_id: THREAD.into(),
+                    turn_id: TURN.into(),
+                },
+                format.clone(),
+            )
+            .unwrap();
+        f.processor
+            .voice_sessions
+            .mark_recording_authenticated(&session.session_id, &owner)
+            .unwrap();
+        f.processor
+            .voice_session_buffers
+            .start_session(&session.session_id, format)
+            .unwrap();
+        let (renewals, _) = watch::channel(ConnectionAccessLease::new(
+            context.principal().clone(),
+            Duration::from_secs(60),
+        ));
+        let mut handlers = ConnectionHandlers::default();
+        handlers.enable_audio(
+            f.processor.clone(),
+            f.processor.session_manager.clone(),
+            f.auth.clone(),
+            f.connection,
+            f.outbound.clone(),
+        );
+        let mut deferred = VecDeque::new();
+        let (input, mut reader) = incoming();
+        let dispatch = dispatch(f.processor.clone());
+        let pump = process_with_access_renewals(
+            async {
+                ordinary.join().await.unwrap();
+            },
+            IngressMode::Serial,
+            &mut reader,
+            &mut deferred,
+            &f.auth,
+            &f.processor.session_manager,
+            &mut context,
+            &renewals,
+            &f.outbound,
+            &mut handlers,
+            &dispatch,
+        );
+        let driver = async {
+            // No native recognizer is running. Transport must still accept exact PCM.
+            for sequence in 0..80 {
+                let header = pioneer_protocol::VoiceChunkFrameHeader {
+                    session_id: session.session_id.clone(),
+                    sequence,
+                    sample_rate_hz: 16_000,
+                    channels: 1,
+                    encoding: pioneer_protocol::VoiceAudioEncoding::PcmS16Le,
+                    payload_len: 0,
+                    captured_at_unix_ms: Some(sequence),
+                    duration_ms: None,
+                };
+                let pcm = (sequence as i16).to_le_bytes();
+                input
+                    .send(Message::Binary(
+                        pioneer_protocol::encode_voice_chunk_frame(header, &pcm)
+                            .unwrap()
+                            .into(),
+                    ))
+                    .unwrap();
+            }
+            for sequence in 0..80 {
+                let Message::Text(text) = f.responses.recv().await.unwrap() else {
+                    panic!("voice traffic closed the socket");
+                };
+                let value: JsonValue = serde_json::from_str(&text).unwrap();
+                assert_eq!(
+                    value["method"],
+                    pioneer_protocol::constants::events::VOICE_CHUNK_ACK
+                );
+                assert_eq!(value["params"]["session_id"], session.session_id);
+                assert_eq!(value["params"]["sequence"], sequence);
+            }
+            let audio = f
+                .processor
+                .voice_session_buffers
+                .take_session_audio(&session.session_id)
+                .unwrap();
+            assert_eq!(audio.chunks.len(), 80);
+            for (sequence, chunk) in audio.chunks.iter().enumerate() {
+                assert_eq!(chunk.sequence, sequence as u64);
+                assert_eq!(chunk.audio_payload, (sequence as i16).to_le_bytes());
+                assert_eq!(chunk.captured_at_unix_ms, Some(sequence as u64));
+            }
+            f.gate.release.notify_one();
+            let response = recv_response_by_id(&mut f.responses, &id("ordinary")).await;
+            assert!(response.result.is_object() || response.result.is_array());
+        };
+        let (alive, ()) = tokio::join!(pump, driver);
+        assert!(alive);
+        assert!(
+            deferred.is_empty(),
+            "voice never consumes ordinary count/bytes"
+        );
+        handlers.shutdown().await;
+        f.processor.connection_closed(f.connection).await;
+    })
+    .await
+    .expect("audio and ordinary owner both make positive progress");
+}
+
+fn ingress_recording(
+    f: &Fixture,
+    context: &crate::request_context::ConnectionContext,
+    name: &str,
+) -> crate::voice::session_store::GatewayVoiceSession {
+    let request = RequestContext::new(
+        context,
+        None,
+        crate::request_context::CanonicalMethod::binary("voice/chunk"),
+    );
+    let owner = AuthenticatedTransferOwner::from_request_context(&request);
+    let format = pioneer_protocol::VoiceAudioFormat::pioneer_streaming_target();
+    let session = f
+        .processor
+        .voice_sessions
+        .create_authenticated_session(
+            name,
+            owner.clone(),
+            pioneer_protocol::VoiceSessionStartContext {
+                workspace_id: f.workspace.clone(),
+                thread_id: THREAD.into(),
+                turn_id: TURN.into(),
+            },
+            format.clone(),
+        )
+        .unwrap();
+    f.processor
+        .voice_sessions
+        .mark_recording_authenticated(name, &owner)
+        .unwrap();
+    f.processor
+        .voice_session_buffers
+        .start_session(name, format)
+        .unwrap();
+    session
+}
+fn ingress_frame(session: &str, sequence: u64) -> Message {
+    Message::Binary(
+        pioneer_protocol::encode_voice_chunk_frame(
+            pioneer_protocol::VoiceChunkFrameHeader {
+                session_id: session.into(),
+                sequence,
+                sample_rate_hz: 16_000,
+                channels: 1,
+                encoding: pioneer_protocol::VoiceAudioEncoding::PcmS16Le,
+                payload_len: 0,
+                captured_at_unix_ms: Some(sequence),
+                duration_ms: None,
+            },
+            &(sequence as i16).to_le_bytes(),
+        )
+        .unwrap()
+        .into(),
+    )
+}
+
+#[tokio::test]
+async fn paused_audio_ingest_does_not_hold_independent_read_group_or_cancel() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let mut f = Fixture::new().await;
+        let mut context = f
+            .processor
+            .session_manager
+            .connection_context(f.connection)
+            .await
+            .unwrap();
+        let session = ingress_recording(&f, &context, "voice_reverse_ingress");
+        assert!(
+            f.processor
+                .thread_manager
+                .subscribe_connection(THREAD, f.connection)
+                .await
+        );
+        let (renewals, _) = watch::channel(ConnectionAccessLease::new(
+            context.principal().clone(),
+            Duration::from_secs(60),
+        ));
+        let mut handlers = ConnectionHandlers::default();
+        handlers.enable_audio(
+            f.processor.clone(),
+            f.processor.session_manager.clone(),
+            f.auth.clone(),
+            f.connection,
+            f.outbound.clone(),
+        );
+        let (entered, ingest_entered) = tokio::sync::oneshot::channel();
+        let (release, ingest_release) = tokio::sync::oneshot::channel();
+        handlers.pause_audio_once(entered, ingest_release);
+        let (gate, mut entries, _) = read_gate(&["held-ingress-read"]);
+        let dispatch = gated_read_dispatch(f.processor.clone(), gate.clone());
+        let mut deferred = VecDeque::from([get_thread("held-ingress-read")]);
+        let (input, mut reader) = incoming();
+        let pump = process_with_access_renewals(
+            std::future::pending(),
+            IngressMode::ReadGroup,
+            &mut reader,
+            &mut deferred,
+            &f.auth,
+            &f.processor.session_manager,
+            &mut context,
+            &renewals,
+            &f.outbound,
+            &mut handlers,
+            &dispatch,
+        );
+        let driver = async {
+            assert_eq!(entries.recv().await.unwrap(), id("held-ingress-read"));
+            input.send(ingress_frame(&session.session_id, 0)).unwrap();
+            ingest_entered.await.unwrap();
+            input.send(get_thread("while-audio-paused")).unwrap();
+            let response = recv_response_by_id(&mut f.responses, &id("while-audio-paused")).await;
+            assert!(response.result.get("thread").is_some());
+            input
+                .send(Message::Text(
+                    rpc(
+                        "cancel-paused-audio",
+                        methods::VOICE_SESSION_CANCEL,
+                        json!({"session_id":session.session_id,"reason":"test"}),
+                    )
+                    .into(),
+                ))
+                .unwrap();
+            let response = recv_response_by_id(&mut f.responses, &id("cancel-paused-audio")).await;
+            assert_eq!(response.result["cancelled"], true);
+            assert!(session.ingress.cancelled.is_cancelled());
+            let replacement_context = f
+                .processor
+                .session_manager
+                .connection_context(f.connection)
+                .await
+                .unwrap();
+            let replacement =
+                ingress_recording(&f, &replacement_context, "voice_after_ingress_cancel");
+            input.send(ingress_frame(&session.session_id, 1)).unwrap();
+            input
+                .send(ingress_frame(&replacement.session_id, 0))
+                .unwrap();
+            let _ = release.send(());
+            loop {
+                let Message::Text(text) = f.responses.recv().await.unwrap() else {
+                    panic!("cancel disconnected unrelated work");
+                };
+                let value: JsonValue = serde_json::from_str(&text).unwrap();
+                if value["method"] == pioneer_protocol::constants::events::VOICE_CHUNK_ACK {
+                    assert_eq!(value["params"]["session_id"], replacement.session_id);
+                    assert_eq!(value["params"]["sequence"], 0);
+                    break;
+                }
+            }
+            assert_eq!(
+                f.processor
+                    .voice_session_buffers
+                    .buffered_bytes_for_test(&replacement.session_id)
+                    .unwrap(),
+                2
+            );
+            gate.release.add_permits(1);
+        };
+        let (alive, ()) = tokio::join!(pump, driver);
+        assert!(alive);
+        handlers.shutdown().await;
+        f.processor.connection_closed(f.connection).await;
+    })
+    .await
+    .expect("RPC and control progress while audio admission owns active work");
+}
+
+#[tokio::test]
+async fn audio_capacity_failure_is_terminal_for_its_recording_and_preserves_read_group() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let mut f = Fixture::new().await;
+        let mut context = f
+            .processor
+            .session_manager
+            .connection_context(f.connection)
+            .await
+            .unwrap();
+        let session = ingress_recording(&f, &context, "voice_capacity_ingress");
+        let (renewals, _) = watch::channel(ConnectionAccessLease::new(
+            context.principal().clone(),
+            Duration::from_secs(60),
+        ));
+        let mut handlers = ConnectionHandlers::default();
+        handlers.enable_audio(
+            f.processor.clone(),
+            f.processor.session_manager.clone(),
+            f.auth.clone(),
+            f.connection,
+            f.outbound.clone(),
+        );
+        let (entered, ingest_entered) = tokio::sync::oneshot::channel();
+        let (_release, ingest_release) = tokio::sync::oneshot::channel();
+        handlers.pause_audio_once(entered, ingest_release);
+        let (gate, mut entries, _) = read_gate(&["held-overload-read"]);
+        let dispatch = gated_read_dispatch(f.processor.clone(), gate.clone());
+        let mut deferred = VecDeque::from([get_thread("held-overload-read")]);
+        let (input, mut reader) = incoming();
+        let pump = process_with_access_renewals(
+            std::future::pending(),
+            IngressMode::ReadGroup,
+            &mut reader,
+            &mut deferred,
+            &f.auth,
+            &f.processor.session_manager,
+            &mut context,
+            &renewals,
+            &f.outbound,
+            &mut handlers,
+            &dispatch,
+        );
+        let driver = async {
+            assert_eq!(entries.recv().await.unwrap(), id("held-overload-read"));
+            input.send(ingress_frame(&session.session_id, 0)).unwrap();
+            ingest_entered.await.unwrap();
+            // Count includes the gated active item; the 129th cannot fit.
+            for sequence in 1..129 {
+                input
+                    .send(ingress_frame(&session.session_id, sequence))
+                    .unwrap();
+            }
+            loop {
+                let Message::Text(text) = f.responses.recv().await.unwrap() else {
+                    panic!("voice overload closed the shared socket");
+                };
+                let value: JsonValue = serde_json::from_str(&text).unwrap();
+                if value["method"] == pioneer_protocol::constants::events::VOICE_SESSION_RESULT {
+                    let result: pioneer_protocol::VoiceSessionResultNotification =
+                        serde_json::from_value(value["params"].clone()).unwrap();
+                    assert_eq!(result.session_id, session.session_id);
+                    assert_eq!(
+                        result.outcome,
+                        pioneer_protocol::VoiceSessionOutcome::Failed
+                    );
+                    assert_eq!(
+                        result.error.unwrap().public_error.unwrap().code,
+                        pioneer_protocol::PublicErrorCode::ResourceExhausted
+                    );
+                    break;
+                }
+            }
+            assert!(session.ingress.cancelled.is_cancelled());
+            session.ingress.drain().await;
+            assert!(session.ingress.admit().is_none());
+            assert!(
+                f.processor
+                    .voice_session_buffers
+                    .finish_processing_verified(
+                        &session.session_id,
+                        Some(pioneer_protocol::VoiceAudioIntegrity {
+                            next_sequence: 129,
+                            normalized_samples: 129
+                        })
+                    )
+                    .is_err()
+            );
+            input
+                .send(ingress_frame("foreign_voice_recording", 0))
+                .unwrap();
+            input
+                .send(Message::Binary(
+                    pioneer_protocol::VOICE_CHUNK_FRAME_MAGIC.to_vec().into(),
+                ))
+                .unwrap();
+            input.send(get_thread("after-voice-overload")).unwrap();
+            let response = recv_response_by_id(&mut f.responses, &id("after-voice-overload")).await;
+            assert!(response.result.get("thread").is_some());
+            gate.release.add_permits(1);
+        };
+        let (alive, ()) = tokio::join!(pump, driver);
+        assert!(alive);
+        assert!(deferred.is_empty());
+        handlers.shutdown().await;
+        f.processor.connection_closed(f.connection).await;
+    })
+    .await
+    .expect("bounded voice overload never retires healthy ordinary transport");
+}
+
+#[tokio::test]
+async fn audio_worker_retirement_releases_active_and_queued_tickets() {
+    for terminal in ["shutdown", "drop", "panic"] {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let mut f = Fixture::new().await;
+            let mut context = f
+                .processor
+                .session_manager
+                .connection_context(f.connection)
+                .await
+                .unwrap();
+            let session = ingress_recording(&f, &context, "voice_retired_ingress");
+            let (renewals, _) = watch::channel(ConnectionAccessLease::new(
+                context.principal().clone(),
+                Duration::from_secs(60),
+            ));
+            let mut handlers = ConnectionHandlers::default();
+            handlers.enable_audio(
+                f.processor.clone(),
+                f.processor.session_manager.clone(),
+                f.auth.clone(),
+                f.connection,
+                f.outbound.clone(),
+            );
+            let (entered, ingest_entered) = tokio::sync::oneshot::channel();
+            let (release, ingest_release) = tokio::sync::oneshot::channel();
+            handlers.pause_audio_once(entered, ingest_release);
+            let mut deferred = VecDeque::new();
+            let (input, mut reader) = incoming();
+            let (finish, finished) = tokio::sync::oneshot::channel();
+            let dispatch = dispatch(f.processor.clone());
+            let pump = process_with_access_renewals(
+                async {
+                    let _ = finished.await;
+                },
+                IngressMode::Serial,
+                &mut reader,
+                &mut deferred,
+                &f.auth,
+                &f.processor.session_manager,
+                &mut context,
+                &renewals,
+                &f.outbound,
+                &mut handlers,
+                &dispatch,
+            );
+            let driver = async {
+                input.send(ingress_frame(&session.session_id, 0)).unwrap();
+                ingest_entered.await.unwrap();
+                input.send(ingress_frame(&session.session_id, 1)).unwrap();
+                // Positive dispatch completion proves the pump served later input
+                // while the worker was alive and parked at its active item.
+                input
+                    .send(Message::Text(
+                        rpc(
+                            "retirement-probe",
+                            methods::TASK_WAIT,
+                            json!({"run_ids":[RUN],"timeout_ms":1}),
+                        )
+                        .into(),
+                    ))
+                    .unwrap();
+                let response = recv_response_by_id(&mut f.responses, &id("retirement-probe")).await;
+                assert_eq!(response.result["timed_out"], true);
+                if terminal == "panic" {
+                    drop(release); // the test-only gate injects a worker panic
+                    None
+                } else {
+                    finish.send(()).unwrap();
+                    Some(release)
+                }
+            };
+            let (alive, kept_release) = tokio::join!(pump, driver);
+            assert_eq!(alive, terminal != "panic");
+            if terminal == "drop" {
+                drop(handlers);
+            } else {
+                handlers.shutdown().await;
+            }
+            session.ingress.drain().await;
+            drop(kept_release);
+            assert_eq!(
+                f.processor
+                    .voice_session_buffers
+                    .buffered_bytes_for_test(&session.session_id)
+                    .unwrap(),
+                0
+            );
+            f.processor.connection_closed(f.connection).await;
+        })
+        .await
+        .expect("audio retirement must drop accepted payload ownership");
+    }
+}
+
+#[tokio::test]
+async fn finalize_transport_seal_includes_active_and_queued_audio_and_rejects_late_tail() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let mut f = Fixture::new().await;
+        let mut context = f.processor.session_manager.connection_context(f.connection).await.unwrap();
+        let session = ingress_recording(&f, &context, "voice_finalize_ingress");
+        f.processor.voice_session_buffers.remove_session(&session.session_id).unwrap();
+        let (_recognizer, completion) = tokio::sync::oneshot::channel();
+        f.processor.voice_session_buffers.start_processing(session.session_id.clone(), session.audio_format.clone(),
+            tokio_util::sync::CancellationToken::new(), completion).unwrap();
+        let (renewals, _) = watch::channel(ConnectionAccessLease::new(context.principal().clone(), Duration::from_secs(60)));
+        let mut handlers = ConnectionHandlers::default();
+        handlers.enable_audio(f.processor.clone(), f.processor.session_manager.clone(), f.auth.clone(), f.connection, f.outbound.clone());
+        let (entered, ingest_entered) = tokio::sync::oneshot::channel();
+        let (release, ingest_release) = tokio::sync::oneshot::channel();
+        handlers.pause_audio_once(entered, ingest_release);
+        let (gate, mut entries, _) = read_gate(&["held-finalize-read"]);
+        let dispatch = gated_read_dispatch(f.processor.clone(), gate.clone());
+        let mut deferred = VecDeque::from([get_thread("held-finalize-read")]);
+        let (input, mut reader) = incoming();
+        let pump = process_with_access_renewals(std::future::pending(), IngressMode::ReadGroup,
+            &mut reader, &mut deferred, &f.auth, &f.processor.session_manager,
+            &mut context, &renewals, &f.outbound, &mut handlers, &dispatch);
+        let driver = async {
+            assert_eq!(entries.recv().await.unwrap(), id("held-finalize-read"));
+            input.send(ingress_frame(&session.session_id, 0)).unwrap();
+            ingest_entered.await.unwrap();
+            input.send(ingress_frame(&session.session_id, 1)).unwrap();
+            input.send(ingress_frame(&session.session_id, 2)).unwrap();
+            // Seal is a receive boundary even while the domain request is deferred.
+            input.send(Message::Text(rpc("fenced-finalize", methods::VOICE_SESSION_FINALIZE, json!({
+                "session_id":session.session_id,"audio_integrity":{"next_sequence":3,"normalized_samples":3},
+                "context":{"workspace_id":f.workspace,"thread_id":THREAD,"turn_id":TURN}
+            })).into())).unwrap();
+            input.send(ingress_frame(&session.session_id, 3)).unwrap();
+            // Exact control has independent admission beyond the deferred Finalize.
+            input.send(Message::Text(rpc("seal-probe", methods::TASK_WAIT,
+                json!({"run_ids":[RUN],"timeout_ms":1})).into())).unwrap();
+            let response = recv_response_by_id(&mut f.responses, &id("seal-probe")).await;
+            assert_eq!(response.result["timed_out"], true);
+            assert!(session.ingress.admit().is_none());
+            assert!(session.ingress.drain().now_or_never().is_none());
+            release.send(()).unwrap();
+            for sequence in 0..3 {
+                let Message::Text(text) = f.responses.recv().await.unwrap() else { panic!("finalize seal retired socket"); };
+                let value: JsonValue = serde_json::from_str(&text).unwrap();
+                assert_eq!(value["method"], pioneer_protocol::constants::events::VOICE_CHUNK_ACK);
+                assert_eq!(value["params"]["sequence"], sequence);
+            }
+            session.ingress.drain().await;
+            // The same production integrity proof used by the domain finalizer
+            // accepts every pre-seal sample and excludes the late fourth frame.
+            let completion = f.processor.voice_session_buffers.finish_processing_verified(&session.session_id,
+                Some(pioneer_protocol::VoiceAudioIntegrity { next_sequence:3, normalized_samples:3 })).unwrap();
+            drop(completion);
+            let audio = f.processor.voice_session_buffers.take_session_audio(&session.session_id).unwrap();
+            assert_eq!(audio.chunks.iter().map(|c| c.sequence).collect::<Vec<_>>(), vec![0,1,2]);
+            assert_eq!(audio.normalized_samples.len(), 3);
+            gate.release.add_permits(1);
+        };
+        let (alive, ()) = tokio::join!(pump, driver);
+        assert!(alive);
+        assert_eq!(deferred.len(), 1, "only the domain Finalize retains its ordinary barrier");
+        handlers.shutdown().await;
+        f.processor.connection_closed(f.connection).await;
+    }).await.expect("finalize admission fence covers the active item and queue transition");
+}

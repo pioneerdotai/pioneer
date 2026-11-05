@@ -25,7 +25,7 @@ impl crate::rpc::JsonRpcRequestTransport for GatewayWsCommandSender {
         if let Some(transport) = self.test_requests.lock().unwrap().clone() {
             return transport.send_json_rpc_request(request_id, payload, response_tx);
         }
-        if is_turn_cancel(&payload) {
+        if is_domain_cancel(&payload) {
             let Some(receipt) = self.socket.lock().unwrap().clone() else {
                 let message = "websocket Cancel socket unavailable";
                 let _ = response_tx.send(Err(crate::rpc::JsonRpcResponseError::transport(message)));
@@ -1169,12 +1169,17 @@ impl GatewayWsCommandSender {
             &pcm_chunk,
         )?;
         let payload = self.voice_budget.admit(payload)?;
-        self.command_tx
-            .send(GatewayWsCommand::VoiceBinaryChunk {
-                expected_connection: Some(connection),
-                payload,
-            })
-            .map_err(|_| anyhow!("websocket worker is not available"))
+        let receipt = self
+            .socket
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| anyhow!("voice socket unavailable"))?;
+        anyhow::ensure!(
+            receipt.scope.connection == connection,
+            "voice socket replaced"
+        );
+        receipt.admit_voice(payload)
     }
 
     pub fn send_voice_audio_chunk(
@@ -1195,14 +1200,13 @@ impl GatewayWsCommandSender {
             pcm_chunk.as_slice(),
         )?;
         let payload = self.voice_budget.admit(payload)?;
-        self.command_tx
-            .send(GatewayWsCommand::VoiceBinaryChunk {
-                expected_connection: None,
-                payload,
-            })
-            .map_err(|_| anyhow!("websocket worker is not available"))?;
-
-        Ok(())
+        let receipt = self
+            .socket
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| anyhow!("voice socket unavailable"))?;
+        receipt.admit_voice(payload)
     }
 
     pub fn prepare_composer_turn_with_file_system(
@@ -1861,7 +1865,7 @@ impl crate::rpc::JsonRpcRequestTransport for ConnectionRequestTransport {
         if let Some(transport) = self.sender.test_requests.lock().unwrap().clone() {
             return transport.send_json_rpc_request(request_id, payload, response_tx);
         }
-        if is_turn_cancel(&payload) {
+        if is_domain_cancel(&payload) {
             if self.sender.connection_generations.lock().unwrap().active != Some(self.connection) {
                 response_tx.cancel();
                 return Err("websocket Cancel route retired".into());

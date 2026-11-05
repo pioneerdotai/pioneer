@@ -690,10 +690,8 @@ async fn delayed_voice_tail_and_finalize_keep_socket_order_without_per_packet_ac
         fixture.gate.block();
         let budget = Arc::new(super::super::voice_budget::VoiceTransportBudget::default());
         fixture
-            .commands
-            .send(ConnectionRpcCommand::VoiceBinaryChunk {
-                payload: budget.admit(pcm.clone()).unwrap(),
-            })
+            .receipt
+            .admit_voice(budget.admit(pcm.clone()).unwrap())
             .unwrap();
         fixture.gate.wait_entered().await;
         // The in-flight socket write still owns its capacity reservation.
@@ -711,15 +709,13 @@ async fn delayed_voice_tail_and_finalize_keep_socket_order_without_per_packet_ac
             )
             .unwrap();
             fixture
-                .commands
-                .send(ConnectionRpcCommand::VoiceBinaryChunk {
-                    payload: budget.admit(frame.clone()).unwrap(),
-                })
+                .receipt
+                .admit_voice(budget.admit(frame.clone()).unwrap())
                 .unwrap();
             frames.push(frame);
         }
         fixture.idle.after(epoch).await;
-        // A is at the gate, B fills the handoff, C prevents further FIFO dequeue.
+        // A is at the socket gate; B/C occupy the separate voice mailbox.
         fixture.reply(&first.id).await;
         assert!(receive(first.rx).await.is_ok());
         assert!(fixture.gate.state.lock().unwrap().blocked);
@@ -821,18 +817,14 @@ async fn blocked_voice_burst(
 ) {
     f.consume_initial_heartbeat().await;
     f.gate.block();
-    f.commands
-        .send(ConnectionRpcCommand::VoiceBinaryChunk {
-            payload: budget.admit(vec![1]).unwrap(),
-        })
+    f.receipt
+        .admit_voice(budget.admit(vec![1]).unwrap())
         .unwrap();
     f.gate.wait_entered().await;
     let epoch = f.idle.epoch();
     for byte in [2, 3] {
-        f.commands
-            .send(ConnectionRpcCommand::VoiceBinaryChunk {
-                payload: budget.admit(vec![byte]).unwrap(),
-            })
+        f.receipt
+            .admit_voice(budget.admit(vec![byte]).unwrap())
             .unwrap();
     }
     f.idle.after(epoch).await;
@@ -849,13 +841,11 @@ async fn pending_voice_teardown_releases_budget_and_never_migrates_frames() {
             let mut f = Fixture::start().await;
             let budget = Arc::new(super::super::voice_budget::VoiceTransportBudget::default());
             blocked_voice_burst(&mut f, &budget).await;
-            // Three reservations span writer, handoff and pending; the rest stay
-            // in the existing FIFO. Neither stage bypasses the frame/byte limits.
+            // Reservations span the active writer and its separate voice mailbox.
+            // Every stage retains the same frame/byte admission budget.
             for _ in 3..128 {
-                f.commands
-                    .send(ConnectionRpcCommand::VoiceBinaryChunk {
-                        payload: budget.admit(vec![4]).unwrap(),
-                    })
+                f.receipt
+                    .admit_voice(budget.admit(vec![4]).unwrap())
                     .unwrap();
             }
             assert!(budget.admit(vec![5]).is_err());
@@ -902,17 +892,13 @@ async fn pending_finalize_preserves_completion_cancellation_and_deadline() {
             f.consume_initial_heartbeat().await;
             f.gate.block();
             let budget = Arc::new(super::super::voice_budget::VoiceTransportBudget::default());
-            f.commands
-                .send(ConnectionRpcCommand::VoiceBinaryChunk {
-                    payload: budget.admit(vec![1]).unwrap(),
-                })
+            f.receipt
+                .admit_voice(budget.admit(vec![1]).unwrap())
                 .unwrap();
             f.gate.wait_entered().await;
             let epoch = f.idle.epoch();
-            f.commands
-                .send(ConnectionRpcCommand::VoiceBinaryChunk {
-                    payload: budget.admit(vec![2]).unwrap(),
-                })
+            f.receipt
+                .admit_voice(budget.admit(vec![2]).unwrap())
                 .unwrap();
             let rpc = crate::rpc::build_json_rpc_request_payload(
                 pioneer_protocol::constants::methods::VOICE_SESSION_FINALIZE,
@@ -1208,12 +1194,12 @@ async fn assert_teardown(termination: Termination) {
     let control = cancel_request(&f.receipt);
     assert_eq!(f.next_request().await["id"], control.id);
     f.gate.block();
-    f.commands
-        .send(ConnectionRpcCommand::VoiceBinaryChunk {
-            payload: Arc::new(super::super::voice_budget::VoiceTransportBudget::default())
+    f.receipt
+        .admit_voice(
+            Arc::new(super::super::voice_budget::VoiceTransportBudget::default())
                 .admit(vec![5, 6])
                 .unwrap(),
-        })
+        )
         .unwrap();
     f.gate.wait_entered().await;
     let queued = request(&f.commands, "synthetic/queued");
