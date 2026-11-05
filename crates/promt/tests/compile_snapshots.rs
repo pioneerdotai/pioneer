@@ -425,8 +425,8 @@ section_ids:
 - recovery_continuation
 
 ## Hidden Tool Domains
-For hidden tools, call request_tools to open their domain.
-Shared tools become visible when any listed domain opens.
+For hidden tools, call request_tools to open a domain.
+Shared tools open with any listed domain.
 
 Domains:
 - threads: threads_tools_result_read, threads_list, threads_history_read, threads_search, threads_children_list, threads_start_options, threads_identity_models_list, thread_message_send, thread_create, threads_turn_start.
@@ -492,8 +492,8 @@ section_ids:
 - recovery_continuation
 
 ## Hidden Tool Domains
-For hidden tools, call request_tools to open their domain.
-Shared tools become visible when any listed domain opens.
+For hidden tools, call request_tools to open a domain.
+Shared tools open with any listed domain.
 
 Domains:
 - threads: threads_tools_result_read, threads_list, threads_history_read, threads_search, threads_children_list, threads_start_options, threads_identity_models_list, thread_message_send, thread_create, threads_turn_start.
