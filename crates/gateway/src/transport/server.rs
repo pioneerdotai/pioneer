@@ -41,6 +41,7 @@ const MAX_READ_HANDLERS: usize = 4;
 #[derive(Clone, Copy)]
 enum ConnectionRequestClass {
     Cancel,
+    VoiceCancel,
     TaskWait,
     Read,
 }
@@ -71,9 +72,8 @@ fn connection_request_class(
 ) -> Option<ConnectionRequestClass> {
     use pioneer_protocol::constants::methods;
     match request.method.as_str() {
-        methods::TURN_CANCEL | methods::VOICE_SESSION_CANCEL => {
-            Some(ConnectionRequestClass::Cancel)
-        }
+        methods::TURN_CANCEL => Some(ConnectionRequestClass::Cancel),
+        methods::VOICE_SESSION_CANCEL => Some(ConnectionRequestClass::VoiceCancel),
         methods::TASK_WAIT => Some(ConnectionRequestClass::TaskWait),
         _ => None,
     }
@@ -86,6 +86,7 @@ fn connection_request_class(
 #[derive(Default)]
 pub(crate) struct ConnectionHandlers {
     cancels: JoinSet<()>,
+    voice_cancels: JoinSet<()>,
     waits: JoinSet<()>,
     reads: JoinSet<()>,
     closed: bool,
@@ -119,6 +120,7 @@ impl ConnectionHandlers {
     }
     fn is_empty(&self) -> bool {
         self.cancels.is_empty()
+            && self.voice_cancels.is_empty()
             && self.waits.is_empty()
             && self.reads.is_empty()
             && self.audio.is_none()
@@ -127,6 +129,9 @@ impl ConnectionHandlers {
     fn reap(&mut self) -> Result<()> {
         if let Some(audio) = &mut self.audio {
             audio.reap()?;
+        }
+        while let Some(result) = self.voice_cancels.try_join_next() {
+            result?;
         }
         while let Some(result) = self.cancels.try_join_next() {
             result?;
@@ -143,6 +148,7 @@ impl ConnectionHandlers {
     async fn next(&mut self) -> Result<()> {
         tokio::select! {
             result = async { self.audio.as_mut().expect("audio owner").next().await }, if self.audio.is_some() => { result?; }
+            result = self.voice_cancels.join_next(), if !self.voice_cancels.is_empty() => { result.expect("active voice cancel")?; }
             result = self.cancels.join_next(), if !self.cancels.is_empty() => { result.expect("active cancel")?; }
             result = self.waits.join_next(), if !self.waits.is_empty() => { result.expect("active wait")?; }
             result = self.reads.join_next(), if !self.reads.is_empty() => { result.expect("active read")?; }
@@ -158,6 +164,7 @@ impl ConnectionHandlers {
         self.reap()?;
         let (tasks, capacity) = match class {
             ConnectionRequestClass::Cancel => (&mut self.cancels, MAX_CANCEL_HANDLERS),
+            ConnectionRequestClass::VoiceCancel => (&mut self.voice_cancels, 1),
             ConnectionRequestClass::TaskWait => (&mut self.waits, MAX_TASK_WAITERS),
             ConnectionRequestClass::Read => (&mut self.reads, MAX_READ_HANDLERS),
         };
@@ -179,9 +186,11 @@ impl ConnectionHandlers {
         if let Some(mut audio) = self.audio.take() {
             audio.shutdown().await;
         }
+        self.voice_cancels.abort_all();
         self.cancels.abort_all();
         self.waits.abort_all();
         self.reads.abort_all();
+        while self.voice_cancels.join_next().await.is_some() {}
         while self.cancels.join_next().await.is_some() {}
         while self.waits.join_next().await.is_some() {}
         while self.reads.join_next().await.is_some() {}
@@ -701,6 +710,10 @@ pub(crate) async fn run_normal_connection_inner(
                     let request = serde_json::from_str::<pioneer_protocol::JsonRpcRequest>(&payload).ok();
                     if let Some(class) = request.as_ref().and_then(connection_request_class) {
                         if handlers.admit(class, dispatch_owned(connection_context.clone(), payload.to_string())).is_err() {
+                            if matches!(class, ConnectionRequestClass::VoiceCancel) {
+                                reject_voice_cancel_capacity(&outbound_tx, request.as_ref().expect("classified request").id.clone());
+                                continue;
+                            }
                             send_close_bounded(&outbound_tx, 1013, "connection_control_overloaded").await;
                             break;
                         }
@@ -1091,6 +1104,10 @@ where
                         }
                         if let Some(class) = connection_request_class(&request) {
                             if handlers.admit(class, dispatch(connection.clone(), payload.to_string())).is_err() {
+                                if matches!(class, ConnectionRequestClass::VoiceCancel) {
+                                    reject_voice_cancel_capacity(outbound, request.id.clone());
+                                    continue;
+                                }
                                 send_close_bounded(outbound, 1013, "connection_control_overloaded").await;
                                 return false;
                             }
@@ -1283,6 +1300,23 @@ async fn normal_ingress_lease_failure(
         })
 }
 
+fn reject_voice_cancel_capacity(outbound: &SessionOutbound, id: pioneer_protocol::RequestId) {
+    let response = pioneer_protocol::JsonRpcErrorResponse {
+        jsonrpc: pioneer_protocol::JSONRPC_VERSION.into(),
+        id: Some(id),
+        error: pioneer_protocol::JsonRpcError {
+            code: -32029,
+            message: "voice control capacity exhausted".into(),
+            data: None,
+        },
+    };
+    if let Ok(text) = serde_json::to_string(&response) {
+        // Nonblocking and recording-control scoped. A hostile duplicate stream
+        // cannot spend the turn Cancel slot or evict the socket on Full.
+        let _ = outbound.try_send_audio(Message::Text(text.into()), true);
+    }
+}
+
 async fn send_close_bounded(sender: &SessionOutbound, code: u16, reason: &'static str) {
     if sender.capacity() == 0 {
         record_outbound_queue_saturation("close_waited");
@@ -1319,6 +1353,22 @@ mod tests {
                 let _ = sender.send(());
             }
         }
+    }
+
+    #[tokio::test]
+    async fn cancel_classes_keep_independent_outstanding_slots() {
+        let mut owner = ConnectionHandlers::default();
+        for class in [
+            ConnectionRequestClass::Cancel,
+            ConnectionRequestClass::VoiceCancel,
+        ] {
+            owner.admit(class, std::future::pending()).unwrap();
+            assert!(owner.admit(class, async {}).is_err());
+        }
+        assert_eq!(owner.cancels.len(), 1);
+        assert_eq!(owner.voice_cancels.len(), 1);
+        owner.shutdown().await;
+        assert!(owner.is_empty());
     }
 
     #[tokio::test]

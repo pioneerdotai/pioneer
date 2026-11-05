@@ -93,7 +93,7 @@ impl VoiceIngressOwner {
                         if let Ok(text) = pioneer_protocol::JsonRpcNotification::from_params(
                             pioneer_protocol::constants::events::VOICE_SESSION_RESULT, &notification)
                             .and_then(|v| serde_json::to_string(&v)) {
-                            let _ = outbound.send(Message::Text(text.into())).await;
+                            let _ = outbound.send_audio(Message::Text(text.into()), true).await;
                         }
                         processing.retire_failed_voice_ingress(&session);
                     }

@@ -18,13 +18,15 @@ pub(crate) struct SocketReceipt {
     live: Arc<Mutex<bool>>,
     cancels: tokio::sync::mpsc::Sender<SocketCancel>,
     cancel_slots: Arc<tokio::sync::Semaphore>,
+    voice_cancel_slots: Arc<tokio::sync::Semaphore>,
     voice: tokio::sync::mpsc::Sender<super::voice_budget::QueuedVoiceAudio>,
 }
 impl SocketReceipt {
     pub(crate) fn new(connection: u64) -> (Self, SocketCancelReceiver) {
         static NEXT: AtomicU64 = AtomicU64::new(1);
-        let (cancels, receiver) = tokio::sync::mpsc::channel(SOCKET_CANCEL_CAPACITY);
+        let (cancels, receiver) = tokio::sync::mpsc::channel(2 * SOCKET_CANCEL_CAPACITY);
         let cancel_slots = Arc::new(tokio::sync::Semaphore::new(SOCKET_CANCEL_CAPACITY));
+        let voice_cancel_slots = Arc::new(tokio::sync::Semaphore::new(SOCKET_CANCEL_CAPACITY));
         let live = Arc::new(Mutex::new(true));
         let (voice, voice_rx) = tokio::sync::mpsc::channel(128);
         let owner = SocketCancelReceiver {
@@ -32,6 +34,7 @@ impl SocketReceipt {
             voice: Some(voice_rx),
             live: live.clone(),
             slots: cancel_slots.clone(),
+            voice_slots: voice_cancel_slots.clone(),
         };
         (
             Self {
@@ -46,6 +49,7 @@ impl SocketReceipt {
                 live,
                 cancels,
                 cancel_slots,
+                voice_cancel_slots,
                 voice,
             },
             owner,
@@ -76,7 +80,17 @@ impl SocketReceipt {
             let _ = response.send(Err(crate::rpc::JsonRpcResponseError::transport(message)));
             return Err(message.into());
         }
-        let slot = match self.cancel_slots.clone().try_acquire_owned() {
+        let voice_cancel = serde_json::from_str::<serde_json::Value>(&payload)
+            .ok()
+            .is_some_and(|v| {
+                v["method"] == pioneer_protocol::constants::methods::VOICE_SESSION_CANCEL
+            });
+        let slots = if voice_cancel {
+            &self.voice_cancel_slots
+        } else {
+            &self.cancel_slots
+        };
+        let slot = match slots.clone().try_acquire_owned() {
             Ok(slot) => slot,
             Err(_) => {
                 let message = "websocket Cancel capacity full or retired";
@@ -109,6 +123,7 @@ impl SocketReceipt {
     pub(crate) fn retire(&self) {
         *self.live.lock().unwrap() = false;
         self.cancel_slots.close();
+        self.voice_cancel_slots.close();
     }
     fn is_current(&self) -> bool {
         *self.live.lock().unwrap()
@@ -142,11 +157,13 @@ pub(crate) struct SocketCancelReceiver {
     pub(super) voice: Option<tokio::sync::mpsc::Receiver<super::voice_budget::QueuedVoiceAudio>>,
     live: Arc<Mutex<bool>>,
     slots: Arc<tokio::sync::Semaphore>,
+    voice_slots: Arc<tokio::sync::Semaphore>,
 }
 impl Drop for SocketCancelReceiver {
     fn drop(&mut self) {
         *self.live.lock().unwrap() = false;
         self.slots.close();
+        self.voice_slots.close();
         self.receiver.close();
         while let Ok(command) = self.receiver.try_recv() {
             let _ = command

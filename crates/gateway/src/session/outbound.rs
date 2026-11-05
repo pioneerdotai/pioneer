@@ -77,18 +77,49 @@ pub(crate) struct OutboundEnvelope {
 pub(crate) struct OutboundReceiver {
     rx: mpsc::Receiver<OutboundEnvelope>,
     admission: Arc<Admission>,
+    audio: Option<Box<OutboundReceiver>>,
+    prefer_audio: bool,
 }
 impl OutboundReceiver {
     pub(crate) fn seal(&mut self) {
         self.admission.close();
         self.rx.close();
+        if let Some(audio) = &mut self.audio {
+            audio.seal();
+        }
     }
     #[cfg(test)]
     pub(crate) fn try_recv(&mut self) -> Result<OutboundEnvelope, mpsc::error::TryRecvError> {
+        if let Some(audio) = &mut self.audio {
+            if self.prefer_audio {
+                if let Ok(item) = audio.rx.try_recv() {
+                    self.prefer_audio = false;
+                    return Ok(item);
+                }
+            }
+            match self.rx.try_recv() {
+                Ok(item) => {
+                    self.prefer_audio = true;
+                    return Ok(item);
+                }
+                Err(mpsc::error::TryRecvError::Empty) => return audio.rx.try_recv(),
+                Err(e) => return Err(e),
+            }
+        }
         self.rx.try_recv()
     }
     pub(crate) async fn recv(&mut self) -> Option<OutboundEnvelope> {
-        self.rx.recv().await
+        if let Some(audio) = &mut self.audio {
+            let item = if self.prefer_audio {
+                tokio::select! { biased; item = audio.rx.recv() => item, item = self.rx.recv() => item }
+            } else {
+                tokio::select! { biased; item = self.rx.recv() => item, item = audio.rx.recv() => item }
+            };
+            self.prefer_audio = !self.prefer_audio;
+            item
+        } else {
+            self.rx.recv().await
+        }
     }
 }
 impl Drop for OutboundReceiver {
@@ -101,6 +132,7 @@ pub(crate) struct SessionOutbound {
     tx: mpsc::Sender<OutboundEnvelope>,
     admission: Arc<Admission>,
     observer: QueueObserver,
+    audio: Option<Box<SessionOutbound>>,
 }
 impl SessionOutbound {
     pub(crate) fn channel(
@@ -108,9 +140,27 @@ impl SessionOutbound {
         bytes: usize,
         reserved_bytes: usize,
     ) -> (Self, OutboundReceiver) {
+        let (mut sender, mut receiver) = Self::channel_inner(
+            capacity,
+            bytes,
+            reserved_bytes,
+            16.min((capacity / 8).max(1)),
+        );
+        // ACKs never consume ordinary Data or ReplyControl capacity. Two slots
+        // and 8 KiB within this audio lane remain reserved for terminal outcome.
+        let (audio, audio_rx) = Self::channel_inner(130, 128 * 1024, 8 * 1024, 2);
+        sender.audio = Some(Box::new(audio));
+        receiver.audio = Some(Box::new(audio_rx));
+        (sender, receiver)
+    }
+    fn channel_inner(
+        capacity: usize,
+        bytes: usize,
+        reserved_bytes: usize,
+        reserve: usize,
+    ) -> (Self, OutboundReceiver) {
         assert!(capacity >= 2 && capacity <= tokio::sync::Semaphore::MAX_PERMITS);
         assert!(reserved_bytes > 0 && reserved_bytes < bytes);
-        let reserve = 16.min((capacity / 8).max(1));
         let admission = Arc::new(Admission {
             usage: Mutex::new(Usage::default()),
             changed: Notify::new(),
@@ -130,15 +180,27 @@ impl SessionOutbound {
                 tx,
                 admission: admission.clone(),
                 observer,
+                audio: None,
             },
-            OutboundReceiver { rx, admission },
+            OutboundReceiver {
+                rx,
+                admission,
+                audio: None,
+                prefer_audio: false,
+            },
         )
     }
     pub(crate) fn close(&self) {
         self.admission.close();
+        if let Some(audio) = &self.audio {
+            audio.close();
+        }
     }
     pub(crate) fn abort(&self) {
         self.admission.abort();
+        if let Some(audio) = &self.audio {
+            audio.abort();
+        }
     }
     /// Graceful seal stops producers immediately but permits FIFO drain until
     /// its original deadline. Repeated seal cannot extend that deadline.
@@ -287,9 +349,53 @@ impl SessionOutbound {
     ) -> Result<(), mpsc::error::TrySendError<Message>> {
         self.try_send_class(message, AdmissionClass::Data)
     }
+    pub(crate) fn try_send_audio(
+        &self,
+        message: Message,
+        terminal: bool,
+    ) -> Result<(), mpsc::error::TrySendError<Message>> {
+        self.audio
+            .as_ref()
+            .expect("audio lane attached to outbound")
+            .try_send_class(
+                message,
+                if terminal {
+                    AdmissionClass::ReplyControl
+                } else {
+                    AdmissionClass::Data
+                },
+            )
+    }
+    /// Audio waits only for its own bounded lane; it never invokes eviction.
+    pub(crate) async fn send_audio(
+        &self,
+        message: Message,
+        terminal: bool,
+    ) -> Result<(), mpsc::error::SendError<Message>> {
+        let lane = self
+            .audio
+            .as_ref()
+            .expect("audio lane attached to outbound");
+        lane.send_class(
+            message,
+            if terminal {
+                AdmissionClass::ReplyControl
+            } else {
+                AdmissionClass::Data
+            },
+        )
+        .await
+    }
     pub(crate) async fn send(
         &self,
+        message: Message,
+    ) -> Result<(), mpsc::error::SendError<Message>> {
+        self.send_class(message, AdmissionClass::ReplyControl).await
+    }
+    async fn send_class(
+        &self,
         mut message: Message,
+        class: AdmissionClass,
     ) -> Result<(), mpsc::error::SendError<Message>> {
         let mut wait = self.observer.send_wait();
         let _live_wait = pioneer_observability::live::WaitGuard::new(
@@ -299,7 +405,7 @@ impl SessionOutbound {
             let notified = self.admission.changed.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            match self.try_send(message) {
+            match self.try_send_class(message, class) {
                 Ok(()) => {
                     wait.complete();
                     return Ok(());
@@ -326,6 +432,36 @@ mod tests {
 
     fn text(bytes: usize) -> Message {
         Message::Text("x".repeat(bytes).into())
+    }
+
+    #[tokio::test]
+    async fn audio_pressure_does_not_spend_ordinary_reply_or_data_capacity() {
+        let (tx, mut rx) = SessionOutbound::channel(8, 100, 20);
+        tx.try_send_data(text(80)).unwrap();
+        for _ in 0..128 {
+            tx.try_send_audio(text(1), false).unwrap();
+        }
+        assert!(matches!(
+            tx.try_send_audio(text(1), false),
+            Err(mpsc::error::TrySendError::Full(_))
+        ));
+        let waiting = tx.send_audio(text(1), false);
+        tokio::pin!(waiting);
+        assert!(waiting.as_mut().now_or_never().is_none());
+        tx.try_send(text(20)).unwrap();
+        tx.try_send_audio(text(1), true).unwrap();
+        // The real receiver advances ordinary and audio lanes independently.
+        let ordinary = rx.rx.recv().await.unwrap();
+        assert_eq!(message_bytes(&ordinary.item.value), 80);
+        drop(ordinary);
+        let reply = rx.rx.recv().await.unwrap();
+        assert_eq!(message_bytes(&reply.item.value), 20);
+        drop(reply);
+        drop(rx.audio.as_mut().unwrap().rx.recv().await.unwrap());
+        waiting.await.unwrap();
+        assert!(tx.try_send(text(1)).is_ok());
+        drop(rx);
+        assert!(tx.send_audio(text(1), false).await.is_err());
     }
 
     #[tokio::test]

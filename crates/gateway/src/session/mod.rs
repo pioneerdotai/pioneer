@@ -419,6 +419,29 @@ impl SessionManager {
         }
     }
 
+    pub(crate) async fn send_voice_text(
+        &self,
+        id: ConnectionId,
+        payload: String,
+        terminal: bool,
+    ) -> Result<()> {
+        let sender = {
+            let connections = self.connections.read().await;
+            let connection = connections
+                .get(&id)
+                .ok_or_else(|| anyhow!("voice connection retired"))?;
+            anyhow::ensure!(
+                connection.termination_tx.borrow().is_none(),
+                "voice connection terminated"
+            );
+            connection.sender.clone()
+        };
+        sender
+            .send_audio(Message::Text(payload.into()), terminal)
+            .await
+            .map_err(|_| anyhow!("voice outbound retired"))
+    }
+
     pub async fn send_text(&self, connection_id: ConnectionId, payload: String) -> Result<()> {
         let sender = {
             self.connections

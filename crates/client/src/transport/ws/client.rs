@@ -947,7 +947,7 @@ async fn monitor_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Un
     let (writer, mut reader) = stream.split();
     let (data_tx, data_rx) = tokio::sync::mpsc::channel(WRITER_HANDOFF_CAPACITY);
     let (control_tx, control_rx) = tokio::sync::mpsc::channel(WRITER_HANDOFF_CAPACITY);
-    let (cancel_tx, cancel_rx) = tokio::sync::mpsc::channel(WRITER_HANDOFF_CAPACITY);
+    let (cancel_tx, cancel_rx) = tokio::sync::mpsc::channel(2);
     let writer = connection_writer(
         writer,
         data_rx,

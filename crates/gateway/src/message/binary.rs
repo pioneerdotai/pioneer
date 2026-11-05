@@ -594,15 +594,20 @@ impl MessageProcessor {
                         "decoded voice chunk appended to session buffer"
                     );
                 }
-                self.send_notification_to_connections(
+                if let Ok(text) = JsonRpcNotification::from_params(
                     events::VOICE_CHUNK_ACK,
                     &VoiceChunkAckNotification {
                         session_id: report.session_id,
                         sequence: report.sequence,
                     },
-                    vec![connection_id],
                 )
-                .await;
+                .and_then(|notification| serde_json::to_string(&notification))
+                {
+                    let _ = self
+                        .session_manager
+                        .send_voice_text(connection_id, text, false)
+                        .await;
+                }
             }
             Err(error) => {
                 let voice_error = error.into_voice_error();
