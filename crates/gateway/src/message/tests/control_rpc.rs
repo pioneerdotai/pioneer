@@ -2352,7 +2352,7 @@ async fn domain_finalize_drains_slow_tail_with_recording_and_buffered_recognizer
                 assert_eq!(response.status,pioneer_protocol::VoiceStatus::Transcribing);
                 let result: pioneer_protocol::VoiceSessionResultNotification = serde_json::from_value(terminal.unwrap()).unwrap();
                 assert_eq!(result.session_id,started.session_id);
-                assert_eq!(result.outcome,pioneer_protocol::VoiceSessionOutcome::TurnStarted);
+                assert_eq!(result.outcome,pioneer_protocol::VoiceSessionOutcome::TurnStarted,"buffered={buffered}, finalization error: {:?}",result.error);
                 assert_eq!(result.turn_id.as_deref(),Some("turn_transport_finalize_full"));
                 assert!(f.processor.crud_store.get_turn(THREAD,"turn_transport_finalize_full").await.unwrap().is_some());
                 assert!(result.error.is_none());
