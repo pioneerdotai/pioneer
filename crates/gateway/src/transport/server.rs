@@ -1311,6 +1311,12 @@ fn reject_voice_cancel_capacity(outbound: &SessionOutbound, id: pioneer_protocol
         },
     };
     if let Ok(text) = serde_json::to_string(&response) {
+        // An untrusted request id must not retire the audio lane through its
+        // oversized-message guard while reporting a rejected control request.
+        if text.len() > 8 * 1024 {
+            record_outbound_queue_saturation("voice_cancel_rejection_deadline_outcome");
+            return;
+        }
         // Nonblocking and recording-control scoped. A hostile duplicate stream
         // cannot spend the turn Cancel slot or evict the socket on Full.
         match outbound.try_send_audio(Message::Text(text.into()), true) {
@@ -1362,6 +1368,39 @@ mod tests {
                 let _ = sender.send(());
             }
         }
+    }
+
+    #[tokio::test]
+    async fn saturated_voice_cancel_rejection_keeps_other_rpc_capacity_and_drain() {
+        let (outbound, mut receiver) = SessionOutbound::channel(8, 100, 20);
+        for _ in 0..128 {
+            outbound
+                .try_send_audio(Message::Text("a".into()), false)
+                .unwrap();
+        }
+        for _ in 0..2 {
+            outbound
+                .try_send_audio(Message::Text("t".into()), true)
+                .unwrap();
+        }
+        reject_voice_cancel_capacity(
+            &outbound,
+            pioneer_protocol::RequestId::new("R00000000000000000001").unwrap(),
+        );
+        assert!(outbound.closed().now_or_never().is_none());
+        outbound.send(Message::Text("rpc".into())).await.unwrap();
+        let envelope = receiver.recv().await.unwrap();
+        assert!(matches!(envelope.item.value, Message::Text(text) if text == "rpc"));
+        drop(envelope.reservation);
+        receiver.seal();
+        let mut drained = 0;
+        while receiver.recv().await.is_some() {
+            drained += 1;
+        }
+        assert_eq!(
+            drained, 130,
+            "rejected request promises deadline failure, not a delivered error frame"
+        );
     }
 
     #[tokio::test]
