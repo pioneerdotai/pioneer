@@ -274,3 +274,98 @@ async fn shared_workspace_transitions_establish_connection_scope_without_global_
     workflow.await.unwrap();
     assert_preserved(&harness, &workspace_b, &catalog_before).await;
 }
+
+#[tokio::test]
+async fn id_only_open_selects_authoritative_workspace_and_never_creates_missing_thread() {
+    let mut harness = setup_semantic_timeline_query_harness().await;
+    let thread_id = harness.sandbox_thread_id.clone();
+    let expected = harness
+        .processor
+        .crud_store
+        .get_thread_model(&thread_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let other = harness
+        .processor
+        .workspace_manager
+        .create_workspace("open_other_workspace", Some("Selected before open"))
+        .await
+        .unwrap()
+        .id;
+    let selected = rpc(
+        &mut harness,
+        "workspace/select",
+        json!({"workspace_id":other,"make_current":false}),
+    )
+    .await;
+    assert!(selected.get("error").is_none());
+    let result = rpc(&mut harness, "thread/open", json!({"thread_id":thread_id})).await;
+    let opened: pioneer_protocol::ThreadStartResponse =
+        serde_json::from_value(result["result"].clone()).unwrap();
+    assert_eq!(opened.thread.id, expected.id);
+    assert_eq!(opened.thread.workspace_id, expected.workspace_id);
+    assert_eq!(
+        harness
+            .processor
+            .session_manager
+            .connection_workspace_id(harness.connection_id)
+            .await
+            .as_deref(),
+        Some(expected.workspace_id.as_str())
+    );
+    let missing = generate_test_request_id("thread", "missingopen");
+    let result = rpc(&mut harness, "thread/open", json!({"thread_id":missing})).await;
+    assert!(result.get("error").is_some());
+    assert!(
+        harness
+            .processor
+            .crud_store
+            .get_thread_model(&missing)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(!harness.processor.thread_manager.has_thread(&missing).await);
+    assert_eq!(
+        harness
+            .processor
+            .session_manager
+            .connection_workspace_id(harness.connection_id)
+            .await
+            .as_deref(),
+        Some(expected.workspace_id.as_str())
+    );
+    // Physical deletion through the project's runtime/ORM fixture boundary.
+    // The loaded runtime and its old membership are deliberately still present.
+    use sea_orm::EntityTrait;
+    pioneer_entity::thread::Entity::delete_by_id(expected.id.clone())
+        .exec(&harness.processor.crud_store.database_connection())
+        .await
+        .unwrap();
+    let denied = rpc(
+        &mut harness,
+        "thread/open",
+        json!({"thread_id":expected.id}),
+    )
+    .await;
+    assert_eq!(denied["error"]["message"], "not_found");
+    assert!(
+        harness
+            .processor
+            .crud_store
+            .get_thread_model(&expected.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        harness
+            .processor
+            .session_manager
+            .connection_workspace_id(harness.connection_id)
+            .await
+            .as_deref(),
+        Some(expected.workspace_id.as_str())
+    );
+}
