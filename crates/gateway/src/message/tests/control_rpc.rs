@@ -1,6 +1,7 @@
 //! Unrun owner-boundary regressions. The stream supplies frames; the production
 //! pump owns classification/admission and every domain request uses dispatch.
 use super::*;
+use crate::request_context::RequestContext;
 use crate::transport::{
     ConnectionAccessLease, ConnectionHandlers, IngressMode, process_with_access_renewals,
 };
@@ -2180,7 +2181,7 @@ async fn revoke_unrelated_voice_acl(processor: &MessageProcessor, other: &str) {
             authenticated_test_member_collaborator()
                 .principal_id
                 .clone(),
-            other.into(),
+            other,
         )
         .await;
 }
