@@ -166,7 +166,9 @@ impl VoiceIngressOwner {
         );
         if let Some((count, bytes)) = permits {
             let item = Item {
-                payload: payload.clone(),
+                // A Bytes slice may retain a much larger WebSocket read buffer.
+                // Own exactly this validated frame under its byte reservation.
+                payload: axum::body::Bytes::copy_from_slice(payload),
                 ticket,
                 _count: count,
                 _bytes: bytes,
