@@ -2534,7 +2534,7 @@ async fn durable_revoke_before_publication_is_rechecked_before_audio_effect() {
                 .await
                 .unwrap()
                 .unwrap();
-            use sea_orm::IntoActiveModel;
+            use sea_orm::{ActiveModelTrait, IntoActiveModel};
             let mut device = device.into_active_model().reset_all();
             device.id = Set(member.device_id.to_string());
             device.principal_id = Set(member.principal_id.to_string());
