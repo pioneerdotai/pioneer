@@ -2243,6 +2243,7 @@ async fn domain_finalize_drains_slow_tail_with_recording_and_buffered_recognizer
         .with_test_writer()
         .try_init();
     for buffered in [false, true] {
+        let phase = std::cell::Cell::new("fixture setup");
         tokio::time::timeout(Duration::from_secs(20), async {
             let mut f = Fixture::new().await;
             let home = tempfile::tempdir().unwrap();
@@ -2281,6 +2282,7 @@ async fn domain_finalize_drains_slow_tail_with_recording_and_buffered_recognizer
                 }), ..Default::default()
             }).await.unwrap();
             assert!(f.processor.thread_manager.subscribe_connection(THREAD, f.connection).await);
+            phase.set("start recording");
             let started = start_test_voice_session(&f.processor, f.connection, &mut f.responses,
                 &f.workspace, THREAD, "turn_transport_finalize_full", &id("full-start")).await;
             let mut context = f.processor.session_manager.connection_context(f.connection).await.unwrap();
@@ -2305,6 +2307,7 @@ async fn domain_finalize_drains_slow_tail_with_recording_and_buffered_recognizer
                 &mut reader, &mut deferred, &f.auth, &f.processor.session_manager,
                 &mut context, &renewals, &f.outbound, &mut handlers, &dispatch);
             let driver = async {
+                phase.set("initial audio ACKs");
                 for sequence in 0..30 {
                     input.send(Message::Binary(voice_test_frame(&started.session_id, sequence, 1600, 12000).into())).unwrap();
                     let ack = recv_notification_by_method(&mut f.responses, pioneer_protocol::constants::events::VOICE_CHUNK_ACK).await;
@@ -2315,11 +2318,13 @@ async fn domain_finalize_drains_slow_tail_with_recording_and_buffered_recognizer
                 let (release, resumed) = tokio::sync::oneshot::channel();
                 *recording.ingress.proof_pause.lock().unwrap() = Some((entered, resumed));
                 input.send(Message::Binary(voice_test_frame(&started.session_id, 30, 1600, 12000).into())).unwrap();
+                phase.set("active chunk proof gate");
                 at_proof.await.unwrap();
                 let (tail_entered, tail_proof) = tokio::sync::oneshot::channel();
                 let (tail_release, tail_resume) = tokio::sync::oneshot::channel();
                 *recording.ingress.proof_pause.lock().unwrap() = Some((tail_entered, tail_resume));
                 input.send(Message::Binary(voice_test_frame(&started.session_id, 31, 7, 3000).into())).unwrap();
+                phase.set("unrelated ACL commit and publication");
                 revoke_unrelated_voice_acl(&f.processor, &other).await;
                 assert!(f.processor.current_authorization_revision().await.unwrap() > policy_before);
                 let payload = rpc("full-finalize", methods::VOICE_SESSION_FINALIZE, json!({
@@ -2332,16 +2337,22 @@ async fn domain_finalize_drains_slow_tail_with_recording_and_buffered_recognizer
                 input.send(Message::Binary(voice_test_frame(&started.session_id,32,7,16000).into())).unwrap();
                 input.send(Message::Text(rpc("full-seal-probe", methods::TASK_WAIT,
                     json!({"runIds":[RUN],"timeoutMs":1})).into())).unwrap();
+                phase.set("transport seal probe");
                 let probe = recv_response_by_id(&mut f.responses,&id("full-seal-probe")).await;
                 assert_eq!(probe.result["timedOut"],true);
                 assert!(recording.ingress.admit().is_none());
                 finalize.send(payload).unwrap();
                 release.send(()).unwrap();
+                phase.set("queued tail proof gate");
                 tail_proof.await.unwrap();
-                if !buffered { native_entered.notified().await; }
+                if !buffered {
+                    phase.set("recording recognizer entry");
+                    native_entered.notified().await;
+                }
                 tail_release.send(()).unwrap();
                 let mut reply = None;
                 let mut received = 30;
+                phase.set("active and tail audio ACKs");
                 while received < 32 {
                     let Message::Text(text) = f.responses.recv().await.unwrap() else { panic!("finalize disconnected"); };
                     let value: JsonValue = serde_json::from_str(&text).unwrap();
@@ -2350,9 +2361,13 @@ async fn domain_finalize_drains_slow_tail_with_recording_and_buffered_recognizer
                         received += 1;
                     } else if value["id"] == id("full-finalize") { reply = Some(value); }
                 }
-                if buffered { native_entered.notified().await; }
+                if buffered {
+                    phase.set("buffered recognizer entry");
+                    native_entered.notified().await;
+                }
                 native_release.release();
                 let mut terminal = None;
+                phase.set("finalize reply and terminal result");
                 while reply.is_none() || terminal.is_none() {
                     let Message::Text(text) = f.responses.recv().await.unwrap() else { panic!("finalize disconnected"); };
                     let value: JsonValue = serde_json::from_str(&text).unwrap();
@@ -2373,9 +2388,13 @@ async fn domain_finalize_drains_slow_tail_with_recording_and_buffered_recognizer
             };
             let (alive,()) = tokio::join!(pump,driver);
             assert!(alive);
+            phase.set("audio handler shutdown");
             handlers.shutdown().await;
+            phase.set("connection cleanup");
             f.processor.connection_closed(f.connection).await;
-        }).await.expect("complete native/fake pipeline must include the admitted slow tail");
+        }).await.unwrap_or_else(|error| {
+            panic!("complete native/fake pipeline must include the admitted slow tail: buffered={buffered}, phase={}, {error:?}", phase.get());
+        });
     }
 }
 
