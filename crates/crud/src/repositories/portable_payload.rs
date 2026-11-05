@@ -287,13 +287,46 @@ struct PendingSource {
     invalid_root: bool,
 }
 
-async fn pending_source(
+#[derive(sea_orm::FromQueryResult)]
+struct PendingKey {
+    owner: String,
+}
+
+async fn pending_upper(store: &CrudStore, family: Family) -> Result<Option<PendingKey>> {
+    let _phase = observe::stage(observe::Stage::SourceRead);
+    store
+        .run_background_database_quantum(|| async {
+            target!(family, |Target, Col, key, field, reference| {
+                let mut query = Target::find()
+                    .select_only()
+                    .column_as(key, "owner")
+                    .filter(reference.is_null())
+                    .filter(field.is_not_null());
+                if matches!(family, Family::CliMapping | Family::TaskHistory) {
+                    query = query.filter(
+                        Expr::col(Alias::new("frozen_manifest_id"))
+                            .is_null()
+                            .or(Expr::col(Alias::new("frozen_manifest_id")).ne("")),
+                    );
+                }
+                query = query.order_by_desc(key);
+                Ok(query
+                    .limit(1)
+                    .into_model::<PendingKey>()
+                    .one(&store.connection)
+                    .await?)
+            })
+        })
+        .await
+}
+
+async fn pending_sources(
     store: &CrudStore,
     family: Family,
     after: Option<&str>,
     upper: Option<&str>,
-    descending: bool,
-) -> Result<Option<PendingSource>> {
+    limit: u64,
+) -> Result<Vec<PendingSource>> {
     let _phase = observe::stage(observe::Stage::SourceRead);
     store
         .run_background_database_quantum(|| async {
@@ -324,15 +357,11 @@ async fn pending_source(
                 if let Some(upper) = upper {
                     query = query.filter(key.lte(upper));
                 }
-                query = if descending {
-                    query.order_by_desc(key)
-                } else {
-                    query.order_by_asc(key)
-                };
+                query = query.order_by_asc(key);
                 Ok(query
-                    .limit(1)
+                    .limit(limit)
                     .into_model::<PendingSource>()
-                    .one(&store.connection)
+                    .all(&store.connection)
                     .await?)
             })
         })
@@ -470,81 +499,86 @@ impl PortablePayloadProgress {
         // NULL metadata is final SQL NULL, not an empty/pending value.
         let index = family as usize;
         if self.after[index].is_none() {
-            self.upper[index] = pending_source(store, family, None, None, true)
-                .await?
-                .map(|row| row.owner);
+            self.upper[index] = pending_upper(store, family).await?.map(|row| row.owner);
         }
         let Some(upper) = self.upper[index].as_deref() else {
             self.finished[index] = true;
             observe::outcome(observe::Outcome::NoWork);
             return Ok(true);
         };
-        // Seek one key at a time and stop at the first eligible source. This
-        // bounds refusals to 64 per quantum without projecting an eligible tail
-        // that would be discarded and read again on the next family visit.
-        // Each await releases DB capacity; no candidate cache survives quanta.
-        for _ in 0..64 {
-            let Some(row) = pending_source(
+        // Start with one row for dense queues. Only refusals grow the next
+        // page, and growth resets each quantum: an eligible tail is never
+        // repeatedly fetched in large pages. No candidates survive an await
+        // into another quantum; source preparation/publication revalidate CAS.
+        let mut remaining = 64_u64;
+        let mut limit = 1_u64;
+        while remaining > 0 {
+            let rows = pending_sources(
                 store,
                 family,
                 self.after[index].as_deref(),
                 Some(upper),
-                false,
+                limit,
             )
-            .await?
-            else {
+            .await?;
+            let exhausted = rows.len() < limit as usize;
+            remaining -= rows.len() as u64;
+            for row in rows {
+                self.after[index] = Some(row.owner.clone());
+                ensure!(!row.invalid_root, "invalid frozen history counters");
+                if !row.eligible {
+                    // Outcome describes the entire quantum, not individual skips.
+                    // A later read/counter failure must retain Error classification.
+                    continue;
+                }
+                let payload_id = pioneer_protocol::generate_id(PAYLOAD_ID_LEN);
+                self.pending = Some(Preparation {
+                    family,
+                    owner: row.owner,
+                    revision: row.portable_revision,
+                    identity: row.portable_identity,
+                    owner_stamp: row.owner_stamp,
+                    size: usize::try_from(row.bytes)?,
+                    offset: 0,
+                    bytes: Vec::new(),
+                    digest: Sha256::new(),
+                    chars: 0,
+                    opaque: false,
+                    json_projection: (family == Family::CliMapping)
+                        .then(super::portable_payload_json::Projection::default),
+                    prepared: Prepared {
+                        _read_hold: Some(PayloadReadHold::capture(&payload_id, family)?),
+                        header: value::Model {
+                            id: payload_id,
+                            family: family.name().into(),
+                            original_bytes: row.bytes,
+                            original_chars: 0,
+                            sha256: vec![0; 32],
+                            raw: 1,
+                            retired: 1,
+                            dictionary_id: None,
+                        },
+                        blocks: Vec::new(),
+                        next: 0,
+                        written: 0,
+                        encoded_bytes: 0,
+                        finalized: false,
+                        installed: false,
+                        reservation_attempts: 0,
+                        projection: None,
+                    },
+                    dictionary: None,
+                    shape: None,
+                });
+                return Ok(true);
+            }
+            if exhausted {
                 self.after[index] = None;
                 self.upper[index] = None;
                 self.finished[index] = true;
                 break;
-            };
-            self.after[index] = Some(row.owner.clone());
-            ensure!(!row.invalid_root, "invalid frozen history counters");
-            if !row.eligible {
-                // Outcome describes the entire quantum, not individual skips.
-                // A later read/counter failure must retain Error classification.
-                continue;
             }
-            let payload_id = pioneer_protocol::generate_id(PAYLOAD_ID_LEN);
-            self.pending = Some(Preparation {
-                family,
-                owner: row.owner,
-                revision: row.portable_revision,
-                identity: row.portable_identity,
-                owner_stamp: row.owner_stamp,
-                size: usize::try_from(row.bytes)?,
-                offset: 0,
-                bytes: Vec::new(),
-                digest: Sha256::new(),
-                chars: 0,
-                opaque: false,
-                json_projection: (family == Family::CliMapping)
-                    .then(super::portable_payload_json::Projection::default),
-                prepared: Prepared {
-                    _read_hold: Some(PayloadReadHold::capture(&payload_id, family)?),
-                    header: value::Model {
-                        id: payload_id,
-                        family: family.name().into(),
-                        original_bytes: row.bytes,
-                        original_chars: 0,
-                        sha256: vec![0; 32],
-                        raw: 1,
-                        retired: 1,
-                        dictionary_id: None,
-                    },
-                    blocks: Vec::new(),
-                    next: 0,
-                    written: 0,
-                    encoded_bytes: 0,
-                    finalized: false,
-                    installed: false,
-                    reservation_attempts: 0,
-                    projection: None,
-                },
-                dictionary: None,
-                shape: None,
-            });
-            return Ok(true);
+            limit = (limit * 2).min(remaining);
         }
         // A bounded source page is not EOF for the other families.
         observe::outcome(observe::Outcome::NoWork);
@@ -690,7 +724,7 @@ impl Preparation {
                 "portable Task history contains unsupported legacy NUL"
             );
             drop(verify_source);
-            if self.dictionary.is_none() {
+            if self.size > 126 && self.dictionary.is_none() {
                 self.dictionary =
                     Some(load_or_prepare_dictionary(store, self.family, &fragment).await?);
             }
@@ -725,33 +759,35 @@ impl Preparation {
                 let text = std::str::from_utf8(&self.bytes[..end])?;
                 let chars = text.chars().count() as i64;
                 drop(verify);
-                let data = codec_observed(|diagnostics| {
-                    codec::encode_observed(
-                        text.as_bytes(),
-                        self.dictionary
-                            .as_ref()
-                            .context("portable dictionary missing")?,
-                        diagnostics,
-                    )
-                })?;
-                observe::bytes(observe::ByteKind::EncodedOriginal, end as u64);
-                observe::bytes(observe::ByteKind::Encoded, data.len() as u64);
-                observe::blocks(observe::BlockKind::Encoded, 1);
-                let _assembly = observe::stage(observe::Stage::VerifyAssemble);
-                prepared.encoded_bytes = prepared
-                    .encoded_bytes
-                    .checked_add(data.len() + 48)
-                    .context("portable encoded byte overflow")?;
-                prepared.blocks.push(block::Model {
-                    payload_id: prepared.header.id.clone(),
-                    ordinal: prepared.next,
-                    byte_offset: prepared.written,
-                    char_offset: self.chars,
-                    original_bytes: end as i64,
-                    original_chars: chars,
-                    data,
-                });
-                prepared.next += 1;
+                if self.size > 126 {
+                    let data = codec_observed(|diagnostics| {
+                        codec::encode_observed(
+                            text.as_bytes(),
+                            self.dictionary
+                                .as_ref()
+                                .context("portable dictionary missing")?,
+                            diagnostics,
+                        )
+                    })?;
+                    observe::bytes(observe::ByteKind::EncodedOriginal, end as u64);
+                    observe::bytes(observe::ByteKind::Encoded, data.len() as u64);
+                    observe::blocks(observe::BlockKind::Encoded, 1);
+                    let _assembly = observe::stage(observe::Stage::VerifyAssemble);
+                    prepared.encoded_bytes = prepared
+                        .encoded_bytes
+                        .checked_add(data.len() + 48)
+                        .context("portable encoded byte overflow")?;
+                    prepared.blocks.push(block::Model {
+                        payload_id: prepared.header.id.clone(),
+                        ordinal: prepared.next,
+                        byte_offset: prepared.written,
+                        char_offset: self.chars,
+                        original_bytes: end as i64,
+                        original_chars: chars,
+                        data,
+                    });
+                    prepared.next += 1;
+                }
                 prepared.written += end as i64;
                 self.chars += chars;
                 self.bytes.drain(..end);
@@ -777,7 +813,9 @@ impl Preparation {
             if unsupported {
                 tracing::warn!("portable CLI projection retained unsupported legacy JSON as raw");
             }
-            let raw = prepared.encoded_bytes >= self.size || self.size == 0 || unsupported;
+            // PPAY v1 has a 78-byte envelope and the benefit model adds
+            // 48 bytes per block row. Even a zero-byte body cannot win here.
+            let raw = self.size <= 126 || prepared.encoded_bytes >= self.size || unsupported;
             prepared.header.raw = i32::from(raw);
             prepared.header.original_chars = self.chars;
             prepared.header.sha256 = self.digest.clone().finalize().to_vec();
@@ -845,7 +883,7 @@ impl Preparation {
         }
         // An unprofitable value is terminal raw. Discard staged blocks in
         // bounded portions before publishing its completed reference.
-        if prepared.header.raw == 1 && {
+        if prepared.header.raw == 1 && prepared.next > 0 && {
             let _phase = observe::stage(observe::Stage::Cleanup);
             store
                 .run_background_database_quantum(|| clear_blocks(store, &prepared.header.id))
@@ -1131,14 +1169,57 @@ async fn hydrate_header_inner(
         return Ok(plain);
     }
     let size = usize::try_from(meta.original_bytes)?;
+    let dict = load_read_dictionary(db, meta).await?;
     let mut bytes = Vec::new();
-    let mut offset = 0;
-    while offset < size {
-        let part = read_range(db, meta, offset as i64, (size - offset).min(BLOCK), false).await?;
-        ensure!(!part.is_empty(), "portable payload block missing");
-        offset += part.len();
-        let _assembly = observe::stage(observe::Stage::VerifyAssemble);
-        bytes.extend(part);
+    let mut next = 0_i64;
+    let mut previous: Option<BlockPosition> = None;
+    loop {
+        // Composite primary-key seek, including a final EOF query to reject
+        // extra rows. Every reader is released before validation/decode.
+        let blocks = {
+            let _read = observe::stage(observe::Stage::BlockRead);
+            let mut query = block::Entity::find().filter(block::Column::PayloadId.eq(&meta.id));
+            if next > 0 {
+                query = query.filter(block::Column::Ordinal.gte(next));
+            }
+            query
+                .order_by_asc(block::Column::Ordinal)
+                .limit(16)
+                .all(db)
+                .await?
+        };
+        if blocks.is_empty() {
+            break;
+        }
+        for b in blocks {
+            ensure!(
+                b.payload_id == meta.id && b.ordinal == next,
+                "portable payload block missing or identity mismatch"
+            );
+            let current = BlockPosition::from(&b);
+            current.validate(meta)?;
+            if let Some(previous) = &previous {
+                current.follows(previous)?;
+            }
+            observe::bytes(observe::ByteKind::ReadEncoded, b.data.len() as u64);
+            observe::blocks(observe::BlockKind::Read, 1);
+            let decoded = codec_observed(|d| codec::decode_observed(&b.data, Some(&dict), d))?;
+            observe::bytes(observe::ByteKind::ReadOriginal, decoded.len() as u64);
+            let _verify = observe::stage(observe::Stage::VerifyAssemble);
+            ensure!(
+                decoded.len() as i64 == b.original_bytes,
+                "portable block length mismatch"
+            );
+            ensure!(
+                std::str::from_utf8(&decoded)?.chars().count() as i64 == b.original_chars,
+                "portable block character count mismatch"
+            );
+            bytes.extend(decoded);
+            next = next
+                .checked_add(1)
+                .context("portable block ordinal overflow")?;
+            previous = Some(current);
+        }
     }
     let _verify = observe::stage(observe::Stage::VerifyAssemble);
     ensure!(
@@ -1376,25 +1457,7 @@ async fn read_range_inner(
             .context("portable range ordinal overflow")?;
     }
     drop(read_phase);
-    let dictionary_id = meta
-        .dictionary_id
-        .as_deref()
-        .context("portable payload dictionary reference missing")?;
-    let dictionary_phase = observe::stage(observe::Stage::DictionaryLoad);
-    let dict = dictionary::Entity::find_by_id(dictionary_id)
-        .one(db)
-        .await?
-        .context("portable payload dictionary missing")?;
-    drop(dictionary_phase);
-    ensure!(
-        dict.family == meta.family,
-        "portable dictionary family mismatch"
-    );
-    let dict = codec_observed(|d| codec::Dictionary::from_bytes_observed(dict.data, d))?;
-    ensure!(
-        dictionary_key(&meta.family, dict.digest()) == dictionary_id,
-        "portable dictionary digest mismatch"
-    );
+    let dict = load_read_dictionary(db, meta).await?;
     let mut output = Vec::new();
     let mut position = start;
     let mut previous = None;
@@ -1460,6 +1523,32 @@ async fn read_range_inner(
     }
     ensure!(position == end, "portable range incomplete");
     Ok(output)
+}
+
+async fn load_read_dictionary(
+    db: &pioneer_sqlite::SqliteDatabase,
+    meta: &PayloadHeader,
+) -> Result<codec::Dictionary> {
+    let dictionary_id = meta
+        .dictionary_id
+        .as_deref()
+        .context("portable payload dictionary reference missing")?;
+    let dictionary_phase = observe::stage(observe::Stage::DictionaryLoad);
+    let dict = dictionary::Entity::find_by_id(dictionary_id)
+        .one(db)
+        .await?
+        .context("portable payload dictionary missing")?;
+    drop(dictionary_phase);
+    ensure!(
+        dict.family == meta.family,
+        "portable dictionary family mismatch"
+    );
+    let dict = codec_observed(|d| codec::Dictionary::from_bytes_observed(dict.data, d))?;
+    ensure!(
+        dictionary_key(&meta.family, dict.digest()) == dictionary_id,
+        "portable dictionary digest mismatch"
+    );
+    Ok(dict)
 }
 
 fn dictionary_key(family: &str, digest: [u8; 32]) -> String {
@@ -1882,7 +1971,24 @@ mod tests {
         assert!(db.reader_query_only_enabled().await.unwrap());
     }
 
+    #[derive(Default)]
+    struct ReadCount(std::sync::atomic::AtomicUsize);
+    impl pioneer_sqlite::SqliteReadObserver for ReadCount {
+        fn observe(&self, event: pioneer_sqlite::SqliteReadEvent) {
+            if matches!(
+                event,
+                pioneer_sqlite::SqliteReadEvent::OperationFinished { .. }
+            ) {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+    }
     async fn reservation_fixture() -> (tempfile::TempDir, CrudStore) {
+        reservation_fixture_observed(Arc::new(ReadCount::default())).await
+    }
+    async fn reservation_fixture_observed(
+        observer: Arc<ReadCount>,
+    ) -> (tempfile::TempDir, CrudStore) {
         use pioneer_sqlite::{SqliteDatabase, SqliteWriteClass, SqliteWriteExecutor};
         use sea_orm::{ConnectOptions, Database};
         pioneer_sqlite::zstd::register_auto_extension_once().unwrap();
@@ -1912,8 +2018,10 @@ mod tests {
             .execute_unprepared("PRAGMA query_only=ON")
             .await
             .unwrap();
-        let store =
-            CrudStore::new(SqliteDatabase::from_executor(reader, writer)).with_maintenance_access();
+        let store = CrudStore::new(SqliteDatabase::from_executor_with_read_observer(
+            reader, writer, observer,
+        ))
+        .with_maintenance_access();
         for sql in [
             "INSERT INTO workspace(id,name,is_active,is_current) VALUES('ws','fixture',1,1)",
             "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES('thread','ws','','agent','m','p','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
@@ -2295,6 +2403,162 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn refusal_pages_continue_without_events_and_revisit_newly_eligible_old_keys() {
+        use sea_orm::Statement;
+        use std::sync::atomic::Ordering::SeqCst;
+        let reads = Arc::new(ReadCount::default());
+        let (_dir, store) = reservation_fixture_observed(reads.clone()).await;
+        // Legacy rows with missing owner/run are ordinary availability refusals.
+        for i in 0..130 {
+            store.connection.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+                "INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at) VALUES(?,'missing','ws','thread','[]',CURRENT_TIMESTAMP)",
+                [format!("run-{i:03}").into()])).await.unwrap();
+        }
+        let mut progress = PortablePayloadProgress::default();
+        let before = reads.0.load(SeqCst);
+        let mut eof = false;
+        for _ in 0..20 {
+            if !progress.quantum(&store).await.unwrap() {
+                eof = true;
+                break;
+            }
+        }
+        assert!(eof, "full refusal pages must continue to global EOF");
+        // Three pages of at most 64 candidates: 7 + 7 + 2 queries, plus
+        // one frontier for each family and cleanup. No per-row seeks.
+        assert!(reads.0.load(SeqCst) - before <= 22);
+        for sql in [
+            "INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,created_by_turn_id,executor_kind,status,title,goal) VALUES('missing','ws','thread','thread','thread','turn','agent','running','fixture','fixture')",
+            "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES('run-000','missing','run-000',1,1,'succeeded','agent')",
+        ] {
+            store.connection.execute_unprepared(sql).await.unwrap();
+        }
+        // Existing finite-pass reset revisits a key below the former cursor.
+        let mut completed = false;
+        for _ in 0..40 {
+            if !progress.quantum(&store).await.unwrap() {
+                completed = true;
+                break;
+            }
+        }
+        assert!(completed);
+        let row = pioneer_entity::task_run_conversation_snapshot::Entity::find_by_id("run-000")
+            .one(&store.connection)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(row.history_json_payload_id.is_some());
+    }
+
+    #[tokio::test]
+    async fn tiny_raw_threshold_preserves_values_without_codec_staging_and_cas_loss() {
+        use pioneer_entity::tool_output_chunk as chunk;
+        for text in [
+            String::new(),
+            "x".repeat(126),
+            "я".repeat(63),
+            "x".repeat(127),
+        ] {
+            for stale in [false, true] {
+                let (_dir, store) = reservation_fixture().await;
+                let output = pioneer_protocol::ItemDeltaNotification {
+                    workspace_id: "ws".into(),
+                    thread_id: "thread".into(),
+                    turn_id: "turn".into(),
+                    item_id: "tiny".into(),
+                    delta: "seed".into(),
+                    stream: None,
+                    payload: None,
+                    markdown: None,
+                    markdown_version: None,
+                };
+                store.record_tool_output("tiny", &output).await.unwrap();
+                chunk::Entity::update_many()
+                    .col_expr(chunk::Column::Text, Expr::value(text.clone()))
+                    .filter(chunk::Column::Id.eq("tiny"))
+                    .exec(&store.connection)
+                    .await
+                    .unwrap();
+                if text.len() <= 126 {
+                    // These fail the real write path if codec work is staged.
+                    store.connection.execute_unprepared("CREATE TRIGGER reject_dictionary BEFORE INSERT ON portable_payload_dictionary BEGIN SELECT RAISE(ABORT,'tiny dictionary'); END").await.unwrap();
+                    store.connection.execute_unprepared("CREATE TRIGGER reject_block BEFORE INSERT ON portable_payload_block BEGIN SELECT RAISE(ABORT,'tiny block'); END").await.unwrap();
+                }
+                let mut progress = PortablePayloadProgress::default();
+                pending_preparation(&mut progress, &store).await;
+                let mut preparation = progress.pending.take().unwrap();
+                for _ in 0..12 {
+                    if preparation.prepared.finalized {
+                        break;
+                    }
+                    assert!(!preparation.step(&store).await.unwrap());
+                }
+                assert!(preparation.prepared.finalized);
+                if text.len() <= 126 {
+                    assert_eq!(preparation.prepared.header.raw, 1);
+                    assert!(preparation.dictionary.is_none());
+                } else {
+                    assert!(preparation.dictionary.is_some());
+                }
+                if stale {
+                    chunk::Entity::update_many()
+                        .col_expr(chunk::Column::Text, Expr::value("replacement"))
+                        .filter(chunk::Column::Id.eq("tiny"))
+                        .exec(&store.connection)
+                        .await
+                        .unwrap();
+                }
+                for _ in 0..4 {
+                    if preparation.step(&store).await.unwrap() {
+                        break;
+                    }
+                }
+                let row = chunk::Entity::find_by_id("tiny")
+                    .one(&store.connection)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(row.metadata.is_none() && row.metadata_payload_id.is_none());
+                if stale {
+                    assert!(row.text_payload_id.is_none());
+                    assert_eq!(row.text, "replacement");
+                } else {
+                    let id = row
+                        .text_payload_id
+                        .as_deref()
+                        .expect("terminal publication");
+                    assert_eq!(
+                        hydrate(
+                            &store.connection,
+                            Family::ToolText,
+                            Some(id),
+                            row.text.clone()
+                        )
+                        .await
+                        .unwrap(),
+                        text
+                    );
+                    let mut restarted = PortablePayloadProgress::default();
+                    for _ in 0..30 {
+                        if !restarted.quantum(&store).await.unwrap() {
+                            break;
+                        }
+                    }
+                    assert_eq!(
+                        chunk::Entity::find_by_id("tiny")
+                            .one(&store.connection)
+                            .await
+                            .unwrap()
+                            .unwrap()
+                            .text_payload_id,
+                        row.text_payload_id
+                    );
+                }
+            }
+        }
+    }
+
     fn collide_with(progress: &mut PortablePayloadProgress, id: &str) {
         let pending = progress.pending.as_mut().unwrap();
         assert!(!pending.prepared.installed);
@@ -2305,7 +2569,8 @@ mod tests {
 
     #[tokio::test]
     async fn reservation_collision_retries_own_blocks_and_abandons_unconfirmed_candidates() {
-        let (_dir, store) = reservation_fixture().await;
+        let reads = Arc::new(ReadCount::default());
+        let (_dir, store) = reservation_fixture_observed(reads.clone()).await;
         let output = pioneer_protocol::ItemDeltaNotification {
             workspace_id: "ws".into(),
             thread_id: "thread".into(),
@@ -2441,6 +2706,76 @@ mod tests {
             .exec(&store.connection)
             .await
             .unwrap();
+        // The real large UTF-8 fixture crosses several full-reader batches.
+        // Random ranges retain their independent byte/character offset path.
+        for start in [BLOCK - 2, 16 * BLOCK - 2] {
+            assert_eq!(
+                read_range(&store.connection, &captured, start as i64, 31, false)
+                    .await
+                    .unwrap(),
+                legacy.as_bytes()[start..start + 31]
+            );
+        }
+        assert_eq!(
+            read_range(&store.connection, &captured, 16000, 127, true)
+                .await
+                .unwrap(),
+            legacy
+                .chars()
+                .skip(16000)
+                .take(127)
+                .collect::<String>()
+                .into_bytes()
+        );
+        let boundary = block::Entity::find_by_id((reserved.clone(), 16))
+            .one(&store.connection)
+            .await
+            .unwrap()
+            .unwrap();
+        for fault in [0, 1, 2] {
+            match fault {
+                0 => {
+                    block::Entity::delete_by_id((reserved.clone(), 16))
+                        .exec(&store.connection)
+                        .await
+                        .unwrap();
+                }
+                1 => {
+                    block::Entity::update_many()
+                        .col_expr(
+                            block::Column::CharOffset,
+                            Expr::value(boundary.char_offset + 1),
+                        )
+                        .filter(block::Column::PayloadId.eq(&reserved))
+                        .filter(block::Column::Ordinal.eq(16))
+                        .exec(&store.connection)
+                        .await
+                        .unwrap();
+                }
+                _ => {
+                    block::Entity::update_many()
+                        .col_expr(block::Column::Data, Expr::value(vec![0_u8; 78]))
+                        .filter(block::Column::PayloadId.eq(&reserved))
+                        .filter(block::Column::Ordinal.eq(16))
+                        .exec(&store.connection)
+                        .await
+                        .unwrap();
+                }
+            }
+            assert!(
+                hydrate_header(&store.connection, &captured, String::new())
+                    .await
+                    .is_err()
+            );
+            block::Entity::delete_by_id((reserved.clone(), 16))
+                .exec(&store.connection)
+                .await
+                .unwrap();
+            block::Entity::insert(boundary.clone().into_active_model())
+                .exec(&store.connection)
+                .await
+                .unwrap();
+        }
         pioneer_entity::tool_output_chunk::Entity::delete_many()
             .filter(pioneer_entity::tool_output_chunk::Column::Id.eq("original"))
             .exec(&store.connection)
@@ -2453,11 +2788,20 @@ mod tests {
                 .unwrap()
                 .0
         );
-        assert_eq!(
-            hydrate_header(&store.connection, &captured, String::new())
-                .await
-                .unwrap(),
-            legacy
+        // Measure only this successful logical read, after fault restoration
+        // and deletion/blocked cleanup. The UTF-8 value spans >16 blocks.
+        // Two sequential batches + dictionary + EOF fit comfortably in eight
+        // reads; the old per-range hydration needs dozens of reader operations.
+        let before_full_read = reads.0.load(std::sync::atomic::Ordering::SeqCst);
+        let hydrated = hydrate_header(&store.connection, &captured, String::new())
+            .await
+            .unwrap();
+        let full_read_operations =
+            reads.0.load(std::sync::atomic::Ordering::SeqCst) - before_full_read;
+        assert_eq!(hydrated, legacy);
+        assert!(
+            full_read_operations <= 8,
+            "full hydration exceeded its sequential-read budget: {full_read_operations}"
         );
         drop(captured);
         assert!(
