@@ -288,7 +288,7 @@ async fn blocked_ordinary_allows_exact_cancel_and_wait_without_reordering_binary
         let driver = async {
             input
                 .send(Message::Text(
-                    rpc("wait", methods::TASK_WAIT, json!({"run_ids":[RUN]})).into(),
+                    rpc("wait", methods::TASK_WAIT, json!({"runIds":[RUN]})).into(),
                 ))
                 .unwrap();
             // Invalid protocol/target cannot use classification as authorization.
@@ -455,7 +455,7 @@ async fn deferred_count_bytes_single_message_and_control_capacity_close_boundedl
                                 rpc(
                                     &format!("wait{n}"),
                                     methods::TASK_WAIT,
-                                    json!({"run_ids":[RUN]}),
+                                    json!({"runIds":[RUN]}),
                                 )
                                 .into(),
                             ))
@@ -1076,7 +1076,7 @@ async fn full_read_slots_defer_and_reuse_capacity_without_spending_cancel_or_wai
             input.send(get_thread("slot4")).unwrap();
             input
                 .send(Message::Text(
-                    rpc("slot-wait", methods::TASK_WAIT, json!({"run_ids":[RUN]})).into(),
+                    rpc("slot-wait", methods::TASK_WAIT, json!({"runIds":[RUN]})).into(),
                 ))
                 .unwrap();
             input
@@ -2034,13 +2034,13 @@ async fn audio_worker_retirement_releases_active_and_queued_tickets() {
                         rpc(
                             "retirement-probe",
                             methods::TASK_WAIT,
-                            json!({"run_ids":[RUN],"timeout_ms":1}),
+                            json!({"runIds":[RUN],"timeoutMs":1}),
                         )
                         .into(),
                     ))
                     .unwrap();
                 let response = recv_response_by_id(&mut f.responses, &id("retirement-probe")).await;
-                assert_eq!(response.result["timed_out"], true);
+                assert_eq!(response.result["timedOut"], true);
                 if terminal == "panic" {
                     drop(release); // the test-only gate injects a worker panic
                     None
@@ -2109,9 +2109,9 @@ async fn finalize_transport_seal_includes_active_and_queued_audio_and_rejects_la
             input.send(ingress_frame(&session.session_id, 3)).unwrap();
             // Exact control has independent admission beyond the deferred Finalize.
             input.send(Message::Text(rpc("seal-probe", methods::TASK_WAIT,
-                json!({"run_ids":[RUN],"timeout_ms":1})).into())).unwrap();
+                json!({"runIds":[RUN],"timeoutMs":1})).into())).unwrap();
             let response = recv_response_by_id(&mut f.responses, &id("seal-probe")).await;
-            assert_eq!(response.result["timed_out"], true);
+            assert_eq!(response.result["timedOut"], true);
             assert!(session.ingress.admit().is_none());
             assert!(session.ingress.drain().now_or_never().is_none());
             release.send(()).unwrap();
@@ -2144,7 +2144,7 @@ async fn seed_unrelated_voice_acl(processor: &MessageProcessor, workspace: &str)
     materialize_test_member_collaborator(processor.crud_store.as_ref(), workspace, THREAD).await;
     let other = processor
         .workspace_manager
-        .create_workspace("voice_unrelated_acl", None)
+        .create_workspace("W00000000000000000009", None)
         .await
         .unwrap()
         .id;
@@ -2316,9 +2316,9 @@ async fn domain_finalize_drains_slow_tail_with_recording_and_buffered_recognizer
                 input.send(Message::Text(payload.clone().into())).unwrap();
                 input.send(Message::Binary(voice_test_frame(&started.session_id,32,7,16000).into())).unwrap();
                 input.send(Message::Text(rpc("full-seal-probe", methods::TASK_WAIT,
-                    json!({"run_ids":[RUN],"timeout_ms":1})).into())).unwrap();
+                    json!({"runIds":[RUN],"timeoutMs":1})).into())).unwrap();
                 let probe = recv_response_by_id(&mut f.responses,&id("full-seal-probe")).await;
-                assert_eq!(probe.result["timed_out"],true);
+                assert_eq!(probe.result["timedOut"],true);
                 assert!(recording.ingress.admit().is_none());
                 finalize.send(payload).unwrap();
                 release.send(()).unwrap();
@@ -2441,13 +2441,13 @@ async fn real_ack_capacity_wait_preserves_rpc_and_controls_with_full_ordinary_da
             input.send(ingress_frame(&session.session_id, 128)).unwrap();
             reached.await.unwrap(); // production send_voice_text observed actual Full
             release.send(()).unwrap();
-            input.send(get_thread("ack-pressure-rpc")).unwrap();
+            input.send(get_thread("ack-rpc")).unwrap();
             input
                 .send(Message::Text(
                     rpc(
-                        "ack-pressure-control",
+                        "ack-control",
                         methods::TASK_WAIT,
-                        json!({"run_ids":[RUN],"timeout_ms":1}),
+                        json!({"runIds":[RUN],"timeoutMs":1}),
                     )
                     .into(),
                 ))
@@ -2462,12 +2462,12 @@ async fn real_ack_capacity_wait_preserves_rpc_and_controls_with_full_ordinary_da
                     continue;
                 }
                 let value: JsonValue = serde_json::from_str(&text).unwrap();
-                if value["id"] == id("ack-pressure-rpc") {
+                if value["id"] == id("ack-rpc") {
                     assert!(value["result"]["thread"].is_object());
                     rpc_done = true;
                 }
-                if value["id"] == id("ack-pressure-control") {
-                    assert_eq!(value["result"]["timed_out"], true);
+                if value["id"] == id("ack-control") {
+                    assert_eq!(value["result"]["timedOut"], true);
                     control_done = true;
                 }
             }
@@ -2588,7 +2588,7 @@ async fn durable_revoke_before_publication_is_rechecked_before_audio_effect() {
                         rpc(
                             "revoke-queue-probe",
                             methods::TASK_WAIT,
-                            json!({"run_ids":[RUN],"timeout_ms":1}),
+                            json!({"runIds":[RUN],"timeoutMs":1}),
                         )
                         .into(),
                     ))
@@ -2719,7 +2719,7 @@ async fn audio_delivery_capacity_wait_revalidates_renewal_expiry_and_physical_ow
             next.access_expires_at_unix = if action == "expiry" {
                 0
             } else {
-                next.access_expires_at_unix + 3600
+                crate::helpers::unix_timestamp_secs().unwrap() + 3600
             };
             f.processor
                 .session_manager
@@ -2968,9 +2968,9 @@ async fn queued_and_active_audio_revalidate_current_lease_and_exact_socket() {
                 input.send(ingress_frame(&session.session_id,0)).unwrap();
                 reached.await.unwrap();
                 input.send(ingress_frame(&session.session_id,1)).unwrap();
-                input.send(Message::Text(rpc("queued-lease-probe",methods::TASK_WAIT,json!({"run_ids":[RUN],"timeout_ms":1})).into())).unwrap();
+                input.send(Message::Text(rpc("queued-lease-probe",methods::TASK_WAIT,json!({"runIds":[RUN],"timeoutMs":1})).into())).unwrap();
                 let probe=recv_response_by_id(&mut f.responses,&id("queued-lease-probe")).await;
-                assert_eq!(probe.result["timed_out"],true);
+                assert_eq!(probe.result["timedOut"],true);
                 let mut replacement=None;
                 if matches!(action,"renewal"|"expiry") {
                     let mut next=expected.clone();

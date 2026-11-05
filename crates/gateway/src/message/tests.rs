@@ -82492,34 +82492,24 @@ async fn recv_jsonrpc_payload_by_id(
     rx: &mut crate::session::test_support::OutboundTestReceiver,
     request_id: &str,
 ) -> String {
-    for _ in 0..200 {
-        let payload = recv_text_timeout(rx, Duration::from_secs(2)).await;
-        let value: serde_json::Value =
-            serde_json::from_str(&payload).expect("json-rpc payload should decode");
-        if value.get("id").and_then(serde_json::Value::as_str) == Some(request_id) {
-            return payload;
-        }
-    }
-
-    panic!("timed out waiting for JSON-RPC payload id `{request_id}`");
+    let message = timeout(Duration::from_secs(2), rx.recv_response(request_id))
+        .await
+        .expect("timed out waiting for JSON-RPC response")
+        .expect("websocket channel closed waiting for response");
+    let Message::Text(payload) = message else {
+        unreachable!()
+    };
+    payload.to_string()
 }
 
 async fn recv_response_by_id(
     rx: &mut crate::session::test_support::OutboundTestReceiver,
     request_id: &str,
 ) -> JsonRpcResponse {
-    for _ in 0..200 {
-        let payload = recv_text_timeout(rx, Duration::from_secs(2)).await;
-        let value: serde_json::Value =
-            serde_json::from_str(&payload).expect("json-rpc payload should decode");
-        if value.get("id").and_then(serde_json::Value::as_str) == Some(request_id) {
-            return serde_json::from_value(value.clone()).unwrap_or_else(|error| {
-                panic!("json-rpc response should decode: {error}; payload: {value}")
-            });
-        }
-    }
-
-    panic!("timed out waiting for response id `{request_id}`");
+    let payload = recv_jsonrpc_payload_by_id(rx, request_id).await;
+    serde_json::from_str(&payload).unwrap_or_else(|error| {
+        panic!("json-rpc response should decode: {error}; payload: {payload}")
+    })
 }
 
 async fn recv_response_and_notification_by_id_method(

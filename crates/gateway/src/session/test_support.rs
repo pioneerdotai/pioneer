@@ -145,7 +145,10 @@ pub(crate) async fn register_authenticated_test_connection(
 
 /// Test sink for the real outbound envelope. Dequeue consumes the frame as a
 /// completed write; tests needing writer retention use OutboundReceiver itself.
-pub(crate) struct OutboundTestReceiver(super::outbound::OutboundReceiver);
+pub(crate) struct OutboundTestReceiver(
+    super::outbound::OutboundReceiver,
+    std::collections::VecDeque<Message>,
+);
 impl OutboundTestReceiver {
     /// Hold the audio lane untouched while observing real RPC delivery progress.
     pub(crate) async fn recv_ordinary(&mut self) -> Option<Message> {
@@ -158,7 +161,34 @@ impl OutboundTestReceiver {
         Some(message)
     }
 
+    pub(crate) async fn recv_response(&mut self, id: &str) -> Option<Message> {
+        let matches = |message: &Message| match message {
+            Message::Text(text) => serde_json::from_str::<serde_json::Value>(text)
+                .ok()
+                .is_some_and(|value| value["id"].as_str() == Some(id)),
+            _ => false,
+        };
+        if let Some(index) = self.1.iter().position(&matches) {
+            return self.1.remove(index);
+        }
+        loop {
+            let envelope = self.0.recv().await?;
+            let (message, _) = envelope.item.received(
+                pioneer_observability::work::Boundary::EventLane,
+                pioneer_observability::work::WorkKind::Event,
+                pioneer_observability::work::ExecutorRole::Gateway,
+            );
+            if matches(&message) {
+                return Some(message);
+            }
+            self.1.push_back(message);
+        }
+    }
+
     pub(crate) async fn recv(&mut self) -> Option<Message> {
+        if let Some(message) = self.1.pop_front() {
+            return Some(message);
+        }
         let envelope = self.0.recv().await?;
         let (message, _) = envelope.item.received(
             pioneer_observability::work::Boundary::EventLane,
@@ -168,6 +198,9 @@ impl OutboundTestReceiver {
         Some(message)
     }
     pub(crate) fn try_recv(&mut self) -> Result<Message, tokio::sync::mpsc::error::TryRecvError> {
+        if let Some(message) = self.1.pop_front() {
+            return Ok(message);
+        }
         let envelope = self.0.try_recv()?;
         let (message, _) = envelope.item.received(
             pioneer_observability::work::Boundary::EventLane,
@@ -180,7 +213,7 @@ impl OutboundTestReceiver {
 pub(crate) fn outbound_channel(capacity: usize) -> (super::SessionOutbound, OutboundTestReceiver) {
     let (sender, receiver) =
         super::SessionOutbound::channel(capacity, 64 * 1024 * 1024, 16 * 1024 * 1024);
-    (sender, OutboundTestReceiver(receiver))
+    (sender, OutboundTestReceiver(receiver, Default::default()))
 }
 
 /// One-shot barrier at the real final delivery boundary, outside every lock.

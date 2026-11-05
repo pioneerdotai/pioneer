@@ -703,7 +703,6 @@ async fn delayed_voice_tail_and_finalize_keep_socket_order_without_per_packet_ac
         fixture.gate.wait_entered().await;
         // The in-flight socket write still owns its capacity reservation.
         assert!(budget.admit(vec![0; 256 * 1024]).is_err());
-        let epoch = fixture.idle.epoch();
         let mut frames = vec![pcm.clone()];
         for sequence in 1..3 {
             let frame = crate::transport::ws::frames::encode_voice_audio_chunk_frame(
@@ -721,7 +720,6 @@ async fn delayed_voice_tail_and_finalize_keep_socket_order_without_per_packet_ac
                 .unwrap();
             frames.push(frame);
         }
-        fixture.idle.after(epoch).await;
         // A is at the socket gate; B/C occupy the separate voice mailbox.
         fixture.reply(&first.id).await;
         assert!(receive(first.rx).await.is_ok());
@@ -828,13 +826,11 @@ async fn blocked_voice_burst(
         .admit_voice(budget.admit(vec![1]).unwrap())
         .unwrap();
     f.gate.wait_entered().await;
-    let epoch = f.idle.epoch();
     for byte in [2, 3] {
         f.receipt
             .admit_voice(budget.admit(vec![byte]).unwrap())
             .unwrap();
     }
-    f.idle.after(epoch).await;
 }
 
 #[tokio::test]
