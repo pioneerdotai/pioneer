@@ -1307,3 +1307,20 @@ async fn migration_schema_and_marker_roll_back_together_after_index_failure() ->
     assert!(bootstrap(&f.db).await?.complete);
     Ok(())
 }
+
+#[tokio::test]
+async fn retry_deadline_ignores_dependency_waiters_and_preserves_subsecond_due_time() {
+    let f = Fixture::open().await.unwrap();
+    assert_eq!(f.store.native_event_cleanup_deadline().await.unwrap(), None);
+    f.sql("INSERT INTO native_event_cleanup_job(turn_id,state,available_at,last_served_at,revision) VALUES('blocked','waiting',1,0,1),('retry','queued',1900000000000001,0,1)")
+        .await.unwrap();
+    assert_eq!(
+        f.store.native_event_cleanup_deadline().await.unwrap(),
+        Some(1_900_000_001),
+        "round up a real retry; never repeatedly wake before microsecond eligibility"
+    );
+    f.sql("UPDATE native_event_cleanup_job SET state='waiting' WHERE turn_id='retry'")
+        .await
+        .unwrap();
+    assert_eq!(f.store.native_event_cleanup_deadline().await.unwrap(), None);
+}

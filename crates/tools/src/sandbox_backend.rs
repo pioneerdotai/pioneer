@@ -212,6 +212,7 @@ pub fn configure_nono_command(
     Ok(())
 }
 
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
 fn nono_policy_is_noop(snapshot: &TurnExecutionSecuritySnapshot) -> bool {
     snapshot.sandbox.filesystem.kind == TurnFilesystemSandboxKind::Unrestricted
         && snapshot.network.mode == TurnNetworkMode::Enabled

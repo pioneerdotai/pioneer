@@ -627,6 +627,7 @@ pub trait TaskExecutor: Send + Sync {
 
 #[derive(Default)]
 pub struct TaskExecutorRegistry {
+    changed: pioneer_sqlite::WorkSignal,
     executors: RwLock<HashMap<&'static str, Arc<dyn TaskExecutor>>>,
 }
 
@@ -635,11 +636,16 @@ impl TaskExecutorRegistry {
         Self::default()
     }
 
+    pub(crate) fn work_signal(&self) -> pioneer_sqlite::WorkSignal {
+        self.changed.clone()
+    }
+
     pub async fn register(&self, executor: Arc<dyn TaskExecutor>) {
         self.executors
             .write()
             .await
             .insert(executor_key(executor.kind()), executor);
+        self.changed.notify();
     }
 
     pub async fn get(&self, kind: TaskExecutorKind) -> Option<Arc<dyn TaskExecutor>> {

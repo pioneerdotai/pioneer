@@ -323,20 +323,6 @@ struct ApiModelEntry {
 
 impl GlmProvider {
     #[cfg(test)]
-    fn build_chat_request(
-        request: &ChatRequest,
-        messages: Vec<ApiMessage>,
-        stream: bool,
-    ) -> Result<ApiChatRequest> {
-        Self::build_chat_request_with_catalog(
-            request,
-            messages,
-            stream,
-            crate::catalog::model_catalog().ok().as_deref(),
-        )
-    }
-
-    #[cfg(test)]
     fn build_chat_request_with_catalog(
         request: &ChatRequest,
         messages: Vec<ApiMessage>,

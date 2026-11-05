@@ -1490,6 +1490,50 @@ pub(crate) fn claim_page(
         .limit(limit)
 }
 
+pub(crate) async fn next_execution_deadline<C: ConnectionTrait>(db: &C) -> Result<Option<i64>> {
+    let mut next = None;
+    for (status, column) in [
+        (
+            STATUS_READY,
+            native_terminal_effect_outbox::Column::NextRunAt,
+        ),
+        (
+            STATUS_RETRY_WAIT,
+            native_terminal_effect_outbox::Column::NextRunAt,
+        ),
+        (
+            STATUS_RUNNING,
+            native_terminal_effect_outbox::Column::ClaimExpiresAt,
+        ),
+    ] {
+        if let Some(at) = native_terminal_effect_outbox::Entity::find()
+            .select_only()
+            .column(column)
+            .filter(native_terminal_effect_outbox::Column::Status.eq(status))
+            .filter(column.is_not_null())
+            .order_by_asc(column)
+            .into_tuple::<DateTimeWithTimeZone>()
+            .one(db)
+            .await?
+        {
+            let at = crate::util::deadline_unix_seconds(at);
+            next = Some(next.map_or(at, |old: i64| std::cmp::Ord::min(old, at)));
+        }
+    }
+    if let Some(at) = native_terminal_effect_outbox::Entity::find()
+        .select_only()
+        .column(native_terminal_effect_outbox::Column::GateProbeAt)
+        .filter(native_terminal_effect_outbox::Column::Status.eq(STATUS_WAITING_ACCEPTANCE))
+        .order_by_asc(native_terminal_effect_outbox::Column::GateProbeAt)
+        .into_tuple::<i64>()
+        .one(db)
+        .await?
+    {
+        next = Some(next.map_or(at, |old| std::cmp::Ord::min(old, at)));
+    }
+    Ok(next)
+}
+
 pub async fn claim_due<F: FnMut() -> String>(
     db: &SqliteDatabase,
     discovery_now: DateTimeWithTimeZone,
@@ -1896,8 +1940,8 @@ pub async fn store_handler_checkpoint<C: ConnectionTrait>(
     }
 }
 
-pub async fn mark_failed<C: ConnectionTrait>(
-    db: &C,
+pub async fn mark_failed(
+    db: &SqliteDatabase,
     effect_id: &str,
     claim_token: &str,
     error_code: &str,
@@ -1906,25 +1950,75 @@ pub async fn mark_failed<C: ConnectionTrait>(
     retry_at: DateTimeWithTimeZone,
     now: DateTimeWithTimeZone,
 ) -> Result<bool> {
-    let code = bounded_chars(error_code, MAX_ERROR_CODE_CHARS);
-    let message = bounded_chars(error_message, MAX_ERROR_MESSAGE_CHARS);
-    if retryable {
+    let change = db.work_signal("control.native_retry").changing();
+    let control_change = db.work_signal("gateway.control").changing();
+    let result = async {
+        let code = bounded_chars(error_code, MAX_ERROR_CODE_CHARS);
+        let message = bounded_chars(error_message, MAX_ERROR_MESSAGE_CHARS);
+        if retryable {
+            let updated = native_terminal_effect_outbox::Entity::update_many()
+                .col_expr(
+                    native_terminal_effect_outbox::Column::Status,
+                    Expr::value(STATUS_RETRY_WAIT.to_owned()),
+                )
+                .col_expr(
+                    native_terminal_effect_outbox::Column::LastErrorCode,
+                    Expr::value(Some(code.clone())),
+                )
+                .col_expr(
+                    native_terminal_effect_outbox::Column::LastErrorMessage,
+                    Expr::value(Some(message.clone())),
+                )
+                .col_expr(
+                    native_terminal_effect_outbox::Column::NextRunAt,
+                    Expr::value(Some(retry_at)),
+                )
+                .col_expr(
+                    native_terminal_effect_outbox::Column::ClaimToken,
+                    Expr::value(Option::<String>::None),
+                )
+                .col_expr(
+                    native_terminal_effect_outbox::Column::ClaimExpiresAt,
+                    Expr::value(Option::<DateTimeWithTimeZone>::None),
+                )
+                .col_expr(
+                    native_terminal_effect_outbox::Column::UpdatedAt,
+                    Expr::value(now),
+                )
+                .filter(native_terminal_effect_outbox::Column::EffectId.eq(effect_id.to_owned()))
+                .filter(native_terminal_effect_outbox::Column::Status.eq(STATUS_RUNNING))
+                .filter(
+                    native_terminal_effect_outbox::Column::ClaimToken.eq(claim_token.to_owned()),
+                )
+                .filter(
+                    Expr::col(native_terminal_effect_outbox::Column::AttemptCount).lt(Expr::col(
+                        native_terminal_effect_outbox::Column::MaxAttempts,
+                    )),
+                )
+                .exec(db)
+                .await
+                .context("failed to retry native terminal effect")?
+                .rows_affected;
+            if updated == 1 {
+                return Ok(true);
+            }
+        }
         let updated = native_terminal_effect_outbox::Entity::update_many()
             .col_expr(
                 native_terminal_effect_outbox::Column::Status,
-                Expr::value(STATUS_RETRY_WAIT.to_owned()),
+                Expr::value(STATUS_UNRESOLVED.to_owned()),
             )
             .col_expr(
                 native_terminal_effect_outbox::Column::LastErrorCode,
-                Expr::value(Some(code.clone())),
+                Expr::value(Some(code)),
             )
             .col_expr(
                 native_terminal_effect_outbox::Column::LastErrorMessage,
-                Expr::value(Some(message.clone())),
+                Expr::value(Some(message)),
             )
             .col_expr(
                 native_terminal_effect_outbox::Column::NextRunAt,
-                Expr::value(Some(retry_at)),
+                Expr::value(Option::<DateTimeWithTimeZone>::None),
             )
             .col_expr(
                 native_terminal_effect_outbox::Column::ClaimToken,
@@ -1935,66 +2029,100 @@ pub async fn mark_failed<C: ConnectionTrait>(
                 Expr::value(Option::<DateTimeWithTimeZone>::None),
             )
             .col_expr(
+                native_terminal_effect_outbox::Column::CompletedAt,
+                Expr::value(Some(now)),
+            )
+            .col_expr(
                 native_terminal_effect_outbox::Column::UpdatedAt,
                 Expr::value(now),
             )
             .filter(native_terminal_effect_outbox::Column::EffectId.eq(effect_id.to_owned()))
             .filter(native_terminal_effect_outbox::Column::Status.eq(STATUS_RUNNING))
             .filter(native_terminal_effect_outbox::Column::ClaimToken.eq(claim_token.to_owned()))
-            .filter(
-                Expr::col(native_terminal_effect_outbox::Column::AttemptCount).lt(Expr::col(
-                    native_terminal_effect_outbox::Column::MaxAttempts,
-                )),
-            )
             .exec(db)
             .await
-            .context("failed to retry native terminal effect")?
+            .context("failed to terminalize native terminal effect")?
             .rows_affected;
-        if updated == 1 {
-            return Ok(true);
-        }
+        Ok(updated == 1)
     }
-    let updated = native_terminal_effect_outbox::Entity::update_many()
-        .col_expr(
-            native_terminal_effect_outbox::Column::Status,
-            Expr::value(STATUS_UNRESOLVED.to_owned()),
+    .await;
+    if let Ok(changed) = &result {
+        change.completed(*changed);
+        control_change.completed(*changed);
+    }
+    result
+}
+
+fn retryable_unresolved_failures() -> Condition {
+    // provider_http_403 deliberately stays outside this allowlist: it receives
+    // the original durable budget only, never a fresh budget from periodic scans.
+    let retryable_codes = [
+        "effect_timeout",
+        "memory.post_turn_extractor.runtime_unavailable",
+        "memory.post_turn_extractor.checkpoint_load_failed",
+        "memory.post_turn_extractor.checkpoint_store_failed",
+        "memory.post_turn_extractor.manifest_storage_transient",
+        "memory.post_turn_extractor.write_storage_transient",
+        "memory.post_turn_extractor.provider_network_transient",
+        "memory.post_turn_extractor.provider_rate_limited",
+        "memory.post_turn_extractor.provider_5xx",
+        "memory.post_turn_extractor.provider_stream_stall",
+        "memory.post_turn_extractor.provider_stream_truncated",
+    ];
+    Condition::any()
+        .add(native_terminal_effect_outbox::Column::LastErrorCode.is_in(retryable_codes))
+        .add(
+            Condition::all()
+                .add(
+                    native_terminal_effect_outbox::Column::LastErrorCode
+                        .eq("memory.post_turn_extractor.write_failed"),
+                )
+                .add(native_terminal_effect_outbox::Column::HandlerCheckpointJson.is_not_null()),
         )
-        .col_expr(
-            native_terminal_effect_outbox::Column::LastErrorCode,
-            Expr::value(Some(code)),
+        // No checkpoint is required: legacy manifest failures preceded extraction.
+        .add(
+            native_terminal_effect_outbox::Column::LastErrorCode
+                .eq("memory.post_turn_extractor.manifest_failed"),
         )
-        .col_expr(
-            native_terminal_effect_outbox::Column::LastErrorMessage,
-            Expr::value(Some(message)),
+}
+
+/// The same allowlist and age window as requeue; an exhausted historical row
+/// outside that window does not keep the owner awake. The preparation window
+/// also supplies a deadline when it closes before the retry cooldown ends.
+pub async fn next_unresolved_retry_at<C: ConnectionTrait>(
+    db: &C,
+    now: DateTimeWithTimeZone,
+) -> Result<Option<i64>> {
+    let completed = native_terminal_effect_outbox::Entity::find()
+        .select_only()
+        .column(native_terminal_effect_outbox::Column::CompletedAt)
+        .column(native_terminal_effect_outbox::Column::PreparedAt)
+        .filter(native_terminal_effect_outbox::Column::Status.eq(STATUS_UNRESOLVED))
+        .filter(native_terminal_effect_outbox::Column::CompletedAt.is_not_null())
+        .filter(native_terminal_effect_outbox::Column::EffectKind.eq("post_turn_hook"))
+        .filter(retryable_unresolved_failures())
+        .filter(
+            native_terminal_effect_outbox::Column::PreparedAt
+                .gte(now - chrono::Duration::hours(24)),
         )
-        .col_expr(
-            native_terminal_effect_outbox::Column::NextRunAt,
-            Expr::value(Option::<DateTimeWithTimeZone>::None),
-        )
-        .col_expr(
-            native_terminal_effect_outbox::Column::ClaimToken,
-            Expr::value(Option::<String>::None),
-        )
-        .col_expr(
-            native_terminal_effect_outbox::Column::ClaimExpiresAt,
-            Expr::value(Option::<DateTimeWithTimeZone>::None),
-        )
-        .col_expr(
-            native_terminal_effect_outbox::Column::CompletedAt,
-            Expr::value(Some(now)),
-        )
-        .col_expr(
-            native_terminal_effect_outbox::Column::UpdatedAt,
-            Expr::value(now),
-        )
-        .filter(native_terminal_effect_outbox::Column::EffectId.eq(effect_id.to_owned()))
-        .filter(native_terminal_effect_outbox::Column::Status.eq(STATUS_RUNNING))
-        .filter(native_terminal_effect_outbox::Column::ClaimToken.eq(claim_token.to_owned()))
-        .exec(db)
-        .await
-        .context("failed to terminalize native terminal effect")?
-        .rows_affected;
-    Ok(updated == 1)
+        .order_by_asc(native_terminal_effect_outbox::Column::CompletedAt)
+        .limit(1)
+        .into_tuple::<(Option<DateTimeWithTimeZone>, DateTimeWithTimeZone)>()
+        .one(db)
+        .await?;
+    Ok(completed.and_then(|(completed, prepared)| {
+        completed.map(|at| {
+            // If the window closes first, rediscover once just after its inclusive
+            // boundary to remove this row from the eligible head.
+            std::cmp::Ord::min(
+                crate::util::deadline_unix_seconds(at).saturating_add(60 * 60),
+                prepared
+                    .timestamp()
+                    .saturating_add(24 * 60 * 60)
+                    .saturating_add(1),
+            )
+        })
+    }))
 }
 
 /// Reopens a bounded set of recently exhausted post-turn obligations whose
@@ -2015,36 +2143,7 @@ pub async fn requeue_retryable_unresolved<C: ConnectionTrait>(
     if limit == 0 {
         return Ok(0);
     }
-    // provider_http_403 deliberately stays outside this allowlist: it receives
-    // the original durable budget only, never a fresh budget from periodic scans.
-    let retryable_codes = [
-        "effect_timeout",
-        "memory.post_turn_extractor.runtime_unavailable",
-        "memory.post_turn_extractor.checkpoint_load_failed",
-        "memory.post_turn_extractor.checkpoint_store_failed",
-        "memory.post_turn_extractor.manifest_storage_transient",
-        "memory.post_turn_extractor.write_storage_transient",
-        "memory.post_turn_extractor.provider_network_transient",
-        "memory.post_turn_extractor.provider_rate_limited",
-        "memory.post_turn_extractor.provider_5xx",
-        "memory.post_turn_extractor.provider_stream_stall",
-        "memory.post_turn_extractor.provider_stream_truncated",
-    ];
-    let eligible_failures = Condition::any()
-        .add(native_terminal_effect_outbox::Column::LastErrorCode.is_in(retryable_codes))
-        .add(
-            Condition::all()
-                .add(
-                    native_terminal_effect_outbox::Column::LastErrorCode
-                        .eq("memory.post_turn_extractor.write_failed"),
-                )
-                .add(native_terminal_effect_outbox::Column::HandlerCheckpointJson.is_not_null()),
-        )
-        // No checkpoint is required: legacy manifest failures preceded extraction.
-        .add(
-            native_terminal_effect_outbox::Column::LastErrorCode
-                .eq("memory.post_turn_extractor.manifest_failed"),
-        );
+    let eligible_failures = retryable_unresolved_failures();
     let effect_ids = native_terminal_effect_outbox::Entity::find()
         .select_only()
         .column(native_terminal_effect_outbox::Column::EffectId)

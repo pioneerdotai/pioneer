@@ -888,6 +888,31 @@ pub async fn expire_session_refresh_family<C: ConnectionTrait>(
     Ok(session.rows_affected == 1)
 }
 
+/// Both expiry workers use the same durable eligibility as their bounded
+/// updates. An empty installation has no clock-driven discovery obligation.
+pub async fn next_auth_session_expiry<C: ConnectionTrait>(
+    db: &C,
+) -> Result<Option<DateTimeWithTimeZone>> {
+    let active = auth_session::Entity::find()
+        .select_only()
+        .column(auth_session::Column::RefreshExpiresAt)
+        .filter(auth_session::Column::Status.eq("active"))
+        .filter(auth_session::Column::RefreshExpiresAt.is_not_null())
+        .order_by_asc(auth_session::Column::RefreshExpiresAt)
+        .into_tuple::<DateTimeWithTimeZone>()
+        .one(db)
+        .await?;
+    let pending = auth_session::Entity::find()
+        .select_only()
+        .column(auth_session::Column::ActivationExpiresAt)
+        .filter(auth_session::Column::Status.eq("pending"))
+        .order_by_asc(auth_session::Column::ActivationExpiresAt)
+        .into_tuple::<DateTimeWithTimeZone>()
+        .one(db)
+        .await?;
+    Ok(active.into_iter().chain(pending).min())
+}
+
 pub async fn expire_stale_auth_sessions<C: ConnectionTrait>(
     db: &C,
     now: DateTimeWithTimeZone,

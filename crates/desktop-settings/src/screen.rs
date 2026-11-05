@@ -685,7 +685,7 @@ mod render_tests {
 
     #[gpui_kit::test]
     fn settings_pages_scroll_within_the_screen_above_the_footer(cx: &mut TestAppContext) {
-        use gpui_kit::{ScrollDelta, ScrollWheelEvent, point, px};
+        use gpui_kit::{ScrollDelta, ScrollEvent, point, px};
         cx.update(gpui_kit::init);
         for route in [
             SettingsContentView::General,
@@ -738,7 +738,7 @@ mod render_tests {
                 let viewport = window_cx.debug_bounds("settings-test-viewport").unwrap();
                 let footer = window_cx.debug_bounds("settings-test-footer").unwrap();
                 let scroll = |window_cx: &mut gpui_kit::VisualTestContext, delta| {
-                    window_cx.simulate_event(ScrollWheelEvent {
+                    window_cx.simulate_event(ScrollEvent {
                         position: viewport.center(),
                         delta: ScrollDelta::Pixels(point(px(0.), px(delta))),
                         ..Default::default()

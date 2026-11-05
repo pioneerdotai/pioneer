@@ -23528,7 +23528,7 @@ async fn artifact_binary_ingress_case(overloaded: bool) {
         processor,
         _session_manager,
         owner_connection_id,
-        mut owner_rx,
+        owner_rx,
         foreign_connection_id,
         mut foreign_rx,
         _crud_store,
@@ -23686,7 +23686,7 @@ async fn skill_binary_ingress_case(overloaded: bool) {
         processor,
         _session_manager,
         owner_connection_id,
-        mut owner_rx,
+        owner_rx,
         foreign_connection_id,
         mut foreign_rx,
         crud_store,
@@ -61063,6 +61063,7 @@ async fn cli_runtime_active_command_heartbeat_renews_rolling_hard_deadline() {
     let heartbeat_now = now
         .saturating_add(processor.cli_runtime_command_heartbeats.interval_secs())
         .saturating_add(2);
+    rehydrate_command_registry(&processor).await;
     assert_eq!(
         processor
             .heartbeat_due_cli_runtime_command_items(heartbeat_now)
@@ -61189,6 +61190,7 @@ async fn cli_runtime_command_heartbeat_does_not_renew_without_confirmed_runtime_
     let heartbeat_now = now
         .saturating_add(processor.cli_runtime_command_heartbeats.interval_secs())
         .saturating_add(2);
+    rehydrate_command_registry(&processor).await;
     assert_eq!(
         processor
             .heartbeat_due_cli_runtime_command_items(heartbeat_now)
@@ -61260,6 +61262,7 @@ async fn cli_runtime_command_terminal_snapshot_stops_heartbeat_and_finalizes_tur
     let heartbeat_now = now
         .saturating_add(processor.cli_runtime_command_heartbeats.interval_secs())
         .saturating_add(2);
+    rehydrate_command_registry(&processor).await;
     assert_eq!(
         processor
             .heartbeat_due_cli_runtime_command_items(heartbeat_now)
@@ -84700,6 +84703,168 @@ async fn native_history_intent_is_precompleted_idempotent_and_restart_discoverab
 }
 
 #[tokio::test]
+async fn completed_history_result_write_failure_remains_an_error_with_durable_work() {
+    use pioneer_compaction::{CompactionSettings, ModelSelection, Transport};
+    use pioneer_entity::compaction_history_check as check;
+    use sea_orm::EntityTrait;
+    let provider = Arc::new(CaptureSummaryProvider::new("unused"));
+    let harness = setup_phase_13_compaction_harness(phase_13_provider_registry(provider)).await;
+    harness
+        .processor
+        .agent_manager
+        .set_context_controller(Some(Arc::new(
+            crate::compaction::GatewayNativeContextController::new(Arc::downgrade(
+                &harness.processor,
+            )),
+        )))
+        .await;
+    let thread = "history-result-fault-thread";
+    let turn_id = "history-result-fault-turn";
+    materialize_cli_runtime_turn_with_text(
+        &harness.crud_store,
+        &harness.workspace_id,
+        thread,
+        turn_id,
+        "current input",
+    )
+    .await;
+    harness
+        .crud_store
+        .materialize_item_completed(
+            ItemCompletedNotification {
+                workspace_id: harness.workspace_id.clone(),
+                thread_id: thread.into(),
+                turn_id: turn_id.into(),
+                item: TurnItem::AgentMessage {
+                    id: "history-result-answer".into(),
+                    text: "answer".into(),
+                    phase: Default::default(),
+                    markdown: None,
+                    markdown_version: None,
+                },
+            },
+            phase_13_now_secs(),
+        )
+        .await
+        .unwrap();
+    let (_, mut turn) = harness
+        .crud_store
+        .get_turn(thread, turn_id)
+        .await
+        .unwrap()
+        .unwrap();
+    turn.status = TurnStatus::Completed;
+    harness
+        .crud_store
+        .materialize_turn_completed(
+            TurnCompletedNotification {
+                workspace_id: harness.workspace_id.clone(),
+                thread_id: thread.into(),
+                turn,
+            },
+            phase_13_now_secs(),
+        )
+        .await
+        .unwrap();
+    // A valid captured descriptor whose unavailable provider produces a normal
+    // durable diagnostic. The injected fault affects only recording that result.
+    let descriptor = serde_json::json!({
+        "current": ModelSelection { transport: Transport::Api, instance: "missing-result-provider".into(),
+            model: "missing-result-model".into(), effort: None },
+        "settings": CompactionSettings { selection: None }, "cli_override": null,
+        "deadline_ms": (phase_13_now_secs() * 1000 + 30_000) as u64,
+    }).to_string();
+    harness
+        .crud_store
+        .compaction_enqueue_native_history_check(
+            &harness.workspace_id,
+            thread,
+            turn_id,
+            &descriptor,
+        )
+        .await
+        .unwrap();
+    let db = harness.crud_store.database_connection();
+    db.execute_unprepared("CREATE TRIGGER reject_history_result BEFORE UPDATE OF outcome ON compaction_history_check WHEN OLD.turn_id='history-result-fault-turn' BEGIN SELECT RAISE(ABORT,'fixture result failure'); END").await.unwrap();
+    harness
+        .processor
+        .poll_completed_history_checks()
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if harness
+                .processor
+                .completed_history_checks
+                .lock()
+                .await
+                .values()
+                .all(|job| {
+                    job.handle
+                        .as_ref()
+                        .is_none_or(tokio::task::JoinHandle::is_finished)
+                })
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        harness
+            .processor
+            .poll_completed_history_checks()
+            .await
+            .is_err(),
+        "an unconfirmed service result must reach the owner's bounded error backoff"
+    );
+    assert!(
+        harness
+            .processor
+            .completed_history_checks
+            .lock()
+            .await
+            .is_empty(),
+        "the failed due row must not be re-admitted in that same discovery pass"
+    );
+    let row = check::Entity::find_by_id(turn_id)
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.state, "pending");
+    assert!(row.outcome.is_none());
+    db.execute_unprepared("DROP TRIGGER reject_history_result")
+        .await
+        .unwrap();
+    harness
+        .processor
+        .poll_completed_history_checks()
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if check::Entity::find_by_id(turn_id)
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap()
+                .outcome
+                .is_some()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    harness.processor.shutdown_resilience_workers().await;
+}
+
+#[tokio::test]
 async fn native_history_descriptor_does_not_overwrite_processing_or_terminal_check() {
     let provider = Arc::new(CaptureSummaryProvider::new("unused summary"));
     let harness = setup_phase_13_compaction_harness(phase_13_provider_registry(provider)).await;
@@ -91140,4 +91305,23 @@ async fn task_webhook_url_uses_actual_bind_and_rejects_persisted_disconnected_re
     let persisted = std::fs::read_to_string(&settings_path).unwrap();
     assert!(!persisted.contains("public_base_url"));
     assert!(!persisted.contains("obsolete.example"));
+}
+
+// The control owner restores startup/mutation pages before heartbeat and timeout.
+async fn rehydrate_command_registry(processor: &MessageProcessor) {
+    let mut after = None;
+    loop {
+        let (_, next, failed) = processor
+            .rehydrate_cli_runtime_command_items(None, after.as_deref(), 256)
+            .await
+            .expect("command registry startup page should load");
+        assert!(
+            !failed,
+            "command registry startup validation should succeed"
+        );
+        after = next;
+        if after.is_none() {
+            break;
+        }
+    }
 }

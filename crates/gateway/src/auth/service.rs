@@ -60,6 +60,31 @@ const MAX_DIAGNOSTIC_TEXT: usize = 255;
 const AUTH_MAINTENANCE_BATCH_SIZE: u64 = 256;
 const AUTH_MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
+/// The startup owner joins this worker before closing SQLite. Dropping startup
+/// on an error also cancels it; an indefinitely parked Weak worker cannot leak.
+pub(crate) struct AuthMaintenanceGuard {
+    cancellation: tokio_util::sync::CancellationToken,
+    handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl AuthMaintenanceGuard {
+    pub(crate) async fn shutdown(mut self) {
+        self.cancellation.cancel();
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.await;
+        }
+    }
+}
+
+impl Drop for AuthMaintenanceGuard {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
+    }
+}
+
 pub(crate) struct GatewayAuthService {
     database: SqliteDatabase,
     config: GatewayAuthConfig,
@@ -260,6 +285,7 @@ impl GatewayAuthService {
         let transaction_acquire_stage = trace.stage(
             pioneer_observability::GatewayOperationStage::AuthRefreshDatabaseTransactionAcquire,
         );
+        let expiry_change = self.database.work_signal("auth.expiry").changing();
         let transaction = self
             .database
             .begin_with_options(TransactionOptions {
@@ -325,6 +351,7 @@ impl GatewayAuthService {
                 AuthSessionTerminationReason::SessionExpired,
             )
             .await;
+            expiry_change.completed(true);
             return Err(AuthError::new(AuthErrorCode::SessionExpired));
         }
         let current = load_current_refresh(&transaction, &presented.session_id)
@@ -372,6 +399,7 @@ impl GatewayAuthService {
                 AuthSessionTerminationReason::SessionCompromised,
             )
             .await;
+            expiry_change.completed(true);
             return Err(AuthError::new(AuthErrorCode::SessionCompromised));
         }
         if presented.generation > session_generation {
@@ -575,6 +603,7 @@ impl GatewayAuthService {
                 return Err(error);
             }
         };
+        expiry_change.completed(rotate);
         Ok(AuthRefreshGrant {
             gateway: AuthGatewaySnapshot { id: gateway_id },
             principal: AuthPrincipalSnapshot {
@@ -1213,16 +1242,20 @@ impl GatewayAuthService {
         u64::try_from(expired.len()).map_err(|_| AuthError::new(AuthErrorCode::InvalidCredential))
     }
 
-    pub(crate) fn spawn_auth_maintenance(self: &Arc<Self>) {
+    pub(crate) fn spawn_auth_maintenance(self: &Arc<Self>) -> AuthMaintenanceGuard {
         let service = Arc::downgrade(self);
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(AUTH_MAINTENANCE_INTERVAL);
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            // Startup performs the first reconciliation synchronously before the
-            // listener opens. The detached worker starts with the next tick.
-            interval.tick().await;
+        let database = self.database.maintenance();
+        let mut wake = database.work_signal("auth.expiry").subscribe();
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let worker_cancellation = cancellation.clone();
+        let worker = async move {
             loop {
-                interval.tick().await;
+                if let Err(error) = wake.begin_pass(&database).await {
+                    tracing::warn!(%error, "failed to settle auth expiry sources");
+                    wake.wait(Some(Utc::now().timestamp().saturating_add(3600)))
+                        .await;
+                    continue;
+                }
                 let Some(service) = service.upgrade() else {
                     break;
                 };
@@ -1234,14 +1267,16 @@ impl GatewayAuthService {
                             error = %error,
                             "failed to read the clock for auth maintenance"
                         );
+                        drop(service);
+                        tokio::time::sleep(AUTH_MAINTENANCE_INTERVAL).await;
                         continue;
                     }
                 };
-                match service
+                let active = service
                     .expire_stale_sessions(now_unix, AUTH_MAINTENANCE_BATCH_SIZE)
-                    .await
-                {
-                    Ok(expired_sessions) if expired_sessions > 0 => tracing::info!(
+                    .await;
+                match &active {
+                    Ok(expired_sessions) if *expired_sessions > 0 => tracing::info!(
                         event = "auth_sessions_expired",
                         expired_sessions,
                         "stale auth sessions were expired"
@@ -1254,11 +1289,11 @@ impl GatewayAuthService {
                         "stale auth session expiry failed"
                     ),
                 }
-                match service
+                let pending = service
                     .expire_pending_device_sessions(now_unix, AUTH_MAINTENANCE_BATCH_SIZE)
-                    .await
-                {
-                    Ok(expired_sessions) if expired_sessions > 0 => tracing::info!(
+                    .await;
+                match &pending {
+                    Ok(expired_sessions) if *expired_sessions > 0 => tracing::info!(
                         event = "auth_pending_device_sessions_expired",
                         expired_sessions,
                         "expired pending device sessions marked terminal"
@@ -1271,8 +1306,41 @@ impl GatewayAuthService {
                         "pending device session expiry failed"
                     ),
                 }
+                drop(service);
+                if active
+                    .as_ref()
+                    .is_ok_and(|count| *count >= AUTH_MAINTENANCE_BATCH_SIZE)
+                    || pending
+                        .as_ref()
+                        .is_ok_and(|count| *count >= AUTH_MAINTENANCE_BATCH_SIZE)
+                {
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+                let next = pioneer_crud::next_auth_session_expiry(&database).await;
+                let deadline = if active.is_err() || pending.is_err() || next.is_err() {
+                    // Errors retain the previous bounded retry policy; only a
+                    // successful empty discovery may park without a deadline.
+                    Some(Utc::now().timestamp().saturating_add(3600))
+                } else {
+                    next.ok().flatten().map(|at| {
+                        at.timestamp()
+                            .saturating_add(i64::from(at.timestamp_subsec_nanos() != 0))
+                    })
+                };
+                wake.wait(deadline).await;
+            }
+        };
+        let handle = tokio::spawn(async move {
+            tokio::select! {
+                _ = worker_cancellation.cancelled() => {},
+                _ = worker => {},
             }
         });
+        AuthMaintenanceGuard {
+            cancellation,
+            handle: Some(handle),
+        }
     }
 
     pub(crate) async fn list_sessions(
@@ -1513,6 +1581,7 @@ impl GatewayAuthService {
             .checked_add(self.config.device_activation_code_ttl_seconds)
             .ok_or_else(|| AuthError::new(AuthErrorCode::InvalidCredential))?;
         let expires_at = datetime(expires_at_unix)?;
+        let expiry_change = self.database.work_signal("auth.expiry").changing();
         let transaction = self
             .database
             .begin_with_options(TransactionOptions {
@@ -1740,6 +1809,7 @@ impl GatewayAuthService {
                 return Err(error);
             }
         };
+        expiry_change.completed(true);
         tracing::info!(
             event = "auth_pending_device_session_created",
             device_id = %ids.device_id,
@@ -1995,6 +2065,7 @@ impl GatewayAuthService {
             .checked_add(self.config.access_token_ttl_seconds)
             .ok_or_else(|| AuthError::new(AuthErrorCode::InvalidCredential))?;
         let refresh_expires_at = datetime(refresh_expires_at_unix)?;
+        let expiry_change = self.database.work_signal("auth.expiry").changing();
         let transaction = self
             .database
             .begin_with_options(TransactionOptions {
@@ -2063,6 +2134,7 @@ impl GatewayAuthService {
                 .commit()
                 .await
                 .map_err(|_| AuthError::new(AuthErrorCode::InvalidCredential))?;
+            expiry_change.completed(true);
             tracing::info!(
                 event = "auth_device_activation_expired",
                 auth_session_id = %session_id,
@@ -2100,6 +2172,7 @@ impl GatewayAuthService {
                     (failed_attempts, true)
                 }
             };
+            expiry_change.completed(request_revoked);
             tracing::warn!(
                 event = "auth_device_activation_rejected",
                 auth_session_id = %session_id,
@@ -2257,6 +2330,7 @@ impl GatewayAuthService {
                 return Err(error);
             }
         };
+        expiry_change.completed(true);
         if let Some(session_id) = superseded_session_id.as_ref() {
             self.disconnect_session_after_commit(
                 session_id,
@@ -2918,6 +2992,84 @@ mod tests {
         )
         .unwrap();
         (service, identity)
+    }
+
+    // Existing expiry tests protect authorization/terminal transitions. This
+    // regression protects their scheduling boundary: new deadlines invalidate
+    // idle discovery, while the worker's own expiry ACK does not feed itself.
+    #[tokio::test]
+    async fn auth_expiry_tracks_session_lifecycle_without_ack_wake() {
+        use futures_util::FutureExt;
+        let (service, _) = fixture().await;
+        let database = service.database.maintenance();
+        let mut wake = database.work_signal("auth.expiry").subscribe();
+        wake.begin_pass(&database).await.unwrap();
+        assert!(
+            pioneer_crud::next_auth_session_expiry(&database)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let pending = service.create_local_device().await.unwrap();
+        assert!(wake.wait(None).now_or_never().is_some());
+        assert_eq!(
+            pioneer_crud::next_auth_session_expiry(&database)
+                .await
+                .unwrap()
+                .unwrap()
+                .timestamp(),
+            i64::try_from(pending.expires_at_unix).unwrap()
+        );
+        wake.begin_pass(&database).await.unwrap();
+        let grant = service
+            .activate_device(
+                device_activation_admission(&service, pending.activation_code.expose_secret()),
+                params("expiry-scheduling", ClientKind::Desktop),
+            )
+            .await
+            .unwrap();
+        assert!(wake.wait(None).now_or_never().is_some());
+        assert_eq!(
+            pioneer_crud::next_auth_session_expiry(&database)
+                .await
+                .unwrap()
+                .unwrap()
+                .timestamp(),
+            i64::try_from(grant.session.refresh_expires_at_unix).unwrap()
+        );
+        wake.begin_pass(&database).await.unwrap();
+        let rotated = service
+            .exchange_refresh(
+                refresh_admission(grant.refresh_token.expose_secret()),
+                refresh_params(1),
+            )
+            .await
+            .unwrap();
+        assert!(wake.wait(None).now_or_never().is_some());
+        wake.begin_pass(&database).await.unwrap();
+        assert_eq!(
+            service
+                .expire_stale_sessions(rotated.refresh_expires_at_unix, 256)
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(
+            pioneer_crud::next_auth_session_expiry(&database)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(wake.wait(None).now_or_never().is_none());
+        let persisted = load_session(&database, &grant.session.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.status, "expired");
+        let worker = Arc::new(service).spawn_auth_maintenance();
+        tokio::time::timeout(std::time::Duration::from_secs(5), worker.shutdown())
+            .await
+            .unwrap();
     }
 
     async fn member_access_credential(
@@ -3678,6 +3830,63 @@ mod tests {
             .await,
             "active"
         );
+    }
+
+    #[tokio::test]
+    async fn private_operator_transport_requires_local_capability_without_session_bootstrap() {
+        let (service, _) = fixture().await;
+        let service = Arc::new(service);
+        let home = tempfile::tempdir().unwrap();
+        let config = pioneer_config::AppConfig::load().unwrap();
+        let artifacts = Arc::new(pioneer_artifacts::ArtifactService::new(
+            Arc::new(CrudStore::new(service.database.clone())),
+            Arc::new(pioneer_artifacts::LocalArtifactBlobStore::new(
+                home.path().to_path_buf(),
+            )),
+        ));
+        let server = crate::transport::local_operations::LocalOperations::start(
+            home.path(),
+            &config,
+            service.clone(),
+            artifacts,
+        )
+        .await
+        .unwrap();
+        let mut endpoint_path = pioneer_sqlite::WriterOwnership::database_identity(
+            &crate::database::gateway_database_path(home.path(), &config).unwrap(),
+        )
+        .unwrap()
+        .into_os_string();
+        endpoint_path.push(".operator.json");
+        let endpoint: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(std::path::PathBuf::from(endpoint_path)).unwrap(),
+        )
+        .unwrap();
+        let before = count(&service.database, "auth_session").await;
+        let rejected = reqwest::Client::new()
+            .post(format!("http://{}/operation", endpoint["address"].as_str().unwrap()))
+            .json(&serde_json::json!({
+                "nonce": "0".repeat(64),
+                "payload": serde_json::to_string(&crate::transport::local_operations::Operation::DeviceCreate).unwrap(),
+                "mac": "0".repeat(64),
+            }))
+            .send().await.unwrap();
+        assert_eq!(rejected.status(), reqwest::StatusCode::UNAUTHORIZED);
+        assert_eq!(count(&service.database, "auth_session").await, before);
+        let created: pioneer_protocol::AuthDeviceCreateResponse =
+            crate::transport::local_operations::request(
+                home.path(),
+                &config,
+                crate::transport::local_operations::Operation::DeviceCreate,
+            )
+            .await
+            .unwrap();
+        assert!(!created.activation_code.expose_secret().is_empty());
+        assert_eq!(count(&service.database, "auth_session").await, before + 1);
+        server.shutdown().await.unwrap();
+        assert!(crate::transport::local_operations::request::<pioneer_protocol::AuthDeviceCreateResponse>(
+            home.path(), &config, crate::transport::local_operations::Operation::DeviceCreate,
+        ).await.is_err());
     }
 
     #[tokio::test]

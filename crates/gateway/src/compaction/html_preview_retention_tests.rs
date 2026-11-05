@@ -128,8 +128,20 @@ async fn retain_as_task_basis(
 }
 
 async fn drain_preview_worker(store: &CrudStore, service: &ArtifactService) {
-    let mut progress = crate::database::maintenance::html_previews::Progress::default();
-    for _ in 0..3 {
+    use futures_util::FutureExt;
+    let database = store.database_connection().maintenance();
+    let mut changes = database.work_signal("maintenance.html").subscribe();
+    let mut released = database
+        .work_signal("maintenance.frozen.release")
+        .subscribe();
+    let io = store.html_preview_io_work_notification();
+    // Initial discovery covers older notifications; subsequent passes need a
+    // real producer/release wake, as the production owner does after EOF.
+    let _ = io.notified().now_or_never();
+    let _ = service.html_preview_release_notified().now_or_never();
+    for _ in 0..16 {
+        changes.begin_pass(&database).await.unwrap();
+        let mut progress = crate::database::maintenance::html_previews::Progress::default();
         let mut idle = false;
         for _ in 0..256 {
             if !crate::database::maintenance::html_previews::quantum(store, service, &mut progress)
@@ -141,7 +153,18 @@ async fn drain_preview_worker(store: &CrudStore, service: &ArtifactService) {
             }
         }
         assert!(idle);
+        let source = changes.wait(None).now_or_never().is_some();
+        let release = released.changed().now_or_never().is_some();
+        let io_ready = io.notified().now_or_never().is_some();
+        let activity = service
+            .html_preview_release_notified()
+            .now_or_never()
+            .is_some();
+        if !(source || release || io_ready || activity) {
+            return;
+        }
     }
+    panic!("preview maintenance must quiesce after its own source changes");
 }
 
 #[tokio::test]
@@ -518,6 +541,63 @@ async fn preview_history_replay(format_version: u32) {
             .unwrap()
             .is_none()
     );
+    // Keep durable seed/point tickets timed so this fixture exercises fallback
+    // discovery. The exact source and live task basis above remain authoritative.
+    db.execute_unprepared("UPDATE html_preview_io_work SET state='timed',due_at=9223372036854775807,claim_token=NULL WHERE family IN ('seed_witness','seed_copies') OR state IN ('ready','timed','running','blocked')").await.unwrap();
+    db.execute_unprepared("CREATE TRIGGER fail_fallback_witness BEFORE UPDATE OF archive_wire_sha256 ON html_preview_frozen_result WHEN NEW.archive_wire_sha256 IS NOT NULL BEGIN SELECT RAISE(ABORT,'fixture witness commit failure'); END").await.unwrap();
+    let activity = service.html_preview_activity().await;
+    let mut fallback_progress = crate::database::maintenance::html_previews::Progress::default();
+    let mut fallback_failed = false;
+    for _ in 0..256 {
+        if crate::database::maintenance::html_previews::quantum(
+            &f.store,
+            &service,
+            &mut fallback_progress,
+        )
+        .await
+        .is_err()
+        {
+            fallback_failed = true;
+            break;
+        }
+    }
+    assert!(fallback_failed);
+    db.execute_unprepared("DROP TRIGGER fail_fallback_witness")
+        .await
+        .unwrap();
+    // DDL repair emits no work wake. Witness EOF must independently rewind,
+    // although the activity guard leaves the service's family unfinished.
+    let mut fallback_retried = false;
+    for _ in 0..256 {
+        let _ = crate::database::maintenance::html_previews::quantum(
+            &f.store,
+            &service,
+            &mut fallback_progress,
+        )
+        .await;
+        let row = db.query_one_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+            "SELECT archive_wire_sha256 FROM html_preview_frozen_result WHERE manifest_id=?1 AND ordinal=?2",
+            [witness.manifest.clone().into(),witness.ordinal.into()])).await.unwrap().unwrap();
+        if row
+            .try_get::<Option<String>>("", "archive_wire_sha256")
+            .unwrap()
+            .is_some()
+        {
+            fallback_retried = true;
+            break;
+        }
+    }
+    assert!(
+        fallback_retried,
+        "witness retry must not wait for unrelated activity release"
+    );
+    assert!(preview_paths.iter().all(|path| path.exists()));
+    drop(activity);
+    db.execute_unprepared(
+        "UPDATE html_preview_io_work SET state='ready',due_at=0 WHERE state='timed'",
+    )
+    .await
+    .unwrap();
     let checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let observed = checks.clone();
     let audit: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
@@ -662,24 +742,7 @@ async fn preview_history_replay(format_version: u32) {
         .unwrap();
     // A restarted worker reuses persisted receipts and retires only after all
     // temporary owners have released; it never expires/deletes the Task root.
-    let mut progress = crate::database::maintenance::html_previews::Progress::default();
-    for _ in 0..3 {
-        let mut idle = false;
-        for _ in 0..128 {
-            if !crate::database::maintenance::html_previews::quantum(
-                &f.store,
-                &service,
-                &mut progress,
-            )
-            .await
-            .unwrap()
-            {
-                idle = true;
-                break;
-            }
-        }
-        assert!(idle);
-    }
+    drain_preview_worker(&f.store, &service).await;
     assert!(preview_paths.iter().all(|p| !p.exists()));
     for (summary, bytes) in &permanent {
         assert_eq!(

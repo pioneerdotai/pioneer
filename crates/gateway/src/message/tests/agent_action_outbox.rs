@@ -395,6 +395,13 @@ async fn agent_action_outbox_creation_and_polling_panics_preserve_remainder_and_
 // The existing claimed-row seam accepts a scoped connection. Inject an unwind
 // after the actual ACK commits, without changing the real writer or its routes.
 struct PanicAckConnection<C>(C);
+impl<C: pioneer_crud::GatewayControlConnection> pioneer_crud::GatewayControlConnection
+    for PanicAckConnection<C>
+{
+    fn gateway_control_change(&self) -> Option<pioneer_sqlite::WorkChange> {
+        self.0.gateway_control_change()
+    }
+}
 #[sea_orm::prelude::async_trait::async_trait]
 impl<C: ConnectionTrait> ConnectionTrait for PanicAckConnection<C> {
     fn get_database_backend(&self) -> sea_orm::DatabaseBackend {

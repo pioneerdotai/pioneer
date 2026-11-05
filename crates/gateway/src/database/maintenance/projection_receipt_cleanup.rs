@@ -15,6 +15,10 @@ enum QuantumError {
 
 pub(super) async fn run(crud_store: Arc<CrudStore>, cancellation: CancellationToken) {
     let store = crud_store.with_maintenance_access();
+    let database = store.database_connection();
+    let mut wake = database.work_signal("maintenance.receipts").subscribe();
+    let mut begin = true;
+    let mut through_turn_id = None::<String>;
     let mut after_turn_id = None::<String>;
     let mut scanned = 0_u64;
     let mut deleted = 0_u64;
@@ -23,6 +27,36 @@ pub(super) async fn run(crud_store: Arc<CrudStore>, cancellation: CancellationTo
     let mut failed = 0_u64;
     let mut last_progress_log = Instant::now();
     loop {
+        if begin {
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => return,
+                result = wake.begin_pass(&database) => if result.is_err() {
+                    tokio::select! {
+                        _ = cancellation.cancelled() => return,
+                        _ = tokio::time::sleep(IDLE_PAUSE) => {},
+                    }
+                    continue;
+                },
+            }
+            begin = false;
+        }
+        if after_turn_id.is_none() {
+            let upper = tokio::select! {
+                _ = cancellation.cancelled() => return,
+                upper = store.projection_receipt_cleanup_upper_bound() => upper,
+            };
+            match upper {
+                Ok(upper) => through_turn_id = Some(upper.unwrap_or_default()),
+                Err(_) => {
+                    tokio::select! {
+                        _ = cancellation.cancelled() => return,
+                        _ = tokio::time::sleep(IDLE_PAUSE) => {},
+                    }
+                    continue;
+                }
+            }
+        }
         let started = Instant::now();
         // Do not put a local timeout around dispatched SQLite work. Dropping
         // the SQLx future does not interrupt sqlite3_step on its worker thread,
@@ -34,7 +68,7 @@ pub(super) async fn run(crud_store: Arc<CrudStore>, cancellation: CancellationTo
             result = crate::database::attribution::scope_database_workload_result(
                 pioneer_observability::DatabaseWorkload::ProjectionReceiptCleanup, pioneer_observability::DatabaseOperationSite::ProjectionReceiptCleanupQuantum,
                 async {
-                    match store.cleanup_projection_receipts_quantum(after_turn_id.as_deref()).await {
+                    match store.cleanup_projection_receipts_quantum(after_turn_id.as_deref(), through_turn_id.as_deref()).await {
                         Ok(outcome) if outcome.failed => Err(QuantumError::StreamFailed(outcome)),
                         Ok(outcome) => Ok(outcome),
                         Err(_) => Err(QuantumError::Database),
@@ -42,8 +76,12 @@ pub(super) async fn run(crud_store: Arc<CrudStore>, cancellation: CancellationTo
                 },
             ) => result,
         };
+        let mut parked = false;
         let pause = match result {
-            Ok(outcome) if !outcome.backfill_ready => IDLE_PAUSE,
+            Ok(outcome) if !outcome.backfill_ready => {
+                parked = true;
+                IDLE_PAUSE
+            }
             Ok(outcome) | Err(QuantumError::StreamFailed(outcome)) => {
                 if let Some(turn_id) = outcome.last_turn_id {
                     after_turn_id = Some(turn_id);
@@ -80,6 +118,7 @@ pub(super) async fn run(crud_store: Arc<CrudStore>, cancellation: CancellationTo
                         );
                     }
                     after_turn_id = None;
+                    parked = failed == 0 && deleted == 0;
                     let pause = if deleted > 0 {
                         quantum_pause(started.elapsed())
                     } else {
@@ -102,10 +141,18 @@ pub(super) async fn run(crud_store: Arc<CrudStore>, cancellation: CancellationTo
                 IDLE_PAUSE
             }
         };
-        tokio::select! {
-            biased;
-            _ = cancellation.cancelled() => return,
-            _ = tokio::time::sleep(pause) => {},
+        if parked {
+            tokio::select! {
+                _ = cancellation.cancelled() => return,
+                _ = wake.wait(None) => {},
+            }
+            begin = true;
+        } else {
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => return,
+                _ = tokio::time::sleep(pause) => {},
+            }
         }
     }
 }

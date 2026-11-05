@@ -11302,6 +11302,7 @@ version = "0.68.0"
 dependencies = [
  "anyhow",
  "hex",
+ "pioneer-sqlite",
  "sea-orm-migration",
  "serde_json",
  "sha2 0.11.1",
@@ -11447,6 +11448,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "env_logger 0.11.11",
+ "fs4 1.1.0",
  "futures-util",
  "lazy_static",
  "log",

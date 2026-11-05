@@ -618,6 +618,57 @@ pub async fn list_hook_run_attempts<C: ConnectionTrait>(
         .collect()
 }
 
+/// Advisory deadline using the same eligibility clocks as recovery discovery.
+/// Each probe returns one scalar; completed history never keeps recovery awake.
+pub async fn next_recovery_deadline<C: ConnectionTrait>(
+    db: &C,
+    stale_running_after_ms: u64,
+) -> Result<Option<i64>> {
+    let recoverable = || {
+        hook_run::Entity::find()
+            .select_only()
+            .filter(hook_run::Column::ResumeStateJson.is_not_null())
+    };
+    let queued = recoverable()
+        .column(hook_run::Column::QueuedAt)
+        .filter(hook_run::Column::Status.eq(hook_run_status_to_db(HookRunStatus::Queued)))
+        .order_by_asc(hook_run::Column::QueuedAt)
+        .into_tuple::<Option<DateTimeWithTimeZone>>()
+        .one(db)
+        .await?
+        .map(|at| at.map_or(0, |at| at.timestamp_millis()));
+    let deadline = recoverable()
+        .column(hook_run::Column::DeadlineAt)
+        .filter(hook_run::Column::Status.eq(hook_run_status_to_db(HookRunStatus::Running)))
+        .filter(hook_run::Column::DeadlineAt.is_not_null())
+        .order_by_asc(hook_run::Column::DeadlineAt)
+        .into_tuple::<DateTimeWithTimeZone>()
+        .one(db)
+        .await?
+        .map(|at| at.timestamp_millis());
+    let stale = recoverable()
+        .column(hook_run::Column::StartedAt)
+        .filter(hook_run::Column::Status.eq(hook_run_status_to_db(HookRunStatus::Running)))
+        .filter(hook_run::Column::StartedAt.is_not_null())
+        .order_by_asc(hook_run::Column::StartedAt)
+        .into_tuple::<DateTimeWithTimeZone>()
+        .one(db)
+        .await?
+        .map(|at| {
+            at.timestamp_millis()
+                .saturating_add(i64::try_from(stale_running_after_ms).unwrap_or(i64::MAX))
+        });
+    Ok(queued
+        .into_iter()
+        .chain(deadline)
+        .chain(stale)
+        .min()
+        .map(|ms| {
+            ms.div_euclid(1000)
+                .saturating_add(i64::from(ms.rem_euclid(1000) != 0))
+        }))
+}
+
 pub async fn list_recoverable_hook_runs<C: ConnectionTrait>(
     db: &C,
     scan: HookRecoveryScan,
@@ -1442,6 +1493,83 @@ mod tests {
             batch_size,
             phases: Some(vec![HookPhase::TurnPostTurn]),
         }
+    }
+
+    #[tokio::test]
+    async fn recovery_deadline_tracks_future_stale_and_immediate_queued_work() {
+        let (_connection, store) = migrated_store().await;
+        assert_eq!(
+            store.next_hook_recovery_deadline(10_000).await.unwrap(),
+            None
+        );
+
+        // Completed history and non-resumable queued runs are not obligations.
+        let mut history = resumable_run("deadline-completed");
+        history.status = HookRunStatus::Succeeded;
+        store.create_hook_run(history, timestamp(0)).await.unwrap();
+        store
+            .create_hook_run(new_run("deadline-no-resume"), timestamp(0))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.next_hook_recovery_deadline(10_000).await.unwrap(),
+            None
+        );
+
+        let mut running = resumable_run("deadline-running");
+        running.status = HookRunStatus::Running;
+        running.started_at = Some(timestamp(100));
+        running.deadline_at = Some(timestamp(200));
+        store
+            .create_hook_run(running, timestamp(100))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.next_hook_recovery_deadline(10_000).await.unwrap(),
+            Some(timestamp(110).timestamp())
+        );
+
+        let mut queued = resumable_run("deadline-earlier");
+        queued.queued_at = Some(timestamp(105));
+        store.create_hook_run(queued, timestamp(100)).await.unwrap();
+        assert_eq!(
+            store.next_hook_recovery_deadline(10_000).await.unwrap(),
+            Some(timestamp(105).timestamp())
+        );
+
+        let mut immediate = resumable_run("deadline-immediate");
+        immediate.queued_at = None;
+        let immediate = store
+            .create_hook_run(immediate, timestamp(100))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.next_hook_recovery_deadline(10_000).await.unwrap(),
+            Some(timestamp(100).timestamp()),
+            "normal creation supplies its queue timestamp"
+        );
+        // Legacy queued rows can lack that timestamp; cover an actual SQL NULL
+        // rather than an input normalized by create_hook_run.
+        hook_run::Entity::update_many()
+            .col_expr(
+                hook_run::Column::QueuedAt,
+                Expr::value(None::<DateTimeWithTimeZone>),
+            )
+            .filter(hook_run::Column::Id.eq(immediate.id.as_str()))
+            .exec(&store.database_connection())
+            .await
+            .unwrap();
+        assert_eq!(
+            store.next_hook_recovery_deadline(10_000).await.unwrap(),
+            Some(0)
+        );
+        assert!(
+            !store
+                .list_recoverable_hook_runs(recovery_scan(1))
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]

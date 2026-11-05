@@ -3163,6 +3163,8 @@ pub(crate) async fn process_due_agent_action_outbox(
 
 #[derive(Debug, Default)]
 pub(crate) struct AgentActionOutboxProcessingBatch {
+    /// Continue from the raw claim quantum, not the number of dispatched rows.
+    pub has_more: bool,
     pub delivered: usize,
     pub errors: Vec<anyhow::Error>,
 }
@@ -3175,11 +3177,12 @@ pub(super) async fn process_claimed_agent_action_outbox<C, F, Fut>(
     mut dispatch: F,
 ) -> AgentActionOutboxProcessingBatch
 where
-    C: sea_orm::ConnectionTrait,
+    C: pioneer_crud::GatewayControlConnection,
     F: FnMut(pioneer_entity::agent_action_outbox::Model) -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<AgentActionOutboxDispatch>>,
 {
     let mut output = AgentActionOutboxProcessingBatch {
+        has_more: batch.has_more,
         delivered: 0,
         errors: batch.errors,
     };

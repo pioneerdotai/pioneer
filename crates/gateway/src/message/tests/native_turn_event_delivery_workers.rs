@@ -857,6 +857,12 @@ async fn empty_delivery_owners_and_projection_cycles_do_not_repeat_deadline_quer
     );
     processor.release_completed_history_preparation_barrier();
     processor.arm_completed_history_preparation_barrier("__event_delivery_recovery_before_kick__");
+    // Empty owners now wait for a source invalidation instead of a timer.
+    processor
+        .crud_store
+        .database_connection()
+        .work_signal("projection")
+        .notify();
     timeout(
         Duration::from_secs(10),
         processor.wait_for_completed_history_preparation_barrier(),

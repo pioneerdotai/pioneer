@@ -321,3 +321,15 @@ pub(crate) async fn defer_failed_claim(
         TaskRunOccurrenceClaimDeferral::StateChanged
     })
 }
+
+pub(crate) async fn next_deadline<C: ConnectionTrait>(db: &C) -> Result<Option<i64>> {
+    use sea_orm::QueryOrder;
+    Ok(pending::Entity::find()
+        .select_only()
+        .column(pending::Column::NextAttemptAt)
+        .order_by_asc(pending::Column::NextAttemptAt)
+        .limit(1)
+        .into_tuple::<i64>()
+        .one(db)
+        .await?)
+}

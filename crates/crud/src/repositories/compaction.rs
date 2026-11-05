@@ -1549,7 +1549,7 @@ pub(crate) async fn compaction_finish<C: ConnectionTrait>(
     id: &str,
     status: &str,
     outcome: &str,
-) -> Result<()> {
+) -> Result<bool> {
     ensure!(
         ["failed", "cancelled", "stale"].contains(&status),
         "invalid terminal transition"
@@ -1558,7 +1558,7 @@ pub(crate) async fn compaction_finish<C: ConnectionTrait>(
         outcome.len() <= 128,
         "outcome must be a bounded classification"
     );
-    compaction_operation::Entity::update_many()
+    let changed = compaction_operation::Entity::update_many()
         .col_expr(
             compaction_operation::Column::Status,
             Expr::Value(status.into()),
@@ -1574,7 +1574,7 @@ pub(crate) async fn compaction_finish<C: ConnectionTrait>(
         )
         .exec(db)
         .await?;
-    Ok(())
+    Ok(changed.rows_affected > 0)
 }
 
 /// Saves complete intermediate results without publishing a working pointer.

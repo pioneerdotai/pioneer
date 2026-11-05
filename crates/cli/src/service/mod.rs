@@ -13,7 +13,9 @@ pub const SERVICE_MODE_ARG: &str = "gateway-service";
 
 pub(crate) struct ServiceSettings {
     pub service_name: String,
+    #[cfg(target_os = "macos")]
     pub legacy_service_names: Vec<String>,
+    #[cfg(target_os = "macos")]
     pub macos_associated_bundle_identifier: String,
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub managed_by: InstallManagedBy,
@@ -122,11 +124,13 @@ impl GatewayServiceRegistration {
 
 // LaunchAgent/systemd definitions are restored as bytes at their original path.
 // Keep the absent case explicit so recovery never invents a registration.
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
 pub(super) struct ServiceDefinitionBackup {
     path: PathBuf,
     contents: Option<(Vec<u8>, std::fs::Permissions)>,
 }
 
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
 impl ServiceDefinitionBackup {
     pub(super) fn capture(path: PathBuf) -> Result<Self> {
         let contents = match std::fs::symlink_metadata(&path) {
@@ -362,7 +366,9 @@ fn load_service_settings_from_config(config: &AppConfig) -> Result<ServiceSettin
     config.runtime_home_dir()?;
     Ok(ServiceSettings {
         service_name,
+        #[cfg(target_os = "macos")]
         legacy_service_names,
+        #[cfg(target_os = "macos")]
         macos_associated_bundle_identifier: config
             .install
             .macos_associated_bundle_identifier

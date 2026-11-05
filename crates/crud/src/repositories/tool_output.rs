@@ -29,7 +29,11 @@ pub(crate) async fn record_tool_output(
         metadata: Set(metadata),
         ..Default::default()
     };
-    store
+    let change = store
+        .connection
+        .work_signal("maintenance.portable")
+        .changing();
+    let result = store
         .run_serialized_write(|| {
             let row = row.clone();
             async move {
@@ -75,6 +79,7 @@ pub(crate) async fn record_tool_output(
                         .is_some(),
                     "tool output turn mismatch"
                 );
+                let inserted;
                 if let Some(actual) = tool_output_chunk::Entity::find()
                     .select_only()
                     .columns([
@@ -86,17 +91,23 @@ pub(crate) async fn record_tool_output(
                     .one(&tx)
                     .await?
                 {
+                    inserted = false;
                     if expected != Some(actual) {
                         return Err(portable_payload::PreflightRace.into());
                     }
                 } else {
                     tool_output_chunk::Entity::insert(row).exec(&tx).await?;
+                    inserted = true;
                 }
                 tx.commit().await?;
-                Ok(())
+                Ok(inserted)
             }
         })
-        .await
+        .await;
+    if let Ok(inserted) = &result {
+        change.completed(*inserted);
+    }
+    result.map(|_| ())
 }
 /// Bounded ordered chunks; caller releases reader capacity before rendering.
 pub(crate) async fn tool_output_page(

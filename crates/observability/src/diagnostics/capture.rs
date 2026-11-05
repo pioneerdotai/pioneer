@@ -4,7 +4,7 @@ use super::{
 };
 use crate::{
     identity::{monotonic_ms, unix_ms},
-    resources::{ChildRegistration, ChildRole, read_process},
+    resources::{ChildRegistration, ChildRole},
     symbols::ModuleIdentity,
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -1340,7 +1340,7 @@ fn child_module(
             Path::new(std::str::from_utf8(path.to_bytes())?),
             || allowed(epoch, stop, cancel),
         )?;
-        let os = read_process(pid)?;
+        let os = crate::resources::read_process(pid)?;
         ensure!(
             os.main_module_id.as_ref() == Some(&module.module_id),
             "mapped executable UUID differs from file; symbols cannot be attested"
@@ -3068,7 +3068,7 @@ mod fake_tool_tests {
             -1
         );
         assert!(temp.path().join("partial.txt").is_file());
-        assert!(read_process(std::process::id()).is_ok());
+        assert!(crate::resources::read_process(std::process::id()).is_ok());
     }
     #[test]
     fn oversized_output_is_retained_as_bounded_partial_not_completed() {

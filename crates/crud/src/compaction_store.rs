@@ -35,10 +35,18 @@ impl CrudStore {
         workspace: &str,
         thread: &str,
     ) -> Result<bool> {
-        self.run_scoped_database_quantum(|| {
-            repositories::compaction_preparation::quantum(self, workspace, thread)
-        })
-        .await
+        let change = self.connection.work_signal("compaction").changing();
+        let result = async {
+            self.run_scoped_database_quantum(|| {
+                repositories::compaction_preparation::quantum(self, workspace, thread)
+            })
+            .await
+        }
+        .await;
+        if let Ok((_, changed)) = &result {
+            change.completed(*changed);
+        }
+        result.map(|(ready, _)| ready)
     }
 
     pub async fn compaction_history_prepared(&self, workspace: &str, thread: &str) -> Result<bool> {
@@ -210,7 +218,15 @@ impl CrudStore {
         thread: &str,
         snapshot: &OperationSnapshot,
     ) -> Result<OperationRecord> {
-        repositories::compaction::compaction_admit(self, workspace, thread, snapshot).await
+        let change = self.connection.work_signal("compaction").changing();
+        let result = async {
+            repositories::compaction::compaction_admit(self, workspace, thread, snapshot).await
+        }
+        .await;
+        if result.is_ok() {
+            change.completed(true);
+        }
+        result
     }
     pub async fn compaction_admit_for_turn(
         &self,
@@ -219,14 +235,22 @@ impl CrudStore {
         snapshot: &OperationSnapshot,
         execution_turn: Option<&str>,
     ) -> Result<OperationRecord> {
-        repositories::compaction::compaction_admit_for_turn(
-            self,
-            workspace,
-            thread,
-            snapshot,
-            execution_turn,
-        )
-        .await
+        let change = self.connection.work_signal("compaction").changing();
+        let result = async {
+            repositories::compaction::compaction_admit_for_turn(
+                self,
+                workspace,
+                thread,
+                snapshot,
+                execution_turn,
+            )
+            .await
+        }
+        .await;
+        if result.is_ok() {
+            change.completed(true);
+        }
+        result
     }
     pub async fn compaction_operation_for_plan(
         &self,
@@ -327,18 +351,49 @@ impl CrudStore {
         transient_retry: bool,
         correction: bool,
     ) -> Result<bool> {
-        repositories::compaction::compaction_claim_attempt(
-            &self.connection,
-            id,
-            expected_attempts,
-            now_ms,
-            transient_retry,
-            correction,
-        )
-        .await
+        let change = self.connection.work_signal("compaction").changing();
+        let result = async {
+            repositories::compaction::compaction_claim_attempt(
+                &self.connection,
+                id,
+                expected_attempts,
+                now_ms,
+                transient_retry,
+                correction,
+            )
+            .await
+        }
+        .await;
+        if let Ok(changed) = &result {
+            change.completed(*changed);
+        }
+        result
     }
     pub async fn compaction_finish(&self, id: &str, status: &str, outcome: &str) -> Result<()> {
-        repositories::compaction::compaction_finish(&self.connection, id, status, outcome).await
+        let change = self.connection.work_signal("compaction").changing();
+        let result = async {
+            let maintenance_changes = [
+                self.connection.work_signal("maintenance.frozen").changing(),
+                self.connection.work_signal("maintenance.html").changing(),
+            ];
+            let maintenance_result = async {
+                repositories::compaction::compaction_finish(&self.connection, id, status, outcome)
+                    .await
+            }
+            .await;
+            let maintenance_changed = matches!(&maintenance_result, Ok(true));
+            if maintenance_result.is_ok() {
+                for change in maintenance_changes {
+                    change.completed(maintenance_changed);
+                }
+            }
+            maintenance_result
+        }
+        .await;
+        if let Ok(changed) = &result {
+            change.completed(*changed);
+        }
+        result.map(|_| ())
     }
     /// Saves complete intermediate results without publishing a working pointer.
     pub async fn compaction_save_candidate(
@@ -346,7 +401,15 @@ impl CrudStore {
         checkpoint: &Checkpoint,
         portion: i64,
     ) -> Result<()> {
-        repositories::compaction::compaction_save_candidate(self, checkpoint, portion).await
+        let change = self.connection.work_signal("compaction").changing();
+        let result = async {
+            repositories::compaction::compaction_save_candidate(self, checkpoint, portion).await
+        }
+        .await;
+        if result.is_ok() {
+            change.completed(true);
+        }
+        result
     }
     /// Read bounded historical coverage metadata without loading summary text.
     pub async fn compaction_checkpoint_edges(&self, id: &str) -> Result<Option<CheckpointEdges>> {
@@ -376,8 +439,22 @@ impl CrudStore {
         expected_head: Option<&str>,
         assertions: &[SourceAssertion],
     ) -> Result<CommitOutcome> {
-        repositories::compaction::compaction_apply(self, checkpoint, expected_head, assertions)
-            .await
+        let maintenance_changes = [
+            self.connection.work_signal("maintenance.frozen").changing(),
+            self.connection.work_signal("maintenance.html").changing(),
+        ];
+        let maintenance_result = async {
+            repositories::compaction::compaction_apply(self, checkpoint, expected_head, assertions)
+                .await
+        }
+        .await;
+        let maintenance_changed = matches!(&maintenance_result, Ok(CommitOutcome::Applied));
+        if maintenance_result.is_ok() {
+            for change in maintenance_changes {
+                change.completed(maintenance_changed);
+            }
+        }
+        maintenance_result
     }
     /// Bounded Unicode-safe reads of very large canonical payloads. Revision is
     /// maintained atomically by source-table triggers, including deletes/reinserts.
@@ -622,14 +699,22 @@ impl CrudStore {
         turn: &str,
         descriptor: &str,
     ) -> Result<()> {
-        repositories::compaction::background::compaction_enqueue_native_history_check(
-            &self.connection,
-            workspace,
-            thread,
-            turn,
-            descriptor,
-        )
-        .await
+        let change = self.connection.work_signal("compaction").changing();
+        let result = async {
+            repositories::compaction::background::compaction_enqueue_native_history_check(
+                &self.connection,
+                workspace,
+                thread,
+                turn,
+                descriptor,
+            )
+            .await
+        }
+        .await;
+        if let Ok(value) = &result {
+            change.completed(*value);
+        }
+        result.map(|_| ())
     }
     /// Bookkeeping has Maintenance reads and writes even on a request handle.
     /// Call seed and ordinary scopes at most once each per shared quantum.
@@ -672,8 +757,19 @@ impl CrudStore {
         event: Option<CanonicalTurnEventPayload>,
         timestamp_secs: i64,
     ) -> Result<bool> {
+        let changes = [
+            "gateway.control",
+            "projection",
+            "compaction",
+            "maintenance.zstd",
+            "maintenance.receipts",
+            "maintenance.native",
+            "maintenance.frozen",
+            "maintenance.html",
+        ]
+        .map(|domain| self.connection.work_signal(domain).changing());
         let maintenance = self.with_maintenance_access();
-        repositories::portable_payload::after_database_owners(
+        let result = repositories::portable_payload::after_database_owners(
             repositories::compaction::lifecycle::repair_lifecycle(
                 &maintenance,
                 prepared,
@@ -681,7 +777,13 @@ impl CrudStore {
                 timestamp_secs,
             ),
         )
-        .await
+        .await;
+        if let Ok((_, changed)) = &result {
+            for change in changes {
+                change.completed(*changed);
+            }
+        }
+        result.map(|(acknowledged, _)| acknowledged)
     }
     /// A newer execution invalidates an optional older check. Inspect one
     /// locator at a time rather than bulk-updating a thread's retained history.
@@ -790,15 +892,29 @@ impl CrudStore {
         imports: u64,
         imports_sha256: &str,
     ) -> Result<()> {
-        repositories::compaction::frozen::compaction_begin_frozen_history_with_imports(
-            &self.connection,
-            workspace,
-            owner_thread,
-            descriptor,
-            imports,
-            imports_sha256,
-        )
-        .await
+        let maintenance_changes = [
+            self.connection.work_signal("maintenance.frozen").changing(),
+            self.connection.work_signal("maintenance.html").changing(),
+        ];
+        let maintenance_result = async {
+            repositories::compaction::frozen::compaction_begin_frozen_history_with_imports(
+                &self.connection,
+                workspace,
+                owner_thread,
+                descriptor,
+                imports,
+                imports_sha256,
+            )
+            .await
+        }
+        .await;
+        let maintenance_changed = maintenance_result.is_ok();
+        if maintenance_result.is_ok() {
+            for change in maintenance_changes {
+                change.completed(maintenance_changed);
+            }
+        }
+        maintenance_result
     }
     /// The prepared JSON contains typed references and hashes only. Before DB
     /// admission it is validated and bounded; the transaction revalidates the
@@ -811,15 +927,29 @@ impl CrudStore {
         start: u64,
         messages: &[FrozenMessageRef],
     ) -> Result<()> {
-        repositories::compaction::frozen::compaction_append_frozen_history(
-            self,
-            workspace,
-            owner_thread,
-            manifest,
-            start,
-            messages,
-        )
-        .await
+        let maintenance_changes = [
+            self.connection.work_signal("maintenance.frozen").changing(),
+            self.connection.work_signal("maintenance.html").changing(),
+        ];
+        let maintenance_result = async {
+            repositories::compaction::frozen::compaction_append_frozen_history(
+                self,
+                workspace,
+                owner_thread,
+                manifest,
+                start,
+                messages,
+            )
+            .await
+        }
+        .await;
+        let maintenance_changed = maintenance_result.is_ok();
+        if maintenance_result.is_ok() {
+            for change in maintenance_changes {
+                change.completed(maintenance_changed);
+            }
+        }
+        maintenance_result
     }
     /// Ready is published only after the bounded writer has filled all exact
     /// ordinals. The content digest is checked by the caller before this CAS.
@@ -845,23 +975,40 @@ impl CrudStore {
         owner: &str,
         descriptor: &FrozenHistoryRef,
     ) -> Result<crate::FrozenReadHold> {
-        self.run_serialized_write(|| async {
-            use sea_orm::TransactionTrait;
-            let tx = self.connection.begin().await?;
-            anyhow::ensure!(
-                repositories::compaction::frozen::compaction_finish_frozen_history(
-                    &tx, workspace, owner, descriptor
-                )
-                .await?,
-                "frozen history publication failed"
-            );
-            crate::frozen_lifetime::exact_header(&tx, workspace, descriptor).await?;
-            let hold =
-                crate::FrozenReadHold::register(&self.frozen_readers, &descriptor.manifest_id);
-            tx.commit().await?;
-            Ok(hold)
-        })
-        .await
+        let maintenance_changes = [
+            self.connection.work_signal("maintenance.frozen").changing(),
+            self.connection.work_signal("maintenance.html").changing(),
+        ];
+        let maintenance_result = async {
+            self.run_serialized_write(|| async {
+                use sea_orm::TransactionTrait;
+                let tx = self.connection.begin().await?;
+                anyhow::ensure!(
+                    repositories::compaction::frozen::compaction_finish_frozen_history(
+                        &tx, workspace, owner, descriptor
+                    )
+                    .await?,
+                    "frozen history publication failed"
+                );
+                crate::frozen_lifetime::exact_header(&tx, workspace, descriptor).await?;
+                let hold = crate::FrozenReadHold::register_on(
+                    &self.frozen_readers,
+                    &descriptor.manifest_id,
+                    &self.connection,
+                );
+                tx.commit().await?;
+                Ok(hold)
+            })
+            .await
+        }
+        .await;
+        let maintenance_changed = maintenance_result.is_ok();
+        if maintenance_result.is_ok() {
+            for change in maintenance_changes {
+                change.completed(maintenance_changed);
+            }
+        }
+        maintenance_result
     }
     pub async fn compaction_frozen_history_owner(
         &self,
@@ -1000,10 +1147,24 @@ impl CrudStore {
         start: u64,
         imports: &[(u64, PreparedFrozenImport)],
     ) -> Result<()> {
-        repositories::compaction::frozen_import::compaction_append_frozen_imports(
-            self, workspace, owner, manifest, start, imports,
-        )
-        .await
+        let maintenance_changes = [
+            self.connection.work_signal("maintenance.frozen").changing(),
+            self.connection.work_signal("maintenance.html").changing(),
+        ];
+        let maintenance_result = async {
+            repositories::compaction::frozen_import::compaction_append_frozen_imports(
+                self, workspace, owner, manifest, start, imports,
+            )
+            .await
+        }
+        .await;
+        let maintenance_changed = maintenance_result.is_ok();
+        if maintenance_result.is_ok() {
+            for change in maintenance_changes {
+                change.completed(maintenance_changed);
+            }
+        }
+        maintenance_result
     }
     pub async fn compaction_frozen_import_state(
         &self,
@@ -1131,14 +1292,28 @@ impl CrudStore {
         source: &SourceRef,
         event: &crate::CanonicalTurnEventPayload,
     ) -> Result<bool> {
-        repositories::compaction::history::compaction_record_event_projection(
-            &self.connection,
-            workspace,
-            thread,
-            source,
-            event,
-        )
-        .await
+        let maintenance_changes = [
+            self.connection.work_signal("maintenance.frozen").changing(),
+            self.connection.work_signal("maintenance.html").changing(),
+        ];
+        let maintenance_result = async {
+            repositories::compaction::history::compaction_record_event_projection(
+                &self.connection,
+                workspace,
+                thread,
+                source,
+                event,
+            )
+            .await
+        }
+        .await;
+        let maintenance_changed = maintenance_result.as_ref().is_ok_and(|changed| *changed);
+        if maintenance_result.is_ok() {
+            for change in maintenance_changes {
+                change.completed(maintenance_changed);
+            }
+        }
+        maintenance_result
     }
     /// Exact command/outcome relationship for a canonical delivered result.
     /// This is a point metadata query: neither matching text nor a delivered
@@ -1288,10 +1463,18 @@ impl CrudStore {
         owner: &str,
         turn: &str,
     ) -> Result<()> {
-        repositories::compaction::lifecycle::compaction_stop_execution(
-            self, workspace, thread, owner, turn,
-        )
-        .await
+        let change = self.connection.work_signal("compaction").changing();
+        let result = async {
+            repositories::compaction::lifecycle::compaction_stop_execution(
+                self, workspace, thread, owner, turn,
+            )
+            .await
+        }
+        .await;
+        if let Ok(value) = &result {
+            change.completed(*value);
+        }
+        result.map(|_| ())
     }
     pub async fn compaction_materialize_lifecycle(
         &self,
@@ -1300,7 +1483,18 @@ impl CrudStore {
         event: CanonicalTurnEventPayload,
         timestamp_secs: i64,
     ) -> Result<()> {
-        repositories::portable_payload::after_database_owners(
+        let changes = [
+            "gateway.control",
+            "projection",
+            "compaction",
+            "maintenance.zstd",
+            "maintenance.receipts",
+            "maintenance.native",
+            "maintenance.frozen",
+            "maintenance.html",
+        ]
+        .map(|domain| self.connection.work_signal(domain).changing());
+        let result = repositories::portable_payload::after_database_owners(
             repositories::compaction::lifecycle::compaction_materialize_lifecycle(
                 self,
                 operation,
@@ -1309,7 +1503,13 @@ impl CrudStore {
                 timestamp_secs,
             ),
         )
-        .await
+        .await;
+        if let Ok(changed) = &result {
+            for change in changes {
+                change.completed(*changed);
+            }
+        }
+        result.map(|_| ())
     }
     /// Manifest admission contains metadata only and resumes in bounded batches.
     /// No provider may run until activate_runner has checked the whole manifest.
@@ -1323,12 +1523,20 @@ impl CrudStore {
         .await
     }
     pub async fn compaction_bind_execution_turn(&self, operation: &str, turn: &str) -> Result<()> {
-        repositories::compaction::runner::compaction_bind_execution_turn(
-            &self.connection,
-            operation,
-            turn,
-        )
-        .await
+        let change = self.connection.work_signal("compaction").changing();
+        let result = async {
+            repositories::compaction::runner::compaction_bind_execution_turn(
+                &self.connection,
+                operation,
+                turn,
+            )
+            .await
+        }
+        .await;
+        if let Ok(changed) = &result {
+            change.completed(*changed);
+        }
+        result.map(|_| ())
     }
     pub async fn compaction_prepare_runner(
         &self,
@@ -1337,14 +1545,22 @@ impl CrudStore {
         source_count: u64,
         reference_count: u64,
     ) -> Result<()> {
-        repositories::compaction::runner::compaction_prepare_runner(
-            &self.connection,
-            operation,
-            budget,
-            source_count,
-            reference_count,
-        )
-        .await
+        let change = self.connection.work_signal("compaction").changing();
+        let result = async {
+            repositories::compaction::runner::compaction_prepare_runner(
+                &self.connection,
+                operation,
+                budget,
+                source_count,
+                reference_count,
+            )
+            .await
+        }
+        .await;
+        if let Ok(changed) = &result {
+            change.completed(*changed);
+        }
+        result.map(|_| ())
     }
     pub async fn compaction_runner_plan(
         &self,
@@ -1371,7 +1587,16 @@ impl CrudStore {
         operation: &str,
         initial: &RunnerState,
     ) -> Result<()> {
-        repositories::compaction::runner::compaction_activate_runner(self, operation, initial).await
+        let change = self.connection.work_signal("compaction").changing();
+        let result = async {
+            repositories::compaction::runner::compaction_activate_runner(self, operation, initial)
+                .await
+        }
+        .await;
+        if let Ok(changed) = &result {
+            change.completed(*changed);
+        }
+        result.map(|_| ())
     }
     pub async fn compaction_runner_state(&self, operation: &str) -> Result<Option<RunnerState>> {
         repositories::compaction::runner::compaction_runner_state(&self.connection, operation).await
@@ -1416,15 +1641,37 @@ impl CrudStore {
         status: &str,
         outcome: &str,
     ) -> Result<()> {
-        repositories::compaction::runner::compaction_finish_execution(
-            &self.connection,
-            operation,
-            execution_turn,
-            deadline_ms,
-            status,
-            outcome,
-        )
-        .await
+        let change = self.connection.work_signal("compaction").changing();
+        let result = async {
+            let maintenance_changes = [
+                self.connection.work_signal("maintenance.frozen").changing(),
+                self.connection.work_signal("maintenance.html").changing(),
+            ];
+            let maintenance_result = async {
+                repositories::compaction::runner::compaction_finish_execution(
+                    &self.connection,
+                    operation,
+                    execution_turn,
+                    deadline_ms,
+                    status,
+                    outcome,
+                )
+                .await
+            }
+            .await;
+            let maintenance_changed = matches!(&maintenance_result, Ok(true));
+            if maintenance_result.is_ok() {
+                for change in maintenance_changes {
+                    change.completed(maintenance_changed);
+                }
+            }
+            maintenance_result
+        }
+        .await;
+        if let Ok(value) = &result {
+            change.completed(*value);
+        }
+        result.map(|_| ())
     }
 
     /// Complete the state record after a control-plane terminal fence. No
@@ -1434,7 +1681,17 @@ impl CrudStore {
         &self,
         operation: &str,
     ) -> Result<Option<RunnerState>> {
-        repositories::compaction::runner::compaction_reconcile_runner_state(self, operation).await
+        let changes = ["compaction", "maintenance.frozen", "maintenance.html"]
+            .map(|domain| self.connection.work_signal(domain).changing());
+        let result =
+            repositories::compaction::runner::compaction_reconcile_runner_state(self, operation)
+                .await;
+        if let Ok((_, changed)) = &result {
+            for change in changes {
+                change.completed(*changed);
+            }
+        }
+        result.map(|(state, _)| state)
     }
     pub async fn compaction_manifest_page(
         &self,
@@ -1461,10 +1718,18 @@ impl CrudStore {
         next: &RunnerState,
         candidate: Option<&Checkpoint>,
     ) -> Result<bool> {
-        repositories::compaction::runner::compaction_runner_transition(
-            self, operation, expected, next, candidate,
-        )
-        .await
+        let change = self.connection.work_signal("compaction").changing();
+        let result = async {
+            repositories::compaction::runner::compaction_runner_transition(
+                self, operation, expected, next, candidate,
+            )
+            .await
+        }
+        .await;
+        if let Ok(changed) = &result {
+            change.completed(*changed);
+        }
+        result
     }
     pub(crate) async fn prepare_checkpoint_ancestry(
         &self,
@@ -1488,13 +1753,35 @@ impl CrudStore {
         state: &RunnerState,
         expected_head: Option<&str>,
     ) -> Result<CommitOutcome> {
-        repositories::compaction::runner::compaction_apply_runner(
-            self,
-            operation,
-            state,
-            expected_head,
-        )
-        .await
+        let change = self.connection.work_signal("compaction").changing();
+        let result = async {
+            let maintenance_changes = [
+                self.connection.work_signal("maintenance.frozen").changing(),
+                self.connection.work_signal("maintenance.html").changing(),
+            ];
+            let maintenance_result = async {
+                repositories::compaction::runner::compaction_apply_runner(
+                    self,
+                    operation,
+                    state,
+                    expected_head,
+                )
+                .await
+            }
+            .await;
+            let maintenance_changed = matches!(&maintenance_result, Ok(CommitOutcome::Applied));
+            if maintenance_result.is_ok() {
+                for change in maintenance_changes {
+                    change.completed(maintenance_changed);
+                }
+            }
+            maintenance_result
+        }
+        .await;
+        if result.is_ok() {
+            change.completed(matches!(&result, Ok(CommitOutcome::Applied)));
+        }
+        result
     }
     pub async fn compaction_bound_source_projection(
         &self,
@@ -1514,10 +1801,24 @@ impl CrudStore {
         operation: &str,
         descriptor: &FrozenHistoryRef,
     ) -> Result<()> {
-        repositories::compaction::source_projection::compaction_bind_source_projection(
-            self, operation, descriptor,
-        )
-        .await
+        let maintenance_changes = [
+            self.connection.work_signal("maintenance.frozen").changing(),
+            self.connection.work_signal("maintenance.html").changing(),
+        ];
+        let maintenance_result = async {
+            repositories::compaction::source_projection::compaction_bind_source_projection(
+                self, operation, descriptor,
+            )
+            .await
+        }
+        .await;
+        let maintenance_changed = maintenance_result.is_ok();
+        if maintenance_result.is_ok() {
+            for change in maintenance_changes {
+                change.completed(maintenance_changed);
+            }
+        }
+        maintenance_result
     }
     /// First accepted manifest wins across retries. This is one metadata write;
     /// source materialization/hashing occurred before acquiring the writer.
@@ -1529,13 +1830,35 @@ impl CrudStore {
         task_run_turn: &str,
         history: &FrozenHistoryRef,
     ) -> Result<TaskOutputSnapshot> {
-        repositories::compaction::task_output::compaction_record_task_output(
-            self,
-            workspace,
-            task_run_turn,
-            history,
-        )
-        .await
+        let change = self.connection.work_signal("compaction").changing();
+        let result = async {
+            let maintenance_changes = [
+                self.connection.work_signal("maintenance.frozen").changing(),
+                self.connection.work_signal("maintenance.html").changing(),
+            ];
+            let maintenance_result = async {
+                repositories::compaction::task_output::compaction_record_task_output(
+                    self,
+                    workspace,
+                    task_run_turn,
+                    history,
+                )
+                .await
+            }
+            .await;
+            let maintenance_changed = maintenance_result.is_ok();
+            if maintenance_result.is_ok() {
+                for change in maintenance_changes {
+                    change.completed(maintenance_changed);
+                }
+            }
+            maintenance_result
+        }
+        .await;
+        if result.is_ok() {
+            change.completed(true);
+        }
+        result
     }
     /// Point metadata read with the complete retained Task/turn relationship.
     /// No result payload or mutable current child transcript is loaded.
@@ -1620,45 +1943,59 @@ impl CrudStore {
         messages: &[pioneer_compaction::frozen::FrozenMessageRef],
         imports: &[(u64, PreparedFrozenImport)],
     ) -> Result<(u64, u64)> {
-        let refs = messages
-            .iter()
-            .map(serde_json::to_string)
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        let proofs = imports
-            .iter()
-            .map(|(ordinal, p)| serde_json::to_string(&p.record_at(*ordinal)))
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        let messages = repositories::compaction_frozen_storage::prepare(
-            self, workspace, owner, manifest, 0, &refs,
-        )
-        .await?;
-        let imports = repositories::compaction_frozen_storage::prepare(
-            self, workspace, owner, manifest, 1, &proofs,
-        )
-        .await?;
-        use pioneer_entity::compaction_frozen_layout as layout;
-        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QuerySelect, QueryTrait};
-        let registered = |kind| {
-            sea_orm::sea_query::Expr::exists(
-                layout::Entity::find()
-                    .select_only()
-                    .column(layout::Column::ManifestId)
-                    .filter(layout::Column::ManifestId.eq(manifest))
-                    .filter(layout::Column::Kind.eq(kind))
-                    .into_query(),
+        let maintenance_changes = [
+            self.connection.work_signal("maintenance.frozen").changing(),
+            self.connection.work_signal("maintenance.html").changing(),
+        ];
+        let maintenance_result = async {
+            let refs = messages
+                .iter()
+                .map(serde_json::to_string)
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let proofs = imports
+                .iter()
+                .map(|(ordinal, p)| serde_json::to_string(&p.record_at(*ordinal)))
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let messages = repositories::compaction_frozen_storage::prepare(
+                self, workspace, owner, manifest, 0, &refs,
             )
-        };
-        pioneer_entity::compaction_frozen_history::Entity::update_many()
-            .col_expr(
-                pioneer_entity::compaction_frozen_history::Column::StorageRegistered,
-                sea_orm::sea_query::Expr::val(1_i64),
-            )
-            .filter(pioneer_entity::compaction_frozen_history::Column::Id.eq(manifest))
-            .filter(registered(0))
-            .filter(registered(1))
-            .exec(&self.connection)
             .await?;
-        Ok((messages, imports))
+            let imports = repositories::compaction_frozen_storage::prepare(
+                self, workspace, owner, manifest, 1, &proofs,
+            )
+            .await?;
+            use pioneer_entity::compaction_frozen_layout as layout;
+            use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QuerySelect, QueryTrait};
+            let registered = |kind| {
+                sea_orm::sea_query::Expr::exists(
+                    layout::Entity::find()
+                        .select_only()
+                        .column(layout::Column::ManifestId)
+                        .filter(layout::Column::ManifestId.eq(manifest))
+                        .filter(layout::Column::Kind.eq(kind))
+                        .into_query(),
+                )
+            };
+            pioneer_entity::compaction_frozen_history::Entity::update_many()
+                .col_expr(
+                    pioneer_entity::compaction_frozen_history::Column::StorageRegistered,
+                    sea_orm::sea_query::Expr::val(1_i64),
+                )
+                .filter(pioneer_entity::compaction_frozen_history::Column::Id.eq(manifest))
+                .filter(registered(0))
+                .filter(registered(1))
+                .exec(&self.connection)
+                .await?;
+            Ok((messages, imports))
+        }
+        .await;
+        let maintenance_changed = maintenance_result.is_ok();
+        if maintenance_result.is_ok() {
+            for change in maintenance_changes {
+                change.completed(maintenance_changed);
+            }
+        }
+        maintenance_result
     }
     pub async fn compact_frozen_storage_quantum(
         &self,
@@ -1670,6 +2007,39 @@ impl CrudStore {
 }
 
 impl CrudStore {
+    pub async fn next_compaction_background_deadline(
+        &self,
+        owned: &[(String, String)],
+    ) -> Result<Option<i64>> {
+        let history = if owned.len() >= 16 {
+            None
+        } else {
+            repositories::compaction::background::next_history_deadline(&self.connection, owned)
+                .await?
+        };
+        let lifecycle =
+            repositories::compaction_lifecycle_pending::next_deadline(&self.connection).await?;
+        Ok(history.into_iter().chain(lifecycle).min().map(|ms| {
+            ms.div_euclid(1000)
+                .saturating_add(i64::from(ms.rem_euclid(1000) != 0))
+        }))
+    }
+
+    pub async fn compaction_due_history_checks_excluding(
+        &self,
+        now: i64,
+        owned: &[(String, String)],
+    ) -> Result<Vec<CompletedHistoryCheck>> {
+        if owned.len() >= 16 {
+            return Ok(Vec::new());
+        }
+        repositories::compaction::background::compaction_due_history_checks_excluding(
+            &self.connection,
+            now,
+            owned,
+        )
+        .await
+    }
     pub async fn compaction_due_history_checks(
         &self,
         now: i64,
@@ -1712,11 +2082,20 @@ impl CrudStore {
         diagnostic: &crate::compaction::HistoryCheckDiagnostic,
         now: i64,
     ) -> Result<bool> {
-        // Serialize before database admission. No history, output or raw error.
-        let json = serde_json::to_string(diagnostic)?;
-        repositories::compaction::background::record_history_result(
-            self, id, revision, failures, outcome, &json, now,
-        )
-        .await
+        let change = self.connection.work_signal("compaction").changing();
+        let result = async {
+            // Serialize before database admission. No history, output or raw error.
+            let json = serde_json::to_string(diagnostic)?;
+            repositories::compaction::background::record_history_result(
+                self, id, revision, failures, outcome, &json, now,
+            )
+            .await
+        }
+        .await;
+        if let Ok(value) = &result {
+            let _ = value;
+            change.completed(*value);
+        }
+        result
     }
 }

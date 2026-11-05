@@ -301,11 +301,11 @@ impl MessageProcessor {
 
     pub(super) async fn process_due_task_deliveries(&self, now: i64, limit: u64) -> Result<()> {
         let task_service = self.task_runtime.background_control_service();
-        if task_service
+        let recovery_error = task_service
             .recover_stuck_deliveries(now, limit)
             .await
-            .is_err()
-        {
+            .err();
+        if recovery_error.is_some() {
             warn!(
                 failure_class = "task_delivery_recovery_gateway_discovery_failed",
                 "delivery recovery unavailable; continuing independent due deliveries"
@@ -357,6 +357,9 @@ impl MessageProcessor {
                     .await
                     .map_err(|error| anyhow!("{error:#}"))?;
             }
+        }
+        if let Some(error) = recovery_error {
+            return Err(anyhow!("{error:#}"));
         }
         Ok(())
     }

@@ -13,11 +13,10 @@ pub(crate) const DESKTOP_UPDATE_STAGING_DIR: &str = "staging";
 pub(crate) const DESKTOP_UPDATE_PLAN_FILE: &str = "plan.json";
 pub(crate) const DESKTOP_UPDATE_PLAN_SCHEMA_VERSION: u32 = 2;
 pub(crate) const DESKTOP_UPDATE_ATTEMPT_ID_LEN: usize = 21;
-pub(crate) const DESKTOP_UPDATE_HELPER_NAME: &str = "pioneer-app-updater";
 #[cfg(windows)]
 pub(crate) const DESKTOP_UPDATE_HELPER_EXE_NAME: &str = "pioneer-app-updater.exe";
 #[cfg(not(windows))]
-pub(crate) const DESKTOP_UPDATE_HELPER_EXE_NAME: &str = DESKTOP_UPDATE_HELPER_NAME;
+pub(crate) const DESKTOP_UPDATE_HELPER_EXE_NAME: &str = "pioneer-app-updater";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DesktopUpdatePlanInput {

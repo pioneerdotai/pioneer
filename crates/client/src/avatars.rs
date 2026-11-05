@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use pioneer_protocol::{AuthSessionId, GatewayId, PROFILE_AVATAR_MAX_DECODED_BYTES};
 pub use pioneer_protocol::{MemberSummary, PrincipalId, ProfileAvatarMediaType};
 use sha2::{Digest, Sha256};
-use tokio::fs::{self, File, OpenOptions};
+use tokio::fs::{self, OpenOptions};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -556,7 +556,7 @@ async fn persist_atomically(
 
 #[cfg(unix)]
 async fn sync_cache_directory(path: &Path) -> Result<(), AvatarCacheError> {
-    File::open(path)
+    fs::File::open(path)
         .await
         .map_err(|_| AvatarCacheError::Disk)?
         .sync_all()

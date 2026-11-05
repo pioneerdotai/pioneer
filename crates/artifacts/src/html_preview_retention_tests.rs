@@ -398,10 +398,22 @@ async fn preview_release_after_owners(six_frames: bool) {
         }
     }
     assert!(rolled_back);
-    let copies: i64 = harness.store.database_connection().query_one_raw(
-        Statement::from_string(DbBackend::Sqlite, "SELECT COUNT(*) n FROM html_preview_io_work WHERE family='copies'")
-    ).await.unwrap().unwrap().try_get("", "n").unwrap();
-    assert_eq!(copies, 0, "release rollback must also roll back copy obligations");
+    let copies: i64 = harness
+        .store
+        .database_connection()
+        .query_one_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT COUNT(*) n FROM html_preview_io_work WHERE family='copies'",
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "n")
+        .unwrap();
+    assert_eq!(
+        copies, 0,
+        "release rollback must also roll back copy obligations"
+    );
 
     assert!(old_paths.iter().all(|p| p.exists()));
     let retained = harness
@@ -637,7 +649,7 @@ async fn html_preview_shared_blob_concurrent_ingestion_and_failed_deletion_resta
     );
 
     // A second source is orphaned by the production release path. Deletion
-    // failure keeps its blob row, so a fresh maintenance owner can retry it.
+    // failure keeps its blob row; the same owner must retry without a wake.
     let orphan = harness
         .service
         .ingest_bytes({
@@ -675,9 +687,42 @@ async fn html_preview_shared_blob_concurrent_ingestion_and_failed_deletion_resta
             .unwrap()
             .exists()
     );
+    // Finish the captured keysets with the same state. The earlier physical
+    // failure must prevent a successful empty result at EOF, even though the
+    // failed blob is now behind the cursor and the backend would succeed.
+    let mut retry_at_eof = false;
+    for _ in 0..128 {
+        match harness
+            .service
+            .html_preview_maintenance_quantum(&mut progress)
+            .await
+        {
+            Err(_) => {
+                retry_at_eof = true;
+                break;
+            }
+            Ok(false) => panic!("failed blob was forgotten at discovery EOF"),
+            Ok(true) => {}
+        }
+    }
+    assert!(
+        retry_at_eof,
+        "finite pass must reach retry/backoff boundary"
+    );
     storage.pause_once.store(true, Ordering::SeqCst);
-    let restarted = harness.service.clone();
-    let cleanup = tokio::spawn(async move { preview_maintenance(&restarted).await });
+    let resumed = harness.service.clone();
+    let cleanup = tokio::spawn(async move {
+        for _ in 0..128 {
+            if !resumed
+                .html_preview_maintenance_quantum(&mut progress)
+                .await
+                .unwrap()
+            {
+                return;
+            }
+        }
+        panic!("same owner failed to drain its retry pass");
+    });
     storage.entered.notified().await;
     let ingestion_service = harness.service.clone();
     let registration = tokio::spawn(async move {
@@ -1123,9 +1168,145 @@ async fn physical_copy_preparation_succeeds_with_disconnected_database() {
     let path = directory.join("frame.html");
     tokio::fs::write(&path, "retired frame").await.unwrap();
     let previous = json!({"htmlTool":{"retention":"released","releasedCopies":[path]}}).to_string();
-    let prepared = service.prepare_html_preview_copy_cleanup("ws_a", &previous)
-        .await.unwrap().unwrap();
+    let prepared = service
+        .prepare_html_preview_copy_cleanup("ws_a", &previous)
+        .await
+        .unwrap()
+        .unwrap();
     assert!(!path.exists());
     let metadata: serde_json::Value = serde_json::from_str(&prepared).unwrap();
     assert_eq!(metadata["htmlTool"]["releasedCopies"], json!([]));
+}
+
+#[tokio::test]
+async fn retirement_failure_retries_same_owner_after_eof_without_external_wake() {
+    let harness = preview_fixture().await;
+    let preview = harness
+        .service
+        .ingest_bytes(preview_request("input", b"retry retirement".to_vec()))
+        .await
+        .unwrap();
+    let db = harness.store.database_connection();
+    db.execute_unprepared("UPDATE turn SET status='completed' WHERE id='preview-turn'")
+        .await
+        .unwrap();
+    db.execute_unprepared("CREATE TRIGGER fail_single_retirement BEFORE DELETE ON artifact_version BEGIN SELECT RAISE(ABORT,'fixture retirement failure'); END").await.unwrap();
+    let mut progress = crate::HtmlPreviewMaintenanceProgress::default();
+    let mut failed = false;
+    for _ in 0..128 {
+        if harness
+            .service
+            .html_preview_maintenance_quantum(&mut progress)
+            .await
+            .is_err()
+        {
+            failed = true;
+            break;
+        }
+    }
+    assert!(failed);
+    db.execute_unprepared("DROP TRIGGER fail_single_retirement")
+        .await
+        .unwrap();
+    // DDL repair sends no domain wake. Retain the original cursors and drive
+    // only the owner's continuation/retry decisions until successful EOF.
+    let mut idle = false;
+    let mut eof_retry = false;
+    for _ in 0..256 {
+        match harness
+            .service
+            .html_preview_maintenance_quantum(&mut progress)
+            .await
+        {
+            Err(_) => eof_retry = true,
+            Ok(true) => {}
+            Ok(false) => {
+                idle = true;
+                break;
+            }
+        }
+    }
+    assert!(idle);
+    assert!(
+        eof_retry,
+        "uncertainty at EOF must request backoff before retry"
+    );
+    assert!(
+        harness
+            .store
+            .get_artifact_version_blob("ws_a", &preview.artifact.artifact_id, None)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn blob_retry_reaches_durable_deletion_while_activity_remains_held() {
+    let mut harness = preview_fixture().await;
+    let storage = Arc::new(PreviewDeletionGate {
+        local: LocalArtifactBlobStore::new(harness._temp.path()),
+        fail_once: AtomicBool::new(false),
+        pause_once: AtomicBool::new(false),
+        entered: Default::default(),
+        late_once: AtomicBool::new(false),
+        late_resume: Default::default(),
+        resume: Default::default(),
+    });
+    harness.service.blob_store = storage.clone();
+    harness.service.gc_policy.grace_secs = 0;
+    let preview = harness
+        .service
+        .ingest_bytes(preview_request("input", b"held retry orphan".to_vec()))
+        .await
+        .unwrap();
+    let blob = harness
+        .store
+        .get_artifact_version_blob("ws_a", &preview.artifact.artifact_id, None)
+        .await
+        .unwrap();
+    let path = storage.local.blob_path("ws_a", &blob.storage_key).unwrap();
+    harness
+        .store
+        .database_connection()
+        .execute_unprepared("UPDATE turn SET status='completed' WHERE id='preview-turn'")
+        .await
+        .unwrap();
+    storage.fail_once.store(true, Ordering::SeqCst);
+    let mut progress = crate::HtmlPreviewMaintenanceProgress::default();
+    let mut failed = false;
+    for _ in 0..128 {
+        if harness
+            .service
+            .html_preview_maintenance_quantum(&mut progress)
+            .await
+            .is_err()
+        {
+            failed = true;
+            break;
+        }
+    }
+    assert!(failed);
+    assert!(path.exists());
+    let activity = harness.service.html_preview_activity().await;
+    let mut retried = false;
+    for _ in 0..128 {
+        let _ = harness
+            .service
+            .html_preview_maintenance_outcome(&mut progress)
+            .await;
+        let count: i64 = harness.store.database_connection().query_one_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite, "SELECT COUNT(*) AS n FROM artifact_blob WHERE workspace_id='ws_a' AND storage_key=?",
+            [blob.storage_key.clone().into()],
+        )).await.unwrap().unwrap().try_get("", "n").unwrap();
+        if count == 0 {
+            retried = true;
+            break;
+        }
+    }
+    assert!(
+        retried,
+        "BlobGC must retry at its own EOF before activity release"
+    );
+    assert!(!path.exists());
+    drop(activity);
 }

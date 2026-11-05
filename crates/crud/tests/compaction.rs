@@ -6797,6 +6797,34 @@ async fn compaction_terminal_fence_reconciliation_persists_once_and_rejects_late
         )
         .await
         .unwrap();
+    for _ in 0..32 {
+        if store
+            .compaction_prepare_history_quantum("ws", "thread")
+            .await
+            .unwrap()
+        {
+            break;
+        }
+    }
+    assert!(
+        store
+            .compaction_history_prepared("ws", "thread")
+            .await
+            .unwrap()
+    );
+    let database = store.database_connection();
+    let mut prepared_wake = database.work_signal("compaction").subscribe();
+    prepared_wake.begin_pass(&database).await.unwrap();
+    assert!(
+        store
+            .compaction_prepare_history_quantum("ws", "thread")
+            .await
+            .unwrap()
+    );
+    assert!(
+        futures_util::FutureExt::now_or_never(prepared_wake.wait(None)).is_none(),
+        "an already prepared history is a read-only acknowledgement"
+    );
     let reference = store
         .compaction_source_page("ws", "thread", "turn", PagedSource::Event, 0)
         .await
@@ -6810,8 +6838,34 @@ async fn compaction_terminal_fence_reconciliation_persists_once_and_rejects_late
     ] {
         let op = admit_import_operation(&store, id, "thread", "turn").await;
         let initial = ready_import_operation(&store, &op, "thread", &reference).await;
-        store.compaction_finish(id, status, outcome).await.unwrap();
         let db = store.database_connection();
+        let mut replay = db.work_signal("compaction").subscribe();
+        replay.begin_pass(&db).await.unwrap();
+        store
+            .compaction_bind_execution_turn(id, "turn")
+            .await
+            .unwrap();
+        let budget = ModelBudget::new(None, None, None);
+        store
+            .compaction_prepare_runner(id, &budget, 1, 0)
+            .await
+            .unwrap();
+        let activation = pioneer_compaction::runner::RunnerState::new(
+            op.admission.deadline_ms,
+            &budget,
+            1000,
+            None,
+        )
+        .unwrap();
+        store
+            .compaction_activate_runner(id, &activation)
+            .await
+            .unwrap();
+        assert!(
+            futures_util::FutureExt::now_or_never(replay.wait(None)).is_none(),
+            "idempotent runner admission must not wake discovery"
+        );
+        store.compaction_finish(id, status, outcome).await.unwrap();
         db.execute_unprepared("CREATE TEMP TRIGGER abort_terminal_state BEFORE UPDATE ON compaction_runner_state BEGIN SELECT RAISE(ABORT,'terminal state rollback'); END").await.unwrap();
         assert!(store.compaction_reconcile_runner_state(id).await.is_err());
         assert_eq!(
@@ -6826,6 +6880,11 @@ async fn compaction_terminal_fence_reconciliation_persists_once_and_rejects_late
         db.execute_unprepared("DROP TRIGGER abort_terminal_state")
             .await
             .unwrap();
+        let mut consumers = ["compaction", "maintenance.frozen", "maintenance.html"]
+            .map(|domain| db.work_signal(domain).subscribe());
+        for consumer in &mut consumers {
+            consumer.begin_pass(&db).await.unwrap();
+        }
         let (a, b) = tokio::join!(
             store.compaction_reconcile_runner_state(id),
             store.compaction_reconcile_runner_state(id)
@@ -6834,6 +6893,23 @@ async fn compaction_terminal_fence_reconciliation_persists_once_and_rejects_late
             assert_eq!(state.generation, initial.generation + 1);
             assert_eq!(state.phase, RunnerPhase::Failed { kind: kind.clone() });
         }
+        for consumer in &mut consumers {
+            assert!(futures_util::FutureExt::now_or_never(consumer.wait(None)).is_some());
+            consumer.begin_pass(&db).await.unwrap();
+        }
+        // A repeated terminal UPDATE and unchanged DTO must not re-enqueue work.
+        store.compaction_finish(id, status, outcome).await.unwrap();
+        store
+            .compaction_finish_execution(id, None, op.admission.deadline_ms, status, outcome)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .compaction_reconcile_runner_state("absent-operation")
+                .await
+                .unwrap()
+                .is_none()
+        );
         let again = store
             .compaction_reconcile_runner_state(id)
             .await
@@ -6851,6 +6927,18 @@ async fn compaction_terminal_fence_reconciliation_persists_once_and_rejects_late
                 .await
                 .unwrap()
         );
+        assert!(
+            !store
+                .compaction_claim_attempt(id, 0, 0, false, false)
+                .await
+                .unwrap()
+        );
+        for consumer in &mut consumers {
+            assert!(
+                futures_util::FutureExt::now_or_never(consumer.wait(None)).is_none(),
+                "terminal ACK and rejected CAS must leave independent consumers parked"
+            );
+        }
         let event = pioneer_crud::CanonicalTurnEventPayload::ItemCompleted(
             pioneer_protocol::ItemCompletedNotification {
                 workspace_id: "ws".into(),
@@ -6997,14 +7085,19 @@ async fn compaction_post_terminal_stop_survives_worker_loss_and_fences_new_admis
     db.execute_unprepared("DROP TRIGGER abort_context_stop")
         .await
         .unwrap();
+    let mut stopped = db.work_signal("compaction").subscribe();
+    stopped.begin_pass(&db).await.unwrap();
     store
         .compaction_stop_execution("ws", "thread", &op.owner, "turn")
         .await
         .unwrap();
+    assert!(futures_util::FutureExt::now_or_never(stopped.wait(None)).is_some());
+    stopped.begin_pass(&db).await.unwrap();
     store
         .compaction_stop_execution("ws", "thread", &op.owner, "turn")
         .await
         .unwrap();
+    assert!(futures_util::FutureExt::now_or_never(stopped.wait(None)).is_none());
     // No service reconciliation runs: model a lost worker with a ready candidate.
     assert!(store.compaction_execution_cancelled(&op.id).await.unwrap());
     assert_eq!(
@@ -8378,8 +8471,62 @@ async fn history_check_retries_are_durable_bounded_and_cas_protected() {
         .compaction_enqueue_native_history_check("ws", "thread", "turn", "{}")
         .await
         .unwrap();
+    let db = store.database_connection();
+    let mut duplicate = db.work_signal("compaction").subscribe();
+    duplicate.begin_pass(&db).await.unwrap();
+    store
+        .compaction_enqueue_native_history_check("ws", "thread", "turn", "{}")
+        .await
+        .unwrap();
+    assert!(
+        futures_util::FutureExt::now_or_never(duplicate.wait(None)).is_none(),
+        "an unchanged pending descriptor must not wake discovery"
+    );
     publish_history_check_root(&store).await;
     let mut now = 1000;
+    // Finish the real lifecycle bootstrap/scope obligations first. They have
+    // independent deadlines even while this history root is owned.
+    for _ in 0..16 {
+        let seed = store
+            .compaction_expand_lifecycle_scope(true, &|| 1000)
+            .await
+            .unwrap();
+        let scopes = store
+            .compaction_expand_lifecycle_scope(false, &|| 1000)
+            .await
+            .unwrap();
+        if seed + scopes == 0 {
+            break;
+        }
+    }
+    let owned_root = [("ws".to_owned(), "thread".to_owned())];
+    assert!(
+        store
+            .compaction_due_history_checks_excluding(now, &owned_root)
+            .await
+            .unwrap()
+            .is_empty(),
+        "an older owned check blocks this whole conversation"
+    );
+    assert!(
+        store
+            .next_compaction_background_deadline(&owned_root)
+            .await
+            .unwrap()
+            .is_none(),
+        "completion notification owns capacity release; no due SQL spin while it is held"
+    );
+    assert_eq!(
+        store
+            .compaction_due_history_checks_excluding(
+                now,
+                &[("other-workspace".to_owned(), "thread".to_owned())]
+            )
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
     for (failure, delay) in [60_000, 300_000, 900_000, 0].into_iter().enumerate() {
         let page = store.compaction_due_history_checks(now).await.unwrap();
         assert_eq!(page.len(), 1);

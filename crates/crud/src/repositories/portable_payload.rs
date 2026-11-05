@@ -30,6 +30,14 @@ const RECLAIMING_SHA256: &[u8] = &[];
 const PAYLOAD_ID_LEN: usize = 12;
 const RESERVATION_ATTEMPTS: u8 = 8;
 
+// Register only cleanup actually blocked by a read hold. Ordinary maintenance
+// reads must not invalidate their own completed pass when their hold drops.
+fn blocked_cleanup() -> &'static Mutex<BTreeMap<String, Vec<pioneer_sqlite::WorkSignal>>> {
+    static BLOCKED: OnceLock<Mutex<BTreeMap<String, Vec<pioneer_sqlite::WorkSignal>>>> =
+        OnceLock::new();
+    BLOCKED.get_or_init(Mutex::default)
+}
+
 type PayloadGates = Mutex<BTreeMap<String, Weak<RwLock<()>>>>;
 fn payload_gates() -> &'static PayloadGates {
     static GATES: OnceLock<PayloadGates> = OnceLock::new();
@@ -88,8 +96,7 @@ impl PayloadReadHold {
 }
 impl Drop for PayloadReadLease {
     fn drop(&mut self) {
-        drop(self.guard.take());
-        release_payload_gate(&self.id);
+        release_payload_hold(&self.id, &mut self.guard);
     }
 }
 struct PayloadCleanupHold {
@@ -107,8 +114,23 @@ impl PayloadCleanupHold {
 }
 impl Drop for PayloadCleanupHold {
     fn drop(&mut self) {
-        drop(self.guard.take());
-        release_payload_gate(&self.id);
+        release_payload_hold(&self.id, &mut self.guard);
+    }
+}
+
+fn release_payload_hold<T>(id: &str, guard: &mut Option<T>) {
+    // Both read holds and a competing cleanup writer can block discovery.
+    // Serialize release with registration; notify every blocked DB runtime
+    // sharing this existing payload gate, after releasing all native locks.
+    let mut blocked = blocked_cleanup()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    drop(guard.take());
+    release_payload_gate(id);
+    let signals = blocked.remove(id).unwrap_or_default();
+    drop(blocked);
+    for signal in signals {
+        signal.notify();
     }
 }
 
@@ -322,12 +344,15 @@ async fn pending_source(
 #[derive(Default)]
 pub struct PortablePayloadProgress {
     family: usize,
+    finished: [bool; 5],
     pending: Option<Preparation>,
     after: [Option<String>; 5],
     // Finite per-pass fence only: reset/re-discover after EOF. A hot stream
     // of higher keys cannot prevent revisiting logical updates below cursor.
     upper: [Option<String>; 5],
     cleanup_after: Option<String>,
+    cleanup_upper: Option<String>,
+    cleanup_finished: bool,
 }
 struct Preparation {
     family: Family,
@@ -372,8 +397,17 @@ impl PortablePayloadProgress {
             let result = pending.step(store).await;
             match result {
                 Ok(false) => self.pending = Some(pending),
-                Ok(true) => {}
+                Ok(true) => {
+                    // Publication can lose its source CAS and leave retired
+                    // staging behind the already finished cleanup frontier.
+                    self.cleanup_finished = false;
+                    self.cleanup_upper = None;
+                    self.cleanup_after = None;
+                }
                 Err(error) => {
+                    self.cleanup_finished = false;
+                    self.cleanup_upper = None;
+                    self.cleanup_after = None;
                     // Database phases already retry transient lock failures.
                     // Advance this pass; a failed source is diagnosed and
                     // revisited after EOF. It cannot starve later sources.
@@ -388,12 +422,29 @@ impl PortablePayloadProgress {
             }
             return Ok(true);
         }
-        let (cleaned, cleanup_after) = store
-            .run_background_database_quantum(|| cleanup(store, self.cleanup_after.as_deref()))
-            .await?;
-        self.cleanup_after = cleanup_after;
-        if cleaned {
-            return Ok(true);
+        if !self.cleanup_finished {
+            if self.cleanup_upper.is_none() {
+                self.cleanup_upper = value::Entity::find()
+                    .select_only()
+                    .column(value::Column::Id)
+                    .filter(value::Column::Retired.eq(1))
+                    .order_by_desc(value::Column::Id)
+                    .into_tuple::<String>()
+                    .one(&store.connection)
+                    .await?;
+            }
+            if let Some(upper) = self.cleanup_upper.as_deref() {
+                let (cleaned, cleanup_after) = store
+                    .run_background_database_quantum(|| {
+                        cleanup(store, self.cleanup_after.as_deref(), Some(upper))
+                    })
+                    .await?;
+                self.cleanup_after = cleanup_after;
+                if cleaned {
+                    return Ok(true);
+                }
+            }
+            self.cleanup_finished = true;
         }
         // Only families installed by the corresponding target migration are
         // registered here. Completed EOF is deliberately revisited next cycle.
@@ -404,6 +455,15 @@ impl PortablePayloadProgress {
             Family::TaskHistory,
             Family::TaskEvent,
         ];
+        if self.finished.iter().all(|done| *done) {
+            self.finished = [false; 5];
+            self.cleanup_finished = false;
+            self.cleanup_upper = None;
+            return Ok(false);
+        }
+        while self.finished[self.family] {
+            self.family = (self.family + 1) % FAMILIES.len();
+        }
         let family = FAMILIES[self.family];
         observe::set_family(family.observed());
         self.family = (self.family + 1) % FAMILIES.len();
@@ -415,8 +475,9 @@ impl PortablePayloadProgress {
                 .map(|row| row.owner);
         }
         let Some(upper) = self.upper[index].as_deref() else {
+            self.finished[index] = true;
             observe::outcome(observe::Outcome::NoWork);
-            return Ok(false);
+            return Ok(true);
         };
         // Seek one key at a time and stop at the first eligible source. This
         // bounds refusals to 64 per quantum without projecting an eligible tail
@@ -434,6 +495,7 @@ impl PortablePayloadProgress {
             else {
                 self.after[index] = None;
                 self.upper[index] = None;
+                self.finished[index] = true;
                 break;
             };
             self.after[index] = Some(row.owner.clone());
@@ -484,10 +546,9 @@ impl PortablePayloadProgress {
             });
             return Ok(true);
         }
-        // No preparation/cleanup work: let the worker retain its idle sleep
-        // even when the database contains only temporarily ineligible rows.
+        // A bounded source page is not EOF for the other families.
         observe::outcome(observe::Outcome::NoWork);
-        Ok(false)
+        Ok(true)
     }
 }
 impl Preparation {
@@ -856,7 +917,11 @@ async fn load_or_prepare_dictionary(
     );
     Ok(dict)
 }
-async fn cleanup(store: &CrudStore, after: Option<&str>) -> Result<(bool, Option<String>)> {
+async fn cleanup(
+    store: &CrudStore,
+    after: Option<&str>,
+    through: Option<&str>,
+) -> Result<(bool, Option<String>)> {
     let _phase = observe::stage(observe::Stage::Cleanup);
     // A held/staging value must not starve other retired values. Fetch only
     // IDs (never payload bytes); skip held IDs with a bounded seek page.
@@ -868,6 +933,9 @@ async fn cleanup(store: &CrudStore, after: Option<&str>) -> Result<(bool, Option
     if let Some(after) = after {
         query = query.filter(value::Column::Id.gt(after));
     }
+    if let Some(through) = through {
+        query = query.filter(value::Column::Id.lte(through));
+    }
     let candidates = query
         .limit(64)
         .into_tuple::<String>()
@@ -878,7 +946,24 @@ async fn cleanup(store: &CrudStore, after: Option<&str>) -> Result<(bool, Option
     for id in candidates {
         last = Some(id.clone());
         // Never await a logical gate while occupying database capacity.
-        let Some(_exclusive) = PayloadCleanupHold::try_acquire(&id) else {
+        let exclusive = {
+            let mut blocked = blocked_cleanup()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let exclusive = PayloadCleanupHold::try_acquire(&id);
+            if exclusive.is_none() {
+                let signal = store.connection.work_signal("maintenance.portable");
+                let signals = blocked.entry(id.clone()).or_default();
+                if !signals
+                    .iter()
+                    .any(|existing| existing.same_channel(&signal))
+                {
+                    signals.push(signal);
+                }
+            }
+            exclusive
+        };
+        let Some(_exclusive) = exclusive else {
             continue;
         };
         // Revalidate after discovery. Live/staging publication has its own
@@ -1838,6 +1923,60 @@ mod tests {
         }
         (dir, store)
     }
+
+    #[tokio::test]
+    async fn shared_payload_gate_release_wakes_each_blocked_database_cleanup() {
+        use futures_util::FutureExt;
+        use sea_orm::ActiveModelTrait;
+        let (_first_dir, first) = reservation_fixture().await;
+        let (_second_dir, second) = reservation_fixture().await;
+        for writer_hold in [false, true] {
+            let id = uuid::Uuid::new_v4().to_string();
+            for store in [&first, &second] {
+                value::ActiveModel {
+                    id: Set(id.clone()),
+                    family: Set(Family::TaskHistory.name().into()),
+                    original_bytes: Set(0),
+                    original_chars: Set(0),
+                    sha256: Set(vec![0; 32]),
+                    raw: Set(1),
+                    retired: Set(1),
+                    dictionary_id: Set(None),
+                }
+                .insert(&store.connection)
+                .await
+                .unwrap();
+            }
+            let first_db = first.database_connection();
+            let second_db = second.database_connection();
+            let mut first_wake = first_db.work_signal("maintenance.portable").subscribe();
+            let mut second_wake = second_db.work_signal("maintenance.portable").subscribe();
+            first_wake.begin_pass(&first_db).await.unwrap();
+            second_wake.begin_pass(&second_db).await.unwrap();
+            let read_hold =
+                (!writer_hold).then(|| PayloadReadHold::capture(&id, Family::TaskHistory).unwrap());
+            let cleanup_hold = writer_hold.then(|| PayloadCleanupHold::try_acquire(&id).unwrap());
+            assert!(!cleanup(&first, None, None).await.unwrap().0);
+            assert!(!cleanup(&second, None, None).await.unwrap().0);
+            drop(read_hold);
+            drop(cleanup_hold);
+            assert!(first_wake.wait(None).now_or_never().is_some());
+            assert!(second_wake.wait(None).now_or_never().is_some());
+            for store in [&first, &second] {
+                for _ in 0..4 {
+                    cleanup(store, None, None).await.unwrap();
+                }
+                assert!(
+                    value::Entity::find_by_id(&id)
+                        .one(&store.connection)
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+            }
+        }
+    }
+
     async fn pending_preparation(progress: &mut PortablePayloadProgress, store: &CrudStore) {
         for _ in 0..30 {
             progress.quantum(store).await.unwrap();
@@ -1878,20 +2017,32 @@ mod tests {
             // Preserve exact JSON bytes while ensuring real staged blocks for
             // refusal/hold/cleanup coverage, including a final-publication race.
             history.push_str(&" ".repeat(200_000));
+            let snapshot = crate::NewTaskRunConversationSnapshot {
+                run_id: "run".into(),
+                task_id: "task".into(),
+                workspace_id: "ws".into(),
+                conversation_thread_id: "thread".into(),
+                source_turn_id: None,
+                history_json: history.clone(),
+                created_at: chrono::Utc::now().fixed_offset(),
+            };
+            let database = store.database_connection();
+            let mut wake = database.work_signal("maintenance.portable").subscribe();
+            wake.begin_pass(&database).await.unwrap();
             store
-                .insert_task_run_conversation_snapshot_if_absent(
-                    crate::NewTaskRunConversationSnapshot {
-                        run_id: "run".into(),
-                        task_id: "task".into(),
-                        workspace_id: "ws".into(),
-                        conversation_thread_id: "thread".into(),
-                        source_turn_id: None,
-                        history_json: history.clone(),
-                        created_at: chrono::Utc::now().fixed_offset(),
-                    },
-                )
+                .insert_task_run_conversation_snapshot_if_absent(snapshot.clone())
                 .await
                 .unwrap();
+            assert!(futures_util::FutureExt::now_or_never(wake.wait(None)).is_some());
+            wake.begin_pass(&database).await.unwrap();
+            store
+                .insert_task_run_conversation_snapshot_if_absent(snapshot)
+                .await
+                .unwrap();
+            assert!(
+                futures_util::FutureExt::now_or_never(wake.wait(None)).is_none(),
+                "snapshot replay must stay quiet"
+            );
             let mut progress = PortablePayloadProgress::default();
             pending_preparation(&mut progress, &store).await;
             // Stop after finalization and raw block cleanup, immediately before
@@ -1961,8 +2112,17 @@ mod tests {
             );
             // Rejected staging remains protected while a reader holds it, then
             // ordinary bounded cleanup can reclaim both header and blocks.
+            let database = store.database_connection();
+            let mut wake = database.work_signal("maintenance.portable").subscribe();
+            wake.begin_pass(&database).await.unwrap();
+            let unblocked = PayloadReadHold::capture(&id, Family::TaskHistory).unwrap();
+            drop(unblocked);
+            assert!(
+                futures_util::FutureExt::now_or_never(wake.wait(None)).is_none(),
+                "ordinary reader release must not reopen completed cleanup"
+            );
             let hold = PayloadReadHold::capture(&id, Family::TaskHistory).unwrap();
-            assert!(!cleanup(&store, None).await.unwrap().0);
+            assert!(!cleanup(&store, None, None).await.unwrap().0);
             assert!(
                 value::Entity::find_by_id(&id)
                     .one(&store.connection)
@@ -1971,8 +2131,24 @@ mod tests {
                     .is_some()
             );
             drop(hold);
-            for _ in 0..10 {
-                cleanup(&store, None).await.unwrap();
+            // Also covers legacy/generic repository captures: only a blocked
+            // cleanup installs a release obligation, avoiding read self-wakes.
+            tokio::time::timeout(std::time::Duration::from_secs(1), wake.wait(None))
+                .await
+                .unwrap();
+            if mutation.contains("history_json='[]'") {
+                let mut idle = false;
+                for _ in 0..100 {
+                    if !progress.quantum(&store).await.unwrap() {
+                        idle = true;
+                        break;
+                    }
+                }
+                assert!(idle, "source refusal must clean staging before worker EOF");
+            } else {
+                for _ in 0..10 {
+                    cleanup(&store, None, None).await.unwrap();
+                }
             }
             assert!(
                 value::Entity::find_by_id(&id)
@@ -2083,7 +2259,7 @@ mod tests {
                 assert_eq!(terminals.len(), 1);
                 let operation = terminals[0].portable_payload.unwrap();
                 if operation.family != observe::Family::TaskHistory {
-                    assert!(!result.unwrap());
+                    assert!(result.unwrap());
                     continue;
                 }
                 if corrupted {
@@ -2092,7 +2268,7 @@ mod tests {
                         "invalid frozen history counters"
                     );
                 } else {
-                    assert!(!result.unwrap());
+                    assert!(result.unwrap());
                 }
                 assert_eq!(operation.family, observe::Family::TaskHistory);
                 assert_eq!(operation.mode, observe::Mode::Background);
@@ -2272,7 +2448,7 @@ mod tests {
             .unwrap();
         assert!(
             !store
-                .run_background_database_quantum(|| cleanup(&store, None))
+                .run_background_database_quantum(|| cleanup(&store, None, None))
                 .await
                 .unwrap()
                 .0
@@ -2286,7 +2462,7 @@ mod tests {
         drop(captured);
         assert!(
             store
-                .run_background_database_quantum(|| cleanup(&store, None))
+                .run_background_database_quantum(|| cleanup(&store, None, None))
                 .await
                 .unwrap()
                 .0
@@ -2315,7 +2491,7 @@ mod tests {
         drop(late_hold);
         for _ in 0..4 {
             store
-                .run_background_database_quantum(|| cleanup(&store, None))
+                .run_background_database_quantum(|| cleanup(&store, None, None))
                 .await
                 .unwrap();
         }

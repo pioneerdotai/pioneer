@@ -941,12 +941,17 @@ async fn snapshot_observation_and_shutdown_do_not_allow_a_late_initial_start() {
     }
     assert!(saw_response);
     assert!(!f.processor.foreground_starts.pending(THREAD, TURN));
-    assert!(
+    // Terminal cleanup may already have reclaimed the runtime-only snapshot.
+    // Shutting down publication must preserve the canonical completed turn.
+    assert_eq!(
         f.store
-            .get_turn_runtime_snapshot(TURN)
+            .get_turn(THREAD, TURN)
             .await
             .unwrap()
-            .is_some()
+            .unwrap()
+            .1
+            .status,
+        TurnStatus::Completed
     );
     assert!(
         f.processor

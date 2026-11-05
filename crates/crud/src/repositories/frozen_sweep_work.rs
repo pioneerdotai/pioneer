@@ -13,7 +13,10 @@ use sea_orm::sea_query::{
     Alias, BinOper, Expr, ExprTrait, Func, IntoIden, IntoTableRef, JoinType, OnConflict, Order,
     Query, SelectStatement,
 };
-use sea_orm::{ConnectionTrait, DbBackend, Statement, TransactionTrait};
+use sea_orm::{
+    ColumnTrait, ConnectionTrait, DbBackend, EntityTrait, QueryFilter, QueryOrder, QuerySelect,
+    Statement, TransactionTrait,
+};
 
 #[derive(Clone)]
 pub(super) struct Work {
@@ -374,6 +377,32 @@ pub(super) async fn fanout_step(store: &CrudStore) -> Result<bool> {
 pub(super) struct ServiceRound {
     pub(super) after_row: i64,
     pub(super) until_row: i64,
+    complete: bool,
+    propagated: bool,
+}
+
+impl ServiceRound {
+    pub(super) fn invalidate(&mut self) {
+        self.propagated = true;
+    }
+}
+
+pub(super) enum Completion {
+    Complete(Statement),
+    Blocked,
+    Retry,
+}
+
+pub(super) async fn next_retry_deadline(store: &CrudStore) -> Result<Option<i64>> {
+    Ok(work::Entity::find()
+        .select_only()
+        .column(work::Column::RetryAt)
+        .filter(work::Column::Pending.eq(1))
+        .filter(work::Column::RetryAt.gt(0))
+        .order_by_asc(work::Column::RetryAt)
+        .into_tuple::<i64>()
+        .one(&store.connection)
+        .await?)
 }
 
 pub(super) enum Admission {
@@ -388,6 +417,20 @@ pub(super) async fn discover(
     kind: i64,
     round: &mut ServiceRound,
 ) -> Result<Admission> {
+    let has_active = active.iter().any(|(_, active_kind)| *active_kind == kind);
+    if round.complete || (round.until_row > 0 && round.after_row >= round.until_row) {
+        if !round.propagated {
+            round.complete = true;
+            return Ok(Admission::Idle);
+        }
+        // Finish the finite frontier before revisiting keys invalidated by
+        // fanout behind it. An ACK can release a pre-fanout deletion fence
+        // without changing that source's work revision again.
+        *round = ServiceRound::default();
+        // The active visit may still carry the old revision. Excluding it
+        // from admission is not proof that its propagated generation is done.
+        round.propagated = has_active;
+    }
     let mut due = Query::select();
     due.expr(Expr::val(1))
         .from(work::Entity)
@@ -423,6 +466,8 @@ pub(super) async fn discover(
     );
     // No due non-active work means idle without walking future-retry pages.
     if store.connection.query_one_raw(due).await?.is_none() {
+        round.complete = true;
+        round.propagated &= has_active;
         return Ok(Admission::Idle);
     }
     if round.after_row >= round.until_row {
@@ -441,6 +486,8 @@ pub(super) async fn discover(
             .ok_or_else(|| anyhow::anyhow!("work frontier missing"))?
             .try_get("", "until_row")?;
         round.after_row = 0;
+        // This frontier already includes propagation completed before its capture.
+        round.propagated &= has_active;
     }
     // Stable insertion order, not mutable retry_at or TEXT order. New rows
     // cannot enter this round; re-dirty/retry cannot move a visited row ahead.
@@ -544,22 +591,23 @@ impl Work {
     }
 
     /// Completion validates geometry in this same short writer boundary.
-    /// Refusal persists a delayed retry; CAS never clears newer domain work.
-    pub(super) async fn finish(
-        &self,
-        store: &CrudStore,
-        validation: Option<Statement>,
-    ) -> Result<()> {
+    /// Expected protection stays pending until invalidation; errors retain a
+    /// bounded retry. CAS never clears newer domain work in either case.
+    pub(super) async fn finish(&self, store: &CrudStore, completion: Completion) -> Result<()> {
         store
             .run_serialized_write(|| async {
                 let tx = store.connection.begin().await?;
-                let valid = if let Some(guard) = &validation {
+                let valid = if let Completion::Complete(guard) = &completion {
                     tx.query_one_raw(self.fence()).await?.is_some()
                         && tx.query_one_raw(guard.clone()).await?.is_some()
                 } else {
                     false
                 };
                 let retry = if valid {
+                    Expr::val(0)
+                } else if !matches!(completion, Completion::Retry) {
+                    // A protected generation is reconsidered on dependency
+                    // invalidation. It is not an error-owned clock retry.
                     Expr::val(0)
                 } else {
                     Expr::expr(Func::cust(Alias::new("unixepoch"))).add(60)
