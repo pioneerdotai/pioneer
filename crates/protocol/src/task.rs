@@ -1982,9 +1982,25 @@ impl TaskEventPayload {
                 task.id, task.revision
             )),
             Self::TaskUpdated { .. } | Self::TaskPaused { .. } | Self::TaskResumed { .. } => None,
-            // Separate runs can finish without advancing the trigger cursor.
-            // Their refresh payloads have different timestamps, so a cursor key
-            // would collide. The atomic terminal batch deduplicates by run id.
+            // Explicit replacements are distinct assignments even with identical
+            // timestamps. One-shot consumption is protected by the writer's
+            // trigger snapshot CAS, not a historical cursor event key.
+            Self::TaskRescheduled {
+                reason: TaskRescheduleReason::UserRequested,
+                ..
+            } => None,
+            Self::TaskRescheduled {
+                trigger,
+                reason: TaskRescheduleReason::TriggerFired | TaskRescheduleReason::MissedFireSkipped,
+                ..
+            } if matches!(
+                trigger.spec,
+                TaskTriggerSpec::Immediate | TaskTriggerSpec::ScheduledAt { .. }
+            ) =>
+            {
+                None
+            }
+            // Terminal refreshes are deduplicated by their run's terminal batch.
             Self::TaskRescheduled {
                 reason: TaskRescheduleReason::RunTerminalStatusRefresh,
                 ..
@@ -2464,6 +2480,19 @@ pub struct TaskRescheduleResponse {
     pub trigger: TaskTrigger,
 }
 
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskRunNowParams {
+    pub task_id: String,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskRunNowResponse {
+    pub task_id: String,
+    pub run_id: String,
+}
+
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskPauseParams {
@@ -2473,9 +2502,19 @@ pub struct TaskPauseParams {
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskPauseScheduleOutcome {
+    Paused,
+    NoFutureFirings,
+    NotApplied,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskPauseResponse {
     pub task: Task,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule_outcome: Option<TaskPauseScheduleOutcome>,
     #[serde(default)]
     pub triggers: Vec<TaskTrigger>,
 }

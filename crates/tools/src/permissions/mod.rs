@@ -619,6 +619,7 @@ fn extract_task_permission_intent(invocation: &ToolInvocation) -> Option<Permiss
         "task_list" => "list task/subagent state",
         "task_get" => "get task/subagent state",
         "task_reschedule" => "reschedule task/subagent",
+        "task_run_now" => "run task/subagent now",
         "task_pause" => "pause task/subagent",
         "task_resume" => "resume task/subagent",
         _ => "task/subagent action",
@@ -645,6 +646,7 @@ fn extract_task_permission_intent(invocation: &ToolInvocation) -> Option<Permiss
                 | "task_finish"
                 | "task_update"
                 | "task_detach"
+                | "task_run_now"
                 | "task_reschedule"
                 | "task_pause"
                 | "task_resume"
@@ -660,9 +662,8 @@ fn extract_task_permission_intent(invocation: &ToolInvocation) -> Option<Permiss
             // task/subagent authority; otherwise `Internal` would bypass
             // supervised consent for durable task graph changes.
             "task_create" | "task_accept" | "task_revise" | "task_cancel" | "task_finish"
-            | "task_update" | "task_detach" | "task_reschedule" | "task_pause" | "task_resume" => {
-                PermissionActionKind::TaskSubagent
-            }
+            | "task_update" | "task_detach" | "task_run_now" | "task_reschedule" | "task_pause"
+            | "task_resume" => PermissionActionKind::TaskSubagent,
             _ => PermissionActionKind::Internal,
         },
         scope,
@@ -2224,6 +2225,7 @@ mod tests {
             ("task_list", PermissionActionKind::Internal),
             ("task_get", PermissionActionKind::Internal),
             ("task_reschedule", PermissionActionKind::TaskSubagent),
+            ("task_run_now", PermissionActionKind::TaskSubagent),
             ("task_pause", PermissionActionKind::TaskSubagent),
             ("task_resume", PermissionActionKind::TaskSubagent),
             ("artifact_prepare", PermissionActionKind::Internal),
@@ -3351,6 +3353,12 @@ mod tests {
                 },
             ),
             invocation_for_tool(
+                "task_run_now",
+                ToolPayload::Function {
+                    arguments: serde_json::json!({ "taskId": "task_a" }),
+                },
+            ),
+            invocation_for_tool(
                 "task_pause",
                 ToolPayload::Function {
                     arguments: serde_json::json!({ "taskId": "task_a" }),
@@ -3375,6 +3383,7 @@ mod tests {
                     | "task_finish"
                     | "task_update"
                     | "task_detach"
+                    | "task_run_now"
                     | "task_reschedule"
                     | "task_pause"
                     | "task_resume"

@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TaskRunNowParams",
+  "type": "object",
+  "properties": {
+    "taskId": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "taskId"
+  ]
+}

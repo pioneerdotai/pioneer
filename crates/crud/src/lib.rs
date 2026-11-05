@@ -34403,6 +34403,16 @@ impl CrudStore {
         occurrence_contracts: Vec<pioneer_protocol::TaskOccurrenceContract>,
         reserve_executions: Vec<(String, TaskExecutorKind)>,
     ) -> Result<Vec<AppendedTaskEvent>> {
+        // A manual/webhook admission can win after scheduler preparation.
+        // Revalidate allocation facts inside the same writer as consumption;
+        // a stale plan leaves the trigger due for the next scheduler pass.
+        let expected_run_number = events.iter().find_map(|event| match event {
+            TaskEventPayload::RunCreated { run, .. } => Some(run.run_number),
+            _ => None,
+        });
+        let expected_generation = occurrence_contracts
+            .first()
+            .map(|contract| contract.execution_generation);
         let events = self.prepare_task_events_for_write(events).await?;
         if occurrence_contracts.len() > MAX_ATOMIC_TASK_EVENT_BATCH_SIZE
             || reserve_executions.len() > MAX_ATOMIC_TASK_EVENT_BATCH_SIZE
@@ -34441,6 +34451,21 @@ impl CrudStore {
                 return Ok(Vec::new());
             }
 
+            if let Some(expected) = expected_run_number
+                && task_run::next_run_number(&transaction, &trigger.task_id).await? != expected
+            {
+                return Ok(Vec::new());
+            }
+            if let Some(expected) = expected_generation
+                && task_actor_contract::next_task_occurrence_execution_generation(
+                    &transaction,
+                    &trigger.task_id,
+                )
+                .await?
+                    != expected
+            {
+                return Ok(Vec::new());
+            }
             if task_repository::finish_requested(&transaction, &trigger.task_id).await? {
                 return Ok(Vec::new());
             }

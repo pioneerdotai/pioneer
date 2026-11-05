@@ -2730,6 +2730,222 @@ fn cli_tasks_share_authorization_schemas_skills_and_durable_replay_for_all_provi
                     .len(),
                 1
             );
+            // Invocations recreate facade handlers: receipt replay must survive
+            // loss of the first response, rather than depend on an in-memory cache.
+            let before = processor
+                .crud_store
+                .get_task(&task_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let run_args = json!({"taskId":task_id,"idempotencyKey":"extra-check"});
+            let first_run = invoke_task(
+                &processor,
+                &turn_id,
+                "run-now-a",
+                "task_run_now",
+                run_args.clone(),
+            )
+            .await
+            .unwrap();
+            assert!(!first_run.is_error, "{first_run:?}");
+            let run_id = first_run.structured_content.as_ref().unwrap()["runId"].clone();
+            drop(first_run);
+            let repeated = invoke_task(&processor, &turn_id, "run-now-b", "task_run_now", run_args)
+                .await
+                .unwrap();
+            assert!(!repeated.is_error, "{repeated:?}");
+            assert_eq!(
+                repeated.structured_content.as_ref().unwrap()["runId"],
+                run_id
+            );
+            let after = processor
+                .crud_store
+                .get_task(&task_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(after.triggers, before.triggers);
+            assert_eq!(after.runs.len(), before.runs.len() + 1);
+            let run = after
+                .runs
+                .iter()
+                .find(|run| run.id == run_id.as_str().unwrap())
+                .unwrap();
+            assert!(run.trigger_id.is_none());
+            assert!(
+                processor
+                    .crud_store
+                    .get_task_occurrence_contract_by_run(&run.id)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            let denied = invoke_task(
+                &processor,
+                &turn_id,
+                "foreign-run-now",
+                "task_run_now",
+                json!({"taskId":"123456789012345678901"}),
+            )
+            .await
+            .unwrap();
+            assert!(denied.is_error);
+            // The interval adapter shares the same queue contract, including
+            // independent scheduled/manual occurrence identities.
+            let mut interval_args = args.clone();
+            interval_args["idempotencyKey"] = json!("interval-monitor");
+            interval_args["trigger"] = json!({"kind":"interval", "intervalSeconds":1800, "intervalAnchorAt":4000000000_i64});
+            let interval = invoke_task(
+                &processor,
+                &turn_id,
+                "interval-create",
+                "task_create",
+                interval_args,
+            )
+            .await
+            .unwrap();
+            assert!(!interval.is_error, "{interval:?}");
+            let interval_id = interval.structured_content.as_ref().unwrap()["taskId"]
+                .as_str()
+                .unwrap();
+            let interval_before = processor
+                .crud_store
+                .get_task(interval_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let extra = invoke_task(
+                &processor,
+                &turn_id,
+                "interval-extra",
+                "task_run_now",
+                json!({"taskId":interval_id}),
+            )
+            .await
+            .unwrap();
+            assert!(!extra.is_error, "{extra:?}");
+            let interval_after = processor
+                .crud_store
+                .get_task(interval_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(interval_after.triggers, interval_before.triggers);
+            assert_eq!(interval_after.runs.len(), 1);
+            // Each refusal owns a fresh task. In particular blocked/finish
+            // cannot pass merely because an earlier pause already rejects runs.
+            for restriction in ["paused", "blocked", "finished"] {
+                let mut restricted_args = args.clone();
+                restricted_args["idempotencyKey"] = json!(format!("restriction-{restriction}"));
+                let restricted = invoke_task(
+                    &processor,
+                    &turn_id,
+                    &format!("create-{restriction}"),
+                    "task_create",
+                    restricted_args,
+                )
+                .await
+                .unwrap();
+                assert!(!restricted.is_error, "{restricted:?}");
+                let restricted_id = restricted.structured_content.as_ref().unwrap()["taskId"]
+                    .as_str()
+                    .unwrap();
+                let before = processor
+                    .crud_store
+                    .get_task(restricted_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(before.triggers[0].status, TaskTriggerStatus::Active);
+                assert!(!before.task.status.is_terminal());
+                assert!(before.task.finish_request().is_none());
+                assert!(before.runs.is_empty());
+                if restriction == "paused" {
+                    let result = invoke_task(
+                        &processor,
+                        &turn_id,
+                        "apply-paused",
+                        "task_pause",
+                        json!({"taskId":restricted_id}),
+                    )
+                    .await
+                    .unwrap();
+                    assert!(!result.is_error, "{result:?}");
+                } else {
+                    // Seed each task-state guard with the existing event fixture.
+                    // Full block/finish transitions also stop triggers (and finish
+                    // may terminalize the task), masking the guard under test.
+                    let mut task = before.task.clone();
+                    if restriction == "blocked" {
+                        task.status = TaskStatus::Blocked;
+                    } else {
+                        task.metadata
+                            .get_or_insert_with(Default::default)
+                            .finish_request = Some(pioneer_protocol::TaskFinishRequest {
+                            requested_at: chrono::Utc::now().timestamp(),
+                            reason: None,
+                            first_run_number: 1,
+                        });
+                    }
+                    processor
+                        .crud_store
+                        .append_task_events(
+                            vec![pioneer_protocol::TaskEventPayload::TaskUpdated {
+                                task,
+                                trigger: None,
+                                agent_spec: None,
+                                changed_fields: vec![restriction.to_owned()],
+                                updated_at: chrono::Utc::now().timestamp(),
+                            }],
+                            chrono::Utc::now().timestamp(),
+                        )
+                        .await
+                        .unwrap();
+                }
+                let restricted_state = processor
+                    .crud_store
+                    .get_task(restricted_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if restriction == "blocked" {
+                    assert_eq!(restricted_state.task.status, TaskStatus::Blocked);
+                    assert_eq!(
+                        restricted_state.triggers[0].status,
+                        TaskTriggerStatus::Active
+                    );
+                    assert!(restricted_state.task.finish_request().is_none());
+                }
+                if restriction == "finished" {
+                    assert!(!restricted_state.task.status.is_terminal());
+                    assert_eq!(
+                        restricted_state.triggers[0].status,
+                        TaskTriggerStatus::Active
+                    );
+                    assert!(restricted_state.task.finish_request().is_some());
+                }
+                let refused = invoke_task(
+                    &processor,
+                    &turn_id,
+                    &format!("refuse-{restriction}"),
+                    "task_run_now",
+                    json!({"taskId":restricted_id}),
+                )
+                .await
+                .unwrap();
+                assert!(refused.is_error, "{restriction}: {refused:?}");
+                assert_eq!(
+                    processor
+                        .crud_store
+                        .get_task(restricted_id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .runs,
+                    before.runs
+                );
+            }
             let options = invoke_task(
                 &processor,
                 &turn_id,
@@ -2798,6 +3014,16 @@ fn cli_tasks_share_authorization_schemas_skills_and_durable_replay_for_all_provi
                     .status,
                 pioneer_protocol::TaskStatus::Cancelled
             );
+            let stopped = invoke_task(
+                &processor,
+                &turn_id,
+                "run-now-cancelled",
+                "task_run_now",
+                json!({"taskId":task_id}),
+            )
+            .await
+            .unwrap();
+            assert!(stopped.is_error);
             let conflict = invoke_task(&processor, &turn_id, "reschedule-cancelled", "task_reschedule", json!({
                 "taskId":task_id, "trigger":{"kind":"cron", "cronExpr":"0 9 * * *", "timezone":"Europe/Moscow"}
             })).await.unwrap();
@@ -6693,5 +6919,625 @@ fn cli_threads_collaborative_admission_uses_one_detached_task_and_normal_stop() 
             .unwrap()
             .unwrap();
         assert_eq!(parent.status, TurnStatus::Completed);
+    });
+}
+
+// Holds an actually dispatched planned run while the facade admits extra work.
+#[derive(Default)]
+struct HoldingPlannedSystemExecutor {
+    handle: std::sync::Mutex<Option<pioneer_tasks::TaskExecutionHandle>>,
+}
+
+#[async_trait::async_trait]
+impl pioneer_tasks::TaskExecutor for HoldingPlannedSystemExecutor {
+    fn kind(&self) -> TaskExecutorKind {
+        TaskExecutorKind::System
+    }
+    async fn start_run(
+        &self,
+        _context: pioneer_tasks::TaskExecutionContext,
+        run: TaskRun,
+        handle: pioneer_tasks::TaskExecutionHandle,
+    ) -> pioneer_tasks::TaskRuntimeResult<pioneer_tasks::TaskExecutorStartOutcome> {
+        handle.mark_started(run.created_at).await?;
+        *self.handle.lock().unwrap() = Some(handle);
+        Ok(pioneer_tasks::TaskExecutorStartOutcome::Started)
+    }
+    async fn cancel_run(
+        &self,
+        _context: pioneer_tasks::TaskExecutionContext,
+        _run_id: &str,
+        _reason: &str,
+        _handle: pioneer_tasks::TaskExecutionHandle,
+    ) -> pioneer_tasks::TaskRuntimeResult<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn extra_run_completion_preserves_and_executes_original_one_shot() {
+    run_standard_stack_message_test("Extra run preserves one-shot execution", async {
+        for scenario in [
+            "future",
+            "queued",
+            "failed",
+            "retry",
+            "finish",
+            "cancel",
+            "planned_first",
+            "planned_first_failed",
+        ] {
+            let scheduled_already_queued = scenario == "queued";
+            let fails = matches!(scenario, "failed" | "retry");
+            let (_harness, processor, turn_id) =
+                start_task_cli_fixture(CLIAgentRuntimeKind::Codex).await;
+            let binding = processor
+                .crud_store
+                .get_cli_runtime_turn_binding(&turn_id)
+                .await
+                .unwrap()
+                .unwrap();
+            // Reuse the real System executor so completion goes through queue,
+            // execution handle, terminal writer and configured delivery.
+            let mut params = test_task_create_params(
+                &binding.workspace_id,
+                &binding.thread_id,
+                &turn_id,
+                "One-shot with extra check",
+                3,
+            );
+            params.executor_kind = TaskExecutorKind::System;
+            params.agent_spec = None;
+            params.lifecycle_policy = None;
+            params.trigger = TaskTriggerInput {
+                spec: TaskTriggerSpec::ScheduledAt {
+                    scheduled_at: 4_000_000_000,
+                    timezone: Some("UTC".to_owned()),
+                    catch_up_policy: None,
+                },
+            };
+            params.delivery_policy = Some(TaskDeliveryPolicy {
+                mode: TaskDeliveryMode::Thread,
+                thread_target: Some(pioneer_protocol::TaskDeliveryThreadTarget::OriginThread),
+                thread_id: Some(binding.thread_id.clone()),
+                webhook_url: None,
+                include_result: true,
+                format: TaskDeliveryFormat::Summary,
+            });
+            if scenario == "retry" {
+                params.retry_policy = Some(TaskRetryPolicy {
+                    max_attempts: 2,
+                    backoff: TaskRetryBackoffKind::None,
+                    initial_delay_seconds: None,
+                    max_delay_seconds: None,
+                    retry_on: vec![pioneer_protocol::TaskErrorClass::Internal],
+                });
+            }
+            if matches!(scenario, "planned_first" | "planned_first_failed") {
+                params.concurrency_policy = Some(pioneer_protocol::TaskConcurrencyPolicy {
+                    key: None,
+                    max_parallel_runs: 1,
+                    on_conflict: pioneer_protocol::TaskConcurrencyConflictPolicy::Queue,
+                });
+            }
+            let created = processor
+                .task_runtime
+                .service()
+                .create_task(pioneer_tasks::TaskCreateContext::default(), params)
+                .await
+                .unwrap();
+            let task_id = &created.task.id;
+            assert_eq!(
+                created.task.lifecycle_policy.as_ref().unwrap().completion,
+                TaskCompletionBehavior::CompleteOnTerminalRun
+            );
+            let planned_first = matches!(scenario, "planned_first" | "planned_first_failed");
+            let holding = Arc::new(HoldingPlannedSystemExecutor::default());
+            let mut planned_terminal = None;
+            if planned_first {
+                processor
+                    .task_runtime
+                    .register_executor(holding.clone())
+                    .await;
+                processor
+                    .task_runtime
+                    .process_due_once(4_000_000_000)
+                    .await
+                    .unwrap();
+                let running = processor
+                    .crud_store
+                    .get_task(task_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(running.runs.len(), 1);
+                assert_eq!(running.runs[0].status, TaskRunStatus::Running);
+                assert_eq!(running.triggers[0].status, TaskTriggerStatus::Exhausted);
+                let terminal = if scenario == "planned_first_failed" {
+                    TaskEventPayload::RunFailed {
+                        task_id: task_id.clone(),
+                        run_id: running.runs[0].id.clone(),
+                        error: Some(pioneer_protocol::TaskError {
+                            recovery_diagnostic: None,
+                            code: "primary_failed".to_owned(),
+                            message: "primary check failed".to_owned(),
+                            class: pioneer_protocol::TaskErrorClass::Internal,
+                            details: None,
+                            failed_run_id: Some(running.runs[0].id.clone()),
+                        }),
+                        completed_at: chrono::Utc::now().timestamp(),
+                    }
+                } else {
+                    TaskEventPayload::RunCompleted {
+                        task_id: task_id.clone(),
+                        run_id: running.runs[0].id.clone(),
+                        result: None,
+                        completed_at: chrono::Utc::now().timestamp(),
+                    }
+                };
+                // Deliberately prepare before extra admission: the writer must
+                // reload completion facts instead of committing TaskCompleted.
+                let prepared = processor
+                    .crud_store
+                    .prepare_task_terminal_transition(terminal.clone())
+                    .await
+                    .unwrap();
+                planned_terminal = Some((prepared, terminal));
+            }
+            let args =
+                json!({"taskId":task_id, "idempotencyKey":format!("one-shot-extra-{scenario}")});
+            let extra = invoke_task(
+                &processor,
+                &turn_id,
+                &format!("extra-{scenario}"),
+                "task_run_now",
+                args.clone(),
+            )
+            .await
+            .unwrap();
+            assert!(!extra.is_error, "{extra:?}");
+            let run_id = extra.structured_content.as_ref().unwrap()["runId"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            if let Some((prepared, terminal)) = planned_terminal {
+                processor
+                    .task_runtime
+                    .process_due_once(4_000_000_000)
+                    .await
+                    .unwrap();
+                let waiting = processor
+                    .crud_store
+                    .get_task(task_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(waiting.runs.len(), 2);
+                assert_eq!(waiting.runs[0].status, TaskRunStatus::Running);
+                assert_eq!(waiting.runs[1].status, TaskRunStatus::Queued);
+                assert!(waiting.runs[1].trigger_id.is_none());
+                let outcome = processor
+                    .crud_store
+                    .commit_task_terminal_transition(prepared)
+                    .await
+                    .unwrap();
+                processor
+                    .task_runtime
+                    .event_bus()
+                    .publish_many(outcome.events)
+                    .await;
+                let after_primary = processor
+                    .crud_store
+                    .get_task(task_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(!after_primary.task.status.is_terminal());
+                assert_eq!(after_primary.runs[1].status, TaskRunStatus::Queued);
+                let primary_handle = holding.handle.lock().unwrap().take().unwrap();
+                match &terminal {
+                    TaskEventPayload::RunCompleted {
+                        result,
+                        completed_at,
+                        ..
+                    } => primary_handle
+                        .complete_run(result.clone(), *completed_at)
+                        .await
+                        .unwrap(),
+                    TaskEventPayload::RunFailed {
+                        error,
+                        completed_at,
+                        ..
+                    } => primary_handle
+                        .fail_run(error.clone(), *completed_at)
+                        .await
+                        .unwrap(),
+                    _ => unreachable!(),
+                }
+                let replay = invoke_task(
+                    &processor,
+                    &turn_id,
+                    &format!("replay-{scenario}"),
+                    "task_run_now",
+                    args,
+                )
+                .await
+                .unwrap();
+                assert!(!replay.is_error, "{replay:?}");
+                assert_eq!(replay.structured_content.as_ref().unwrap()["runId"], run_id);
+                processor
+                    .task_runtime
+                    .register_executor(Arc::new(CompletingSystemExecutor))
+                    .await;
+                processor
+                    .task_runtime
+                    .process_due_once(4_000_000_000)
+                    .await
+                    .unwrap();
+                let completed = processor
+                    .crud_store
+                    .get_task(task_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(completed.runs.len(), 2);
+                assert_eq!(completed.runs[1].id, run_id);
+                assert_eq!(completed.runs[1].status, TaskRunStatus::Succeeded);
+                assert_eq!(
+                    completed.task.lifecycle_policy,
+                    created.task.lifecycle_policy
+                );
+                assert_eq!(
+                    completed.task.status,
+                    if scenario == "planned_first_failed" {
+                        TaskStatus::Failed
+                    } else {
+                        TaskStatus::Completed
+                    }
+                );
+                if scenario == "planned_first_failed" {
+                    assert_eq!(
+                        completed.task.error.as_ref().unwrap().code,
+                        "primary_failed"
+                    );
+                }
+                let extra_handle = pioneer_tasks::TaskExecutionHandle::new(
+                    processor.crud_store.clone(),
+                    processor.task_runtime.event_bus(),
+                    task_id.clone(),
+                    run_id.clone(),
+                );
+                extra_handle
+                    .complete_run(
+                        completed.runs[1].result.clone(),
+                        completed.runs[1].completed_at.unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                processor
+                    .task_runtime
+                    .process_due_once(4_000_000_000)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    processor
+                        .crud_store
+                        .get_task(task_id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .runs,
+                    completed.runs
+                );
+                let deliveries = processor
+                    .task_runtime
+                    .service()
+                    .list_deliveries(TaskDeliveriesParams {
+                        workspace_id: binding.workspace_id.clone(),
+                        task_id: Some(task_id.clone()),
+                        run_id: None,
+                        statuses: Vec::new(),
+                        limit: Some(100),
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(deliveries.deliveries.len(), 2);
+                continue;
+            }
+            let now = chrono::Utc::now().timestamp();
+            if scheduled_already_queued || fails || matches!(scenario, "finish" | "cancel") {
+                let handle = pioneer_tasks::TaskExecutionHandle::new(
+                    processor.crud_store.clone(),
+                    processor.task_runtime.event_bus(),
+                    task_id.clone(),
+                    run_id.clone(),
+                );
+                handle.mark_started(now).await.unwrap();
+                if matches!(scenario, "finish" | "cancel") {
+                    let tool = if scenario == "finish" {
+                        "task_finish"
+                    } else {
+                        "task_cancel"
+                    };
+                    let stop = invoke_task(
+                        &processor,
+                        &turn_id,
+                        &format!("stop-{scenario}"),
+                        tool,
+                        json!({"taskId":task_id}),
+                    )
+                    .await
+                    .unwrap();
+                    assert!(!stop.is_error, "{stop:?}");
+                    if scenario == "finish" {
+                        handle.complete_run(None, now).await.unwrap();
+                    }
+                    processor
+                        .task_runtime
+                        .register_executor(Arc::new(CompletingSystemExecutor))
+                        .await;
+                    processor
+                        .task_runtime
+                        .process_due_once(4_000_000_000)
+                        .await
+                        .unwrap();
+                    let stopped = processor
+                        .crud_store
+                        .get_task(task_id)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(stopped.runs.len(), 1);
+                    assert_eq!(
+                        stopped.task.status,
+                        if scenario == "finish" {
+                            TaskStatus::Completed
+                        } else {
+                            TaskStatus::Cancelled
+                        }
+                    );
+                    assert_eq!(
+                        stopped.runs[0].status,
+                        if scenario == "finish" {
+                            TaskRunStatus::Succeeded
+                        } else {
+                            TaskRunStatus::Cancelled
+                        }
+                    );
+                    assert_eq!(stopped.triggers[0].status, TaskTriggerStatus::Cancelled);
+                    continue;
+                }
+                let before_planned_fire = if scheduled_already_queued {
+                    Some(
+                        processor
+                            .crud_store
+                            .prepare_task_terminal_transition(TaskEventPayload::RunCompleted {
+                                task_id: task_id.clone(),
+                                run_id: run_id.clone(),
+                                result: None,
+                                completed_at: now,
+                            })
+                            .await
+                            .unwrap(),
+                    )
+                } else {
+                    None
+                };
+                // No System executor yet: the planned fire becomes a queued
+                // sibling while the additional occurrence owns the serial slot.
+                if scheduled_already_queued {
+                    processor
+                        .task_runtime
+                        .process_due_once(4_000_000_000)
+                        .await
+                        .unwrap();
+                    let queued = processor
+                        .crud_store
+                        .get_task(task_id)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(queued.runs.len(), 2);
+                    assert_eq!(queued.runs[1].status, TaskRunStatus::Queued);
+                    assert_eq!(queued.runs[0].status, TaskRunStatus::Running);
+                }
+                if fails {
+                    handle
+                        .fail_run(
+                            Some(pioneer_protocol::TaskError {
+                                recovery_diagnostic: None,
+                                code: "extra_failed".to_owned(),
+                                message: "extra check failed".to_owned(),
+                                class: pioneer_protocol::TaskErrorClass::Internal,
+                                details: None,
+                                failed_run_id: Some(run_id.clone()),
+                            }),
+                            now,
+                        )
+                        .await
+                        .unwrap();
+                } else {
+                    if let Some(prepared) = before_planned_fire {
+                        let outcome = processor
+                            .crud_store
+                            .commit_task_terminal_transition(prepared)
+                            .await
+                            .unwrap();
+                        processor
+                            .task_runtime
+                            .event_bus()
+                            .publish_many(outcome.events)
+                            .await;
+                    }
+                    handle.complete_run(None, now).await.unwrap();
+                }
+            } else {
+                processor
+                    .task_runtime
+                    .register_executor(Arc::new(CompletingSystemExecutor))
+                    .await;
+                processor.task_runtime.process_due_once(now).await.unwrap();
+            }
+            let after_extra = processor
+                .crud_store
+                .get_task(task_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(!after_extra.task.status.is_terminal());
+            assert_eq!(
+                after_extra.task.lifecycle_policy,
+                created.task.lifecycle_policy
+            );
+            let completed = after_extra
+                .runs
+                .iter()
+                .find(|run| run.id == run_id)
+                .unwrap();
+            assert_eq!(
+                completed.status,
+                if fails {
+                    TaskRunStatus::Failed
+                } else {
+                    TaskRunStatus::Succeeded
+                }
+            );
+            if fails {
+                assert_eq!(completed.error.as_ref().unwrap().code, "extra_failed");
+            }
+            if !scheduled_already_queued {
+                assert_eq!(after_extra.triggers[0].spec, created.trigger.spec);
+                assert_eq!(after_extra.triggers[0].next_fire_at, Some(4_000_000_000));
+            }
+            // A reconstructed handle replays the terminal outcome, and a fresh
+            // facade invocation recovers the original durable operation receipt.
+            let recovered = pioneer_tasks::TaskExecutionHandle::new(
+                processor.crud_store.clone(),
+                processor.task_runtime.event_bus(),
+                task_id.clone(),
+                run_id.clone(),
+            );
+            if fails {
+                recovered
+                    .fail_run(completed.error.clone(), completed.completed_at.unwrap())
+                    .await
+                    .unwrap();
+            } else {
+                recovered
+                    .complete_run(completed.result.clone(), completed.completed_at.unwrap())
+                    .await
+                    .unwrap();
+            }
+            let replay = invoke_task(
+                &processor,
+                &turn_id,
+                &format!("extra-replay-{scenario}"),
+                "task_run_now",
+                args,
+            )
+            .await
+            .unwrap();
+            assert!(!replay.is_error, "{replay:?}");
+            assert_eq!(replay.structured_content.as_ref().unwrap()["runId"], run_id);
+            processor
+                .task_runtime
+                .register_executor(Arc::new(CompletingSystemExecutor))
+                .await;
+            if scenario == "retry" {
+                processor.task_runtime.process_due_once(now).await.unwrap();
+                let retried = processor
+                    .crud_store
+                    .get_task(task_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(retried.runs.len(), 2);
+                assert_eq!(
+                    retried.runs[1].retry_of_run_id.as_deref(),
+                    Some(run_id.as_str())
+                );
+                assert_eq!(retried.runs[1].status, TaskRunStatus::Succeeded);
+                assert!(!retried.task.status.is_terminal());
+                assert_eq!(retried.triggers[0].next_fire_at, Some(4_000_000_000));
+            }
+            processor
+                .task_runtime
+                .process_due_once(4_000_000_000)
+                .await
+                .unwrap();
+            processor
+                .task_runtime
+                .process_due_once(4_000_000_000)
+                .await
+                .unwrap();
+            let final_state = processor
+                .crud_store
+                .get_task(task_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                final_state.runs.len(),
+                if scenario == "retry" { 3 } else { 2 }
+            );
+            assert_eq!(
+                final_state
+                    .runs
+                    .iter()
+                    .filter(|run| run.status == TaskRunStatus::Failed)
+                    .count(),
+                usize::from(fails)
+            );
+            assert_eq!(
+                final_state.runs.last().unwrap().status,
+                TaskRunStatus::Succeeded
+            );
+            assert_eq!(
+                final_state
+                    .runs
+                    .iter()
+                    .filter(|run| run.trigger_id.as_deref() == Some(created.trigger.id.as_str()))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                final_state.task.status,
+                if scenario == "failed" {
+                    TaskStatus::Failed
+                } else {
+                    TaskStatus::Completed
+                }
+            );
+            if scenario == "failed" {
+                assert_eq!(
+                    final_state.task.error.as_ref().unwrap().code,
+                    "extra_failed"
+                );
+            }
+            let deliveries = processor
+                .task_runtime
+                .service()
+                .list_deliveries(pioneer_protocol::TaskDeliveriesParams {
+                    workspace_id: binding.workspace_id.clone(),
+                    task_id: Some(task_id.clone()),
+                    run_id: None,
+                    statuses: Vec::new(),
+                    limit: Some(100),
+                })
+                .await
+                .unwrap();
+            assert_eq!(deliveries.deliveries.len(), 2);
+            if scenario == "failed" {
+                let failed_delivery = deliveries
+                    .deliveries
+                    .iter()
+                    .find(|delivery| delivery.run_id == run_id)
+                    .unwrap();
+                assert_eq!(
+                    failed_delivery.error_snapshot.as_ref().unwrap().code,
+                    "extra_failed"
+                );
+            }
+        }
     });
 }

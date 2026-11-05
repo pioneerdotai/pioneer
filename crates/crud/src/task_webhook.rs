@@ -32,6 +32,18 @@ impl CrudStore {
             .transpose()
     }
 
+    pub async fn get_task_queue_admission_snapshot(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<TaskWebhookAdmissionSnapshot>> {
+        let Some(trigger) =
+            task_trigger::find_latest_trigger_by_task(&self.connection, task_id).await?
+        else {
+            return Ok(None);
+        };
+        self.get_task_webhook_admission_snapshot(&trigger.id).await
+    }
+
     pub async fn get_task_webhook_admission_snapshot(
         &self,
         trigger_id: &str,
@@ -79,11 +91,40 @@ impl CrudStore {
         occurrence: TaskOccurrenceContract,
         events: Vec<TaskEventPayload>,
     ) -> Result<Option<Vec<AppendedTaskEvent>>> {
+        Ok(self
+            .accept_task_queued_occurrence(
+                expected_task,
+                expected_trigger,
+                run,
+                occurrence,
+                events,
+                None,
+            )
+            .await?
+            .map(|(_, events)| events))
+    }
+
+    /// Shared ordinary queue admission. Manual requests carry the existing
+    /// Agent action ledger commit; webhook POSTs retain their endpoint identity.
+    pub async fn accept_task_queued_occurrence(
+        &self,
+        expected_task: &Task,
+        expected_trigger: &TaskTrigger,
+        run: &TaskRun,
+        occurrence: TaskOccurrenceContract,
+        events: Vec<TaskEventPayload>,
+        action: Option<crate::AgentCommitInput>,
+    ) -> Result<Option<(String, Vec<AppendedTaskEvent>)>> {
+        let manual = action.is_some();
         anyhow::ensure!(
             run.task_id == expected_task.id
                 && occurrence.run_id == run.id
                 && occurrence.task_id == run.task_id
-                && run.trigger_id.as_deref() == Some(expected_trigger.id.as_str()),
+                && if manual {
+                    run.trigger_id.is_none()
+                } else {
+                    run.trigger_id.as_deref() == Some(expected_trigger.id.as_str())
+                },
             "invalid webhook occurrence identity"
         );
         occurrence
@@ -122,13 +163,54 @@ impl CrudStore {
             let prepared = self.refresh_task_event_preflight(prepared.clone()).await?;
             let transaction = self.connection.begin().await?;
             let outcome = async {
+                if let Some(action) = action.as_ref()
+                    && let Some(existing) = crate::repositories::agent_domain::load_agent_action(
+                        &transaction,
+                        &action.action.id,
+                    )
+                    .await?
+                    && existing.status == "committed"
+                {
+                    anyhow::ensure!(
+                        existing.request_fingerprint == action.request_fingerprint
+                            && existing.execution_id == action.action.execution_id,
+                        "manual run action identity conflict"
+                    );
+                    let response: serde_json::Value = serde_json::from_str(
+                        existing
+                            .response_json
+                            .as_deref()
+                            .context("manual run receipt missing")?,
+                    )?;
+                    let run_id = response["taskRunNow"]["runId"]
+                        .as_str()
+                        .context("manual run reference missing")?;
+                    let existing_run = task_run::find_run_by_id(&transaction, run_id)
+                        .await?
+                        .context("manual run missing")?;
+                    anyhow::ensure!(
+                        existing_run.task_id == expected_task.id,
+                        "manual run task mismatch"
+                    );
+                    return Ok(Some((existing_run.id, Vec::new())));
+                }
                 let Some(current_trigger) =
                     task_trigger::find_trigger_by_id(&transaction, &expected_trigger.id).await?
                 else {
                     return Ok(None);
                 };
                 if current_trigger.task_id != expected_task.id
-                    || current_trigger.status != "active"
+                    || !(current_trigger.status == "active"
+                        || (manual && current_trigger.status == "exhausted"))
+                    || (manual
+                        && current_trigger.status
+                            != crate::convention::task_trigger_status_to_db(
+                                expected_trigger.status,
+                            ))
+                    || current_trigger.next_fire_at.map(|at| at.timestamp())
+                        != expected_trigger.next_fire_at
+                    || current_trigger.last_fire_at.map(|at| at.timestamp())
+                        != expected_trigger.last_fire_at
                     || current_trigger.spec_json != expected_spec
                     || current_trigger.webhook_secret_ref != expected_trigger.webhook_secret_ref
                     || current_trigger.updated_at.timestamp() != expected_trigger.updated_at
@@ -187,7 +269,11 @@ impl CrudStore {
                     &run.id,
                 )
                 .await?;
-                Ok(Some(appended))
+                if let Some(action) = action.as_ref() {
+                    crate::repositories::agent_domain::commit_agent_action(&transaction, action)
+                        .await?;
+                }
+                Ok(Some((run.id.clone(), appended)))
             }
             .await;
             match outcome {
@@ -196,7 +282,7 @@ impl CrudStore {
                         .commit()
                         .await
                         .context("failed to commit webhook admission")?;
-                    Ok(value.map(materialize_task_events))
+                    Ok(value.map(|(run, events)| (run, materialize_task_events(events))))
                 }
                 Err(error) => {
                     let _ = transaction.rollback().await;
