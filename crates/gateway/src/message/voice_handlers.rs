@@ -1338,7 +1338,7 @@ impl MessageProcessor {
     pub(super) async fn send_voice_session_result_notification(
         &self,
         connection_id: ConnectionId,
-        _thread_id: &str,
+        thread_id: &str,
         mut notification: VoiceSessionResultNotification,
     ) {
         if let Some(key) = notification.turn_id.as_deref() {
@@ -1364,6 +1364,13 @@ impl MessageProcessor {
                 pioneer_protocol::PublicErrorStage::Execution,
             ));
         }
+        if self
+            .authorized_thread_connection_recipients(thread_id, vec![connection_id])
+            .await
+            .is_empty()
+        {
+            return;
+        }
         // A terminal recording outcome is addressed to its authenticated
         // physical owner, not ordinary notification fanout. Its capacity and
         // lifecycle checks are the same as audio ACK/overflow delivery.
@@ -1373,7 +1380,12 @@ impl MessageProcessor {
         {
             let _ = self
                 .session_manager
-                .send_voice_text(connection_id, text, true)
+                .send_voice_text_authorized(connection_id, text, true, || async {
+                    !self
+                        .authorized_thread_connection_recipients(thread_id, vec![connection_id])
+                        .await
+                        .is_empty()
+                })
                 .await;
         }
     }

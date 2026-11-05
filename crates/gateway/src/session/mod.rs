@@ -425,6 +425,21 @@ impl SessionManager {
         payload: String,
         terminal: bool,
     ) -> Result<()> {
+        self.send_voice_text_authorized(id, payload, terminal, || async { true })
+            .await
+    }
+
+    pub(crate) async fn send_voice_text_authorized<F, Fut>(
+        &self,
+        id: ConnectionId,
+        payload: String,
+        terminal: bool,
+        mut authorize: F,
+    ) -> Result<()>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
         let original = self.connection_context(id).await?;
         let sender = {
             let connections = self.connections.read().await;
@@ -441,6 +456,9 @@ impl SessionManager {
             let changed = sender.audio_capacity_changed().notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
+            // A capacity wake grants no authority. Recheck the resource before
+            // every enqueue attempt, without holding the connection registry.
+            anyhow::ensure!(authorize().await, "voice delivery resource retired");
             let admission = self
                 .with_voice_ingress_connection(id, original.principal(), || {
                     sender.try_send_audio(message, terminal)
