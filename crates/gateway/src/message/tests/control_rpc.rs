@@ -1871,7 +1871,7 @@ async fn paused_audio_ingest_does_not_hold_independent_read_group_or_cancel() {
                     .voice_session_buffers
                     .buffered_bytes_for_test(&replacement.session_id)
                     .unwrap(),
-                2
+                6 // one PCM i16 sample plus one normalized f32 sample
             );
             gate.release.add_permits(1);
         };
