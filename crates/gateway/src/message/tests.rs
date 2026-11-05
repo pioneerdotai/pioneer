@@ -33224,15 +33224,27 @@ async fn cli_predispatch_read_failure_cancel_and_shutdown_release_session_lease_
             .await
             .unwrap();
         let thread = format!("predispatch-{case}");
-        open_persisted_child_for_test(
-            &processor,
-            connection,
-            &mut rx,
-            &workspace,
-            &thread,
-            &format!("open-{case}"),
-        )
-        .await;
+        // This case starts with a fresh thread, so create it before testing
+        // dispatch cleanup. thread/open only subscribes to existing threads.
+        let create_id = generate_test_request_id("predispatch-create", case);
+        processor
+            .process_request_for_connection(
+                connection,
+                &json!({
+                    "jsonrpc": "2.0", "id": create_id, "method": "thread/start",
+                    "params": {
+                        "thread_id": thread, "workspace_id": workspace,
+                        "model": "gpt-5", "model_provider": "openai",
+                        "sandbox": SandboxMode::FullAccess, "mode": "Agent"
+                    }
+                })
+                .to_string(),
+            )
+            .await;
+        let response = recv_response_by_id(&mut rx, &create_id).await;
+        let created: ThreadStartResponse = serde_json::from_value(response.result).unwrap();
+        assert_eq!(created.thread.id, thread);
+        assert_eq!(created.thread.workspace_id, workspace);
         let turn = format!("predispatch-turn-{case}");
         processor.arm_completed_history_preparation_barrier("__cli_predispatch__");
         if case == "read_error" {

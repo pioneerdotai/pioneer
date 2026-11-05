@@ -14307,6 +14307,18 @@ mod tests {
             thread_id: "a".into(),
             turn: turn.clone(),
         }));
+        core.apply_thread_notification(GatewayNotification::ItemStarted(ItemStartedNotification {
+            workspace_id: "ws".into(),
+            thread_id: "a".into(),
+            turn_id: turn.id.clone(),
+            item: TurnItem::AgentMessage {
+                id: "answer".into(),
+                text: String::new(),
+                phase: pioneer_protocol::AgentMessagePhase::FinalAnswer,
+                markdown: None,
+                markdown_version: None,
+            },
+        }));
         core.apply_thread_notification(GatewayNotification::ItemCompleted(
             ItemCompletedNotification {
                 workspace_id: "ws".into(),
