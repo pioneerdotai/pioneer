@@ -1687,6 +1687,14 @@ async fn portable_schema_rollback_refuses_live_compressed_values_without_losing_
     );
     assert_portable_logical_reads(&store, &originals).await;
     for migration in portable_schema_migrations().iter().rev() {
+        if migration.name() == "m20261105_000001_portable_pending_indexes" {
+            // Index-only rollback preserves live values and needs no TEXT restoration.
+            portable_schema_step(&store, migration.as_ref(), false)
+                .await
+                .unwrap();
+            assert_portable_logical_reads(&store, &originals).await;
+            continue;
+        }
         let error = portable_schema_step(&store, migration.as_ref(), false)
             .await
             .unwrap_err();

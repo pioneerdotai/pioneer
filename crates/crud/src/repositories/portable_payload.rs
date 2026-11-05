@@ -2412,7 +2412,7 @@ mod tests {
         // Legacy rows with missing owner/run are ordinary availability refusals.
         for i in 0..130 {
             store.connection.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-                "INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at) VALUES(?,'missing','ws','thread','[]',CURRENT_TIMESTAMP)",
+                "INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at,frozen_manifest_id) VALUES(?,'missing','ws','thread','[]',CURRENT_TIMESTAMP,NULL)",
                 [format!("run-{i:03}").into()])).await.unwrap();
         }
         let mut progress = PortablePayloadProgress::default();

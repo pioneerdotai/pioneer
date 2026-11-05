@@ -181,7 +181,7 @@ mod worker_tests {
         panic!("worker did not reach the observed DB boundary");
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn worker_pays_active_debt_retains_throttle_signal_and_cancels_during_rest() {
         use futures_util::StreamExt;
         use sea_orm::{DbBackend, Statement, StreamTrait};
@@ -199,6 +199,8 @@ mod worker_tests {
         assert!(held.next().await.unwrap().is_ok());
         let before_worker_admission = reads.enqueued.load(SeqCst);
         let before_worker_finish = reads.finished.load(SeqCst);
+        // Establish real SQLite connections before pausing the worker clock.
+        tokio::time::pause();
         let mut worker = Box::pin(run(Arc::new(CrudStore::new(db)), cancellation.clone()));
         let started = tokio::time::Instant::now();
         assert!(futures_util::poll!(&mut worker).is_pending());
@@ -254,8 +256,10 @@ mod worker_tests {
 
         // Start a fresh pass with another known active await, then interrupt
         // its real throttle before the 1.8 seconds of rest have elapsed.
+        tokio::time::resume();
         let mut held = maintenance.stream_raw(stream_query).await.unwrap();
         assert!(held.next().await.unwrap().is_ok());
+        tokio::time::pause();
         let before_restart = reads.enqueued.load(SeqCst);
         signal.notify();
         assert!(futures_util::poll!(&mut worker).is_pending());
@@ -278,11 +282,13 @@ mod worker_tests {
         assert_eq!(reads.enqueued.load(SeqCst), before_restart + 2);
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn empty_worker_parks_until_signal_and_cancels_without_idle_polling() {
         let (_directory, db, reads) = empty_fixture().await;
         let signal = db.work_signal("maintenance.portable");
         let cancellation = CancellationToken::new();
+        // Establish real SQLite connections before pausing the worker clock.
+        tokio::time::pause();
         let mut worker = Box::pin(run(Arc::new(CrudStore::new(db)), cancellation.clone()));
         // Drive actual DB futures while virtual time pays active pacing. The
         // empty pass has one cleanup frontier and five family frontier reads.
@@ -315,7 +321,7 @@ mod worker_tests {
         assert!(invalidated_during_pass);
         assert_eq!(reads.finished.load(SeqCst), 18);
     }
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn database_error_keeps_backoff_and_shutdown_interrupts_it() {
         let raw = sea_orm::Database::connect("sqlite::memory:").await.unwrap();
         let reads = Arc::new(Reads::default());
@@ -325,6 +331,8 @@ mod worker_tests {
             reads.clone(),
         );
         let cancellation = CancellationToken::new();
+        // Establish real SQLite connections before pausing the worker clock.
+        tokio::time::pause();
         let mut worker = Box::pin(run(Arc::new(CrudStore::new(db)), cancellation.clone()));
         for _ in 0..10000 {
             assert!(futures_util::poll!(&mut worker).is_pending());
