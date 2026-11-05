@@ -82658,19 +82658,16 @@ async fn recv_notification_by_method_timeout(
     method: &str,
     wait_for: Duration,
 ) -> JsonRpcNotification {
-    let context = format!("notification method `{method}`");
-    for _ in 0..200 {
-        let payload = recv_text_timeout_context(rx, wait_for, context.as_str()).await;
-        let value: serde_json::Value =
-            serde_json::from_str(&payload).expect("json-rpc payload should decode");
-        if value.get("id").is_none()
-            && value.get("method").and_then(serde_json::Value::as_str) == Some(method)
-        {
-            return serde_json::from_value(value).expect("json-rpc notification should decode");
-        }
-    }
-
-    panic!("timed out waiting for notification method `{method}`");
+    let message = timeout(wait_for, rx.recv_notification(method))
+        .await
+        .unwrap_or_else(|error| {
+            panic!("timed out waiting for notification method `{method}`: {error:?}")
+        })
+        .expect("websocket channel closed waiting for notification");
+    let Message::Text(payload) = message else {
+        unreachable!()
+    };
+    serde_json::from_str(&payload).expect("json-rpc notification should decode")
 }
 
 async fn recv_echo_turn_lifecycle_notifications(

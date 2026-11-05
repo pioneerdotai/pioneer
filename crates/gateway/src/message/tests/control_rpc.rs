@@ -2518,6 +2518,37 @@ async fn durable_revoke_before_publication_is_rechecked_before_audio_effect() {
                 THREAD,
             )
             .await;
+            // The real audio worker validates the durable device/session lease.
+            // ACL membership alone is insufficient for this physical owner.
+            let db = f.processor.crud_store.database_connection();
+            let member = authenticated_test_member_collaborator();
+            let device = pioneer_entity::device::Entity::find_by_id("D00000000000000000001")
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap();
+            let session = pioneer_entity::auth_session::Entity::find_by_id("S00000000000000000001")
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap();
+            use sea_orm::IntoActiveModel;
+            let mut device = device.into_active_model().reset_all();
+            device.id = Set(member.device_id.to_string());
+            device.principal_id = Set(member.principal_id.to_string());
+            device.insert(&db).await.unwrap();
+            let mut session = session.into_active_model().reset_all();
+            session.id = Set(member.session_id.to_string());
+            session.principal_id = Set(member.principal_id.to_string());
+            session.device_id = Set(member.device_id.to_string());
+            session.token_family_id = Set("F0000000000000000000C".into());
+            session.activation_token_hash = Set(vec![0xCC; 32]);
+            session.activation_locator_hash = Set(vec![0xCD; 32]);
+            session.insert(&db).await.unwrap();
+            f.auth
+                .validate_session_lease(member.as_ref())
+                .await
+                .unwrap();
             let (tx, rx) = crate::session::test_support::outbound_channel(128);
             f.connection = f
                 .processor

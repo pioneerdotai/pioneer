@@ -162,13 +162,30 @@ impl OutboundTestReceiver {
     }
 
     pub(crate) async fn recv_response(&mut self, id: &str) -> Option<Message> {
-        let matches = |message: &Message| match message {
-            Message::Text(text) => serde_json::from_str::<serde_json::Value>(text)
-                .ok()
-                .is_some_and(|value| value["id"].as_str() == Some(id)),
-            _ => false,
+        self.recv_matching(|value| value["id"].as_str() == Some(id))
+            .await
+    }
+
+    pub(crate) async fn recv_notification(&mut self, method: &str) -> Option<Message> {
+        self.recv_matching(|value| {
+            value.get("id").is_none() && value["method"].as_str() == Some(method)
+        })
+        .await
+    }
+
+    async fn recv_matching(
+        &mut self,
+        matches: impl Fn(&serde_json::Value) -> bool,
+    ) -> Option<Message> {
+        let decode = |message: &Message| match message {
+            Message::Text(text) => serde_json::from_str::<serde_json::Value>(text).ok(),
+            _ => None,
         };
-        if let Some(index) = self.1.iter().position(&matches) {
+        if let Some(index) = self
+            .1
+            .iter()
+            .position(|message| decode(message).is_some_and(|v| matches(&v)))
+        {
             return self.1.remove(index);
         }
         loop {
@@ -178,10 +195,23 @@ impl OutboundTestReceiver {
                 pioneer_observability::work::WorkKind::Event,
                 pioneer_observability::work::ExecutorRole::Gateway,
             );
-            if matches(&message) {
-                return Some(message);
+            if let Some(value) = decode(&message) {
+                if matches(&value) {
+                    return Some(message);
+                }
+                // Audio can overtake ordinary replies and turn notifications.
+                // Preserve that lane; retain the helpers' existing behavior
+                // of skipping unrelated ordinary notifications.
+                if matches!(
+                    value["method"].as_str(),
+                    Some(
+                        pioneer_protocol::constants::events::VOICE_CHUNK_ACK
+                            | pioneer_protocol::constants::events::VOICE_SESSION_RESULT
+                    )
+                ) {
+                    self.1.push_back(message);
+                }
             }
-            self.1.push_back(message);
         }
     }
 
