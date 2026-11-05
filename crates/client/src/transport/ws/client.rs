@@ -808,17 +808,22 @@ async fn connection_writer<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unp
     mut voice: tokio::sync::mpsc::Receiver<super::voice_budget::QueuedVoiceAudio>,
     mut control: tokio::sync::mpsc::Receiver<WriterFrame>,
     mut cancels: tokio::sync::mpsc::Receiver<WriterFrame>,
+    mut voice_cancels: tokio::sync::mpsc::Receiver<WriterFrame>,
     connection_id: u64,
 ) -> String {
     let mut prefer_cancel = true;
     let mut fenced = std::collections::VecDeque::new();
     loop {
+        let cancel = async {
+            tokio::select! { frame = cancels.recv() => frame, frame = voice_cancels.recv() => frame }
+        };
+        tokio::pin!(cancel);
         let from_fence = !fenced.is_empty();
         let frame = if from_fence {
             tokio::select! {
                 biased;
                 frame = control.recv() => frame,
-                frame = cancels.recv(), if prefer_cancel => { prefer_cancel = false; frame },
+                frame = &mut cancel, if prefer_cancel => { prefer_cancel = false; frame },
                 frame = async { fenced.pop_front() } => { prefer_cancel = true; frame },
             }
         } else {
@@ -837,14 +842,14 @@ async fn connection_writer<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unp
                     if prefer_cancel {
                         tokio::select! {
                             biased;
-                            frame = cancels.recv() => Either::Left(frame),
+                            frame = &mut cancel => Either::Left(frame),
                             frame = &mut ordinary => Either::Right(frame),
                         }
                     } else {
                         tokio::select! {
                             biased;
                             frame = &mut ordinary => Either::Right(frame),
-                            frame = cancels.recv() => Either::Left(frame),
+                            frame = &mut cancel => Either::Left(frame),
                         }
                     }
                 } => match frame {
@@ -947,7 +952,8 @@ async fn monitor_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Un
     let (writer, mut reader) = stream.split();
     let (data_tx, data_rx) = tokio::sync::mpsc::channel(WRITER_HANDOFF_CAPACITY);
     let (control_tx, control_rx) = tokio::sync::mpsc::channel(WRITER_HANDOFF_CAPACITY);
-    let (cancel_tx, cancel_rx) = tokio::sync::mpsc::channel(2);
+    let (cancel_tx, cancel_rx) = tokio::sync::mpsc::channel(1);
+    let (voice_cancel_tx, voice_cancel_rx) = tokio::sync::mpsc::channel(1);
     let writer = connection_writer(
         writer,
         data_rx,
@@ -957,6 +963,7 @@ async fn monitor_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Un
             .expect("voice receiver owned by socket"),
         control_rx,
         cancel_rx,
+        voice_cancel_rx,
         connection_id,
     );
     tokio::pin!(writer);
@@ -1032,14 +1039,14 @@ async fn monitor_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Un
                 if prefer_cancels {
                     tokio::select! {
                         biased;
-                        cancel = cancels.receiver.recv() => Either::Left(cancel),
+                        cancel = cancels.recv() => Either::Left(cancel),
                         input = &mut regular => Either::Right(input),
                     }
                 } else {
                     tokio::select! {
                         biased;
                         input = &mut regular => Either::Right(input),
-                        cancel = cancels.receiver.recv() => Either::Left(cancel),
+                        cancel = cancels.recv() => Either::Left(cancel),
                     }
                 }
             } => match input {
@@ -1050,8 +1057,11 @@ async fn monitor_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Un
                 // Same pending owner, before frame admission/claim. Final writer
                 // claim still checks physical/subscription/deadline/cancellation.
                 waiters.requests.insert(cancel.request_id, cancel.response.clone());
+                let voice_control = serde_json::from_str::<serde_json::Value>(&cancel.payload).ok()
+                    .is_some_and(|v| v["method"] == pioneer_protocol::constants::methods::VOICE_SESSION_CANCEL);
                 let frame = WriterFrame::new(Message::Text(cancel.payload.into()), Some(cancel.response.clone()));
-                if cancel_tx.try_send(frame).is_err() {
+                let handoff = if voice_control { &voice_cancel_tx } else { &cancel_tx };
+                if handoff.try_send(frame).is_err() {
                     let _ = cancel.response.send(Err(crate::rpc::JsonRpcResponseError::transport("websocket Cancel writer handoff full or closed")));
                 }
             }

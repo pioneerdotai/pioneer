@@ -1596,35 +1596,12 @@ async fn blocked_ordinary_accepts_eighty_voice_frames_without_using_deferred_fif
             .connection_context(f.connection)
             .await
             .unwrap();
-        let request_context = RequestContext::new(
+        let session = ingress_recording(
+            &f.processor,
+            &f.workspace,
             &context,
-            None,
-            crate::request_context::CanonicalMethod::binary("voice/chunk"),
+            "voice_ingress_regression",
         );
-        let owner = AuthenticatedTransferOwner::from_request_context(&request_context);
-        let format = pioneer_protocol::VoiceAudioFormat::pioneer_streaming_target();
-        let session = f
-            .processor
-            .voice_sessions
-            .create_authenticated_session(
-                "voice_ingress_regression",
-                owner.clone(),
-                pioneer_protocol::VoiceSessionStartContext {
-                    workspace_id: f.workspace.clone(),
-                    thread_id: THREAD.into(),
-                    turn_id: TURN.into(),
-                },
-                format.clone(),
-            )
-            .unwrap();
-        f.processor
-            .voice_sessions
-            .mark_recording_authenticated(&session.session_id, &owner)
-            .unwrap();
-        f.processor
-            .voice_session_buffers
-            .start_session(&session.session_id, format)
-            .unwrap();
         let (renewals, _) = watch::channel(ConnectionAccessLease::new(
             context.principal().clone(),
             Duration::from_secs(60),
@@ -1658,23 +1635,8 @@ async fn blocked_ordinary_accepts_eighty_voice_frames_without_using_deferred_fif
         let driver = async {
             // No native recognizer is running. Transport must still accept exact PCM.
             for sequence in 0..80 {
-                let header = pioneer_protocol::VoiceChunkFrameHeader {
-                    session_id: session.session_id.clone(),
-                    sequence,
-                    sample_rate_hz: 16_000,
-                    channels: 1,
-                    encoding: pioneer_protocol::VoiceAudioEncoding::PcmS16Le,
-                    payload_len: 0,
-                    captured_at_unix_ms: Some(sequence),
-                    duration_ms: None,
-                };
-                let pcm = (sequence as i16).to_le_bytes();
                 input
-                    .send(Message::Binary(
-                        pioneer_protocol::encode_voice_chunk_frame(header, &pcm)
-                            .unwrap()
-                            .into(),
-                    ))
+                    .send(ingress_frame(&session.session_id, sequence))
                     .unwrap();
             }
             for sequence in 0..80 {
@@ -1718,7 +1680,8 @@ async fn blocked_ordinary_accepts_eighty_voice_frames_without_using_deferred_fif
 }
 
 fn ingress_recording(
-    f: &Fixture,
+    processor: &MessageProcessor,
+    workspace: &str,
     context: &crate::request_context::ConnectionContext,
     name: &str,
 ) -> crate::voice::session_store::GatewayVoiceSession {
@@ -1729,25 +1692,24 @@ fn ingress_recording(
     );
     let owner = AuthenticatedTransferOwner::from_request_context(&request);
     let format = pioneer_protocol::VoiceAudioFormat::pioneer_streaming_target();
-    let session = f
-        .processor
+    let session = processor
         .voice_sessions
         .create_authenticated_session(
             name,
             owner.clone(),
             pioneer_protocol::VoiceSessionStartContext {
-                workspace_id: f.workspace.clone(),
+                workspace_id: workspace.to_owned(),
                 thread_id: THREAD.into(),
                 turn_id: TURN.into(),
             },
             format.clone(),
         )
         .unwrap();
-    f.processor
+    processor
         .voice_sessions
         .mark_recording_authenticated(name, &owner)
         .unwrap();
-    f.processor
+    processor
         .voice_session_buffers
         .start_session(name, format)
         .unwrap();
@@ -1783,7 +1745,12 @@ async fn paused_audio_ingest_does_not_hold_independent_read_group_or_cancel() {
             .connection_context(f.connection)
             .await
             .unwrap();
-        let session = ingress_recording(&f, &context, "voice_reverse_ingress");
+        let session = ingress_recording(
+            &f.processor,
+            &f.workspace,
+            &context,
+            "voice_reverse_ingress",
+        );
         assert!(
             f.processor
                 .thread_manager
@@ -1848,8 +1815,12 @@ async fn paused_audio_ingest_does_not_hold_independent_read_group_or_cancel() {
                 .connection_context(f.connection)
                 .await
                 .unwrap();
-            let replacement =
-                ingress_recording(&f, &replacement_context, "voice_after_ingress_cancel");
+            let replacement = ingress_recording(
+                &f.processor,
+                &f.workspace,
+                &replacement_context,
+                "voice_after_ingress_cancel",
+            );
             input.send(ingress_frame(&session.session_id, 1)).unwrap();
             input
                 .send(ingress_frame(&replacement.session_id, 0))
@@ -1894,7 +1865,12 @@ async fn audio_capacity_failure_is_terminal_for_its_recording_and_preserves_read
             .connection_context(f.connection)
             .await
             .unwrap();
-        let session = ingress_recording(&f, &context, "voice_capacity_ingress");
+        let session = ingress_recording(
+            &f.processor,
+            &f.workspace,
+            &context,
+            "voice_capacity_ingress",
+        );
         let (renewals, _) = watch::channel(ConnectionAccessLease::new(
             context.principal().clone(),
             Duration::from_secs(60),
@@ -2006,7 +1982,12 @@ async fn audio_worker_retirement_releases_active_and_queued_tickets() {
                 .connection_context(f.connection)
                 .await
                 .unwrap();
-            let session = ingress_recording(&f, &context, "voice_retired_ingress");
+            let session = ingress_recording(
+                &f.processor,
+                &f.workspace,
+                &context,
+                "voice_retired_ingress",
+            );
             let (renewals, _) = watch::channel(ConnectionAccessLease::new(
                 context.principal().clone(),
                 Duration::from_secs(60),
@@ -2095,7 +2076,7 @@ async fn finalize_transport_seal_includes_active_and_queued_audio_and_rejects_la
     tokio::time::timeout(Duration::from_secs(10), async {
         let mut f = Fixture::new().await;
         let mut context = f.processor.session_manager.connection_context(f.connection).await.unwrap();
-        let session = ingress_recording(&f, &context, "voice_finalize_ingress");
+        let session = ingress_recording(&f.processor, &f.workspace, &context, "voice_finalize_ingress");
         f.processor.voice_session_buffers.remove_session(&session.session_id).unwrap();
         let (_recognizer, completion) = tokio::sync::oneshot::channel();
         f.processor.voice_session_buffers.start_processing(session.session_id.clone(), session.audio_format.clone(),
@@ -2156,4 +2137,1172 @@ async fn finalize_transport_seal_includes_active_and_queued_audio_and_rejects_la
         handlers.shutdown().await;
         f.processor.connection_closed(f.connection).await;
     }).await.expect("finalize admission fence covers the active item and queue transition");
+}
+
+async fn seed_unrelated_voice_acl(processor: &MessageProcessor, workspace: &str) -> String {
+    materialize_test_member_collaborator(processor.crud_store.as_ref(), workspace, THREAD).await;
+    let other = processor
+        .workspace_manager
+        .create_workspace("voice_unrelated_acl", None)
+        .await
+        .unwrap()
+        .id;
+    let now = chrono::Utc::now().fixed_offset();
+    pioneer_entity::workspace_membership::Entity::insert(
+        pioneer_entity::workspace_membership::ActiveModel {
+            principal_id: Set(TEST_COLLABORATOR_PRINCIPAL_ID.into()),
+            workspace_id: Set(other.clone()),
+            granted_by_actor_kind: Set("system".into()),
+            granted_by_actor_id: Set(None),
+            created_at: Set(now),
+            updated_at: Set(now),
+            inbox_after_sequence: Set(None),
+        },
+    )
+    .exec(&processor.crud_store.database_connection())
+    .await
+    .unwrap();
+    other
+}
+async fn revoke_unrelated_voice_acl(processor: &MessageProcessor, other: &str) {
+    let deletion = pioneer_entity::workspace_membership::Entity::delete_many()
+        .filter(
+            pioneer_entity::workspace_membership::Column::PrincipalId
+                .eq(TEST_COLLABORATOR_PRINCIPAL_ID),
+        )
+        .filter(pioneer_entity::workspace_membership::Column::WorkspaceId.eq(other))
+        .exec(&processor.crud_store.database_connection())
+        .await
+        .unwrap();
+    assert_eq!(deletion.rows_affected, 1);
+    processor
+        .publish_committed_workspace_membership_invalidation(
+            authenticated_test_member_collaborator()
+                .principal_id
+                .clone(),
+            other.into(),
+        )
+        .await;
+}
+
+#[tokio::test]
+async fn unrelated_committed_policy_change_reauthorizes_same_audio_without_loss() {
+    let mut f = Fixture::new().await;
+    let context = f
+        .processor
+        .session_manager
+        .connection_context(f.connection)
+        .await
+        .unwrap();
+    let session = ingress_recording(&f.processor, &f.workspace, &context, "voice_policy_recheck");
+    let other = seed_unrelated_voice_acl(&f.processor, &f.workspace).await;
+    let before = f.processor.current_authorization_revision().await.unwrap();
+    let (entered, reached) = tokio::sync::oneshot::channel();
+    let (release, resumed) = tokio::sync::oneshot::channel();
+    *session.ingress.proof_pause.lock().unwrap() = Some((entered, resumed));
+    let Message::Binary(frame) = ingress_frame(&session.session_id, 0) else {
+        unreachable!()
+    };
+    let processing = f.processor.process_binary_frame(&context, &frame);
+    let mutation = async {
+        reached.await.unwrap();
+        revoke_unrelated_voice_acl(&f.processor, &other).await;
+        assert!(f.processor.current_authorization_revision().await.unwrap() > before);
+        release.send(()).unwrap();
+    };
+    tokio::join!(processing, mutation);
+    let Message::Text(ack) = f.responses.recv().await.unwrap() else {
+        panic!("unexpected close");
+    };
+    let ack: JsonValue = serde_json::from_str(&ack).unwrap();
+    assert_eq!(
+        ack["method"],
+        pioneer_protocol::constants::events::VOICE_CHUNK_ACK
+    );
+    assert_eq!(ack["params"]["sequence"], 0);
+    let audio = f
+        .processor
+        .voice_session_buffers
+        .take_session_audio(&session.session_id)
+        .unwrap();
+    assert_eq!(audio.chunks.len(), 1);
+    assert_eq!(audio.chunks[0].audio_payload, vec![0, 0]);
+    assert_eq!(audio.normalized_samples.len(), 1);
+    f.processor.connection_closed(f.connection).await;
+}
+
+#[tokio::test]
+async fn domain_finalize_drains_slow_tail_with_recording_and_buffered_recognizer() {
+    for buffered in [false, true] {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let mut f = Fixture::new().await;
+            let home = tempfile::tempdir().unwrap();
+            let mut processor = (*f.processor).clone().with_runtime_home_for_tests(home.path().to_path_buf())
+                .with_test_voice_transcript("complete transport transcript")
+                .with_voice_input_supervisor(ready_gateway_voice_supervisor_for_model("complete transport transcript", "moonshine-base"));
+            processor.provider_registry = test_provider();
+            let native_gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+            let native_release = PendingVoiceRelease(native_gate.clone());
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let worker_calls = calls.clone();
+            let native_entered = Arc::new(Notify::new());
+            let native_started = native_entered.clone();
+            let gate = native_gate.clone();
+            processor.voice_test_transcriber = Some(Arc::new(move |_| {
+                if worker_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 { native_started.notify_one(); }
+                let (lock, wake) = &*gate;
+                let mut ready = lock.lock().unwrap();
+                while !*ready { ready = wake.wait(ready).unwrap(); }
+                Ok("complete transport transcript".into())
+            }));
+            f.processor = Arc::new(processor);
+            let settings_context = registered_request_context(&f.processor, f.connection, "settings/update").await;
+            f.processor.update_gateway_settings(&settings_context, pioneer_protocol::GatewaySettingsUpdate {
+                voice_input: Some(pioneer_protocol::GatewayVoiceInputSettingsUpdate {
+                    enabled: Some(true), provider: Some(Some(pioneer_protocol::GatewayVoiceInputProvider::Local)),
+                    model: Some(Some("moonshine-base".into())),
+                    transcribe_while_recording: Some(!buffered), ..Default::default()
+                }), ..Default::default()
+            }).await.unwrap();
+            assert!(f.processor.thread_manager.subscribe_connection(THREAD, f.connection).await);
+            let started = start_test_voice_session(&f.processor, f.connection, &mut f.responses,
+                &f.workspace, THREAD, "turn_transport_finalize_full", &id("full-start")).await;
+            let mut context = f.processor.session_manager.connection_context(f.connection).await.unwrap();
+            let recording = f.processor.voice_sessions.lookup_session(&started.session_id, f.connection).unwrap();
+            let other = seed_unrelated_voice_acl(&f.processor, &f.workspace).await;
+            let policy_before = f.processor.current_authorization_revision().await.unwrap();
+            let (renewals, _) = watch::channel(ConnectionAccessLease::new(context.principal().clone(), Duration::from_secs(60)));
+            let mut handlers = ConnectionHandlers::default();
+            handlers.enable_audio(f.processor.clone(), f.processor.session_manager.clone(), f.auth.clone(), f.connection, f.outbound.clone());
+            let mut deferred = VecDeque::new();
+            let (input, mut reader) = incoming();
+            let (finalize, finalization) = tokio::sync::oneshot::channel::<String>();
+            let dispatch = dispatch(f.processor.clone());
+            let processor = f.processor.clone();
+            let finalize_context = context.clone();
+            let processing = async move {
+                let payload = finalization.await.unwrap();
+                let mut request = processor.start_owned_request(finalize_context, payload);
+                request.join().await.unwrap();
+            };
+            let pump = process_with_access_renewals(processing, IngressMode::Serial,
+                &mut reader, &mut deferred, &f.auth, &f.processor.session_manager,
+                &mut context, &renewals, &f.outbound, &mut handlers, &dispatch);
+            let driver = async {
+                for sequence in 0..30 {
+                    input.send(Message::Binary(voice_test_frame(&started.session_id, sequence, 1600, 12000).into())).unwrap();
+                    let ack = recv_notification_by_method(&mut f.responses, pioneer_protocol::constants::events::VOICE_CHUNK_ACK).await;
+                    assert_eq!(ack.params.unwrap()["sequence"], sequence);
+                }
+                if buffered { assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0); }
+                let (entered, at_proof) = tokio::sync::oneshot::channel();
+                let (release, resumed) = tokio::sync::oneshot::channel();
+                *recording.ingress.proof_pause.lock().unwrap() = Some((entered, resumed));
+                input.send(Message::Binary(voice_test_frame(&started.session_id, 30, 1600, 12000).into())).unwrap();
+                at_proof.await.unwrap();
+                let (tail_entered, tail_proof) = tokio::sync::oneshot::channel();
+                let (tail_release, tail_resume) = tokio::sync::oneshot::channel();
+                *recording.ingress.proof_pause.lock().unwrap() = Some((tail_entered, tail_resume));
+                input.send(Message::Binary(voice_test_frame(&started.session_id, 31, 7, 3000).into())).unwrap();
+                revoke_unrelated_voice_acl(&f.processor, &other).await;
+                assert!(f.processor.current_authorization_revision().await.unwrap() > policy_before);
+                let payload = rpc("full-finalize", methods::VOICE_SESSION_FINALIZE, json!({
+                    "session_id":started.session_id,"audio_integrity":{"next_sequence":32,"normalized_samples":49607},
+                    "context":{"workspace_id":f.workspace,"thread_id":THREAD,"turn_id":"turn_transport_finalize_full"}
+                }));
+                // Receive-time seal through the production busy pump, followed
+                // by actual owned domain dispatch of that same finalized input.
+                input.send(Message::Text(payload.clone().into())).unwrap();
+                input.send(Message::Binary(voice_test_frame(&started.session_id,32,7,16000).into())).unwrap();
+                input.send(Message::Text(rpc("full-seal-probe", methods::TASK_WAIT,
+                    json!({"run_ids":[RUN],"timeout_ms":1})).into())).unwrap();
+                let probe = recv_response_by_id(&mut f.responses,&id("full-seal-probe")).await;
+                assert_eq!(probe.result["timed_out"],true);
+                assert!(recording.ingress.admit().is_none());
+                finalize.send(payload).unwrap();
+                release.send(()).unwrap();
+                tail_proof.await.unwrap();
+                if !buffered { native_entered.notified().await; }
+                tail_release.send(()).unwrap();
+                let mut reply = None;
+                let mut received = 30;
+                while received < 32 {
+                    let Message::Text(text) = f.responses.recv().await.unwrap() else { panic!("finalize disconnected"); };
+                    let value: JsonValue = serde_json::from_str(&text).unwrap();
+                    if value["method"] == pioneer_protocol::constants::events::VOICE_CHUNK_ACK {
+                        assert_eq!(value["params"]["sequence"], received);
+                        received += 1;
+                    } else if value["id"] == id("full-finalize") { reply = Some(value); }
+                }
+                if buffered { native_entered.notified().await; }
+                native_release.release();
+                let mut terminal = None;
+                while reply.is_none() || terminal.is_none() {
+                    let Message::Text(text) = f.responses.recv().await.unwrap() else { panic!("finalize disconnected"); };
+                    let value: JsonValue = serde_json::from_str(&text).unwrap();
+                    if value["id"] == id("full-finalize") { reply = Some(value); }
+                    else if value["method"] == pioneer_protocol::constants::events::VOICE_SESSION_RESULT {
+                        terminal = Some(value["params"].clone());
+                    }
+                }
+                let response: pioneer_protocol::VoiceSessionFinalizeResponse = serde_json::from_value(reply.unwrap()["result"].clone()).unwrap();
+                assert_eq!(response.status,pioneer_protocol::VoiceStatus::Transcribing);
+                let result: pioneer_protocol::VoiceSessionResultNotification = serde_json::from_value(terminal.unwrap()).unwrap();
+                assert_eq!(result.session_id,started.session_id);
+                assert_eq!(result.outcome,pioneer_protocol::VoiceSessionOutcome::TurnStarted);
+                assert!(result.error.is_none());
+                assert!(calls.load(std::sync::atomic::Ordering::SeqCst) > 0);
+            };
+            let (alive,()) = tokio::join!(pump,driver);
+            assert!(alive);
+            handlers.shutdown().await;
+            f.processor.connection_closed(f.connection).await;
+        }).await.expect("complete native/fake pipeline must include the admitted slow tail");
+    }
+}
+
+#[tokio::test]
+async fn real_ack_capacity_wait_preserves_rpc_and_controls_with_full_ordinary_data() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let mut f = Fixture::new().await;
+        let mut context = f
+            .processor
+            .session_manager
+            .connection_context(f.connection)
+            .await
+            .unwrap();
+        let session = ingress_recording(&f.processor, &f.workspace, &context, "voice_ack_pressure");
+        // The physical audio delivery owner remains undrained throughout the
+        // positive RPC/control checks. Ordinary Data is independently full.
+        for sequence in 0..128 {
+            let Message::Binary(frame) = ingress_frame(&session.session_id, sequence) else {
+                unreachable!()
+            };
+            f.processor.process_binary_frame(&context, &frame).await;
+        }
+        let mut ordinary_count = 0;
+        loop {
+            match f
+                .outbound
+                .try_send_data(Message::Text("ordinary-budget".into()))
+            {
+                Ok(()) => ordinary_count += 1,
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => break,
+                Err(e) => panic!("healthy owner closed: {e}"),
+            }
+        }
+        assert!(ordinary_count > 0);
+        let (entered, reached) = tokio::sync::oneshot::channel();
+        let (release, resumed) = tokio::sync::oneshot::channel();
+        *f.processor
+            .session_manager
+            .replay_delivery_pause
+            .lock()
+            .unwrap() = Some(crate::session::test_support::DeliveryPause {
+            connection: f.connection,
+            method: pioneer_protocol::constants::events::VOICE_CHUNK_ACK,
+            entered,
+            release: resumed,
+        });
+        let (renewals, _) = watch::channel(ConnectionAccessLease::new(
+            context.principal().clone(),
+            Duration::from_secs(60),
+        ));
+        let mut handlers = ConnectionHandlers::default();
+        handlers.enable_audio(
+            f.processor.clone(),
+            f.processor.session_manager.clone(),
+            f.auth.clone(),
+            f.connection,
+            f.outbound.clone(),
+        );
+        let (read_gate, mut entries, _) = read_gate(&["ack-held-read"]);
+        let dispatch = gated_read_dispatch(f.processor.clone(), read_gate.clone());
+        let mut deferred = VecDeque::from([get_thread("ack-held-read")]);
+        let (input, mut reader) = incoming();
+        let pump = process_with_access_renewals(
+            std::future::pending(),
+            IngressMode::ReadGroup,
+            &mut reader,
+            &mut deferred,
+            &f.auth,
+            &f.processor.session_manager,
+            &mut context,
+            &renewals,
+            &f.outbound,
+            &mut handlers,
+            &dispatch,
+        );
+        let driver = async {
+            entries.recv().await.unwrap();
+            input.send(ingress_frame(&session.session_id, 128)).unwrap();
+            reached.await.unwrap(); // production send_voice_text observed actual Full
+            release.send(()).unwrap();
+            input.send(get_thread("ack-pressure-rpc")).unwrap();
+            input
+                .send(Message::Text(
+                    rpc(
+                        "ack-pressure-control",
+                        methods::TASK_WAIT,
+                        json!({"run_ids":[RUN],"timeout_ms":1}),
+                    )
+                    .into(),
+                ))
+                .unwrap();
+            let mut rpc_done = false;
+            let mut control_done = false;
+            while !rpc_done || !control_done {
+                let Message::Text(text) = f.responses.recv_ordinary().await.unwrap() else {
+                    panic!("audio pressure closed socket");
+                };
+                if text == "ordinary-budget" {
+                    continue;
+                }
+                let value: JsonValue = serde_json::from_str(&text).unwrap();
+                if value["id"] == id("ack-pressure-rpc") {
+                    assert!(value["result"]["thread"].is_object());
+                    rpc_done = true;
+                }
+                if value["id"] == id("ack-pressure-control") {
+                    assert_eq!(value["result"]["timed_out"], true);
+                    control_done = true;
+                }
+            }
+            assert!(
+                f.processor
+                    .session_manager
+                    .connection_context(f.connection)
+                    .await
+                    .is_ok()
+            );
+            assert!(session.ingress.drain().now_or_never().is_none());
+            // Only now permit audio delivery. Every ACK must remain individual.
+            for sequence in 0..129 {
+                let ack = recv_notification_by_method(
+                    &mut f.responses,
+                    pioneer_protocol::constants::events::VOICE_CHUNK_ACK,
+                )
+                .await;
+                assert_eq!(ack.params.unwrap()["sequence"], sequence);
+            }
+            session.ingress.drain().await;
+            let audio = f
+                .processor
+                .voice_session_buffers
+                .take_session_audio(&session.session_id)
+                .unwrap();
+            assert_eq!(audio.chunks.len(), 129);
+            read_gate.release.add_permits(1);
+        };
+        let (alive, ()) = tokio::join!(pump, driver);
+        assert!(alive);
+        handlers.shutdown().await;
+        f.processor.connection_closed(f.connection).await;
+    })
+    .await
+    .expect("audio ACK pressure must preserve positively completed ordinary work");
+}
+
+#[tokio::test]
+async fn durable_revoke_before_publication_is_rechecked_before_audio_effect() {
+    for publish in [false, true] {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let mut f = Fixture::new().await;
+            let unrelated = f.connection;
+            materialize_test_member_collaborator(
+                f.processor.crud_store.as_ref(),
+                &f.workspace,
+                THREAD,
+            )
+            .await;
+            let (tx, rx) = crate::session::test_support::outbound_channel(128);
+            f.connection = f
+                .processor
+                .session_manager
+                .register_connection(tx.clone(), authenticated_test_member_collaborator())
+                .await
+                .unwrap();
+            f.outbound = tx;
+            f.responses = rx;
+            f.processor
+                .session_manager
+                .set_connection_workspace(f.connection, Some(f.workspace.clone()))
+                .await;
+            let mut context = f
+                .processor
+                .session_manager
+                .connection_context(f.connection)
+                .await
+                .unwrap();
+            let principal = context.principal().clone();
+            let session = ingress_recording(
+                &f.processor,
+                &f.workspace,
+                &context,
+                "voice_revoke_before_observe",
+            );
+            let before = f.processor.current_authorization_revision().await.unwrap();
+            let (entered, reached) = tokio::sync::oneshot::channel();
+            let (release, resumed) = tokio::sync::oneshot::channel();
+            *session.ingress.proof_pause.lock().unwrap() = Some((entered, resumed));
+            let (renewals, _) = watch::channel(ConnectionAccessLease::new(
+                principal.clone(),
+                Duration::from_secs(60),
+            ));
+            let mut handlers = ConnectionHandlers::default();
+            handlers.enable_audio(
+                f.processor.clone(),
+                f.processor.session_manager.clone(),
+                f.auth.clone(),
+                f.connection,
+                f.outbound.clone(),
+            );
+            let (input, mut reader) = incoming();
+            let (finish, finished) = tokio::sync::oneshot::channel();
+            let mut deferred = VecDeque::new();
+            let dispatch = dispatch(f.processor.clone());
+            let pump = process_with_access_renewals(
+                async {
+                    finished.await.unwrap();
+                },
+                IngressMode::Serial,
+                &mut reader,
+                &mut deferred,
+                &f.auth,
+                &f.processor.session_manager,
+                &mut context,
+                &renewals,
+                &f.outbound,
+                &mut handlers,
+                &dispatch,
+            );
+            let driver = async {
+                input.send(ingress_frame(&session.session_id, 0)).unwrap();
+                reached.await.unwrap();
+                input.send(ingress_frame(&session.session_id, 1)).unwrap();
+                input
+                    .send(Message::Text(
+                        rpc(
+                            "revoke-queue-probe",
+                            methods::TASK_WAIT,
+                            json!({"run_ids":[RUN],"timeout_ms":1}),
+                        )
+                        .into(),
+                    ))
+                    .unwrap();
+                loop {
+                    let Message::Text(text) = f.responses.recv().await.unwrap() else {
+                        panic!("revoke probe lost")
+                    };
+                    let value: JsonValue = serde_json::from_str(&text).unwrap();
+                    if value["id"] == id("revoke-queue-probe") {
+                        assert!(value.get("result").is_some() || value.get("error").is_some());
+                        break;
+                    }
+                }
+                let deletion = pioneer_entity::workspace_membership::Entity::delete_many()
+                    .filter(
+                        pioneer_entity::workspace_membership::Column::PrincipalId
+                            .eq(principal.principal_id.as_str()),
+                    )
+                    .filter(
+                        pioneer_entity::workspace_membership::Column::WorkspaceId.eq(&f.workspace),
+                    )
+                    .exec(&f.processor.crud_store.database_connection())
+                    .await
+                    .unwrap();
+                assert_eq!(deletion.rows_affected, 1);
+                assert_eq!(
+                    f.processor.current_authorization_revision().await.unwrap(),
+                    before
+                );
+                if publish {
+                    f.processor
+                        .publish_committed_workspace_membership_invalidation(
+                            principal.principal_id.clone(),
+                            f.workspace.clone(),
+                        )
+                        .await;
+                    assert!(session.ingress.cancelled.is_cancelled());
+                }
+                let _ = release.send(());
+                if !publish {
+                    let result = recv_notification_by_method(
+                        &mut f.responses,
+                        pioneer_protocol::constants::events::VOICE_SESSION_RESULT,
+                    )
+                    .await;
+                    let result: pioneer_protocol::VoiceSessionResultNotification =
+                        serde_json::from_value(result.params.unwrap()).unwrap();
+                    assert_eq!(result.session_id, session.session_id);
+                    assert_eq!(
+                        result.outcome,
+                        pioneer_protocol::VoiceSessionOutcome::Failed
+                    );
+                }
+                session.ingress.drain().await;
+                assert!(
+                    f.processor
+                        .voice_session_buffers
+                        .buffered_bytes_for_test(&session.session_id)
+                        .is_err()
+                );
+                assert!(
+                    f.processor
+                        .voice_sessions
+                        .lookup_session(&session.session_id, f.connection)
+                        .is_err()
+                );
+                assert!(session.ingress.cancelled.is_cancelled());
+                assert!(
+                    f.processor
+                        .session_manager
+                        .connection_context(unrelated)
+                        .await
+                        .is_ok()
+                );
+                finish.send(()).unwrap();
+            };
+            let (alive, ()) = tokio::join!(pump, driver);
+            assert!(alive);
+            handlers.shutdown().await;
+            f.processor.connection_closed(f.connection).await;
+        })
+        .await
+        .expect("durable denial and published retirement must fence active and queued audio");
+    }
+}
+
+#[tokio::test]
+async fn audio_delivery_capacity_wait_revalidates_renewal_expiry_and_physical_owner() {
+    for action in ["renewal", "expiry", "disconnect", "replacement"] {
+        let mut f = Fixture::new().await;
+        let context = f
+            .processor
+            .session_manager
+            .connection_context(f.connection)
+            .await
+            .unwrap();
+        for _ in 0..128 {
+            f.outbound
+                .try_send_audio(Message::Text("held-audio".into()), false)
+                .unwrap();
+        }
+        let waiting =
+            f.processor
+                .session_manager
+                .send_voice_text(f.connection, "late-audio".into(), false);
+        tokio::pin!(waiting);
+        assert!(waiting.as_mut().now_or_never().is_none());
+        f.processor
+            .process_request_for_connection(
+                f.connection,
+                &rpc(
+                    "audio-wait-probe",
+                    methods::THREAD_GET,
+                    json!({"thread_id":THREAD}),
+                ),
+            )
+            .await;
+        let Message::Text(reply) = f.responses.recv_ordinary().await.unwrap() else {
+            panic!("RPC lost")
+        };
+        let reply: JsonValue = serde_json::from_str(&reply).unwrap();
+        assert_eq!(reply["id"], id("audio-wait-probe"));
+        assert!(reply["result"]["thread"].is_object());
+        if matches!(action, "renewal" | "expiry") {
+            let mut next = context.principal().clone();
+            next.access_jti = "renewed-voice-wait".into();
+            next.access_expires_at_unix = if action == "expiry" {
+                0
+            } else {
+                next.access_expires_at_unix + 3600
+            };
+            f.processor
+                .session_manager
+                .renew_connection_principal(f.connection, context.principal(), Arc::new(next))
+                .await
+                .unwrap();
+        } else {
+            f.processor
+                .session_manager
+                .unregister_connection(f.connection)
+                .await;
+        }
+        if action == "renewal" {
+            assert!(waiting.as_mut().now_or_never().is_none());
+            assert!(
+                matches!(f.responses.recv().await,Some(Message::Text(text)) if text=="held-audio")
+            );
+            waiting.await.unwrap();
+            for _ in 1..128 {
+                f.responses.recv().await.unwrap();
+            }
+            assert!(
+                matches!(f.responses.recv().await,Some(Message::Text(text)) if text=="late-audio")
+            );
+        } else {
+            assert!(waiting.await.is_err());
+            if action == "replacement" {
+                let (tx, mut rx) = crate::session::test_support::outbound_channel(8);
+                let current = f
+                    .processor
+                    .session_manager
+                    .register_connection(tx, authenticated_test_superuser())
+                    .await
+                    .unwrap();
+                assert_ne!(current, f.connection);
+                f.processor
+                    .session_manager
+                    .send_voice_text(current, "current-owner".into(), false)
+                    .await
+                    .unwrap();
+                assert!(
+                    matches!(rx.recv().await,Some(Message::Text(text)) if text=="current-owner")
+                );
+                assert!(rx.try_recv().is_err());
+                f.processor
+                    .session_manager
+                    .unregister_connection(current)
+                    .await;
+            }
+        }
+        f.processor.connection_closed(f.connection).await;
+    }
+}
+
+#[tokio::test]
+async fn unpolled_audio_owner_drops_queued_payload_and_completion_ticket() {
+    let f = Fixture::new().await;
+    let mut context = f
+        .processor
+        .session_manager
+        .connection_context(f.connection)
+        .await
+        .unwrap();
+    let session = ingress_recording(&f.processor, &f.workspace, &context, "voice_unpolled_owner");
+    let (renewals, _) = watch::channel(ConnectionAccessLease::new(
+        context.principal().clone(),
+        Duration::from_secs(60),
+    ));
+    let mut handlers = ConnectionHandlers::default();
+    handlers.enable_audio(
+        f.processor.clone(),
+        f.processor.session_manager.clone(),
+        f.auth.clone(),
+        f.connection,
+        f.outbound.clone(),
+    );
+    let mut reader = futures_util::stream::iter([Ok(ingress_frame(&session.session_id, 0))]);
+    let mut deferred = VecDeque::new();
+    let dispatch = dispatch(f.processor.clone());
+    // Current-thread runtime: the ready stream and EOF complete in this poll;
+    // the spawned worker has had no scheduling yield before shutdown below.
+    assert!(
+        !process_with_access_renewals(
+            std::future::pending(),
+            IngressMode::Serial,
+            &mut reader,
+            &mut deferred,
+            &f.auth,
+            &f.processor.session_manager,
+            &mut context,
+            &renewals,
+            &f.outbound,
+            &mut handlers,
+            &dispatch
+        )
+        .await
+    );
+    assert!(session.ingress.drain().now_or_never().is_none());
+    handlers.shutdown().await;
+    session.ingress.drain().await;
+    assert_eq!(
+        f.processor
+            .voice_session_buffers
+            .buffered_bytes_for_test(&session.session_id)
+            .unwrap(),
+        0
+    );
+    f.processor.connection_closed(f.connection).await;
+}
+
+#[tokio::test]
+async fn idle_socket_audio_demultiplex_keeps_normal_rpc_and_exact_pcm() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message as WireMessage;
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let f = Fixture::new().await;
+        let (mut wire, _block, _entered) = OutboundSocket::new(&f, false).await;
+        let context = f
+            .processor
+            .session_manager
+            .connection_context(wire.connection)
+            .await
+            .unwrap();
+        let session = ingress_recording(&f.processor, &f.workspace, &context, "voice_idle_socket");
+        wire.start_writer.send(()).unwrap();
+        let Message::Binary(frame) = ingress_frame(&session.session_id, 0) else {
+            unreachable!()
+        };
+        wire.socket.send(WireMessage::Binary(frame)).await.unwrap();
+        loop {
+            match wire.socket.next().await.unwrap().unwrap() {
+                WireMessage::Text(text) => {
+                    let value: JsonValue = serde_json::from_str(&text).unwrap();
+                    if value["method"] == pioneer_protocol::constants::events::VOICE_CHUNK_ACK {
+                        assert_eq!(value["params"]["session_id"], session.session_id);
+                        assert_eq!(value["params"]["sequence"], 0);
+                        break;
+                    }
+                }
+                WireMessage::Close(_) => panic!("audio closed idle socket"),
+                _ => {}
+            }
+        }
+        wire.socket
+            .send(WireMessage::Text(
+                rpc(
+                    "idle-audio-rpc",
+                    methods::THREAD_GET,
+                    json!({"thread_id":THREAD}),
+                )
+                .into(),
+            ))
+            .await
+            .unwrap();
+        loop {
+            match wire.socket.next().await.unwrap().unwrap() {
+                WireMessage::Text(text) => {
+                    let value: JsonValue = serde_json::from_str(&text).unwrap();
+                    if value["id"] == id("idle-audio-rpc") {
+                        assert!(value["result"]["thread"].is_object());
+                        break;
+                    }
+                }
+                WireMessage::Close(_) => panic!("ordinary RPC lost after idle audio"),
+                _ => {}
+            }
+        }
+        let audio = f
+            .processor
+            .voice_session_buffers
+            .take_session_audio(&session.session_id)
+            .unwrap();
+        assert_eq!(audio.chunks.len(), 1);
+        assert_eq!(audio.chunks[0].audio_payload, vec![0, 0]);
+        for (label, method, params) in [
+            (
+                "idle-turn-cancel",
+                methods::TURN_CANCEL,
+                json!({"thread_id":THREAD,"turn_id":TURN}),
+            ),
+            (
+                "idle-voice-cancel",
+                methods::VOICE_SESSION_CANCEL,
+                json!({"session_id":session.session_id}),
+            ),
+        ] {
+            wire.socket
+                .send(WireMessage::Text(rpc(label, method, params).into()))
+                .await
+                .unwrap();
+        }
+        let mut completed = Vec::new();
+        while completed.len() < 2 {
+            match wire.socket.next().await.unwrap().unwrap() {
+                WireMessage::Text(text) => {
+                    let value: JsonValue = serde_json::from_str(&text).unwrap();
+                    for label in ["idle-turn-cancel", "idle-voice-cancel"] {
+                        if value["id"] == id(label) {
+                            assert!(!completed.contains(&label));
+                            assert!(value.get("result").is_some() || value.get("error").is_some());
+                            if label == "idle-voice-cancel" {
+                                assert_eq!(value["result"]["cancelled"], true);
+                            }
+                            completed.push(label);
+                        }
+                    }
+                }
+                WireMessage::Close(_) => panic!("independent Cancel closed idle socket"),
+                _ => {}
+            }
+        }
+        wire.stop.send(true).unwrap();
+        while let Some(frame) = wire.socket.next().await {
+            if matches!(frame.unwrap(), WireMessage::Close(_)) {
+                break;
+            }
+        }
+        wire.completion.await.unwrap().unwrap();
+        wire.server.abort_and_join().await;
+    })
+    .await
+    .expect("idle normal owner must positively service audio then RPC");
+}
+
+#[tokio::test]
+async fn queued_and_active_audio_revalidate_current_lease_and_exact_socket() {
+    for action in ["renewal", "expiry", "disconnect", "replacement"] {
+        tokio::time::timeout(Duration::from_secs(10),async {
+            let mut f=Fixture::new().await;
+            let mut context=f.processor.session_manager.connection_context(f.connection).await.unwrap();
+            let expected=context.principal().clone();
+            let session=ingress_recording(&f.processor, &f.workspace,&context,"voice_queued_lease");
+            let (entered,reached)=tokio::sync::oneshot::channel();
+            let (release,resumed)=tokio::sync::oneshot::channel();
+            *session.ingress.proof_pause.lock().unwrap()=Some((entered,resumed));
+            let (renewals,_)=watch::channel(ConnectionAccessLease::new(expected.clone(),Duration::from_secs(60)));
+            let mut handlers=ConnectionHandlers::default();
+            handlers.enable_audio(f.processor.clone(),f.processor.session_manager.clone(),f.auth.clone(),f.connection,f.outbound.clone());
+            let (input,mut reader)=incoming();
+            let (finish,finished)=tokio::sync::oneshot::channel();
+            let mut deferred=VecDeque::new();
+            let dispatch=dispatch(f.processor.clone());
+            let pump=process_with_access_renewals(async {finished.await.unwrap();},IngressMode::Serial,
+                &mut reader,&mut deferred,&f.auth,&f.processor.session_manager,&mut context,&renewals,&f.outbound,&mut handlers,&dispatch);
+            let driver=async {
+                input.send(ingress_frame(&session.session_id,0)).unwrap();
+                reached.await.unwrap();
+                input.send(ingress_frame(&session.session_id,1)).unwrap();
+                input.send(Message::Text(rpc("queued-lease-probe",methods::TASK_WAIT,json!({"run_ids":[RUN],"timeout_ms":1})).into())).unwrap();
+                let probe=recv_response_by_id(&mut f.responses,&id("queued-lease-probe")).await;
+                assert_eq!(probe.result["timed_out"],true);
+                let mut replacement=None;
+                if matches!(action,"renewal"|"expiry") {
+                    let mut next=expected.clone();
+                    next.access_jti="queued-renewal".into();
+                    next.access_expires_at_unix=if action=="expiry" {0} else {expected.access_expires_at_unix+3600};
+                    f.processor.session_manager.renew_connection_principal(f.connection,&expected,Arc::new(next)).await.unwrap();
+                } else {
+                    f.processor.session_manager.unregister_connection(f.connection).await;
+                    if action=="replacement" {
+                        let (sender,receiver)=crate::session::test_support::outbound_channel(8);
+                        let current=f.processor.session_manager.register_connection(sender,authenticated_test_superuser()).await.unwrap();
+                        assert_ne!(current,f.connection);
+                        replacement=Some((current,receiver));
+                    }
+                }
+                release.send(()).unwrap();
+                if action=="renewal" {
+                    for sequence in 0..2 {
+                        let ack=recv_notification_by_method(&mut f.responses,pioneer_protocol::constants::events::VOICE_CHUNK_ACK).await;
+                        assert_eq!(ack.params.unwrap()["sequence"],sequence);
+                    }
+                }
+                session.ingress.drain().await;
+                let audio=f.processor.voice_session_buffers.take_session_audio(&session.session_id).unwrap();
+                assert_eq!(audio.chunks.len(),if action=="renewal" {2} else {0});
+                if let Some((current,mut receiver))=replacement {
+                    assert!(receiver.try_recv().is_err(),"old work cannot migrate to a new socket");
+                    f.processor.session_manager.send_voice_text(current,"replacement-live".into(),false).await.unwrap();
+                    assert!(matches!(receiver.recv().await,Some(Message::Text(text)) if text=="replacement-live"));
+                    f.processor.session_manager.unregister_connection(current).await;
+                }
+                finish.send(()).unwrap();
+            };
+            let (alive,())=tokio::join!(pump,driver);
+            assert!(alive);
+            handlers.shutdown().await;
+            f.processor.connection_closed(f.connection).await;
+        }).await.expect("active and queued audio must observe current physical authority");
+    }
+}
+
+#[tokio::test]
+async fn fail_cancel_restart_while_terminal_delivery_is_full_preserves_new_recording() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let mut f = Fixture::new().await;
+        let mut context = f
+            .processor
+            .session_manager
+            .connection_context(f.connection)
+            .await
+            .unwrap();
+        let old = ingress_recording(
+            &f.processor,
+            &f.workspace,
+            &context,
+            "voice_blocked_terminal_old",
+        );
+        assert!(
+            f.processor
+                .thread_manager
+                .subscribe_connection(THREAD, f.connection)
+                .await
+        );
+        for _ in 0..128 {
+            f.outbound
+                .try_send_audio(Message::Text("held-ack".into()), false)
+                .unwrap();
+        }
+        for _ in 0..2 {
+            f.outbound
+                .try_send_audio(Message::Text("held-terminal".into()), true)
+                .unwrap();
+        }
+        let (terminal_entered, terminal_full) = tokio::sync::oneshot::channel();
+        let (terminal_release, terminal_resume) = tokio::sync::oneshot::channel();
+        *f.processor
+            .session_manager
+            .replay_delivery_pause
+            .lock()
+            .unwrap() = Some(crate::session::test_support::DeliveryPause {
+            connection: f.connection,
+            method: pioneer_protocol::constants::events::VOICE_SESSION_RESULT,
+            entered: terminal_entered,
+            release: terminal_resume,
+        });
+        let (renewals, _) = watch::channel(ConnectionAccessLease::new(
+            context.principal().clone(),
+            Duration::from_secs(60),
+        ));
+        let mut handlers = ConnectionHandlers::default();
+        handlers.enable_audio(
+            f.processor.clone(),
+            f.processor.session_manager.clone(),
+            f.auth.clone(),
+            f.connection,
+            f.outbound.clone(),
+        );
+        let (entered, reached) = tokio::sync::oneshot::channel();
+        let (_release, resume) = tokio::sync::oneshot::channel();
+        handlers.pause_audio_once(entered, resume);
+        let (gate, mut entries, _) = read_gate(&["terminal-held-read"]);
+        let dispatch = gated_read_dispatch(f.processor.clone(), gate.clone());
+        let mut deferred = VecDeque::from([get_thread("terminal-held-read")]);
+        let (input, mut reader) = incoming();
+        let pump = process_with_access_renewals(
+            std::future::pending(),
+            IngressMode::ReadGroup,
+            &mut reader,
+            &mut deferred,
+            &f.auth,
+            &f.processor.session_manager,
+            &mut context,
+            &renewals,
+            &f.outbound,
+            &mut handlers,
+            &dispatch,
+        );
+        let driver = async {
+            entries.recv().await.unwrap();
+            input.send(ingress_frame(&old.session_id, 0)).unwrap();
+            reached.await.unwrap();
+            for sequence in 1..129 {
+                input
+                    .send(ingress_frame(&old.session_id, sequence))
+                    .unwrap();
+            }
+            terminal_full.await.unwrap();
+            assert!(old.ingress.cancelled.is_cancelled());
+            old.ingress.drain().await;
+            input
+                .send(Message::Text(
+                    rpc(
+                        "terminal-cancel",
+                        methods::VOICE_SESSION_CANCEL,
+                        json!({"session_id":old.session_id}),
+                    )
+                    .into(),
+                ))
+                .unwrap();
+            loop {
+                let Message::Text(text) = f.responses.recv_ordinary().await.unwrap() else {
+                    panic!("shared owner lost")
+                };
+                let value: JsonValue = serde_json::from_str(&text).unwrap();
+                if value["id"] == id("terminal-cancel") {
+                    assert_eq!(value["result"]["cancelled"], true);
+                    break;
+                }
+            }
+            let current = f
+                .processor
+                .session_manager
+                .connection_context(f.connection)
+                .await
+                .unwrap();
+            let new = ingress_recording(
+                &f.processor,
+                &f.workspace,
+                &current,
+                "voice_blocked_terminal_new",
+            );
+            input.send(ingress_frame(&old.session_id, 200)).unwrap();
+            input.send(ingress_frame(&new.session_id, 0)).unwrap();
+            terminal_release.send(()).unwrap();
+            input.send(get_thread("terminal-rpc-probe")).unwrap();
+            loop {
+                let Message::Text(text) = f.responses.recv_ordinary().await.unwrap() else {
+                    panic!("RPC lost")
+                };
+                let value: JsonValue = serde_json::from_str(&text).unwrap();
+                if value["id"] == id("terminal-rpc-probe") {
+                    assert!(value["result"]["thread"].is_object());
+                    break;
+                }
+            }
+            // Release actual audio capacity only after both canonical Cancel
+            // and an unrelated RPC have completed while terminal send waited.
+            loop {
+                let Message::Text(text) = f.responses.recv().await.unwrap() else {
+                    panic!("voice error closed socket")
+                };
+                if text.starts_with("held-") {
+                    continue;
+                }
+                let value: JsonValue = serde_json::from_str(&text).unwrap();
+                if value["method"] == pioneer_protocol::constants::events::VOICE_CHUNK_ACK {
+                    assert_eq!(value["params"]["session_id"], new.session_id);
+                    assert_eq!(value["params"]["sequence"], 0);
+                    break;
+                }
+            }
+            new.ingress.drain().await;
+            let audio = f
+                .processor
+                .voice_session_buffers
+                .take_session_audio(&new.session_id)
+                .unwrap();
+            assert_eq!(audio.chunks.len(), 1);
+            assert_eq!(audio.chunks[0].audio_payload, vec![0, 0]);
+            assert!(
+                f.processor
+                    .voice_session_buffers
+                    .buffered_bytes_for_test(&old.session_id)
+                    .is_err()
+            );
+            gate.release.add_permits(1);
+        };
+        let (alive, ()) = tokio::join!(pump, driver);
+        assert!(alive);
+        handlers.shutdown().await;
+        f.processor.connection_closed(f.connection).await;
+    })
+    .await
+    .expect("old terminal delivery must not own a replacement recording");
+}
+
+#[tokio::test]
+async fn production_cancel_dispatch_keeps_other_class_admissible_after_reply() {
+    for voice_first in [false, true] {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let mut f = Fixture::new().await;
+            let mut context = f
+                .processor
+                .session_manager
+                .connection_context(f.connection)
+                .await
+                .unwrap();
+            let session = ingress_recording(
+                &f.processor,
+                &f.workspace,
+                &context,
+                "voice_cancel_class_dispatch",
+            );
+            assert!(
+                f.processor
+                    .thread_manager
+                    .subscribe_connection(THREAD, f.connection)
+                    .await
+            );
+            let first = if voice_first {
+                methods::VOICE_SESSION_CANCEL
+            } else {
+                methods::TURN_CANCEL
+            };
+            let second = if voice_first {
+                methods::TURN_CANCEL
+            } else {
+                methods::VOICE_SESSION_CANCEL
+            };
+            let held = Arc::new(Notify::new());
+            let release = Arc::new(tokio::sync::Semaphore::new(0));
+            let dispatch = {
+                let processor = f.processor.clone();
+                let held = held.clone();
+                let release = release.clone();
+                move |context: crate::request_context::ConnectionContext, payload: String| {
+                    let processor = processor.clone();
+                    let held = held.clone();
+                    let release = release.clone();
+                    message_future(async move {
+                        let request: JsonRpcRequest = serde_json::from_str(&payload).unwrap();
+                        processor.process_request(&context, &payload).await;
+                        if request.method == first {
+                            held.notify_one();
+                            release.acquire().await.unwrap().forget();
+                        }
+                    })
+                }
+            };
+            let mut handlers = ConnectionHandlers::default();
+            let mut deferred = VecDeque::new();
+            let (input, mut reader) = incoming();
+            let (finish, finished) = tokio::sync::oneshot::channel();
+            let (renewals, _) = watch::channel(ConnectionAccessLease::new(
+                context.principal().clone(),
+                Duration::from_secs(60),
+            ));
+            let pump = process_with_access_renewals(
+                async {
+                    finished.await.unwrap();
+                },
+                IngressMode::Serial,
+                &mut reader,
+                &mut deferred,
+                &f.auth,
+                &f.processor.session_manager,
+                &mut context,
+                &renewals,
+                &f.outbound,
+                &mut handlers,
+                &dispatch,
+            );
+            let driver = async {
+                for (label, method) in [("first-cancel", first), ("second-cancel", second)] {
+                    let params = if method == methods::VOICE_SESSION_CANCEL {
+                        json!({"session_id":session.session_id})
+                    } else {
+                        json!({"thread_id":THREAD,"turn_id":TURN})
+                    };
+                    input
+                        .send(Message::Text(rpc(label, method, params).into()))
+                        .unwrap();
+                    loop {
+                        let Message::Text(text) = f.responses.recv().await.unwrap() else {
+                            panic!("one Cancel class closed shared transport")
+                        };
+                        let value: JsonValue = serde_json::from_str(&text).unwrap();
+                        if value["id"] == id(label) {
+                            assert!(value.get("result").is_some() || value.get("error").is_some());
+                            if method == methods::VOICE_SESSION_CANCEL {
+                                assert_eq!(value["result"]["cancelled"], true);
+                            }
+                            break;
+                        }
+                    }
+                    if label == "first-cancel" {
+                        held.notified().await;
+                    }
+                }
+                assert!(
+                    f.processor
+                        .session_manager
+                        .connection_context(f.connection)
+                        .await
+                        .is_ok()
+                );
+                release.add_permits(1);
+                finish.send(()).unwrap();
+            };
+            let (alive, ()) = tokio::join!(pump, driver);
+            assert!(alive);
+            handlers.shutdown().await;
+            f.processor.connection_closed(f.connection).await;
+        })
+        .await
+        .expect("real Cancel dispatch must retain independent class admission");
+    }
 }

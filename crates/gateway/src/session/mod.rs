@@ -425,21 +425,57 @@ impl SessionManager {
         payload: String,
         terminal: bool,
     ) -> Result<()> {
+        let original = self.connection_context(id).await?;
         let sender = {
             let connections = self.connections.read().await;
-            let connection = connections
+            connections
                 .get(&id)
-                .ok_or_else(|| anyhow!("voice connection retired"))?;
-            anyhow::ensure!(
-                connection.termination_tx.borrow().is_none(),
-                "voice connection terminated"
-            );
-            connection.sender.clone()
+                .ok_or_else(|| anyhow!("voice connection retired"))?
+                .sender
+                .clone()
         };
-        sender
-            .send_audio(Message::Text(payload.into()), terminal)
-            .await
-            .map_err(|_| anyhow!("voice outbound retired"))
+        let mut scope = self.connection_scope_receiver(id).await?;
+        let mut termination = self.connection_termination_receiver(id).await?;
+        let mut message = Message::Text(payload.into());
+        loop {
+            let changed = sender.audio_capacity_changed().notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let admission = self
+                .with_voice_ingress_connection(id, original.principal(), || {
+                    sender.try_send_audio(message, terminal)
+                })
+                .await;
+            match admission {
+                Some(Ok(())) => return Ok(()),
+                Some(Err(tokio::sync::mpsc::error::TrySendError::Full(returned))) => {
+                    message = returned;
+                    #[cfg(test)]
+                    self.pause_delivery(
+                        id,
+                        if terminal {
+                            pioneer_protocol::constants::events::VOICE_SESSION_RESULT
+                        } else {
+                            pioneer_protocol::constants::events::VOICE_CHUNK_ACK
+                        },
+                    )
+                    .await;
+                }
+                _ => anyhow::bail!("voice delivery owner retired"),
+            }
+            let current = self.connection_context(id).await?;
+            let now = crate::helpers::unix_timestamp_secs()?;
+            anyhow::ensure!(
+                now < current.principal().access_expires_at_unix,
+                "voice access expired"
+            );
+            tokio::select! {
+                _ = &mut changed => {},
+                _ = scope.changed() => {},
+                _ = termination.changed() => {},
+                _ = tokio::time::sleep(Duration::from_secs(current.principal().access_expires_at_unix - now)) => {},
+            }
+        }
     }
 
     pub async fn send_text(&self, connection_id: ConnectionId, payload: String) -> Result<()> {

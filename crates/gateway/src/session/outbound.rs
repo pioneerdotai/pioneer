@@ -79,6 +79,8 @@ pub(crate) struct OutboundReceiver {
     admission: Arc<Admission>,
     audio: Option<Box<OutboundReceiver>>,
     prefer_audio: bool,
+    ordinary_done: bool,
+    audio_done: bool,
 }
 impl OutboundReceiver {
     pub(crate) fn seal(&mut self) {
@@ -89,37 +91,90 @@ impl OutboundReceiver {
         }
     }
     #[cfg(test)]
+    pub(super) async fn recv_ordinary(&mut self) -> Option<OutboundEnvelope> {
+        self.rx.recv().await
+    }
+    #[cfg(test)]
     pub(crate) fn try_recv(&mut self) -> Result<OutboundEnvelope, mpsc::error::TryRecvError> {
-        if let Some(audio) = &mut self.audio {
-            if self.prefer_audio {
-                if let Ok(item) = audio.rx.try_recv() {
-                    self.prefer_audio = false;
-                    return Ok(item);
+        for audio_first in [self.prefer_audio, !self.prefer_audio] {
+            let result = if audio_first {
+                match &mut self.audio {
+                    Some(audio) if !self.audio_done => audio.rx.try_recv(),
+                    _ => {
+                        self.audio_done = true;
+                        continue;
+                    }
                 }
-            }
-            match self.rx.try_recv() {
+            } else if !self.ordinary_done {
+                self.rx.try_recv()
+            } else {
+                continue;
+            };
+            match result {
                 Ok(item) => {
-                    self.prefer_audio = true;
+                    self.prefer_audio = !audio_first;
                     return Ok(item);
                 }
-                Err(mpsc::error::TryRecvError::Empty) => return audio.rx.try_recv(),
-                Err(e) => return Err(e),
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    if audio_first {
+                        self.audio_done = true;
+                    } else {
+                        self.ordinary_done = true;
+                    }
+                }
+                Err(mpsc::error::TryRecvError::Empty) => {}
             }
         }
-        self.rx.try_recv()
+        if self.audio.is_none() {
+            self.audio_done = true;
+        }
+        Err(if self.ordinary_done && self.audio_done {
+            mpsc::error::TryRecvError::Disconnected
+        } else {
+            mpsc::error::TryRecvError::Empty
+        })
     }
     pub(crate) async fn recv(&mut self) -> Option<OutboundEnvelope> {
-        if let Some(audio) = &mut self.audio {
-            let item = if self.prefer_audio {
-                tokio::select! { biased; item = audio.rx.recv() => item, item = self.rx.recv() => item }
+        std::future::poll_fn(|cx| {
+            for audio_first in [self.prefer_audio, !self.prefer_audio] {
+                let polled = if audio_first {
+                    match &mut self.audio {
+                        Some(audio) if !self.audio_done => audio.rx.poll_recv(cx),
+                        _ => {
+                            self.audio_done = true;
+                            continue;
+                        }
+                    }
+                } else if !self.ordinary_done {
+                    self.rx.poll_recv(cx)
+                } else {
+                    continue;
+                };
+                match polled {
+                    std::task::Poll::Ready(Some(item)) => {
+                        self.prefer_audio = !audio_first;
+                        return std::task::Poll::Ready(Some(item));
+                    }
+                    std::task::Poll::Ready(None) => {
+                        if audio_first {
+                            self.audio_done = true;
+                        } else {
+                            self.ordinary_done = true;
+                        }
+                    }
+                    std::task::Poll::Pending => {}
+                }
+            }
+            if self.audio.is_none() {
+                self.audio_done = true;
+            }
+            if self.ordinary_done && self.audio_done {
+                std::task::Poll::Ready(None)
             } else {
-                tokio::select! { biased; item = self.rx.recv() => item, item = audio.rx.recv() => item }
-            };
-            self.prefer_audio = !self.prefer_audio;
-            item
-        } else {
-            self.rx.recv().await
-        }
+                std::task::Poll::Pending
+            }
+        })
+        .await
     }
 }
 impl Drop for OutboundReceiver {
@@ -187,6 +242,8 @@ impl SessionOutbound {
                 admission,
                 audio: None,
                 prefer_audio: false,
+                ordinary_done: false,
+                audio_done: false,
             },
         )
     }
@@ -349,6 +406,9 @@ impl SessionOutbound {
     ) -> Result<(), mpsc::error::TrySendError<Message>> {
         self.try_send_class(message, AdmissionClass::Data)
     }
+    pub(crate) fn audio_capacity_changed(&self) -> &Notify {
+        &self.audio.as_ref().expect("audio lane").admission.changed
+    }
     pub(crate) fn try_send_audio(
         &self,
         message: Message,
@@ -366,7 +426,8 @@ impl SessionOutbound {
                 },
             )
     }
-    /// Audio waits only for its own bounded lane; it never invokes eviction.
+    /// Test owner admission primitive; production delivery revalidates through SessionManager.
+    #[cfg(test)]
     pub(crate) async fn send_audio(
         &self,
         message: Message,
@@ -435,6 +496,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn audio_reservation_survives_dequeue_and_terminal_lifecycle_wakes_waiter() {
+        for terminal in ["drop", "abort", "seal"] {
+            let (tx, mut rx) = SessionOutbound::channel(8, 100, 20);
+            for _ in 0..128 {
+                tx.try_send_audio(text(1), false).unwrap();
+            }
+            let held = rx.recv().await.unwrap();
+            let waiting = tx.send_audio(text(1), false);
+            tokio::pin!(waiting);
+            assert!(waiting.as_mut().now_or_never().is_none());
+            tx.try_send(text(20)).unwrap();
+            if terminal == "drop" {
+                drop(rx);
+            } else if terminal == "abort" {
+                tx.abort();
+            } else {
+                tx.close();
+            }
+            assert!(waiting.await.is_err());
+            drop(held);
+            assert!(tx.send_audio(text(1), false).await.is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn combined_receiver_drains_all_sealed_tails_exactly_once() {
+        for (ordinary, audio) in [(3, 0), (0, 3), (3, 3)] {
+            for synchronous in [false, true] {
+                let (tx, mut rx) = SessionOutbound::channel(8, 100, 20);
+                for _ in 0..ordinary {
+                    tx.try_send(text(2)).unwrap();
+                }
+                if ordinary > 0 {
+                    tx.try_send(Message::Close(None)).unwrap();
+                }
+                for _ in 0..audio {
+                    tx.try_send_audio(text(1), false).unwrap();
+                }
+                rx.seal();
+                let mut lengths = Vec::new();
+                if synchronous {
+                    loop {
+                        match rx.try_recv() {
+                            Ok(envelope) => lengths.push(message_bytes(&envelope.item.value)),
+                            Err(mpsc::error::TryRecvError::Disconnected) => break,
+                            Err(e) => panic!("sealed queues cannot return {e:?}"),
+                        }
+                    }
+                } else {
+                    while let Some(envelope) = rx.recv().await {
+                        lengths.push(message_bytes(&envelope.item.value));
+                    }
+                }
+                assert_eq!(lengths.iter().filter(|&&n| n == 2).count(), ordinary);
+                assert_eq!(lengths.iter().filter(|&&n| n == 1).count(), audio);
+                assert_eq!(
+                    lengths.iter().filter(|&&n| n == 0).count(),
+                    usize::from(ordinary > 0)
+                );
+                assert!(rx.recv().await.is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn one_lane_eof_does_not_end_live_peer_or_spin() {
+        for end_audio in [false, true] {
+            let (tx, mut rx) = SessionOutbound::channel(8, 100, 20);
+            if end_audio {
+                rx.audio.as_mut().unwrap().rx.close();
+            } else {
+                rx.rx.close();
+            }
+            assert!(rx.recv().now_or_never().is_none());
+            assert!(matches!(
+                rx.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
+            if end_audio {
+                tx.try_send(text(2)).unwrap();
+            } else {
+                tx.try_send_audio(text(2), false).unwrap();
+            }
+            let frame = rx.recv().await.unwrap();
+            assert_eq!(message_bytes(&frame.item.value), 2);
+            drop(frame);
+            rx.seal();
+            assert!(rx.recv().await.is_none());
+        }
+    }
+
+    #[tokio::test]
     async fn audio_pressure_does_not_spend_ordinary_reply_or_data_capacity() {
         let (tx, mut rx) = SessionOutbound::channel(8, 100, 20);
         tx.try_send_data(text(80)).unwrap();
@@ -451,13 +604,14 @@ mod tests {
         tx.try_send(text(20)).unwrap();
         tx.try_send_audio(text(1), true).unwrap();
         // The real receiver advances ordinary and audio lanes independently.
-        let ordinary = rx.rx.recv().await.unwrap();
+        let ordinary = rx.recv().await.unwrap();
         assert_eq!(message_bytes(&ordinary.item.value), 80);
         drop(ordinary);
-        let reply = rx.rx.recv().await.unwrap();
+        drop(rx.recv().await.unwrap()); // fair audio progress between ordinary frames
+        let reply = rx.recv().await.unwrap();
         assert_eq!(message_bytes(&reply.item.value), 20);
         drop(reply);
-        drop(rx.audio.as_mut().unwrap().rx.recv().await.unwrap());
+        drop(rx.recv().await.unwrap());
         waiting.await.unwrap();
         assert!(tx.try_send(text(1)).is_ok());
         drop(rx);

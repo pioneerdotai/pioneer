@@ -412,9 +412,16 @@ fn request(commands: &WsSender<ConnectionRpcCommand>, method: &str) -> Request {
 }
 
 fn cancel_request(receipt: &SocketReceipt) -> Request {
+    cancel_request_for(receipt, pioneer_protocol::constants::methods::TURN_CANCEL)
+}
+fn cancel_request_for(receipt: &SocketReceipt, method: &str) -> Request {
     let request = crate::rpc::build_json_rpc_request_payload(
-        pioneer_protocol::constants::methods::TURN_CANCEL,
-        json!({"thread_id":"control-thread", "turn_id":"control-turn"}),
+        method,
+        if method == pioneer_protocol::constants::methods::VOICE_SESSION_CANCEL {
+            json!({"session_id":"control-voice-session"})
+        } else {
+            json!({"thread_id":"control-thread", "turn_id":"control-turn"})
+        },
     )
     .unwrap();
     let (tx, rx) = mpsc::channel();
@@ -1501,4 +1508,54 @@ async fn subscription_retirement_fences_queued_json_and_artifact_on_live_socket(
     })
     .await
     .expect("subscription scope regression must complete");
+}
+
+#[tokio::test]
+async fn voice_and_turn_cancel_cross_actual_writer_while_other_response_is_pending() {
+    use pioneer_protocol::constants::methods;
+    for voice_first in [false, true] {
+        for cancel_first in [false, true] {
+            timeout(Duration::from_secs(10), async {
+                let mut f = Fixture::start().await;
+                let first_method = if voice_first {
+                    methods::VOICE_SESSION_CANCEL
+                } else {
+                    methods::TURN_CANCEL
+                };
+                let second_method = if voice_first {
+                    methods::TURN_CANCEL
+                } else {
+                    methods::VOICE_SESSION_CANCEL
+                };
+                let first = cancel_request_for(&f.receipt, first_method);
+                let observed = f.next_request().await;
+                assert_eq!(observed["id"], first.id);
+                assert_eq!(observed["method"], first_method);
+                let second = cancel_request_for(&f.receipt, second_method);
+                let observed = f.next_request().await;
+                assert_eq!(observed["id"], second.id);
+                assert_eq!(observed["method"], second_method);
+                assert!(first.response.is_active());
+                if cancel_first {
+                    first.response.cancel();
+                }
+                f.reply(&second.id).await;
+                assert!(receive(second.rx).await.is_ok());
+                if !cancel_first {
+                    assert!(first.response.is_active());
+                }
+                f.reply(&first.id).await;
+                assert_eq!(receive(first.rx).await.is_ok(), !cancel_first);
+                let next = cancel_request_for(&f.receipt, first_method);
+                assert_eq!(f.next_request().await["id"], next.id);
+                f.reply(&next.id).await;
+                assert!(receive(next.rx).await.is_ok());
+                assert!(!f.task.is_finished());
+                f.task.abort();
+                let _ = f.task.await;
+            })
+            .await
+            .expect("one Cancel class cannot occupy the other class's response lifetime");
+        }
+    }
 }

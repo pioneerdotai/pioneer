@@ -89,7 +89,6 @@ impl MessageProcessor {
         let span = context.request_span();
 
         async {
-            let policy_generation = crate::authorization::observed_policy_generation();
             let decision = match kind {
                 BinaryIngressKind::ArtifactUploadChunk => {
                     self.authorize_artifact_upload_chunk(&context, payload)
@@ -119,7 +118,11 @@ impl MessageProcessor {
             record_binary_decision(registration, &decision);
             if !decision.is_allowed() {
                 if kind == BinaryIngressKind::VoiceChunk {
-                    self.reject_owned_voice_ingress(&context, payload);
+                    if let Some(session) = self.voice_ingress_session(connection, payload) {
+                        self.reject_voice_authorization(&session).await;
+                    } else {
+                        self.reject_owned_voice_ingress(&context, payload);
+                    }
                 }
                 return;
             }
@@ -136,8 +139,7 @@ impl MessageProcessor {
                         .await;
                 }
                 BinaryIngressKind::VoiceChunk => {
-                    self.process_voice_chunk_frame(&context, payload, policy_generation)
-                        .await;
+                    self.process_voice_chunk_frame(&context, payload).await;
                 }
             }
         }
@@ -421,16 +423,11 @@ impl MessageProcessor {
         Ok(())
     }
 
-    async fn process_voice_chunk_frame(
-        &self,
-        request_context: &RequestContext,
-        payload: &[u8],
-        policy_generation: u64,
-    ) {
+    async fn process_voice_chunk_frame(&self, request_context: &RequestContext, payload: &[u8]) {
         let connection_id = request_context.connection_id();
         match decode_gateway_voice_chunk_frame(payload) {
             Ok(chunk) => {
-                self.forward_decoded_voice_chunk(request_context, chunk, policy_generation)
+                self.forward_decoded_voice_chunk(request_context, chunk, payload)
                     .await;
             }
             Err(error) => {
@@ -485,11 +482,41 @@ impl MessageProcessor {
         }
     }
 
+    pub(super) async fn reject_voice_authorization(
+        &self,
+        session: &crate::voice::session_store::GatewayVoiceSession,
+    ) {
+        session.ingress.seal();
+        self.voice_session_buffers
+            .reject_ingress(&session.session_id);
+        let notification = pioneer_protocol::VoiceSessionResultNotification {
+            session_id: session.session_id.clone(),
+            turn_id: Some(session.turn_id.clone()),
+            outcome: pioneer_protocol::VoiceSessionOutcome::Failed,
+            error: Some(VoiceError {
+                kind: VoiceErrorKind::InvalidSession,
+                message: "voice authorization could not be established".into(),
+                public_error: None,
+            }),
+        };
+        if let Ok(text) =
+            JsonRpcNotification::from_params(events::VOICE_SESSION_RESULT, &notification)
+                .and_then(|n| serde_json::to_string(&n))
+        {
+            let _ = self
+                .session_manager
+                .send_voice_text(session.connection_id, text, true)
+                .await;
+        }
+        self.fail_voice_ingress(session);
+        self.retire_failed_voice_ingress(session);
+    }
+
     async fn forward_decoded_voice_chunk(
         &self,
         request_context: &RequestContext,
         chunk: GatewayVoiceChunkFrame,
-        policy_generation: u64,
+        payload: &[u8],
     ) {
         let connection_id = request_context.connection_id();
         let Ok(current) = self.session_manager.connection_context(connection_id).await else {
@@ -542,29 +569,79 @@ impl MessageProcessor {
             return;
         }
 
-        let Some(ingested) = self
-            .session_manager
-            .with_voice_ingress_connection(connection_id, request_context.principal(), || {
-                session
-                    .ingress
-                    .effect(|| {
-                        if crate::authorization::observed_policy_generation() != policy_generation {
-                            self.voice_session_buffers
-                                .reject_ingress(&session.session_id);
-                            return None;
-                        }
-                        Some(
-                            self.voice_session_buffers
-                                .append_chunk(chunk.header, chunk.audio_payload),
-                        )
-                    })
-                    .flatten()
-            })
-            .await
-        else {
-            return;
-        };
-        let Some(ingested) = ingested else {
+        let mut pending = Some(chunk);
+        let mut accepted = None;
+        // Global generation changes request a fresh canonical decision; they
+        // are never themselves evidence of a denial on this recording.
+        #[cfg(test)]
+        session.ingress.pause_proof_once().await;
+        for _ in 0..3 {
+            let Ok(current) = self.session_manager.connection_context(connection_id).await else {
+                return;
+            };
+            if let Some(auth) = &self.auth_service {
+                if auth
+                    .validate_session_lease(current.principal())
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            let context = RequestContext::new(
+                &current,
+                None,
+                crate::request_context::CanonicalMethod::binary("voice/chunk"),
+            );
+            let generation = self.authorization_invalidation_hub.observed_revision();
+            if !self
+                .authorize_voice_chunk(&context, payload)
+                .await
+                .is_allowed()
+            {
+                self.reject_voice_authorization(&session).await;
+                return;
+            }
+            if let Some(auth) = &self.auth_service {
+                if auth
+                    .validate_session_lease(context.principal())
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            let effect = self
+                .session_manager
+                .with_voice_ingress_connection(connection_id, context.principal(), || {
+                    session
+                        .ingress
+                        .effect(|| {
+                            if self.authorization_invalidation_hub.observed_revision() != generation
+                            {
+                                return None;
+                            }
+                            let chunk = pending.take().expect("append owns exactly one chunk");
+                            Some(
+                                self.voice_session_buffers
+                                    .append_chunk(chunk.header, chunk.audio_payload),
+                            )
+                        })
+                        .flatten()
+                })
+                .await;
+            match effect {
+                Some(Some(result)) => {
+                    accepted = Some(result);
+                    break;
+                }
+                None => return,
+                Some(None) if session.ingress.cancelled.is_cancelled() => return,
+                Some(None) => continue,
+            }
+        }
+        let Some(ingested) = accepted else {
+            self.reject_voice_authorization(&session).await;
             return;
         };
         match ingested {

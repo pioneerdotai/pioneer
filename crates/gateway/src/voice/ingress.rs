@@ -12,6 +12,13 @@ struct State {
 pub(crate) struct VoiceIngress {
     state: Mutex<State>,
     drained: Notify,
+    #[cfg(test)]
+    pub(crate) proof_pause: Mutex<
+        Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
     pub(crate) cancelled: CancellationToken,
 }
 impl PartialEq for VoiceIngress {
@@ -30,6 +37,14 @@ impl VoiceIngress {
         }
         state.pending += 1;
         Some(VoiceIngressTicket(self.clone()))
+    }
+    #[cfg(test)]
+    pub(crate) async fn pause_proof_once(&self) {
+        let pause = self.proof_pause.lock().unwrap().take();
+        if let Some((entered, release)) = pause {
+            let _ = entered.send(());
+            let _ = release.await;
+        }
     }
     pub(crate) fn effect<T>(&self, effect: impl FnOnce() -> T) -> Option<T> {
         let _state = self

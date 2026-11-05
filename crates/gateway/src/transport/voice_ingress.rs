@@ -1,7 +1,6 @@
 //! One bounded sequential audio worker per physical connection. JoinSet aborts on Drop.
 use crate::voice::{ingress::VoiceIngressTicket, session_store::GatewayVoiceSession};
 use crate::{message::MessageProcessor, session::SessionOutbound};
-use axum::extract::ws::Message;
 use std::sync::Arc;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::task::JoinSet;
@@ -38,7 +37,7 @@ impl VoiceIngressOwner {
         sessions: Arc<crate::session::SessionManager>,
         auth: Arc<crate::auth::GatewayAuthService>,
         connection_id: crate::session::ConnectionId,
-        outbound: SessionOutbound,
+        _outbound: SessionOutbound,
     ) -> Self {
         let (sender, mut receiver) = mpsc::channel::<Item>(MAX_FRAMES);
         // Only one failed recording may remain registered until its outcome is
@@ -93,7 +92,7 @@ impl VoiceIngressOwner {
                         if let Ok(text) = pioneer_protocol::JsonRpcNotification::from_params(
                             pioneer_protocol::constants::events::VOICE_SESSION_RESULT, &notification)
                             .and_then(|v| serde_json::to_string(&v)) {
-                            let _ = outbound.send_audio(Message::Text(text.into()), true).await;
+                            let _ = sessions.send_voice_text(connection_id, text, true).await;
                         }
                         processing.retire_failed_voice_ingress(&session);
                     }

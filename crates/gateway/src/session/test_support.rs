@@ -147,6 +147,17 @@ pub(crate) async fn register_authenticated_test_connection(
 /// completed write; tests needing writer retention use OutboundReceiver itself.
 pub(crate) struct OutboundTestReceiver(super::outbound::OutboundReceiver);
 impl OutboundTestReceiver {
+    /// Hold the audio lane untouched while observing real RPC delivery progress.
+    pub(crate) async fn recv_ordinary(&mut self) -> Option<Message> {
+        let envelope = self.0.recv_ordinary().await?;
+        let (message, _) = envelope.item.received(
+            pioneer_observability::work::Boundary::EventLane,
+            pioneer_observability::work::WorkKind::Event,
+            pioneer_observability::work::ExecutorRole::Gateway,
+        );
+        Some(message)
+    }
+
     pub(crate) async fn recv(&mut self) -> Option<Message> {
         let envelope = self.0.recv().await?;
         let (message, _) = envelope.item.received(

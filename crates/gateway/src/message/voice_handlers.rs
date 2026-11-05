@@ -462,14 +462,73 @@ impl MessageProcessor {
                 .await;
                 return;
             }
-            let transition = self
-                .session_manager
-                .with_voice_ingress_connection(connection_id, request_context.principal(), || {
-                    self.voice_sessions
-                        .mark_finalizing_authenticated(params.session_id.as_str(), &owner)
-                })
-                .await;
+            let mut transition = None;
+            for _ in 0..3 {
+                let generation = self.authorization_invalidation_hub.observed_revision();
+                if !self
+                    .revalidate_voice_thread_access(
+                        request_context,
+                        pending_session.workspace_id.as_str(),
+                        pending_session.thread_id.as_str(),
+                    )
+                    .await
+                {
+                    break;
+                }
+                let Ok(current) = self.session_manager.connection_context(connection_id).await
+                else {
+                    return;
+                };
+                if let Some(auth) = &self.auth_service {
+                    if auth
+                        .validate_session_lease(current.principal())
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                let attempt =
+                    self.session_manager
+                        .with_voice_ingress_connection(
+                            connection_id,
+                            request_context.principal(),
+                            || {
+                                if self.authorization_invalidation_hub.observed_revision()
+                                    != generation
+                                {
+                                    return None;
+                                }
+                                Some(self.voice_sessions.mark_finalizing_authenticated(
+                                    params.session_id.as_str(),
+                                    &owner,
+                                ))
+                            },
+                        )
+                        .await;
+                match attempt {
+                    Some(Some(result)) => {
+                        transition = Some(result);
+                        break;
+                    }
+                    None => return,
+                    Some(None) => continue,
+                }
+            }
             let Some(transition) = transition else {
+                self.reject_voice_authorization(&pending_session).await;
+                self.send_voice_error(
+                    connection_id,
+                    request_id,
+                    INVALID_REQUEST_CODE,
+                    methods::VOICE_SESSION_FINALIZE,
+                    VoiceError {
+                        kind: VoiceErrorKind::InvalidSession,
+                        message: "voice authorization could not be established".into(),
+                        public_error: None,
+                    },
+                )
+                .await;
                 return;
             };
             if let Err(error) = transition {
@@ -1279,7 +1338,7 @@ impl MessageProcessor {
     pub(super) async fn send_voice_session_result_notification(
         &self,
         connection_id: ConnectionId,
-        thread_id: &str,
+        _thread_id: &str,
         mut notification: VoiceSessionResultNotification,
     ) {
         if let Some(key) = notification.turn_id.as_deref() {
@@ -1305,13 +1364,18 @@ impl MessageProcessor {
                 pioneer_protocol::PublicErrorStage::Execution,
             ));
         }
-        self.send_thread_scoped_notification_to_connections(
-            thread_id,
-            events::VOICE_SESSION_RESULT,
-            &notification,
-            vec![connection_id],
-        )
-        .await;
+        // A terminal recording outcome is addressed to its authenticated
+        // physical owner, not ordinary notification fanout. Its capacity and
+        // lifecycle checks are the same as audio ACK/overflow delivery.
+        if let Ok(text) =
+            JsonRpcNotification::from_params(events::VOICE_SESSION_RESULT, &notification)
+                .and_then(|notification| serde_json::to_string(&notification))
+        {
+            let _ = self
+                .session_manager
+                .send_voice_text(connection_id, text, true)
+                .await;
+        }
     }
 
     async fn send_voice_error(

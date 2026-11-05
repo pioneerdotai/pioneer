@@ -1313,7 +1313,16 @@ fn reject_voice_cancel_capacity(outbound: &SessionOutbound, id: pioneer_protocol
     if let Ok(text) = serde_json::to_string(&response) {
         // Nonblocking and recording-control scoped. A hostile duplicate stream
         // cannot spend the turn Cancel slot or evict the socket on Full.
-        let _ = outbound.try_send_audio(Message::Text(text.into()), true);
+        match outbound.try_send_audio(Message::Text(text.into()), true) {
+            Ok(()) => {}
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                // The request was not admitted. Delivery cannot be promised
+                // after its own terminal reserve is exhausted: bounded clients
+                // retain their original RPC deadline and retire their waiter.
+                record_outbound_queue_saturation("voice_cancel_unadmitted_deadline_outcome");
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
+        }
     }
 }
 
@@ -1377,6 +1386,7 @@ mod tests {
         let mut drops = Vec::new();
         for class in [
             ConnectionRequestClass::Cancel,
+            ConnectionRequestClass::VoiceCancel,
             ConnectionRequestClass::TaskWait,
             ConnectionRequestClass::Read,
         ] {
