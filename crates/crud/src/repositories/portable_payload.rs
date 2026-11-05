@@ -578,7 +578,7 @@ impl PortablePayloadProgress {
                 self.finished[index] = true;
                 break;
             }
-            limit = (limit * 2).min(remaining);
+            limit = std::cmp::min(limit * 2, remaining);
         }
         // A bounded source page is not EOF for the other families.
         observe::outcome(observe::Outcome::NoWork);
