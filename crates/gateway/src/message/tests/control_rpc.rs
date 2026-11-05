@@ -2043,13 +2043,15 @@ async fn audio_worker_retirement_releases_active_and_queued_tickets() {
                 assert_eq!(response.result["timedOut"], true);
                 if terminal == "panic" {
                     drop(release); // the test-only gate injects a worker panic
-                    None
+                    // Keep the completion sender alive until the pump observes
+                    // the worker panic. Dropping it would also ready `finished`.
+                    (None, Some(finish))
                 } else {
                     finish.send(()).unwrap();
-                    Some(release)
+                    (Some(release), None)
                 }
             };
-            let (alive, kept_release) = tokio::join!(pump, driver);
+            let (alive, (kept_release, _kept_finish)) = tokio::join!(pump, driver);
             assert_eq!(alive, terminal != "panic");
             if terminal == "drop" {
                 drop(handlers);
@@ -2981,6 +2983,12 @@ async fn queued_and_active_audio_revalidate_current_lease_and_exact_socket() {
         tokio::time::timeout(Duration::from_secs(10),async {
             let mut f=Fixture::new().await;
             let mut context=f.processor.session_manager.connection_context(f.connection).await.unwrap();
+            // Start with a real expiry so renewal extends it instead of
+            // overflowing the superuser fixture's i64::MAX sentinel.
+            let mut initial=context.principal().clone();
+            initial.access_expires_at_unix=crate::helpers::unix_timestamp_secs().unwrap()+3600;
+            f.processor.session_manager.renew_connection_principal(f.connection,context.principal(),Arc::new(initial)).await.unwrap();
+            context=f.processor.session_manager.connection_context(f.connection).await.unwrap();
             let expected=context.principal().clone();
             let session=ingress_recording(&f.processor, &f.workspace,&context,"voice_queued_lease");
             let (entered,reached)=tokio::sync::oneshot::channel();

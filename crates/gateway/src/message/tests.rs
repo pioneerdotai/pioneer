@@ -41425,7 +41425,14 @@ async fn task_create_tool_idempotency_key_deduplicates_parallel_mutations_impl()
         "openai",
     )
     .await;
-    let _ = recv_notification_by_method(&mut rx, events::TURN_COMPLETED).await;
+    // The parent performs durable task admission before it can finish. This
+    // checks deduplication, not the shared helper's two-second completion SLA.
+    let _ = recv_notification_by_method_timeout(
+        &mut rx,
+        events::TURN_COMPLETED,
+        Duration::from_secs(30),
+    )
+    .await;
 
     let turn_items = crud_store
         .get_turn_item_events("thr_task_tool_idempotency", "turn_task_tool_idempotency")
