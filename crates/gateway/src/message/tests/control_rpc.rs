@@ -2249,6 +2249,13 @@ async fn domain_finalize_drains_slow_tail_with_recording_and_buffered_recognizer
             let mut processor = (*f.processor).clone().with_runtime_home_for_tests(home.path().to_path_buf())
                 .with_test_voice_transcript("complete transport transcript")
                 .with_voice_input_supervisor(ready_gateway_voice_supervisor_for_model("complete transport transcript", "moonshine-base"));
+            // This scenario publishes an ACL change and then persists a new
+            // turn. Both steps must share the durable policy generation, as
+            // they do in production; the lightweight constructor uses a hub
+            // whose generation lives only in memory.
+            processor.authorization_invalidation_hub = Arc::new(
+                crate::authorization::AuthorizationInvalidationHub::durable(processor.crud_store.clone()),
+            );
             processor.provider_registry = test_provider();
             let native_gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
             let native_release = PendingVoiceRelease(native_gate.clone());
