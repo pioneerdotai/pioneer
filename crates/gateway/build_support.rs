@@ -1,9 +1,16 @@
-// Final-binary Swift inputs for the cua-driver SDK.
+// Final-binary macOS linker inputs, including the cua-driver SDK.
 // Adapted from trycua/cua 688c5fd62a9f13dddc309970c948df494e7de33f,
 // libs/cua-driver/rust/crates/cua-driver/build.rs (MIT; notice in
 // crates/tools/src/handlers/computer_use/LICENSE.cua).
 // Transitive rustc-link-arg directives do not reach Pioneer executables.
 pub fn macos_link_inputs() {
+    // Development images can exceed compact unwind's 24-bit offset range.
+    // Apple's debug mode keeps unwinding and omits release-only advisories.
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos")
+        && std::env::var("PROFILE").as_deref() == Ok("debug")
+    {
+        println!("cargo:rustc-link-arg=-Wl,-debug_variant");
+    }
     // Each final binary must opt in explicitly; dependency features do not
     // propagate Cargo feature environment variables to its build script.
     if std::env::var_os("CARGO_FEATURE_COMPUTER_USE").is_none() {

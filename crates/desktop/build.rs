@@ -3,6 +3,13 @@ mod build_support;
 
 fn main() {
     build_support::manifest();
+    // Development images can exceed compact unwind's 24-bit offset range.
+    // Apple's debug mode keeps unwinding and omits release-only advisories.
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos")
+        && std::env::var("PROFILE").as_deref() == Ok("debug")
+    {
+        println!("cargo:rustc-link-arg=-Wl,-debug_variant");
+    }
     #[cfg(target_os = "windows")]
     {
         let manifest_dir = std::path::PathBuf::from(
