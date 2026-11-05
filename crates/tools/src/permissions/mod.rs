@@ -2293,7 +2293,7 @@ mod tests {
             .map(str::to_owned),
         );
 
-        assert_eq!(registered.len(), 68, "native tool inventory changed");
+        assert_eq!(registered.len(), 69, "native tool inventory changed");
         assert_eq!(
             registered,
             expected_actions

@@ -6957,6 +6957,7 @@ impl pioneer_tasks::TaskExecutor for HoldingPlannedSystemExecutor {
 #[test]
 fn extra_run_completion_preserves_and_executes_original_one_shot() {
     run_standard_stack_message_test("Extra run preserves one-shot execution", async {
+        // Heap-allocate dispatch futures so this matrix uses the normal Gateway worker stack.
         for scenario in [
             "future",
             "queued",
@@ -7039,9 +7040,7 @@ fn extra_run_completion_preserves_and_executes_original_one_shot() {
                     .task_runtime
                     .register_executor(holding.clone())
                     .await;
-                processor
-                    .task_runtime
-                    .process_due_once(4_000_000_000)
+                Box::pin(processor.task_runtime.process_due_once(4_000_000_000))
                     .await
                     .unwrap();
                 let running = processor
@@ -7101,9 +7100,7 @@ fn extra_run_completion_preserves_and_executes_original_one_shot() {
                 .unwrap()
                 .to_owned();
             if let Some((prepared, terminal)) = planned_terminal {
-                processor
-                    .task_runtime
-                    .process_due_once(4_000_000_000)
+                Box::pin(processor.task_runtime.process_due_once(4_000_000_000))
                     .await
                     .unwrap();
                 let waiting = processor
@@ -7169,9 +7166,7 @@ fn extra_run_completion_preserves_and_executes_original_one_shot() {
                     .task_runtime
                     .register_executor(Arc::new(CompletingSystemExecutor))
                     .await;
-                processor
-                    .task_runtime
-                    .process_due_once(4_000_000_000)
+                Box::pin(processor.task_runtime.process_due_once(4_000_000_000))
                     .await
                     .unwrap();
                 let completed = processor
@@ -7214,9 +7209,7 @@ fn extra_run_completion_preserves_and_executes_original_one_shot() {
                     )
                     .await
                     .unwrap();
-                processor
-                    .task_runtime
-                    .process_due_once(4_000_000_000)
+                Box::pin(processor.task_runtime.process_due_once(4_000_000_000))
                     .await
                     .unwrap();
                 assert_eq!(
@@ -7276,9 +7269,7 @@ fn extra_run_completion_preserves_and_executes_original_one_shot() {
                         .task_runtime
                         .register_executor(Arc::new(CompletingSystemExecutor))
                         .await;
-                    processor
-                        .task_runtime
-                        .process_due_once(4_000_000_000)
+                    Box::pin(processor.task_runtime.process_due_once(4_000_000_000))
                         .await
                         .unwrap();
                     let stopped = processor
@@ -7326,9 +7317,7 @@ fn extra_run_completion_preserves_and_executes_original_one_shot() {
                 // No System executor yet: the planned fire becomes a queued
                 // sibling while the additional occurrence owns the serial slot.
                 if scheduled_already_queued {
-                    processor
-                        .task_runtime
-                        .process_due_once(4_000_000_000)
+                    Box::pin(processor.task_runtime.process_due_once(4_000_000_000))
                         .await
                         .unwrap();
                     let queued = processor
@@ -7376,7 +7365,9 @@ fn extra_run_completion_preserves_and_executes_original_one_shot() {
                     .task_runtime
                     .register_executor(Arc::new(CompletingSystemExecutor))
                     .await;
-                processor.task_runtime.process_due_once(now).await.unwrap();
+                Box::pin(processor.task_runtime.process_due_once(now))
+                    .await
+                    .unwrap();
             }
             let after_extra = processor
                 .crud_store
@@ -7444,7 +7435,9 @@ fn extra_run_completion_preserves_and_executes_original_one_shot() {
                 .register_executor(Arc::new(CompletingSystemExecutor))
                 .await;
             if scenario == "retry" {
-                processor.task_runtime.process_due_once(now).await.unwrap();
+                Box::pin(processor.task_runtime.process_due_once(now))
+                    .await
+                    .unwrap();
                 let retried = processor
                     .crud_store
                     .get_task(task_id)
@@ -7460,14 +7453,10 @@ fn extra_run_completion_preserves_and_executes_original_one_shot() {
                 assert!(!retried.task.status.is_terminal());
                 assert_eq!(retried.triggers[0].next_fire_at, Some(4_000_000_000));
             }
-            processor
-                .task_runtime
-                .process_due_once(4_000_000_000)
+            Box::pin(processor.task_runtime.process_due_once(4_000_000_000))
                 .await
                 .unwrap();
-            processor
-                .task_runtime
-                .process_due_once(4_000_000_000)
+            Box::pin(processor.task_runtime.process_due_once(4_000_000_000))
                 .await
                 .unwrap();
             let final_state = processor
