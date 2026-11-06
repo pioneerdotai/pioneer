@@ -417,7 +417,6 @@ pub(super) async fn discover(
     kind: i64,
     round: &mut ServiceRound,
 ) -> Result<Admission> {
-    let has_active = active.iter().any(|(_, active_kind)| *active_kind == kind);
     if round.complete || (round.until_row > 0 && round.after_row >= round.until_row) {
         if !round.propagated {
             round.complete = true;
@@ -427,9 +426,6 @@ pub(super) async fn discover(
         // fanout behind it. An ACK can release a pre-fanout deletion fence
         // without changing that source's work revision again.
         *round = ServiceRound::default();
-        // The active visit may still carry the old revision. Excluding it
-        // from admission is not proof that its propagated generation is done.
-        round.propagated = has_active;
     }
     let mut due = Query::select();
     due.expr(Expr::val(1))
@@ -467,7 +463,7 @@ pub(super) async fn discover(
     // No due non-active work means idle without walking future-retry pages.
     if store.connection.query_one_raw(due).await?.is_none() {
         round.complete = true;
-        round.propagated &= has_active;
+        round.propagated = false;
         return Ok(Admission::Idle);
     }
     if round.after_row >= round.until_row {
@@ -487,7 +483,7 @@ pub(super) async fn discover(
             .try_get("", "until_row")?;
         round.after_row = 0;
         // This frontier already includes propagation completed before its capture.
-        round.propagated &= has_active;
+        round.propagated = false;
     }
     // Stable insertion order, not mutable retry_at or TEXT order. New rows
     // cannot enter this round; re-dirty/retry cannot move a visited row ahead.

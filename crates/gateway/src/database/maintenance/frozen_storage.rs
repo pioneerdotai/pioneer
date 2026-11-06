@@ -1012,6 +1012,101 @@ mod tests {
         assert_eq!(admission.done, [false; 2], "DB errors do not latch EOF");
     }
 
+    // Distinct lifecycle proof: the actual run future stays parked, including
+    // across elapsed pacing/backoff intervals, with protected pending work.
+    #[tokio::test]
+    async fn protected_pending_owner_parks_without_clock_rescans() {
+        let (_directory, store, observer) = fixture_with_metadata(0).await;
+        let db = store.database_connection();
+        for index in 0..7 {
+            let id = format!("protected-{index}");
+            db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+                "INSERT INTO compaction_frozen_history(id,workspace_id,owner_thread,identity_sha256,imports_sha256,message_count,import_count,next_ordinal,next_import,ready) VALUES(?1,'ws','thread','fixture','fixture',0,0,0,0,0)",
+                [id.clone().into()])).await.unwrap();
+            let kind = i64::from(index != 0);
+            db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+                "INSERT INTO compaction_frozen_layout(manifest_id,kind,active,pending) VALUES(?1,?2,0,1)",
+                [id.clone().into(), kind.into()])).await.unwrap();
+            let sql = if kind == 0 {
+                "INSERT INTO compaction_frozen_message_data(manifest_id,ordinal,reference_json,bytes) VALUES(?1,0,'{}',2)"
+            } else {
+                "INSERT INTO compaction_frozen_import_data(manifest_id,ordinal,message_ordinal,source_scope,source_id,source_version,source_thread,proof_json,bytes) VALUES(?1,0,0,'event','e','v','thread','{}',2)"
+            };
+            db.execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                sql,
+                [id.into()],
+            ))
+            .await
+            .unwrap();
+        }
+        tokio::time::pause();
+        let cancellation = CancellationToken::new();
+        let mut worker = Box::pin(run(Arc::new(store.clone()), cancellation.clone()));
+        let mut previous = (0, 0);
+        let mut quiet = 0;
+        for _ in 0..200_000 {
+            assert!(futures_util::poll!(&mut worker).is_pending());
+            let current = (
+                observer.reads.lock().unwrap().len(),
+                observer.writes.lock().unwrap().len(),
+            );
+            let readers_idle = matches!(
+                observer
+                    .reads
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .rev()
+                    .find(|event| !matches!(event, SqliteReadEvent::OperationFinished { .. })),
+                Some(SqliteReadEvent::AdmissionReleased {
+                    active: 0,
+                    queue_depth: 0,
+                    ..
+                })
+            );
+            let writers_idle = matches!(
+                observer.writes.lock().unwrap().last(),
+                Some(SqliteWriteEvent::Released { .. })
+            );
+            if current == previous && readers_idle && writers_idle {
+                quiet += 1;
+            } else {
+                quiet = 0;
+            }
+            previous = current;
+            if quiet == 2000 {
+                break;
+            }
+            tokio::time::advance(Duration::from_millis(1)).await;
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(quiet, 2000, "finite backlog must park the real owner");
+        for _ in 0..4 {
+            tokio::time::advance(Duration::from_secs(3600)).await;
+            for _ in 0..1000 {
+                assert!(futures_util::poll!(&mut worker).is_pending());
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(
+                (
+                    observer.reads.lock().unwrap().len(),
+                    observer.writes.lock().unwrap().len()
+                ),
+                previous,
+                "no read/write admission, housekeeping, or clock rescan after EOF"
+            );
+        }
+        cancellation.cancel();
+        worker.await;
+        let pending = db.query_one_raw(Statement::from_string(DbBackend::Sqlite,
+            "SELECT count(*) AS n FROM compaction_frozen_sweep_work WHERE manifest_id LIKE 'protected-%' AND pending=1 AND retry_at=0")).await.unwrap().unwrap();
+        assert_eq!(pending.try_get::<i64>("", "n").unwrap(), 7);
+        let retained = db.query_one_raw(Statement::from_string(DbBackend::Sqlite,
+            "SELECT (SELECT count(*) FROM compaction_frozen_message_data WHERE manifest_id LIKE 'protected-%') + (SELECT count(*) FROM compaction_frozen_import_data WHERE manifest_id LIKE 'protected-%') AS n")).await.unwrap().unwrap();
+        assert_eq!(retained.try_get::<i64>("", "n").unwrap(), 7);
+    }
+
     #[tokio::test]
     async fn durable_sweep_restarts_quietly_without_writes_and_keeps_maintenance_routes() {
         let (_directory, store, observer) = fixture_with_metadata(0).await;
