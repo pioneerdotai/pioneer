@@ -69,6 +69,15 @@ def export(args):
             paths = set(object_paths(data))
             if not paths:
                 raise ValueError("empty release object debug map")
+            # N_OSO lists objects/archives, but not the Clang modules referenced
+            # by their DWARF when Swift bridges are built with -gmodules. Retain
+            # the PCM files from those dependencies' Cargo OUT_DIRs as well.
+            # Scope discovery to linked build outputs, not the entire target or
+            # the runner's global caches. Keep original paths for oso-prepend-path.
+            output_dirs = {parent for path in paths for parent in path.parents
+                           if parent.name == "out" and parent.parent.parent.name == "build"}
+            paths.update(module for directory in output_dirs
+                         for module in directory.rglob("*.pcm"))
             for path in paths:
                 if not path.is_absolute() or ".." in path.parts:
                     raise ValueError(f"unsupported non-absolute object path: {path}")

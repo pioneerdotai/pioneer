@@ -452,7 +452,9 @@ mod tests {
             let root = std::path::PathBuf::from(root);
             let settings = crate::service::ServiceSettings {
                 service_name: "pioneer-stop-test".to_owned(),
+                #[cfg(target_os = "macos")]
                 legacy_service_names: vec![],
+                #[cfg(target_os = "macos")]
                 macos_associated_bundle_identifier: String::new(),
                 managed_by: pioneer_config::InstallManagedBy::Manual,
             };

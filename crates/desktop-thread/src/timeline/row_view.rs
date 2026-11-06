@@ -1184,6 +1184,117 @@ mod tests {
         });
     }
 
+    #[gpui_kit::test]
+    fn repeated_measurement_releases_html_child_after_retirement(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let client = Arc::new(ClientCore::new());
+        install_thread_timeline(&client, "a", "initial");
+        // Pending HTML still has a retained view and is included in the row's
+        // element tree, but cannot start downloads or mount a native WebView.
+        client.apply_thread_timeline_page(
+            serde_json::from_value(serde_json::json!({
+                "workspaceId":"workspace","threadId":"a","projectionVersion":2,
+                "blocks":[{"workspaceId":"workspace","threadId":"a","blockId":"html",
+                    "turnId":"turn","sortKey":"1","kind":{"kind":"assistant_message",
+                        "itemId":"html","text":"Document","htmlPublications":[{
+                            "workspaceId":"workspace","threadId":"a","turnId":"turn",
+                            "callId":"html-call","title":"Document","artifact":{
+                                "artifact_id":"document","version_id":"version","display_name":"Document",
+                                "kind":"file","mime_type":"text/html","size_bytes":10,
+                                "sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                                "status":"pending"
+                            }
+                        }]}}],
+                "page":{"hasMoreBefore":false,"hasMoreAfter":false}
+            }))
+            .unwrap(),
+            TopLevelPageMergeMode::Reset,
+        );
+        let (registrar, deliver) = binding_router(client.clone());
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            Root::new(
+                ThreadView::new(
+                    ThreadViewConfig::new(
+                        client.clone(),
+                        "a".into(),
+                        registrar,
+                        Arc::new(ThreadPorts),
+                        Arc::new(ThreadPorts),
+                        Arc::new(ThreadPorts),
+                    ),
+                    window,
+                    cx,
+                ),
+                window,
+                cx,
+            )
+        });
+        deliver();
+        cx.run_until_parked();
+        let thread = root.read_with(cx, |root, _| {
+            root.view().clone().downcast::<ThreadView>().unwrap()
+        });
+        let timeline = thread.read_with(cx, |view, _| view.timeline_for_test());
+        // Mount the list to obtain its pane width, then measure and commit the
+        // initial publication before capturing the child created at commit.
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            timeline.update(cx, |view, cx| {
+                super::super::controller::DesktopTimelineController::viewport(view, window, cx);
+                cx.notify();
+            });
+            window.draw(cx).clear(cx);
+        });
+        cx.run_until_parked();
+        let (id, child) = timeline.read_with(cx, |view, cx| {
+            let prepared = view.thread_timeline_view_state.prepared.as_ref().unwrap();
+            let slot = prepared
+                .slots
+                .iter()
+                .find(|slot| slot.snapshot().id().as_str() == "html")
+                .unwrap();
+            let row = slot.view.as_ref().unwrap().read(cx);
+            assert_eq!(row.presentation.html.len(), 1);
+            (
+                slot.snapshot().id().clone(),
+                row.presentation.html[0].downgrade(),
+            )
+        });
+        for _ in 0..2 {
+            cx.update(|window, cx| {
+                timeline.update(cx, |view, cx| {
+                    // Reconciliation runs in update with the existing HTML
+                    // child, so this must exercise measurement, not a cache hit.
+                    view.layout_store.invalidate_row(&id);
+                    view.reconcile_timeline(window, cx);
+                    assert!(view.measurement_coordinator.draw.is_some());
+                    cx.notify();
+                });
+                window.draw(cx).clear(cx);
+            });
+            cx.run_until_parked();
+            timeline.read_with(cx, |view, _| {
+                assert!(view.measurement_coordinator.draw.is_none());
+            });
+        }
+        assert!(child.upgrade().is_some());
+        timeline.update(cx, |view, cx| view.retire_timeline_rows(cx));
+        drop(timeline);
+        drop(thread);
+        drop(root);
+        drop(deliver);
+        drop(client);
+        // Dispose retained frame owners as well as the row registry. Only a
+        // leaked temporary measurement element could keep this child alive.
+        cx.update(|window, _| window.remove_window());
+        cx.run_until_parked();
+        assert!(
+            child.upgrade().is_none(),
+            "measurement retained the retired HTML child"
+        );
+    }
+
     fn publish_work(client: &Arc<ClientCore>, revision: i64, extra: bool) {
         let work = serde_json::json!({"turnId":"turn","presentation":"expanded_terminal_no_final","state":"completed",
             "workCount":7,"visibleWorkCount":7,"hiddenWorkCount":0,"hasMoreBefore":false,"hasMoreAfter":false});

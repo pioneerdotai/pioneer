@@ -34,6 +34,7 @@ async fn index_quantum(
     store: &CrudStore,
     after: &mut String,
     imports: &mut Option<PreviewImportIndex>,
+    upper: &str,
 ) -> Result<bool> {
     if let Some(state) = imports.as_ref() {
         let manifest = state.header.manifest.clone();
@@ -95,6 +96,7 @@ async fn index_quantum(
                     .or(col("i", frozen_index::Column::Unknown).eq(Expr::Constant(1.into()))),
             )
             .and_where(col("i", frozen_index::Column::ManifestId).gt(after.as_str()))
+            .and_where(col("i", frozen_index::Column::ManifestId).lte(upper))
             .order_by(("i", frozen_index::Column::ManifestId), Order::Asc);
     } else {
         query
@@ -106,6 +108,7 @@ async fn index_quantum(
                 col("i", frozen_index::Column::ManifestId).eq(col("h", history::Column::Id)),
             )
             .and_where(col("h", history::Column::Id).gt(after.as_str()))
+            .and_where(col("h", history::Column::Id).lte(upper))
             .order_by(("h", history::Column::Id), Order::Asc);
     }
     let row = store.connection.query_one(&query).await?;
@@ -312,7 +315,8 @@ async fn index_quantum(
         tracing::warn!("HTML preview retention preserved an unknown frozen media scope");
     }
     let io_locator = super::html_preview_io_work::HtmlPreviewIoLocator::new(&id);
-    store
+    let change = store.connection.work_signal("maintenance.html").changing();
+    let changed = store
         .run_serialized_write(|| async {
             let tx = store.connection.begin().await?;
             let header = history::Entity::find_by_id(&id)
@@ -330,7 +334,7 @@ async fn index_quantum(
                 .await?;
             if header.is_none() {
                 tx.rollback().await?;
-                return Ok(());
+                return Ok(false);
             }
             let changed = frozen_index::Entity::update_many()
                 .col_expr(frozen_index::Column::NextOrdinal, Expr::val(end))
@@ -402,10 +406,13 @@ async fn index_quantum(
                 }
             }
             tx.commit().await?;
-            Ok(())
+            Ok(changed == 1)
         })
         .await?;
-    if !results.is_empty() {
+    change.completed(
+        changed && !unknown && end == count && row.try_get::<i64>("", "import_count")? == 0,
+    );
+    if changed && !results.is_empty() {
         store.notify_html_preview_io_work();
     }
     if !unknown && (end < count || row.try_get::<i64>("", "import_count")? > 0) {
@@ -579,9 +586,10 @@ async fn index_import_quantum(
         .filter(Expr::col(history::Column::NextImport).eq(Expr::col(history::Column::ImportCount)))
         .filter(history::Column::ImportsSha256.eq(expected))
         .into_query();
-    store
+    let change = store.connection.work_signal("maintenance.html").changing();
+    let changed = store
         .run_serialized_write(|| async {
-            frozen_index::Entity::update_many()
+            let changed = frozen_index::Entity::update_many()
                 .col_expr(
                     frozen_index::Column::Complete,
                     Expr::val(i64::from(done && !unknown)),
@@ -598,10 +606,12 @@ async fn index_import_quantum(
                 .filter(frozen_index::Column::Expired.eq(0))
                 .filter(Expr::exists(header.clone()))
                 .exec(&store.connection)
-                .await?;
-            Ok(())
+                .await?
+                .rows_affected;
+            Ok(changed == 1)
         })
         .await?;
+    change.completed(changed && !unknown);
     // A zero-row guard rejection is terminal for this pass too. The marker
     // remains retaining and a later pass/restart can prepare fresh progress.
     Ok(true)
@@ -712,24 +722,76 @@ pub struct HtmlPreviewRetentionProgress {
     input_after: String,
     phase: usize,
     idle: [bool; 3],
+    // Legacy input EOF cannot publish completion after skipping a failed row.
+    input_retry_debt: bool,
+    // Frozen index, legacy inputs and artifact IDs each own a finite pass.
+    // A producer cannot extend an active suffix and postpone wrap forever.
+    upper: [Option<String>; 3],
 }
 impl HtmlPreviewRetentionProgress {
     /// Returns false at discovery EOF. Errors do not pin the cursor to poison
-    /// data; the existing maintenance owner revisits every pass/restart.
+    /// data; the maintenance owner must retain retry debt through pass EOF.
     pub async fn quantum(&mut self, store: &CrudStore) -> Result<bool> {
         while self.idle[self.phase] {
             self.phase = (self.phase + 1) % 3;
         }
         let path = self.phase;
         self.phase = (self.phase + 1) % 3;
+        if self.upper[path].is_none() {
+            self.upper[path] = Some(match path {
+                0 => history::Entity::find()
+                    .select_only()
+                    .column(history::Column::Id)
+                    .order_by_desc(history::Column::Id)
+                    .into_tuple::<String>()
+                    .one(&store.connection)
+                    .await?
+                    .unwrap_or_default(),
+                1 => turn_input::Entity::find()
+                    .select_only()
+                    .column(turn_input::Column::Id)
+                    .order_by_desc(turn_input::Column::Id)
+                    .into_tuple::<String>()
+                    .one(&store.connection)
+                    .await?
+                    .unwrap_or_default(),
+                _ => store.html_preview_artifact_frontier().await?,
+            });
+        }
         let more = match path {
-            0 => index_quantum(store, &mut self.index_after, &mut self.imports).await?,
-            1 => input_adoption_quantum(store, &mut self.input_after).await?,
+            0 => {
+                index_quantum(
+                    store,
+                    &mut self.index_after,
+                    &mut self.imports,
+                    self.upper[0].as_deref().expect("captured frontier"),
+                )
+                .await?
+            }
+            1 => {
+                let retry_debt = self.input_retry_debt;
+                // Cancellation after cursor advancement also keeps the durable
+                // completion gate open when this progress is reused.
+                self.input_retry_debt = true;
+                let more = input_adoption_quantum(
+                    store,
+                    &mut self.input_after,
+                    self.upper[1].as_deref().expect("captured frontier"),
+                    !retry_debt,
+                )
+                .await?;
+                self.input_retry_debt = retry_debt;
+                more
+            }
             _ => self.artifact_quantum(store).await?,
         };
+        if path == 1 && !more {
+            self.input_retry_debt = false;
+        }
         self.idle[path] = !more;
         if self.idle.iter().all(|idle| *idle) {
             self.idle = [false; 3];
+            self.upper = Default::default();
             Ok(false)
         } else {
             Ok(true)
@@ -742,6 +804,9 @@ impl HtmlPreviewRetentionProgress {
                 .columns([artifact::Column::Id, artifact::Column::CurrentVersionId])
                 .column_as(bytes(Expr::col(artifact::Column::MetadataJson)), "bytes")
                 .filter(artifact::Column::Id.gt(self.after.as_str()))
+                .filter(
+                    artifact::Column::Id.lte(self.upper[2].as_deref().expect("captured frontier")),
+                )
                 .filter(
                     Expr::col(artifact::Column::CreatedByKind).eq(Expr::Constant("tool".into())),
                 )
@@ -1020,7 +1085,11 @@ async fn release(store: &CrudStore, candidate: artifact::Model) -> Result<()> {
             )
         })
         .collect::<std::collections::BTreeMap<_, _>>();
-    store
+    // Retirement releases physical blob references, including when no readable
+    // copy ticket exists. Reopen GC that already passed this source's key.
+    let changes = ["maintenance.zstd", "maintenance.html"]
+        .map(|domain| store.connection.work_signal(domain).changing());
+    let changed = store
         .run_serialized_write(|| async {
             let tx = store.connection.begin().await?;
             if !unowned(
@@ -1034,7 +1103,7 @@ async fn release(store: &CrudStore, candidate: artifact::Model) -> Result<()> {
             .await?
             {
                 tx.rollback().await?;
-                return Ok(());
+                return Ok(false);
             }
             // Recheck mutable adoption/version/identity assumptions inside commit.
             for ((a, v), b) in artifacts.iter().zip(&versions).zip(&bindings) {
@@ -1162,10 +1231,13 @@ async fn release(store: &CrudStore, candidate: artifact::Model) -> Result<()> {
                     .await?;
             }
             tx.commit().await?;
-            Ok(())
+            Ok(true)
         })
         .await?;
-    if !copy_obligations.is_empty() {
+    for change in changes {
+        change.completed(changed);
+    }
+    if changed && !copy_obligations.is_empty() {
         store.notify_html_preview_io_work();
     }
     Ok(())
@@ -1200,6 +1272,19 @@ impl CrudStore {
         String,
         Vec<(String, super::artifact::ArtifactGcBlobCandidateRecord)>,
     )> {
+        let upper = self.html_preview_blob_frontier().await?;
+        self.html_preview_gc_blob_page_through(after, cutoff_ms, &upper)
+            .await
+    }
+    pub async fn html_preview_gc_blob_page_through(
+        &self,
+        after: &str,
+        cutoff_ms: i64,
+        upper: &str,
+    ) -> Result<(
+        String,
+        Vec<(String, super::artifact::ArtifactGcBlobCandidateRecord)>,
+    )> {
         // Page the source rows first, even if every blob still has owners.
         // This bounds work independently of the number of GC candidates.
         let cutoff = chrono::DateTime::from_timestamp_millis(cutoff_ms)
@@ -1226,6 +1311,7 @@ impl CrudStore {
             ])
             .expr_as(orphan, "orphan")
             .and_where(col("b", artifact_blob::Column::Id).gt(after))
+            .and_where(col("b", artifact_blob::Column::Id).lte(upper))
             .order_by(("b", artifact_blob::Column::Id), Order::Asc)
             .limit(16)
             .to_owned();
@@ -1251,6 +1337,15 @@ impl CrudStore {
         &self,
         after: &str,
     ) -> Result<(String, Option<(String, String)>)> {
+        let upper = self.html_preview_artifact_frontier().await?;
+        self.html_preview_released_copies_page_through(after, &upper)
+            .await
+    }
+    pub async fn html_preview_released_copies_page_through(
+        &self,
+        after: &str,
+        upper: &str,
+    ) -> Result<(String, Option<(String, String)>)> {
         let query = artifact::Entity::find()
             .select_only()
             .columns([
@@ -1268,6 +1363,7 @@ impl CrudStore {
                 "metadata_json",
             )
             .filter(artifact::Column::Id.gt(after))
+            .filter(artifact::Column::Id.lte(upper))
             .filter(Expr::col(artifact::Column::CreatedByKind).eq(Expr::Constant("tool".into())))
             .filter(
                 Expr::col(artifact::Column::CreatedByActorId)
@@ -1601,7 +1697,12 @@ pub(crate) async fn retain_preview_input<C: ConnectionTrait>(
     Ok(())
 }
 
-async fn input_adoption_quantum(store: &CrudStore, after: &mut String) -> Result<bool> {
+async fn input_adoption_quantum(
+    store: &CrudStore,
+    after: &mut String,
+    upper: &str,
+    may_complete: bool,
+) -> Result<bool> {
     // Supported input projection writers retain previews in their atomic write
     // set, including inputs inserted behind this legacy cursor after completion.
     // Do not cache the gate: a legacy-data migration may need to reopen it.
@@ -1631,11 +1732,18 @@ async fn input_adoption_quantum(store: &CrudStore, after: &mut String) -> Result
         ])
         .column_as(payload_bytes, "bytes")
         .filter(turn_input::Column::Id.gt(after.as_str()))
+        .filter(turn_input::Column::Id.lte(upper))
         .order_by_asc(turn_input::Column::Id)
         .limit(1)
         .into_query();
     let row = store.connection.query_one(&query).await?;
     let Some(row) = row else {
+        if !may_complete {
+            // The owner retains retry debt through the common pass EOF. Keep
+            // the durable gate open so a fresh pass/restart revisits failures.
+            after.clear();
+            return Ok(false);
+        }
         store
             .run_serialized_write(|| async {
                 backfill::Entity::update_many()
@@ -1719,6 +1827,15 @@ impl CrudStore {
         &self,
         after: &(String, i64),
     ) -> Result<(Option<(String, i64)>, Option<HtmlPreviewArchiveWitness>)> {
+        let upper = self.html_preview_witness_frontier().await?;
+        self.html_preview_archive_witness_page_through(after, &upper)
+            .await
+    }
+    pub async fn html_preview_archive_witness_page_through(
+        &self,
+        after: &(String, i64),
+        upper: &(String, i64),
+    ) -> Result<(Option<(String, i64)>, Option<HtmlPreviewArchiveWitness>)> {
         // Page source rows, even if expired/already verified; never search the
         // whole candidate pool inside one background quantum.
         let query = Query::select()
@@ -1751,6 +1868,16 @@ impl CrudStore {
                 .gt(Expr::tuple([
                     Expr::val(after.0.clone()),
                     Expr::val(after.1),
+                ])),
+            )
+            .and_where(
+                Expr::tuple([
+                    col("r", frozen_result::Column::ManifestId),
+                    col("r", frozen_result::Column::Ordinal),
+                ])
+                .lte(Expr::tuple([
+                    Expr::val(upper.0.clone()),
+                    Expr::val(upper.1),
                 ])),
             )
             .order_by(("r", frozen_result::Column::ManifestId), Order::Asc)
@@ -1851,6 +1978,7 @@ impl CrudStore {
             archive_hash.len() == 64 && archive_hash.bytes().all(|b| b.is_ascii_hexdigit()),
             "invalid archival hash"
         );
+        let change = self.connection.work_signal("maintenance.html").changing();
         let reference = serde_json::to_string(&witness.reference)?;
         let io_locator = super::html_preview_io_work::HtmlPreviewIoLocator::new(&witness.manifest);
         let Some((source_version, source_id, source_turn)) =
@@ -1863,15 +1991,18 @@ impl CrudStore {
                 .one(&self.connection)
                 .await?
         else {
+            change.completed(false);
             return Ok(false);
         };
         let Some(source_revision) = source_version
             .strip_prefix("revision:")
             .and_then(|v| v.parse::<i64>().ok())
         else {
+            change.completed(false);
             return Ok(false);
         };
         if source_version != format!("revision:{source_revision}") {
+            change.completed(false);
             return Ok(false);
         }
         let current = queries::canonical_preview()
@@ -1904,80 +2035,89 @@ impl CrudStore {
             .and_where(col("c", turn_llm_context::Column::Payload).eq(&witness.payload))
             .and_where(col("v", compaction_source_revision::Column::Revision).eq(source_revision))
             .to_owned();
-        self.run_serialized_write(|| async {
-            let tx = self.connection.begin().await?;
-            let callback = if claim.is_none() {
-                super::html_preview_io_work::callback_ticket(
-                    &tx,
-                    "witness",
-                    &io_locator,
-                    witness.ordinal,
-                )
-                .await?
-            } else {
-                None
-            };
-            if let Some(claim) = claim {
-                ensure!(
-                    pioneer_entity::html_preview_io_work::Entity::find()
-                        .filter(super::html_preview_io_work::fence(&claim.row))
-                        .one(&tx)
-                        .await?
-                        .is_some(),
-                    "witness claim fence lost"
-                );
-            }
-            let changed = frozen_result::Entity::update_many()
-                .col_expr(
-                    frozen_result::Column::ArchiveWireSha256,
-                    Expr::val(archive_hash),
-                )
-                .filter(frozen_result::Column::ManifestId.eq(&witness.manifest))
-                .filter(frozen_result::Column::Ordinal.eq(witness.ordinal))
-                .filter(frozen_result::Column::ReferenceJson.eq(&reference))
-                .filter(frozen_result::Column::SourceVersion.eq(&source_version))
-                .filter(frozen_result::Column::SourceId.eq(&source_id))
-                .filter(frozen_result::Column::TurnId.eq(&source_turn))
-                .filter(frozen_result::Column::ArchiveWireSha256.is_null())
-                .filter(Expr::exists(current.clone()))
-                .exec(&tx)
-                .await?
-                .rows_affected;
-            // Zero affected rows alone never establish successful publication.
-            // A concurrent publisher may already have stored this exact receipt;
-            // reread under current domain authority before acknowledging it.
-            if changed != 1 {
-                let stored =
-                    frozen_result::Entity::find_by_id((witness.manifest.clone(), witness.ordinal))
-                        .select_only()
-                        .column(frozen_result::Column::ArchiveWireSha256)
-                        .filter(frozen_result::Column::ReferenceJson.eq(&reference))
-                        .filter(frozen_result::Column::SourceVersion.eq(&source_version))
-                        .filter(frozen_result::Column::SourceId.eq(&source_id))
-                        .filter(frozen_result::Column::TurnId.eq(&source_turn))
-                        .filter(Expr::exists(current.clone()))
-                        .lock_exclusive()
-                        .into_tuple::<Option<String>>()
-                        .one(&tx)
-                        .await?;
-                if !stored.is_some_and(|value| value.as_deref() == Some(archive_hash)) {
-                    tx.rollback().await?;
-                    return Ok(false);
+        let result = self
+            .run_serialized_write(|| async {
+                let tx = self.connection.begin().await?;
+                let callback = if claim.is_none() {
+                    super::html_preview_io_work::callback_ticket(
+                        &tx,
+                        "witness",
+                        &io_locator,
+                        witness.ordinal,
+                    )
+                    .await?
+                } else {
+                    None
+                };
+                if let Some(claim) = claim {
+                    ensure!(
+                        pioneer_entity::html_preview_io_work::Entity::find()
+                            .filter(super::html_preview_io_work::fence(&claim.row))
+                            .one(&tx)
+                            .await?
+                            .is_some(),
+                        "witness claim fence lost"
+                    );
                 }
-            }
-            if let Some(claim) = claim {
-                ensure!(
-                    super::html_preview_io_work::ack(&tx, claim).await?,
-                    "witness ACK fence lost"
-                );
-            }
-            if let Some(row) = &callback {
-                super::html_preview_io_work::callback_ack(&tx, row).await?;
-            }
-            tx.commit().await?;
-            Ok(true)
-        })
-        .await
+                let changed = frozen_result::Entity::update_many()
+                    .col_expr(
+                        frozen_result::Column::ArchiveWireSha256,
+                        Expr::val(archive_hash),
+                    )
+                    .filter(frozen_result::Column::ManifestId.eq(&witness.manifest))
+                    .filter(frozen_result::Column::Ordinal.eq(witness.ordinal))
+                    .filter(frozen_result::Column::ReferenceJson.eq(&reference))
+                    .filter(frozen_result::Column::SourceVersion.eq(&source_version))
+                    .filter(frozen_result::Column::SourceId.eq(&source_id))
+                    .filter(frozen_result::Column::TurnId.eq(&source_turn))
+                    .filter(frozen_result::Column::ArchiveWireSha256.is_null())
+                    .filter(Expr::exists(current.clone()))
+                    .exec(&tx)
+                    .await?
+                    .rows_affected;
+                // Zero affected rows alone never establish successful publication.
+                // A concurrent publisher may already have stored this exact receipt;
+                // reread under current domain authority before acknowledging it.
+                if changed != 1 {
+                    let stored = frozen_result::Entity::find_by_id((
+                        witness.manifest.clone(),
+                        witness.ordinal,
+                    ))
+                    .select_only()
+                    .column(frozen_result::Column::ArchiveWireSha256)
+                    .filter(frozen_result::Column::ReferenceJson.eq(&reference))
+                    .filter(frozen_result::Column::SourceVersion.eq(&source_version))
+                    .filter(frozen_result::Column::SourceId.eq(&source_id))
+                    .filter(frozen_result::Column::TurnId.eq(&source_turn))
+                    .filter(Expr::exists(current.clone()))
+                    .lock_exclusive()
+                    .into_tuple::<Option<String>>()
+                    .one(&tx)
+                    .await?;
+                    if !stored.is_some_and(|value| value.as_deref() == Some(archive_hash)) {
+                        tx.rollback().await?;
+                        return Ok((false, false));
+                    }
+                }
+                if let Some(claim) = claim {
+                    ensure!(
+                        super::html_preview_io_work::ack(&tx, claim).await?,
+                        "witness ACK fence lost"
+                    );
+                }
+                if let Some(row) = &callback {
+                    super::html_preview_io_work::callback_ack(&tx, row).await?;
+                }
+                tx.commit().await?;
+                Ok((true, changed == 1))
+            })
+            .await;
+        // A new witness can unblock previews already passed by retirement.
+        // Repeated verification/ACK alone must not invalidate its own pass.
+        if let Ok((_, published)) = &result {
+            change.completed(*published);
+        }
+        result.map(|(accepted, _)| accepted)
     }
 
     /// Only an exact, previously authenticated frozen preview can use this
@@ -2345,5 +2485,78 @@ impl CrudStore {
             return Ok(Source::Obsolete);
         }
         Ok(Source::Ready((workspace, metadata)))
+    }
+}
+
+impl CrudStore {
+    /// Future GC eligibility for currently unowned temporary blobs. Source
+    /// changes can invalidate ownership and must wake maintenance separately.
+    pub async fn html_preview_gc_deadline(
+        &self,
+        grace_ms: i64,
+        pass_cutoff_ms: i64,
+    ) -> Result<Option<i64>> {
+        let cutoff = chrono::DateTime::from_timestamp_millis(pass_cutoff_ms)
+            .ok_or_else(|| anyhow::anyhow!("invalid artifact GC cutoff"))?
+            .fixed_offset();
+        let created = artifact_blob::Entity::find()
+            .select_only()
+            .column(artifact_blob::Column::CreatedAt)
+            .filter(artifact_blob::Column::CreatedAt.gt(cutoff))
+            .filter(
+                json_field(
+                    Expr::col(artifact_blob::Column::MetadataJson),
+                    "$.htmlToolTemporary",
+                )
+                .eq(1),
+            )
+            .filter(queries::blob_has_owners("artifact_blob").not())
+            .order_by_asc(artifact_blob::Column::CreatedAt)
+            .into_tuple::<chrono::DateTime<chrono::FixedOffset>>()
+            .one(&self.connection)
+            .await?;
+        Ok(created.map(|at| {
+            let ms = at.timestamp_millis().saturating_add(grace_ms);
+            ms.div_euclid(1000) + i64::from(ms.rem_euclid(1000) != 0)
+        }))
+    }
+}
+
+impl CrudStore {
+    /// Capture once per keyset pass. Later source commits remain invalidations
+    /// for the following pass, including changes behind its current cursor.
+    pub async fn html_preview_artifact_frontier(&self) -> Result<String> {
+        Ok(artifact::Entity::find()
+            .select_only()
+            .column(artifact::Column::Id)
+            .order_by_desc(artifact::Column::Id)
+            .into_tuple::<String>()
+            .one(&self.connection)
+            .await?
+            .unwrap_or_default())
+    }
+    pub async fn html_preview_blob_frontier(&self) -> Result<String> {
+        Ok(artifact_blob::Entity::find()
+            .select_only()
+            .column(artifact_blob::Column::Id)
+            .order_by_desc(artifact_blob::Column::Id)
+            .into_tuple::<String>()
+            .one(&self.connection)
+            .await?
+            .unwrap_or_default())
+    }
+    pub async fn html_preview_witness_frontier(&self) -> Result<(String, i64)> {
+        Ok(frozen_result::Entity::find()
+            .select_only()
+            .columns([
+                frozen_result::Column::ManifestId,
+                frozen_result::Column::Ordinal,
+            ])
+            .order_by_desc(frozen_result::Column::ManifestId)
+            .order_by_desc(frozen_result::Column::Ordinal)
+            .into_tuple::<(String, i64)>()
+            .one(&self.connection)
+            .await?
+            .unwrap_or_default())
     }
 }

@@ -38,6 +38,7 @@ pub(crate) struct GatewayVoiceSession {
     pub(crate) turn_id: String,
     pub(crate) state: GatewayVoiceSessionState,
     pub(crate) audio_format: VoiceAudioFormat,
+    pub(crate) ingress: Arc<super::ingress::VoiceIngress>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -132,6 +133,18 @@ impl GatewayVoiceSessionStore {
         }
     }
 
+    pub(crate) fn has_failed_ingress(&self, connection_id: ConnectionId) -> bool {
+        self.sessions
+            .lock()
+            .map(|sessions| {
+                sessions.values().any(|session| {
+                    session.connection_id == connection_id
+                        && session.ingress.cancelled.is_cancelled()
+                })
+            })
+            .unwrap_or(true)
+    }
+
     pub(crate) fn has_active_sessions(&self) -> Result<bool, GatewayVoiceSessionError> {
         Ok(!self.lock_sessions()?.is_empty())
     }
@@ -194,6 +207,7 @@ impl GatewayVoiceSessionStore {
             turn_id: context.turn_id.clone(),
             state: GatewayVoiceSessionState::Created,
             audio_format,
+            ingress: Arc::default(),
         };
         sessions.insert(session_id, session.clone());
         Ok(session)
@@ -292,6 +306,7 @@ impl GatewayVoiceSessionStore {
             )
         })?;
         ensure_authenticated_session_owner(session, owner)?;
+        session.ingress.cancel();
         Ok(sessions
             .remove(session_id)
             .expect("session exists after lookup"))
@@ -371,7 +386,11 @@ impl GatewayVoiceSessionStore {
 
         session_ids
             .into_iter()
-            .filter_map(|session_id| sessions.remove(session_id.as_str()))
+            .filter_map(|session_id| {
+                let session = sessions.remove(session_id.as_str())?;
+                session.ingress.cancel();
+                Some(session)
+            })
             .collect()
     }
 
@@ -394,7 +413,11 @@ impl GatewayVoiceSessionStore {
 
         Ok(session_ids
             .into_iter()
-            .filter_map(|session_id| sessions.remove(session_id.as_str()))
+            .filter_map(|session_id| {
+                let session = sessions.remove(session_id.as_str())?;
+                session.ingress.cancel();
+                Some(session)
+            })
             .collect())
     }
 

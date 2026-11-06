@@ -5,6 +5,16 @@ use sea_orm::{ConnectionTrait, DbBackend, Statement};
 const HEARTBEAT_WRITTEN: &str = "__execution_owner_heartbeat_written__";
 
 pub(super) async fn hold_history_pass(processor: &Arc<MessageProcessor>) {
+    // Every caller must install the production history owner, including the
+    // attached-CLI fixture which does not use this module's constructor.
+    if !processor.agent_manager.has_context_controller().await {
+        processor
+            .agent_manager
+            .set_context_controller(Some(Arc::new(
+                crate::compaction::GatewayNativeContextController::new(Arc::downgrade(processor)),
+            )))
+            .await;
+    }
     processor.arm_completed_history_preparation_barrier("__resilience_before_history_poll__");
     processor.start_resilience_workers().await.unwrap();
     timeout(
@@ -50,6 +60,12 @@ async fn fixture(
         test_summary_config(),
         test_tool_loop_config(),
     ));
+    processor
+        .agent_manager
+        .set_context_controller(Some(Arc::new(
+            crate::compaction::GatewayNativeContextController::new(Arc::downgrade(&processor)),
+        )))
+        .await;
     (directory, processor, store, workspace)
 }
 
@@ -134,6 +150,19 @@ async fn owner_heartbeat_survives_held_pass_is_single_and_stops_with_parent() {
         "cli_runtime",
     )
     .await;
+    // Recovery no longer pauses with the independent history worker. A foreign
+    // receipt must have a live lease to test heartbeat ownership in isolation.
+    store
+        .database_connection()
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE turn_execution SET lease_until=?1 WHERE turn_id='foreign'",
+            [(chrono::Utc::now() + chrono::Duration::hours(1))
+                .to_rfc3339()
+                .into()],
+        ))
+        .await
+        .unwrap();
     seed_execution(
         &store,
         &workspace,
@@ -143,6 +172,37 @@ async fn owner_heartbeat_survives_held_pass_is_single_and_stops_with_parent() {
         "cli_runtime",
     )
     .await;
+    // An owned recovering receipt without an unresolved episode is a genuine
+    // orphan: independent control must repair it even while history is held.
+    // Keep this heartbeat case in a real provider retry cooldown instead.
+    let recovery = processor
+        .recovery_coordinator
+        .enqueue_provider_failure_job(
+            &crate::resilience::ProviderFailureCandidate {
+                turn_id: "recovering".to_owned(),
+                item_id: "orphan:recovering".to_owned(),
+                item_type: pioneer_protocol::TurnItemType::Reasoning,
+                failure: pioneer_protocol::ProviderFailureDetails {
+                    provider: "fixture".to_owned(),
+                    model: "fixture".to_owned(),
+                    transport: pioneer_protocol::ProviderTransportKind::Stream,
+                    class: pioneer_protocol::ProviderFailureClass::Provider5xx,
+                    stage: pioneer_protocol::ProviderFailureStage::MidStream,
+                    http_status: Some(502),
+                    provider_code: None,
+                    retry_after_ms: Some(3_600_000),
+                    raw_response: None,
+                    error_reason: Some(pioneer_protocol::ProviderErrorReason::ProviderUnavailable),
+                    request_id: None,
+                    is_recoverable_hint: true,
+                    message: Some("provider retry cooldown".to_owned()),
+                },
+            },
+            now_timestamp_secs(),
+        )
+        .await
+        .unwrap()
+        .into_job();
     let foreign = store.get_turn_execution("foreign").await.unwrap().unwrap();
     let terminal = store.get_turn_execution("terminal").await.unwrap().unwrap();
     hold_history_pass(&processor).await;
@@ -209,6 +269,9 @@ async fn owner_heartbeat_survives_held_pass_is_single_and_stops_with_parent() {
         store.get_turn_execution("terminal").await.unwrap().unwrap(),
         terminal
     );
+    let pending = store.get_recovery_job(&recovery.id).await.unwrap().unwrap();
+    assert_eq!(pending.status, pioneer_protocol::RecoveryJobStatus::Pending);
+    assert_eq!(pending.next_run_at_unix, recovery.next_run_at_unix);
     assert!(
         observer.writes.lock().unwrap()[writes_before..]
             .iter()

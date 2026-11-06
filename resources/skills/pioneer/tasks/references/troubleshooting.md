@@ -8,6 +8,8 @@ Use this reference after confusing durable task behavior, missing delivered resu
 - `task_wait` Says There Is Nothing To Wait For
 - Task Tool Schema Error
 - Existing Scheduled Task Needs Editing
+- Recurrence Disappeared After An Extra Check
+- Pause Did Not Return A Paused Trigger
 - Duplicate Or Noisy Scheduled Messages
 - Delivery Update Did Not Affect Previous Run
 - Stuck Or Failed Task
@@ -74,6 +76,20 @@ Use `task_get` first. Preserve fields the user did not ask to change.
 For delivery-only changes, patch only `deliveryPolicy`.
 
 For prompt changes on scheduled tasks, ensure `instructions` and `outputInstructions` remain self-contained for future runs.
+
+## Recurrence Disappeared After An Extra Check
+
+Inspect the saved trigger with `task_get`. If an interval/cron trigger was replaced
+with `immediate` or `scheduled_at`, restore the user-requested recurring schedule
+and verify its next fire time. Follow [Schedule Changes And Extra Runs](delivery-and-scheduled.md#schedule-changes-and-extra-runs)
+for the intended workflow.
+
+## Pause Did Not Return A Paused Trigger
+
+Check [`scheduleOutcome`](tool-schemas.md#task_pause-and-task_resume) and the
+remaining schedule. `no_future_firings` is valid for an exhausted one-shot;
+`not_applied` or an error does not confirm a pause. See
+[Pausing And Resuming Schedules](delivery-and-scheduled.md#pausing-and-resuming-schedules).
 
 ## Duplicate Or Noisy Scheduled Messages
 

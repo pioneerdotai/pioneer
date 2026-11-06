@@ -32,6 +32,18 @@ impl CrudStore {
             .transpose()
     }
 
+    pub async fn get_task_queue_admission_snapshot(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<TaskWebhookAdmissionSnapshot>> {
+        let Some(trigger) =
+            task_trigger::find_latest_trigger_by_task(&self.connection, task_id).await?
+        else {
+            return Ok(None);
+        };
+        self.get_task_webhook_admission_snapshot(&trigger.id).await
+    }
+
     pub async fn get_task_webhook_admission_snapshot(
         &self,
         trigger_id: &str,
@@ -79,131 +91,222 @@ impl CrudStore {
         occurrence: TaskOccurrenceContract,
         events: Vec<TaskEventPayload>,
     ) -> Result<Option<Vec<AppendedTaskEvent>>> {
-        anyhow::ensure!(
-            run.task_id == expected_task.id
-                && occurrence.run_id == run.id
-                && occurrence.task_id == run.task_id
-                && run.trigger_id.as_deref() == Some(expected_trigger.id.as_str()),
-            "invalid webhook occurrence identity"
-        );
-        occurrence
-            .validate()
-            .map_err(|_| anyhow::anyhow!("invalid webhook occurrence"))?;
-        let expected_spec = serde_json::to_string(&expected_trigger.spec)?;
-        // This fresh occurrence is insert-only. Serialize before writer admission.
-        let expected_generation = occurrence.execution_generation;
-        let prepared_occurrence = task_occurrence_contract::ActiveModel {
-            occurrence_id: Set(occurrence.occurrence_id),
-            task_id: Set(occurrence.task_id),
-            run_id: Set(occurrence.run_id),
-            trigger_id: Set(occurrence.trigger_id),
-            occurrence_key: Set(occurrence.occurrence_key),
-            execution_generation: Set(i64::try_from(occurrence.execution_generation)?),
-            agent_execution_id: Set(occurrence.agent_execution_id),
-            work_graph_root_execution_id: Set(occurrence.work_graph_root_execution_id),
-            root_resource_scope_id: Set(occurrence.root_resource_scope_id),
-            status: Set(serde_json::to_string(&occurrence.status)?
-                .trim_matches('"')
-                .to_owned()),
-            queue_position: Set(occurrence.queue_position.map(i64::try_from).transpose()?),
-            retry_attempt: Set(i64::from(occurrence.retry_attempt)),
-            action_idempotency_key: Set(occurrence.action_idempotency_key),
-            route_id: Set(occurrence.route_id),
-            result_return_route_id: Set(occurrence.result_return_route_id),
-            delivery_plan_json: Set(crate::util::optional_typed_json_to_db(
-                &occurrence.delivery_plan,
-            )?),
-            terminal_reason: Set(occurrence.terminal_reason),
-            created_at: Set(crate::util::unix_to_datetime(run.created_at)),
-            updated_at: Set(crate::util::unix_to_datetime(run.created_at)),
-        };
-        let prepared = self.prepare_task_events_for_write(events).await?;
-        self.run_serialized_write(|| async {
-            let prepared = self.refresh_task_event_preflight(prepared.clone()).await?;
-            let transaction = self.connection.begin().await?;
-            let outcome = async {
-                let Some(current_trigger) =
-                    task_trigger::find_trigger_by_id(&transaction, &expected_trigger.id).await?
-                else {
-                    return Ok(None);
-                };
-                if current_trigger.task_id != expected_task.id
-                    || current_trigger.status != "active"
-                    || current_trigger.spec_json != expected_spec
-                    || current_trigger.webhook_secret_ref != expected_trigger.webhook_secret_ref
-                    || current_trigger.updated_at.timestamp() != expected_trigger.updated_at
-                {
-                    return Ok(None);
-                }
-                let Some(current_task) =
-                    task::find_task_by_id(&transaction, &expected_task.id).await?
-                else {
-                    return Ok(None);
-                };
-                if current_task.revision != expected_task.revision
-                    || !matches!(
-                        current_task.status.as_str(),
-                        "waiting" | "scheduled" | "queued" | "running" | "waiting_review"
-                    )
-                    || task::finish_requested(&transaction, &expected_task.id).await?
-                {
-                    return Ok(None);
-                }
-                if task_run::next_run_number(&transaction, &expected_task.id).await?
-                    != run.run_number
-                    || task_actor_contract::next_task_occurrence_execution_generation(
-                        &transaction,
-                        &expected_task.id,
-                    )
-                    .await?
-                        != expected_generation
-                    || task_actor_contract::find_task_actor_contract_row(
-                        &transaction,
-                        &expected_task.id,
-                    )
-                    .await?
-                    .is_none()
-                {
-                    return Ok(None);
-                }
-                let appended = self
-                    .append_task_events_in_connection(&transaction, prepared, run.created_at)
-                    .await?;
-                task_occurrence_contract::Entity::insert(prepared_occurrence.clone())
-                    .exec(&transaction)
-                    .await?;
-                let occurrence_row =
-                    task_actor_contract::find_task_occurrence_row_by_run(&transaction, &run.id)
+        Ok(self
+            .accept_task_queued_occurrence(
+                expected_task,
+                expected_trigger,
+                run,
+                occurrence,
+                events,
+                None,
+            )
+            .await?
+            .map(|(_, events)| events))
+    }
+
+    /// Shared ordinary queue admission. Manual requests carry the existing
+    /// Agent action ledger commit; webhook POSTs retain their endpoint identity.
+    pub async fn accept_task_queued_occurrence(
+        &self,
+        expected_task: &Task,
+        expected_trigger: &TaskTrigger,
+        run: &TaskRun,
+        occurrence: TaskOccurrenceContract,
+        events: Vec<TaskEventPayload>,
+        action: Option<crate::AgentCommitInput>,
+    ) -> Result<Option<(String, Vec<AppendedTaskEvent>)>> {
+        let change = crate::task_events::TaskWorkChange::new(&self.connection);
+        let result = async {
+            let manual = action.is_some();
+            anyhow::ensure!(
+                run.task_id == expected_task.id
+                    && occurrence.run_id == run.id
+                    && occurrence.task_id == run.task_id
+                    && if manual {
+                        run.trigger_id.is_none()
+                    } else {
+                        run.trigger_id.as_deref() == Some(expected_trigger.id.as_str())
+                    },
+                "invalid webhook occurrence identity"
+            );
+            occurrence
+                .validate()
+                .map_err(|_| anyhow::anyhow!("invalid webhook occurrence"))?;
+            let expected_spec = serde_json::to_string(&expected_trigger.spec)?;
+            // This fresh occurrence is insert-only. Serialize before writer admission.
+            let expected_generation = occurrence.execution_generation;
+            let prepared_occurrence = task_occurrence_contract::ActiveModel {
+                occurrence_id: Set(occurrence.occurrence_id),
+                task_id: Set(occurrence.task_id),
+                run_id: Set(occurrence.run_id),
+                trigger_id: Set(occurrence.trigger_id),
+                occurrence_key: Set(occurrence.occurrence_key),
+                execution_generation: Set(i64::try_from(occurrence.execution_generation)?),
+                agent_execution_id: Set(occurrence.agent_execution_id),
+                work_graph_root_execution_id: Set(occurrence.work_graph_root_execution_id),
+                root_resource_scope_id: Set(occurrence.root_resource_scope_id),
+                status: Set(serde_json::to_string(&occurrence.status)?
+                    .trim_matches('"')
+                    .to_owned()),
+                queue_position: Set(occurrence.queue_position.map(i64::try_from).transpose()?),
+                retry_attempt: Set(i64::from(occurrence.retry_attempt)),
+                action_idempotency_key: Set(occurrence.action_idempotency_key),
+                route_id: Set(occurrence.route_id),
+                result_return_route_id: Set(occurrence.result_return_route_id),
+                delivery_plan_json: Set(crate::util::optional_typed_json_to_db(
+                    &occurrence.delivery_plan,
+                )?),
+                terminal_reason: Set(occurrence.terminal_reason),
+                created_at: Set(crate::util::unix_to_datetime(run.created_at)),
+                updated_at: Set(crate::util::unix_to_datetime(run.created_at)),
+            };
+            let prepared = self.prepare_task_events_for_write(events).await?;
+            self.run_serialized_write(|| async {
+                let prepared = self.refresh_task_event_preflight(prepared.clone()).await?;
+                let transaction = self.connection.begin().await?;
+                let outcome = async {
+                    if let Some(action) = action.as_ref()
+                        && let Some(existing) =
+                            crate::repositories::agent_domain::load_agent_action(
+                                &transaction,
+                                &action.action.id,
+                            )
+                            .await?
+                        && existing.status == "committed"
+                    {
+                        anyhow::ensure!(
+                            existing.request_fingerprint == action.request_fingerprint
+                                && existing.execution_id == action.action.execution_id,
+                            "manual run action identity conflict"
+                        );
+                        let response: serde_json::Value = serde_json::from_str(
+                            existing
+                                .response_json
+                                .as_deref()
+                                .context("manual run receipt missing")?,
+                        )?;
+                        let run_id = response["taskRunNow"]["runId"]
+                            .as_str()
+                            .context("manual run reference missing")?;
+                        let existing_run = task_run::find_run_by_id(&transaction, run_id)
+                            .await?
+                            .context("manual run missing")?;
+                        anyhow::ensure!(
+                            existing_run.task_id == expected_task.id,
+                            "manual run task mismatch"
+                        );
+                        return Ok(Some((existing_run.id, Vec::new())));
+                    }
+                    let Some(current_trigger) =
+                        task_trigger::find_trigger_by_id(&transaction, &expected_trigger.id)
+                            .await?
+                    else {
+                        return Ok(None);
+                    };
+                    if current_trigger.task_id != expected_task.id
+                        || !(current_trigger.status == "active"
+                            || (manual && current_trigger.status == "exhausted"))
+                        || (manual
+                            && current_trigger.status
+                                != crate::convention::task_trigger_status_to_db(
+                                    expected_trigger.status,
+                                ))
+                        || current_trigger.next_fire_at.map(|at| at.timestamp())
+                            != expected_trigger.next_fire_at
+                        || current_trigger.last_fire_at.map(|at| at.timestamp())
+                            != expected_trigger.last_fire_at
+                        || current_trigger.spec_json != expected_spec
+                        || current_trigger.webhook_secret_ref != expected_trigger.webhook_secret_ref
+                        || current_trigger.updated_at.timestamp() != expected_trigger.updated_at
+                    {
+                        return Ok(None);
+                    }
+                    let Some(current_task) =
+                        task::find_task_by_id(&transaction, &expected_task.id).await?
+                    else {
+                        return Ok(None);
+                    };
+                    if current_task.revision != expected_task.revision
+                        || !matches!(
+                            current_task.status.as_str(),
+                            "waiting" | "scheduled" | "queued" | "running" | "waiting_review"
+                        )
+                        || task::finish_requested(&transaction, &expected_task.id).await?
+                    {
+                        return Ok(None);
+                    }
+                    if task_run::next_run_number(&transaction, &expected_task.id).await?
+                        != run.run_number
+                        || task_actor_contract::next_task_occurrence_execution_generation(
+                            &transaction,
+                            &expected_task.id,
+                        )
                         .await?
-                        .context("webhook occurrence disappeared after insert")?;
-                crate::repositories::task_occurrence_producers::contract_change(
-                    &transaction,
-                    None,
-                    Some(&occurrence_row),
-                )
-                .await?;
-                crate::repositories::task_child_producers::occurrence_identity(
-                    &transaction,
-                    &run.id,
-                )
-                .await?;
-                Ok(Some(appended))
-            }
-            .await;
-            match outcome {
-                Ok(value) => {
-                    transaction
-                        .commit()
-                        .await
-                        .context("failed to commit webhook admission")?;
-                    Ok(value.map(materialize_task_events))
+                            != expected_generation
+                        || task_actor_contract::find_task_actor_contract_row(
+                            &transaction,
+                            &expected_task.id,
+                        )
+                        .await?
+                        .is_none()
+                    {
+                        return Ok(None);
+                    }
+                    let appended = self
+                        .append_task_events_in_connection(&transaction, prepared, run.created_at)
+                        .await?;
+                    task_occurrence_contract::Entity::insert(prepared_occurrence.clone())
+                        .exec(&transaction)
+                        .await?;
+                    let occurrence_row =
+                        task_actor_contract::find_task_occurrence_row_by_run(&transaction, &run.id)
+                            .await?
+                            .context("webhook occurrence disappeared after insert")?;
+                    crate::repositories::task_occurrence_producers::contract_change(
+                        &transaction,
+                        None,
+                        Some(&occurrence_row),
+                    )
+                    .await?;
+                    crate::repositories::task_child_producers::occurrence_identity(
+                        &transaction,
+                        &run.id,
+                    )
+                    .await?;
+                    if let Some(action) = action.as_ref() {
+                        crate::repositories::agent_domain::commit_agent_action(
+                            &transaction,
+                            action,
+                        )
+                        .await?;
+                    }
+                    Ok(Some((run.id.clone(), appended)))
                 }
-                Err(error) => {
-                    let _ = transaction.rollback().await;
-                    Err(error)
+                .await;
+                match outcome {
+                    Ok(value) => {
+                        transaction
+                            .commit()
+                            .await
+                            .context("failed to commit webhook admission")?;
+                        Ok(value.map(|(run, events)| (run, materialize_task_events(events))))
+                    }
+                    Err(error) => {
+                        let _ = transaction.rollback().await;
+                        Err(error)
+                    }
                 }
-            }
-        })
-        .await
+            })
+            .await
+        }
+        .await;
+        if let Ok(value) = &result {
+            change.completed(
+                value
+                    .as_ref()
+                    .is_some_and(|(_, events)| crate::task_events::inserted_task_events(events)),
+            );
+        }
+        result
     }
 }

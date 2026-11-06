@@ -148,6 +148,30 @@ pub async fn list_due_job_ids<C: ConnectionTrait>(
         .context("failed to discover due recovery job identities")
 }
 
+/// Earliest pending job eligibility includes an outstanding claim lease. A
+/// successful empty result permits the due owner to park until invalidated.
+pub async fn next_due_at<C: ConnectionTrait>(db: &C) -> Result<Option<i64>> {
+    use sea_orm::sea_query::{Expr, Func};
+    let eligible = Expr::case(
+        Expr::col(recovery_job::Column::ClaimExpiresAt)
+            .gt(Expr::col(recovery_job::Column::NextRunAt)),
+        Expr::col(recovery_job::Column::ClaimExpiresAt),
+    )
+    .finally(Expr::col(recovery_job::Column::NextRunAt));
+    let deadline = recovery_job::Entity::find()
+        .select_only()
+        .expr(Func::min(eligible))
+        .filter(
+            recovery_job::Column::Status.eq(recovery_job_status_to_db(RecoveryJobStatus::Pending)),
+        )
+        .into_tuple::<Option<DateTimeWithTimeZone>>()
+        .one(db)
+        .await
+        .context("failed to discover next recovery job deadline")?
+        .flatten();
+    Ok(deadline.map(crate::util::deadline_unix_seconds))
+}
+
 /// Claims only the bounded reader page. No reader observation grants authority:
 /// status, due time and lease are rechecked by each conditional writer UPDATE.
 pub async fn claim_due_job_ids<C: ConnectionTrait>(

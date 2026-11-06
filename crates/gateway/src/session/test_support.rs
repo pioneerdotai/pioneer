@@ -145,9 +145,80 @@ pub(crate) async fn register_authenticated_test_connection(
 
 /// Test sink for the real outbound envelope. Dequeue consumes the frame as a
 /// completed write; tests needing writer retention use OutboundReceiver itself.
-pub(crate) struct OutboundTestReceiver(super::outbound::OutboundReceiver);
+pub(crate) struct OutboundTestReceiver(
+    super::outbound::OutboundReceiver,
+    std::collections::VecDeque<Message>,
+);
 impl OutboundTestReceiver {
+    /// Hold the audio lane untouched while observing real RPC delivery progress.
+    pub(crate) async fn recv_ordinary(&mut self) -> Option<Message> {
+        let envelope = self.0.recv_ordinary().await?;
+        let (message, _) = envelope.item.received(
+            pioneer_observability::work::Boundary::EventLane,
+            pioneer_observability::work::WorkKind::Event,
+            pioneer_observability::work::ExecutorRole::Gateway,
+        );
+        Some(message)
+    }
+
+    pub(crate) async fn recv_response(&mut self, id: &str) -> Option<Message> {
+        self.recv_matching(|value| value["id"].as_str() == Some(id))
+            .await
+    }
+
+    pub(crate) async fn recv_notification(&mut self, method: &str) -> Option<Message> {
+        self.recv_matching(|value| {
+            value.get("id").is_none() && value["method"].as_str() == Some(method)
+        })
+        .await
+    }
+
+    async fn recv_matching(
+        &mut self,
+        matches: impl Fn(&serde_json::Value) -> bool,
+    ) -> Option<Message> {
+        let decode = |message: &Message| match message {
+            Message::Text(text) => serde_json::from_str::<serde_json::Value>(text).ok(),
+            _ => None,
+        };
+        if let Some(index) = self
+            .1
+            .iter()
+            .position(|message| decode(message).is_some_and(|v| matches(&v)))
+        {
+            return self.1.remove(index);
+        }
+        loop {
+            let envelope = self.0.recv().await?;
+            let (message, _) = envelope.item.received(
+                pioneer_observability::work::Boundary::EventLane,
+                pioneer_observability::work::WorkKind::Event,
+                pioneer_observability::work::ExecutorRole::Gateway,
+            );
+            if let Some(value) = decode(&message) {
+                if matches(&value) {
+                    return Some(message);
+                }
+                // Audio can overtake ordinary replies and turn notifications.
+                // Preserve that lane; retain the helpers' existing behavior
+                // of skipping unrelated ordinary notifications.
+                if matches!(
+                    value["method"].as_str(),
+                    Some(
+                        pioneer_protocol::constants::events::VOICE_CHUNK_ACK
+                            | pioneer_protocol::constants::events::VOICE_SESSION_RESULT
+                    )
+                ) {
+                    self.1.push_back(message);
+                }
+            }
+        }
+    }
+
     pub(crate) async fn recv(&mut self) -> Option<Message> {
+        if let Some(message) = self.1.pop_front() {
+            return Some(message);
+        }
         let envelope = self.0.recv().await?;
         let (message, _) = envelope.item.received(
             pioneer_observability::work::Boundary::EventLane,
@@ -157,6 +228,9 @@ impl OutboundTestReceiver {
         Some(message)
     }
     pub(crate) fn try_recv(&mut self) -> Result<Message, tokio::sync::mpsc::error::TryRecvError> {
+        if let Some(message) = self.1.pop_front() {
+            return Ok(message);
+        }
         let envelope = self.0.try_recv()?;
         let (message, _) = envelope.item.received(
             pioneer_observability::work::Boundary::EventLane,
@@ -169,5 +243,33 @@ impl OutboundTestReceiver {
 pub(crate) fn outbound_channel(capacity: usize) -> (super::SessionOutbound, OutboundTestReceiver) {
     let (sender, receiver) =
         super::SessionOutbound::channel(capacity, 64 * 1024 * 1024, 16 * 1024 * 1024);
-    (sender, OutboundTestReceiver(receiver))
+    (sender, OutboundTestReceiver(receiver, Default::default()))
+}
+
+/// One-shot barrier at the real final delivery boundary, outside every lock.
+pub(crate) struct DeliveryPause {
+    pub(crate) connection: ConnectionId,
+    pub(crate) method: &'static str,
+    pub(crate) entered: tokio::sync::oneshot::Sender<()>,
+    pub(crate) release: tokio::sync::oneshot::Receiver<()>,
+}
+
+impl SessionManager {
+    pub(crate) async fn pause_delivery(&self, id: ConnectionId, method: &str) {
+        let pause = {
+            let mut slot = self.replay_delivery_pause.lock().unwrap();
+            if slot
+                .as_ref()
+                .is_some_and(|pause| pause.connection == id && pause.method == method)
+            {
+                slot.take()
+            } else {
+                None
+            }
+        };
+        if let Some(pause) = pause {
+            let _ = pause.entered.send(());
+            let _ = pause.release.await;
+        }
+    }
 }

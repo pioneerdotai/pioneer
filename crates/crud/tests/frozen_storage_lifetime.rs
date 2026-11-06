@@ -1434,7 +1434,13 @@ fn portable_schema_migrations() -> Vec<Box<dyn migration::MigrationTrait>> {
         .iter()
         .position(|m| m.name() == "m20261027_000005_portable_task_event")
         .unwrap();
-    migrations.drain(first..=last).collect()
+    let mut portable: Vec<_> = migrations.drain(first..=last).collect();
+    portable.extend(
+        migrations
+            .into_iter()
+            .filter(|m| m.name() == "m20261105_000001_portable_pending_indexes"),
+    );
+    portable
 }
 
 async fn portable_schema_step(
@@ -1561,15 +1567,10 @@ async fn assert_portable_logical_reads(store: &CrudStore, originals: &[String; 5
 
 async fn portable_schema_backfill(store: &CrudStore) {
     let mut progress = pioneer_crud::PortablePayloadProgress::default();
-    let mut idle = 0;
     for _ in 0..1024 {
-        if progress.quantum(store).await.unwrap() {
-            idle = 0;
-        } else {
-            idle += 1;
-            if idle == 16 {
-                return;
-            }
+        // False is EOF for all families, including staged publication and cleanup.
+        if !progress.quantum(store).await.unwrap() {
+            return;
         }
     }
     panic!("portable schema fixture exceeded its maintenance budget");
@@ -1686,6 +1687,14 @@ async fn portable_schema_rollback_refuses_live_compressed_values_without_losing_
     );
     assert_portable_logical_reads(&store, &originals).await;
     for migration in portable_schema_migrations().iter().rev() {
+        if migration.name() == "m20261105_000001_portable_pending_indexes" {
+            // Index-only rollback preserves live values and needs no TEXT restoration.
+            portable_schema_step(&store, migration.as_ref(), false)
+                .await
+                .unwrap();
+            assert_portable_logical_reads(&store, &originals).await;
+            continue;
+        }
         let error = portable_schema_step(&store, migration.as_ref(), false)
             .await
             .unwrap_err();
@@ -1927,4 +1936,97 @@ async fn wholly_unscoped_legacy_operation_blocks_cleanup_but_locator_reconciliat
     .await;
     drive(&store, &mut p, 1500).await;
     assert_eq!(expired(&store, "free").await, 1);
+}
+
+#[tokio::test]
+async fn portable_pending_indexes_upgrade_rollback_reapply_match_fresh_install() {
+    use sea_orm::sea_query::{Alias, Expr, ExprTrait, Order, Query, SqliteQueryBuilder};
+    const NAME: &str = "m20261105_000001_portable_pending_indexes";
+    let fresh = fixture().await;
+    let upgraded = CrudStore::new(db_fixture_before(Some(NAME)).await).with_maintenance_access();
+    let migration = Migrator::migrations()
+        .into_iter()
+        .find(|m| m.name() == NAME)
+        .unwrap();
+    for up in [true, false, true] {
+        portable_schema_step(&upgraded, migration.as_ref(), up)
+            .await
+            .unwrap();
+        for (table, key, field, frozen) in [
+            ("tool_output_chunk", "id", "text", false),
+            ("tool_output_chunk", "id", "metadata", false),
+            (
+                "turn_cli_runtime_binding",
+                "turn_id",
+                "input_mapping_json",
+                true,
+            ),
+            (
+                "task_run_conversation_snapshot",
+                "run_id",
+                "history_json",
+                true,
+            ),
+            ("task_event", "id", "payload_json", false),
+        ] {
+            let index = format!("{table}_{field}_portable_pending");
+            let definition = |db: pioneer_sqlite::SqliteDatabase, index: String| async move {
+                db.query_one_raw(Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    "SELECT sql FROM sqlite_master WHERE type='index' AND name=?",
+                    [index.into()],
+                ))
+                .await
+                .unwrap()
+                .unwrap()
+                .try_get::<String>("", "sql")
+                .unwrap()
+            };
+            let actual = definition(upgraded.database_connection(), index.clone()).await;
+            if up || field == "metadata" {
+                assert_eq!(
+                    actual,
+                    definition(fresh.database_connection(), index.clone()).await
+                );
+            } else {
+                // Down restores the historical predicate, including its term.
+                assert!(actual.contains(&format!("\"{field}\" IS NOT NULL")));
+            }
+            // Generate the pending/frozen/NULL predicate with the same builders
+            // as the typed discovery. Check index choice without matching an
+            // entire SQLite-version-dependent EXPLAIN sentence.
+            let mut query = Query::select();
+            query
+                .column(Alias::new(key))
+                .from(Alias::new(table))
+                .and_where(Expr::col(Alias::new(format!("{field}_payload_id"))).is_null())
+                .and_where(Expr::col(Alias::new(field)).is_not_null());
+            if frozen {
+                query.and_where(
+                    Expr::col(Alias::new("frozen_manifest_id"))
+                        .is_null()
+                        .or(Expr::col(Alias::new("frozen_manifest_id")).ne("")),
+                );
+            }
+            query.order_by(Alias::new(key), Order::Desc).limit(1);
+            let (sql, values) = query.build(SqliteQueryBuilder);
+            let plans = upgraded
+                .database_connection()
+                .query_all_raw(Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    format!("EXPLAIN QUERY PLAN {sql}"),
+                    values.0,
+                ))
+                .await
+                .unwrap();
+            // Historical redundant predicates need not be usable on SQLite.
+            if up || field == "metadata" {
+                assert!(
+                    plans
+                        .iter()
+                        .any(|r| r.try_get::<String>("", "detail").unwrap().contains(&index))
+                );
+            }
+        }
+    }
 }

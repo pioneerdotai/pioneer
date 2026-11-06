@@ -1318,8 +1318,25 @@ fn memory_response_canary_is_absent_from_sentry_events_and_breadcrumbs() {
         options.transport = Some(Arc::new(transport.clone()));
         let client = sentry::Client::from(options);
         let hub = Arc::new(sentry::Hub::new(Some(Arc::new(client)), Default::default()));
-        let subscriber =
-            tracing_subscriber::registry().with(sentry::integrations::tracing::layer());
+        let subscriber = tracing_subscriber::registry()
+            .with(
+                sentry::integrations::tracing::SpanLayer::new()
+                    .with_filter(tracing_subscriber::filter::LevelFilter::INFO),
+            )
+            .with(
+                sentry::integrations::tracing::BreadcrumbLayer::new().with_filter(
+                    tracing_subscriber::filter::filter_fn(|metadata| {
+                        matches!(
+                            *metadata.level(),
+                            tracing::Level::WARN | tracing::Level::INFO
+                        )
+                    }),
+                ),
+            )
+            .with(
+                sentry::integrations::tracing::ErrorLayer::new()
+                    .with_filter(tracing_subscriber::filter::LevelFilter::ERROR),
+            );
         async {
             let f = fixture(
                 (0..3)

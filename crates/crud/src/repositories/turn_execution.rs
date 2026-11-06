@@ -574,7 +574,7 @@ fn ensure_same_immutable(
     Ok(())
 }
 
-fn record_from_model(model: turn_execution::Model) -> Result<TurnExecutionRecord> {
+pub(crate) fn record_from_model(model: turn_execution::Model) -> Result<TurnExecutionRecord> {
     Ok(TurnExecutionRecord {
         turn_id: model.turn_id,
         thread_id: model.thread_id,

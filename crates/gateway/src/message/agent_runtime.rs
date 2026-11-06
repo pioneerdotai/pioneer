@@ -48,14 +48,22 @@ pub(super) struct NativeTurnEventDeliveryWorkers {
 struct NativeTurnEventDeliveryGuard {
     wake: Arc<NativeTurnEventDeliveryWake>,
     owned: bool,
+    recovery: pioneer_sqlite::WorkSignal,
 }
 
 impl NativeTurnEventDeliveryGuard {
-    fn acquire(wake: Arc<NativeTurnEventDeliveryWake>) -> Option<Self> {
+    fn acquire(
+        wake: Arc<NativeTurnEventDeliveryWake>,
+        recovery: pioneer_sqlite::WorkSignal,
+    ) -> Option<Self> {
         wake.running
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .ok()?;
-        Some(Self { wake, owned: true })
+        Some(Self {
+            wake,
+            owned: true,
+            recovery,
+        })
     }
 
     fn release(&mut self) {
@@ -86,6 +94,7 @@ impl Drop for NativeTurnEventDeliveryGuard {
             // remain leased; neither cancellation nor this bit ACKs an effect.
             self.wake.pending.store(true, Ordering::SeqCst);
             self.release();
+            self.recovery.notify();
         }
     }
 }
@@ -3347,7 +3356,12 @@ impl MessageProcessor {
         }
         wake.pending.store(true, Ordering::SeqCst);
         wake.deadline_wake.notify_one();
-        let Some(guard) = NativeTurnEventDeliveryGuard::acquire(wake.clone()) else {
+        let Some(guard) = NativeTurnEventDeliveryGuard::acquire(
+            wake.clone(),
+            self.crud_store
+                .database_connection()
+                .work_signal("projection"),
+        ) else {
             return;
         };
         let this = self.scoped_for_background_reconciliation();
@@ -3409,18 +3423,13 @@ impl MessageProcessor {
                         // domain commit is required. Keep the coalesced owner
                         // only while a future eligible timer exists. A retained
                         // Notify permit plus pending covers kick-before-sleep.
-                        if let Some(deadline) =
-                            next_eligible_at_unix.filter(|at| *at > now_timestamp_secs())
-                        {
-                            let delay = Duration::from_secs(
-                                deadline.saturating_sub(now_timestamp_secs()).max(0) as u64,
-                            );
+                        if let Some(deadline) = next_eligible_at_unix {
                             #[cfg(test)]
                             wake.claim_barrier.wait_if_armed("timer", shutdown).await;
                             if !wake.pending.load(Ordering::SeqCst) {
                                 tokio::select! {
                                     _ = wake.deadline_wake.notified() => {}
-                                    _ = tokio::time::sleep(delay) => {}
+                                    _ = pioneer_sqlite::wait_for_unix_deadline(deadline) => {}
                                 }
                             }
                             wake.pending.store(true, Ordering::SeqCst);
@@ -3438,6 +3447,9 @@ impl MessageProcessor {
                         // Claim/ACK/deferral errors cannot turn coalesced
                         // wakes into a hot loop. No DB capacity is held.
                         tokio::time::sleep(Duration::from_secs(5)).await;
+                        // Retain the durable retry obligation when the owner is
+                        // released below; no periodic external kick is needed.
+                        wake.pending.store(true, Ordering::SeqCst);
                         break;
                     }
                 }
@@ -3464,7 +3476,7 @@ impl MessageProcessor {
 
     /// Wake durable terminal work without lending handler latency to the
     /// process-wide resilience loop. One bounded claim wave runs at a time;
-    /// terminal commits and the periodic worker provide subsequent kicks.
+    /// terminal commits provide invalidation; this owner retains due clocks.
     pub(super) fn kick_native_terminal_effects(&self) {
         #[cfg(not(test))]
         self.spawn_native_terminal_effect_kick();
@@ -3478,28 +3490,74 @@ impl MessageProcessor {
         &self,
         #[cfg(test)] discovery_clock: Option<Box<dyn Fn() -> i64 + Send>>,
     ) {
+        let workers = &self.native_turn_event_delivery_workers;
+        let _admission = workers
+            .admission
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if workers.tasks.is_closed() || workers.shutdown.is_cancelled() {
+            return;
+        }
+        let database = self.crud_store.database_connection().maintenance();
+        let signal = database.work_signal("native.effects");
+        let mut changes = signal.subscribe();
         // Retain a wakeup that arrives while the bounded worker is already
         // running. Without this bit, a terminal commit racing an earlier
-        // preparation kick can leave a newly eligible effect asleep until the
-        // periodic recovery sweep.
+        // preparation kick must still invalidate that owner's next discovery.
         self.native_terminal_effect_kick_pending
             .store(true, Ordering::Release);
         if self
             .native_terminal_effect_kick_running
             .swap(true, Ordering::AcqRel)
         {
+            drop(_admission);
+            signal.notify();
             return;
         }
         let this = self.scoped_for_background_reconciliation();
-        tokio::spawn(async move {
+        let shutdown = workers.shutdown.clone();
+        struct OwnerGuard {
+            running: Arc<AtomicBool>,
+            control: pioneer_sqlite::WorkSignal,
+            shutdown: tokio_util::sync::CancellationToken,
+            complete: bool,
+        }
+        impl Drop for OwnerGuard {
+            fn drop(&mut self) {
+                if !self.complete {
+                    self.running.store(false, Ordering::Release);
+                    if !self.shutdown.is_cancelled() {
+                        self.control.notify();
+                    }
+                }
+            }
+        }
+        let owner = OwnerGuard {
+            running: this.native_terminal_effect_kick_running.clone(),
+            control: database.work_signal("gateway.control"),
+            shutdown: shutdown.clone(),
+            complete: false,
+        };
+        let worker_signal = signal.clone();
+        let worker = async move {
+            let mut owner = owner;
             loop {
                 this.native_terminal_effect_kick_pending
                     .store(false, Ordering::Release);
+                if changes.begin_pass(&database).await.is_err() {
+                    warn!(
+                        dispatched_count = 0_u64,
+                        "native terminal-effect source settlement failed; retry deferred"
+                    );
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    continue;
+                }
                 let discovery_now = now_timestamp_secs();
                 #[cfg(test)]
                 let discovery_now = discovery_clock
                     .as_ref()
                     .map_or(discovery_now, |clock| clock());
+                let change = worker_signal.changing();
                 let (dispatched_count, storage_failed) = match this
                     .process_due_native_terminal_effects(discovery_now, 8)
                     .await
@@ -3507,6 +3565,11 @@ impl MessageProcessor {
                     Ok(outcome) => (outcome.count, outcome.storage_failed),
                     Err(_error) => (0, true),
                 };
+                if !storage_failed {
+                    change.completed(false);
+                } else {
+                    drop(change);
+                }
                 if storage_failed {
                     warn!(
                         dispatched_count,
@@ -3515,38 +3578,70 @@ impl MessageProcessor {
                     // A failed durable deferral/claim must not spin on coalesced
                     // kicks. The quantum has released all database capacity.
                     tokio::time::sleep(Duration::from_secs(5)).await;
+                    // Retry settlement after one backoff. A failed discovery
+                    // cannot supply a valid deadline head; querying it here
+                    // could add a second backoff before the same retry.
+                    continue;
                 }
 
-                // Dispatch count is not the input quantum: rotating status
-                // quotas can return fewer records while due work remains.
-                // Continue on successful progress; each bounded wave releases
-                // DB capacity and yields. An empty wave stops, so future retry,
-                // lease and acceptance-gate clocks cannot create a busy loop.
-                if (!storage_failed && dispatched_count > 0)
-                    || this
-                        .native_terminal_effect_kick_pending
-                        .load(Ordering::Acquire)
+                // The raw due head covers quota continuation even if no row
+                // dispatched (gate probes, exhausted rows or a stale claim).
+                // Future retry, lease and acceptance clocks need no client.
+                let deadline = match this
+                    .crud_store
+                    .next_native_terminal_effect_execution_deadline()
+                    .await
+                {
+                    Ok(deadline) => deadline,
+                    Err(_) => {
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                        continue;
+                    }
+                };
+                if this
+                    .native_terminal_effect_kick_pending
+                    .load(Ordering::Acquire)
                 {
                     tokio::task::yield_now().await;
                     continue;
                 }
-
-                this.native_terminal_effect_kick_running
-                    .store(false, Ordering::Release);
-                // Close the release/reacquire race: a caller that published a
-                // wake immediately before `running` became false observed the
-                // old true value and did not spawn a replacement worker.
-                if !this
+                if deadline.is_some() {
+                    #[cfg(test)]
+                    this.completed_history_preparation_barrier
+                        .wait_if_armed("__terminal_effect_before_timer__", &owner.shutdown)
+                        .await;
+                    changes.wait(deadline).await;
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+                // Admission also guards release, so the old owner cannot
+                // clear the running flag of a newly admitted replacement.
+                let _admission = this
+                    .native_turn_event_delivery_workers
+                    .admission
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                if this
                     .native_terminal_effect_kick_pending
                     .swap(false, Ordering::AcqRel)
-                    || this
-                        .native_terminal_effect_kick_running
-                        .swap(true, Ordering::AcqRel)
                 {
-                    break;
+                    continue;
                 }
+                owner.complete = true;
+                this.native_terminal_effect_kick_running
+                    .store(false, Ordering::Release);
+                break;
+            }
+        };
+        workers.tasks.spawn(async move {
+            tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => {},
+                _ = worker => {},
             }
         });
+        drop(_admission);
+        signal.notify();
     }
 
     async fn persist_native_patch_history(
@@ -7314,14 +7409,31 @@ impl MessageProcessor {
         }
     }
 
+    #[cfg(test)]
     pub(super) async fn poll_timeouts_respecting_human_wait(
         &self,
         now_unix: i64,
         limit: u64,
     ) -> Result<Vec<TimeoutCandidate>> {
-        let candidates = self
+        self.poll_timeout_candidate_page(now_unix, limit, None)
+            .await
+            .map(|(rows, _)| rows)
+    }
+
+    /// Control-loop continuation follows raw candidates, including human waits
+    /// and unavailable runtime observations that emit no timeout event.
+    pub(super) async fn poll_timeout_candidate_page(
+        &self,
+        now_unix: i64,
+        limit: u64,
+        after: Option<&pioneer_crud::TimeoutCandidateCursor>,
+    ) -> Result<(
+        Vec<TimeoutCandidate>,
+        Option<pioneer_crud::TimeoutCandidateCursor>,
+    )> {
+        let (candidates, next) = self
             .timeout_supervisor
-            .list_timeout_candidates(now_unix, limit)
+            .list_timeout_candidate_page(now_unix, limit, after)
             .await?;
         let now_unix_ms = now_unix.saturating_mul(1_000);
         let mut timed_out = Vec::new();
@@ -7440,7 +7552,7 @@ impl MessageProcessor {
                 timed_out.push(candidate);
             }
         }
-        Ok(timed_out)
+        Ok((timed_out, next))
     }
 
     async fn renew_active_native_runtime_turn_deadlines(

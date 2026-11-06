@@ -266,7 +266,9 @@ mod tests {
     fn test_settings(managed_by: InstallManagedBy) -> ServiceSettings {
         ServiceSettings {
             service_name: "com.pioneer.gateway.test".to_owned(),
+            #[cfg(target_os = "macos")]
             legacy_service_names: Vec::new(),
+            #[cfg(target_os = "macos")]
             macos_associated_bundle_identifier: "ai.pioneer.test".to_owned(),
             managed_by,
         }

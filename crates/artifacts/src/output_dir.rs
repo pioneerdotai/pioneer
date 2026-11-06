@@ -65,7 +65,7 @@ fn output_dir_is_active(path: &Path) -> bool {
         .unwrap_or(true)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub struct ArtifactOutputDirGcCandidate {
     pub thread_id: String,
     pub turn_id: String,

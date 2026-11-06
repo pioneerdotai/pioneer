@@ -121,10 +121,18 @@ impl CrudStore {
         at: i64,
         action: Option<crate::AgentCommitInput>,
     ) -> Result<(bool, Vec<AppendedTaskEvent>)> {
-        self.run_serialized_write(|| {
-            self.request_task_finish_once(task_id, reason.clone(), at, action.clone())
-        })
-        .await
+        let change = crate::task_events::TaskWorkChange::new(&self.connection);
+        let result = async {
+            self.run_serialized_write(|| {
+                self.request_task_finish_once(task_id, reason.clone(), at, action.clone())
+            })
+            .await
+        }
+        .await;
+        if let Ok(value) = &result {
+            change.completed(crate::task_events::inserted_task_events(&value.1));
+        }
+        result
     }
 
     async fn request_task_finish_once(
@@ -212,6 +220,8 @@ impl CrudStore {
                 events.push(outcome_event(task_id, runs.outcome.as_ref(), at)?);
             }
             let prepared = self.prepare_task_events_for_write(events).await?;
+            let control_change = self.connection.work_signal("gateway.control").changing();
+            let mut action_changed = false;
             let tx = self.connection.begin().await?;
             let result: Result<Option<Vec<DeferredAppendedTaskEvent>>> = async {
                 if task::find_task_by_id(&tx, task_id).await? != Some(model)
@@ -234,6 +244,11 @@ impl CrudStore {
                     .append_task_events_in_connection(&tx, prepared, at)
                     .await?;
                 if let Some(action) = action.clone() {
+                    action_changed =
+                        !crate::repositories::agent_domain::agent_action_commit_exists(
+                            &tx, &action,
+                        )
+                        .await?;
                     crate::repositories::agent_domain::commit_agent_action(&tx, &action).await?;
                 }
                 Ok(Some(events))
@@ -242,10 +257,12 @@ impl CrudStore {
             match result {
                 Ok(Some(events)) => {
                     tx.commit().await?;
+                    control_change.completed(action_changed);
                     return Ok((already_terminal, materialize_task_events(events)));
                 }
                 Ok(None) => {
                     tx.rollback().await?;
+                    control_change.completed(false);
                 }
                 Err(error) => {
                     let _ = tx.rollback().await;
@@ -270,8 +287,16 @@ impl CrudStore {
         task_id: &str,
         at: i64,
     ) -> Result<Vec<AppendedTaskEvent>> {
-        self.run_serialized_write(|| self.discard_finished_task_queue_once(task_id, at))
-            .await
+        let change = crate::task_events::TaskWorkChange::new(&self.connection);
+        let result = async {
+            self.run_serialized_write(|| self.discard_finished_task_queue_once(task_id, at))
+                .await
+        }
+        .await;
+        if let Ok(value) = &result {
+            change.completed(crate::task_events::inserted_task_events(value));
+        }
+        result
     }
 
     async fn discard_finished_task_queue_once(

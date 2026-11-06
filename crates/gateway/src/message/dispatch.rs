@@ -1911,7 +1911,8 @@ impl MessageProcessor {
             ResourceResolverKind::Thread
                 if matches!(
                     request.method.as_str(),
-                    methods::THREAD_GET
+                    methods::THREAD_OPEN
+                        | methods::THREAD_GET
                         | methods::THREADS_TOOLS_RESULT_READ
                         | methods::THREAD_TIMELINE_PAGE
                         | methods::THREAD_PATCH_STEPS_PAGE
@@ -2011,7 +2012,10 @@ impl MessageProcessor {
                     ProofResolution::Denied(decision)
                         if matches!(
                             request.method.as_str(),
-                            methods::THREAD_GET | methods::THREAD_UNSUBSCRIBE | methods::TURN_START
+                            methods::THREAD_OPEN
+                                | methods::THREAD_GET
+                                | methods::THREAD_UNSUBSCRIBE
+                                | methods::TURN_START
                         ) && matches!(
                             decision,
                             AuthorizationDecision::Deny {
@@ -4791,6 +4795,24 @@ impl MessageProcessor {
                             )
                             .await;
                         }
+                    }
+                }
+                methods::THREAD_OPEN => {
+                    match serde_json::from_value::<ThreadGetParams>(request.params.unwrap_or_else(empty_object_value)) {
+                        Ok(params) => {
+                            if let Some(proof) = admission.thread() {
+                                // Workspace and every start option come from the authorized resource.
+                                let start = super::thread_handlers::open_only_thread_start_params_for_id(
+                                    params.thread_id, proof.workspace_id().to_owned());
+                                self.thread_open(&context, proof, request.id, start).await;
+                            } else if let Some(access) = admission.runtime_draft() {
+                                self.thread_open_runtime_draft(&context, access, request.id).await;
+                            } else {
+                                unreachable!("central admission supplies exact open proof");
+                            }
+                        }
+                        Err(error) => self.send_error(connection_id, JsonRpcErrorResponse::new(
+                            Some(request.id), INVALID_PARAMS_CODE, format!("invalid thread/open params: {error}"))).await,
                     }
                 }
                 methods::THREAD_GET => {

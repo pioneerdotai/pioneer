@@ -949,3 +949,58 @@ fn active_model_from_attempt(attempt: &TaskDeliveryAttempt) -> task_delivery_att
         response_fingerprint: Set(attempt.response_fingerprint.clone()),
     }
 }
+
+pub(crate) async fn next_work_deadline<C: ConnectionTrait>(
+    db: &C,
+    now: i64,
+    stale_after: i64,
+) -> Result<Option<i64>> {
+    use pioneer_entity::task_delivery_recovery_retry as retry;
+    use sea_orm::QuerySelect;
+    use sea_orm::sea_query::Expr;
+    let pending = task_delivery::Entity::find()
+        .select_only()
+        .column(task_delivery::Column::NextAttemptAt)
+        .filter(task_delivery::Column::Status.eq("pending"))
+        .order_by_asc(task_delivery::Column::NextAttemptAt)
+        .limit(1)
+        .into_tuple::<Option<DateTimeWithTimeZone>>()
+        .one(db)
+        .await?
+        .map(|at| at.map_or(now, crate::util::deadline_unix_seconds));
+    // Preserve DeliveryRecoverySnapshot::eligible: even a stale retry row
+    // gates this source until next_probe_at. A due row is discovered from
+    // the current delivering source; terminal leftovers create no timer.
+    let deferred = sea_orm::sea_query::Query::select()
+        .column(retry::Column::DeliveryId)
+        .from(retry::Entity)
+        .and_where(Expr::col(retry::Column::NextProbeAt).gt(now))
+        .to_owned();
+    let source = task_delivery::Entity::find()
+        .select_only()
+        .column(task_delivery::Column::UpdatedAt)
+        .filter(task_delivery::Column::Status.eq("delivering"))
+        .filter(task_delivery::Column::Id.not_in_subquery(deferred))
+        .order_by_asc(task_delivery::Column::UpdatedAt)
+        .limit(1)
+        .into_tuple::<DateTimeWithTimeZone>()
+        .one(db)
+        .await?
+        .map(|at| crate::util::deadline_unix_seconds(at).saturating_add(stale_after));
+    let delivering = sea_orm::sea_query::Query::select()
+        .column(task_delivery::Column::Id)
+        .from(task_delivery::Entity)
+        .and_where(Expr::col(task_delivery::Column::Status).eq("delivering"))
+        .to_owned();
+    let retry = retry::Entity::find()
+        .select_only()
+        .column(retry::Column::NextProbeAt)
+        .filter(retry::Column::NextProbeAt.gt(now))
+        .filter(retry::Column::DeliveryId.in_subquery(delivering))
+        .order_by_asc(retry::Column::NextProbeAt)
+        .limit(1)
+        .into_tuple::<i64>()
+        .one(db)
+        .await?;
+    Ok(pending.into_iter().chain(source).chain(retry).min())
+}

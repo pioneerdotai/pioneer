@@ -7,6 +7,8 @@ Use this reference when creating future work, recurring tasks, interval tasks, c
 - Product Meaning
 - Delivery Modes
 - Choosing Summary Vs Full Result
+- Schedule Changes And Extra Runs
+- Pausing And Resuming Schedules
 - Scheduled Task Instructions
 - No-Op Runs
 - Permanently Stopping Scheduled Work
@@ -101,6 +103,35 @@ Use `format:"full_result"` when markdown structure, sections, citations, or arti
 Use `format:"summary"` for compact notifications, dashboards, or routine status where a short preview is enough.
 
 If `includeResult:false`, the delivered thread message may only say that the task completed. Do not use it for "send me the answer."
+
+## Schedule Changes And Extra Runs
+
+`task_run_now` requests an additional run using the saved task configuration,
+without changing recurrence or the next planned fire. Current work continues;
+normal concurrency and admission limits apply. It cannot resume paused or blocked
+work, reopen terminal tasks, or override a finish request.
+
+`task_reschedule` replaces the schedule; `task_update` can replace its trigger
+while changing other fields. Replacing an interval/cron trigger with `immediate`
+or `scheduled_at` removes recurrence. For an early first check followed by
+recurring checks, save an interval/cron trigger and request the extra run with
+`task_run_now`. Future-run instructions alone cannot establish recurrence.
+When copying an existing monitor, inspect its configuration and explicitly
+preserve the settings the user wants to retain.
+
+See [tool-schemas.md](tool-schemas.md#task_run_now) for arguments, admission
+confirmation and retry identity.
+
+## Pausing And Resuming Schedules
+
+Pause stops future schedule firings and leaves current runs running. It does not
+cancel queued work or prohibit later rescheduling. An exhausted one-shot already
+has no future firings; it need not acquire the literal trigger status `paused`.
+See [the pause response](tool-schemas.md#task_pause-and-task_resume) to interpret
+`scheduleOutcome`.
+
+Resume preserves the configured interval/cron trigger. After either operation,
+use the response or `task_get` to verify the schedule and next fire time.
 
 ## Scheduled Task Instructions
 

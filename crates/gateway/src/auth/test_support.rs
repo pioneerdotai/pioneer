@@ -1,7 +1,4 @@
-use std::{
-    path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
-};
+use std::path::{Path, PathBuf};
 
 use migration::{Migrator, MigratorTrait};
 use pioneer_protocol::{GatewayId, PrincipalId, PrincipalKind, PrincipalStatus};
@@ -17,23 +14,6 @@ pub(crate) const TEST_SUPERUSER_ID: &str = "P00000000000000000001";
 const EPIC_2_MIGRATION: &str = "m20260726_000002_gateway_identity_foundation";
 const ISOLATED_RUNTIME_PREFIX: &str = ".pioneer.epic03-test-";
 const PRODUCTION_RUNTIME_DIRECTORY: &str = ".pioneer";
-
-#[derive(Debug)]
-pub(crate) struct TestAuthClock {
-    now_unix: AtomicU64,
-}
-
-impl TestAuthClock {
-    pub(crate) const fn new(now_unix: u64) -> Self {
-        Self {
-            now_unix: AtomicU64::new(now_unix),
-        }
-    }
-
-    pub(crate) fn now_unix(&self) -> u64 {
-        self.now_unix.load(Ordering::SeqCst)
-    }
-}
 
 pub(crate) struct PopulatedEpic2Database {
     pub(crate) database: DatabaseConnection,

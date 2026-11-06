@@ -10,6 +10,7 @@ Use this reference when exact task tool arguments matter for durable, scheduled,
 - task_list
 - task_get
 - task_update
+- task_run_now
 - task_reschedule
 - task_pause and task_resume
 - task_finish
@@ -212,9 +213,25 @@ Change delivery to the origin thread:
 
 For scheduled, interval, and cron agent tasks, do not clear `instructions` or `outputInstructions` unless replacing them with valid self-contained versions.
 
+## task_run_now
+
+```json
+{"taskId":"TASK_ID"}
+```
+
+Returns `taskId` and `runId`, confirming durable admission of a queued run,
+not its completion; receipt replay also returns `alreadyCommitted`.
+Omit `idempotencyKey` in normal model calls: the runtime derives the durable
+operation identity. Retry the same operation identity after response loss.
+A new identity intentionally requests another run.
+
+For eligibility and effects on existing work and schedules, see
+[Schedule Changes And Extra Runs](delivery-and-scheduled.md#schedule-changes-and-extra-runs).
+
 ## task_reschedule
 
-Use to change only the schedule.
+Use to replace only the schedule. For choosing between a schedule change and an
+extra run, see [Schedule Changes And Extra Runs](delivery-and-scheduled.md#schedule-changes-and-extra-runs).
 
 ```json
 {
@@ -237,7 +254,14 @@ Pause when future runs should stop temporarily but the task should remain config
 
 Resume when a paused task should run according to its configured trigger again.
 
-After pausing or resuming, verify the current task status with the tool result or `task_get`.
+The pause response includes `scheduleOutcome`:
+
+- `paused`: future schedule firings were paused.
+- `no_future_firings`: no future firings remain, including an exhausted one-shot.
+- `not_applied`: the operation was not applied, for example to a terminal task.
+
+For schedule behavior and verification, see
+[Pausing And Resuming Schedules](delivery-and-scheduled.md#pausing-and-resuming-schedules).
 
 ## task_finish
 

@@ -19,6 +19,9 @@ mod control_rpc;
 #[path = "tests/detached_work_projection.rs"]
 mod detached_work_projection;
 
+#[path = "tests/post_open_replay.rs"]
+mod post_open_replay;
+
 #[path = "tests/workspace_scope.rs"]
 mod workspace_scope;
 
@@ -9571,10 +9574,9 @@ async fn open_persisted_child_for_test(
             &json!({
                 "jsonrpc": "2.0",
                 "id": request_id,
-                "method": "thread/start",
+                "method": "thread/open",
                 "params": {
-                    "thread_id": child_thread_id,
-                    "workspace_id": workspace_id
+                    "thread_id": child_thread_id
                 }
             })
             .to_string(),
@@ -9582,8 +9584,9 @@ async fn open_persisted_child_for_test(
         .await;
     let response = recv_response_by_id(rx, request_id.as_str()).await;
     let opened: ThreadStartResponse = serde_json::from_value(response.result)
-        .expect("persisted child should open through the authorized thread/start path");
+        .expect("persisted child should open through the authorized thread/open path");
     assert_eq!(opened.thread.id, child_thread_id);
+    assert_eq!(opened.thread.workspace_id, workspace_id);
     assert!(processor.thread_manager.has_thread(child_thread_id).await);
 }
 
@@ -17487,37 +17490,37 @@ owned_voice_ingress_test!(
     early
 );
 owned_voice_ingress_test!(
-    owned_voice_context_commit_during_preview_thirteen_seconds,
+    owned_voice_finalized_short_thirteen_seconds_one_call,
     "closed_13",
     "winner",
     early
 );
 owned_voice_ingress_test!(
-    owned_voice_context_commit_during_preview_seventeen_seconds,
+    owned_voice_finalized_short_seventeen_seconds_one_call,
     "closed_17",
     "winner",
     early
 );
 owned_voice_ingress_test!(
-    owned_voice_context_long_backlog_with_rephrased_probes,
+    owned_voice_finalized_long_backlog_preserves_chunk_order,
     "long_context",
     "winner",
     early
 );
 owned_voice_ingress_test!(
-    owned_voice_context_final_error_after_window_advance_has_no_partial_turn,
+    owned_voice_finalized_tail_error_has_no_partial_turn,
     "long_tail_error",
     "winner",
     early
 );
 owned_voice_ingress_test!(
-    owned_voice_context_final_error_discards_confirmed_prefix,
+    owned_voice_finalized_error_after_pause_discards_prior_chunk,
     "sealed_tail_error",
     "winner",
     early
 );
 owned_voice_ingress_test!(
-    owned_voice_context_generation_change_fences_tail,
+    owned_voice_finalized_generation_change_fences_tail,
     "generation_change",
     "winner",
     early
@@ -17629,6 +17632,7 @@ fn owned_voice_ingress_case(
         let entered_tx = std::sync::Mutex::new(Some(entered_tx));
         let captured = Arc::new(std::sync::Mutex::new(Vec::<Vec<f32>>::new()));
         let worker_captured = captured.clone();
+        let live_chunks = early && !buffered && !matches!(terminal, "closed_13" | "closed_17");
         // Every case owns its settings file. Persist through the production
         // settings mutation below; never use a test-only mode override.
         let runtime_home = tempfile::tempdir().unwrap();
@@ -17680,25 +17684,16 @@ fn owned_voice_ingress_case(
             }
             drop(flag);
             if matches!(terminal, "long_context" | "long_tail_error") {
-                if terminal == "long_tail_error" && call_count == 6 {
+                if terminal == "long_tail_error" && call_count == 2 {
                     return Err(transcription_error(
                         VoiceTranscriptionErrorKind::RuntimeFailure,
-                        "controlled final failure after window advance",
+                        "controlled final fragment failure",
                     ));
                 }
-                let samples = buffer.flattened_samples();
-                return Ok(if samples.len() <= 48000 && samples[0] > 0.3 {
-                    "incorrect early boundary"
-                } else if samples[0] > 0.3 && samples.len() == 18 * 16000 {
-                    "Привет, мир. Да, да. Ещё раз, ещё раз."
-                } else if samples[0] > 0.3 {
-                    "Привет. Мир. ДА, ДА!"
-                } else if samples.len() <= 24000 {
-                    "да, да."
-                } else if samples.len() > 9 * 16000 {
-                    "Да, да. Ещё раз, ещё раз. Конец."
+                return Ok(if call_count == 1 {
+                    "Привет, мир. Да, да."
                 } else {
-                    "Ещё раз. ЕЩЁ РАЗ!"
+                    "Ещё раз, ещё раз. Конец."
                 }
                 .to_owned());
             }
@@ -17708,7 +17703,7 @@ fn owned_voice_ingress_case(
                     VoiceTranscriptionErrorKind::RuntimeFailure,
                     "controlled native tail failure",
                 )),
-                "sealed_tail_error" if call_count == 3 => Err(transcription_error(
+                "sealed_tail_error" if call_count == 2 => Err(transcription_error(
                     VoiceTranscriptionErrorKind::RuntimeFailure,
                     "controlled failure after confirmed VAD span",
                 )),
@@ -17717,11 +17712,12 @@ fn owned_voice_ingress_case(
                     "controlled fake failure",
                 )),
                 "no_speech" => Ok("  ".to_owned()),
-                // Context changes the hypothesis across the old 3 s cut. The
-                // final assertion must observe the correction, never append it.
-                _ if early && !buffered && buffer.speech_samples() <= 48000 => {
-                    Ok("incorrect early boundary".to_owned())
+                _ if live_chunks => Ok(if call_count == 1 {
+                    "controlled"
+                } else {
+                    "transcript"
                 }
+                .to_owned()),
                 _ => Ok("controlled transcript".to_owned()),
             }
         }));
@@ -17849,15 +17845,22 @@ fn owned_voice_ingress_case(
         .await;
         let mut entered_rx = Some(entered_rx);
         let last_sequence = match terminal {
-            "long_context" | "long_tail_error" | "buffered_long" => 200,
+            "buffered_long" => 200,
             "closed_13" => 129,
             "closed_17" => 169,
+            _ if live_chunks => 500,
             _ => 60,
         };
-        // Feed the first backlog packet before waiting for the 3 s preview:
-        // 48,000 samples leave an incomplete 512-sample VAD frame. This packet
-        // completes it without changing the source PCM or its total duration.
-        let initial_chunks = if early { 31 } else { 1 };
+        // Continuous live input needs the 40 s maximum plus 5 s lookahead.
+        // One more packet completes the 512-sample VAD frame at that horizon.
+        // Short recordings and buffered mode have no pre-Commit ASR call.
+        let initial_chunks = if live_chunks {
+            451
+        } else if early {
+            31
+        } else {
+            1
+        };
         for sequence in 0..initial_chunks {
             processor
                 .process_binary_frame_for_connection(
@@ -17867,10 +17870,12 @@ fn owned_voice_ingress_case(
                         sequence,
                         if early { 1600 } else { 960 },
                         if terminal == "silence"
-                            || (sequence == 30 && terminal == "sealed_tail_error")
+                            || (sequence >= 450 && terminal == "sealed_tail_error")
                         {
                             0
-                        } else if sequence == 30 {
+                        } else if (live_chunks && sequence >= 450)
+                            || (!live_chunks && sequence == 30)
+                        {
                             6000
                         } else {
                             12000
@@ -17882,10 +17887,10 @@ fn owned_voice_ingress_case(
             let _ = recv_notification_by_method(&mut rx, events::VOICE_CHUNK_ACK).await;
         }
         if early {
-            if buffered {
+            if !live_chunks {
                 assert!(
                     captured.lock().unwrap().is_empty(),
-                    "buffered must not call ASR before Commit"
+                    "short and buffered recordings must not call ASR before Commit"
                 );
             } else {
                 let key = tokio::time::timeout(Duration::from_secs(5), entered_rx.take().unwrap())
@@ -17906,9 +17911,9 @@ fn owned_voice_ingress_case(
                     .state,
                 crate::voice::session_store::GatewayVoiceSessionState::Recording
             );
-            // Duplicate accepted sequences are ACKed without replay. Keep a full
-            // second source span and a seven-sample tail behind native work.
-            for sequence in 29..=last_sequence {
+            // Duplicate accepted sequences are ACKed without replay. Queue the
+            // remaining source and a seven-sample tail behind native work.
+            for sequence in initial_chunks - 2..=last_sequence {
                 let samples = if sequence == last_sequence
                     && !matches!(terminal, "closed_13" | "closed_17")
                 {
@@ -17918,7 +17923,7 @@ fn owned_voice_ingress_case(
                 };
                 let amplitude = if terminal == "silence" {
                     0
-                } else if sequence == 29 {
+                } else if sequence < if live_chunks { 450 } else { 30 } {
                     12000
                 } else if sequence == last_sequence {
                     3000
@@ -18217,8 +18222,8 @@ fn owned_voice_ingress_case(
             );
         }
         if terminal == "generation_change" {
-            // The next contextual call must use the recording's admitted
-            // generation; a successful old preview cannot authorize a new one.
+            // The final chunk must use the recording's admitted generation;
+            // a successful earlier fragment cannot authorize a stale call.
             processor
                 .voice_input_supervisor
                 .as_ref()
@@ -18276,63 +18281,47 @@ fn owned_voice_ingress_case(
                         "one full prepared PCM call, including final residual"
                     );
                 }
-            } else if early
-                && matches!(action, "winner" | "mode_switch")
-                && matches!(terminal, "transcript" | "no_speech" | "tail_error")
-            {
-                assert_eq!(
-                    calls.iter().map(Vec::len).collect::<Vec<_>>(),
-                    vec![48000, 96007],
-                    "Commit coalesces superseded previews into one contextual tail"
-                );
-                assert_eq!(calls[0], vec![12000.0 / 32768.0; 48000]);
-                let mut source = vec![12000.0 / 32768.0; 48000];
-                source.extend(vec![6000.0 / 32768.0; 48000]);
-                source.extend([3000.0 / 32768.0; 7]);
-                assert_eq!(calls[1], source, "overlap must preserve source PCM order");
-            } else if terminal == "sealed_tail_error" {
-                assert_eq!(
-                    calls.iter().map(Vec::len).collect::<Vec<_>>(),
-                    vec![48000, 55296, 7943]
-                );
-                let mut confirmed_source = vec![12000.0 / 32768.0; 48000];
-                // The mixed 512-sample frame ends at 48128, followed by
-                // fourteen real hangover frames before the span is sealed.
-                confirmed_source.extend([0.0; 7296]);
-                assert_eq!(calls[1], confirmed_source);
-                let mut tail = vec![0.0; 7936];
-                tail.extend([3000.0 / 32768.0; 7]);
-                assert_eq!(calls[2], tail);
             } else if matches!(terminal, "closed_13" | "closed_17") {
                 let count = if terminal == "closed_13" {
                     13 * 16000
                 } else {
                     17 * 16000
                 };
-                assert_eq!(
-                    calls.iter().map(Vec::len).collect::<Vec<_>>(),
-                    vec![48000, count]
-                );
-                assert_eq!(calls.iter().map(Vec::len).sum::<usize>(), 48000 + count);
                 let mut source = vec![12000.0 / 32768.0; 48000];
                 source.extend(vec![6000.0 / 32768.0; count - 48000 - 1600]);
                 source.extend([3000.0 / 32768.0; 1600]);
-                assert_eq!(calls[1], source);
-            } else if matches!(terminal, "long_context" | "long_tail_error") {
+                assert_eq!(
+                    *calls,
+                    vec![source],
+                    "short recording decoded exactly once after Commit"
+                );
+            } else if live_chunks
+                && matches!(action, "winner" | "mode_switch")
+                && matches!(
+                    terminal,
+                    "transcript" | "no_speech" | "tail_error" | "long_context" | "long_tail_error"
+                )
+            {
+                let mut source = vec![12000.0 / 32768.0; 720000];
+                source.extend(vec![6000.0 / 32768.0; 80000]);
+                source.extend([3000.0 / 32768.0; 7]);
                 assert_eq!(
                     calls.iter().map(Vec::len).collect::<Vec<_>>(),
-                    vec![48000, 288000, 168000, 120000, 24000, 176007]
+                    vec![640000, 160007]
                 );
-                assert_eq!(calls.iter().map(Vec::len).sum::<usize>(), 824007);
-                assert!(calls.iter().all(|call| call.len() <= 18 * 16000));
-                let mut source = vec![12000.0 / 32768.0; 48000];
-                source.extend(vec![6000.0 / 32768.0; 272000]);
-                source.extend([3000.0 / 32768.0; 7]);
-                assert_eq!(calls[1], source[..288000]);
-                assert_eq!(calls[2], source[..168000]);
-                assert_eq!(calls[3], source[168000..288000]);
-                assert_eq!(calls[4], source[144000..168000]);
-                assert_eq!(calls[5], source[144000..]);
+                assert_eq!(
+                    calls.concat(),
+                    source,
+                    "finalized ranges never overlap or omit source PCM"
+                );
+            } else if terminal == "sealed_tail_error" {
+                assert_eq!(
+                    calls.len(),
+                    2,
+                    "the final fragment fails after a successful finalized fragment"
+                );
+                assert_eq!(calls[0], vec![12000.0 / 32768.0; 640000]);
+                assert_eq!(&calls[1][calls[1].len() - 7..], &[3000.0 / 32768.0; 7]);
             } else {
                 assert_eq!(
                     calls.len(),
@@ -18478,7 +18467,7 @@ fn owned_voice_ingress_case(
                     &next_start,
                 )
                 .await;
-                for sequence in 0..40 {
+                for sequence in 0..if buffered { 451 } else { 40 } {
                     processor
                         .process_binary_frame_for_connection(
                             foreign_id,
@@ -19664,7 +19653,7 @@ async fn voice_session_finalize_without_speech_does_not_create_turn() {
 async fn voice_integrity_barrier_blocks_incomplete_prefix_without_poisoning_a_new_session() {
     for case in [
         "missing_tail",
-        "preview_missing_tail",
+        "finalized_missing_tail",
         "gap",
         "malformed",
         "legacy",
@@ -19685,11 +19674,11 @@ async fn voice_integrity_barrier_blocks_incomplete_prefix_without_poisoning_a_ne
             test_tool_loop_config(),
         )
         .with_test_voice_transcript("controlled transcript");
-        let (preview_tx, mut preview_rx) = tokio::sync::mpsc::unbounded_channel();
-        if case == "preview_missing_tail" {
+        let (fragment_tx, mut fragment_rx) = tokio::sync::mpsc::unbounded_channel();
+        if case == "finalized_missing_tail" {
             processor.voice_test_transcriber = Some(Arc::new(move |_| {
-                let text = "successful preliminary transcript".to_owned();
-                let _ = preview_tx.send(());
+                let text = "successful finalized fragment".to_owned();
+                let _ = fragment_tx.send(());
                 Ok(text)
             }));
         }
@@ -19757,8 +19746,8 @@ async fn voice_integrity_barrier_blocks_incomplete_prefix_without_poisoning_a_ne
                 .await
                 .unwrap();
         }
-        let packets = if case == "preview_missing_tail" {
-            31
+        let packets = if case == "finalized_missing_tail" {
+            451
         } else {
             1
         };
@@ -19769,7 +19758,7 @@ async fn voice_integrity_barrier_blocks_incomplete_prefix_without_poisoning_a_ne
                     &voice_test_frame(
                         &session.session_id,
                         sequence,
-                        if case == "preview_missing_tail" {
+                        if case == "finalized_missing_tail" {
                             1600
                         } else {
                             960
@@ -19781,8 +19770,8 @@ async fn voice_integrity_barrier_blocks_incomplete_prefix_without_poisoning_a_ne
                 .unwrap();
             let _ = recv_notification_by_method(&mut rx, events::VOICE_CHUNK_ACK).await;
         }
-        if case == "preview_missing_tail" {
-            tokio::time::timeout(Duration::from_secs(5), preview_rx.recv())
+        if case == "finalized_missing_tail" {
+            tokio::time::timeout(Duration::from_secs(5), fragment_rx.recv())
                 .await
                 .unwrap()
                 .unwrap();
@@ -19816,7 +19805,7 @@ async fn voice_integrity_barrier_blocks_incomplete_prefix_without_poisoning_a_ne
             }
             "legacy" => JsonValue::Null,
             "late_old" => json!({"next_sequence":1,"normalized_samples":960}),
-            "preview_missing_tail" => json!({"next_sequence":32,"normalized_samples":49607}),
+            "finalized_missing_tail" => json!({"next_sequence":452,"normalized_samples":721607}),
             _ => json!({"next_sequence":2,"normalized_samples":967}),
         };
         let request_id = generate_test_request_id("voice", "integrity_finalize");
@@ -22583,6 +22572,115 @@ async fn thread_subscriptions_bind_identity_and_revalidate_current_visibility() 
         "Member thread/start must remain runtime-only before the first turn"
     );
 
+    // Exercise the canonical dispatcher while the resource is still runtime-only.
+    let runtime_open_id = generate_test_request_id("realtimethread", "runtimeowneropen");
+    processor.process_request_for_connection(allowed_connection_id, &json!({
+        "jsonrpc":"2.0", "id":runtime_open_id, "method":"thread/open", "params":{"thread_id":THREAD_ID}
+    }).to_string()).await;
+    let opened = recv_response_by_id(&mut allowed_rx, &runtime_open_id).await;
+    let opened: ThreadStartResponse = serde_json::from_value(opened.result).unwrap();
+    assert_eq!(opened.thread.workspace_id, workspace_id);
+    let _ = recv_notification_by_method(&mut allowed_rx, events::THREAD_STARTED).await;
+    assert!(
+        crud_store
+            .get_thread_model(THREAD_ID)
+            .await
+            .unwrap()
+            .is_none(),
+        "runtime open must not promote draft"
+    );
+    processor
+        .session_manager
+        .set_connection_workspace(denied_connection_id, Some("selected-before-denial".into()))
+        .await;
+    let runtime_denied_id = generate_test_request_id("realtimethread", "runtimeforeignopen");
+    processor.process_request_for_connection(denied_connection_id, &json!({
+        "jsonrpc":"2.0", "id":runtime_denied_id, "method":"thread/open", "params":{"thread_id":THREAD_ID}
+    }).to_string()).await;
+    assert_eq!(
+        recv_error_by_id(&mut denied_rx, &runtime_denied_id)
+            .await
+            .error
+            .message,
+        "not_found"
+    );
+    assert_eq!(
+        processor
+            .session_manager
+            .connection_workspace_id(denied_connection_id)
+            .await
+            .as_deref(),
+        Some("selected-before-denial")
+    );
+    assert!(
+        !thread_manager
+            .subscribed_connection_ids(THREAD_ID)
+            .await
+            .contains(&denied_connection_id)
+    );
+
+    let (other_session_tx, mut other_session_rx) =
+        crate::session::test_support::outbound_channel(16);
+    let other_session_connection = processor
+        .session_manager
+        .register_connection(
+            other_session_tx,
+            member_principal(
+                MEMBER_ALLOWED_ID,
+                "D0000000000000000000C",
+                "S0000000000000000000C",
+            ),
+        )
+        .await
+        .expect("register another session for the allowed Member");
+
+    processor
+        .session_manager
+        .set_connection_workspace(
+            other_session_connection,
+            Some("selected-before-draft-denial".into()),
+        )
+        .await;
+    let same_principal_other_session = generate_test_request_id("realtimethread", "draftsession");
+    processor
+        .process_request_for_connection(
+            other_session_connection,
+            &json!({
+                "jsonrpc":"2.0", "id":same_principal_other_session, "method":"thread/open",
+                "params":{"thread_id":THREAD_ID}
+            })
+            .to_string(),
+        )
+        .await;
+    assert_eq!(
+        recv_error_by_id(&mut other_session_rx, &same_principal_other_session)
+            .await
+            .error
+            .message,
+        "not_found"
+    );
+    assert_eq!(
+        processor
+            .session_manager
+            .connection_workspace_id(other_session_connection)
+            .await
+            .as_deref(),
+        Some("selected-before-draft-denial")
+    );
+    assert!(
+        !thread_manager
+            .subscribed_connection_ids(THREAD_ID)
+            .await
+            .contains(&other_session_connection)
+    );
+    assert!(
+        crud_store
+            .get_thread_model(THREAD_ID)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
     let materialize_id = generate_test_request_id("realtimethread", "firstturn");
     processor
         .process_request_for_connection(
@@ -22627,10 +22725,9 @@ async fn thread_subscriptions_bind_identity_and_revalidate_current_visibility() 
             &json!({
                 "jsonrpc": "2.0",
                 "id": superuser_open_id,
-                "method": "thread/start",
+                "method": "thread/open",
                 "params": {
-                    "thread_id": THREAD_ID,
-                    "workspace_id": workspace_id
+                    "thread_id": THREAD_ID
                 }
             })
             .to_string(),
@@ -22638,21 +22735,6 @@ async fn thread_subscriptions_bind_identity_and_revalidate_current_visibility() 
         .await;
     let _ = recv_response_by_id(&mut superuser_rx, superuser_open_id.as_str()).await;
     let _ = recv_notification_by_method(&mut superuser_rx, events::THREAD_STARTED).await;
-
-    let (other_session_tx, mut other_session_rx) =
-        crate::session::test_support::outbound_channel(16);
-    processor
-        .session_manager
-        .register_connection(
-            other_session_tx,
-            member_principal(
-                MEMBER_ALLOWED_ID,
-                "D0000000000000000000C",
-                "S0000000000000000000C",
-            ),
-        )
-        .await
-        .expect("register another session for the allowed Member");
 
     processor
         .send_execution_collaborator_notification(
@@ -22697,10 +22779,9 @@ async fn thread_subscriptions_bind_identity_and_revalidate_current_visibility() 
             &json!({
                 "jsonrpc": "2.0",
                 "id": denied_open_id,
-                "method": "thread/start",
+                "method": "thread/open",
                 "params": {
-                    "thread_id": THREAD_ID,
-                    "workspace_id": workspace_id
+                    "thread_id": THREAD_ID
                 }
             })
             .to_string(),
@@ -22708,6 +22789,14 @@ async fn thread_subscriptions_bind_identity_and_revalidate_current_visibility() 
         .await;
     let denied = recv_error_by_id(&mut denied_rx, denied_open_id.as_str()).await;
     assert_eq!(denied.error.message, "not_found");
+    assert_eq!(
+        processor
+            .session_manager
+            .connection_workspace_id(denied_connection_id)
+            .await
+            .as_deref(),
+        Some("selected-before-denial")
+    );
     assert!(
         !thread_manager
             .subscribed_connection_ids(THREAD_ID)
@@ -23802,7 +23891,7 @@ async fn artifact_binary_ingress_case(overloaded: bool) {
         processor,
         _session_manager,
         owner_connection_id,
-        mut owner_rx,
+        owner_rx,
         foreign_connection_id,
         mut foreign_rx,
         _crud_store,
@@ -23960,7 +24049,7 @@ async fn skill_binary_ingress_case(overloaded: bool) {
         processor,
         _session_manager,
         owner_connection_id,
-        mut owner_rx,
+        owner_rx,
         foreign_connection_id,
         mut foreign_rx,
         crud_store,
@@ -33510,15 +33599,27 @@ async fn cli_predispatch_read_failure_cancel_and_shutdown_release_session_lease_
             .await
             .unwrap();
         let thread = format!("predispatch-{case}");
-        open_persisted_child_for_test(
-            &processor,
-            connection,
-            &mut rx,
-            &workspace,
-            &thread,
-            &format!("open-{case}"),
-        )
-        .await;
+        // This case starts with a fresh thread, so create it before testing
+        // dispatch cleanup. thread/open only subscribes to existing threads.
+        let create_id = generate_test_request_id("predispatch-create", case);
+        processor
+            .process_request_for_connection(
+                connection,
+                &json!({
+                    "jsonrpc": "2.0", "id": create_id, "method": "thread/start",
+                    "params": {
+                        "thread_id": thread, "workspace_id": workspace,
+                        "model": "gpt-5", "model_provider": "openai",
+                        "sandbox": SandboxMode::FullAccess, "mode": "Agent"
+                    }
+                })
+                .to_string(),
+            )
+            .await;
+        let response = recv_response_by_id(&mut rx, &create_id).await;
+        let created: ThreadStartResponse = serde_json::from_value(response.result).unwrap();
+        assert_eq!(created.thread.id, thread);
+        assert_eq!(created.thread.workspace_id, workspace);
         let turn = format!("predispatch-turn-{case}");
         processor.arm_completed_history_preparation_barrier("__cli_predispatch__");
         if case == "read_error" {
@@ -41721,7 +41822,14 @@ async fn task_create_tool_idempotency_key_deduplicates_parallel_mutations_impl()
         "openai",
     )
     .await;
-    let _ = recv_notification_by_method(&mut rx, events::TURN_COMPLETED).await;
+    // The parent performs durable task admission before it can finish. This
+    // checks deduplication, not the shared helper's two-second completion SLA.
+    let _ = recv_notification_by_method_timeout(
+        &mut rx,
+        events::TURN_COMPLETED,
+        Duration::from_secs(30),
+    )
+    .await;
 
     let turn_items = crud_store
         .get_turn_item_events("thr_task_tool_idempotency", "turn_task_tool_idempotency")
@@ -58146,23 +58254,234 @@ async fn cli_runtime_grandchild_request_replays_into_root_capsule_and_resolves_f
         vec![child_thread_id.to_owned(), root_thread_id.to_owned()]
     );
 
-    processor
-        .process_request_for_connection(
-            root_connection_id,
-            &json!({
-                "jsonrpc": "2.0",
-                "id": "cliparentresp00000001",
-                "method": pioneer_protocol::constants::methods::CLI_RUNTIME_REQUEST_RESPOND,
-                "params": {
-                    "workspace_id": workspace_id,
-                    "runtime_id": "codex",
-                    "request_id": pending_request_id,
-                    "resolution": { "status": "approved" }
-                }
-            })
-            .to_string(),
-        )
+    // A failed resource check in the ancestor replay's second pass must
+    // recover, rather than deduplicate a pending request nobody received.
+    let (unavailable_tx, mut unavailable_rx) = crate::session::test_support::outbound_channel(32);
+    let unavailable_outbound = unavailable_tx.clone();
+    let unavailable_connection = session_manager
+        .register_connection(unavailable_tx, authenticated_test_member_collaborator())
+        .await
+        .unwrap();
+    let (auth_entered, auth_release) = post_open_replay::pause_auth_unavailable(
+        &processor,
+        unavailable_connection,
+        events::CLI_RUNTIME_REQUEST_OPENED,
+        root_thread_id,
+        1,
+    );
+    let unavailable_open = generate_test_request_id("cliancestor", "authunavailable");
+    processor.process_request_for_connection(unavailable_connection, &json!({
+        "jsonrpc":"2.0", "id":unavailable_open, "method":"thread/open", "params":{"thread_id":root_thread_id}
+    }).to_string()).await;
+    tokio::time::timeout(Duration::from_secs(10), auth_entered)
+        .await
+        .unwrap()
+        .unwrap();
+    recv_response_by_id(&mut unavailable_rx, &unavailable_open).await;
+    recv_notification_by_method(&mut unavailable_rx, events::THREAD_STARTED).await;
+    auth_release.send(()).unwrap();
+    session_manager
+        .drain_thread_replays(unavailable_connection)
         .await;
+    unavailable_outbound.writer_stopped().await;
+    assert!(
+        unavailable_outbound
+            .try_send_data(Message::Text("requires recovery".into()))
+            .is_err()
+    );
+    assert!(unavailable_rx.try_recv().is_err());
+    assert_eq!(
+        crud_store
+            .get_cli_runtime_pending_request(&pending_request_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        pioneer_crud::CliRuntimePendingRequestStatus::Pending
+    );
+    session_manager
+        .unregister_connection(unavailable_connection)
+        .await;
+    processor
+        .thread_manager
+        .connection_closed(unavailable_connection)
+        .await;
+    let (recovered_tx, mut recovered_rx) = crate::session::test_support::outbound_channel(32);
+    let recovered_connection = session_manager
+        .register_connection(recovered_tx, authenticated_test_member_collaborator())
+        .await
+        .unwrap();
+    let recovered_open = generate_test_request_id("cliancestor", "authrecovered");
+    processor.process_request_for_connection(recovered_connection, &json!({
+        "jsonrpc":"2.0", "id":recovered_open, "method":"thread/open", "params":{"thread_id":root_thread_id}
+    }).to_string()).await;
+    recv_response_by_id(&mut recovered_rx, &recovered_open).await;
+    recv_notification_by_method(&mut recovered_rx, events::THREAD_STARTED).await;
+    let recovered_pending =
+        recv_notification_by_method(&mut recovered_rx, events::CLI_RUNTIME_REQUEST_OPENED).await;
+    let recovered_pending: CLIRuntimeRequestOpenedNotification =
+        serde_json::from_value(recovered_pending.params.unwrap()).unwrap();
+    assert_eq!(recovered_pending.request_id, pending_request_id);
+    assert_eq!(
+        recovered_pending.visible_thread_ids,
+        vec![child_thread_id.to_owned(), root_thread_id.to_owned()]
+    );
+    session_manager
+        .drain_thread_replays(recovered_connection)
+        .await;
+    session_manager
+        .unregister_connection(recovered_connection)
+        .await;
+    processor
+        .thread_manager
+        .connection_closed(recovered_connection)
+        .await;
+
+    let (racing_tx, mut racing_rx) = crate::session::test_support::outbound_channel(32);
+    let racing_connection = session_manager
+        .register_connection(racing_tx, authenticated_test_member_collaborator())
+        .await
+        .unwrap();
+    // Selection deliberately differs: ancestor execution authority is independent.
+    session_manager
+        .set_connection_workspace(racing_connection, Some("unrelated-selection".into()))
+        .await;
+    let (entered, captured) = tokio::sync::oneshot::channel();
+    let (release, released) = tokio::sync::oneshot::channel();
+    *session_manager.replay_delivery_pause.lock().unwrap() =
+        Some(crate::session::test_support::DeliveryPause {
+            connection: racing_connection,
+            method: events::CLI_RUNTIME_REQUEST_OPENED,
+            entered,
+            release: released,
+        });
+    let racing_open = generate_test_request_id("cliancestor", "racingopen");
+    processor.process_request_for_connection(racing_connection, &json!({
+        "jsonrpc":"2.0", "id":racing_open, "method":"thread/open", "params":{"thread_id":root_thread_id}
+    }).to_string()).await;
+    tokio::time::timeout(Duration::from_secs(10), captured)
+        .await
+        .unwrap()
+        .unwrap();
+    recv_response_by_id(&mut racing_rx, &racing_open).await;
+    recv_notification_by_method(&mut racing_rx, events::THREAD_STARTED).await;
+    session_manager
+        .set_connection_workspace(racing_connection, Some("unrelated-selection".into()))
+        .await;
+
+    // A third observer keeps the original late-opened/terminal oracle above,
+    // and independently exercises valid OPENED and LIVE terminal across renewal.
+    let (renewing_tx, mut renewing_rx) = crate::session::test_support::outbound_channel(32);
+    let renewing_outbound = renewing_tx.clone();
+    let renewing_connection = session_manager
+        .register_connection(renewing_tx, authenticated_test_member_collaborator())
+        .await
+        .unwrap();
+    let (renew_entered, renew_captured) = tokio::sync::oneshot::channel();
+    let (renew_release, renew_released) = tokio::sync::oneshot::channel();
+    *session_manager.replay_delivery_pause.lock().unwrap() =
+        Some(crate::session::test_support::DeliveryPause {
+            connection: renewing_connection,
+            method: events::CLI_RUNTIME_REQUEST_OPENED,
+            entered: renew_entered,
+            release: renew_released,
+        });
+    let renewing_open = generate_test_request_id("cliancestor", "renewingopen");
+    processor.process_request_for_connection(renewing_connection, &json!({
+        "jsonrpc":"2.0", "id":renewing_open, "method":"thread/open", "params":{"thread_id":root_thread_id}
+    }).to_string()).await;
+    tokio::time::timeout(Duration::from_secs(10), renew_captured)
+        .await
+        .unwrap()
+        .unwrap();
+    recv_response_by_id(&mut renewing_rx, &renewing_open).await;
+    recv_notification_by_method(&mut renewing_rx, events::THREAD_STARTED).await;
+    session_manager
+        .set_connection_workspace(renewing_connection, Some("unrelated-selection".into()))
+        .await;
+    post_open_replay::renew_same_subject(&session_manager, renewing_connection).await;
+    renew_release.send(()).unwrap();
+    let renewal_opened =
+        recv_notification_by_method(&mut renewing_rx, events::CLI_RUNTIME_REQUEST_OPENED).await;
+    let renewal_opened: CLIRuntimeRequestOpenedNotification =
+        serde_json::from_value(renewal_opened.params.unwrap()).unwrap();
+    assert_eq!(renewal_opened.request_id, pending_request_id);
+    assert_eq!(
+        renewal_opened.visible_thread_ids,
+        vec![child_thread_id.to_owned(), root_thread_id.to_owned()]
+    );
+    let client = pioneer_client::core::ClientCore::new();
+    client.upsert_thread(
+        crud_store
+            .get_thread_model(root_thread_id)
+            .await
+            .unwrap()
+            .unwrap(),
+    );
+    client.apply_thread_notification(
+        pioneer_protocol::GatewayNotification::CLIRuntimeRequestOpened(renewal_opened),
+    );
+    assert_eq!(
+        client
+            .pending_requests_for_scope(Some(&workspace_id), Some(root_thread_id))
+            .len(),
+        1
+    );
+    session_manager
+        .drain_thread_replays(renewing_connection)
+        .await;
+    let membership = processor
+        .thread_manager
+        .subscription_incarnation(renewing_connection, root_thread_id)
+        .await
+        .unwrap();
+    let repeat = generate_test_request_id("cliancestor", "renewaldedup");
+    processor.process_request_for_connection(renewing_connection, &json!({
+        "jsonrpc":"2.0", "id":repeat, "method":"thread/open", "params":{"thread_id":root_thread_id}
+    }).to_string()).await;
+    recv_response_by_id(&mut renewing_rx, &repeat).await;
+    recv_notification_by_method(&mut renewing_rx, events::THREAD_STARTED).await;
+    session_manager
+        .drain_thread_replays(renewing_connection)
+        .await;
+    assert!(
+        renewing_rx.try_recv().is_err(),
+        "delivered pending replay stays deduplicated"
+    );
+    assert!(Arc::ptr_eq(
+        &membership,
+        &processor
+            .thread_manager
+            .subscription_incarnation(renewing_connection, root_thread_id)
+            .await
+            .unwrap()
+    ));
+    let (terminal_entered, terminal_captured) = tokio::sync::oneshot::channel();
+    let (terminal_release, terminal_released) = tokio::sync::oneshot::channel();
+    *session_manager.replay_delivery_pause.lock().unwrap() =
+        Some(crate::session::test_support::DeliveryPause {
+            connection: renewing_connection,
+            method: events::CLI_RUNTIME_REQUEST_RESOLVED,
+            entered: terminal_entered,
+            release: terminal_released,
+        });
+    let resolve_payload = json!({
+        "jsonrpc":"2.0", "id":"cliparentresp00000001",
+        "method":pioneer_protocol::constants::methods::CLI_RUNTIME_REQUEST_RESPOND,
+        "params":{"workspace_id":workspace_id,"runtime_id":"codex","request_id":pending_request_id,
+            "resolution":{"status":"approved"}}
+    })
+    .to_string();
+    let resolving = processor.process_request_for_connection(root_connection_id, &resolve_payload);
+    let renewal = async {
+        tokio::time::timeout(Duration::from_secs(10), terminal_captured)
+            .await
+            .unwrap()
+            .unwrap();
+        post_open_replay::renew_same_subject(&session_manager, renewing_connection).await;
+        terminal_release.send(()).unwrap();
+    };
+    tokio::join!(resolving, renewal);
     let (response, resolved) = recv_response_and_notification_by_id_method(
         &mut root_rx,
         "cliparentresp00000001",
@@ -58181,6 +58500,60 @@ async fn cli_runtime_grandchild_request_replays_into_root_capsule_and_resolves_f
         vec![child_thread_id.to_owned(), root_thread_id.to_owned()]
     );
     assert_eq!(resolved.resolution, CLIRuntimeRequestResolution::Approved);
+
+    let renewal_terminal =
+        recv_notification_by_method(&mut renewing_rx, events::CLI_RUNTIME_REQUEST_RESOLVED).await;
+    let renewal_terminal: CLIRuntimeRequestResolvedNotification =
+        serde_json::from_value(renewal_terminal.params.unwrap()).unwrap();
+    assert_eq!(
+        renewal_terminal.resolution,
+        CLIRuntimeRequestResolution::Approved
+    );
+    client.apply_thread_notification(
+        pioneer_protocol::GatewayNotification::CLIRuntimeRequestResolved(renewal_terminal),
+    );
+    assert!(
+        client
+            .pending_requests_for_scope(Some(&workspace_id), Some(root_thread_id))
+            .is_empty()
+    );
+    renewing_outbound
+        .try_send_data(Message::Text("same ancestor socket remains live".into()))
+        .unwrap();
+
+    let racing_terminal =
+        recv_notification_by_method(&mut racing_rx, events::CLI_RUNTIME_REQUEST_RESOLVED).await;
+    let racing_terminal: CLIRuntimeRequestResolvedNotification =
+        serde_json::from_value(racing_terminal.params.unwrap()).unwrap();
+    assert_eq!(
+        racing_terminal.resolution,
+        CLIRuntimeRequestResolution::Approved
+    );
+    assert_eq!(
+        racing_terminal.thread_id.as_deref(),
+        Some(grandchild_thread_id)
+    );
+    assert_eq!(
+        racing_terminal.visible_thread_ids,
+        vec![child_thread_id.to_owned(), root_thread_id.to_owned()]
+    );
+    release.send(()).unwrap();
+    session_manager
+        .drain_thread_replays(racing_connection)
+        .await;
+    while let Ok(Message::Text(text)) = racing_rx.try_recv() {
+        let frame: JsonValue = serde_json::from_str(&text).unwrap();
+        assert_ne!(
+            frame["method"],
+            events::CLI_RUNTIME_REQUEST_OPENED,
+            "ancestor replay cannot reopen an approved request"
+        );
+        if frame["method"] == events::CLI_RUNTIME_REQUEST_RESOLVED {
+            let resolved: CLIRuntimeRequestResolvedNotification =
+                serde_json::from_value(frame["params"].clone()).unwrap();
+            assert_eq!(resolved.resolution, CLIRuntimeRequestResolution::Approved);
+        }
+    }
 
     let provider_responses = cli_session.responses.lock().await;
     assert_eq!(provider_responses.len(), 1);
@@ -61140,6 +61513,7 @@ async fn cli_runtime_active_command_heartbeat_renews_rolling_hard_deadline() {
     let heartbeat_now = now
         .saturating_add(processor.cli_runtime_command_heartbeats.interval_secs())
         .saturating_add(2);
+    rehydrate_command_registry(&processor).await;
     assert_eq!(
         processor
             .heartbeat_due_cli_runtime_command_items(heartbeat_now)
@@ -61266,6 +61640,7 @@ async fn cli_runtime_command_heartbeat_does_not_renew_without_confirmed_runtime_
     let heartbeat_now = now
         .saturating_add(processor.cli_runtime_command_heartbeats.interval_secs())
         .saturating_add(2);
+    rehydrate_command_registry(&processor).await;
     assert_eq!(
         processor
             .heartbeat_due_cli_runtime_command_items(heartbeat_now)
@@ -61337,6 +61712,7 @@ async fn cli_runtime_command_terminal_snapshot_stops_heartbeat_and_finalizes_tur
     let heartbeat_now = now
         .saturating_add(processor.cli_runtime_command_heartbeats.interval_secs())
         .saturating_add(2);
+    rehydrate_command_registry(&processor).await;
     assert_eq!(
         processor
             .heartbeat_due_cli_runtime_command_items(heartbeat_now)
@@ -78811,21 +79187,13 @@ async fn setup_workspace_manager_with_connection(
     // This helper invokes current Gateway bootstrap and authorization, so it
     // requires the complete schema rather than a historical migration prefix.
     crate::compaction::load_test_catalog();
-    // Keep fresh fixture initialization on one physical connection. There is
-    // no concurrent fixture consumer until migration commits; bootstrap and
-    // every tested Gateway operation still use their normal storage paths.
-    let database = pioneer_sqlite::SqliteDatabase::from_single_connection(connection.clone());
-    let migration = database
-        .begin()
-        .await
-        .expect("fixture migration transaction");
-    Migrator::up(&*migration, None)
+    // Use the normal writer bootstrap path: migrations that change connection
+    // pragmas must own their physical lease outside any enclosing transaction.
+    // Each migration retains its own atomicity; no fixture consumer exists yet.
+    pioneer_sqlite::SqliteWriteExecutor::new(connection.clone())
+        .run_migrations::<Migrator>(pioneer_sqlite::SqliteWriteClass::Maintenance, None)
         .await
         .expect("migrations must succeed");
-    migration
-        .commit()
-        .await
-        .expect("fixture schema must commit");
     bootstrap(&connection)
         .await
         .expect("gateway bootstrap should create default workspace");
@@ -82646,34 +83014,24 @@ async fn recv_jsonrpc_payload_by_id(
     rx: &mut crate::session::test_support::OutboundTestReceiver,
     request_id: &str,
 ) -> String {
-    for _ in 0..200 {
-        let payload = recv_text_timeout(rx, Duration::from_secs(2)).await;
-        let value: serde_json::Value =
-            serde_json::from_str(&payload).expect("json-rpc payload should decode");
-        if value.get("id").and_then(serde_json::Value::as_str) == Some(request_id) {
-            return payload;
-        }
-    }
-
-    panic!("timed out waiting for JSON-RPC payload id `{request_id}`");
+    let message = timeout(Duration::from_secs(2), rx.recv_response(request_id))
+        .await
+        .expect("timed out waiting for JSON-RPC response")
+        .expect("websocket channel closed waiting for response");
+    let Message::Text(payload) = message else {
+        unreachable!()
+    };
+    payload.to_string()
 }
 
 async fn recv_response_by_id(
     rx: &mut crate::session::test_support::OutboundTestReceiver,
     request_id: &str,
 ) -> JsonRpcResponse {
-    for _ in 0..200 {
-        let payload = recv_text_timeout(rx, Duration::from_secs(2)).await;
-        let value: serde_json::Value =
-            serde_json::from_str(&payload).expect("json-rpc payload should decode");
-        if value.get("id").and_then(serde_json::Value::as_str) == Some(request_id) {
-            return serde_json::from_value(value.clone()).unwrap_or_else(|error| {
-                panic!("json-rpc response should decode: {error}; payload: {value}")
-            });
-        }
-    }
-
-    panic!("timed out waiting for response id `{request_id}`");
+    let payload = recv_jsonrpc_payload_by_id(rx, request_id).await;
+    serde_json::from_str(&payload).unwrap_or_else(|error| {
+        panic!("json-rpc response should decode: {error}; payload: {payload}")
+    })
 }
 
 async fn recv_response_and_notification_by_id_method(
@@ -82822,19 +83180,16 @@ async fn recv_notification_by_method_timeout(
     method: &str,
     wait_for: Duration,
 ) -> JsonRpcNotification {
-    let context = format!("notification method `{method}`");
-    for _ in 0..200 {
-        let payload = recv_text_timeout_context(rx, wait_for, context.as_str()).await;
-        let value: serde_json::Value =
-            serde_json::from_str(&payload).expect("json-rpc payload should decode");
-        if value.get("id").is_none()
-            && value.get("method").and_then(serde_json::Value::as_str) == Some(method)
-        {
-            return serde_json::from_value(value).expect("json-rpc notification should decode");
-        }
-    }
-
-    panic!("timed out waiting for notification method `{method}`");
+    let message = timeout(wait_for, rx.recv_notification(method))
+        .await
+        .unwrap_or_else(|error| {
+            panic!("timed out waiting for notification method `{method}`: {error:?}")
+        })
+        .expect("websocket channel closed waiting for notification");
+    let Message::Text(payload) = message else {
+        unreachable!()
+    };
+    serde_json::from_str(&payload).expect("json-rpc notification should decode")
 }
 
 async fn recv_echo_turn_lifecycle_notifications(
@@ -84859,6 +85214,168 @@ async fn native_history_intent_is_precompleted_idempotent_and_restart_discoverab
         "short history needs no summarizer"
     );
     context.events.shutdown_progress().await;
+}
+
+#[tokio::test]
+async fn completed_history_result_write_failure_remains_an_error_with_durable_work() {
+    use pioneer_compaction::{CompactionSettings, ModelSelection, Transport};
+    use pioneer_entity::compaction_history_check as check;
+    use sea_orm::EntityTrait;
+    let provider = Arc::new(CaptureSummaryProvider::new("unused"));
+    let harness = setup_phase_13_compaction_harness(phase_13_provider_registry(provider)).await;
+    harness
+        .processor
+        .agent_manager
+        .set_context_controller(Some(Arc::new(
+            crate::compaction::GatewayNativeContextController::new(Arc::downgrade(
+                &harness.processor,
+            )),
+        )))
+        .await;
+    let thread = "history-result-fault-thread";
+    let turn_id = "history-result-fault-turn";
+    materialize_cli_runtime_turn_with_text(
+        &harness.crud_store,
+        &harness.workspace_id,
+        thread,
+        turn_id,
+        "current input",
+    )
+    .await;
+    harness
+        .crud_store
+        .materialize_item_completed(
+            ItemCompletedNotification {
+                workspace_id: harness.workspace_id.clone(),
+                thread_id: thread.into(),
+                turn_id: turn_id.into(),
+                item: TurnItem::AgentMessage {
+                    id: "history-result-answer".into(),
+                    text: "answer".into(),
+                    phase: Default::default(),
+                    markdown: None,
+                    markdown_version: None,
+                },
+            },
+            phase_13_now_secs(),
+        )
+        .await
+        .unwrap();
+    let (_, mut turn) = harness
+        .crud_store
+        .get_turn(thread, turn_id)
+        .await
+        .unwrap()
+        .unwrap();
+    turn.status = TurnStatus::Completed;
+    harness
+        .crud_store
+        .materialize_turn_completed(
+            TurnCompletedNotification {
+                workspace_id: harness.workspace_id.clone(),
+                thread_id: thread.into(),
+                turn,
+            },
+            phase_13_now_secs(),
+        )
+        .await
+        .unwrap();
+    // A valid captured descriptor whose unavailable provider produces a normal
+    // durable diagnostic. The injected fault affects only recording that result.
+    let descriptor = serde_json::json!({
+        "current": ModelSelection { transport: Transport::Api, instance: "missing-result-provider".into(),
+            model: "missing-result-model".into(), effort: None },
+        "settings": CompactionSettings { selection: None }, "cli_override": null,
+        "deadline_ms": (phase_13_now_secs() * 1000 + 30_000) as u64,
+    }).to_string();
+    harness
+        .crud_store
+        .compaction_enqueue_native_history_check(
+            &harness.workspace_id,
+            thread,
+            turn_id,
+            &descriptor,
+        )
+        .await
+        .unwrap();
+    let db = harness.crud_store.database_connection();
+    db.execute_unprepared("CREATE TRIGGER reject_history_result BEFORE UPDATE OF outcome ON compaction_history_check WHEN OLD.turn_id='history-result-fault-turn' BEGIN SELECT RAISE(ABORT,'fixture result failure'); END").await.unwrap();
+    harness
+        .processor
+        .poll_completed_history_checks()
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if harness
+                .processor
+                .completed_history_checks
+                .lock()
+                .await
+                .values()
+                .all(|job| {
+                    job.handle
+                        .as_ref()
+                        .is_none_or(tokio::task::JoinHandle::is_finished)
+                })
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        harness
+            .processor
+            .poll_completed_history_checks()
+            .await
+            .is_err(),
+        "an unconfirmed service result must reach the owner's bounded error backoff"
+    );
+    assert!(
+        harness
+            .processor
+            .completed_history_checks
+            .lock()
+            .await
+            .is_empty(),
+        "the failed due row must not be re-admitted in that same discovery pass"
+    );
+    let row = check::Entity::find_by_id(turn_id)
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.state, "pending");
+    assert!(row.outcome.is_none());
+    db.execute_unprepared("DROP TRIGGER reject_history_result")
+        .await
+        .unwrap();
+    harness
+        .processor
+        .poll_completed_history_checks()
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if check::Entity::find_by_id(turn_id)
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap()
+                .outcome
+                .is_some()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    harness.processor.shutdown_resilience_workers().await;
 }
 
 #[tokio::test]
@@ -91946,4 +92463,23 @@ async fn task_webhook_url_uses_actual_bind_and_rejects_persisted_disconnected_re
     let persisted = std::fs::read_to_string(&settings_path).unwrap();
     assert!(!persisted.contains("public_base_url"));
     assert!(!persisted.contains("obsolete.example"));
+}
+
+// The control owner restores startup/mutation pages before heartbeat and timeout.
+async fn rehydrate_command_registry(processor: &MessageProcessor) {
+    let mut after = None;
+    loop {
+        let (_, next, failed) = processor
+            .rehydrate_cli_runtime_command_items(None, after.as_deref(), 256)
+            .await
+            .expect("command registry startup page should load");
+        assert!(
+            !failed,
+            "command registry startup validation should succeed"
+        );
+        after = next;
+        if after.is_none() {
+            break;
+        }
+    }
 }

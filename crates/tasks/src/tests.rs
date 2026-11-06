@@ -356,18 +356,12 @@ async fn runtime() -> TaskRuntime {
     let connection = Database::connect("sqlite::memory:")
         .await
         .expect("sqlite memory database should connect");
-    let database = pioneer_sqlite::SqliteDatabase::from_single_connection(connection.clone());
-    let migration = database
-        .begin()
-        .await
-        .expect("fixture migration transaction");
-    Migrator::up(&*migration, None)
+    // Bootstrap before publishing the store; migrations own their transactions
+    // and connection state while the writer executor serializes installation.
+    pioneer_sqlite::SqliteWriteExecutor::new(connection.clone())
+        .run_migrations::<Migrator>(pioneer_sqlite::SqliteWriteClass::Maintenance, None)
         .await
         .expect("migration should apply");
-    migration
-        .commit()
-        .await
-        .expect("fixture schema must commit");
     seed_task_test_workspace(&connection).await;
     let store = Arc::new(CrudStore::new(connection));
     TaskRuntime::new(store)
@@ -377,18 +371,12 @@ async fn runtime_with_review_config() -> TaskRuntime {
     let connection = Database::connect("sqlite::memory:")
         .await
         .expect("sqlite memory database should connect");
-    let database = pioneer_sqlite::SqliteDatabase::from_single_connection(connection.clone());
-    let migration = database
-        .begin()
-        .await
-        .expect("fixture migration transaction");
-    Migrator::up(&*migration, None)
+    // Bootstrap before publishing the store; migrations own their transactions
+    // and connection state while the writer executor serializes installation.
+    pioneer_sqlite::SqliteWriteExecutor::new(connection.clone())
+        .run_migrations::<Migrator>(pioneer_sqlite::SqliteWriteClass::Maintenance, None)
         .await
         .expect("migration should apply");
-    migration
-        .commit()
-        .await
-        .expect("fixture schema must commit");
     seed_task_test_workspace(&connection).await;
     let store = Arc::new(CrudStore::new(connection));
     TaskRuntime::new_with_config(
@@ -8763,4 +8751,329 @@ async fn compatibility_audit_error_repairs_healthy_work_before_returning_and_set
             .status,
         TaskOccurrenceStatus::Recovering
     );
+}
+
+// Owns assignment consumption regressions at the durable service boundary.
+#[tokio::test]
+async fn one_shot_replacement_after_prior_runs_is_consumed_once_via_both_inputs() {
+    for via_update in [false, true] {
+        let runtime = runtime().await;
+        let future = 4_000_000_000;
+        let created = runtime
+            .service()
+            .create_task(
+                TaskCreateContext::default(),
+                create_params(TaskTriggerSpec::ScheduledAt {
+                    scheduled_at: future,
+                    timezone: None,
+                    catch_up_policy: None,
+                }),
+            )
+            .await
+            .unwrap();
+        let task_id = created.task.id;
+        for (assignment, scheduled_at) in [10, 10].into_iter().enumerate() {
+            let trigger = TaskTriggerInput {
+                spec: TaskTriggerSpec::ScheduledAt {
+                    scheduled_at,
+                    timezone: None,
+                    catch_up_policy: None,
+                },
+            };
+            if via_update {
+                runtime
+                    .service()
+                    .update_task(
+                        TaskMutationContext::default(),
+                        TaskUpdateParams {
+                            task_id: task_id.clone(),
+                            trigger: Some(trigger),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
+            } else {
+                runtime
+                    .service()
+                    .reschedule_task(
+                        TaskMutationContext::default(),
+                        TaskRescheduleParams {
+                            task_id: task_id.clone(),
+                            trigger,
+                        },
+                    )
+                    .await
+                    .unwrap();
+            }
+            runtime.process_due_once(100).await.unwrap();
+            let state = runtime
+                .service()
+                .store()
+                .get_task(&task_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(state.runs.len(), assignment + 1);
+            assert_eq!(state.triggers[0].status, TaskTriggerStatus::Exhausted);
+            runtime.process_due_once(100).await.unwrap();
+            assert_eq!(
+                runtime
+                    .service()
+                    .store()
+                    .get_task(&task_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .runs,
+                state.runs
+            );
+        }
+        let paused = runtime
+            .service()
+            .pause_task(
+                TaskMutationContext::default(),
+                TaskPauseParams {
+                    task_id,
+                    reason: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            paused.schedule_outcome,
+            Some(pioneer_protocol::TaskPauseScheduleOutcome::NoFutureFirings)
+        );
+        assert_eq!(paused.triggers[0].status, TaskTriggerStatus::Exhausted);
+    }
+}
+
+#[tokio::test]
+async fn pause_running_recurring_task_preserves_run_and_resume_preserves_repetition() {
+    let runtime = runtime().await;
+    let spec = TaskTriggerSpec::Interval {
+        interval_seconds: 1800,
+        interval_anchor_at: Some(4_000_000_000),
+        catch_up_policy: None,
+    };
+    let created = runtime
+        .service()
+        .create_task(TaskCreateContext::default(), create_params(spec.clone()))
+        .await
+        .unwrap();
+    runtime.process_due_once(4_000_000_000).await.unwrap();
+    let state = runtime
+        .service()
+        .store()
+        .get_task(&created.task.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let run = &state.runs[0];
+    let handle = TaskExecutionHandle::new(
+        runtime.service().store(),
+        runtime.event_bus(),
+        created.task.id.clone(),
+        run.id.clone(),
+    );
+    handle.mark_started(4_000_000_000).await.unwrap();
+    let paused = runtime
+        .service()
+        .pause_task(
+            TaskMutationContext::default(),
+            TaskPauseParams {
+                task_id: created.task.id.clone(),
+                reason: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        paused.schedule_outcome,
+        Some(pioneer_protocol::TaskPauseScheduleOutcome::Paused)
+    );
+    assert_eq!(
+        runtime
+            .service()
+            .store()
+            .get_task_run(&run.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        TaskRunStatus::Running
+    );
+    handle.complete_run(None, 4_000_000_001).await.unwrap();
+    let resumed = runtime
+        .service()
+        .resume_task(
+            TaskMutationContext::default(),
+            TaskResumeParams {
+                task_id: created.task.id.clone(),
+                reason: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(resumed.triggers[0].spec, spec);
+    assert_eq!(resumed.triggers[0].status, TaskTriggerStatus::Active);
+    assert!(resumed.triggers[0].next_fire_at.is_some());
+}
+
+#[tokio::test]
+async fn manual_queue_waits_for_scheduled_run_and_completion_keeps_next_fire() {
+    let runtime = runtime().await;
+    let created = runtime
+        .service()
+        .create_task(
+            TaskCreateContext::default(),
+            create_params(TaskTriggerSpec::Interval {
+                interval_seconds: 1800,
+                interval_anchor_at: Some(4_000_000_000),
+                catch_up_policy: None,
+            }),
+        )
+        .await
+        .unwrap();
+    runtime.process_due_once(4_000_000_000).await.unwrap();
+    let store = runtime.service().store();
+    let before = store.get_task(&created.task.id).await.unwrap().unwrap();
+    let scheduled = &before.runs[0];
+    let scheduled_handle = TaskExecutionHandle::new(
+        store.clone(),
+        runtime.event_bus(),
+        created.task.id.clone(),
+        scheduled.id.clone(),
+    );
+    scheduled_handle.mark_started(1).await.unwrap();
+    // Seed an ordinary manual queue occurrence. API admission and action replay
+    // are owned by the CLI regression; this fixture owns dispatch/terminal policy.
+    let mut manual = scheduled.clone();
+    manual.id = "M12345678901234567890".to_owned();
+    manual.trigger_id = None;
+    manual.run_group_id = "G12345678901234567890".to_owned();
+    manual.run_number = 2;
+    manual.ready_at = Some(1);
+    manual.created_at = 1;
+    let actor = store
+        .get_task_actor_contract(&created.task.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let occurrence = crate::actor_contract::build_occurrence_contract(
+        &before.task,
+        &actor,
+        &manual.id,
+        None,
+        "manual:fixture".to_owned(),
+        2,
+        1,
+    )
+    .unwrap();
+    store
+        .append_task_events(
+            vec![
+                TaskEventPayload::RunCreated {
+                    run: manual.clone(),
+                    agent_spec: None,
+                },
+                TaskEventPayload::TaskQueued {
+                    task_id: created.task.id.clone(),
+                    run_id: Some(manual.id.clone()),
+                },
+            ],
+            1,
+        )
+        .await
+        .unwrap();
+    store
+        .upsert_task_occurrence_contract(&occurrence, 1)
+        .await
+        .unwrap();
+    // A scheduler plan prepared before manual admission must not reuse its
+    // run number/generation or consume the scheduled fire on a stale write.
+    let mut stale = manual.clone();
+    stale.id = "S12345678901234567890".to_owned();
+    stale.trigger_id = Some(before.triggers[0].id.clone());
+    let stale_contract = crate::actor_contract::build_occurrence_contract(
+        &before.task,
+        &actor,
+        &stale.id,
+        stale.trigger_id.as_deref(),
+        "scheduled:stale".to_owned(),
+        2,
+        4_000_001_800,
+    )
+    .unwrap();
+    let mut advanced = before.triggers[0].clone();
+    advanced.last_fire_at = Some(4_000_001_800);
+    advanced.next_fire_at = Some(4_000_003_600);
+    let appended = store
+        .append_due_trigger_task_events(
+            &before.triggers[0],
+            4_000_001_800,
+            vec![
+                TaskEventPayload::RunCreated {
+                    run: stale.clone(),
+                    agent_spec: None,
+                },
+                TaskEventPayload::TaskQueued {
+                    task_id: created.task.id.clone(),
+                    run_id: Some(stale.id.clone()),
+                },
+                TaskEventPayload::TaskRescheduled {
+                    task_id: created.task.id.clone(),
+                    trigger: advanced,
+                    rescheduled_at: 4_000_001_800,
+                    reason: TaskRescheduleReason::TriggerFired,
+                },
+            ],
+            vec![stale_contract],
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    assert!(appended.is_empty());
+    assert!(store.get_task_run(&stale.id).await.unwrap().is_none());
+    assert_eq!(
+        store
+            .get_task(&created.task.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .triggers,
+        before.triggers
+    );
+    runtime
+        .register_executor(Arc::new(CompletingSystemExecutor))
+        .await;
+    runtime.process_due_once(4_000_000_000).await.unwrap();
+    assert_eq!(
+        store
+            .get_task_run(&manual.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        TaskRunStatus::Queued
+    );
+    assert_eq!(
+        store
+            .get_task_run(&scheduled.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        TaskRunStatus::Running
+    );
+    scheduled_handle.complete_run(None, 2).await.unwrap();
+    runtime.process_due_once(4_000_000_000).await.unwrap();
+    let after = store.get_task(&created.task.id).await.unwrap().unwrap();
+    assert_eq!(after.runs.last().unwrap().status, TaskRunStatus::Succeeded);
+    assert_eq!(after.triggers[0].spec, before.triggers[0].spec);
+    assert_eq!(
+        after.triggers[0].next_fire_at,
+        before.triggers[0].next_fire_at
+    );
+    assert_eq!(after.task.status, TaskStatus::Scheduled);
 }

@@ -1191,16 +1191,14 @@ impl ClientFfiRuntime {
         let request = serde_json::from_str::<ClientActiveThreadOpenRequest>(input_json)
             .map_err(|_| "invalid active thread open request".to_owned())?;
 
-        active_thread::open_thread(&self.core, self.core.transport_runtime(), request)
-            .map_err(|error| format!("{error:#}"))
+        active_thread::open_thread(&self.core, request).map_err(|error| format!("{error:#}"))
     }
 
     fn active_thread_open_by_id(&self, input_json: &str) -> Result<(), String> {
         let request = serde_json::from_str::<ClientActiveThreadOpenByIdRequest>(input_json)
             .map_err(|_| "invalid active thread open by id request".to_owned())?;
 
-        active_thread::open_thread_by_id(&self.core, self.core.transport_runtime(), request)
-            .map_err(|error| format!("{error:#}"))
+        active_thread::open_thread_by_id(&self.core, request).map_err(|error| format!("{error:#}"))
     }
 
     fn active_thread_open_or_create_new(&self, input_json: &str) -> Result<String, String> {

@@ -691,7 +691,7 @@ mod tests {
             test_support::{ThreadPorts, binding_router, install_thread_timeline},
             thread::{ThreadView, ThreadViewConfig},
         };
-        use gpui_kit::{component::Root, prelude::*, *};
+        use gpui_kit::{component::Root, *};
         use pioneer_client::{core::ClientCore, timeline::semantic::TopLevelPageMergeMode};
         use std::sync::Arc;
         cx.update(gpui_kit::init);

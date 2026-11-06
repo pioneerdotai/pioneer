@@ -532,6 +532,25 @@ pub struct SqliteDatabase {
 }
 
 impl SqliteDatabase {
+    /// Runtime-local, coalesced hints shared by all scopes and store wrappers.
+    /// Domain owners use stable names and subscribe independently.
+    pub fn work_signal(&self, domain: &'static str) -> crate::WorkSignal {
+        self.writer.work_signal(domain)
+    }
+
+    pub(crate) async fn settle_dispatched_writes(&self) -> Result<(), DbErr> {
+        // A control fence, not a domain query. The single physical writer
+        // executes it after earlier dispatched commands (including rollback).
+        // This is used only following an unknown mutation outcome.
+        self.writer_connection()
+            .query_one_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT 1".to_owned(),
+            ))
+            .await?;
+        Ok(())
+    }
+
     /// Stable across scheduling-class clones. Intended for process-local test
     /// instrumentation; it conveys no database authority or durable identity.
     #[doc(hidden)]

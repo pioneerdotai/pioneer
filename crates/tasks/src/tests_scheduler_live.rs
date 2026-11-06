@@ -4,6 +4,23 @@ use crate::reconciliation::TaskStartupReconciler;
 use crate::scheduler::TaskScheduler;
 use sea_orm::{ColumnTrait, QueryFilter};
 
+async fn drain_immediate_reconciliation(reconciler: &TaskStartupReconciler, now: i64) {
+    // Bootstrap occurrence seeding has its own finite continuation. Finish it
+    // before asserting that the owner can park on a run's lease or error retry.
+    for _ in 0..16 {
+        if reconciler
+            .next_wake_deadline(now)
+            .await
+            .unwrap()
+            .is_none_or(|at| at > now)
+        {
+            return;
+        }
+        reconciler.reconcile(now).await.unwrap();
+    }
+    panic!("initial reconciliation did not finish its bounded work");
+}
+
 #[tokio::test]
 async fn due_run_page_filters_future_work_before_limit_and_rotates() {
     let runtime = runtime().await;
@@ -32,7 +49,7 @@ async fn due_run_page_filters_future_work_before_limit_and_rotates() {
         .col_expr(
             pioneer_entity::task_run::Column::ReadyAt,
             sea_orm::sea_query::Expr::value(
-                chrono::DateTime::from_timestamp(now + 1000, 0)
+                chrono::DateTime::from_timestamp(now + 1000, 500_000_000)
                     .unwrap()
                     .fixed_offset(),
             ),
@@ -41,6 +58,26 @@ async fn due_run_page_filters_future_work_before_limit_and_rotates() {
         .await
         .unwrap();
     let store = runtime.service().store().with_maintenance_access();
+    assert_eq!(
+        store.next_queued_task_ready_deadline(now).await.unwrap(),
+        Some(now + 1001)
+    );
+    assert!(
+        !store
+            .list_scheduler_due_task_runs(now + 1000, None, 10)
+            .await
+            .unwrap()
+            .iter()
+            .any(|run| run.id == runs[0].id)
+    );
+    assert!(
+        store
+            .list_scheduler_due_task_runs(now + 1001, None, 10)
+            .await
+            .unwrap()
+            .iter()
+            .any(|run| run.id == runs[0].id)
+    );
     let first = store
         .list_scheduler_due_task_runs(now, None, 1)
         .await
@@ -535,7 +572,10 @@ async fn due_trigger_keyset_visits_equal_timestamps_before_wrap() {
 
 // Persistent dormant-row failure must retain an error without suppressing
 // independently owned recovery on either startup or a later live pass.
-struct DormantIsolationExecutor(Arc<std::sync::atomic::AtomicUsize>);
+struct DormantIsolationExecutor(
+    Arc<std::sync::atomic::AtomicUsize>,
+    Option<Arc<std::sync::atomic::AtomicBool>>,
+);
 #[async_trait::async_trait]
 impl TaskExecutor for DormantIsolationExecutor {
     fn kind(&self) -> TaskExecutorKind {
@@ -569,6 +609,13 @@ impl TaskExecutor for DormantIsolationExecutor {
         _handle: TaskExecutionHandle,
     ) -> TaskRuntimeResult<TaskExecutorRecoveryOutcome> {
         self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self
+            .1
+            .as_ref()
+            .is_some_and(|fail| fail.load(Ordering::SeqCst))
+        {
+            anyhow::bail!("injected waiting-review recovery storage failure");
+        }
         Ok(TaskExecutorRecoveryOutcome::LeftUnchanged)
     }
 }
@@ -609,7 +656,7 @@ async fn dormant_append_poison_keeps_error_while_healthy_inflight_recovery_proce
     let count = Arc::new(AtomicUsize::new(0));
     let executors = Arc::new(TaskExecutorRegistry::new());
     executors
-        .register(Arc::new(DormantIsolationExecutor(count.clone())))
+        .register(Arc::new(DormantIsolationExecutor(count.clone(), None)))
         .await;
     let bus = runtime.event_bus();
     let scheduler = TaskScheduler::new(runtime.service().store(), bus.clone(), executors.clone());
@@ -765,8 +812,12 @@ async fn foreign_expired_cache_refresh_replaces_deadlines_without_rebuild() {
         }
         scheduler.process_due_once(4_000_000_000).await.unwrap();
         assert_eq!(
-            scheduler.next_sleep_duration(4_000_000_000).await,
-            crate::service::LIVE_RECONCILIATION_INTERVAL,
+            scheduler.next_wake_deadline(4_000_000_000).await.unwrap(),
+            if change == "later" {
+                Some(4_000_000_040)
+            } else {
+                None
+            },
             "{change}"
         );
         if change == "later" {
@@ -833,8 +884,8 @@ async fn foreign_expired_cache_refresh_replaces_deadlines_without_rebuild() {
     // a local hint, so only expired-cache addressed refresh can remove the entry.
     scheduler.process_due_once(4_000_000_000).await.unwrap();
     assert_eq!(
-        scheduler.next_sleep_duration(4_000_000_000).await,
-        crate::service::LIVE_RECONCILIATION_INTERVAL
+        scheduler.next_wake_deadline(4_000_000_000).await.unwrap(),
+        None
     );
 }
 
@@ -941,7 +992,7 @@ async fn malformed_discovery_rows_preserve_executor_dispatch_and_terminal_repair
     let count = Arc::new(AtomicUsize::new(0));
     let executors = Arc::new(TaskExecutorRegistry::new());
     executors
-        .register(Arc::new(DormantIsolationExecutor(count.clone())))
+        .register(Arc::new(DormantIsolationExecutor(count.clone(), None)))
         .await;
     let scheduler = TaskScheduler::new(store.clone(), runtime.event_bus(), executors.clone());
     let reconciler = TaskStartupReconciler::new(
@@ -1101,8 +1152,8 @@ async fn finite_due_trigger_pass_returns_behind_cursor_under_suffix_growth() {
     );
     scheduler.process_due_once(now).await.unwrap();
     assert_eq!(
-        scheduler.next_sleep_duration(now).await,
-        Duration::ZERO,
+        scheduler.next_wake_deadline(now).await.unwrap(),
+        Some(now),
         "an overdue cached backlog preserves base immediate scheduling between finite pages"
     );
     let missed = runtime
@@ -1602,13 +1653,14 @@ async fn waiting_review_with_current_execution_lease_does_not_recover_or_wake() 
     let calls = Arc::new(AtomicUsize::new(0));
     let executors = Arc::new(TaskExecutorRegistry::new());
     executors
-        .register(Arc::new(DormantIsolationExecutor(calls.clone())))
+        .register(Arc::new(DormantIsolationExecutor(calls.clone(), None)))
         .await;
     let bus = Arc::new(crate::event_bus::TaskEventBus::new());
     let scheduler = TaskScheduler::new(store.clone(), bus.clone(), executors.clone());
     let reconciler =
         TaskStartupReconciler::new(store.clone(), bus.clone(), executors, scheduler.handle());
     reconciler.reconcile(now).await.unwrap();
+    drain_immediate_reconciliation(&reconciler, now).await;
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     let lease = store
         .load_execution_for_run(&run.id)
@@ -1637,4 +1689,209 @@ async fn waiting_review_with_current_execution_lease_does_not_recover_or_wake() 
                 .is_err()
         );
     }
+    // A normal heartbeat may shorten the wall-clock lease. It must wake the
+    // parked owner and replace its cached lease without waiting for that lease.
+    let db = store.database_connection();
+    let mut wake = db.work_signal("tasks.lifecycle").subscribe();
+    wake.begin_pass(&db).await.unwrap();
+    store
+        .heartbeat_execution(&lease.id, now + 12, Some(now + 20))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        std::future::Future::poll(
+            std::pin::pin!(wake.wait(None)),
+            &mut std::task::Context::from_waker(std::task::Waker::noop()),
+        )
+        .is_ready()
+    );
+    reconciler.reconcile(now + 13).await.unwrap();
+    assert_eq!(
+        reconciler.next_wake_deadline(now + 13).await.unwrap(),
+        Some(now + 20)
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    wake.begin_pass(&db).await.unwrap();
+    store
+        .heartbeat_execution(&lease.id, now + 14, Some(now + 21))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        std::future::Future::poll(
+            std::pin::pin!(wake.wait(None)),
+            &mut std::task::Context::from_waker(std::task::Waker::noop()),
+        )
+        .is_pending(),
+        "ordinary extension stays quiet"
+    );
+    store
+        .heartbeat_execution(&lease.id, now + 14, Some(now + 20))
+        .await
+        .unwrap()
+        .unwrap();
+    reconciler.reconcile(now + 20).await.unwrap();
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "durable earlier lease releases recovery"
+    );
+}
+
+#[tokio::test]
+async fn task_commit_wakes_independent_runtime_subscribers_without_bus_delivery() {
+    let runtime = runtime().await;
+    let database = runtime.service().store().database_connection();
+    // Separate facade instances share the physical runtime, not a TaskEventBus.
+    let observer = pioneer_crud::CrudStore::new(database.clone());
+    let signal = observer
+        .database_connection()
+        .work_signal("tasks.scheduler");
+    let mut first = signal.subscribe();
+    let mut second = signal.subscribe();
+    first.begin_pass(&database).await.unwrap();
+    second.begin_pass(&database).await.unwrap();
+    runtime
+        .service()
+        .create_task(
+            TaskCreateContext::default(),
+            create_params(TaskTriggerSpec::Immediate),
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        first.changed().await;
+        second.changed().await;
+    })
+    .await
+    .expect("each independent consumer must see the durable Task commit");
+}
+
+#[tokio::test]
+async fn identical_actor_contract_upsert_does_not_reopen_scheduler_discovery() {
+    let runtime = runtime().await;
+    let task = runtime
+        .service()
+        .create_task(
+            TaskCreateContext::default(),
+            create_params(TaskTriggerSpec::Immediate),
+        )
+        .await
+        .unwrap();
+    let store = runtime.service().store();
+    let contract = store
+        .get_task_actor_contract(&task.task.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let database = store.database_connection();
+    let mut changes = database.work_signal("tasks.scheduler").subscribe();
+    changes.begin_pass(&database).await.unwrap();
+    let other_facade = pioneer_crud::CrudStore::new(database.clone());
+    other_facade
+        .upsert_task_actor_contract(&contract, task.task.created_at)
+        .await
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), changes.changed())
+            .await
+            .is_err(),
+        "an immutable idempotent replay must not restart empty scheduler discovery"
+    );
+}
+
+#[tokio::test]
+async fn waiting_review_recovery_error_retries_without_another_recovery_event() {
+    use std::sync::atomic::AtomicBool;
+    let runtime = runtime().await;
+    let store = runtime.service().store();
+    let created = runtime
+        .service()
+        .create_task(
+            TaskCreateContext::default(),
+            create_params(TaskTriggerSpec::Immediate),
+        )
+        .await
+        .unwrap();
+    let run = created.run.unwrap();
+    let now = run.created_at;
+    TaskExecutionHandle::new(
+        store.clone(),
+        runtime.event_bus(),
+        created.task.id,
+        run.id.clone(),
+    )
+    .mark_started(now)
+    .await
+    .unwrap();
+    // A durable waiting-review run with no current execution lease needs the
+    // executor to reconstruct review work; no candidate/auto-accept clock exists.
+    pioneer_entity::task_run::Entity::update_many()
+        .filter(pioneer_entity::task_run::Column::Id.eq(&run.id))
+        .col_expr(
+            pioneer_entity::task_run::Column::Status,
+            sea_orm::sea_query::Expr::value("waiting_review"),
+        )
+        .exec(&store.database_connection())
+        .await
+        .unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let fail = Arc::new(AtomicBool::new(true));
+    let executors = Arc::new(TaskExecutorRegistry::new());
+    executors
+        .register(Arc::new(DormantIsolationExecutor(
+            calls.clone(),
+            Some(fail.clone()),
+        )))
+        .await;
+    let bus = runtime.event_bus();
+    let scheduler = TaskScheduler::new(store.clone(), bus.clone(), executors.clone());
+    let reconciler = TaskStartupReconciler::new(store.clone(), bus, executors, scheduler.handle());
+    assert!(reconciler.reconcile(now).await.is_err());
+    drain_immediate_reconciliation(&reconciler, now).await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        reconciler.next_wake_deadline(now).await.unwrap(),
+        Some(now + 5)
+    );
+    store
+        .database_connection()
+        .work_signal("tasks.lifecycle")
+        .notify();
+    reconciler.reconcile(now + 1).await.unwrap();
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "backoff cannot be bypassed by its own event"
+    );
+    assert!(reconciler.reconcile(now + 5).await.is_err());
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    let recovered_events = store
+        .get_task_events(&run.task_id, None)
+        .await
+        .unwrap()
+        .events
+        .into_iter()
+        .filter(|event| {
+            matches!(&event.payload,
+            TaskEventPayload::TaskRecovered { run_id: Some(id), .. } if id == &run.id)
+        })
+        .count();
+    assert_eq!(
+        recovered_events, 1,
+        "the existing recovery event does not prove executor success"
+    );
+    assert_eq!(
+        reconciler.next_wake_deadline(now + 5).await.unwrap(),
+        Some(now + 10)
+    );
+    fail.store(false, Ordering::SeqCst);
+    reconciler.reconcile(now + 10).await.unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+    assert_eq!(
+        store.get_task_run(&run.id).await.unwrap().unwrap().status,
+        TaskRunStatus::WaitingReview
+    );
+    assert_eq!(reconciler.next_wake_deadline(now + 10).await.unwrap(), None);
 }

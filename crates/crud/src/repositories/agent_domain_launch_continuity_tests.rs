@@ -659,3 +659,231 @@ async fn new_workspace_executor_is_not_added_to_an_old_parent_grant() {
             .is_none()
     );
 }
+
+#[tokio::test]
+async fn capsule_route_commit_revalidates_saved_receipt_against_current_route() {
+    let store = store().await;
+    sync(&store, true, "original").await;
+    let graph = graph(&store, "Ecapsulecommit1234567", None).await;
+    store
+        .commit_agent_execution_graph(graph.clone())
+        .await
+        .unwrap();
+    let db = store.database_connection();
+    let execution = load_agent_execution(&db, &graph.child_execution.id)
+        .await
+        .unwrap()
+        .unwrap();
+    db.execute_unprepared("PRAGMA foreign_keys=OFF")
+        .await
+        .unwrap();
+    // SQL seeds the already-authorized route state; the subject is the actual
+    // transactional revalidation called by commit_agent_action, not insertion.
+    db.execute_unprepared("INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES('destination','continuity-workspace','','agent','m','p','idle','agent','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)").await.unwrap();
+    db.execute_unprepared("INSERT INTO agent_delegation_route(id,source_execution_id,destination_thread_id,route_kind,grant_fingerprint,status,source_capsule_id,destination_capsule_id,source_workspace_id,destination_workspace_id,source_identity_id,allowed_actions_json,disclosure_json) VALUES('route','finished-creator','destination','capsule_bound','fingerprint','active','continuity-root','destination','continuity-workspace','continuity-workspace','different-creator-identity','[\"send_message\"]','{\"text\":true}')").await.unwrap();
+    let now = utc_now();
+    let input = AgentCommitInput {
+        mutation_kind: "send_message".into(), idempotency_key: "commit-key".into(),
+        request_fingerprint: "request".into(), actor_identity_id: execution.agent_identity_id.clone(),
+        action: AgentActionInput { id: "action".into(), execution_id: execution.id.clone(),
+            action_kind: "send_message".into(), idempotency_key: "commit-key".into(), request_fingerprint: "request".into(), now },
+        receipt_id: "receipt".into(), outbox_id: "outbox".into(), action_response_json: None, receipt_response_json: None,
+        route_receipt_json: Some(serde_json::json!({"routeId":"route","routeGeneration":1,"sourcePolicyGeneration":1,"destinationPolicyGeneration":1,"action":"send_message"}).to_string()),
+        outbox_payload_json: serde_json::json!({"route_id":"route","destination_thread_id":"destination"}).to_string(),
+        policy_fingerprint: "policy".into(), execution_grant_fingerprint: graph.grant.grant_fingerprint.clone(), execution_grant_policy_generation: 1,
+        source_scope_id: "continuity-root".into(), destination_scope_id: Some("destination".into()),
+        subject_role_key: "thread_agent".into(), authorized_resource_action: "thread.message.send".into(), source_policy_generation: 1,
+        destination_policy_generation: Some(1), route_generation: Some(1), disclosure_class: "routed_text".into(),
+        expected_execution_generation: 1, expected_current_identity_source_revision: execution.identity_source_revision,
+        expected_current_identity_source_fingerprint: execution.identity_source_fingerprint.clone(), expected_attempt_generation: 1,
+        expected_policy_generation: 1, requires_cross_capsule_route: true, resource: None,
+    };
+    let txn = db.begin().await.unwrap();
+    revalidate_agent_route_for_commit(&txn, &input, &execution)
+        .await
+        .unwrap();
+    txn.rollback().await.unwrap();
+    for mutation in [
+        "status='revoked'",
+        "expires_at='2000-01-01T00:00:00Z'",
+        "route_generation=2",
+        "source_policy_generation=2",
+        "destination_policy_generation=2",
+        "disclosure_json='{}'",
+        "allowed_actions_json='[]'",
+        "source_capsule_id='foreign'",
+        "destination_thread_id='foreign'",
+        "route_kind='execution_bound'",
+        "route_kind='identity_bound'",
+    ] {
+        let txn = db.begin().await.unwrap();
+        txn.execute_unprepared(&format!(
+            "UPDATE agent_delegation_route SET {mutation} WHERE id='route'"
+        ))
+        .await
+        .unwrap();
+        assert!(
+            revalidate_agent_route_for_commit(&txn, &input, &execution)
+                .await
+                .is_err(),
+            "accepted {mutation}"
+        );
+        txn.rollback().await.unwrap();
+    }
+}
+
+// TaskRuntime::resume_task on an already active, nonblocked Task calls this
+// durable boundary with no Task events. No caller dispatch/publish follows it.
+#[tokio::test]
+async fn empty_task_resume_action_wakes_control_after_commit_and_exact_replay_parks() {
+    use futures_util::FutureExt;
+
+    let store = store().await;
+    sync(&store, true, "resume-action").await;
+    let mut graph = graph(&store, "Eresumeaction12345678", None).await;
+    let db = store.database_connection();
+    let generation = crate::repositories::policy_generation::current_policy_generation_on(&db)
+        .await
+        .unwrap()
+        .get() as i64;
+    let fingerprint = "a".repeat(64);
+    let mut grant: serde_json::Value = serde_json::from_str(&graph.grant.grant_json).unwrap();
+    grant["agent_authorization_fingerprint"] = serde_json::json!(fingerprint);
+    grant["role_key"] = serde_json::json!("owner");
+    grant["agent_policy_generation"] = serde_json::json!(generation);
+    grant["allowed_actions"] = serde_json::json!(["task_schedule_manage"]);
+    graph.grant.grant_json = grant.to_string();
+    graph.grant.grant_fingerprint =
+        agent_execution_grant_fingerprint(&graph.grant.grant_json).unwrap();
+    store
+        .commit_agent_execution_graph(graph.clone())
+        .await
+        .unwrap();
+
+    let mut task = crate::tests::sample_task(graph.contract_now);
+    task.workspace_id = "continuity-workspace".into();
+    store
+        .append_task_events(
+            vec![crate::TaskEventPayload::TaskCreated { task: task.clone() }],
+            graph.contract_now,
+        )
+        .await
+        .unwrap();
+    let before = store.get_task(&task.id).await.unwrap().unwrap();
+    assert_eq!(before.task.status, pioneer_protocol::TaskStatus::Scheduled);
+    assert!(before.triggers.is_empty());
+    let action = AgentCommitInput {
+        mutation_kind: "control_task".into(),
+        idempotency_key: "resume-active-task".into(),
+        request_fingerprint: "resume-request".into(),
+        actor_identity_id: graph.identity.id.clone(),
+        action: AgentActionInput {
+            id: canonical_agent_id('A', "resume-active-task"),
+            execution_id: graph.child_execution.id.clone(),
+            action_kind: "control_task".into(),
+            idempotency_key: "resume-active-task".into(),
+            request_fingerprint: "resume-request".into(),
+            now: graph.child_execution.now,
+        },
+        receipt_id: canonical_agent_id('R', "resume-active-task"),
+        outbox_id: canonical_agent_id('O', "resume-active-task"),
+        action_response_json: Some("{}".into()),
+        receipt_response_json: Some("{}".into()),
+        route_receipt_json: None,
+        outbox_payload_json: "{}".into(),
+        policy_fingerprint: fingerprint.clone(),
+        execution_grant_fingerprint: fingerprint,
+        execution_grant_policy_generation: generation,
+        source_scope_id: graph.child_execution.home_root_thread_id.clone(),
+        destination_scope_id: None,
+        subject_role_key: "owner".into(),
+        authorized_resource_action: "task_schedule_manage".into(),
+        source_policy_generation: generation,
+        destination_policy_generation: None,
+        route_generation: None,
+        disclosure_class: "source_capsule".into(),
+        expected_execution_generation: graph.child_execution.execution_generation,
+        expected_current_identity_source_revision: graph.identity.source_revision,
+        expected_current_identity_source_fingerprint: graph.identity.source_fingerprint.clone(),
+        expected_attempt_generation: 1,
+        expected_policy_generation: generation,
+        requires_cross_capsule_route: false,
+        resource: None,
+    };
+    let mut control = db.work_signal("gateway.control").subscribe();
+    control.begin_pass(&db).await.unwrap();
+    assert!(
+        load_agent_action_outbox(&db, &action.action.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(control.wait(None).now_or_never().is_none());
+
+    let appended = store
+        .append_task_events_with_agent_action(Vec::new(), graph.contract_now, action.clone())
+        .await
+        .unwrap();
+    assert!(appended.is_empty());
+    assert!(
+        control.wait(None).now_or_never().is_some(),
+        "new action-only commit must wake a parked control consumer"
+    );
+    let committed = agent_action::Entity::find_by_id(action.action.id.clone())
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(committed.status, "committed");
+    let receipt = load_agent_action_receipt(&db, &action.action.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(receipt.id, action.receipt_id);
+    let outbox = load_agent_action_outbox(&db, &action.action.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(outbox.id, action.outbox_id);
+    assert_eq!(outbox.status, "pending");
+    assert_eq!(outbox.attempts, 0);
+    assert_eq!(
+        store.get_task(&task.id).await.unwrap().unwrap().task,
+        before.task
+    );
+
+    control.begin_pass(&db).await.unwrap();
+    assert!(
+        store
+            .append_task_events_with_agent_action(Vec::new(), graph.contract_now, action.clone())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        control.wait(None).now_or_never().is_none(),
+        "exact replay must leave control parked"
+    );
+    assert_eq!(
+        load_agent_action_receipt(&db, &action.action.id)
+            .await
+            .unwrap()
+            .unwrap(),
+        receipt
+    );
+    assert_eq!(
+        load_agent_action_outbox(&db, &action.action.id)
+            .await
+            .unwrap()
+            .unwrap(),
+        outbox
+    );
+    assert_eq!(agent_action::Entity::find().count(&db).await.unwrap(), 1);
+    assert_eq!(
+        agent_domain_commit::Entity::find()
+            .count(&db)
+            .await
+            .unwrap(),
+        1
+    );
+}

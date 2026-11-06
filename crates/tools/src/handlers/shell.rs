@@ -16,7 +16,6 @@ use async_trait::async_trait;
 use pioneer_protocol::{SandboxBackendKind, TurnExecutionSecuritySnapshot};
 use std::collections::{BTreeMap, HashMap};
 use std::future::pending;
-use std::io;
 use std::path::Path;
 use std::process::{ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1413,7 +1412,7 @@ fn configure_process_group(command: &mut Command) -> Result<(), ToolError> {
         unsafe {
             command.pre_exec(|| {
                 if libc::setpgid(0, 0) != 0 {
-                    return Err(io::Error::last_os_error());
+                    return Err(std::io::Error::last_os_error());
                 }
                 Ok(())
             });

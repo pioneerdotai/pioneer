@@ -36,7 +36,7 @@ Before using durable task tools, decide what kind of task work this is.
 
 1. If work should run later or repeatedly, use `task_create` to create a scheduled, interval, or cron task with self-contained future-run instructions.
 2. If existing task behavior must change, inspect it first with `task_get` or `task_list`.
-3. If only the schedule changes, use `task_reschedule` when available.
+3. For an extra run now, use `task_run_now` when available. To replace the schedule, use `task_reschedule`.
 4. If delivery changes, patch only delivery and verify it.
 5. If the task should be temporarily stopped or restarted, use pause/resume tools when visible.
 6. If the user asks to stop permanently while letting current work finish, use `task_finish` when visible. Use `task_cancel` when the user wants cancellation under its existing interruption rules.
@@ -52,7 +52,7 @@ For an inbound HTTP webhook, create an agent task with `trigger: {"kind":"extern
 Keep this file in context for normal durable task work. Load detailed references only for the matching situation:
 
 - Read `references/tool-schemas.md` before constructing non-trivial durable task payloads, after schema errors, or when exact field names matter.
-- Read `references/delivery-and-scheduled.md` before creating or updating scheduled/interval/cron tasks, changing delivery, choosing notification vs thread delivery, or diagnosing why a result did not appear in the main thread.
+- Read [references/delivery-and-scheduled.md](references/delivery-and-scheduled.md) before creating or updating scheduled/interval/cron tasks, requesting an extra run, pausing/resuming schedules, or changing delivery.
 - Read `references/troubleshooting.md` after task tool failures, missing final answers, hidden results, noisy recurring messages, delivery confusion, or stuck/stale tasks.
 
 For current-turn attached child agents, read `system:pioneer/subagents`.
@@ -139,7 +139,7 @@ After an update, verify the current task state with the tool result or `task_get
 
 Choose the operation from the user's intent:
 
-- `task_pause` temporarily stops future runs so the task can be resumed.
+- `task_pause` temporarily stops future schedule firings so the task can be resumed.
 - `task_cancel` cancels under the existing rules, including interruption of current work and restrictions on cancelling the current execution's own task or its ancestors.
 - `task_finish` permanently stops a task at the user's request. It prevents new runs and lets already started work finish with its results preserved and configured delivery. Use it when the user asks to stop the task while allowing current work to finish.
 

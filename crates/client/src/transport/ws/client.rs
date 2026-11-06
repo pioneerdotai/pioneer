@@ -189,10 +189,6 @@ pub enum GatewayWsCommand {
         payload: Vec<u8>,
         response_tx: JsonRpcResponseSender,
     },
-    VoiceBinaryChunk {
-        expected_connection: Option<u64>,
-        payload: super::voice_budget::QueuedVoiceAudio,
-    },
     Disconnect,
     DisconnectConnection {
         connection_id: u64,
@@ -224,9 +220,6 @@ enum ConnectionRpcCommand {
         payload: Vec<u8>,
         response_tx: JsonRpcResponseSender,
     },
-    VoiceBinaryChunk {
-        payload: super::voice_budget::QueuedVoiceAudio,
-    },
 }
 
 impl ConnectionRpcCommand {
@@ -241,7 +234,6 @@ impl ConnectionRpcCommand {
             Self::ArtifactBinaryUploadChunk { response_tx, .. } => {
                 let _ = response_tx.send(Err(crate::rpc::JsonRpcResponseError::transport(reason)));
             }
-            Self::VoiceBinaryChunk { .. } => {}
         }
     }
 }
@@ -601,21 +593,6 @@ async fn handle_command(
                 )));
             }
         }
-        GatewayWsCommand::VoiceBinaryChunk {
-            expected_connection,
-            payload,
-        } => {
-            let Some(connection_task) = connection_task.as_mut() else {
-                return true;
-            };
-
-            if expected_connection.is_some_and(|id| id != connection_task.connection_id) {
-                return true;
-            }
-            let _ = connection_task
-                .rpc_tx
-                .send(ConnectionRpcCommand::VoiceBinaryChunk { payload });
-        }
         GatewayWsCommand::Disconnect => {
             abort_connection_task(connection_task).await;
         }
@@ -834,38 +811,79 @@ impl WriterFrame {
 async fn connection_writer<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
     mut writer: futures_util::stream::SplitSink<tokio_tungstenite::WebSocketStream<S>, Message>,
     mut data: tokio::sync::mpsc::Receiver<WriterFrame>,
+    mut voice: tokio::sync::mpsc::Receiver<super::voice_budget::QueuedVoiceAudio>,
     mut control: tokio::sync::mpsc::Receiver<WriterFrame>,
     mut cancels: tokio::sync::mpsc::Receiver<WriterFrame>,
+    mut voice_cancels: tokio::sync::mpsc::Receiver<WriterFrame>,
     connection_id: u64,
 ) -> String {
     let mut prefer_cancel = true;
+    let mut fenced = std::collections::VecDeque::new();
     loop {
-        let frame = tokio::select! {
-            biased;
-            // Domain Cancel cannot consume or displace transport control.
-            frame = control.recv() => frame,
-            frame = async {
-                if prefer_cancel {
-                    tokio::select! {
-                        biased;
-                        frame = cancels.recv() => Either::Left(frame),
-                        frame = data.recv() => Either::Right(frame),
-                    }
-                } else {
-                    tokio::select! {
-                        biased;
-                        frame = data.recv() => Either::Right(frame),
-                        frame = cancels.recv() => Either::Left(frame),
-                    }
+        let cancel = async {
+            tokio::select! { frame = cancels.recv() => frame, frame = voice_cancels.recv() => frame }
+        };
+        tokio::pin!(cancel);
+        let from_fence = !fenced.is_empty();
+        let frame = if from_fence {
+            tokio::select! {
+                biased;
+                frame = control.recv() => frame,
+                frame = &mut cancel, if prefer_cancel => { prefer_cancel = false; frame },
+                frame = async { fenced.pop_front() } => { prefer_cancel = true; frame },
+            }
+        } else {
+            let ordinary = async {
+                tokio::select! {
+                    frame = voice.recv() => frame.map(WriterFrame::voice),
+                    frame = data.recv() => frame,
                 }
-            } => match frame {
-                Either::Left(frame) => { prefer_cancel = false; frame }
-                Either::Right(frame) => { prefer_cancel = true; frame }
-            },
+            };
+            tokio::pin!(ordinary);
+            tokio::select! {
+                biased;
+                // Domain Cancel cannot consume or displace transport control.
+                frame = control.recv() => frame,
+                frame = async {
+                    if prefer_cancel {
+                        tokio::select! {
+                            biased;
+                            frame = &mut cancel => Either::Left(frame),
+                            frame = &mut ordinary => Either::Right(frame),
+                        }
+                    } else {
+                        tokio::select! {
+                            biased;
+                            frame = &mut ordinary => Either::Right(frame),
+                            frame = &mut cancel => Either::Left(frame),
+                        }
+                    }
+                } => match frame {
+                    Either::Left(frame) => { prefer_cancel = false; frame }
+                    Either::Right(frame) => { prefer_cancel = true; frame }
+                },
+            }
         };
         let Some(frame) = frame else {
             return "websocket writer channel closed".to_owned();
         };
+        if !from_fence
+            && matches!(&frame.message, Message::Text(text)
+            if serde_json::from_str::<serde_json::Value>(text).ok()
+                .and_then(|v| v.get("method").and_then(|v| v.as_str()).map(str::to_owned))
+                .is_some_and(|method| method == pioneer_protocol::constants::methods::VOICE_SESSION_FINALIZE))
+        {
+            // Capture only the already admitted prefix. The voice budget still
+            // owns every payload while this bounded writer-local fence drains.
+            let prefix = voice.len();
+            for _ in 0..prefix {
+                if let Ok(payload) = voice.try_recv() {
+                    fenced.push_back(WriterFrame::voice(payload));
+                }
+            }
+            fenced.push_back(frame);
+            continue;
+        }
         let WriterFrame {
             message,
             request,
@@ -940,8 +958,20 @@ async fn monitor_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Un
     let (writer, mut reader) = stream.split();
     let (data_tx, data_rx) = tokio::sync::mpsc::channel(WRITER_HANDOFF_CAPACITY);
     let (control_tx, control_rx) = tokio::sync::mpsc::channel(WRITER_HANDOFF_CAPACITY);
-    let (cancel_tx, cancel_rx) = tokio::sync::mpsc::channel(WRITER_HANDOFF_CAPACITY);
-    let writer = connection_writer(writer, data_rx, control_rx, cancel_rx, connection_id);
+    let (cancel_tx, cancel_rx) = tokio::sync::mpsc::channel(1);
+    let (voice_cancel_tx, voice_cancel_rx) = tokio::sync::mpsc::channel(1);
+    let writer = connection_writer(
+        writer,
+        data_rx,
+        cancels
+            .voice
+            .take()
+            .expect("voice receiver owned by socket"),
+        control_rx,
+        cancel_rx,
+        voice_cancel_rx,
+        connection_id,
+    );
     tokio::pin!(writer);
     let mut ping_interval = tokio::time::interval(spec.timings.ping_interval);
     ping_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -955,8 +985,8 @@ async fn monitor_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Un
     };
 
     let _lifetime = SocketLifetime(receipt.clone());
-    // One connection-owned frame; its voice reservation follows it into the writer.
-    // Keep the FIFO stopped until admission, but renewals have independent ingress.
+    // One deferred Finalize frame. Audio bypasses this ordinary handoff;
+    // renewal and domain Cancel also retain independent ingress.
     let mut pending_data: Option<WriterFrame> = None;
     let mut prefer_commands = false;
     let mut prefer_cancels = true;
@@ -1015,14 +1045,14 @@ async fn monitor_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Un
                 if prefer_cancels {
                     tokio::select! {
                         biased;
-                        cancel = cancels.receiver.recv() => Either::Left(cancel),
+                        cancel = cancels.recv() => Either::Left(cancel),
                         input = &mut regular => Either::Right(input),
                     }
                 } else {
                     tokio::select! {
                         biased;
                         input = &mut regular => Either::Right(input),
-                        cancel = cancels.receiver.recv() => Either::Left(cancel),
+                        cancel = cancels.recv() => Either::Left(cancel),
                     }
                 }
             } => match input {
@@ -1033,8 +1063,11 @@ async fn monitor_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Un
                 // Same pending owner, before frame admission/claim. Final writer
                 // claim still checks physical/subscription/deadline/cancellation.
                 waiters.requests.insert(cancel.request_id, cancel.response.clone());
+                let voice_control = serde_json::from_str::<serde_json::Value>(&cancel.payload).ok()
+                    .is_some_and(|v| v["method"] == pioneer_protocol::constants::methods::VOICE_SESSION_CANCEL);
                 let frame = WriterFrame::new(Message::Text(cancel.payload.into()), Some(cancel.response.clone()));
-                if cancel_tx.try_send(frame).is_err() {
+                let handoff = if voice_control { &voice_cancel_tx } else { &cancel_tx };
+                if handoff.try_send(frame).is_err() {
                     let _ = cancel.response.send(Err(crate::rpc::JsonRpcResponseError::transport("websocket Cancel writer handoff full or closed")));
                 }
             }
@@ -1201,17 +1234,7 @@ async fn monitor_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Un
                             }
                         }
                     }
-                    Some(ConnectionRpcCommand::VoiceBinaryChunk { payload }) => {
-                        match data_tx.try_send(WriterFrame::voice(payload)) {
-                            Ok(()) => {}
-                            Err(tokio::sync::mpsc::error::TrySendError::Full(frame)) => {
-                                pending_data = Some(frame);
-                            }
-                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                                return Some("websocket voice writer handoff closed".to_owned());
-                            }
-                        }
-                    }
+
                     None => {
                         return Some(WEBSOCKET_COMMAND_CHANNEL_CLOSED_MESSAGE.to_owned());
                     }
@@ -1267,6 +1290,7 @@ mod tests {
         let (commands, mut command_rx) = work_channel(Boundary::ClientRpc);
         let (renewals, mut renewal_rx) = renewal_channel();
         let (receipt, cancels) = SocketReceipt::new(7);
+        let audio = receipt.clone();
         let task = tokio::spawn(async move {
             monitor_connection(
                 stream,
@@ -1340,14 +1364,12 @@ mod tests {
             rpc_rx.try_recv().is_err(),
             "renewal must retain the pending RPC"
         );
-        commands
-            .send(ConnectionRpcCommand::VoiceBinaryChunk {
-                payload: std::sync::Arc::new(
-                    super::super::voice_budget::VoiceTransportBudget::default(),
-                )
-                .admit(vec![1, 2, 3])
-                .unwrap(),
-            })
+        audio
+            .admit_voice(
+                std::sync::Arc::new(super::super::voice_budget::VoiceTransportBudget::default())
+                    .admit(vec![1, 2, 3])
+                    .unwrap(),
+            )
             .unwrap();
         loop {
             if let Message::Binary(bytes) = peer.next().await.unwrap().unwrap() {
@@ -1514,7 +1536,6 @@ impl WsQueued for GatewayWsCommand {
             | Self::ArtifactBinaryUploadChunk { payload, .. } => {
                 QueueBytes::Known(payload.len() as u64)
             }
-            Self::VoiceBinaryChunk { payload, .. } => QueueBytes::Known(payload.len() as u64),
             _ => QueueBytes::Unsupported,
         }
     }
@@ -1528,7 +1549,6 @@ impl WsQueued for ConnectionRpcCommand {
             | Self::ArtifactBinaryUploadChunk { payload, .. } => {
                 QueueBytes::Known(payload.len() as u64)
             }
-            Self::VoiceBinaryChunk { payload, .. } => QueueBytes::Known(payload.len() as u64),
             _ => QueueBytes::Unsupported,
         }
     }

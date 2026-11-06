@@ -288,7 +288,8 @@ impl AgentActionRuntimeBinding {
                 || projection.source_capsule_id != execution.home_root_thread_id
                 || projection.source_policy_generation != route_policy_generation
                 || projection.destination_policy_generation != route_policy_generation
-                || projection.source_agent_identity_id != facts.identity.id
+                || (projection.kind != pioneer_protocol::AgentRouteKind::CapsuleBound
+                    && projection.source_agent_identity_id != facts.identity.id)
             {
                 continue;
             }
@@ -3177,6 +3178,8 @@ pub(crate) async fn process_due_agent_action_outbox(
 
 #[derive(Debug, Default)]
 pub(crate) struct AgentActionOutboxProcessingBatch {
+    /// Continue from the raw claim quantum, not the number of dispatched rows.
+    pub has_more: bool,
     pub delivered: usize,
     pub errors: Vec<anyhow::Error>,
 }
@@ -3189,11 +3192,12 @@ pub(super) async fn process_claimed_agent_action_outbox<C, F, Fut>(
     mut dispatch: F,
 ) -> AgentActionOutboxProcessingBatch
 where
-    C: sea_orm::ConnectionTrait,
+    C: pioneer_crud::GatewayControlConnection,
     F: FnMut(pioneer_entity::agent_action_outbox::Model) -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<AgentActionOutboxDispatch>>,
 {
     let mut output = AgentActionOutboxProcessingBatch {
+        has_more: batch.has_more,
         delivered: 0,
         errors: batch.errors,
     };
@@ -6087,7 +6091,7 @@ impl AgentActionToolHandler {
                 destination_agent_identity_id: None,
                 destination_profile_id: None,
                 home_capsule_id: Some(facts.home_root_thread_id.clone()),
-                route_kind: "execution_bound".to_owned(),
+                route_kind: "capsule_bound".to_owned(),
                 authority_actor_json: serde_json::to_string(
                     &pioneer_protocol::PersistedActorRef::AgentExecution(execution_id.clone()),
                 )

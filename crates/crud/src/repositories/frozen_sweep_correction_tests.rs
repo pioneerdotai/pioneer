@@ -176,10 +176,13 @@ async fn relevant_pending_geometry_blocks_stale_delete_and_ack_before_target_rev
     let mut accounting = SweepAccounting::default();
     assert_eq!(
         sweep.step(&store, &mut accounting).await.unwrap(),
-        SweepStep::Retry
+        SweepStep::Blocked
     );
     selected
-        .finish(&store, Some(sweep.completion_guard()))
+        .finish(
+            &store,
+            frozen_sweep_work::Completion::Complete(sweep.completion_guard()),
+        )
         .await
         .unwrap();
     assert_eq!(pending(&store, "batch-physical", 0).await, 1);
@@ -541,7 +544,7 @@ async fn physical_round_pages_future_retries_without_false_eof_or_idle_loop() {
             row(&store, &id, kind, 0).await;
             work(&store, &id, kind)
                 .await
-                .finish(&store, None)
+                .finish(&store, frozen_sweep_work::Completion::Retry)
                 .await
                 .unwrap();
         }
@@ -594,8 +597,8 @@ async fn physical_round_pages_future_retries_without_false_eof_or_idle_loop() {
 }
 
 #[tokio::test]
-async fn losing_physical_round_keeps_generation_and_relevant_prefanout_fence() {
-    for kind in [0, 1] {
+async fn physical_round_keeps_generation_and_prefanout_fence_with_or_without_restart() {
+    for (kind, restart) in [(0, false), (1, false), (0, true), (1, true)] {
         let store = batch_fixture(kind, 4).await;
         header_kind(&store, "mutable-consumer", kind, 1, 1, 0).await;
         store.connection.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
@@ -646,10 +649,17 @@ async fn losing_physical_round_keeps_generation_and_relevant_prefanout_fence() {
         assert_eq!(batch_ordinals(&store, kind).await, vec![0, 1, 2, 3]);
         assert_eq!(pending(&store, "batch-physical", kind).await, 1);
         assert_eq!(progress.accounting.rows, [0, 0]);
-        drop(progress); // lose advisory frontier and all active preparations
-        selected.finish(&store, Some(guard)).await.unwrap();
+        selected
+            .finish(&store, frozen_sweep_work::Completion::Complete(guard))
+            .await
+            .unwrap();
         assert_eq!(pending(&store, "batch-physical", kind).await, 1);
-        let mut restarted = FrozenStorageLifetimeProgress::default();
+        let mut restarted = if restart {
+            drop(progress); // lose advisory frontier and all active preparations
+            FrozenStorageLifetimeProgress::default()
+        } else {
+            progress // same owner must revisit work released behind its cursor
+        };
         let mut idle = false;
         for _ in 0..320 {
             let more = restarted.sweep_quantum(&store).await.unwrap();

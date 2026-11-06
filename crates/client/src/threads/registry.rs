@@ -1,5 +1,10 @@
 //! Process-local thread ownership. A transaction can mutate only its named thread.
 
+#[path = "cold_open.rs"]
+mod cold_open;
+#[path = "retirement.rs"]
+mod retirement;
+
 use super::{coordinator::ThreadCoordinator, start::ThreadStartCoordinator};
 use crate::{
     cli_runtime::approvals::{PendingRequest, PendingRequestRegistry, PendingRequestsReduction},
@@ -190,6 +195,7 @@ struct ThreadSubscriptionBaseline {
 }
 
 struct ThreadDomainStore {
+    retirement: Option<Arc<retirement::ThreadRetirement>>,
     resume_attempt: u64,
     coordinator: ThreadCoordinator,
     semantic: SemanticTimelineState,
@@ -222,6 +228,67 @@ impl ThreadDomainStore {
         if let Some(request) = &self.subscription_request {
             request.retire();
         }
+    }
+    fn apply_conversation_event(
+        &mut self,
+        workspace: &str,
+        event: crate::conversation::ConversationEvent,
+        mode: Option<pioneer_protocol::ThreadComposerExecutionMode>,
+    ) -> Option<crate::timeline::semantic::SemanticTimelineCachePatch> {
+        let store = self;
+        if let crate::conversation::ConversationEvent::ItemDelta {
+            turn_id,
+            delta,
+            payload,
+            markdown,
+            ..
+        } = &event
+        {
+            use crate::conversation::reducer::TurnPhase;
+            if (delta.is_empty() && payload.is_none() && markdown.is_none())
+                || store
+                    .coordinator
+                    .conversation
+                    .projection()
+                    .turns
+                    .iter()
+                    .any(|turn| {
+                        turn.id == *turn_id
+                            && matches!(
+                                turn.phase,
+                                TurnPhase::Completed
+                                    | TurnPhase::Failed
+                                    | TurnPhase::Cancelled
+                                    | TurnPhase::Blocked
+                            )
+                    })
+            {
+                return Default::default();
+            }
+        }
+        if store
+            .coordinator
+            .conversation
+            .ignores_admission_response(&event)
+        {
+            return Default::default();
+        }
+        store.coordinator.conversation.apply(event.clone());
+        let execution_mode = store
+            .coordinator
+            .thread()
+            .map(|thread| thread.origin_kind.composer_execution_mode())
+            .or(mode)
+            .unwrap_or(pioneer_protocol::ThreadComposerExecutionMode::ForegroundTurn);
+        let patch =
+            crate::timeline::semantic::apply_local_composer_event_to_semantic_timeline_with_patch(
+                &mut store.semantic,
+                workspace,
+                &event,
+                execution_mode,
+                crate::timeline::labels::now_unix_ms(),
+            );
+        Some(patch)
     }
     fn set_snapshot(&mut self, thread: Thread) {
         if self.coordinator.thread() == Some(&thread) {
@@ -357,6 +424,7 @@ impl ThreadDomainStore {
 
     fn new(id: &str, workspace: &str) -> Self {
         Self {
+            retirement: None,
             resume_attempt: 0,
             coordinator: ThreadCoordinator::pending(id, workspace),
             semantic: Default::default(),
@@ -394,6 +462,7 @@ pub struct ThreadRegistry {
     pending_requests: PendingRequestRegistry,
     pub(crate) navigation: crate::navigation::ClientNavigationState,
     pub(crate) navigation_revision: u64,
+    open_intent: Option<(String, u64)>,
     pub(crate) navigation_publication: Option<Arc<crate::navigation::ClientNavigationState>>,
     start: ThreadStartCoordinator,
     start_generation: u64,
@@ -495,11 +564,19 @@ impl ThreadRegistry {
 
 impl ThreadRegistry {
     pub(crate) fn has_thread_store(&self, id: &str) -> bool {
-        self.stores.contains_key(id)
+        self.stores
+            .get(id)
+            .is_some_and(|store| store.retirement.is_none())
     }
 
     fn require(&mut self, id: &str, workspace: &str) -> bool {
-        if id.is_empty() || workspace.is_empty() {
+        if id.is_empty()
+            || workspace.is_empty()
+            || self
+                .stores
+                .get(id)
+                .is_some_and(|store| store.retirement.is_some())
+        {
             return false;
         }
         if self
@@ -544,9 +621,23 @@ impl ThreadRegistry {
     pub(crate) fn apply_push_summaries(
         &mut self,
         threads: &[pioneer_protocol::ThreadMetadataPatch],
+        encoded_bytes: &[usize],
     ) -> Vec<ClientPublicationDraft> {
         let mut drafts = Vec::new();
-        for patch in threads {
+        for (index, patch) in threads.iter().enumerate() {
+            if let Some(request) = self
+                .stores
+                .get(&patch.thread.id)
+                .and_then(|store| store.subscription_request.as_ref())
+            {
+                let mut flight = request.flight.lock().expect("subscription flight poisoned");
+                if let Some(staged) = &mut flight.cold_staging {
+                    staged.push(
+                        cold_open::ColdIngress::Metadata(patch.clone()),
+                        encoded_bytes.get(index).copied().unwrap_or(usize::MAX),
+                    );
+                }
+            }
             let summary = &patch.thread;
             if self
                 .stores
@@ -588,6 +679,13 @@ impl ThreadRegistry {
     }
 
     fn publish(&mut self, id: &str) -> Vec<ClientPublicationDraft> {
+        if self
+            .stores
+            .get(id)
+            .is_some_and(|store| store.retirement.is_some())
+        {
+            return vec![];
+        }
         let Some(store) = self.stores.get_mut(id) else {
             return Vec::new();
         };
@@ -963,6 +1061,27 @@ impl ClientCore {
     }
 
     pub fn upsert_thread(&self, thread: Thread) {
+        if !self.finish_pending_thread_retirement(&thread.id) {
+            return;
+        }
+        let notification =
+            GatewayNotification::ThreadUpdated(pioneer_protocol::ThreadUpdatedNotification {
+                thread,
+                placement: None,
+            });
+        if self
+            .capture_cold_thread_notification(&notification)
+            .is_some()
+        {
+            return;
+        }
+        let GatewayNotification::ThreadUpdated(pioneer_protocol::ThreadUpdatedNotification {
+            thread,
+            ..
+        }) = notification
+        else {
+            unreachable!()
+        };
         let id = thread.id.clone();
         let workspace = thread.workspace_id.clone();
         if let Some(mut mutation) = self.thread_mutation(&id, &workspace) {
@@ -1054,9 +1173,37 @@ impl ClientCore {
                 return false;
             }
         }
-        let before = registry.pending_requests.requests().to_vec();
-        if !registry.pending_requests.apply(reduction) {
+        let (changed, drafts) = self.apply_pending_requests_locked(&mut registry, reduction);
+        if !changed {
             return false;
+        }
+        self.transition_directory(
+            &mut registry,
+            &ClientMutationAuthority { _private: () },
+            drafts,
+            Vec::new(),
+        );
+        changed
+    }
+    fn apply_pending_requests_locked(
+        &self,
+        registry: &mut ThreadRegistry,
+        reduction: PendingRequestsReduction,
+    ) -> (bool, Vec<ClientPublicationDraft>) {
+        self.apply_pending_requests_batch_locked(registry, [reduction])
+    }
+    fn apply_pending_requests_batch_locked(
+        &self,
+        registry: &mut ThreadRegistry,
+        reductions: impl IntoIterator<Item = PendingRequestsReduction>,
+    ) -> (bool, Vec<ClientPublicationDraft>) {
+        let before = registry.pending_requests.requests().to_vec();
+        let mut changed = false;
+        for reduction in reductions {
+            changed |= registry.pending_requests.apply(reduction);
+        }
+        if !changed {
+            return (false, vec![]);
         }
         let after = registry.pending_requests.requests();
         let mut scopes = HashSet::new();
@@ -1118,13 +1265,7 @@ impl ClientCore {
                 Arc::new(projection),
             ));
         }
-        self.transition_directory(
-            &mut registry,
-            &ClientMutationAuthority { _private: () },
-            drafts,
-            Vec::new(),
-        );
-        true
+        (true, drafts)
     }
 }
 
@@ -1201,6 +1342,7 @@ impl ClientCore {
                 registry
                     .stores
                     .iter()
+                    .filter(|(_, store)| store.retirement.is_none())
                     .map(|(id, store)| (id.clone(), store.coordinator.snapshot_copy())),
             );
             result
@@ -1214,7 +1356,7 @@ impl ClientCore {
             .thread_registry
             .lock()
             .expect("thread registry poisoned");
-        if !registry.stores.contains_key(id) {
+        if !registry.has_thread_store(id) {
             return None;
         }
         Some(ThreadMutation {
@@ -1296,7 +1438,7 @@ impl ClientCore {
             .thread_registry
             .lock()
             .expect("thread registry poisoned");
-        anyhow::ensure!(registry.stores.contains_key(&id), "Resume source retired");
+        anyhow::ensure!(registry.has_thread_store(&id), "Resume source retired");
         if registry.ready_resume.len() >= super::history_scheduler::MAX_JOBS
             && !registry.ready_resume_set.contains(&id)
         {
@@ -1335,7 +1477,7 @@ impl ClientCore {
     pub fn remove_thread_store(&self, id: &str) {
         self.evict_thread_store(id, true);
     }
-    fn evict_thread_store(&self, id: &str, remove_navigation: bool) {
+    fn cancel_retired_thread_operations(&self, id: &str) {
         self.cancel_artifact_downloads(Some(id));
         self.cancel_composer_requests_for_thread(id);
         self.invalidate_task_reviews(Some(id));
@@ -1346,6 +1488,12 @@ impl ClientCore {
         self.invalidate_thread_capabilities(Some(id));
         self.invalidate_thread_members(Some(id));
         self.invalidate_artifacts(Some(id));
+    }
+    fn evict_thread_store(&self, id: &str, remove_navigation: bool) {
+        if !self.finish_pending_thread_retirement(id) {
+            return;
+        }
+        self.cancel_retired_thread_operations(id);
         let workspace = self
             .thread_coordinator_snapshot(id)
             .map(|c| c.workspace_id.clone());
@@ -1359,11 +1507,36 @@ impl ClientCore {
             .thread_registry
             .lock()
             .expect("thread registry poisoned");
+        // A concurrent cold Closed already owns this state retirement. Do not
+        // remove its private barrier while its captured cleanup is still running.
+        if registry
+            .stores
+            .get(id)
+            .is_some_and(|store| store.retirement.is_some())
+        {
+            return;
+        }
+        let drafts = self.retire_thread_state_locked(&mut registry, id, remove_navigation);
+        self.transition_directory(
+            &mut registry,
+            &ClientMutationAuthority { _private: () },
+            drafts,
+            Vec::new(),
+        );
+        drop(registry);
+        self.notify_send_readiness();
+        self.retire_thread_controller_jobs();
+    }
+    fn retire_thread_state_locked(
+        &self,
+        registry: &mut ThreadRegistry,
+        id: &str,
+        remove_navigation: bool,
+    ) -> Vec<ClientPublicationDraft> {
         registry.timeline.invalidate(Some(id));
         if let Some(store) = registry.stores.get(id) {
             store.retire_subscription();
         }
-        self.notify_send_readiness();
         if remove_navigation {
             registry.stores.remove(id);
         } else {
@@ -1388,14 +1561,7 @@ impl ClientCore {
         let mut drafts = registry.navigation_change().into_iter().collect::<Vec<_>>();
         drafts.extend(registry.retire(id));
         drafts.extend(registry.retire_summary(id));
-        self.transition_directory(
-            &mut registry,
-            &ClientMutationAuthority { _private: () },
-            drafts,
-            Vec::new(),
-        );
-        drop(registry);
-        self.retire_thread_controller_jobs();
+        drafts
     }
     pub fn clear_thread_stores(&self) {
         self.cancel_artifact_downloads(None);
@@ -1446,7 +1612,12 @@ impl ClientCore {
         let session_revision = registry.session_revision.saturating_add(1);
         let navigation_revision = registry.navigation_revision;
         let navigation_publication = registry.navigation_publication.take();
+        let stores = std::mem::take(&mut registry.stores)
+            .into_iter()
+            .filter(|(_, store)| store.retirement.is_some())
+            .collect();
         *registry = ThreadRegistry {
+            stores,
             current_principal_id,
             directory,
             presentation_revisions,
@@ -1529,7 +1700,7 @@ impl ClientCore {
             .thread_registry
             .lock()
             .expect("thread registry poisoned");
-        if !registry.stores.contains_key(id) {
+        if !registry.has_thread_store(id) {
             return None;
         }
         Some(ThreadTimelineMutation {
@@ -1870,58 +2041,9 @@ impl ClientCore {
             return Default::default();
         }
         let store = registry.stores.get_mut(&id).expect("retained thread");
-        if let crate::conversation::ConversationEvent::ItemDelta {
-            turn_id,
-            delta,
-            payload,
-            markdown,
-            ..
-        } = &event
-        {
-            use crate::conversation::reducer::TurnPhase;
-            if (delta.is_empty() && payload.is_none() && markdown.is_none())
-                || store
-                    .coordinator
-                    .conversation
-                    .projection()
-                    .turns
-                    .iter()
-                    .any(|turn| {
-                        turn.id == *turn_id
-                            && matches!(
-                                turn.phase,
-                                TurnPhase::Completed
-                                    | TurnPhase::Failed
-                                    | TurnPhase::Cancelled
-                                    | TurnPhase::Blocked
-                            )
-                    })
-            {
-                return Default::default();
-            }
-        }
-        if store
-            .coordinator
-            .conversation
-            .ignores_admission_response(&event)
-        {
+        let Some(patch) = store.apply_conversation_event(workspace, event, mode) else {
             return Default::default();
-        }
-        store.coordinator.conversation.apply(event.clone());
-        let execution_mode = store
-            .coordinator
-            .thread()
-            .map(|thread| thread.origin_kind.composer_execution_mode())
-            .or(mode)
-            .unwrap_or(pioneer_protocol::ThreadComposerExecutionMode::ForegroundTurn);
-        let patch =
-            crate::timeline::semantic::apply_local_composer_event_to_semantic_timeline_with_patch(
-                &mut store.semantic,
-                workspace,
-                &event,
-                execution_mode,
-                crate::timeline::labels::now_unix_ms(),
-            );
+        };
         let drafts = registry.publish(&id);
         self.transition_directory(
             &mut registry,
@@ -2313,6 +2435,17 @@ impl ClientCore {
         &self,
         notification: pioneer_protocol::GatewayNotification,
     ) -> bool {
+        if let Some(handled) = self.capture_cold_thread_notification(&notification) {
+            return handled;
+        }
+        // Ordinary ingress can also arrive in the short retirement handoff.
+        // Complete the old local cleanup before its normal reducer may create
+        // a new owner; do not drop an otherwise accepted metadata/live event.
+        if let Some(id) = notification_thread_id(&notification)
+            && !self.finish_pending_thread_retirement(id)
+        {
+            return true;
+        }
         let startup_key = match &notification {
             pioneer_protocol::GatewayNotification::ItemDelta(n)
                 if !n.delta.is_empty()
@@ -2584,7 +2717,8 @@ impl ThreadRegistry {
             .stores
             .iter()
             .filter(|(id, store)| {
-                self.navigation.active_thread_id.as_ref() != Some(id)
+                store.retirement.is_none()
+                    && self.navigation.active_thread_id.as_ref() != Some(id)
                     && !self.navigation.drafts.values().any(|draft| draft == *id)
                     && self.start.pending_thread_id.as_ref() != Some(id)
                     && !self.ready_resume_set.contains(*id)
@@ -2810,6 +2944,10 @@ mod tests {
     thread_local! {
         pub(super) static RESUME_CAPTURE_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = Default::default();
         pub(super) static SUBSCRIPTION_DUE_CAPTURE_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = Default::default();
+        pub(super) static COLD_CAPTURE_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = Default::default();
+        pub(super) static COLD_RETIREMENT_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = Default::default();
+        pub(super) static SUBSCRIPTION_FINISH_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = Default::default();
+        pub(super) static SUBSCRIPTION_ADMISSION_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = Default::default();
         pub(super) static SUBSCRIPTION_PROMOTION_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = Default::default();
     }
 
@@ -7458,7 +7596,6 @@ mod tests {
         let transport = Arc::new(SubscriptionRecorder {
             starts,
             calls: std::sync::atomic::AtomicUsize::new(0),
-            thread: thread("a", "ws"),
         });
         *core
             .transport_runtime()
@@ -9178,7 +9315,8 @@ mod tests {
                         action: action.clone(),
                         generation,
                     },
-                );
+                )
+                .expect_err("closed controller rejects the planned request");
             } else {
                 core.apply_thread_notification(reconciliation_notification(&["result-140"]));
             }
@@ -9931,7 +10069,8 @@ mod tests {
             );
             assert_eq!(retry.pages.len(), 1);
             assert!(retry.pages[0].generation > owner);
-            core.schedule_planned_timeline_request(retry.pages[0].clone());
+            core.schedule_planned_timeline_request(retry.pages[0].clone())
+                .expect("timeline retry is admitted");
             let request = reconciliation_request(&receiver);
             assert_eq!(receiver.try_iter().count(), 0, "Retry queues one walk");
             let mut history = reconciliation_history();
@@ -10326,7 +10465,8 @@ mod tests {
                             .contains("Work history changed")
                     );
                     let retry = retry_initial_work(&core);
-                    core.schedule_planned_timeline_request(retry.pages[0].clone());
+                    core.schedule_planned_timeline_request(retry.pages[0].clone())
+                        .expect("timeline retry is admitted");
                     let ThreadControllerRequest::Semantic(request) =
                         receiver.try_recv().unwrap().value
                     else {
@@ -10569,7 +10709,8 @@ mod tests {
                 core.set_thread_turn_work_expanded("a", "turn", true);
                 core.materialize_demanded_timelines();
                 let retry = retry_initial_work(&core);
-                core.schedule_planned_timeline_request(retry.pages[0].clone());
+                core.schedule_planned_timeline_request(retry.pages[0].clone())
+                    .expect("timeline retry is admitted");
                 let ThreadControllerRequest::Semantic(request) = receiver.try_recv().unwrap().value
                 else {
                     panic!()
@@ -10792,7 +10933,8 @@ mod tests {
                 assert_eq!(receiver.try_iter().count(), 0);
             }
             let retry = retry_initial_work(&core);
-            core.schedule_planned_timeline_request(retry.pages[0].clone());
+            core.schedule_planned_timeline_request(retry.pages[0].clone())
+                .expect("timeline retry is admitted");
             let semantic = core.thread_semantic_snapshot("a");
             let range = semantic.thread("a").unwrap().work_range("turn").unwrap();
             assert!(!range.has_loaded_page);
@@ -13984,10 +14126,11 @@ mod tests {
             response: crate::rpc::JsonRpcResponseSender,
         ) -> Result<(), String> {
             let request: pioneer_protocol::JsonRpcRequest = serde_json::from_str(&payload).unwrap();
-            assert_eq!(
-                request.method,
+            assert!(matches!(
+                request.method.as_str(),
                 pioneer_protocol::constants::methods::THREAD_START
-            );
+                    | pioneer_protocol::constants::methods::THREAD_OPEN
+            ));
             response
                 .send(Ok(serde_json::to_value(ThreadStartResponse {
                     thread: self.0.clone(),
@@ -14000,7 +14143,7 @@ mod tests {
 
     fn acknowledge_subscription(core: &ClientCore, id: &str, workspace: &str) {
         let (request, ready) = core
-            .admit_thread_subscription(id, workspace, None, false)
+            .admit_thread_subscription(id, workspace, None, false, None)
             .unwrap();
         assert!(!ready);
         let snapshot = core
@@ -14031,8 +14174,13 @@ mod tests {
         token: ThreadOperationToken,
         workspace: &str,
     ) -> anyhow::Result<()> {
-        let (request, _) =
-            core.admit_thread_subscription(&token.id, workspace, Some(token.generation), true)?;
+        let (request, _) = core.admit_thread_subscription(
+            &token.id,
+            workspace,
+            Some(token.generation),
+            true,
+            None,
+        )?;
         core.execute_thread_subscription_request_using(&request, transport);
         let result = request
             .flight
@@ -14047,7 +14195,6 @@ mod tests {
     struct SubscriptionRecorder {
         starts: std::sync::mpsc::Sender<crate::rpc::JsonRpcResponseSender>,
         calls: std::sync::atomic::AtomicUsize,
-        thread: Thread,
     }
     impl crate::rpc::JsonRpcRequestTransport for SubscriptionRecorder {
         fn send_json_rpc_request(
@@ -14058,15 +14205,12 @@ mod tests {
         ) -> Result<(), String> {
             let request: pioneer_protocol::JsonRpcRequest = serde_json::from_str(&payload).unwrap();
             match request.method.as_str() {
-                "thread/start" => {
+                "thread/start" | "thread/open" => {
                     self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     self.starts
                         .send(response)
                         .map_err(|error| error.to_string())
                 }
-                "thread/get" => response
-                    .send(Ok(serde_json::json!({"thread": self.thread})))
-                    .map_err(|error| error.to_string()),
                 method => panic!("unexpected subscription fixture RPC: {method}"),
             }
         }
@@ -14084,7 +14228,6 @@ mod tests {
         let transport = Arc::new(SubscriptionRecorder {
             starts,
             calls: std::sync::atomic::AtomicUsize::new(0),
-            thread: thread("a", "ws"),
         });
         *core
             .transport_runtime()
@@ -14128,6 +14271,826 @@ mod tests {
     }
 
     #[test]
+    fn cold_open_preserves_live_metadata_terminal_and_item_before_ack() {
+        let (core, _transport, responses, _requests) = shared_subscription_core();
+        core.remove_thread_store("a");
+        let (committed, applied) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let open = {
+            let core = core.clone();
+            std::thread::spawn(move || {
+                SUBSCRIPTION_FINISH_HOOK.with(|slot| {
+                    *slot.borrow_mut() = Some(Box::new(move || {
+                        committed.send(()).unwrap();
+                        released.recv_timeout(Duration::from_secs(2)).unwrap();
+                    }))
+                });
+                core.open_thread_by_id("a")
+            })
+        };
+        let response = responses.recv_timeout(Duration::from_secs(2)).unwrap();
+        let mut stale = thread("a", "ws");
+        let mut turn = running_turn("cold-turn");
+        turn.mode = ThreadMode::Chat;
+        stale.turns = vec![turn.clone()];
+        let mut live = stale.clone();
+        live.preview = "new live metadata".into();
+        live.updated_at = 3;
+        let placement = pioneer_protocol::ThreadPlacement {
+            thread_id: "a".into(),
+            workspace_id: "ws".into(),
+            folder_id: Some("live-folder".into()),
+        };
+        core.apply_thread_notification(GatewayNotification::ThreadUpdated(
+            pioneer_protocol::ThreadUpdatedNotification {
+                thread: live,
+                placement: Some(placement.clone()),
+            },
+        ));
+        core.apply_thread_notification(GatewayNotification::TurnStarted(TurnStartedNotification {
+            workspace_id: "ws".into(),
+            thread_id: "a".into(),
+            turn: turn.clone(),
+        }));
+        core.apply_thread_notification(GatewayNotification::ItemStarted(ItemStartedNotification {
+            workspace_id: "ws".into(),
+            thread_id: "a".into(),
+            turn_id: turn.id.clone(),
+            item: TurnItem::AgentMessage {
+                id: "answer".into(),
+                text: String::new(),
+                phase: pioneer_protocol::AgentMessagePhase::FinalAnswer,
+                markdown: None,
+                markdown_version: None,
+            },
+        }));
+        core.apply_thread_notification(GatewayNotification::ItemCompleted(
+            ItemCompletedNotification {
+                workspace_id: "ws".into(),
+                thread_id: "a".into(),
+                turn_id: turn.id.clone(),
+                item: TurnItem::AgentMessage {
+                    id: "answer".into(),
+                    text: "final live answer".into(),
+                    phase: pioneer_protocol::AgentMessagePhase::FinalAnswer,
+                    markdown: None,
+                    markdown_version: None,
+                },
+            },
+        ));
+        turn.status = TurnStatus::Completed;
+        core.apply_thread_notification(GatewayNotification::TurnCompleted(
+            TurnCompletedNotification {
+                workspace_id: "ws".into(),
+                thread_id: "a".into(),
+                turn,
+            },
+        ));
+        let mut foreign = thread("a", "wrong");
+        foreign.preview = "must not publish".into();
+        foreign.updated_at = 9;
+        core.upsert_thread(foreign);
+        assert!(
+            core.thread_snapshot("a").is_none(),
+            "unconfirmed ingress is not a domain snapshot"
+        );
+        response
+            .send(Ok(serde_json::to_value(ThreadStartResponse {
+                thread: stale,
+                sandbox: SandboxPolicy::from_mode(SandboxMode::FullAccess),
+            })
+            .unwrap()))
+            .unwrap();
+        applied.recv_timeout(Duration::from_secs(2)).unwrap();
+        let mut later = thread("a", "ws");
+        later.updated_at = 4;
+        later.preview = "newer after ACK".into();
+        core.upsert_thread(later);
+        release.send(()).unwrap();
+        open.join().unwrap().unwrap();
+        let snapshot = core.thread_snapshot("a").unwrap();
+        let coordinator = snapshot.coordinator();
+        assert_eq!(coordinator.thread().unwrap().preview, "newer after ACK");
+        assert_eq!(
+            core.thread_registry
+                .lock()
+                .unwrap()
+                .directory
+                .placements
+                .get("a"),
+            Some(&placement)
+        );
+        let conversation = coordinator.conversation.projection();
+        assert_eq!(
+            conversation
+                .turns
+                .iter()
+                .find(|turn| turn.id == "cold-turn")
+                .unwrap()
+                .phase,
+            crate::conversation::TurnPhase::Completed
+        );
+        assert!(conversation.items.iter().any(|item| matches!(&item.item, TurnItem::AgentMessage { id, text, .. } if id == "answer" && text == "final live answer")));
+    }
+
+    #[test]
+    fn prepared_cold_close_matches_normal_retirement_and_old_cleanup_preserves_replacement() {
+        use crate::artifacts::operations::{ArtifactDownloadState, ArtifactDownloadTarget};
+        for mode in ["late", "replacement", "normal"] {
+            let (core, transport, responses, _requests) = shared_subscription_core();
+            core.remove_thread_store("a");
+            let opening = {
+                let core = core.clone();
+                std::thread::spawn(move || core.open_thread_by_id("a"))
+            };
+            let ack = responses.recv_timeout(Duration::from_secs(2)).unwrap();
+            let (captured, capture) = std::sync::mpsc::channel();
+            let (release_capture, captured_release) = std::sync::mpsc::channel();
+            let (retired, retirement) = std::sync::mpsc::channel();
+            let (release_retirement, retired_release) = std::sync::mpsc::channel();
+            let close = if mode != "normal" {
+                let core = core.clone();
+                Some(std::thread::spawn(move || {
+                    COLD_CAPTURE_HOOK.with(|slot| {
+                        *slot.borrow_mut() = Some(Box::new(move || {
+                            captured.send(()).unwrap();
+                            captured_release
+                                .recv_timeout(Duration::from_secs(2))
+                                .unwrap();
+                        }))
+                    });
+                    if mode == "replacement" {
+                        COLD_RETIREMENT_HOOK.with(|slot| {
+                            *slot.borrow_mut() = Some(Box::new(move || {
+                                retired.send(()).unwrap();
+                                retired_release
+                                    .recv_timeout(Duration::from_secs(2))
+                                    .unwrap();
+                            }))
+                        });
+                    }
+                    core.apply_thread_notification(GatewayNotification::ThreadClosed(
+                        pioneer_protocol::ThreadClosedNotification {
+                            thread_id: "a".into(),
+                            workspace_id: "ws".into(),
+                        },
+                    ));
+                }))
+            } else {
+                None
+            };
+            if mode != "normal" {
+                capture.recv_timeout(Duration::from_secs(2)).unwrap();
+            }
+            subscription_reply(&ack);
+            opening.join().unwrap().unwrap();
+            assert_eq!(core.active_thread_id().as_deref(), Some("a"));
+            core.enqueue_thread_resume("a".into()).unwrap();
+            let target = ArtifactDownloadTarget {
+                thread_id: Some("a".into()),
+                workspace_id: "ws".into(),
+                artifact_id: "artifact".into(),
+                version_id: Some("version".into()),
+            };
+            let old_download = core
+                .begin_artifact_download("download".into(), target.clone())
+                .unwrap();
+            if mode == "normal" {
+                core.apply_thread_notification(GatewayNotification::ThreadClosed(
+                    pioneer_protocol::ThreadClosedNotification {
+                        thread_id: "a".into(),
+                        workspace_id: "ws".into(),
+                    },
+                ));
+            } else {
+                release_capture.send(()).unwrap();
+            }
+            if mode == "replacement" {
+                retirement.recv_timeout(Duration::from_secs(2)).unwrap();
+                assert!(core.active_thread_id().is_none());
+                assert!(core.thread_snapshot("a").is_none());
+                assert!(core.enqueue_thread_resume("a".into()).is_err());
+                assert!(core.existing_thread_timeline_mutation("a").is_none());
+                let reopening = {
+                    let core = core.clone();
+                    std::thread::spawn(move || core.open_thread_by_id("a"))
+                };
+                let response = responses.recv_timeout(Duration::from_secs(2)).unwrap();
+                subscription_reply(&response);
+                reopening.join().unwrap().unwrap();
+                assert!(old_download.cancellation().is_cancelled());
+                let replacement = core
+                    .begin_artifact_download("download".into(), target)
+                    .unwrap();
+                let budget =
+                    crate::rpc::RequestBudget::new(Instant::now() + Duration::from_secs(2));
+                let receipt = core.ensure_thread_subscription("a", "ws", &budget).unwrap();
+                release_retirement.send(()).unwrap();
+                close.unwrap().join().unwrap();
+                assert!(receipt.is_current());
+                assert_eq!(core.active_thread_id().as_deref(), Some("a"));
+                assert!(core.thread_snapshot("a").is_some());
+                assert!(!replacement.cancellation().is_cancelled());
+                assert_eq!(
+                    core.artifact_download_snapshot("download").unwrap().state,
+                    ArtifactDownloadState::Queued
+                );
+                assert_eq!(transport.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+            } else {
+                if let Some(close) = close {
+                    close.join().unwrap();
+                }
+                assert!(core.active_thread_id().is_none());
+                assert!(core.thread_snapshot("a").is_none());
+                assert!(core.thread_operation_token("a").is_none());
+                assert!(core.take_thread_resume().is_none());
+                assert!(old_download.cancellation().is_cancelled());
+                assert_eq!(
+                    core.artifact_download_snapshot("download").unwrap().state,
+                    ArtifactDownloadState::Cancelled
+                );
+                let registry = core.thread_registry.lock().unwrap();
+                assert!(!registry.directory.threads.contains_key("a"));
+                assert!(!registry.directory.summaries.contains_key("a"));
+                assert!(!registry.directory.placements.contains_key("a"));
+                assert!(registry.navigation.active_thread_id().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn retirement_between_helping_and_admission_refuses_rpc_and_cannot_confirm_private_slot() {
+        let (core, transport, responses, _requests) = shared_subscription_core();
+        core.remove_thread_store("a");
+        let opening = {
+            let core = core.clone();
+            std::thread::spawn(move || core.open_thread_by_id("a"))
+        };
+        let ack = responses.recv_timeout(Duration::from_secs(2)).unwrap();
+        let (captured, capture) = std::sync::mpsc::channel();
+        let (release_capture, captured_release) = std::sync::mpsc::channel();
+        let (retired, retirement) = std::sync::mpsc::channel();
+        let (release_cleanup, cleanup_release) = std::sync::mpsc::channel();
+        let closing = {
+            let core = core.clone();
+            std::thread::spawn(move || {
+                COLD_CAPTURE_HOOK.with(|slot| {
+                    *slot.borrow_mut() = Some(Box::new(move || {
+                        captured.send(()).unwrap();
+                        captured_release
+                            .recv_timeout(Duration::from_secs(2))
+                            .unwrap();
+                    }))
+                });
+                COLD_RETIREMENT_HOOK.with(|slot| {
+                    *slot.borrow_mut() = Some(Box::new(move || {
+                        retired.send(()).unwrap();
+                        cleanup_release
+                            .recv_timeout(Duration::from_secs(2))
+                            .unwrap();
+                    }))
+                });
+                core.apply_thread_notification(GatewayNotification::ThreadClosed(
+                    pioneer_protocol::ThreadClosedNotification {
+                        thread_id: "a".into(),
+                        workspace_id: "ws".into(),
+                    },
+                ));
+            })
+        };
+        capture.recv_timeout(Duration::from_secs(2)).unwrap();
+        subscription_reply(&ack);
+        opening.join().unwrap().unwrap();
+        core.upsert_thread(thread("x", "ws"));
+        core.activate_thread(Some("x"), Some("ws"));
+        let (revision, intent) = {
+            let registry = core.thread_registry.lock().unwrap();
+            (
+                registry.navigation_revision,
+                registry.open_intent.as_ref().unwrap().1,
+            )
+        };
+        let (mut probe, ready) = core
+            .admit_thread_subscription("a", "ws", None, false, Some((revision, intent)))
+            .unwrap();
+        assert!(ready);
+        let (helped, after_help) = std::sync::mpsc::channel();
+        let (release_admission, admission_release) = std::sync::mpsc::channel();
+        let racing = {
+            let core = core.clone();
+            std::thread::spawn(move || {
+                SUBSCRIPTION_ADMISSION_HOOK.with(|slot| {
+                    *slot.borrow_mut() = Some(Box::new(move || {
+                        helped.send(()).unwrap();
+                        admission_release
+                            .recv_timeout(Duration::from_secs(2))
+                            .unwrap();
+                    }))
+                });
+                core.open_thread_by_id("a")
+            })
+        };
+        after_help.recv_timeout(Duration::from_secs(2)).unwrap();
+        release_capture.send(()).unwrap();
+        retirement.recv_timeout(Duration::from_secs(2)).unwrap();
+        // Closing an inactive target must not accidentally hide the race behind
+        // navigation_revision invalidation.
+        assert_eq!(
+            core.thread_registry.lock().unwrap().navigation_revision,
+            revision
+        );
+        assert_eq!(core.active_thread_id().as_deref(), Some("x"));
+        release_admission.send(()).unwrap();
+        assert_eq!(
+            racing.join().unwrap().unwrap_err().to_string(),
+            "Thread retirement in progress"
+        );
+        assert!(responses.try_recv().is_err());
+        assert_eq!(transport.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        {
+            let mut registry = core.thread_registry.lock().unwrap();
+            let slot = registry.stores.get_mut("a").unwrap();
+            assert!(slot.retirement.is_some());
+            assert!(slot.subscription_request.is_none());
+            assert!(slot.subscription_receipt.is_none());
+            // Defense-in-depth: even a captured descriptor with matching exact
+            // request/generation and live socket cannot authorize a private slot.
+            probe.generation = slot.generation;
+            probe.live = Arc::new(std::sync::Mutex::new(true));
+            probe.transport = probe.transport.with_subscription_scope(probe.live.clone());
+            slot.subscription_request = Some(probe.clone());
+        }
+        assert!(!core.subscription_scope_current(&probe));
+        assert!(!core.thread_subscription_request_current(&probe));
+        core.execute_thread_subscription_request(probe.clone());
+        assert!(responses.try_recv().is_err());
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(Ok(serde_json::to_value(ThreadStartResponse {
+            thread: thread("a", "ws"),
+            sandbox: SandboxPolicy::from_mode(SandboxMode::FullAccess),
+        })
+        .unwrap()))
+            .unwrap();
+        {
+            let mut flight = probe.flight.lock().unwrap();
+            flight.result = None;
+            flight.receiver = Some(rx);
+        }
+        core.complete_ready_thread_subscription(&probe);
+        assert!(
+            probe
+                .flight
+                .lock()
+                .unwrap()
+                .result
+                .as_ref()
+                .unwrap()
+                .is_err()
+        );
+        assert!(core.thread_snapshot("a").is_none());
+        assert!(
+            core.thread_registry.lock().unwrap().stores["a"]
+                .subscription_receipt
+                .is_none()
+        );
+        release_cleanup.send(()).unwrap();
+        closing.join().unwrap();
+        let replacement = {
+            let core = core.clone();
+            std::thread::spawn(move || core.open_thread_by_id("a"))
+        };
+        let ack = responses.recv_timeout(Duration::from_secs(2)).unwrap();
+        subscription_reply(&ack);
+        replacement.join().unwrap().unwrap();
+        let receipt = core
+            .ensure_thread_subscription(
+                "a",
+                "ws",
+                &crate::rpc::RequestBudget::new(Instant::now() + Duration::from_secs(2)),
+            )
+            .unwrap();
+        assert!(receipt.is_current());
+        assert!(core.thread_snapshot("a").is_some());
+        assert_eq!(core.active_thread_id().as_deref(), Some("a"));
+        assert_eq!(transport.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn cold_open_capacity_rejects_before_rpc_and_is_released_on_error() {
+        let (core, transport, responses, _requests) = shared_subscription_core();
+        core.remove_thread_store("a");
+        let mut opens = vec![];
+        let mut replies = vec![];
+        for index in 0..8 {
+            let core = core.clone();
+            opens.push(std::thread::spawn(move || {
+                core.open_thread_by_id(&format!("cold-{index}"))
+            }));
+            replies.push(responses.recv_timeout(Duration::from_secs(2)).unwrap());
+        }
+        assert!(core.open_thread_by_id("overflow").is_err());
+        assert_eq!(transport.calls.load(std::sync::atomic::Ordering::SeqCst), 8);
+        assert!(
+            core.thread_snapshots().is_empty(),
+            "reservations are not snapshots"
+        );
+        for response in replies {
+            response
+                .send(Err(crate::rpc::JsonRpcResponseError::transport(
+                    "retryable failure",
+                )))
+                .unwrap();
+        }
+        for open in opens {
+            assert!(open.join().unwrap().is_err());
+        }
+        let retry = {
+            let core = core.clone();
+            std::thread::spawn(move || core.open_thread_by_id("a"))
+        };
+        let response = responses.recv_timeout(Duration::from_secs(2)).unwrap();
+        subscription_reply(&response);
+        retry.join().unwrap().unwrap();
+        assert_eq!(
+            core.thread_snapshot("a")
+                .unwrap()
+                .coordinator()
+                .workspace_id,
+            "ws"
+        );
+    }
+
+    #[test]
+    fn cold_staging_retires_on_error_overflow_or_store_replacement() {
+        for outcome in [
+            "error", "overflow", "count", "replace", "auth", "socket", "closed",
+        ] {
+            let (core, _transport, responses, _requests) = shared_subscription_core();
+            core.remove_thread_store("a");
+            let open = {
+                let core = core.clone();
+                std::thread::spawn(move || core.open_thread_by_id("a"))
+            };
+            let response = responses.recv_timeout(Duration::from_secs(2)).unwrap();
+            let mut live = thread("a", "ws");
+            live.preview = "staged".into();
+            core.upsert_thread(live);
+            match outcome {
+                "error" => {
+                    response
+                        .send(Err(crate::rpc::JsonRpcResponseError::transport(
+                            "transient",
+                        )))
+                        .unwrap();
+                }
+                "overflow" => {
+                    let mut too_large = thread("a", "ws");
+                    too_large.preview = "x".repeat(2 * 1024 * 1024);
+                    core.upsert_thread(too_large);
+                    subscription_reply(&response);
+                }
+                "count" => {
+                    for _ in 0..128 {
+                        core.upsert_thread(thread("a", "ws"));
+                    }
+                    subscription_reply(&response);
+                }
+                "socket" => {
+                    core.transport_runtime()
+                        .ws_command_sender()
+                        .set_http_session_access_for_test(None);
+                    let _ = response.send(Ok(serde_json::json!({})));
+                }
+                "replace" => {
+                    core.remove_thread_store("a");
+                    let mut replacement = thread("a", "ws");
+                    replacement.preview = "replacement".into();
+                    core.upsert_thread(replacement);
+                    let _ = response.send(Ok(serde_json::to_value(ThreadStartResponse {
+                        thread: thread("a", "ws"),
+                        sandbox: SandboxPolicy::from_mode(SandboxMode::FullAccess),
+                    })
+                    .unwrap()));
+                }
+                "auth" => {
+                    core.begin_authorization_epoch(None);
+                    let _ = response.send(Ok(serde_json::json!({})));
+                }
+                "closed" => {
+                    core.apply_thread_notification(GatewayNotification::ThreadClosed(
+                        pioneer_protocol::ThreadClosedNotification {
+                            workspace_id: "ws".into(),
+                            thread_id: "a".into(),
+                        },
+                    ));
+                    subscription_reply(&response);
+                }
+                _ => unreachable!(),
+            }
+            assert!(open.join().unwrap().is_err());
+            if outcome == "replace" {
+                assert_eq!(
+                    core.thread_snapshot("a")
+                        .unwrap()
+                        .coordinator()
+                        .thread()
+                        .unwrap()
+                        .preview,
+                    "replacement"
+                );
+            } else {
+                assert!(core.thread_snapshot("a").is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn cold_waiters_validate_their_own_workspace_without_poisoning_receipt() {
+        let (core, transport, responses, _requests) = shared_subscription_core();
+        core.remove_thread_store("a");
+        let open = {
+            let core = core.clone();
+            std::thread::spawn(move || core.open_thread_by_id("a"))
+        };
+        let response = responses.recv_timeout(Duration::from_secs(2)).unwrap();
+        let mut waiters = Vec::new();
+        for workspace in ["wrong", "ws"] {
+            let (joined_tx, joined_rx) = std::sync::mpsc::channel();
+            let core = core.clone();
+            waiters.push((
+                workspace,
+                std::thread::spawn(move || {
+                    SUBSCRIPTION_PROMOTION_HOOK.with(|slot| {
+                        *slot.borrow_mut() = Some(Box::new(move || joined_tx.send(()).unwrap()))
+                    });
+                    core.ensure_thread_subscription(
+                        "a",
+                        workspace,
+                        &crate::rpc::RequestBudget::new(Instant::now() + Duration::from_secs(2)),
+                    )
+                }),
+            ));
+            joined_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        }
+        assert!(
+            core.ensure_thread_subscription(
+                "a",
+                "",
+                &crate::rpc::RequestBudget::new(Instant::now() + Duration::from_secs(2))
+            )
+            .is_err()
+        );
+        subscription_reply(&response);
+        open.join().unwrap().unwrap();
+        for (workspace, waiter) in waiters {
+            assert_eq!(waiter.join().unwrap().is_ok(), workspace == "ws");
+        }
+        core.ensure_thread_subscription(
+            "a",
+            "ws",
+            &crate::rpc::RequestBudget::new(Instant::now() + Duration::from_secs(2)),
+        )
+        .unwrap();
+        assert_eq!(transport.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn failed_cold_open_preserves_existing_directory_rows() {
+        let (core, _transport, responses, _requests) = shared_subscription_core();
+        core.remove_thread_store("a");
+        let placement = pioneer_protocol::ThreadPlacement {
+            thread_id: "a".into(),
+            workspace_id: "ws".into(),
+            folder_id: None,
+        };
+        let before = thread("a", "ws");
+        {
+            let mut registry = core.thread_registry.lock().unwrap();
+            registry.directory.upsert_thread_summary(before.clone());
+            registry.directory.upsert_placement(placement.clone());
+            registry.directory.summaries.insert(
+                "a".into(),
+                SidebarSummaryChanged {
+                    thread_id: "a".into(),
+                    workspace_id: "ws".into(),
+                    thread: Some(before.clone()),
+                    placement: Some(placement.clone()),
+                },
+            );
+        }
+        core.apply_directory_read(
+            "ws",
+            "a",
+            &pioneer_protocol::ThreadReadCursor {
+                through_turn_id: "turn".into(),
+                sort_key: "1".into(),
+            },
+            7,
+        );
+        let open = {
+            let core = core.clone();
+            std::thread::spawn(move || core.open_thread_by_id("a"))
+        };
+        let response = responses.recv_timeout(Duration::from_secs(2)).unwrap();
+        response
+            .send(Err(crate::rpc::JsonRpcResponseError::transport(
+                "transient failure",
+            )))
+            .unwrap();
+        assert!(open.join().unwrap().is_err());
+        assert!(core.thread_snapshot("a").is_none());
+        let registry = core.thread_registry.lock().unwrap();
+        assert_eq!(registry.directory.threads.get("a"), Some(&before));
+        assert_eq!(registry.directory.placements.get("a"), Some(&placement));
+        assert!(registry.directory.has_unread("a"));
+        assert_eq!(
+            registry
+                .directory
+                .summaries
+                .get("a")
+                .unwrap()
+                .thread
+                .as_ref(),
+            Some(&before)
+        );
+    }
+
+    #[test]
+    fn old_failed_finish_cannot_remove_successful_replacement_receipt() {
+        let (core, _transport, _responses, _requests) = shared_subscription_core();
+        core.remove_thread_store("a");
+        let (revision, intent) = {
+            let mut registry = core.thread_registry.lock().unwrap();
+            registry.open_intent = Some(("a".into(), 1));
+            (registry.navigation_revision, 1)
+        };
+        let (first, _) = core
+            .admit_thread_subscription("a", "", None, false, Some((revision, intent)))
+            .unwrap();
+        let replacement = core.clone();
+        SUBSCRIPTION_FINISH_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                let (second, ready) = replacement
+                    .admit_thread_subscription("a", "", None, false, Some((revision, intent)))
+                    .unwrap();
+                assert!(!ready);
+                replacement.execute_thread_subscription_request_using(
+                    &second,
+                    &SubscriptionAck(thread("a", "ws")),
+                );
+            }))
+        });
+        core.finish_thread_subscription_request(&first, Err(anyhow::anyhow!("transport failure")));
+        assert_eq!(
+            core.thread_snapshot("a")
+                .unwrap()
+                .coordinator()
+                .thread()
+                .unwrap()
+                .workspace_id,
+            "ws"
+        );
+        core.ensure_thread_subscription(
+            "a",
+            "ws",
+            &crate::rpc::RequestBudget::new(Instant::now() + Duration::from_secs(2)),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn aba_open_intents_reuse_pending_a_without_restoring_b() {
+        let (core, transport, responses, _requests) = shared_subscription_core();
+        core.upsert_thread(thread("b", "ws"));
+        let first = {
+            let core = core.clone();
+            std::thread::spawn(move || core.open_thread_by_id("a"))
+        };
+        let a_response = responses.recv_timeout(Duration::from_secs(2)).unwrap();
+        let middle = {
+            let core = core.clone();
+            std::thread::spawn(move || core.open_thread_by_id("b"))
+        };
+        let b_response = responses.recv_timeout(Duration::from_secs(2)).unwrap();
+        let (joined_tx, joined_rx) = std::sync::mpsc::channel();
+        let latest = {
+            let core = core.clone();
+            std::thread::spawn(move || {
+                SUBSCRIPTION_PROMOTION_HOOK.with(|slot| {
+                    *slot.borrow_mut() = Some(Box::new(move || joined_tx.send(()).unwrap()))
+                });
+                core.open_thread_by_id("a")
+            })
+        };
+        joined_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        subscription_reply(&a_response);
+        latest.join().unwrap().unwrap();
+        assert!(first.join().unwrap().is_err());
+        b_response
+            .send(Ok(serde_json::to_value(ThreadStartResponse {
+                thread: thread("b", "ws"),
+                sandbox: SandboxPolicy::from_mode(SandboxMode::FullAccess),
+            })
+            .unwrap()))
+            .unwrap();
+        assert!(middle.join().unwrap().is_err());
+        assert_eq!(core.navigation_snapshot().active_thread_id(), Some("a"));
+        assert_eq!(transport.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        for id in ["a", "b"] {
+            core.ensure_thread_subscription(
+                id,
+                "ws",
+                &crate::rpc::RequestBudget::new(Instant::now() + Duration::from_secs(2)),
+            )
+            .unwrap();
+        }
+        assert_eq!(transport.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn newer_open_intent_wins_over_late_response() {
+        let (core, _transport, responses, _requests) = shared_subscription_core();
+        core.upsert_thread(thread("b", "ws"));
+        let a = {
+            let core = core.clone();
+            std::thread::spawn(move || core.open_thread_by_id("a"))
+        };
+        let old = responses.recv_timeout(Duration::from_secs(2)).unwrap();
+        let (joined_tx, joined_rx) = std::sync::mpsc::channel();
+        let send = {
+            let core = core.clone();
+            std::thread::spawn(move || {
+                SUBSCRIPTION_PROMOTION_HOOK.with(|slot| {
+                    *slot.borrow_mut() = Some(Box::new(move || joined_tx.send(()).unwrap()))
+                });
+                core.ensure_thread_subscription(
+                    "a",
+                    "ws",
+                    &crate::rpc::RequestBudget::new(Instant::now() + Duration::from_secs(2)),
+                )
+            })
+        };
+        joined_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let b = {
+            let core = core.clone();
+            std::thread::spawn(move || core.open_thread_by_id("b"))
+        };
+        let latest = responses.recv_timeout(Duration::from_secs(2)).unwrap();
+        latest
+            .send(Ok(serde_json::to_value(ThreadStartResponse {
+                thread: thread("b", "ws"),
+                sandbox: SandboxPolicy::from_mode(SandboxMode::FullAccess),
+            })
+            .unwrap()))
+            .unwrap();
+        b.join().unwrap().unwrap();
+        subscription_reply(&old);
+        assert!(a.join().unwrap().is_err());
+        assert!(send.join().unwrap().unwrap().is_current());
+        core.ensure_thread_subscription(
+            "a",
+            "ws",
+            &crate::rpc::RequestBudget::new(Instant::now() + Duration::from_secs(2)),
+        )
+        .unwrap();
+        assert!(
+            responses.try_recv().is_err(),
+            "A receipt must not require another subscribe"
+        );
+        assert_eq!(core.navigation_snapshot().active_thread_id(), Some("b"));
+    }
+
+    #[test]
+    fn open_leading_send_joins_real_open_receipt() {
+        let (core, transport, responses, _requests) = shared_subscription_core();
+        let opened = {
+            let core = core.clone();
+            std::thread::spawn(move || core.open_thread_by_id("a"))
+        };
+        let response = responses.recv_timeout(Duration::from_secs(2)).unwrap();
+        let (admitted_tx, admitted_rx) = std::sync::mpsc::channel();
+        let sending = {
+            let core = core.clone();
+            std::thread::spawn(move || {
+                SUBSCRIPTION_PROMOTION_HOOK.with(|slot| {
+                    *slot.borrow_mut() = Some(Box::new(move || admitted_tx.send(()).unwrap()))
+                });
+                let budget =
+                    crate::rpc::RequestBudget::new(Instant::now() + Duration::from_secs(2));
+                core.ensure_thread_subscription("a", "ws", &budget)
+            })
+        };
+        admitted_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        subscription_reply(&response);
+        assert!(sending.join().unwrap().unwrap().is_current());
+        opened.join().unwrap().unwrap();
+        assert_eq!(transport.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let budget = crate::rpc::RequestBudget::new(Instant::now() + Duration::from_secs(2));
+        core.ensure_thread_subscription("a", "ws", &budget).unwrap();
+        assert_eq!(transport.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn scheduled_open_and_send_share_subscription_and_open_keeps_hydration() {
         for scheduled in [false, true] {
             let (core, transport, responses, requests) = shared_subscription_core();
@@ -14148,9 +15111,7 @@ mod tests {
             let response = responses.recv_timeout(Duration::from_secs(2)).unwrap();
             let opened = {
                 let core = core.clone();
-                std::thread::spawn(move || {
-                    core.open_thread_by_id(&core.transport_runtime().ws_command_sender(), "a")
-                })
+                std::thread::spawn(move || core.open_thread_by_id("a"))
             };
             subscription_reply(&response);
             let binding = waiter.join().unwrap().unwrap();
@@ -14311,7 +15272,7 @@ mod tests {
                     },
             );
             let (request, _) = core
-                .admit_thread_subscription("a", "ws", None, false)
+                .admit_thread_subscription("a", "ws", None, false, None)
                 .unwrap();
             core.execute_thread_subscription_request(request.clone());
             let first =
@@ -14342,7 +15303,7 @@ mod tests {
         for outcome in ["failure", "deadline", "retire", "shutdown"] {
             let (core, _transport, responses, _requests) = shared_subscription_core();
             let (request, _) = core
-                .admit_thread_subscription("a", "ws", None, false)
+                .admit_thread_subscription("a", "ws", None, false, None)
                 .unwrap();
             core.execute_thread_subscription_request(request.clone());
             let first = spawn_admitted_subscription_waiter(
@@ -16367,6 +17328,7 @@ struct ThreadSubscriptionFlight {
     result: Option<Result<(), ThreadSubscriptionFailure>>,
     hydrate: bool,
     hydration_claimed: bool,
+    cold_staging: Option<cold_open::ColdOpenStaging>,
 }
 impl Drop for ThreadSubscriptionFlight {
     fn drop(&mut self) {
@@ -16397,6 +17359,7 @@ impl ThreadSubscriptionFailure {
 }
 #[derive(Clone)]
 pub(crate) struct ThreadSubscriptionRequest {
+    open_existing: bool,
     pub(crate) id: String,
     pub(crate) workspace: String,
     pub(crate) generation: u64,
@@ -17464,70 +18427,98 @@ impl ClientCore {
 }
 
 impl ClientCore {
-    pub(crate) fn admit_opened_thread(
-        &self,
-        thread: Thread,
-        navigation: &crate::navigation::ClientNavigationState,
-    ) -> anyhow::Result<ThreadOperationToken> {
+    // Same-target opens share the RPC/receipt. Each waiter retains its captured
+    // navigation revision; the first selection retires competing UI selections,
+    // while independent subscription waiters remain valid.
+    pub(crate) fn open_existing_thread_subscription(&self, id: &str) -> anyhow::Result<()> {
+        let (revision, intent) = {
+            let mut registry = self
+                .thread_registry
+                .lock()
+                .expect("thread registry poisoned");
+            if registry
+                .open_intent
+                .as_ref()
+                .is_none_or(|(target, _)| target != id)
+            {
+                registry.clock = registry
+                    .clock
+                    .checked_add(1)
+                    .expect("thread generation exhausted");
+                registry.open_intent = Some((id.to_owned(), registry.clock));
+            }
+            (
+                registry.navigation_revision,
+                registry.open_intent.as_ref().expect("open intent").1,
+            )
+        };
+        let budget = crate::rpc::RequestBudget::new(
+            std::time::Instant::now() + crate::rpc::RPC_REQUEST_TIMEOUT,
+        );
+        let (request, ready) =
+            self.admit_thread_subscription(id, "", None, false, Some((revision, intent)))?;
+        if !ready {
+            self.execute_thread_subscription_request(request.clone());
+        }
+        self.wait_thread_subscription(&request, false, &budget)?;
+        anyhow::ensure!(
+            self.subscription_scope_current(&request),
+            "thread_open_stale"
+        );
+        let identity = self
+            .identity_authorization
+            .lock()
+            .expect("identity owner poisoned");
+        anyhow::ensure!(
+            identity.authorization_epoch() == request.authority
+                && identity.history_ticket_matches(request.auth.0)
+                && request.transport.is_current(),
+            "thread_open_stale"
+        );
         let mut registry = self
             .thread_registry
             .lock()
             .expect("thread registry poisoned");
         anyhow::ensure!(
-            !self.is_stopped() && &registry.navigation == navigation,
+            registry.navigation_revision == revision
+                && registry
+                    .open_intent
+                    .as_ref()
+                    .is_some_and(|(_, generation)| *generation == intent),
             "thread_open_stale"
         );
-        let id = thread.id.clone();
-        let workspace = thread.workspace_id.clone();
-        anyhow::ensure!(registry.require(&id, &workspace), "thread_open_stale");
-        let store = registry.stores.get_mut(&id).expect("admitted thread");
-        if store
-            .coordinator
-            .thread()
-            .is_none_or(|previous| previous.updated_at <= thread.updated_at)
-        {
-            store.set_snapshot(thread);
-        }
-        let token = ThreadOperationToken {
-            id: id.clone(),
-            generation: store.generation,
-        };
+        let (transport_guard, transport_current) =
+            request.transport.history_apply_fence(request.auth.1);
+        anyhow::ensure!(transport_current && !self.is_stopped(), "thread_open_stale");
+        let store = registry
+            .stores
+            .get(id)
+            .filter(|store| store.retirement.is_none() && store.generation == request.generation)
+            .ok_or_else(|| anyhow::anyhow!("thread_open_stale"))?;
+        let workspace = store.coordinator.workspace_id.clone();
         registry
             .navigation
             .apply(crate::navigation::NavigationIntent::SelectThread {
                 workspace_id: Some(workspace),
-                thread_id: Some(id.clone()),
+                thread_id: Some(id.to_owned()),
             });
-        let mut drafts = registry.publish(&id);
-        drafts.extend(registry.navigation_change());
+        let drafts = registry.navigation_change().into_iter().collect();
+        drop(transport_guard);
         self.transition_directory(
             &mut registry,
             &ClientMutationAuthority { _private: () },
             drafts,
             vec![],
         );
-        Ok(token)
-    }
-
-    pub(crate) fn refresh_opened_thread_subscription(
-        &self,
-        token: ThreadOperationToken,
-        workspace: &str,
-    ) -> anyhow::Result<()> {
-        let budget = crate::rpc::RequestBudget::new(
-            std::time::Instant::now() + crate::rpc::RPC_REQUEST_TIMEOUT,
-        );
-        let result = self.ensure_thread_subscription_generation(
-            &token.id,
-            workspace,
-            Some(token.generation),
-            true,
-            &budget,
-        );
-        if result.is_err() {
-            self.schedule_thread_subscription(&token.id, workspace);
-        }
-        result.map(|_| ())
+        drop(registry);
+        drop(identity);
+        request
+            .flight
+            .lock()
+            .expect("subscription flight poisoned")
+            .hydrate = true;
+        self.hydrate_thread_subscription_once(&request);
+        Ok(())
     }
 
     fn resume_created_thread_delivery(&self, id: &str, workspace: &str) {
@@ -17570,7 +18561,8 @@ impl ClientCore {
         let Some(sender) = sender else {
             return;
         };
-        let Ok((request, ready)) = self.admit_thread_subscription(id, workspace, None, true) else {
+        let Ok((request, ready)) = self.admit_thread_subscription(id, workspace, None, true, None)
+        else {
             return;
         };
         self.retire_thread_controller_jobs();
@@ -17639,7 +18631,23 @@ impl ClientCore {
         workspace: &str,
         expected: Option<u64>,
         hydrate: bool,
+        expected_navigation_revision: Option<(u64, u64)>,
     ) -> anyhow::Result<(ThreadSubscriptionRequest, bool)> {
+        anyhow::ensure!(
+            self.finish_pending_thread_retirement(id),
+            "Thread retirement in progress"
+        );
+        #[cfg(test)]
+        tests::SUBSCRIPTION_ADMISSION_HOOK.with(|slot| {
+            if let Some(hook) = slot.borrow_mut().take() {
+                hook();
+            }
+        });
+        let open_existing = expected_navigation_revision.is_some();
+        anyhow::ensure!(
+            open_existing || !workspace.trim().is_empty(),
+            "Thread subscription workspace required"
+        );
         let session = self.gateway_session();
         let auth = self.current_auth_ticket();
         let authority = self.subscription_authority();
@@ -17667,8 +18675,77 @@ impl ClientCore {
             .expect("thread registry poisoned");
         anyhow::ensure!(
             !self.is_stopped()
+                && !id.is_empty()
                 && registry.start.pending_thread_id.as_deref() != Some(id)
-                && registry.require(id, workspace),
+                && expected_navigation_revision.is_none_or(|(revision, intent)| registry
+                    .navigation_revision
+                    == revision
+                    && registry
+                        .open_intent
+                        .as_ref()
+                        .is_some_and(|(_, generation)| *generation == intent)),
+            "Thread subscription cancelled"
+        );
+        // Helping above is not an admission fence: Closed may have installed a
+        // private slot while auth/transport was captured. Refuse before creating
+        // or joining any flight; the next caller can help outside core locks.
+        anyhow::ensure!(
+            registry
+                .stores
+                .get(id)
+                .is_none_or(|store| store.retirement.is_none()),
+            "Thread retirement in progress"
+        );
+        // An ID-only open reserves the existing store/flight owner before IO.
+        // A cold reservation has no domain snapshot or authoritative workspace.
+        let workspace = if open_existing {
+            registry
+                .stores
+                .get(id)
+                .map(|store| store.coordinator.workspace_id.clone())
+                .unwrap_or_default()
+        } else {
+            workspace.to_owned()
+        };
+        if open_existing && !registry.stores.contains_key(id) {
+            anyhow::ensure!(
+                registry
+                    .stores
+                    .values()
+                    .filter(|store| store.coordinator.workspace_id.is_empty()
+                        && store.subscription_request.is_some())
+                    .count()
+                    < cold_open::MAX_COLD_OPEN_FLIGHTS,
+                "Cold thread open capacity exhausted"
+            );
+            registry.clock = registry.clock.saturating_add(1);
+            let mut store = ThreadDomainStore::new(id, "");
+            store.generation = registry.clock;
+            store.subscriptions = registry.subscription_counts.get(id).copied().unwrap_or(0);
+            store.demand = timeline_demand(
+                &registry.demands,
+                id,
+                registry
+                    .timeline_subscription_counts
+                    .get(id)
+                    .copied()
+                    .unwrap_or(0),
+            );
+            registry.stores.insert(id.to_owned(), store);
+        }
+        let pending_open = registry.stores.get(id).is_some_and(|store| {
+            store.retirement.is_none()
+                && (store.coordinator.workspace_id.is_empty()
+                    || store.coordinator.workspace_id == workspace)
+                && store
+                    .subscription_request
+                    .as_ref()
+                    .is_some_and(|request| request.open_existing)
+        });
+        anyhow::ensure!(
+            !self.is_stopped()
+                && registry.start.pending_thread_id.as_deref() != Some(id)
+                && (open_existing || pending_open || registry.require(id, &workspace)),
             "Thread subscription cancelled"
         );
         let store = registry.stores.get_mut(id).expect("retained thread");
@@ -17677,7 +18754,7 @@ impl ClientCore {
             "Thread subscription cancelled"
         );
         let scope = ThreadSubscriptionScope {
-            workspace: workspace.into(),
+            workspace: workspace.clone(),
             generation: store.generation,
             transport_revision: session.startup.transport_revision,
             auth,
@@ -17687,11 +18764,21 @@ impl ClientCore {
         let ready = store.subscription_receipt.as_ref().is_some_and(|receipt| {
             receipt.scope == scope && *receipt.live.lock().expect("subscription receipt poisoned")
         });
-        if let Some(request) = store
-            .subscription_request
-            .as_ref()
-            .filter(|request| request.scope().as_ref() == Some(&scope))
-        {
+        if let Some(request) = store.subscription_request.as_ref().filter(|request| {
+            request.scope().is_some_and(|mut current| {
+                if request.open_existing {
+                    current.workspace = scope.workspace.clone();
+                }
+                current == scope
+                    && request
+                        .flight
+                        .lock()
+                        .expect("subscription flight poisoned")
+                        .result
+                        .as_ref()
+                        .is_none_or(|result| result.is_ok())
+            })
+        }) {
             request
                 .flight
                 .lock()
@@ -17713,9 +18800,11 @@ impl ClientCore {
             Arc::new(std::sync::Mutex::new(true))
         };
         let transport = transport.with_subscription_scope(live.clone());
+        let store = registry.stores.get_mut(id).expect("retained thread");
         let request = ThreadSubscriptionRequest {
+            open_existing,
             id: id.into(),
-            workspace: workspace.into(),
+            workspace: workspace.clone(),
             generation: store.generation,
             transport_revision: scope.transport_revision,
             auth,
@@ -17732,6 +18821,7 @@ impl ClientCore {
                 result: ready.then_some(Ok(())),
                 hydrate,
                 hydration_claimed: false,
+                cold_staging: (open_existing && workspace.is_empty()).then(Default::default),
             })),
             attempt: 0,
         };
@@ -17743,7 +18833,11 @@ impl ClientCore {
             store.subscription_retry_at = None;
             store.coordinator.history_loading = true;
             store.subscription_failed = false;
-            let drafts = registry.publish(id);
+            let drafts = if store.coordinator.workspace_id.is_empty() {
+                vec![]
+            } else {
+                registry.publish(id)
+            };
             self.transition_directory(
                 &mut registry,
                 &ClientMutationAuthority { _private: () },
@@ -17765,13 +18859,40 @@ impl ClientCore {
         budget: &crate::rpc::RequestBudget,
     ) -> anyhow::Result<crate::transport::ws::runtime::ConnectionRequestTransport> {
         budget.check()?;
-        let (request, ready) = self.admit_thread_subscription(id, workspace, expected, hydrate)?;
+        let (request, ready) =
+            self.admit_thread_subscription(id, workspace, expected, hydrate, None)?;
         if !ready {
             // A foreground caller starts queued work directly. Admission is
             // nonblocking, so the thread worker never waits for its own queue.
             self.execute_thread_subscription_request(request.clone());
         }
-        self.wait_thread_subscription(&request, hydrate, budget)
+        let transport = self.wait_thread_subscription(&request, false, budget)?;
+        self.validate_subscription_workspace(&request, workspace)?;
+        if hydrate {
+            self.hydrate_thread_subscription_once(&request);
+        }
+        Ok(transport)
+    }
+
+    fn validate_subscription_workspace(
+        &self,
+        request: &ThreadSubscriptionRequest,
+        expected: &str,
+    ) -> anyhow::Result<()> {
+        let registry = self
+            .thread_registry
+            .lock()
+            .expect("thread registry poisoned");
+        anyhow::ensure!(
+            !expected.trim().is_empty()
+                && registry.stores.get(&request.id).is_some_and(|store| {
+                    store.retirement.is_none()
+                        && store.generation == request.generation
+                        && store.coordinator.workspace_id == expected
+                }),
+            "Thread subscription workspace mismatch"
+        );
+        Ok(())
     }
 
     fn wait_thread_subscription(
@@ -17863,8 +18984,10 @@ impl ClientCore {
                     .expect("thread registry poisoned");
                 registry.start.pending_thread_id.as_ref() != Some(&request.id)
                     && registry.stores.get(&request.id).is_some_and(|store| {
-                        store.generation == request.generation
-                            && store.coordinator.workspace_id == request.workspace
+                        store.retirement.is_none()
+                            && store.generation == request.generation
+                            && (request.open_existing
+                                || store.coordinator.workspace_id == request.workspace)
                     })
             }
     }
@@ -17877,7 +19000,10 @@ impl ClientCore {
                 .expect("thread registry poisoned")
                 .stores
                 .get(&request.id)
-                .is_some_and(|store| store.subscription_request.as_ref() == Some(request))
+                .is_some_and(|store| {
+                    store.retirement.is_none()
+                        && store.subscription_request.as_ref() == Some(request)
+                })
     }
 
     pub(crate) fn execute_thread_subscription_request(&self, request: ThreadSubscriptionRequest) {
@@ -17912,7 +19038,8 @@ impl ClientCore {
                 .stores
                 .get_mut(&request.id)
                 .filter(|store| {
-                    store.generation == request.generation
+                    store.retirement.is_none()
+                        && store.generation == request.generation
                         && store.subscription_request.as_ref() == Some(request)
                 })
                 .map(|store| {
@@ -17978,12 +19105,23 @@ impl ClientCore {
             response
         };
         let result = (|| -> anyhow::Result<()> {
-            let params =
-                super::start::thread_start_params(request.id.clone(), request.workspace.clone());
-            let payload = crate::rpc::build_json_rpc_request_payload(
-                pioneer_protocol::constants::methods::THREAD_START,
-                serde_json::to_value(params)?,
-            )?;
+            let (method, params) = if request.open_existing {
+                (
+                    pioneer_protocol::constants::methods::THREAD_OPEN,
+                    serde_json::to_value(pioneer_protocol::ThreadGetParams {
+                        thread_id: request.id.clone(),
+                    })?,
+                )
+            } else {
+                (
+                    pioneer_protocol::constants::methods::THREAD_START,
+                    serde_json::to_value(super::start::thread_start_params(
+                        request.id.clone(),
+                        request.workspace.clone(),
+                    ))?,
+                )
+            };
+            let payload = crate::rpc::build_json_rpc_request_payload(method, params)?;
             transport
                 .send_json_rpc_request(payload.request_id, payload.payload, response.clone())
                 .map_err(anyhow::Error::msg)
@@ -18023,43 +19161,132 @@ impl ClientCore {
         let Some(response) = response else {
             return;
         };
+        let mut cold_actions = vec![];
         let result = response.map_err(anyhow::Error::new).and_then(|value| {
             let response: pioneer_protocol::ThreadStartResponse =
                 crate::rpc::deserialize_json_rpc_result(
-                    pioneer_protocol::constants::methods::THREAD_START,
+                    if request.open_existing {
+                        pioneer_protocol::constants::methods::THREAD_OPEN
+                    } else {
+                        pioneer_protocol::constants::methods::THREAD_START
+                    },
                     value,
                 )?;
             anyhow::ensure!(
                 response.thread.id == request.id
-                    && response.thread.workspace_id == request.workspace,
+                    && (request.open_existing || response.thread.workspace_id == request.workspace)
+                    && !response.thread.workspace_id.is_empty(),
                 "Thread subscription response scope mismatch"
             );
             anyhow::ensure!(
                 self.thread_subscription_request_current(request),
                 "Thread subscription retired"
             );
+            let identity = self
+                .identity_authorization
+                .lock()
+                .expect("identity owner poisoned");
+            anyhow::ensure!(
+                identity.authorization_epoch() == request.authority
+                    && identity.history_ticket_matches(request.auth.0)
+                    && request.transport.is_current(),
+                "Thread subscription retired"
+            );
             let mut registry = self
                 .thread_registry
                 .lock()
                 .expect("thread registry poisoned");
+            let (_transport_guard, transport_current) =
+                request.transport.history_apply_fence(request.auth.1);
+            anyhow::ensure!(
+                transport_current && !self.is_stopped(),
+                "Thread subscription retired"
+            );
             let store = registry
                 .stores
                 .get_mut(&request.id)
                 .filter(|store| {
-                    store.generation == request.generation
+                    store.retirement.is_none()
+                        && store.generation == request.generation
                         && store.subscription_request.as_ref() == Some(request)
                 })
                 .ok_or_else(|| anyhow::anyhow!("Thread subscription retired"))?;
             let mut flight = request.flight.lock().expect("subscription flight poisoned");
             anyhow::ensure!(flight.result.is_none(), "Thread subscription retired");
+            let workspace = response.thread.workspace_id.clone();
+            let staged = flight.cold_staging.take();
+            anyhow::ensure!(
+                staged.as_ref().is_none_or(|staged| !staged.overflow),
+                "Cold thread open ingress capacity exhausted"
+            );
+            if let Some(staged) = &staged {
+                anyhow::ensure!(
+                    !staged.contains_closed(&request.id, &workspace),
+                    "Thread closed during open"
+                );
+            }
             store.reconcile_subscription_snapshot(flight.baseline.take().as_ref(), response.thread);
-            store.subscription_receipt = request.scope().map(|scope| ThreadSubscriptionReceipt {
-                scope,
-                live: request.live.clone(),
+            // The snapshot and all captured LIVE state share this one registry
+            // commit. No independently locking ClientCore helper runs here.
+            drop(flight);
+            let mut pending_reductions = vec![];
+            let mut staged_drafts = vec![];
+            if let Some(staged) = staged {
+                for event in staged.events {
+                    let effects = self.apply_cold_ingress_locked(
+                        &mut registry,
+                        &request.id,
+                        &workspace,
+                        event,
+                    );
+                    cold_actions.extend(effects.actions);
+                    pending_reductions.extend(effects.pending);
+                    staged_drafts.extend(effects.drafts);
+                }
+                request
+                    .flight
+                    .lock()
+                    .expect("subscription flight poisoned")
+                    .hydrate = true;
+            }
+            staged_drafts.extend(
+                self.apply_pending_requests_batch_locked(&mut registry, pending_reductions)
+                    .1,
+            );
+            let store = registry
+                .stores
+                .get_mut(&request.id)
+                .expect("exact open store");
+            store.subscription_receipt = request.scope().map(|mut scope| {
+                scope.workspace = workspace;
+                ThreadSubscriptionReceipt {
+                    scope,
+                    live: request.live.clone(),
+                }
             });
+            drop(_transport_guard);
+            self.transition_directory(
+                &mut registry,
+                &ClientMutationAuthority { _private: () },
+                staged_drafts,
+                vec![],
+            );
             Ok(())
         });
+        let applied = result.is_ok();
         self.finish_thread_subscription_request(request, result);
+        if applied {
+            for action in cold_actions {
+                let _ = self.schedule_thread_semantic_request_inner(
+                    action,
+                    Some(request.generation),
+                    true,
+                    false,
+                );
+            }
+            self.retire_thread_controller_jobs();
+            self.refresh_approval_actions();
+        }
     }
 
     fn finish_thread_subscription_request(
@@ -18091,6 +19318,9 @@ impl ClientCore {
             }
             // Promotion marks queued under this same lock, before installing a
             // response. Claim capacity failure here or leave that active flight alone.
+            if result.is_err() {
+                flight.cold_staging = None;
+            }
             flight.result = Some(
                 result
                     .as_ref()
@@ -18105,17 +19335,36 @@ impl ClientCore {
         if let Some(response) = response {
             response.cancel();
         }
+        #[cfg(test)]
+        tests::SUBSCRIPTION_FINISH_HOOK.with(|slot| {
+            let hook = slot.borrow_mut().take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        });
         let mut registry = self
             .thread_registry
             .lock()
             .expect("thread registry poisoned");
+        // Rollback belongs to this exact request, not just the store generation.
+        let mut rollback_reservation = false;
         if let Some(store) = registry.stores.get_mut(&request.id).filter(|store| {
-            store.generation == request.generation
+            store.retirement.is_none()
+                && store.generation == request.generation
                 && store.subscription_request.as_ref() == Some(request)
         }) {
+            rollback_reservation = result.is_err()
+                && request.open_existing
+                && request.workspace.is_empty()
+                && store.coordinator.thread().is_none();
             store.coordinator.history_loading = false;
             store.subscription_failed = result.is_err();
-            if current && retryable && request.attempt < 2 && store.demand == ClientDemand::Visible
+            if current
+                && retryable
+                && !store.coordinator.workspace_id.is_empty()
+                && !(request.open_existing && request.workspace.is_empty())
+                && request.attempt < 2
+                && store.demand == ClientDemand::Visible
             {
                 let mut next = request.clone();
                 next.attempt += 1;
@@ -18131,6 +19380,7 @@ impl ClientCore {
                     result: None,
                     hydrate,
                     hydration_claimed: false,
+                    cold_staging: None,
                 }));
                 store.subscription_retry_at = Some(
                     std::time::Instant::now()
@@ -18141,7 +19391,24 @@ impl ClientCore {
                 store.subscription_request = None;
                 store.subscription_retry_at = None;
             }
-            let drafts = registry.publish(&request.id);
+            let drafts = if result.is_err() && request.open_existing && request.workspace.is_empty()
+            {
+                vec![]
+            } else {
+                registry.publish(&request.id)
+            };
+            self.transition_directory(
+                &mut registry,
+                &ClientMutationAuthority { _private: () },
+                drafts,
+                vec![],
+            );
+        }
+        if rollback_reservation {
+            // No semantic deletion: metadata, placement, unread and in-flight
+            // directory refresh membership existed independently of this open.
+            registry.stores.remove(&request.id);
+            let drafts = registry.retire(&request.id);
             self.transition_directory(
                 &mut registry,
                 &ClientMutationAuthority { _private: () },
@@ -18364,6 +19631,7 @@ impl ClientCore {
             .expect("thread registry poisoned")
             .stores
             .get(id)
+            .filter(|store| store.retirement.is_none())
             .map(|store| ThreadOperationToken {
                 id: id.into(),
                 generation: store.generation,
@@ -18963,6 +20231,9 @@ impl ThreadRegistry {
         self.ready_resume.clear();
         self.ready_resume_set.clear();
         for (id, store) in &mut self.stores {
+            if store.retirement.is_some() {
+                continue;
+            }
             // A protected-publication fence also retires the source incarnation:
             // neither an old RPC completion nor retained semantic pages can revive it.
             self.clock = self.clock.saturating_add(1);

@@ -77,23 +77,6 @@ async fn setup_service_with_config(
     (store, backend, service)
 }
 
-async fn setup_service_with_recording_backend()
--> (Arc<CrudStore>, Arc<RecordingMemoryBackend>, MemoryService) {
-    let connection = Database::connect("sqlite::memory:")
-        .await
-        .expect("connect sqlite");
-    Migrator::up(&connection, None).await.expect("migrate");
-    let store = Arc::new(CrudStore::new(connection));
-    let backend = Arc::new(RecordingMemoryBackend::default());
-    let backend_for_service: Arc<dyn MemoryBackend> = backend.clone();
-    let service = MemoryService::new(
-        store.clone(),
-        backend_for_service,
-        MemoryServiceConfig::default(),
-    );
-    (store, backend, service)
-}
-
 fn scope(kind: MemoryScopeKind, key: &str) -> MemoryScope {
     MemoryScope {
         kind,

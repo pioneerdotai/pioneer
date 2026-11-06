@@ -7202,6 +7202,11 @@ async fn resolve_parent_context(
                     bail!("Task execution route changed after admission");
                 }
                 match projection.kind {
+                    pioneer_protocol::AgentRouteKind::CapsuleBound => {
+                        if projection.source_capsule_id != root_thread_id {
+                            bail!("Task execution route is bound to a different source capsule");
+                        }
+                    }
                     pioneer_protocol::AgentRouteKind::ExecutionBound => {
                         if actor_contract.creator
                             != pioneer_protocol::PersistedActorRef::AgentExecution(

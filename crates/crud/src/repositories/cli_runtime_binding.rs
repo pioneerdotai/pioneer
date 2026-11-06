@@ -510,6 +510,8 @@ pub struct CliRuntimePendingRequestListFilter {
     pub initiating_session_id: Option<String>,
     /// Exclusive stable keyset cursor `(created_at, request_id)`.
     pub after: Option<(DateTimeWithTimeZone, String)>,
+    /// Inclusive frontier captured once before a finite background pass.
+    pub through: Option<(DateTimeWithTimeZone, String)>,
     pub limit: Option<u64>,
 }
 
@@ -1424,6 +1426,43 @@ pub async fn list_active_turn_binding_page<C: ConnectionTrait>(
         .collect()
 }
 
+/// Capture a finite active-set frontier; later mutations remain on the owner's
+/// unacknowledged work signal and are revisited in the next pass.
+pub async fn active_turn_binding_frontier<C: ConnectionTrait>(
+    db: &C,
+    status: CliRuntimeActiveTurnBindingStatus,
+) -> Result<Option<(DateTimeWithTimeZone, String)>> {
+    use turn_cli_runtime_binding::Column;
+    Ok(turn_cli_runtime_binding::Entity::find()
+        .filter(Column::Status.eq(status.as_str()))
+        .order_by_desc(Column::CreatedAt)
+        .order_by_desc(Column::TurnId)
+        .limit(1)
+        .one(db)
+        .await?
+        .map(|row| (row.created_at, row.turn_id)))
+}
+
+pub async fn list_active_turn_binding_page_through<C: ConnectionTrait>(
+    db: &C,
+    status: CliRuntimeActiveTurnBindingStatus,
+    after: Option<&(DateTimeWithTimeZone, String)>,
+    through: &(DateTimeWithTimeZone, String),
+) -> Result<Vec<CliRuntimeTurnBindingRecord>> {
+    use turn_cli_runtime_binding::Column;
+    active_turn_binding_page_query(status, after)
+        .filter(
+            Expr::tuple([Expr::col(Column::CreatedAt), Expr::col(Column::TurnId)]).lte(
+                Expr::tuple([Expr::value(through.0), Expr::value(through.1.clone())]),
+            ),
+        )
+        .all(db)
+        .await?
+        .into_iter()
+        .map(turn_binding_record_from_model)
+        .collect()
+}
+
 pub async fn list_turn_bindings<C: ConnectionTrait>(
     db: &C,
     filter: CliRuntimeTurnBindingListFilter,
@@ -1939,6 +1978,21 @@ pub async fn find_pending_request<C: ConnectionTrait>(
         .transpose()
 }
 
+pub async fn pending_request_frontier_for_turn<C: ConnectionTrait>(
+    db: &C,
+    turn_id: &str,
+) -> Result<Option<(DateTimeWithTimeZone, String)>> {
+    use cli_runtime_pending_request::Column;
+    Ok(cli_runtime_pending_request::Entity::find()
+        .filter(Column::TurnId.eq(turn_id))
+        .order_by_desc(Column::CreatedAt)
+        .order_by_desc(Column::RequestId)
+        .limit(1)
+        .one(db)
+        .await?
+        .map(|row| (row.created_at, row.request_id)))
+}
+
 pub async fn list_pending_requests<C: ConnectionTrait>(
     db: &C,
     filter: CliRuntimePendingRequestListFilter,
@@ -1986,6 +2040,15 @@ pub async fn list_pending_requests<C: ConnectionTrait>(
                         .add(cli_runtime_pending_request::Column::CreatedAt.eq(created_at))
                         .add(cli_runtime_pending_request::Column::RequestId.gt(request_id)),
                 ),
+        );
+    }
+
+    if let Some((created_at, request_id)) = filter.through {
+        use cli_runtime_pending_request::Column;
+        query = query.filter(
+            Expr::tuple([Expr::col(Column::CreatedAt), Expr::col(Column::RequestId)]).lte(
+                Expr::tuple([Expr::value(created_at), Expr::value(request_id)]),
+            ),
         );
     }
 

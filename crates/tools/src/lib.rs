@@ -626,9 +626,7 @@ mod tests {
     };
     use crate::registry::ToolHandler;
     use crate::router::RawToolCall;
-    use crate::spec::{
-        ConfiguredToolSpec, ExecutionClass, PayloadKind, REQUEST_TOOLS_TOOL_NAME, ToolSpec,
-    };
+    use crate::spec::{ConfiguredToolSpec, ExecutionClass, PayloadKind, ToolSpec};
     use async_trait::async_trait;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
@@ -2208,6 +2206,7 @@ mod tests {
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
     }
+    #[cfg(feature = "computer-use")]
     #[derive(Debug, Default)]
     struct ProxyImageSink {
         block_next: AtomicBool,
@@ -2215,6 +2214,7 @@ mod tests {
         entered: Notify,
         resume: Notify,
     }
+    #[cfg(feature = "computer-use")]
     #[async_trait]
     impl crate::handlers::computer_use::ComputerUseImageSink for ProxyImageSink {
         async fn admit(

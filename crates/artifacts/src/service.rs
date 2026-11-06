@@ -76,6 +76,44 @@ pub struct HtmlPreviewMaintenanceProgress {
     copies: String,
     finished: [bool; 3],
     io_seeded: bool,
+    // Earliest GC cutoff observed in this bounded pass. A grace deadline can
+    // expire behind the cursor before EOF; it must still trigger a fresh pass.
+    gc_cutoff_ms: Option<i64>,
+    blob_upper: Option<String>,
+    copies_upper: Option<String>,
+    // Each family's error/cancellation survives successful suffix quanta until
+    // that family's EOF; unrelated Deferred work must not postpone its rewind.
+    retry_debt: [bool; 3],
+}
+
+impl HtmlPreviewMaintenanceProgress {
+    /// Reopen completed families without destroying an unrelated preparation
+    /// still waiting for an activity/read hold. The caller retains invalidation
+    /// for unfinished keysets until their captured pass finishes as well.
+    pub fn invalidate_completed(&mut self) {
+        for family in 0..3 {
+            if self.finished[family] {
+                self.invalidate_family(family);
+            }
+        }
+    }
+
+    fn invalidate_family(&mut self, family: usize) {
+        match family {
+            0 => self.previews = Default::default(),
+            1 => {
+                self.blobs.clear();
+                self.blob_upper = None;
+                self.gc_cutoff_ms = None;
+            }
+            _ => {
+                self.copies.clear();
+                self.copies_upper = None;
+            }
+        }
+        self.finished[family] = false;
+        self.retry_debt[family] = false;
+    }
 }
 
 /// Domain-owned bounded read used by the agent artifact tool.
@@ -220,6 +258,22 @@ struct ArtifactReadBlobDescriptor {
 }
 
 impl ArtifactService {
+    /// Preserve shared activity/read-hold state while selecting the database
+    /// class at an operator/background operation boundary.
+    pub fn with_maintenance_access(&self) -> Self {
+        let mut service = self.clone();
+        service.store = Arc::new(self.store.with_maintenance_access());
+        service
+    }
+
+    /// Preserve the operator invocation's existing GC policy while sharing the
+    /// running owner's store, blob root and preview activity fences.
+    pub fn with_gc_policy(&self, policy: ArtifactGcPolicy) -> Self {
+        let mut service = self.clone();
+        service.gc_policy = policy;
+        service
+    }
+
     pub fn new(store: Arc<CrudStore>, blob_store: Arc<dyn ArtifactBlobStore>) -> Self {
         Self {
             store,
@@ -264,8 +318,8 @@ impl ArtifactService {
 
     /// In-process execution/delivery complements durable runtime/frozen owners.
     /// Shared by this service and its maintenance owner; never a DB permit.
-    pub async fn html_preview_activity(&self) -> tokio::sync::OwnedRwLockReadGuard<()> {
-        self.preview_activity.clone().read_owned().await
+    pub async fn html_preview_activity(&self) -> HtmlPreviewActivityGuard {
+        self.html_preview_activity_signaled().await
     }
 
     pub async fn html_preview_activity_signaled(&self) -> HtmlPreviewActivityGuard {
@@ -833,16 +887,60 @@ impl ArtifactService {
             != HtmlPreviewMaintenanceOutcome::Idle)
     }
 
+    pub async fn html_preview_maintenance_deadline(
+        &self,
+        progress: &HtmlPreviewMaintenanceProgress,
+    ) -> ArtifactResult<Option<i64>> {
+        let store = self.store.with_maintenance_access();
+        let grace =
+            i64::try_from(self.gc_policy.grace_secs.saturating_mul(1000)).unwrap_or(i64::MAX);
+        let io = store.html_preview_io_deadline().await?;
+        let cutoff = progress
+            .gc_cutoff_ms
+            .ok_or(ArtifactError::ContentInvariant {
+                reason: "HTML GC discovery is incomplete",
+            })?;
+        let gc = store.html_preview_gc_deadline(grace, cutoff).await?;
+        Ok(io.into_iter().chain(gc).min())
+    }
+
     pub async fn html_preview_maintenance_outcome(
+        &self,
+        progress: &mut HtmlPreviewMaintenanceProgress,
+    ) -> ArtifactResult<HtmlPreviewMaintenanceOutcome> {
+        let result = self.html_preview_maintenance_pass_quantum(progress).await;
+        let mut retry = false;
+        for family in 0..3 {
+            if progress.retry_debt[family] && progress.finished[family] {
+                // Rewind only the failed family's completed keyset. Another
+                // family's activity/read hold or IO backlog cannot postpone it.
+                progress.invalidate_family(family);
+                retry = true;
+            }
+        }
+        let blocked_debt = matches!(&result, Ok(HtmlPreviewMaintenanceOutcome::Deferred))
+            && progress.retry_debt.iter().any(|debt| *debt);
+        if (retry || blocked_debt) && result.is_ok() {
+            return Err(anyhow::anyhow!("HTML maintenance family requires retry").into());
+        }
+        result
+    }
+
+    async fn html_preview_maintenance_pass_quantum(
         &self,
         progress: &mut HtmlPreviewMaintenanceProgress,
     ) -> ArtifactResult<HtmlPreviewMaintenanceOutcome> {
         let store = self.store.with_maintenance_access();
         if progress.finished.iter().all(|done| *done) {
             progress.finished = [false; 3];
+            progress.gc_cutoff_ms = None;
+            progress.blob_upper = None;
+            progress.copies_upper = None;
         }
         let mut deferred = false;
         let mut copies_deferred = false;
+        let preview_debt = progress.retry_debt[0];
+        progress.retry_debt[0] = !progress.finished[0] || preview_debt;
         let preview_result = if progress.finished[0] {
             Ok(false)
         } else {
@@ -855,80 +953,118 @@ impl ArtifactService {
             }
         };
         if let Ok(more) = &preview_result {
+            progress.retry_debt[0] = preview_debt;
             progress.finished[0] = !more;
         }
-        let grace_ms =
-            i64::try_from(self.gc_policy.grace_secs.saturating_mul(1000)).unwrap_or(i64::MAX);
-        let (next, candidates) = if progress.finished[1] {
-            (String::new(), Vec::new())
-        } else {
-            store
-                .html_preview_gc_blob_page(
-                    &progress.blobs,
-                    Utc::now().timestamp_millis().saturating_sub(grace_ms),
-                )
-                .await?
-        };
-        progress.finished[1] = next.is_empty();
-        progress.blobs = next;
-        let mut deletion_error = None;
-        for (workspace, blob) in candidates {
-            // Waiting and filesystem I/O are outside database admission. Every
-            // producer of original/projection bytes holds the same local lock
-            // until its metadata reference is durable.
-            let result = async {
-                let guard = self.blob_store.acquire_mutation_guard(&workspace).await?;
-                if store
-                    .artifact_storage_key_is_unreferenced(&workspace, &blob.storage_key)
+        let blob_debt = progress.retry_debt[1];
+        progress.retry_debt[1] = !progress.finished[1] || blob_debt;
+        let blob_result = async {
+            let grace_ms =
+                i64::try_from(self.gc_policy.grace_secs.saturating_mul(1000)).unwrap_or(i64::MAX);
+            let (next, candidates) = if progress.finished[1] {
+                (String::new(), Vec::new())
+            } else {
+                if progress.blob_upper.is_none() {
+                    progress.blob_upper = Some(store.html_preview_blob_frontier().await?);
+                }
+                let cutoff = Utc::now().timestamp_millis().saturating_sub(grace_ms);
+                progress.gc_cutoff_ms =
+                    Some(progress.gc_cutoff_ms.map_or(cutoff, |old| old.min(cutoff)));
+                store
+                    .html_preview_gc_blob_page_through(
+                        &progress.blobs,
+                        cutoff,
+                        progress.blob_upper.as_deref().expect("captured frontier"),
+                    )
+                    .await?
+            };
+            progress.finished[1] = next.is_empty();
+            progress.blobs = next;
+            let mut deletion_error = None;
+            for (workspace, blob) in candidates {
+                // Waiting and filesystem I/O are outside database admission. Every
+                // producer of original/projection bytes holds the same local lock
+                // until its metadata reference is durable.
+                let result = async {
+                    let guard = self.blob_store.acquire_mutation_guard(&workspace).await?;
+                    if store
+                        .artifact_storage_key_is_unreferenced(&workspace, &blob.storage_key)
+                        .await?
+                    {
+                        self.blob_store
+                            .delete_unreferenced_guarded(
+                                &workspace,
+                                &blob.storage_key,
+                                guard.clone(),
+                            )
+                            .await?;
+                        store
+                            .delete_artifact_blob_row(&workspace, &blob.blob_id)
+                            .await?;
+                    }
+                    Ok::<(), ArtifactError>(())
+                }
+                .await;
+                if let Err(error) = result {
+                    deletion_error = Some(error);
+                }
+            }
+            if let Some(error) = deletion_error {
+                return Err(error);
+            }
+            Ok::<(), ArtifactError>(())
+        }
+        .await;
+        if blob_result.is_ok() {
+            progress.retry_debt[1] = blob_debt;
+        }
+        let copies_debt = progress.retry_debt[2];
+        progress.retry_debt[2] = !progress.finished[2] || copies_debt;
+        let copies_result = async {
+            if !progress.io_seeded {
+                progress.io_seeded = store.html_preview_io_seed_complete().await?;
+            }
+            let (id, copy) = if progress.finished[2] || progress.io_seeded {
+                (String::new(), None)
+            } else {
+                if progress.copies_upper.is_none() {
+                    progress.copies_upper = Some(store.html_preview_artifact_frontier().await?);
+                }
+                store
+                    .html_preview_released_copies_page_through(
+                        &progress.copies,
+                        progress.copies_upper.as_deref().expect("captured frontier"),
+                    )
+                    .await?
+            };
+            progress.finished[2] = id.is_empty();
+            progress.copies = id.clone();
+            if let Some((workspace, previous)) = copy {
+                match self
+                    .prepare_html_preview_copy_cleanup(&workspace, &previous)
                     .await?
                 {
-                    self.blob_store
-                        .delete_unreferenced_guarded(&workspace, &blob.storage_key, guard.clone())
-                        .await?;
-                    store
-                        .delete_artifact_blob_row(&workspace, &blob.blob_id)
-                        .await?;
-                }
-                Ok::<(), ArtifactError>(())
-            }
-            .await;
-            if let Err(error) = result {
-                deletion_error = Some(error);
-            }
-        }
-        if !progress.io_seeded {
-            progress.io_seeded = store.html_preview_io_seed_complete().await?;
-        }
-        let (id, copy) = if progress.finished[2] || progress.io_seeded {
-            (String::new(), None)
-        } else {
-            store
-                .html_preview_released_copies_page(&progress.copies)
-                .await?
-        };
-        progress.finished[2] = id.is_empty();
-        progress.copies = id.clone();
-        if let Some((workspace, previous)) = copy {
-            match self
-                .prepare_html_preview_copy_cleanup(&workspace, &previous)
-                .await?
-            {
-                Some(prepared) => {
-                    store
-                        .finish_html_preview_copy_cleanup(&id, &previous, &prepared)
-                        .await?;
-                }
-                None => {
-                    copies_deferred = true;
-                    progress.copies.clear();
-                    progress.finished[2] = false;
+                    Some(prepared) => {
+                        store
+                            .finish_html_preview_copy_cleanup(&id, &previous, &prepared)
+                            .await?;
+                    }
+                    None => {
+                        copies_deferred = true;
+                        progress.copies.clear();
+                        progress.finished[2] = false;
+                    }
                 }
             }
+            Ok::<(), ArtifactError>(())
         }
-        if let Some(error) = deletion_error {
-            return Err(error);
+        .await;
+        if copies_result.is_ok() {
+            progress.retry_debt[2] = copies_debt;
         }
+        blob_result?;
         preview_result?;
+        copies_result?;
         let runnable = (!progress.finished[0] && !deferred)
             || !progress.finished[1]
             || (!progress.finished[2] && !copies_deferred);

@@ -1317,6 +1317,18 @@ async fn portable_active_staging_cannot_be_reclaimed_by_another_progress_owner()
 
 #[tokio::test]
 async fn portable_unavailable_history_pages_yield_and_revisit_without_blocking_other_sources() {
+    async fn finish_unavailable_pass(
+        store: &CrudStore,
+        progress: &mut pioneer_crud::PortablePayloadProgress,
+    ) {
+        for _ in 0..30 {
+            if !progress.quantum(store).await.unwrap() {
+                return;
+            }
+        }
+        panic!("unavailable pages must reach finite global EOF");
+    }
+
     let (_file, store, _writer) = fixture().await;
     let root = pioneer_compaction::frozen::FrozenHistoryRef {
         format: 1,
@@ -1351,11 +1363,9 @@ async fn portable_unavailable_history_pages_yield_and_revisit_without_blocking_o
         .await
         .unwrap();
     let mut progress = pioneer_crud::PortablePayloadProgress::default();
-    // False feeds the existing worker's idle policy; poison-only pages must
-    // neither stage bytes nor report endless active work.
-    for _ in 0..30 {
-        assert!(!progress.quantum(&store).await.unwrap());
-    }
+    // An unavailable source page is not global EOF. The finite family pass
+    // must finish without staging bytes or reporting endless active work.
+    finish_unavailable_pass(&store, &mut progress).await;
     assert_eq!(
         scalar(&store, "SELECT count(*) n FROM portable_payload").await,
         0
@@ -1401,15 +1411,11 @@ async fn portable_unavailable_history_pages_yield_and_revisit_without_blocking_o
         .execute_unprepared("DELETE FROM compaction_frozen_history WHERE id='unavailable'")
         .await
         .unwrap();
-    for _ in 0..30 {
-        assert!(!progress.quantum(&store).await.unwrap());
-    }
+    finish_unavailable_pass(&store, &mut progress).await;
     store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
         "INSERT INTO compaction_frozen_history(id,workspace_id,owner_thread,identity_sha256,message_count,next_ordinal,import_count,next_import,imports_sha256,ready) VALUES('unavailable','ws','thread',?,0,0,0,0,'',0)", [root.identity_sha256.into()]
     )).await.unwrap();
-    for _ in 0..30 {
-        assert!(!progress.quantum(&store).await.unwrap());
-    }
+    finish_unavailable_pass(&store, &mut progress).await;
     store
         .database_connection()
         .execute_unprepared(

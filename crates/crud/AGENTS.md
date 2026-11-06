@@ -23,3 +23,13 @@ debugging, see the root [diagnostics scope](../../AGENTS.md#diagnostics).
   alternate connections or classify individual SQL calls here.
 - For schema changes read [migration rules](../migration/AGENTS.md); new tables
   require [generated Entity](../entity/AGENTS.md) before their ordinary CRUD.
+
+## Background Invalidation
+
+Follow the root [background contract](../../AGENTS.md#background-work-and-idle).
+For each mutation affecting background work, preserve the relevant domain
+signal at its semantic commit boundary, including custom atomic publishers,
+trigger side effects, earlier deadlines and release of protection on old rows.
+Reuse existing `WorkChange` guards before dispatch; complete known no-ops
+quietly and preserve unknown outcomes on error/cancellation. Do not broadcast
+every write to every domain or replace missing invalidation with polling.

@@ -217,6 +217,67 @@ pub async fn has_webhook_sibling_activity<C: ConnectionTrait>(
         .is_some())
 }
 
+/// Bounded facts for draining an ordinary task with accepted extra runs.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct AdditionalCompletionRuns {
+    pub pending_run_id: Option<String>,
+    pub outcome: Option<task_run::Model>,
+}
+
+pub(crate) async fn additional_completion_runs<C: ConnectionTrait>(
+    db: &C,
+    task_id: &str,
+    excluding: &str,
+) -> Result<Option<AdditionalCompletionRuns>> {
+    use pioneer_entity::task_run::{Column, Entity};
+    let task_runs = Entity::find().filter(Column::TaskId.eq(task_id.to_owned()));
+    let additional = task_runs
+        .clone()
+        .filter(Column::TriggerId.is_null())
+        .select_only()
+        .column(Column::Id)
+        .into_tuple::<String>()
+        .one(db)
+        .await?;
+    if additional.is_none() {
+        return Ok(None);
+    }
+    let siblings = task_runs.filter(Column::Id.ne(excluding.to_owned()));
+    let pending_run_id = siblings
+        .clone()
+        .filter(Column::Status.is_in([
+            "queued",
+            "starting",
+            "running",
+            "waiting",
+            "waiting_review",
+        ]))
+        .order_by_asc(Column::RunNumber)
+        .select_only()
+        .column(Column::Id)
+        .into_tuple::<String>()
+        .one(db)
+        .await?;
+    // A failed attempt with a retry successor is not that occurrence's final
+    // outcome. Preserve unsuperseded failures when the last sibling succeeds.
+    let retry_sources = Query::select()
+        .column(Column::RetryOfRunId)
+        .from(Entity)
+        .and_where(Column::TaskId.eq(task_id.to_owned()))
+        .and_where(Column::RetryOfRunId.is_not_null())
+        .to_owned();
+    let outcome = siblings
+        .filter(Column::Status.is_in(["failed", "blocked", "cancelled", "timed_out"]))
+        .filter(Column::Id.not_in_subquery(retry_sources))
+        .order_by_desc(Column::RunNumber)
+        .one(db)
+        .await?;
+    Ok(Some(AdditionalCompletionRuns {
+        pending_run_id,
+        outcome,
+    }))
+}
+
 pub async fn find_latest_numbered_run<C: ConnectionTrait>(
     db: &C,
     task_id: &str,
@@ -873,4 +934,22 @@ pub async fn scheduler_due_upper<C: ConnectionTrait>(
         .one(db)
         .await
         .context("failed to capture due run upper")
+}
+
+/// Future queued rows outside the in-memory bounded page still own deadlines.
+pub(crate) async fn next_ready_deadline<C: ConnectionTrait>(
+    db: &C,
+    now: i64,
+) -> Result<Option<i64>> {
+    Ok(task_run::Entity::find()
+        .select_only()
+        .column(task_run::Column::ReadyAt)
+        .filter(task_run::Column::Status.eq(task_run_status_to_db(TaskRunStatus::Queued)))
+        .filter(task_run::Column::ReadyAt.gt(unix_to_datetime(now)))
+        .order_by_asc(task_run::Column::ReadyAt)
+        .limit(1)
+        .into_tuple::<DateTimeWithTimeZone>()
+        .one(db)
+        .await?
+        .map(crate::util::deadline_unix_seconds))
 }

@@ -2,6 +2,7 @@
 //! LIVE delivery. The provider only supplies a controllable model completion.
 use super::*;
 use crate::message::turn_handlers::foreground_start::ForegroundAcceptance;
+use crate::session::test_support::{OutboundTestReceiver, outbound_channel};
 
 const THREAD: &str = "foreground-start-thread";
 const TURN: &str = "foreground-start-turn";
@@ -12,7 +13,7 @@ struct Fixture {
     store: Arc<CrudStore>,
     workspace: String,
     connection: ConnectionId,
-    rx: crate::session::test_support::OutboundTestReceiver,
+    rx: OutboundTestReceiver,
     entered: Arc<Notify>,
     release: Arc<Notify>,
     calls: Arc<AtomicU64>,
@@ -20,7 +21,7 @@ struct Fixture {
 
 impl Fixture {
     async fn new() -> Self {
-        let (tx, mut rx) = crate::session::test_support::outbound_channel(256);
+        let (tx, mut rx) = outbound_channel(256);
         let sessions = Arc::new(SessionManager::new());
         let connection = register_authenticated_test_connection(&sessions, tx).await;
         let (workspaces, store, workspace) = setup_workspace_manager().await;
@@ -940,12 +941,17 @@ async fn snapshot_observation_and_shutdown_do_not_allow_a_late_initial_start() {
     }
     assert!(saw_response);
     assert!(!f.processor.foreground_starts.pending(THREAD, TURN));
-    assert!(
+    // Terminal cleanup may already have reclaimed the runtime-only snapshot.
+    // Shutting down publication must preserve the canonical completed turn.
+    assert_eq!(
         f.store
-            .get_turn_runtime_snapshot(TURN)
+            .get_turn(THREAD, TURN)
             .await
             .unwrap()
-            .is_some()
+            .unwrap()
+            .1
+            .status,
+        TurnStatus::Completed
     );
     assert!(
         f.processor
@@ -1054,7 +1060,7 @@ async fn fresh_processor_replays_the_committed_turn_without_starting_provider_ag
     .await;
     let original = f.store.get_turn_execution(TURN).await.unwrap().unwrap();
     f.close().await;
-    let (tx, _rx) = crate::session::test_support::outbound_channel(256);
+    let (tx, _rx) = outbound_channel(256);
     let sessions = Arc::new(SessionManager::new());
     let connection = register_authenticated_test_connection(&sessions, tx).await;
     let restored = MessageProcessor::new(

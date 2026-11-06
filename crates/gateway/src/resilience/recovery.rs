@@ -25,7 +25,7 @@ use pioneer_provider::{ChatMessage, ModelInputItem, ProviderRegistry, Role};
 use pioneer_tools::{ExecutionWindowAdmissionDecision, decide_execution_window_admission};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use tokio::sync::{Notify, RwLock};
+use tokio::sync::RwLock;
 use tracing::warn;
 
 use super::timeout::{
@@ -54,6 +54,12 @@ const RECOVERY_ATTEMPT_MAX_WALL_CLOCK_SECS: u64 = 15 * 60;
 /// own activity kind and is therefore a causal progress frontier.
 fn is_causal_recovery_progress(activity_kind: &str) -> bool {
     !activity_kind.starts_with("runtime/") && activity_kind != "item/heartbeat"
+}
+
+pub struct SupervisionAuditBatch {
+    pub events: Vec<RecoveryCoordinatorEvent>,
+    pub has_more: bool,
+    pub errors: Vec<String>,
 }
 
 type RecoveryListenerStarter =
@@ -494,6 +500,14 @@ pub struct RuntimeFailureCandidate {
     pub metadata: ToolMetadata,
 }
 
+#[derive(Clone, Default)]
+struct OrphanExecutionScan {
+    upper: Option<String>,
+    foreign_after: Option<String>,
+    owned_after: Option<String>,
+    complete: [bool; 2],
+}
+
 #[derive(Clone)]
 pub struct RecoveryCoordinator {
     crud_store: Arc<CrudStore>,
@@ -505,8 +519,11 @@ pub struct RecoveryCoordinator {
     turn_execution_owner_id: Arc<str>,
     listener_starter: Arc<RwLock<Option<RecoveryListenerStarter>>>,
     plugin_launch_locks: Option<crate::message::plugins::PluginMutationLocks>,
-    due_wake: Arc<Notify>,
     active_scan: Arc<tokio::sync::Mutex<(Option<String>, Option<String>)>>,
+    orphan_scan: Arc<tokio::sync::Mutex<OrphanExecutionScan>>,
+    terminal_scan: Arc<tokio::sync::Mutex<(Option<String>, Option<String>)>>,
+    timeout_backfill_scan: Arc<tokio::sync::Mutex<(Option<String>, Option<String>)>>,
+    supervision_done: Arc<tokio::sync::Mutex<[bool; 4]>>,
 }
 
 #[derive(Debug, Clone)]
@@ -747,7 +764,6 @@ impl RecoveryCoordinator {
         let authorization_invalidation_hub = Arc::new(
             crate::authorization::AuthorizationInvalidationHub::durable(crud_store.clone()),
         );
-        let due_wake = crud_store.recovery_job_notification();
         Self {
             crud_store,
             agent_manager,
@@ -762,8 +778,11 @@ impl RecoveryCoordinator {
             .into(),
             listener_starter: Arc::new(RwLock::new(None)),
             plugin_launch_locks: None,
-            due_wake,
             active_scan: Default::default(),
+            orphan_scan: Default::default(),
+            terminal_scan: Default::default(),
+            timeout_backfill_scan: Default::default(),
+            supervision_done: Default::default(),
         }
     }
 
@@ -1706,8 +1725,8 @@ impl RecoveryCoordinator {
             }))
     }
 
-    /// Compatibility entry point for explicit reconstruction callers. Live
-    /// workers select the independent audit and due phases below.
+    /// Test helper that runs both independent worker phases.
+    #[cfg(test)]
     pub async fn run_ready_jobs(
         &self,
         now_unix: i64,
@@ -1726,71 +1745,145 @@ impl RecoveryCoordinator {
         finish_recovery_phases(events, errors)
     }
 
+    #[cfg(test)]
     pub async fn run_supervision_audits(
         &self,
         now_unix: i64,
         limit: u64,
     ) -> Result<Vec<RecoveryCoordinatorEvent>> {
-        let mut events = Vec::new();
-        let mut phase_errors = Vec::new();
-
-        match self.reconcile_orphan_turn_executions(now_unix, limit).await {
-            Ok(()) => {}
-            Err(error) => {
-                warn!(
-                    error = %format!("{error:#}"),
-                    "recovery coordinator orphan-turn-execution phase failed"
-                );
-                phase_errors.push(format!("orphan Turn executions: {error:#}"));
-            }
-        }
-
-        match self.backfill_timeout_jobs(now_unix, limit).await {
-            Ok(mut phase_events) => events.append(&mut phase_events),
-            Err(error) => {
-                warn!(
-                    error = %format!("{error:#}"),
-                    "recovery coordinator timeout backfill phase failed"
-                );
-                phase_errors.push(format!("timeout backfill: {error:#}"));
-            }
-        }
-
-        match self.expire_active_recovery_jobs(now_unix, limit).await {
-            Ok(mut phase_events) => events.append(&mut phase_events),
-            Err(error) => {
-                warn!(
-                    error = %format!("{error:#}"),
-                    "recovery coordinator active expiration phase failed"
-                );
-                phase_errors.push(format!("active expiration: {error:#}"));
-            }
-        }
-
-        match self
-            .repair_due_terminal_recovery_jobs(now_unix, limit)
-            .await
-        {
-            Ok(mut phase_events) => events.append(&mut phase_events),
-            Err(error) => {
-                warn!(
-                    error = %format!("{error:#}"),
-                    "recovery coordinator terminal repair phase failed"
-                );
-                phase_errors.push(format!("terminal repair: {error:#}"));
-            }
-        }
-
-        finish_recovery_phases(events, phase_errors)
+        let batch = self.run_supervision_quantum(now_unix, limit).await;
+        finish_recovery_phases(batch.events, batch.errors)
     }
 
-    pub(crate) fn due_wake(&self) -> Arc<Notify> {
-        self.due_wake.clone()
+    /// Raw-page continuation is independent of emitted events. Keep source
+    /// invalidations unacknowledged until has_more is false; retry errors with a
+    /// bounded error delay and still dispatch the independent successful events.
+    pub async fn run_supervision_quantum(
+        &self,
+        now_unix: i64,
+        limit: u64,
+    ) -> SupervisionAuditBatch {
+        if limit == 0 {
+            return SupervisionAuditBatch {
+                events: Vec::new(),
+                has_more: false,
+                errors: Vec::new(),
+            };
+        }
+        let mut done = *self.supervision_done.lock().await;
+        let mut events = Vec::new();
+        let mut phase_errors = Vec::new();
+        if !done[0] {
+            match self.reconcile_orphan_turn_executions(now_unix, limit).await {
+                Ok(more) => done[0] = !more,
+                Err(error) => phase_errors.push(format!("orphan Turn executions: {error:#}")),
+            }
+        }
+        if !done[1] {
+            match self.backfill_timeout_jobs(now_unix, limit).await {
+                Ok((mut found, more)) => {
+                    done[1] = !more;
+                    events.append(&mut found);
+                }
+                Err(error) => phase_errors.push(format!("timeout backfill: {error:#}")),
+            }
+        }
+        if !done[2] {
+            match self.expire_active_recovery_jobs(now_unix, limit).await {
+                Ok(mut found) => {
+                    done[2] = self.active_scan.lock().await.0.is_none();
+                    events.append(&mut found);
+                }
+                Err(error) => phase_errors.push(format!("active expiration: {error:#}")),
+            }
+        }
+        if !done[3] {
+            match self
+                .repair_due_terminal_recovery_jobs_quantum(now_unix, limit)
+                .await
+            {
+                Ok((mut found, more)) => {
+                    done[3] = !more;
+                    events.append(&mut found);
+                }
+                Err(error) => phase_errors.push(format!("terminal repair: {error:#}")),
+            }
+        }
+        let has_more = done.iter().any(|complete| !complete);
+        *self.supervision_done.lock().await = if has_more { done } else { [false; 4] };
+        SupervisionAuditBatch {
+            events,
+            has_more,
+            errors: phase_errors,
+        }
+    }
+
+    /// Timed supervision obligations after a completed source sweep. Policy
+    /// calculation is shared with watchdog execution, including legacy compact
+    /// policies, strict `>` expiry and the causal-progress stale boundary.
+    pub async fn next_supervision_deadline(&self, now: i64) -> Result<Option<i64>> {
+        let mut next = None;
+        let mut after = None;
+        let Some(upper) = self.crud_store.active_recovery_job_upper_id().await? else {
+            return Ok(None);
+        };
+        loop {
+            let jobs = self
+                .crud_store
+                .list_active_recovery_job_page(after.as_deref(), &upper, 256)
+                .await?;
+            if jobs.is_empty() {
+                break;
+            }
+            for job in &jobs {
+                let policy = self.policy_for_recovery_job(job).await?;
+                let Ok(budget) = i64::try_from(policy.max_wall_clock_secs) else {
+                    continue;
+                };
+                let attempt_budget = i64::try_from(
+                    policy
+                        .max_wall_clock_secs
+                        .min(RECOVERY_ATTEMPT_MAX_WALL_CLOCK_SECS),
+                )
+                .unwrap_or(i64::MAX);
+                let started = job
+                    .active_attempt_started_at_unix
+                    .unwrap_or(job.updated_at_unix);
+                let mut due = job
+                    .scheduled_at_unix
+                    .saturating_add(budget)
+                    .saturating_add(1)
+                    .min(started.saturating_add(attempt_budget).saturating_add(1));
+                if let Some(progress) = self.crud_store.get_turn_liveness(&job.turn_id).await? {
+                    if is_causal_recovery_progress(&progress.last_activity_kind)
+                        && progress.last_activity_at_unix > started
+                    {
+                        due = due.max(
+                            progress
+                                .last_activity_at_unix
+                                .saturating_add(RECOVERY_PROGRESS_STALE_SECS)
+                                .saturating_add(1),
+                        );
+                    }
+                }
+                // Already due rows were visited by the completed audit. A CAS
+                // competitor invalidates sources; an error retains retry authority.
+                if due > now {
+                    next = Some(next.map_or(due, |old: i64| old.min(due)));
+                }
+            }
+            let last = jobs.last().unwrap().id.clone();
+            if last == upper {
+                break;
+            }
+            after = Some(last);
+        }
+        Ok(next)
     }
 
     /// Due work never invokes discovery/backfill or active supervision. A
-    /// retained wake is advisory; the existing short point retry is retained
-    /// for foreign producers, due/retry deadlines and expired claims.
+    /// retained wake is advisory; durable due/retry deadlines and expired claims
+    /// determine the next pass after the current bounded portion.
     pub async fn run_due_jobs(
         &self,
         now_unix: i64,
@@ -1833,45 +1926,73 @@ impl RecoveryCoordinator {
     /// Gateway which admitted them is gone. Executor kind is persisted at the
     /// same boundary as the Turn, so a missing provider binding is never used
     /// to guess whether work is native or CLI-backed.
-    async fn reconcile_orphan_turn_executions(&self, now_unix: i64, limit: u64) -> Result<()> {
-        let expired = self
-            .crud_store
-            .list_expired_foreign_turn_executions(
-                self.turn_execution_owner_id.as_ref(),
-                now_unix,
-                limit,
-            )
-            .await?;
-        for execution in expired {
-            let Some(claimed) = self
+    async fn reconcile_orphan_turn_executions(&self, now_unix: i64, limit: u64) -> Result<bool> {
+        let mut scan = self.orphan_scan.lock().await.clone();
+        if scan.upper.is_none() {
+            scan.upper = self.crud_store.control_turn_execution_upper_id().await?;
+            *self.orphan_scan.lock().await = scan.clone();
+        }
+        let Some(upper) = scan.upper.as_deref() else {
+            return Ok(false);
+        };
+        if !scan.complete[0] {
+            let (expired, next) = self
                 .crud_store
-                .claim_expired_turn_execution(
-                    &execution,
+                .list_expired_foreign_turn_execution_page(
                     self.turn_execution_owner_id.as_ref(),
                     now_unix,
-                    now_unix.saturating_add(RECOVERY_JOB_CLAIM_LEASE_SECS as i64),
+                    scan.foreign_after.as_deref(),
+                    upper,
+                    limit,
                 )
-                .await?
-            else {
-                continue;
-            };
-            self.enqueue_claimed_turn_execution_recovery(&claimed, now_unix)
                 .await?;
+            for execution in expired {
+                let Some(claimed) = self
+                    .crud_store
+                    .claim_expired_turn_execution(
+                        &execution,
+                        self.turn_execution_owner_id.as_ref(),
+                        now_unix,
+                        now_unix.saturating_add(RECOVERY_JOB_CLAIM_LEASE_SECS as i64),
+                    )
+                    .await?
+                else {
+                    continue;
+                };
+                self.enqueue_claimed_turn_execution_recovery(&claimed, now_unix)
+                    .await?;
+            }
+            scan.complete[0] = next.is_none();
+            scan.foreign_after = next;
         }
-
-        // A storage failure after the ownership CAS must remain retryable.
-        // Recovering rows owned by this process are therefore revisited until
-        // their idempotent recovery job exists or they become terminal.
-        for claimed in self
-            .crud_store
-            .list_owned_recovering_turn_executions(self.turn_execution_owner_id.as_ref(), limit)
-            .await?
-        {
-            self.enqueue_claimed_turn_execution_recovery(&claimed, now_unix)
+        // Revisit owned rows after a crash between ownership CAS and job creation.
+        // Both inputs share a fixed ceiling; a continuous new suffix cannot keep
+        // this supervision phase alive or repeatedly restart its finished half.
+        if !scan.complete[1] {
+            let (recovering, next) = self
+                .crud_store
+                .list_owned_recovering_turn_execution_page(
+                    self.turn_execution_owner_id.as_ref(),
+                    scan.owned_after.as_deref(),
+                    upper,
+                    limit,
+                )
                 .await?;
+            for claimed in recovering {
+                self.enqueue_claimed_turn_execution_recovery(&claimed, now_unix)
+                    .await?;
+            }
+            scan.complete[1] = next.is_none();
+            scan.owned_after = next;
         }
+        let has_more = scan.complete.iter().any(|done| !done);
+        *self.orphan_scan.lock().await = if has_more {
+            scan
+        } else {
+            OrphanExecutionScan::default()
+        };
 
-        Ok(())
+        Ok(has_more)
     }
 
     async fn enqueue_claimed_turn_execution_recovery(
@@ -2099,15 +2220,35 @@ impl RecoveryCoordinator {
         Ok(Some(job))
     }
 
+    #[cfg(test)]
     pub async fn repair_due_terminal_recovery_jobs(
         &self,
         now_unix: i64,
         limit: u64,
     ) -> Result<Vec<RecoveryCoordinatorEvent>> {
-        let jobs = self
+        self.repair_due_terminal_recovery_jobs_quantum(now_unix, limit)
+            .await
+            .map(|(events, _)| events)
+    }
+
+    async fn repair_due_terminal_recovery_jobs_quantum(
+        &self,
+        now_unix: i64,
+        limit: u64,
+    ) -> Result<(Vec<RecoveryCoordinatorEvent>, bool)> {
+        let (after, mut upper) = self.terminal_scan.lock().await.clone();
+        if upper.is_none() {
+            upper = self.crud_store.control_recovery_job_upper_id().await?;
+            self.terminal_scan.lock().await.1 = upper.clone();
+        }
+        let Some(upper) = upper.as_deref() else {
+            return Ok((Vec::new(), false));
+        };
+        let (jobs, next) = self
             .crud_store
-            .list_due_pending_recovery_jobs_by_action(RecoveryAction::MarkFailed, now_unix, limit)
+            .list_due_terminal_repair_page(now_unix, limit, after.as_deref(), upper)
             .await?;
+        let has_more = next.is_some();
         let mut events = Vec::new();
 
         for job in jobs {
@@ -2117,7 +2258,8 @@ impl RecoveryCoordinator {
             );
         }
 
-        Ok(events)
+        *self.terminal_scan.lock().await = (next, has_more.then(|| upper.to_owned()));
+        Ok((events, has_more))
     }
 
     pub async fn terminalize_pending_mark_failed_job(
@@ -4305,11 +4447,20 @@ impl RecoveryCoordinator {
         &self,
         now_unix: i64,
         limit: u64,
-    ) -> Result<Vec<RecoveryCoordinatorEvent>> {
-        let candidates = self
+    ) -> Result<(Vec<RecoveryCoordinatorEvent>, bool)> {
+        let (after, mut upper) = self.timeout_backfill_scan.lock().await.clone();
+        if upper.is_none() {
+            upper = self.crud_store.control_turn_item_attempt_upper_id().await?;
+            self.timeout_backfill_scan.lock().await.1 = upper.clone();
+        }
+        let Some(upper) = upper.as_deref() else {
+            return Ok((Vec::new(), false));
+        };
+        let (candidates, next) = self
             .crud_store
-            .list_unqueued_timeout_candidates(limit)
+            .list_unqueued_timeout_candidate_page(limit, after.as_deref(), Some(upper))
             .await?;
+        let has_more = next.is_some();
         let mut events = Vec::new();
 
         for candidate in candidates {
@@ -4356,7 +4507,8 @@ impl RecoveryCoordinator {
             }
         }
 
-        Ok(events)
+        *self.timeout_backfill_scan.lock().await = (next, has_more.then(|| upper.to_owned()));
+        Ok((events, has_more))
     }
 
     async fn policy_for_recovery_job(&self, job: &RecoveryJobRecord) -> Result<RecoveryPolicy> {
@@ -7150,6 +7302,96 @@ mod tests {
                 claimed
             );
         }
+    }
+
+    #[tokio::test]
+    async fn orphan_repair_finishes_its_pass_before_a_new_suffix() {
+        let (crud_store, coordinator) = setup_coordinator().await;
+        let now = 1_700_000_200;
+        for turn_id in ["turn_finite_a", "turn_finite_b", "turn_finite_z"] {
+            materialize_turn_with_tool_item(
+                &crud_store,
+                "ws_finite_orphan",
+                "thr_finite_orphan",
+                turn_id,
+                &format!("item_{turn_id}"),
+                None,
+            )
+            .await;
+            persist_test_runtime_snapshot(
+                &crud_store,
+                "ws_finite_orphan",
+                "thr_finite_orphan",
+                turn_id,
+            )
+            .await;
+            if turn_id != "turn_finite_z" {
+                insert_test_turn_execution(
+                    &crud_store,
+                    "ws_finite_orphan",
+                    "thr_finite_orphan",
+                    turn_id,
+                    "replaced-owner",
+                    TurnExecutorKind::NativeAgent,
+                    now - 1,
+                )
+                .await;
+            }
+        }
+        assert!(
+            coordinator
+                .reconcile_orphan_turn_executions(now, 1)
+                .await
+                .unwrap()
+        );
+        // Appending work after the first quantum must not enlarge this pass.
+        insert_test_turn_execution(
+            &crud_store,
+            "ws_finite_orphan",
+            "thr_finite_orphan",
+            "turn_finite_z",
+            "replaced-owner",
+            TurnExecutorKind::NativeAgent,
+            now - 1,
+        )
+        .await;
+        assert!(
+            !coordinator
+                .reconcile_orphan_turn_executions(now, 1)
+                .await
+                .unwrap()
+        );
+        assert!(
+            coordinator
+                .open_recovery_for_turn("turn_finite_b")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            coordinator
+                .open_recovery_for_turn("turn_finite_z")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // A subsequent source pass still discovers the appended obligation.
+        for _ in 0..4 {
+            if !coordinator
+                .reconcile_orphan_turn_executions(now, 1)
+                .await
+                .unwrap()
+            {
+                break;
+            }
+        }
+        assert!(
+            coordinator
+                .open_recovery_for_turn("turn_finite_z")
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[tokio::test]
@@ -11221,6 +11463,11 @@ mod tests {
             .unwrap()
             .into_job();
         claim_and_activate(store.as_ref(), &job.id).await;
+        assert_eq!(
+            coordinator.next_supervision_deadline(start).await.unwrap(),
+            Some(start + 901),
+            "strict watchdog expiry must not be rounded to a periodic control cadence"
+        );
         for now in [start - 3600, start + 900] {
             assert!(
                 coordinator
@@ -11245,6 +11492,14 @@ mod tests {
                 .await
                 .unwrap()
                 .is_empty()
+        );
+        assert_eq!(
+            coordinator
+                .next_supervision_deadline(start + 901)
+                .await
+                .unwrap(),
+            None,
+            "a terminal episode no longer owns a watchdog deadline"
         );
     }
 
