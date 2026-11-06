@@ -1463,6 +1463,506 @@ async fn portable_schema_step(
     }
 }
 
+const TASK_EVENT_PENDING_MIGRATION: &str = "m20261105_000001_task_event_portable_pending_index";
+const TASK_EVENT_PENDING_INDEX: &str = "task_event_payload_json_portable_pending";
+
+async fn task_event_pending_schema(store: &CrudStore, legacy: bool) {
+    let db = store.database_connection();
+    let rows = db.query_all_raw(Statement::from_string(DbBackend::Sqlite,
+        "SELECT name,\"unique\",partial,origin FROM pragma_index_list('task_event') WHERE name='task_event_payload_json_portable_pending'"))
+        .await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].try_get::<i64>("", "unique").unwrap(), 0);
+    assert_eq!(rows[0].try_get::<i64>("", "partial").unwrap(), 1);
+    assert_eq!(rows[0].try_get::<String>("", "origin").unwrap(), "c");
+    let keys = db.query_all_raw(Statement::from_string(DbBackend::Sqlite,
+        "SELECT name,desc FROM pragma_index_xinfo('task_event_payload_json_portable_pending') WHERE key=1 ORDER BY seqno"))
+        .await.unwrap();
+    let keys: Vec<(String, i64)> = keys
+        .iter()
+        .map(|row| {
+            (
+                row.try_get("", "name").unwrap(),
+                row.try_get("", "desc").unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        keys,
+        [("payload_json_payload_id".into(), 0), ("id".into(), 0)]
+    );
+    let ddl: String = db
+        .query_one_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT sql FROM sqlite_master WHERE name='task_event_payload_json_portable_pending'",
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "sql")
+        .unwrap();
+    let normalized = ddl
+        .replace(['"', '`', '[', ']', '(', ')', ';'], "")
+        .to_lowercase();
+    let predicate = normalized
+        .split_once("where")
+        .unwrap()
+        .1
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert_eq!(
+        predicate,
+        if legacy {
+            "payload_json_payload_id is null and payload_json is not null"
+        } else {
+            "payload_json_payload_id is null"
+        }
+    );
+    assert_eq!(
+        n(
+            store,
+            "SELECT \"notnull\" n FROM pragma_table_info('task_event') WHERE name=?1",
+            "payload_json"
+        )
+        .await,
+        1
+    );
+
+    task_event_discovery(
+        store,
+        legacy,
+        [
+            Some("pending-b"),
+            Some("pending-a"),
+            Some("pending-b"),
+            None,
+        ],
+    )
+    .await;
+}
+
+async fn task_event_plan(store: &CrudStore, statement: &Statement) -> Vec<String> {
+    let mut explain = statement.clone();
+    explain.sql = format!("EXPLAIN QUERY PLAN {}", explain.sql);
+    store
+        .database_connection()
+        .query_all_raw(explain)
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| row.try_get("", "detail").unwrap())
+        .collect()
+}
+
+async fn task_event_discovery(store: &CrudStore, legacy: bool, expected: [Option<&str>; 4]) {
+    // Contract: pending_source orders by id, with inclusive upper and exclusive
+    // after. Wrong direction/bounds or admitting a published row defeats the
+    // cursor; schema snapshots and a descending-only EXPLAIN cannot detect it.
+    // These four literal tails are the real optional-filter combinations in
+    // pending_source, not nullable-parameter OR predicates or INDEXED BY hints.
+    // EOF's interval contains only the published middle row; pending-b lies
+    // beyond upper, so losing either the reference filter or upper is visible.
+    const SOURCE: &str = "SELECT id AS owner,portable_revision,portable_identity,coalesce((SELECT json_array(t.workspace_id,t.owner_kind,t.owner_id,t.status,t.updated_at) FROM task t WHERE t.id=task_event.task_id),'') AS owner_stamp,(EXISTS(SELECT 1 FROM task t WHERE t.id=task_event.task_id)) AS eligible,0 AS invalid_root,octet_length(payload_json) AS bytes FROM task_event WHERE payload_json_payload_id IS NULL AND payload_json IS NOT NULL";
+    let forms = [
+        (" ORDER BY id DESC LIMIT 1", vec![]),
+        (
+            " AND id<=? ORDER BY id ASC LIMIT 1",
+            vec!["pending-a".into()],
+        ),
+        (
+            " AND id>? AND id<=? ORDER BY id ASC LIMIT 1",
+            vec!["pending-a".into(), "pending-b".into()],
+        ),
+        (
+            " AND id>? AND id<=? ORDER BY id ASC LIMIT 1",
+            vec!["pending-a".into(), "pending-aa".into()],
+        ),
+    ];
+    for (index, ((tail, values), expected)) in forms.into_iter().zip(expected).enumerate() {
+        let statement =
+            Statement::from_sql_and_values(DbBackend::Sqlite, format!("{SOURCE}{tail}"), values);
+        let rows = store
+            .database_connection()
+            .query_all_raw(statement.clone())
+            .await
+            .unwrap();
+        let owners: Vec<String> = rows
+            .iter()
+            .map(|row| row.try_get("", "owner").unwrap())
+            .collect();
+        assert_eq!(
+            owners,
+            expected.into_iter().map(str::to_owned).collect::<Vec<_>>(),
+            "discovery form {index}"
+        );
+        if !legacy || index == 0 {
+            let details = task_event_plan(store, &statement).await;
+            // The old descending negative control runs the identical SELECT
+            // on the real historical index; no forced-plan failure substitutes
+            // for the planner's choice. Other old plans are not constrained.
+            assert_eq!(
+                details.iter().any(|d| d.contains(TASK_EVENT_PENDING_INDEX)),
+                !legacy,
+                "{details:?}"
+            );
+            if !legacy {
+                assert!(
+                    !details
+                        .iter()
+                        .any(|d| d.to_uppercase().contains("TEMP B-TREE")),
+                    "{details:?}"
+                );
+            }
+        }
+    }
+}
+
+async fn task_event_publication(store: &CrudStore, id: &str, payload: &str) -> Statement {
+    // Reproduce publish(TaskEvent)'s raw-storage UPDATE and all its guards.
+    // Identity/stamp are captured inputs, not expected results of the CAS.
+    let source = store.database_connection().query_one_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+        "SELECT portable_revision,portable_identity,coalesce((SELECT json_array(t.workspace_id,t.owner_kind,t.owner_id,t.status,t.updated_at) FROM task t WHERE t.id=task_event.task_id),'') AS stamp FROM task_event WHERE id=?", [id.into()]))
+        .await.unwrap().unwrap();
+    Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "UPDATE task_event SET payload_json_payload_id=? WHERE id=? AND portable_revision=? AND portable_identity=? AND coalesce((SELECT json_array(t.workspace_id,t.owner_kind,t.owner_id,t.status,t.updated_at) FROM task t WHERE t.id=task_event.task_id),'')=? AND payload_json_payload_id IS NULL AND EXISTS(SELECT 1 FROM task t WHERE t.id=task_event.task_id)",
+        vec![
+            payload.into(),
+            id.into(),
+            source
+                .try_get::<i64>("", "portable_revision")
+                .unwrap()
+                .into(),
+            source
+                .try_get::<String>("", "portable_identity")
+                .unwrap()
+                .into(),
+            source.try_get::<String>("", "stamp").unwrap().into(),
+        ],
+    )
+}
+
+async fn task_event_neighbors(store: &CrudStore) -> Vec<Vec<(String, i64)>> {
+    // Contract: adjacent access paths retain all matching pending AND published
+    // rows. A broad scan or loss of the task/sequence or run access is a distinct
+    // regression that snapshots and discovery's partial-index plan miss.
+    // fanout_metadata_query and list_events_for_run in task_event.rs own these
+    // WHERE/order/limit shapes. Run's existing sequence sort is permitted.
+    // Task/run WHERE clauses do not imply reference IS NULL. The CASE in the
+    // fanout projection does not filter rows, so the partial index alone cannot
+    // supply their complete results (likewise type/idempotency/JOIN/full reads).
+    let queries = [
+        (
+            "SELECT id,sequence,CASE WHEN payload_json_payload_id IS NULL THEN octet_length(payload_json) ELSE (SELECT p.original_bytes FROM portable_payload p WHERE p.id=task_event.payload_json_payload_id) END AS payload_bytes FROM task_event WHERE task_id=? AND sequence>? ORDER BY sequence ASC LIMIT 2",
+            vec!["pending-index-task".into(), 1i64.into()],
+            vec![("pending-aa", 2), ("pending-a", 3)],
+            &[
+                "idx_task_event_task_sequence",
+                "uidx_task_event_task_sequence",
+            ][..],
+        ),
+        (
+            "SELECT * FROM task_event WHERE id=? AND payload_json_payload_id IS NULL LIMIT 1",
+            vec!["pending-a".into()],
+            vec![("pending-a", 3)],
+            &[][..],
+        ),
+        (
+            "SELECT * FROM task_event WHERE run_id=? ORDER BY sequence ASC",
+            vec!["pending-index-run".into()],
+            vec![("pending-b", 1), ("pending-aa", 2), ("pending-a", 3)],
+            &["idx_task_event_run"][..],
+        ),
+    ];
+    let mut results = Vec::new();
+    for (index, (query, values, expected, indexes)) in queries.into_iter().enumerate() {
+        let statement = Statement::from_sql_and_values(DbBackend::Sqlite, query, values);
+        let rows = store
+            .database_connection()
+            .query_all_raw(statement.clone())
+            .await
+            .unwrap();
+        let actual: Vec<(String, i64)> = rows
+            .iter()
+            .map(|r| {
+                (
+                    r.try_get("", "id").unwrap(),
+                    r.try_get("", "sequence").unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            actual,
+            expected
+                .into_iter()
+                .map(|(id, seq)| (id.to_owned(), seq))
+                .collect::<Vec<_>>()
+        );
+        if index == 0 {
+            assert_eq!(
+                rows.iter()
+                    .map(|r| r.try_get::<i64>("", "payload_bytes").unwrap())
+                    .collect::<Vec<_>>(),
+                [2, 2]
+            );
+        }
+        let details = task_event_plan(store, &statement).await;
+        assert!(
+            details.iter().any(|d| {
+                let upper = d.to_uppercase();
+                upper.contains("SEARCH TASK_EVENT")
+                    && if index == 1 {
+                        upper.contains("ID=?")
+                    } else {
+                        indexes.iter().any(|name| d.contains(name))
+                    }
+            }),
+            "{details:?}"
+        );
+        if index != 2 {
+            assert!(
+                !details
+                    .iter()
+                    .any(|d| d.to_uppercase().contains("TEMP B-TREE")),
+                "{details:?}"
+            );
+        }
+        results.push(actual);
+    }
+    // Check the actual publication UPDATE too: EXPLAIN does not execute it.
+    // Both PK and the repaired (reference,id) lookup are acceptable; a scan is not.
+    let cas = task_event_publication(store, "pending-a", "publish-a").await;
+    let details = task_event_plan(store, &cas).await;
+    assert!(
+        details.iter().any(|d| {
+            let upper = d.to_uppercase();
+            upper.contains("SEARCH TASK_EVENT") && upper.contains("ID=?")
+        }),
+        "{details:?}"
+    );
+    results
+}
+
+async fn task_event_pending_mutations(store: &CrudStore) {
+    // Contract: writes maintain membership in the rebuilt index. A stale entry,
+    // missed invalidation or retirement is invisible to DDL/data snapshots.
+    // Exercise only this target's reference/logical/delete transitions, leaving
+    // the broader portable-storage worker/CAS suite as its existing owner.
+    for (id, payload, bytes) in [
+        ("pending-a", "publish-a", 2i64),
+        ("pending-b", "publish-b", 0i64),
+    ] {
+        sql(store, "INSERT INTO portable_payload(id,family,original_bytes,original_chars,sha256,raw,retired) VALUES(?,'task_event',?,?,zeroblob(32),1,0)", vec![payload.into(), bytes.into(), bytes.into()]).await;
+        let statement = task_event_publication(store, id, payload).await;
+        let db = store.database_connection();
+        assert_eq!(
+            db.execute_raw(statement.clone())
+                .await
+                .unwrap()
+                .rows_affected(),
+            1
+        );
+        assert_eq!(
+            db.execute_raw(statement).await.unwrap().rows_affected(),
+            0,
+            "reference IS NULL must fence repeated CAS"
+        );
+        assert_eq!(
+            n(
+                store,
+                "SELECT portable_revision n FROM task_event WHERE id=?",
+                id
+            )
+            .await,
+            0
+        );
+        if id == "pending-a" {
+            task_event_discovery(
+                store,
+                false,
+                [Some("pending-b"), None, Some("pending-b"), None],
+            )
+            .await;
+        }
+    }
+    task_event_discovery(store, false, [None; 4]).await;
+    sql(
+        store,
+        "UPDATE task_event SET payload_json=? WHERE id='pending-a'",
+        vec![r#"{"changed":true}"#.into()],
+    )
+    .await;
+    assert_eq!(
+        n(
+            store,
+            "SELECT portable_revision n FROM task_event WHERE id=?",
+            "pending-a"
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        n(
+            store,
+            "SELECT retired n FROM portable_payload WHERE id=?",
+            "publish-a"
+        )
+        .await,
+        1
+    );
+    task_event_discovery(
+        store,
+        false,
+        [Some("pending-a"), Some("pending-a"), None, None],
+    )
+    .await;
+    sql(
+        store,
+        "DELETE FROM task_event WHERE id IN ('pending-a','published')",
+        vec![],
+    )
+    .await;
+    assert_eq!(
+        n(
+            store,
+            "SELECT count(*) n FROM task_event WHERE id=?",
+            "pending-a"
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        n(
+            store,
+            "SELECT count(*) n FROM task_event WHERE id=?",
+            "published"
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        n(
+            store,
+            "SELECT retired n FROM portable_payload WHERE id=?",
+            "pending-index-payload"
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        n(
+            store,
+            "SELECT retired n FROM portable_payload WHERE id=?",
+            "publish-b"
+        )
+        .await,
+        0
+    );
+    task_event_discovery(store, false, [None; 4]).await;
+}
+
+#[tokio::test]
+async fn task_event_pending_index_fresh_upgrade_down_reapply() {
+    use pioneer_entity::{portable_payload, task_event};
+    use sea_orm::QueryOrder;
+
+    let migration = Migrator::migrations()
+        .into_iter()
+        .find(|m| m.name() == TASK_EVENT_PENDING_MIGRATION)
+        .unwrap();
+    for upgrade in [false, true] {
+        let db = db_fixture_before(upgrade.then_some(TASK_EVENT_PENDING_MIGRATION)).await;
+        let store = CrudStore::new(db.clone()).with_maintenance_access();
+        task(&store, "pending-index-task", "running").await;
+        sql(&store, "INSERT INTO portable_payload(id,family,original_bytes,original_chars,sha256,raw,retired) VALUES('pending-index-payload','task_event',2,2,zeroblob(32),1,0),('pending-middle-payload','task_event',2,2,zeroblob(32),1,0)", vec![]).await;
+        sql(&store, "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES('pending-index-run','pending-index-task','pending-index-run',1,1,'succeeded','agent')", vec![]).await;
+        // Deliberately different id/sequence orders, a published row between
+        // pending ids, and a published tail outside the captured upper bound.
+        sql(&store, "INSERT INTO task_event(id,task_id,run_id,sequence,event_type,payload_json,payload_json_payload_id) VALUES('pending-a','pending-index-task','pending-index-run',3,'progress','{}',NULL),('pending-b','pending-index-task','pending-index-run',1,'progress','',NULL),('pending-aa','pending-index-task','pending-index-run',2,'progress','{}','pending-middle-payload'),('published','pending-index-task',NULL,4,'progress','{}','pending-index-payload')", vec![]).await;
+        let neighbors = task_event_neighbors(&store).await;
+        let connection = store.database_connection();
+        let events = task_event::Entity::find()
+            .order_by_asc(task_event::Column::Id)
+            .all(&connection)
+            .await
+            .unwrap();
+        let payloads = portable_payload::Entity::find()
+            .all(&connection)
+            .await
+            .unwrap();
+        let triggers = connection
+            .query_all_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT name,sql FROM sqlite_master WHERE type='trigger' ORDER BY name",
+            ))
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| {
+                (
+                    row.try_get::<String>("", "name").unwrap(),
+                    row.try_get::<String>("", "sql").unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        if upgrade {
+            task_event_pending_schema(&store, true).await;
+            // Apply the registered suffix through the normal Migrator.
+            let tx = connection.begin().await.unwrap();
+            Migrator::up(&*tx, None).await.unwrap();
+            tx.commit().await.unwrap();
+        }
+        task_event_pending_schema(&store, false).await;
+        assert_eq!(task_event_neighbors(&store).await, neighbors);
+        portable_schema_step(&store, &*migration, false)
+            .await
+            .unwrap();
+        task_event_pending_schema(&store, true).await;
+        assert_eq!(task_event_neighbors(&store).await, neighbors);
+        portable_schema_step(&store, &*migration, true)
+            .await
+            .unwrap();
+        task_event_pending_schema(&store, false).await;
+        assert_eq!(
+            task_event::Entity::find()
+                .order_by_asc(task_event::Column::Id)
+                .all(&connection)
+                .await
+                .unwrap(),
+            events
+        );
+        assert_eq!(
+            portable_payload::Entity::find()
+                .all(&connection)
+                .await
+                .unwrap(),
+            payloads
+        );
+        let after = connection
+            .query_all_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT name,sql FROM sqlite_master WHERE type='trigger' ORDER BY name",
+            ))
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| {
+                (
+                    row.try_get::<String>("", "name").unwrap(),
+                    row.try_get::<String>("", "sql").unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(after, triggers);
+        assert_eq!(task_event_neighbors(&store).await, neighbors);
+        assert_eq!(n(&store, "SELECT count(*) n FROM task_event WHERE task_id=?1 AND payload_json_payload_id IS NULL AND payload_json IS NOT NULL", "pending-index-task").await, 2);
+        if upgrade {
+            task_event_pending_mutations(&store).await;
+        }
+    }
+}
+
 async fn portable_upgrade_fixture(large: bool) -> (CrudStore, [String; 5]) {
     let db = db_fixture_before(Some("m20261027_000001_portable_payload")).await;
     let store = CrudStore::new(db.clone()).with_maintenance_access();
