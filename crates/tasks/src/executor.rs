@@ -5,6 +5,7 @@ use crate::scheduler::TASK_EXECUTION_LEASE_SECONDS;
 use anyhow::{Context, bail};
 use async_trait::async_trait;
 use pioneer_crud::CrudStore;
+use pioneer_observability::closing::{Closing, Fact, Phase};
 use pioneer_protocol::{
     TaskError, TaskErrorClass, TaskEventPayload, TaskExecutorKind, TaskProgressDetails, TaskResult,
     TaskResultCandidate, TaskResultReviewEvent, TaskRun, TaskRunExecution, TaskRunThreadBinding,
@@ -225,11 +226,21 @@ impl TaskExecutionHandle {
     }
 
     pub async fn mark_started(&self, started_at: i64) -> TaskRuntimeResult<()> {
+        let ticket = self.event_bus.closing_lifecycle_ticket();
         if let Some(appended) = self
             .store
             .append_task_run_started_once(self.task_id.clone(), self.run_id.clone(), started_at)
             .await?
         {
+            if appended.append_status.is_inserted() {
+                self.event_bus.admit_closing_run(
+                    ticket,
+                    &self.task_id,
+                    &self.run_id,
+                    appended.sequence,
+                    false,
+                );
+            }
             self.event_bus.publish(appended).await;
         }
         self.update_occurrence_status(
@@ -405,30 +416,48 @@ impl TaskExecutionHandle {
         terminal: TaskEventPayload,
         revision: Option<TaskRunTurn>,
     ) -> TaskRuntimeResult<()> {
-        let mut prepared = self
-            .store
-            .prepare_task_terminal_transition(terminal)
+        let (links, link_count) = self.event_bus.closing_run_links(&self.run_id);
+        let mut closing = Closing::start_linked(
+            Phase::RunCommit,
+            &self.event_bus.closing_run_parent(&self.run_id),
+            &links[..link_count],
+        );
+        let correlation = closing.correlation();
+        let mut preparation = Closing::start(Phase::RunPreparation, &correlation);
+        let mut prepared = preparation
+            .correlation()
+            .scope(self.store.prepare_task_terminal_transition(terminal))
             .await
             .context(TerminalCommitPhase::Preparation)?
             .with_pinned_agent_attempt(self.agent_attempt_generation.get().copied().flatten())
             .context(TerminalCommitPhase::AttemptFence)?;
         if let Some(revision) = revision {
-            prepared = self
-                .store
-                .prepare_task_terminal_with_revision(prepared, revision)
+            prepared = preparation
+                .correlation()
+                .scope(
+                    self.store
+                        .prepare_task_terminal_with_revision(prepared, revision),
+                )
                 .await
                 .context(TerminalCommitPhase::Preparation)?;
         }
+        preparation.finish(Fact::Returned);
         #[cfg(test)]
         if let Some(barrier) = self.terminal_preparation_barrier.as_ref() {
             barrier.wait().await;
         }
-        let outcome = self
-            .store
-            .commit_task_terminal_transition(prepared)
+        let outcome = correlation
+            .scope(self.store.commit_task_terminal_transition(prepared))
             .await
             .context(TerminalCommitPhase::Commit)?;
-        self.event_bus.publish_many(outcome.events).await;
+        closing.finish(match outcome.status {
+            pioneer_crud::TaskTerminalCommitStatus::Applied => Fact::Confirmed,
+            pioneer_crud::TaskTerminalCommitStatus::Replayed => Fact::Duplicate,
+            pioneer_crud::TaskTerminalCommitStatus::TaskAlreadyTerminal => Fact::Superseded,
+        });
+        correlation
+            .scope(self.event_bus.publish_many(outcome.events))
+            .await;
         Ok(())
     }
 
@@ -536,10 +565,24 @@ impl TaskExecutionHandle {
         events: Vec<TaskEventPayload>,
         event_timestamp_secs: i64,
     ) -> TaskRuntimeResult<()> {
+        let ticket = self.event_bus.closing_lifecycle_ticket();
         let appended = self
             .projector
             .append_events(events, event_timestamp_secs)
             .await?;
+        for event in &appended {
+            if event.append_status.is_inserted()
+                && matches!(&event.payload, TaskEventPayload::TaskRunTurnStarted { .. })
+            {
+                self.event_bus.admit_closing_run(
+                    ticket,
+                    &self.task_id,
+                    &self.run_id,
+                    event.sequence,
+                    false,
+                );
+            }
+        }
         self.event_bus.publish_many(appended).await;
         Ok(())
     }

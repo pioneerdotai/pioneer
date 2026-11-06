@@ -286,7 +286,15 @@ impl ToolOrchestrator {
         key: &crate::PermissionRequestKey,
         reason: PermissionDecisionReason,
     ) -> PermissionApprovalResolution {
-        tokio::select! {
+        use pioneer_observability::{
+            scenario::Correlation,
+            tool_call::{Fact, Measurement, Phase},
+        };
+        let mut observation = Measurement::start(Phase::Approval, &Correlation::capture());
+        let wait = pioneer_observability::live::WaitGuard::new(
+            pioneer_observability::live::WaitKind::UserOrProvider,
+        );
+        let resolution = tokio::select! {
             biased;
             _ = invocation.cancellation.cancelled() => {
                 PermissionApprovalResolution::Cancelled
@@ -298,7 +306,15 @@ impl ToolOrchestrator {
                 key,
                 reason,
             ) => resolution,
-        }
+        };
+        drop(wait);
+        observation.finish(match &resolution {
+            PermissionApprovalResolution::Cancelled => Fact::Cancelled,
+            PermissionApprovalResolution::Deny { .. } => Fact::Rejected,
+            PermissionApprovalResolution::Expired => Fact::Expired,
+            _ => Fact::Returned,
+        });
+        resolution
     }
 
     async fn revalidate_permission_context(
@@ -405,6 +421,20 @@ impl ToolOrchestrator {
     }
 
     pub async fn run_with_context(
+        &self,
+        registry: &ToolRegistry,
+        invocation: ToolInvocation,
+        trace: &ToolEventTrace,
+        permission_context: &PermissionEvaluationContext,
+    ) -> Result<AnyToolResult, ToolError> {
+        crate::observation::measure(
+            pioneer_observability::tool_call::Phase::Attempt,
+            self.run_observed_attempt(registry, invocation, trace, permission_context),
+        )
+        .await
+    }
+
+    async fn run_observed_attempt(
         &self,
         registry: &ToolRegistry,
         mut invocation: ToolInvocation,
@@ -749,42 +779,58 @@ impl ToolOrchestrator {
         reason: Option<PermissionDecisionReason>,
         cached: bool,
     ) -> Result<(), ToolError> {
-        let turn_id = permission_context
-            .turn_id
-            .clone()
-            .unwrap_or_else(|| trace.turn_id().to_owned());
-        let (security_snapshot_id, security_snapshot_version) = security_snapshot_audit_fields(
-            turn_id.as_str(),
-            invocation.execution_security_snapshot.as_ref(),
+        let mut audit_observation = pioneer_observability::tool_call::Measurement::start(
+            if cached {
+                pioneer_observability::tool_call::Phase::CachedGrant
+            } else {
+                pioneer_observability::tool_call::Phase::PermissionAudit
+            },
+            &pioneer_observability::scenario::Correlation::capture(),
         );
-        trace
-            .emit_permission_audit(
-                invocation.attempt_id,
-                TurnPermissionAuditEvent {
-                    workspace_id: permission_context.workspace_id.clone().unwrap_or_default(),
-                    thread_id: permission_context.thread_id.clone().unwrap_or_default(),
-                    turn_id,
-                    event_kind,
-                    profile_mode: permission_context.permission_profile.mode,
-                    profile_source: permission_context.permission_profile.source,
-                    security_snapshot_id,
-                    security_snapshot_version,
-                    security_reason_code: None,
-                    security_capability: None,
-                    item_id: Some(invocation.call_id.clone()),
-                    tool_call_id: Some(invocation.call_id.clone()),
-                    tool_name: Some(invocation.tool_name.clone()),
-                    action_kind: Some(intent.action),
-                    request_key: request_key.map(|key| TurnPermissionAuditRequestKey {
-                        action_kind: key.action,
-                        scope_hash: key.normalized_scope_hash.clone(),
-                    }),
-                    decision,
-                    reason,
-                    cached,
-                },
-            )
-            .await
+        let result = async {
+            let turn_id = permission_context
+                .turn_id
+                .clone()
+                .unwrap_or_else(|| trace.turn_id().to_owned());
+            let (security_snapshot_id, security_snapshot_version) = security_snapshot_audit_fields(
+                turn_id.as_str(),
+                invocation.execution_security_snapshot.as_ref(),
+            );
+            trace
+                .emit_permission_audit(
+                    invocation.attempt_id,
+                    TurnPermissionAuditEvent {
+                        workspace_id: permission_context.workspace_id.clone().unwrap_or_default(),
+                        thread_id: permission_context.thread_id.clone().unwrap_or_default(),
+                        turn_id,
+                        event_kind,
+                        profile_mode: permission_context.permission_profile.mode,
+                        profile_source: permission_context.permission_profile.source,
+                        security_snapshot_id,
+                        security_snapshot_version,
+                        security_reason_code: None,
+                        security_capability: None,
+                        item_id: Some(invocation.call_id.clone()),
+                        tool_call_id: Some(invocation.call_id.clone()),
+                        tool_name: Some(invocation.tool_name.clone()),
+                        action_kind: Some(intent.action),
+                        request_key: request_key.map(|key| TurnPermissionAuditRequestKey {
+                            action_kind: key.action,
+                            scope_hash: key.normalized_scope_hash.clone(),
+                        }),
+                        decision,
+                        reason,
+                        cached,
+                    },
+                )
+                .await
+        }
+        .await;
+        audit_observation.finish(match &result {
+            Ok(()) => pioneer_observability::tool_call::Fact::Returned,
+            Err(error) => crate::observation::error_fact(error),
+        });
+        result
     }
 
     async fn evaluate_permission(
@@ -793,6 +839,10 @@ impl ToolOrchestrator {
         permission_context: &PermissionEvaluationContext,
         trace: &ToolEventTrace,
     ) -> Result<PermissionEvaluationGrant, ToolError> {
+        let mut policy = pioneer_observability::tool_call::Measurement::start(
+            pioneer_observability::tool_call::Phase::Policy,
+            &pioneer_observability::scenario::Correlation::capture(),
+        );
         trace.emit_stage(
             invocation.attempt_id,
             "permission.evaluate.started",
@@ -840,6 +890,10 @@ impl ToolOrchestrator {
             Some(permission_decision_trace_payload(&decision, &intent)),
         );
 
+        policy.finish(match &decision {
+            PermissionDecision::Deny { .. } => pioneer_observability::tool_call::Fact::Rejected,
+            _ => pioneer_observability::tool_call::Fact::Returned,
+        });
         match decision {
             PermissionDecision::Allow { reason } => {
                 self.emit_permission_audit(

@@ -1407,6 +1407,9 @@ fn cli_observation_tracks_the_child_outcome_across_same_run_resume() {
                 // The fixture keeps both terminal snapshots alive across the
                 // resume. Heap-own the storage future rather than composing
                 // its transaction state into this already large CLI scenario.
+                let closing_bus = processor.task_runtime.event_bus();
+                let closing_ticket = closing_bus.closing_lifecycle_ticket();
+                let old_generation = closing_bus.closing_run_generation(run_id);
                 let resumed = Box::pin(processor.crud_store.resume_task_owned_turn(
                     &a_child.thread_id,
                     &a_child.turn_id,
@@ -1419,6 +1422,7 @@ fn cli_observation_tracks_the_child_outcome_across_same_run_resume() {
                 .unwrap()
                 .unwrap();
                 let pioneer_crud::TaskOwnedTurnResumeOutcome::Resumed {
+                    observation_sequence,
                     task,
                     run,
                     task_run_turn: mut resumed_turn,
@@ -1429,6 +1433,16 @@ fn cli_observation_tracks_the_child_outcome_across_same_run_resume() {
                 };
                 assert_eq!(run.id, run_id);
                 assert!(task.revision > before);
+                assert!(observation_sequence > 0);
+                closing_bus.admit_closing_run(
+                    closing_ticket,
+                    &task.id,
+                    &run.id,
+                    observation_sequence,
+                    true,
+                );
+                assert_ne!(closing_bus.closing_run_generation(run_id), old_generation);
+                assert!(closing_bus.closing_run_generation(run_id).is_some());
                 assert!(
                     processor
                         .crud_store

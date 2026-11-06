@@ -683,6 +683,8 @@ impl DesktopShellView {
                                 },
                                 None,
                             );
+                        } else {
+                            core.observe_unavailable_task_selection();
                         }
                     }
                     pioneer_desktop_thread::ThreadNavigationEvent::CloseTaskThread => {

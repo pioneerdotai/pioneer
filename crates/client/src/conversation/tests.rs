@@ -3531,3 +3531,74 @@ fn agent_admission_owner_controls_live_and_recovered_flow_independently_of_threa
         }
     }
 }
+
+#[test]
+fn closing_settlement_authority_survives_recovery_without_cloning_or_global_idle_wait() {
+    use pioneer_observability::scenario::accept_params;
+    pioneer_observability::set_telemetry_enabled(true);
+    let mut params = serde_json::json!({"_pioneer_correlation":{
+        "v":1,"trace":"cccccccccccccccccccccccccccccccc",
+        "span":"2222222222222222","flags":1}});
+    let (source, _) = accept_params("thread/open", &mut params);
+    let active = || {
+        pioneer_observability::live::snapshot()
+            .unwrap()
+            .active
+            .iter()
+            .filter(|work| work.context.trace_id == Some([0xcc; 16]))
+            .count()
+    };
+    let mut conversation = Conversation::new(THREAD_ID);
+    let mut turn = turn_snapshot(TURN_ID, TurnStatus::InProgress, None);
+    turn.mode = ThreadMode::Agent;
+    source.run(|| {
+        conversation.apply(ConversationEvent::TurnStarted {
+            thread_id: THREAD_ID.into(),
+            turn: turn.clone(),
+        })
+    });
+    turn.status = TurnStatus::Completed;
+    source.run(|| {
+        conversation.apply(ConversationEvent::TurnCompleted {
+            thread_id: THREAD_ID.into(),
+            turn: turn.clone(),
+        })
+    });
+    assert_eq!(active(), 1);
+    let mut snapshot_copy = conversation.snapshot_copy();
+    assert!(snapshot_copy.tick());
+    assert_eq!(active(), 1); // copy owns no observer terminal handle
+    let mut recovered = thread_snapshot_with_turn(turn.clone());
+    let mut other = turn_snapshot("another-active-turn", TurnStatus::InProgress, None);
+    other.mode = ThreadMode::Agent;
+    recovered.turns.push(other.clone());
+    source.run(|| conversation.sync_thread_snapshot(&recovered));
+    assert_eq!(active(), 0);
+    assert_eq!(conversation.in_flight_turn_id(), Some(other.id.as_str()));
+    assert!(!conversation.tick());
+    source.run(|| {
+        conversation.apply(ConversationEvent::TurnCompleted {
+            thread_id: THREAD_ID.into(),
+            turn,
+        })
+    });
+    assert_eq!(active(), 0); // non-current projection settles immediately
+    other.status = TurnStatus::Completed;
+    source.run(|| {
+        conversation.apply(ConversationEvent::TurnCompleted {
+            thread_id: THREAD_ID.into(),
+            turn: other.clone(),
+        })
+    });
+    assert_eq!(active(), 1);
+    conversation.reset();
+    assert_eq!(active(), 0);
+    assert!(!conversation.tick());
+    source.run(|| {
+        conversation.apply(ConversationEvent::TurnCompleted {
+            thread_id: THREAD_ID.into(),
+            turn: other,
+        })
+    });
+    assert_eq!(active(), 0); // historical/reset completion has no pending tick
+}

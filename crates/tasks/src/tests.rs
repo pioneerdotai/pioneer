@@ -367,7 +367,7 @@ async fn runtime() -> TaskRuntime {
     TaskRuntime::new(store)
 }
 
-async fn runtime_with_review_config() -> TaskRuntime {
+pub(crate) async fn runtime_with_review_config() -> TaskRuntime {
     let connection = Database::connect("sqlite::memory:")
         .await
         .expect("sqlite memory database should connect");
@@ -1068,7 +1068,7 @@ fn agent_spec(max_depth: i64) -> TaskAgentSpecInput {
     }
 }
 
-async fn create_waiting_review_agent_task(
+pub(crate) async fn create_waiting_review_agent_task(
     runtime: &TaskRuntime,
     max_revision_rounds: u32,
     candidate_round: u32,
@@ -1089,6 +1089,23 @@ async fn create_waiting_review_agent_task_with_policy(
     candidate_round: u32,
     candidate_status: TaskResultCandidateStatus,
 ) -> (String, String, String) {
+    create_waiting_review_agent_task_with_delivery(
+        runtime,
+        review_policy,
+        candidate_round,
+        candidate_status,
+        None,
+    )
+    .await
+}
+
+async fn create_waiting_review_agent_task_with_delivery(
+    runtime: &TaskRuntime,
+    review_policy: TaskAgentReviewPolicy,
+    candidate_round: u32,
+    candidate_status: TaskResultCandidateStatus,
+    delivery_policy: Option<TaskDeliveryPolicy>,
+) -> (String, String, String) {
     persist_test_agent_turn(
         runtime,
         TEST_PARENT_EXECUTION_ID,
@@ -1104,6 +1121,7 @@ async fn create_waiting_review_agent_task_with_policy(
     let mut spec = agent_spec(3);
     spec.review_policy = Some(review_policy);
     params.agent_spec = Some(spec);
+    params.delivery_policy = delivery_policy;
 
     let response = runtime
         .service()
@@ -1117,7 +1135,7 @@ async fn create_waiting_review_agent_task_with_policy(
         .reserve_execution_for_run(run.id.as_str(), TaskExecutorKind::Agent, run.created_at)
         .await
         .expect("execution should reserve");
-    persist_test_child_agent_execution(runtime, execution.id.as_str()).await;
+    persist_mock_agent_execution(runtime.service().store(), &run).await;
     let handle = TaskExecutionHandle::new(
         runtime.service().store(),
         runtime.event_bus(),
@@ -8753,6 +8771,8 @@ async fn compatibility_audit_error_repairs_healthy_work_before_returning_and_set
     );
 }
 
+#[path = "tests_closing.rs"]
+mod closing;
 // Owns assignment consumption regressions at the durable service boundary.
 #[tokio::test]
 async fn one_shot_replacement_after_prior_runs_is_consumed_once_via_both_inputs() {

@@ -53,6 +53,7 @@ use pioneer_config::{
     EffectiveGatewayCliAgentRuntimeInstanceConfig, GatewayCliAgentRuntimeKindConfig,
 };
 use pioneer_crud::NewCliRuntimeNativeEvent;
+use pioneer_observability::closing::{Closing, Fact, Phase};
 use pioneer_observability::{
     GatewayCliRuntimeKind, GatewayProviderWarmupStage, GatewayProviderWarmupTrace,
 };
@@ -3640,7 +3641,7 @@ impl MessageProcessor {
                                         .await
                                     {
                                         match AssertUnwindSafe(
-                                            durable_receiver.pending_work().scope_result(commit_processor.commit_durable_agent_event_with_cli_blocked_guard(event, durable_receiver.cli_blocked_guard().cloned(), durable_receiver.turn_transition().cloned())),
+                                            durable_receiver.pending_work().scope_result(durable_receiver.pending_closing_correlation().scope(commit_processor.commit_durable_agent_event_with_cli_blocked_guard(event, durable_receiver.cli_blocked_guard().cloned(), durable_receiver.turn_transition().cloned()))),
                                         )
                                         .catch_unwind()
                                         .await
@@ -3660,6 +3661,7 @@ impl MessageProcessor {
                                             }
                                         }
                                     } else {
+                                        durable_receiver.supersede_last_observation();
                                         listener_processor.audit_stale_cli_runtime_process_activity(
                                             &listener_instance,
                                             "durable_projection",
@@ -6002,12 +6004,41 @@ impl MessageProcessor {
     async fn process_bound_cli_runtime_event_inner(
         &self,
         instance: &CliSessionInstanceId,
+        turn_binding: pioneer_crud::CliRuntimeTurnBindingRecord,
+        event: RuntimeEvent,
+        turn_transition: Option<&Arc<tokio::sync::OwnedMutexGuard<()>>>,
+        terminal_delivery: Option<&pioneer_protocol::CliRuntimeBlockedTurnGuard>,
+    ) -> bool {
+        let mut closing = matches!(&event, RuntimeEvent::TurnCompleted(_))
+            .then(|| Closing::current(Phase::CliCandidate));
+        let correlation = closing.as_ref().map(Closing::correlation);
+        let future = self.process_bound_cli_runtime_event_observed(
+            instance,
+            turn_binding,
+            event,
+            turn_transition,
+            terminal_delivery,
+            &mut closing,
+        );
+        match correlation {
+            Some(correlation) => correlation.scope(future).await,
+            None => future.await,
+        }
+    }
+
+    async fn process_bound_cli_runtime_event_observed(
+        &self,
+        instance: &CliSessionInstanceId,
         mut turn_binding: pioneer_crud::CliRuntimeTurnBindingRecord,
         mut event: RuntimeEvent,
         turn_transition: Option<&Arc<tokio::sync::OwnedMutexGuard<()>>>,
         terminal_delivery: Option<&pioneer_protocol::CliRuntimeBlockedTurnGuard>,
+        closing: &mut Option<Closing>,
     ) -> bool {
         if !self.cli_runtime_instance_is_current(instance).await {
+            if let Some(closing) = closing {
+                closing.finish(Fact::Superseded);
+            }
             self.audit_stale_cli_runtime_process_activity(instance, "bound_event");
             return false;
         }
@@ -6269,12 +6300,18 @@ impl MessageProcessor {
                 self.confirm_cli_runtime_recovery_progress(attempt, recovery, event_label.as_str())
                     .await;
             }
+            if let Some(closing) = closing {
+                closing.finish(Fact::Continuation);
+            }
             return true;
         }
         if matches!(&event, RuntimeEvent::TurnCompleted(_)) {
             match self.cli_task_finalization_state(&turn_binding).await {
                 Ok(state) if state.blocks_completion() => {
                     let Some(source) = terminal_delivery else {
+                        if let Some(closing) = closing {
+                            closing.finish(Fact::Blocked);
+                        }
                         return false;
                     };
                     self.publish_cli_runtime_supplemental_timing(
@@ -6305,6 +6342,9 @@ impl MessageProcessor {
                                     "attached_task_continuation",
                                 )
                                 .await;
+                            }
+                            if let Some(closing) = closing {
+                                closing.finish(Fact::Continuation);
                             }
                             return true;
                         }
@@ -6680,6 +6720,9 @@ impl MessageProcessor {
                 }
                 return false;
             }
+        }
+        if let Some(closing) = closing {
+            closing.finish(Fact::Returned);
         }
         if matches!(&event, RuntimeEvent::TurnCompleted(_)) {
             let completed_context = async {
@@ -7195,6 +7238,7 @@ impl MessageProcessor {
         binding: &pioneer_crud::CliRuntimeTurnBindingRecord,
         generation: i64,
     ) -> anyhow::Result<CLIRuntimeSuccessFinalizationPreparation> {
+        let mut closing = Closing::current(Phase::CliPreparation);
         let task_state = self.cli_task_finalization_state(binding).await?;
         anyhow::ensure!(
             !task_state.blocks_completion(),
@@ -7281,10 +7325,12 @@ impl MessageProcessor {
                 turn_id = binding.turn_id.as_str(),
                 "CLI Turn success has no final AgentMessage; using atomic terminal-only finalization"
             );
+            closing.finish(Fact::Returned);
             return Ok(CLIRuntimeSuccessFinalizationPreparation::WithoutFinalMessage);
         };
-        self.crud_store
-            .prepare_turn_finalization(
+        closing
+            .correlation()
+            .scope(self.crud_store.prepare_turn_finalization(
                 &ItemCompletedNotification {
                     workspace_id: binding.workspace_id.clone(),
                     thread_id: binding.thread_id.clone(),
@@ -7294,8 +7340,9 @@ impl MessageProcessor {
                 generation.max(1),
                 Some(task_state.snapshot.revision.as_str()),
                 now_timestamp_secs(),
-            )
+            ))
             .await?;
+        closing.finish(Fact::Confirmed);
         Ok(CLIRuntimeSuccessFinalizationPreparation::WithFinalMessage)
     }
 

@@ -25,6 +25,7 @@ pub struct Conversation {
     next_sequence: u64,
     event_log: VecDeque<EventEnvelope>,
     pending_completion_turn_id: Option<String>,
+    pending_closing: Option<pioneer_observability::closing::Closing>,
     projector: ConversationProjector,
     state_machine: TurnStateMachine,
     item_handlers: TurnItemHandlerRegistry,
@@ -44,6 +45,7 @@ impl Conversation {
             next_sequence: self.next_sequence,
             event_log: self.event_log.clone(),
             pending_completion_turn_id: self.pending_completion_turn_id.clone(),
+            pending_closing: None, // snapshots cannot acquire terminal authority
             projector: self.projector.clone(),
             state_machine: self.state_machine.clone(),
             item_handlers: TurnItemHandlerRegistry::default(),

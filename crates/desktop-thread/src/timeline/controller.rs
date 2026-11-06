@@ -37,7 +37,23 @@ impl DesktopTimelineController {
         {
             return false;
         }
+        let mut applied = pioneer_observability::updates::StageObservation::start(
+            pioneer_observability::updates::Stage::NativeApply,
+        );
+        if model.update.is_pending() {
+            let expected = model
+                .update
+                .authorization_generation()
+                .unwrap_or_else(|| view.client.authorization_connection_generation());
+            let client = std::sync::Arc::downgrade(&view.client);
+            model.update.require_validity(move || {
+                client
+                    .upgrade()
+                    .is_some_and(|client| client.authorization_connection_generation() == expected)
+            });
+        }
         view.thread_timeline_view_state.model = model;
+        applied.finish(pioneer_observability::updates::Fact::Accepted);
         view.reconcile_timeline(window, cx);
         Self::schedule(view, window, cx);
         true
@@ -177,6 +193,24 @@ impl DesktopTimelineController {
             std::collections::HashSet::new()
         };
         view.set_row_terminals_visible(&terminal_rows, cx);
+        // Update visibility is independent of focus/animation availability.
+        for &index in &prepared.update_rows {
+            let slot = &prepared.slots[index];
+            if let Some(row) = &slot.view {
+                let top = view.layout_store.index.borrow().origin(index);
+                let intersects = top.is_some_and(|top| {
+                    top < offset + bounds.size.height
+                        && top + prepared.item_sizes[index].height > offset
+                });
+                let shown = view.thread_timeline_view_state.visible
+                    && window.is_visible()
+                    && bounds.size.width > px(0.)
+                    && bounds.size.height > px(0.)
+                    && intersects
+                    && terminal_rows.contains(slot.snapshot().id().as_str());
+                row.update(cx, |row, _| row.set_update_visible(shown));
+            }
+        }
         // Keep HTML prepared one viewport ahead/behind; native clipping still uses
         // the exact list viewport. Other row viewability policies stay unchanged.
         let nearby = prepared.layout_index.visible_range(

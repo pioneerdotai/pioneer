@@ -6,6 +6,7 @@ use pioneer_crud::{
     TaskRunOccurrenceClaimFailurePhase, TaskRunOccurrenceClock,
     TaskRunOccurrenceTerminalizationOutcome,
 };
+use pioneer_observability::closing::{Closing, Fact, Phase};
 use pioneer_protocol::{
     ItemUpdatedNotification, TaskDeliveryStatus, TaskEventPayload, TaskRescheduleReason,
     TaskTriggerKind,
@@ -518,6 +519,84 @@ impl MessageProcessor {
         &self,
         event: pioneer_crud::AppendedTaskEvent,
     ) -> Result<()> {
+        use pioneer_observability::{
+            updates,
+            work::{Boundary, ExecutorRole, Trigger, WorkCarrier, WorkKind},
+        };
+        let parent = self
+            .task_runtime
+            .event_bus()
+            .closing_publication_parent(&event.task_id, event.sequence);
+        let origin = if parent.is_some() {
+            updates::Origin::Observed
+        } else {
+            updates::Origin::Recovery
+        };
+        let parent = parent.unwrap_or_else(|| {
+            use pioneer_observability::scenario::Correlation;
+            Correlation::default().run(Correlation::capture)
+        });
+        let context = updates::with_context(None, || {
+            parent.run(|| updates::UpdateContext::source_with_origin(None, origin))
+        });
+        let work = updates::with_context(context, || {
+            WorkCarrier::child(
+                Boundary::EventLane,
+                WorkKind::Event,
+                Trigger::Event,
+                ExecutorRole::Event,
+            )
+        });
+        work.scope_result(parent.scope(self.emit_task_event_observed(event)))
+            .await
+    }
+
+    async fn emit_task_event_observed(&self, event: pioneer_crud::AppendedTaskEvent) -> Result<()> {
+        let closing_fact = match &event.payload {
+            TaskEventPayload::RunCompleted { .. } => {
+                Some((Phase::TaskState, Fact::ExecutionSucceeded))
+            }
+            TaskEventPayload::RunFailed { .. } => Some((Phase::TaskState, Fact::ExecutionFailed)),
+            TaskEventPayload::RunBlocked { .. } => Some((Phase::TaskState, Fact::Blocked)),
+            TaskEventPayload::RunCancelled { .. } => Some((Phase::TaskState, Fact::Cancelled)),
+            TaskEventPayload::TaskRunEnteredReview { .. } => {
+                Some((Phase::TaskState, Fact::PendingReview))
+            }
+            TaskEventPayload::TaskResultCandidateAccepted { .. } => {
+                Some((Phase::TaskState, Fact::Accepted))
+            }
+            TaskEventPayload::TaskResultCandidateRejected { .. } => {
+                Some((Phase::TaskState, Fact::Rejected))
+            }
+            TaskEventPayload::TaskResultCandidateCancelled { .. } => {
+                Some((Phase::TaskState, Fact::Cancelled))
+            }
+            TaskEventPayload::DeliveryQueued { .. } => {
+                Some((Phase::DestinationState, Fact::Scheduled))
+            }
+            TaskEventPayload::DeliveryDelivered { .. } => {
+                Some((Phase::DestinationState, Fact::Delivered))
+            }
+            TaskEventPayload::DeliveryCancelled { .. } => {
+                Some((Phase::DestinationState, Fact::Cancelled))
+            }
+            TaskEventPayload::DeliveryFailed { delivery, .. } => Some((
+                Phase::DestinationState,
+                if delivery.status == TaskDeliveryStatus::Failed {
+                    if delivery.attempt_count >= delivery.max_attempts {
+                        Fact::Exhausted
+                    } else {
+                        Fact::DeliveryFailed
+                    }
+                } else {
+                    Fact::Retrying
+                },
+            )),
+            _ => None,
+        };
+        if let Some((phase, fact)) = closing_fact {
+            Closing::committed_event(phase, fact);
+        }
         let Some(task_response) = self
             .crud_store
             .get_task_event_context(&event.payload)

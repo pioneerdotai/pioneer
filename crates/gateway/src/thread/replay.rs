@@ -460,7 +460,23 @@ impl ReplayReservation {
         if state.stopped {
             return;
         }
-        state.tasks.spawn(async move {
+        let source = pioneer_observability::updates::UpdateContext::source_with_origin(
+            None,
+            pioneer_observability::updates::Origin::Replay,
+        );
+        let make_work = || {
+            pioneer_observability::work::WorkCarrier::child(
+                pioneer_observability::work::Boundary::EventLane,
+                pioneer_observability::work::WorkKind::Event,
+                pioneer_observability::work::Trigger::Reconcile,
+                pioneer_observability::work::ExecutorRole::Gateway,
+            )
+        };
+        let observer = match source {
+            Some(context) => context.run(make_work),
+            None => make_work(),
+        };
+        state.tasks.spawn(observer.scope(async move {
             // Move the whole guard, not just its `complete` field. Otherwise
             // precise closure capture leaves the Drop owner outside the task.
             // Construct it before spawn so dropping an unpolled task recovers too.
@@ -478,7 +494,7 @@ impl ReplayReservation {
                 tracing::warn!("post-open replay panicked; socket recovery required");
             }
             drop(running);
-        });
+        }));
     }
 }
 impl Drop for ReplayReservation {

@@ -513,6 +513,8 @@ pub(crate) async fn run_normal_connection_inner(
             let crate::session::outbound::OutboundEnvelope {
                 item,
                 reservation: _reservation,
+                mut observation,
+                mut update_delivery,
             } = envelope;
             let mut queue = item.queue.as_ref().map(|(q, _)| q.processing());
             let (message, work) = item.received(
@@ -556,32 +558,50 @@ pub(crate) async fn run_normal_connection_inner(
                 )
             });
             let terminal = matches!(message, Message::Close(_));
-            work.scope_result(pioneer_observability::live::waiting(
-                pioneer_observability::live::WaitKind::Network,
-                write_outbound_bounded(
-                    &writer_outbound,
-                    if terminal {
-                        ACCESS_CLOSE_GRACE
-                    } else {
-                        write_timeout
-                    },
-                    async {
-                        #[cfg(test)]
-                        if let Some((_, block, entered)) = writer_hooks.as_mut() {
-                            if let Some(entered) = entered.take() {
-                                let _ = entered.send(());
+            let write_result = work
+                .scope_result(pioneer_observability::live::waiting(
+                    pioneer_observability::live::WaitKind::Network,
+                    write_outbound_bounded(
+                        &writer_outbound,
+                        if terminal {
+                            ACCESS_CLOSE_GRACE
+                        } else {
+                            write_timeout
+                        },
+                        async {
+                            #[cfg(test)]
+                            if let Some((_, block, entered)) = writer_hooks.as_mut() {
+                                if let Some(entered) = entered.take() {
+                                    let _ = entered.send(());
+                                }
+                                if let Some(block) = block.take() {
+                                    let _ = block.await;
+                                }
                             }
-                            if let Some(block) = block.take() {
-                                let _ = block.await;
-                            }
-                        }
-                        ws_writer.send(message).await
-                    },
-                ),
-            ))
-            .await?;
+                            ws_writer.send(message).await
+                        },
+                    ),
+                ))
+                .await;
+            if let Err(error) = write_result {
+                observation.finish(pioneer_observability::updates::Fact::WriteFailed);
+                if let Some(update) = update_delivery.as_mut() {
+                    pioneer_observability::updates::finish_delivery(
+                        update,
+                        pioneer_observability::updates::DeliveryOutcome::WriteFailed,
+                    );
+                }
+                return Err(error);
+            }
             if let Some(queue) = queue.as_mut() {
                 queue.processed();
+            }
+            observation.finish(pioneer_observability::updates::Fact::Written);
+            if let Some(update) = update_delivery.as_mut() {
+                pioneer_observability::updates::finish_delivery(
+                    update,
+                    pioneer_observability::updates::DeliveryOutcome::Written,
+                );
             }
             drop(startup_write);
             if let Some((key, output, outcome)) = startup_output {

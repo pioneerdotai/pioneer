@@ -139,6 +139,10 @@ struct PendingRegistration {
 }
 
 struct RequestState {
+    observation: Option<pioneer_observability::scenario::Observation>,
+    observation_live: Option<pioneer_observability::live::WorkGuard>,
+    correlation: pioneer_observability::scenario::Correlation,
+    work: pioneer_observability::work::WorkCarrier,
     response: Option<Sender<JsonRpcResponseResult>>,
     deadline: Instant,
     write_started: bool,
@@ -172,6 +176,10 @@ impl JsonRpcResponseSender {
     pub fn new(response: Sender<JsonRpcResponseResult>, deadline: Instant) -> Self {
         Self {
             state: Arc::new(Mutex::new(RequestState {
+                observation: None,
+                observation_live: None,
+                correlation: pioneer_observability::scenario::Correlation::default(),
+                work: pioneer_observability::work::WorkCarrier::default(),
                 response: Some(response),
                 deadline,
                 write_started: false,
@@ -194,6 +202,53 @@ impl JsonRpcResponseSender {
         let sender = Self::new(response, deadline);
         sender.state.lock().unwrap().wake = Some(wake);
         sender
+    }
+
+    /// Called once by the shared flight owner, before serialization/handoff.
+    pub(crate) fn observe_rpc(&self, method: &str) -> pioneer_observability::scenario::Correlation {
+        use pioneer_observability::{scenario, work};
+        let Some(boundary) = scenario::rpc_boundary(method) else {
+            return scenario::Correlation::capture();
+        };
+        let observation = scenario::Observation::start(
+            scenario::Scenario::Opening,
+            boundary,
+            &scenario::Correlation::capture(),
+            &[],
+        );
+        let correlation = observation.correlation();
+        let carrier = correlation.run(|| {
+            work::WorkCarrier::child(
+                work::Boundary::ClientRpc,
+                work::WorkKind::ClientRpc,
+                work::Trigger::Rpc,
+                work::ExecutorRole::ClientController,
+            )
+        });
+        let mut state = self.state.lock().unwrap();
+        if state.response.is_some() && state.observation.is_none() {
+            state.observation = Some(observation);
+            state.correlation = correlation.clone();
+            state.observation_live = Some(pioneer_observability::live::WorkGuard::start(
+                carrier.context(),
+                false,
+            ));
+            state.work = carrier;
+        }
+        correlation
+    }
+
+    pub(crate) fn observation_context(
+        &self,
+    ) -> Option<(
+        pioneer_observability::scenario::Correlation,
+        pioneer_observability::work::WorkCarrier,
+    )> {
+        let state = self.state.lock().unwrap();
+        state
+            .observation
+            .as_ref()
+            .map(|_| (state.correlation.clone(), state.work.clone()))
     }
 
     pub(crate) fn deadline(&self) -> Instant {
@@ -242,7 +297,7 @@ impl JsonRpcResponseSender {
         &self,
         response: Option<JsonRpcResponseResult>,
     ) -> Result<(), SendError<JsonRpcResponseResult>> {
-        let (sender, registration, expired, wake, control_slot) = {
+        let (sender, registration, expired, wake, control_slot, observation, observation_live) = {
             let mut state = self.state.lock().unwrap();
             (
                 state.response.take(),
@@ -250,6 +305,8 @@ impl JsonRpcResponseSender {
                 Instant::now() >= state.deadline,
                 state.wake.take(),
                 state.control_slot.take(),
+                state.observation.take(),
+                state.observation_live.take(),
             )
         };
         // insert holds state before registry; release state before acquiring
@@ -258,6 +315,14 @@ impl JsonRpcResponseSender {
             self.remove_registration(registration);
         }
         drop(control_slot);
+        use pioneer_observability::scenario::Outcome;
+        let response_outcome = match response.as_ref() {
+            Some(Ok(_)) => Outcome::Confirmed,
+            Some(Err(JsonRpcResponseError::DeadlineExceeded)) => Outcome::DeadlineExceeded,
+            Some(Err(JsonRpcResponseError::Transport { .. })) => Outcome::TransportLost,
+            Some(Err(_)) => Outcome::Failed,
+            None => Outcome::CancelledWaiter,
+        };
         let result = match (sender, response) {
             (Some(sender), Some(response)) if !expired => sender.send(response),
             (Some(sender), Some(response)) => {
@@ -272,6 +337,26 @@ impl JsonRpcResponseSender {
             (None, Some(response)) => Err(SendError(response)),
             (None, None) => Ok(()),
         };
+        if let Some(mut observation) = observation {
+            let outcome = if expired {
+                Outcome::DeadlineExceeded
+            } else {
+                match response_outcome {
+                    Outcome::Confirmed if result.is_err() => Outcome::Unconfirmed,
+                    outcome => outcome,
+                }
+            };
+            observation.finish(outcome);
+            if let Some(mut live) = observation_live {
+                use pioneer_observability::work;
+                live.finish(match outcome {
+                    Outcome::Confirmed => work::Outcome::Completed,
+                    Outcome::Failed => work::Outcome::Failed,
+                    Outcome::CancelledWaiter => work::Outcome::Cancelled,
+                    _ => work::Outcome::Abandoned,
+                });
+            }
+        }
         if let Some(wake) = wake {
             wake();
         }
@@ -386,6 +471,9 @@ impl RequestBudget {
     }
     pub(crate) fn deadline(&self) -> Instant {
         self.deadline
+    }
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.state.lock().unwrap().cancelled
     }
     pub(crate) fn check(&self) -> Result<()> {
         anyhow::ensure!(!self.state.lock().unwrap().cancelled, "operation cancelled");
@@ -563,6 +651,7 @@ pub fn build_json_rpc_request_payload(
 ) -> Result<JsonRpcRequestPayload> {
     let mut params = params;
     pioneer_observability::turn_startup::inject_params(method, &mut params);
+    pioneer_observability::scenario::inject_params(method, &mut params);
     let request_id = new_request_id();
     let request = JsonRpcRequest {
         jsonrpc: JSONRPC_VERSION.to_owned(),
@@ -659,28 +748,57 @@ where
     use pioneer_observability::work::{Boundary, ExecutorRole, Trigger, WorkCarrier, WorkKind};
     let executor =
         pioneer_observability::work::current().map_or(ExecutorRole::Foreign, |c| c.executor);
-    let work = WorkCarrier::child(
-        Boundary::ClientRpc,
-        WorkKind::ClientRpc,
-        Trigger::Rpc,
-        executor,
-    );
-    work.run_result(|| {
-        let startup_key = if matches!(method, "turn/start" | "voice/session/finalize") {
-            pioneer_observability::turn_startup::request_key(&params)
-        } else {
-            None
-        };
-        let deadline = Instant::now() + timeout;
-        let request = build_json_rpc_request_payload(method, params)?;
-        let (response_tx, response_rx) = std::sync::mpsc::channel();
-        let response_tx = JsonRpcResponseSender::new(response_tx, deadline);
-        let _request_guard = response_tx.retire_on_drop();
-        let response_state = Arc::downgrade(&response_tx.state);
+    let observation = pioneer_observability::scenario::rpc_boundary(method).map(|boundary| {
+        pioneer_observability::scenario::Observation::start(
+            pioneer_observability::scenario::Scenario::Opening,
+            boundary,
+            &pioneer_observability::scenario::Correlation::capture(),
+            &[],
+        )
+    });
+    let correlation = observation
+        .as_ref()
+        .map(|o| o.correlation())
+        .unwrap_or_else(pioneer_observability::scenario::Correlation::capture);
+    let selected_rpc = observation.is_some();
+    let send = || {
+        let work = WorkCarrier::child(
+            Boundary::ClientRpc,
+            WorkKind::ClientRpc,
+            Trigger::Rpc,
+            executor,
+        );
+        work.run_result(|| {
+            let startup_key = if matches!(method, "turn/start" | "voice/session/finalize") {
+                pioneer_observability::turn_startup::request_key(&params)
+            } else {
+                None
+            };
+            let deadline = Instant::now() + timeout;
+            let request = build_json_rpc_request_payload(method, params)?;
+            let (response_tx, response_rx) = std::sync::mpsc::channel();
+            let response_tx = JsonRpcResponseSender::new(response_tx, deadline);
+            {
+                let mut state = response_tx.state.lock().unwrap();
+                if observation.is_some() {
+                    state.work = pioneer_observability::work::capture();
+                    state.correlation = correlation.clone();
+                }
+                state.observation = observation;
+            }
+            let _request_guard = response_tx.retire_on_drop();
+            let response_state = Arc::downgrade(&response_tx.state);
 
-        transport
-            .send_json_rpc_request(request.request_id, request.payload, response_tx)
-            .map_err(|error| {
+            // Keep the canonical owner only through admission, so a transport
+            // that drops its argument on Err cannot censor a known failure.
+            let admission_owner = response_tx.clone();
+            let admitted =
+                transport.send_json_rpc_request(request.request_id, request.payload, response_tx);
+            if let Err(error) = &admitted {
+                let _ = admission_owner.send(Err(JsonRpcResponseError::transport(error.clone())));
+            }
+            drop(admission_owner);
+            admitted.map_err(|error| {
                 if let Some(key) = startup_key.as_deref() {
                     pioneer_observability::turn_startup::finish(
                         key,
@@ -690,49 +808,56 @@ where
                 anyhow::Error::msg(error)
             })?;
 
-        let deadline = response_state
-            .upgrade()
-            .map_or(deadline, |state| state.lock().unwrap().deadline);
-        let _wait = pioneer_observability::live::WaitGuard::with_timeout(
-            pioneer_observability::live::WaitKind::Reply,
-            deadline.saturating_duration_since(Instant::now()),
-        );
-        let response = response_rx
-            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-            .map_err(|error| {
-                if let Some(key) = startup_key.as_deref() {
-                    let outcome = if matches!(error, std::sync::mpsc::RecvTimeoutError::Timeout) {
-                        pioneer_observability::turn_startup::Outcome::DeadlineExceeded
-                    } else {
-                        pioneer_observability::turn_startup::Outcome::ObservationLost
-                    };
-                    pioneer_observability::turn_startup::finish(key, outcome);
-                }
-                anyhow!("{}", request_timeout_message(method))
-            })?;
+            let deadline = response_state
+                .upgrade()
+                .map_or(deadline, |state| state.lock().unwrap().deadline);
+            let _wait = pioneer_observability::live::WaitGuard::with_timeout(
+                pioneer_observability::live::WaitKind::Reply,
+                deadline.saturating_duration_since(Instant::now()),
+            );
+            let response = response_rx
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .map_err(|error| {
+                    if let Some(key) = startup_key.as_deref() {
+                        let outcome = if matches!(error, std::sync::mpsc::RecvTimeoutError::Timeout)
+                        {
+                            pioneer_observability::turn_startup::Outcome::DeadlineExceeded
+                        } else {
+                            pioneer_observability::turn_startup::Outcome::ObservationLost
+                        };
+                        pioneer_observability::turn_startup::finish(key, outcome);
+                    }
+                    anyhow!("{}", request_timeout_message(method))
+                })?;
 
-        response.map_err(|error| {
-            if matches!(error, JsonRpcResponseError::DeadlineExceeded) {
-                if let Some(key) = startup_key.as_deref() {
-                    pioneer_observability::turn_startup::finish(
-                        key,
-                        pioneer_observability::turn_startup::Outcome::DeadlineExceeded,
-                    );
-                }
-                anyhow!("{}", request_timeout_message(method))
-            } else {
-                if matches!(error, JsonRpcResponseError::Transport { .. }) {
+            response.map_err(|error| {
+                if matches!(error, JsonRpcResponseError::DeadlineExceeded) {
                     if let Some(key) = startup_key.as_deref() {
                         pioneer_observability::turn_startup::finish(
                             key,
-                            pioneer_observability::turn_startup::Outcome::ObservationLost,
+                            pioneer_observability::turn_startup::Outcome::DeadlineExceeded,
                         );
                     }
+                    anyhow!("{}", request_timeout_message(method))
+                } else {
+                    if matches!(error, JsonRpcResponseError::Transport { .. }) {
+                        if let Some(key) = startup_key.as_deref() {
+                            pioneer_observability::turn_startup::finish(
+                                key,
+                                pioneer_observability::turn_startup::Outcome::ObservationLost,
+                            );
+                        }
+                    }
+                    anyhow::Error::new(error)
                 }
-                anyhow::Error::new(error)
-            }
+            })
         })
-    })
+    };
+    if selected_rpc {
+        correlation.run(send)
+    } else {
+        send()
+    }
 }
 
 pub fn send_json_rpc_request_typed<TResponse, TParams, TTransport>(
@@ -773,6 +898,36 @@ mod tests {
         assert_eq!(request.id.as_str(), payload.request_id);
         assert_eq!(request.method, "workspace/list");
         assert_eq!(request.params, Some(json!({"workspace_id": "ws_1"})));
+    }
+
+    #[test]
+    fn response_observation_censors_failed_handoff_and_keeps_known_transport_error() {
+        crate::scenario_test_support::isolated(
+            "rpc::request::tests::response_observation_censors_failed_handoff_and_keeps_known_transport_error",
+            |capture| {
+                let (tx, rx) = mpsc::channel();
+                let owner = JsonRpcResponseSender::new(tx, Instant::now() + RPC_REQUEST_TIMEOUT);
+                owner.observe_rpc("thread/open");
+                drop(rx);
+                assert!(owner.send(Ok(json!({"unused":true}))).is_err());
+                let spans = capture.spans();
+                assert_eq!(spans.len(), 1);
+                assert_eq!(spans[0].attributes["outcome"], "Unconfirmed");
+
+                // The existing failing fixture consumes and drops its response argument.
+                let error = send_json_rpc_request_value(
+                    &FailingTransport,
+                    "thread/timeline/page",
+                    json!({}),
+                    RPC_REQUEST_TIMEOUT,
+                )
+                .unwrap_err();
+                assert_eq!(error.to_string(), WEBSOCKET_WORKER_UNAVAILABLE_MESSAGE);
+                let spans = capture.spans();
+                assert_eq!(spans.len(), 1);
+                assert_eq!(spans[0].attributes["outcome"], "TransportLost");
+            },
+        );
     }
 
     #[test]

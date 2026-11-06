@@ -559,6 +559,7 @@ impl SerializedClientPayload {
 }
 
 pub struct ClientSnapshot {
+    update: Option<pioneer_observability::updates::UpdateContext>,
     scope: ClientScope,
     revisions: ClientRevisions,
     sequence: ClientChangeSequence,
@@ -569,6 +570,20 @@ pub struct ClientSnapshot {
 impl ClientSnapshot {
     fn from_draft(draft: ClientPublicationDraft, sequence: ClientChangeSequence) -> Arc<Self> {
         Arc::new(Self {
+            update: match &draft.scope {
+                ClientScope::Timeline { thread_id } => pioneer_observability::updates::capture()
+                    .or_else(|| {
+                        pioneer_observability::updates::UpdateContext::source(
+                            pioneer_observability::updates::ContentHint::new(
+                                thread_id,
+                                None,
+                                pioneer_observability::updates::Change::Recovery,
+                                0,
+                            ),
+                        )
+                    }),
+                _ => None,
+            },
             scope: draft.scope,
             revisions: draft.revisions,
             sequence,
@@ -608,6 +623,10 @@ pub struct ClientPublicationReference(
 );
 
 impl ClientPublicationReference {
+    pub fn update_context(&self) -> Option<pioneer_observability::updates::UpdateContext> {
+        self.0.update.clone()
+    }
+
     /// Transaction delta carried by delivery, never retained in a scoped snapshot.
     pub fn timeline_change(&self) -> Option<Arc<crate::timeline::presentation::TimelineChangeSet>> {
         self.1.clone()
@@ -1142,6 +1161,19 @@ impl HistoryAuthority {
         });
         Self { auth, transport }
     }
+    pub(crate) fn observation_scope(
+        &self,
+    ) -> (
+        (u64, Option<u64>),
+        Option<crate::transport::ws::runtime::ConnectionScope>,
+    ) {
+        (
+            self.auth,
+            self.transport
+                .as_ref()
+                .and_then(|transport| transport.scope()),
+        )
+    }
     pub(crate) fn is_current(&self, core: &ClientCore) -> bool {
         self.auth == core.current_auth_ticket()
             && self
@@ -1170,6 +1202,7 @@ impl HistoryAuthority {
 }
 
 struct HistoryFlight {
+    correlation: pioneer_observability::scenario::Correlation,
     reservation: u64,
     response: crate::rpc::JsonRpcResponseSender,
     receiver: std::sync::mpsc::Receiver<crate::rpc::JsonRpcResponseResult>,
@@ -1780,6 +1813,10 @@ impl ClientCore {
         if self.stopped.swap(true, std::sync::atomic::Ordering::AcqRel) {
             return;
         }
+        self.thread_registry
+            .lock()
+            .expect("thread registry poisoned")
+            .retire_opening(pioneer_observability::opening::Result::Unconfirmed);
         self.cancel_composer_send_budgets();
         self.session_driver
             .lock()
@@ -2193,6 +2230,88 @@ impl ClientCore {
         cycle.run(|| self.materialize_demanded_timelines());
     }
 
+    pub(crate) fn opening_content_current(&self, id: &str, generation: u64, revision: u64) -> bool {
+        self.partitions
+            .lock()
+            .expect("client partitions poisoned")
+            .publications
+            .get(&ClientScope::Timeline {
+                thread_id: id.to_owned(),
+            })
+            .and_then(|snapshot| {
+                snapshot.payload::<crate::timeline::presentation::TimelineSnapshot>()
+            })
+            .is_some_and(|snapshot| {
+                snapshot.generation() == generation && snapshot.revision() == revision
+            })
+    }
+    pub(crate) fn opening_publications_current(
+        &self,
+        id: &str,
+        input: &crate::composer::store::ComposerPublication,
+        identity: &Arc<crate::gateway::identity_authorization::IdentityAuthorizationPublication>,
+        capability: Option<&Arc<crate::threads::capabilities::ThreadCapabilityPublication>>,
+        session: &crate::gateway::session_controller::GatewaySessionPublication,
+        runtime: Option<&Arc<crate::providers::runtime::ProviderRuntimePublication>>,
+    ) -> bool {
+        let partitions = self.partitions.lock().expect("client partitions poisoned");
+        let current_input = partitions
+            .publications
+            .get(&ClientScope::Composer {
+                thread_id: id.to_owned(),
+            })
+            .and_then(|snapshot| snapshot.payload::<crate::composer::store::ComposerPublication>());
+        let current_identity = partitions.publications.get(&ClientScope::Administration { workspace_id: None }).and_then(|snapshot| snapshot.payload::<crate::gateway::identity_authorization::IdentityAuthorizationPublication>());
+        let current_capability = partitions
+            .publications
+            .get(&ClientScope::ThreadCapability {
+                thread_id: id.to_owned(),
+            })
+            .and_then(|snapshot| {
+                snapshot.payload::<crate::threads::capabilities::ThreadCapabilityPublication>()
+            });
+        let current_session =
+            partitions
+                .publications
+                .get(&ClientScope::Session)
+                .and_then(|snapshot| {
+                    snapshot
+                        .payload::<crate::gateway::session_controller::GatewaySessionPublication>()
+                });
+        let runtime_current = runtime.is_none_or(|runtime| {
+            partitions
+                .publications
+                .get(&ClientScope::ProviderRuntime {
+                    workspace_id: runtime.workspace_id().to_owned(),
+                })
+                .and_then(|snapshot| {
+                    snapshot.payload::<crate::providers::runtime::ProviderRuntimePublication>()
+                })
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, runtime))
+        });
+        runtime_current
+            && current_input.as_ref().is_some_and(|current| {
+                std::ptr::eq(Arc::as_ptr(current), input)
+                    && current.has_same_submission_prerequisites(input)
+                    && current.domain().selected_permission_mode
+                        == input.domain().selected_permission_mode
+                    && current.selected_permission_mode_allowed()
+                        == input.selected_permission_mode_allowed()
+            })
+            && current_identity
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, identity))
+            && match (current_capability.as_ref(), capability) {
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                (None, None) => true,
+                _ => false,
+            }
+            && current_session.as_ref().is_some_and(|current| {
+                current.startup.transport_revision == session.startup.transport_revision
+                    && current.startup.transport_ready == session.startup.transport_ready
+            })
+    }
     pub(crate) fn start_thread_request_controller(
         self: &Arc<Self>,
         #[cfg(test)] waiting: Option<std::sync::mpsc::Sender<Option<std::time::Duration>>>,
@@ -2253,19 +2372,27 @@ impl ClientCore {
                             } else {
                                 Err(anyhow::anyhow!("History request authority retired"))
                             };
+                            let mut applying = pioneer_observability::opening::Measure::start(
+                                pioneer_observability::opening::Phase::Apply,
+                                &flight.correlation,
+                                &[],
+                            );
                             let continuation = flight.work.run(|| {
-                                apply(
-                                    &core,
-                                    result,
-                                    Some(&HistoryAuthority {
-                                        auth: flight.auth,
-                                        transport: flight.transport.clone(),
-                                    }),
-                                )
-                                .map(|request| {
-                                    Self::history_continuation(request, flight.queue.clone())
+                                flight.correlation.run(|| {
+                                    apply(
+                                        &core,
+                                        result,
+                                        Some(&HistoryAuthority {
+                                            auth: flight.auth,
+                                            transport: flight.transport.clone(),
+                                        }),
+                                    )
+                                    .map(|request| {
+                                        Self::history_continuation(request, flight.queue.clone())
+                                    })
                                 })
                             });
+                            applying.finish(pioneer_observability::opening::Result::Returned);
                             receiver.finish_active(flight.reservation, continuation);
                         }
 
@@ -2303,7 +2430,16 @@ impl ClientCore {
                             // revalidate it before sending or accepting any payload.
                             let HistoryAuthority { auth, transport } =
                                 HistoryAuthority::capture(&core);
-                            let prepared = work.run(|| core.prepare_history_request(request));
+                            let observation_current = request.observation_current();
+                            let correlation = request.correlation();
+                            let mut preparation = pioneer_observability::opening::Measure::start(
+                                pioneer_observability::opening::Phase::Prepare,
+                                &correlation,
+                                &[],
+                            );
+                            let prepared = work
+                                .run(|| correlation.run(|| core.prepare_history_request(request)));
+                            preparation.finish(pioneer_observability::opening::Result::Returned);
                             if let Some(processing) = &mut processing {
                                 processing.processed();
                             }
@@ -2327,6 +2463,19 @@ impl ClientCore {
                                     deadline,
                                     receiver.completion_wake(),
                                 );
+                                // The producer captured causal context before scheduler handoff.
+                                // Observe before attach can retire the response owner; never
+                                // inherit an unrelated ambient span from this worker.
+                                let rpc_context = prepared.rpc.as_ref().and_then(|(method, _)| {
+                                    use pioneer_observability::scenario;
+                                    scenario::rpc_boundary(method)
+                                        .filter(|_| observation_current)
+                                        .map(|_| {
+                                            work.run(|| {
+                                                correlation.run(|| response.observe_rpc(method))
+                                            })
+                                        })
+                                });
                                 if !receiver.attach(reservation, response.clone())
                                     || core.current_auth_ticket() != auth
                                     || transport
@@ -2336,10 +2485,18 @@ impl ClientCore {
                                     response.cancel();
                                 }
                                 let payload = prepared.rpc.map(|(method, params)| {
-                                    crate::rpc::build_json_rpc_request_payload(method, params)
+                                    let prepare = || {
+                                        crate::rpc::build_json_rpc_request_payload(method, params)
+                                    };
+                                    if let Some(correlation) = &rpc_context {
+                                        correlation.run(prepare)
+                                    } else {
+                                        prepare()
+                                    }
                                 });
                                 // Registration precedes send: inline completion cannot be lost.
                                 flights.push(HistoryFlight {
+                                    correlation,
                                     reservation,
                                     response: response.clone(),
                                     receiver: rx,
@@ -2580,7 +2737,21 @@ impl ClientCore {
         );
         let mut processing = queue.as_ref().map(|q| q.processing());
         work.run(|| {
-            self.route_gateway_event(&event);
+            let update = pioneer_observability::updates::capture().map(|update| {
+                update.with_authorization(self.authorization_connection_generation())
+            });
+            let dispatch = || {
+                let mut route = pioneer_observability::updates::StageObservation::start(
+                    pioneer_observability::updates::Stage::ClientRoute,
+                );
+                self.route_gateway_event(&event);
+                route.finish(pioneer_observability::updates::Fact::Returned);
+            };
+            if let Some(update) = update {
+                update.run(dispatch);
+            } else {
+                dispatch();
+            }
         });
         if let Some(processing) = &mut processing {
             processing.processed();
@@ -2706,6 +2877,7 @@ impl ClientCore {
     }
     pub fn dispatch(&self, intent: ClientIntent) -> ClientTransition {
         if self.is_stopped() {
+            self.observe_rejected_opening_intent(&intent);
             let mut partitions = self.partitions.lock().expect("client partitions poisoned");
             partitions.transition_sequence.advance();
             return Self::transition_without_publication(
@@ -3147,6 +3319,13 @@ impl ClientCore {
                                 |equal| equal(draft.payload.as_ref(), current.payload.as_ref()),
                             )
                         {
+                            if matches!(draft.scope, ClientScope::Timeline { .. }) {
+                                let mut no_change =
+                                    pioneer_observability::updates::StageObservation::start(
+                                        pioneer_observability::updates::Stage::Publication,
+                                    );
+                                no_change.finish(pioneer_observability::updates::Fact::NoChange);
+                            }
                             continue;
                         }
                         if draft.revisions == current_revisions {

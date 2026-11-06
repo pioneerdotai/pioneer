@@ -1,5 +1,6 @@
 mod actor_contract;
 mod admission;
+mod closing_observer;
 mod error;
 mod event_bus;
 mod executor;

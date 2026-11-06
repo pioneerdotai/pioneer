@@ -11,6 +11,7 @@ mod loop_guard;
 mod mcp_policy;
 mod network_policy;
 mod no_progress_guard;
+pub mod observation;
 mod orchestrator;
 mod output_dynamic_policy;
 mod output_policy;

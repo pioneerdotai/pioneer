@@ -4,6 +4,7 @@ use super::*;
 use crate::patch_history_observer::{SqlitePatchObserver, reserve_patch_history_capacity};
 use anyhow::{Context, Result, bail};
 use futures_util::{FutureExt, StreamExt};
+use pioneer_observability::closing::{Closing, Fact, Phase};
 use pioneer_observability::{
     GatewayMarkdownMessageMetric, GatewayMarkdownMessageOutcome, GatewayMarkdownOutcome,
     GatewayMarkdownStage, GatewayMarkdownStageMetric, GatewayMarkdownStreamKind,
@@ -995,7 +996,8 @@ impl MessageProcessor {
                             durable_receiver.pending_enqueue_age().unwrap_or_default();
                         let projection_started = Instant::now();
                         let work=durable_receiver.pending_work();
-                        let (commit_result, listener_failed) = match AssertUnwindSafe(work.scope_result(async {
+                        let closing_correlation = durable_receiver.pending_closing_correlation();
+                        let (commit_result, listener_failed) = match AssertUnwindSafe(work.scope_result(closing_correlation.scope(async {
                             if let Some(weak) = &this {
                                 let Some(this) = weak.upgrade() else {
                                     return Err(DurableCommitRejection::permanent(
@@ -1014,7 +1016,7 @@ impl MessageProcessor {
                                     "gateway message processor is no longer available",
                                 )) }
                             }
-                        }))
+                        })))
                         .catch_unwind()
                         .await
                         {
@@ -2002,6 +2004,9 @@ impl MessageProcessor {
         cli_blocked_guard: Option<pioneer_protocol::CliRuntimeBlockedTurnGuard>,
         mut turn_transition: Option<Arc<tokio::sync::OwnedMutexGuard<()>>>,
     ) -> MessageFuture<'a, Result<(), DurableCommitRejection>> {
+        let closing_correlation = (event.is_terminal()
+            || matches!(&event, AgentDurableEvent::TurnFinalizationPrepared { .. }))
+        .then(pioneer_observability::scenario::Correlation::capture);
         let foreground_activation = match &event {
             AgentDurableEvent::NativeCancellationContextPrepared {
                 preparation,
@@ -2462,7 +2467,12 @@ impl MessageProcessor {
         message_future(pioneer_observability::turn_startup::scope_stage(
             startup_key,
             pioneer_observability::turn_startup::Stage::Projection,
-            future,
+            async move {
+                match closing_correlation {
+                    Some(correlation) => correlation.scope(future).await,
+                    None => future.await,
+                }
+            },
         ))
     }
 
@@ -5777,18 +5787,24 @@ impl MessageProcessor {
                 generation,
                 task_finalization_revision,
             } => message_future(async move {
+                let artifact = self.artifact_finalization_ref(&notification.turn_id).await;
+                let mut closing = Closing::start_linked(
+                    Phase::NativePreparation,
+                    &Closing::capture(),
+                    artifact.as_slice(),
+                );
                 let mut notification = notification;
                 self.enrich_item_completed_markdown(&mut notification).await;
                 let thread_id = notification.thread_id.clone();
                 let turn_id = notification.turn_id.clone();
-                if let Err(error) = self
-                    .crud_store
-                    .prepare_turn_finalization(
+                if let Err(error) = closing
+                    .correlation()
+                    .scope(self.crud_store.prepare_turn_finalization(
                         &notification,
                         generation,
                         task_finalization_revision.as_deref(),
                         now_timestamp_secs(),
-                    )
+                    ))
                     .await
                 {
                     self.report_legacy_turn_failure(
@@ -5799,6 +5815,7 @@ impl MessageProcessor {
                     .await;
                     return false;
                 }
+                closing.finish(Fact::Confirmed);
                 self.progress_items
                     .lock()
                     .await
@@ -9831,6 +9848,12 @@ impl MessageProcessor {
         recovery: Option<pioneer_protocol::RecoveryAttemptContext>,
         recover_title: bool,
     ) -> bool {
+        let artifact = self.artifact_finalization_ref(&turn_id).await;
+        let mut closing = Closing::start_linked(
+            Phase::TerminalTransition,
+            &Closing::capture(),
+            artifact.as_slice(),
+        );
         let terminal_actor_generation = self
             .agent_manager
             .turn_owner_generation(thread_id.as_str(), turn_id.as_str())
@@ -9868,9 +9891,15 @@ impl MessageProcessor {
                     self.finalize_agent_execution_for_turn(&current_turn, "completed")
                         .await;
                 }
+                closing.finish(if committed {
+                    Fact::Duplicate
+                } else {
+                    Fact::Unconfirmed
+                });
                 return committed;
             }
             if current_turn.status != TurnStatus::InProgress {
+                closing.finish(Fact::Superseded);
                 self.retire_execution_progress_state(turn_id.as_str()).await;
                 return false;
             }
@@ -9902,6 +9931,7 @@ impl MessageProcessor {
             .artifact_finalization_blocks_completion(thread_id.as_str(), turn_id.as_str())
             .await
         {
+            closing.finish(Fact::Rejected);
             return false;
         }
 
@@ -9934,14 +9964,20 @@ impl MessageProcessor {
         };
 
         let event_timestamp = now_timestamp_secs();
-        if let Err(error) = self
-            .materialize_native_agent_turn_event(
+        let persisted = closing
+            .correlation()
+            .scope(self.materialize_native_agent_turn_event(
                 pioneer_crud::CanonicalTurnEventPayload::TurnCompleted(turn_completed.clone()),
                 event_timestamp,
                 None,
-            )
-            .await
-        {
+            ))
+            .await;
+        let fact = if persisted.is_ok() {
+            Fact::Confirmed
+        } else {
+            Fact::Unconfirmed
+        };
+        if let Err(error) = persisted {
             let rolled_back = self
                 .rollback_terminal_turn_finish_if_event_not_appended(
                     finish_outcome.rollback_context,
@@ -9961,6 +9997,7 @@ impl MessageProcessor {
                 return false;
             }
         }
+        closing.finish(fact);
         if recover_title {
             self.recover_completed_turn_title(thread_id.clone(), &turn_completed.turn)
                 .await;
@@ -9993,13 +10030,14 @@ impl MessageProcessor {
             let executor = Arc::clone(&self.task_agent_executor);
             let reconciliation_thread_id = thread_id.clone();
             let reconciliation_turn_id = turn_id.clone();
+            let correlation = closing.correlation();
             message_fresh_task(async move {
-                executor
-                    .reconcile_child_turn_completed(
+                correlation
+                    .scope(executor.reconcile_child_turn_completed(
                         reconciliation_thread_id.as_str(),
                         reconciliation_turn_id.as_str(),
                         TaskChildReconciliationOrigin::Live,
-                    )
+                    ))
                     .await
             })
             .await
@@ -10360,6 +10398,12 @@ impl MessageProcessor {
         turn_id: String,
         recovery: Option<pioneer_protocol::RecoveryAttemptContext>,
     ) -> bool {
+        let artifact = self.artifact_finalization_ref(&turn_id).await;
+        let mut closing = Closing::start_linked(
+            Phase::NativeFinalization,
+            &Closing::capture(),
+            artifact.as_slice(),
+        );
         if let Some(recovery) = recovery.as_ref() {
             match self
                 .recovery_coordinator
@@ -10393,7 +10437,13 @@ impl MessageProcessor {
             .await
         {
             Ok(true) => {}
-            Ok(false) => return self.complete_turn(thread_id, turn_id, recovery).await,
+            Ok(false) => {
+                closing.finish(Fact::Returned);
+                return closing
+                    .correlation()
+                    .scope(self.complete_turn(thread_id, turn_id, recovery))
+                    .await;
+            }
             Err(error) => {
                 warn!(
                     thread_id,
@@ -10405,13 +10455,17 @@ impl MessageProcessor {
             }
         }
 
-        let committed = match self
-            .crud_store
-            .commit_prepared_turn_finalization(turn_id.as_str(), now_timestamp_secs())
+        let committed = match closing
+            .correlation()
+            .scope(
+                self.crud_store
+                    .commit_prepared_turn_finalization(turn_id.as_str(), now_timestamp_secs()),
+            )
             .await
         {
             Ok(TurnFinalizationCommitOutcome::Committed(committed)) => committed,
             Ok(TurnFinalizationCommitOutcome::DeferredByPredecessor) => {
+                closing.finish(Fact::Pending);
                 debug!(
                     thread_id,
                     turn_id, "native Turn finalization is waiting for an earlier projection"
@@ -10419,6 +10473,7 @@ impl MessageProcessor {
                 return false;
             }
             Ok(TurnFinalizationCommitOutcome::SupersededByTerminalStatus(status)) => {
+                closing.finish(Fact::Superseded);
                 debug!(
                     thread_id,
                     turn_id,
@@ -10446,6 +10501,11 @@ impl MessageProcessor {
             );
             return false;
         }
+        closing.finish(if committed.already_committed {
+            Fact::Duplicate
+        } else {
+            Fact::Confirmed
+        });
         if !committed.already_committed {
             self.recover_completed_turn_title(thread_id.clone(), &committed.turn_completed.turn)
                 .await;
@@ -10457,7 +10517,9 @@ impl MessageProcessor {
         // Reuse terminal cleanup/recovery/task reconciliation. Its canonical
         // TurnCompleted write is now an exact idempotent replay of the already
         // committed terminal half of the finalization transaction.
-        self.complete_turn_with_title_recovery(thread_id, turn_id, recovery, false)
+        closing
+            .correlation()
+            .scope(self.complete_turn_with_title_recovery(thread_id, turn_id, recovery, false))
             .await
     }
 
