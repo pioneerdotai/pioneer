@@ -2244,7 +2244,7 @@ async fn domain_finalize_drains_slow_tail_with_recording_and_buffered_recognizer
         .try_init();
     for buffered in [false, true] {
         let phase = std::cell::Cell::new("fixture setup");
-        tokio::time::timeout(Duration::from_secs(20), async {
+        tokio::time::timeout(Duration::from_secs(60), async {
             let mut f = Fixture::new().await;
             let home = tempfile::tempdir().unwrap();
             let mut processor = (*f.processor).clone().with_runtime_home_for_tests(home.path().to_path_buf())
@@ -2312,7 +2312,7 @@ async fn domain_finalize_drains_slow_tail_with_recording_and_buffered_recognizer
                 &mut context, &renewals, &f.outbound, &mut handlers, &dispatch);
             let driver = async {
                 phase.set("initial audio ACKs");
-                for sequence in 0..31 {
+                for sequence in 0..451 {
                     input.send(Message::Binary(voice_test_frame(&started.session_id, sequence, 1600, 12000).into())).unwrap();
                     let ack = recv_notification_by_method(&mut f.responses, pioneer_protocol::constants::events::VOICE_CHUNK_ACK).await;
                     assert_eq!(ack.params.unwrap()["sequence"], sequence);
@@ -2320,22 +2320,23 @@ async fn domain_finalize_drains_slow_tail_with_recording_and_buffered_recognizer
                 if buffered {
                     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
                 } else {
-                    // 30 packets reach the 3 s preview stride in source samples,
-                    // but VAD still retains a partial 512-sample frame. The extra
-                    // packet crosses the stride before we gate the final prefix.
+                    // Continuous speech needs 45 s of prepared PCM before the
+                    // finalized-chunk planner enters inference during recording.
+                    // 451 packets cross that horizon despite VAD's partial frame.
+                    // ACKs must continue while the native call holds this gate.
                     phase.set("recording recognizer entry");
                     if tokio::time::timeout(Duration::from_secs(5), native_entered.notified()).await.is_err() {
-                        // Finish the real worker before reporting a missing preview.
+                        // Finish the real worker before reporting missing recording inference.
                         // Its outcome distinguishes failed processing from a worker
                         // that only enters inference once Commit closes its inbox.
                         native_release.release();
-                        // All 31 packets above were acknowledged. Diagnostics
+                        // All 451 packets above were acknowledged. Diagnostics
                         // must close with their exact peer proof, just like a
                         // real finalizer, or integrity rejection hides the worker.
                         let completion = f.processor.voice_session_buffers
                             .finish_processing_verified(&started.session_id, Some(pioneer_protocol::VoiceAudioIntegrity {
-                                next_sequence: 31,
-                                normalized_samples: 49600,
+                                next_sequence: 451,
+                                normalized_samples: 721600,
                             })).unwrap();
                         let outcome = completion.await.unwrap().outcome;
                         let diagnostic = match outcome {
@@ -2345,30 +2346,30 @@ async fn domain_finalize_drains_slow_tail_with_recording_and_buffered_recognizer
                             Ok(crate::voice::incremental::GatewayVoiceSessionPipelineOutcome::NoSpeech { no_speech, .. }) =>
                                 format!("worker detected no speech: {no_speech:?}"),
                         };
-                        panic!("recording preview did not enter inference before Commit; calls={}, {diagnostic}", calls.load(std::sync::atomic::Ordering::SeqCst));
+                        panic!("recording inference did not start before Commit; calls={}, {diagnostic}", calls.load(std::sync::atomic::Ordering::SeqCst));
                     }
                 }
                 let (entered, at_proof) = tokio::sync::oneshot::channel();
                 let (release, resumed) = tokio::sync::oneshot::channel();
                 *recording.ingress.proof_pause.lock().unwrap() = Some((entered, resumed));
-                input.send(Message::Binary(voice_test_frame(&started.session_id, 31, 1600, 12000).into())).unwrap();
+                input.send(Message::Binary(voice_test_frame(&started.session_id, 451, 1600, 12000).into())).unwrap();
                 phase.set("active chunk proof gate");
                 at_proof.await.unwrap();
                 let (tail_entered, tail_proof) = tokio::sync::oneshot::channel();
                 let (tail_release, tail_resume) = tokio::sync::oneshot::channel();
                 *recording.ingress.proof_pause.lock().unwrap() = Some((tail_entered, tail_resume));
-                input.send(Message::Binary(voice_test_frame(&started.session_id, 32, 7, 3000).into())).unwrap();
+                input.send(Message::Binary(voice_test_frame(&started.session_id, 452, 7, 3000).into())).unwrap();
                 phase.set("unrelated ACL commit and publication");
                 revoke_unrelated_voice_acl(&f.processor, &other).await;
                 assert!(f.processor.current_authorization_revision().await.unwrap() > policy_before);
                 let payload = rpc("full-finalize", methods::VOICE_SESSION_FINALIZE, json!({
-                    "session_id":started.session_id,"audio_integrity":{"next_sequence":33,"normalized_samples":51207},
+                    "session_id":started.session_id,"audio_integrity":{"next_sequence":453,"normalized_samples":723207},
                     "context":{"workspace_id":f.workspace,"thread_id":THREAD,"turn_id":"turn_transport_finalize_full"}
                 }));
                 // Receive-time seal through the production busy pump, followed
                 // by actual owned domain dispatch of that same finalized input.
                 input.send(Message::Text(payload.clone().into())).unwrap();
-                input.send(Message::Binary(voice_test_frame(&started.session_id,33,7,16000).into())).unwrap();
+                input.send(Message::Binary(voice_test_frame(&started.session_id,453,7,16000).into())).unwrap();
                 input.send(Message::Text(rpc("full-seal-probe", methods::TASK_WAIT,
                     json!({"runIds":[RUN],"timeoutMs":1})).into())).unwrap();
                 phase.set("transport seal probe");
@@ -2381,9 +2382,9 @@ async fn domain_finalize_drains_slow_tail_with_recording_and_buffered_recognizer
                 tail_proof.await.unwrap();
                 tail_release.send(()).unwrap();
                 let mut reply = None;
-                let mut received = 31;
+                let mut received = 451;
                 phase.set("active and tail audio ACKs");
-                while received < 33 {
+                while received < 453 {
                     let Message::Text(text) = f.responses.recv().await.unwrap() else { panic!("finalize disconnected"); };
                     let value: JsonValue = serde_json::from_str(&text).unwrap();
                     if value["method"] == pioneer_protocol::constants::events::VOICE_CHUNK_ACK {
