@@ -6,12 +6,11 @@
 //! entries blocked by capacity/proof do not manufacture an immediate deadline.
 use crate::{CrudStore, Result, unix_to_datetime};
 use pioneer_entity::{
-    agent_action, agent_action_outbox, agent_work_queue, native_terminal_effect_outbox,
-    recovery_job, recovery_terminalization_outbox, skill_upload_session, turn_execution,
-    turn_item_attempt,
+    agent_work_queue, native_terminal_effect_outbox, recovery_job, recovery_terminalization_outbox,
+    skill_upload_session, turn_execution, turn_item_attempt,
 };
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
-use sea_orm::sea_query::{Alias, Expr, ExprTrait, Func, Query};
+use sea_orm::sea_query::{Expr, ExprTrait, Func};
 use sea_orm::{ColumnTrait, Condition, EntityTrait, QueryFilter, QueryOrder, QuerySelect};
 
 /// Adapter for exported repository operations that also serve raw-connection
@@ -253,45 +252,8 @@ impl CrudStore {
                 .await?
                 .map(crate::util::deadline_unix_seconds),
         );
-        let payload = Expr::col(agent_action_outbox::Column::PayloadJson);
-        let valid: Expr = Func::cust(Alias::new("json_valid"))
-            .arg(payload.clone())
-            .into();
-        let safe: Expr = Expr::case(valid, payload).finally(Expr::val("{}")).into();
-        let kind: Expr = Func::cust(Alias::new("json_extract"))
-            .args([safe, Expr::val("$.kind")])
-            .into();
-        let kind: Expr = Func::coalesce([kind, Expr::val("start_agent")]).into();
-        let starts = Query::select()
-            .column(agent_action::Column::Id)
-            .from(agent_action::Entity)
-            .and_where(agent_action::Column::ActionKind.eq("start_agent"))
-            .to_owned();
-        let ordinary = Condition::any()
-            .add(agent_action_outbox::Column::Status.eq("pending"))
-            .add(
-                Condition::all()
-                    .add(agent_action_outbox::Column::Status.eq("failed"))
-                    .add(agent_action_outbox::Column::Attempts.lt(8)),
-            );
-        let exhausted = Condition::all()
-            .add(agent_action_outbox::Column::Status.is_in(["pending", "failed"]))
-            .add(agent_action_outbox::Column::Attempts.eq(8))
-            .add(agent_action_outbox::Column::ActionId.in_subquery(starts))
-            .add(kind.eq("start_agent"));
         deadlines.extend(
-            agent_action_outbox::Entity::find()
-                .select_only()
-                .column(agent_action_outbox::Column::NextAttemptAt)
-                .filter(Condition::any().add(ordinary).add(exhausted))
-                .filter(agent_action_outbox::Column::NextAttemptAt.gt(at))
-                .order_by_asc(agent_action_outbox::Column::NextAttemptAt)
-                .limit(1)
-                .into_tuple::<Option<DateTimeWithTimeZone>>()
-                .one(db)
-                .await?
-                .flatten()
-                .map(crate::util::deadline_unix_seconds),
+            crate::repositories::agent_domain::next_agent_action_outbox_deadline(db, at).await?,
         );
         for (column, statuses) in [
             (
