@@ -1,6 +1,7 @@
 use super::dispatch::RequestAdmission;
 use super::*;
 use crate::authorization::{RuntimeDraftCreator, RuntimeDraftMaterialization};
+use pioneer_observability::closing::{Closing, Fact, Phase};
 use pioneer_protocol::{
     UserInput, VoiceError, VoiceErrorKind, VoiceSessionOutcome, VoiceSessionResultNotification,
 };
@@ -409,6 +410,7 @@ async fn persist_completed_message_turn(
     audit_event: pioneer_protocol::TurnPermissionAuditEvent,
     runtime_draft: Option<&RuntimeDraftMaterialization>,
 ) -> anyhow::Result<()> {
+    let mut closing = Closing::current(Phase::MessageCommit);
     let write = || pioneer_crud::CompletedMessageTurnWrite {
         thread: &outcome.materialization.thread,
         sandbox_mode: outcome.materialization.sandbox_mode,
@@ -418,35 +420,46 @@ async fn persist_completed_message_turn(
         completed: outcome.completed_notification.clone(),
         audit_event: audit_event.clone(),
     };
-    match runtime_draft.map(RuntimeDraftMaterialization::creator) {
-        Some(RuntimeDraftCreator::ScopedPrincipal {
-            gateway_id,
-            principal_id,
-            access_class,
-        }) => {
-            crud_store
-                .materialize_new_member_completed_message_turn_with_permission_audit(
-                    write(),
+    let result = closing
+        .correlation()
+        .scope(async {
+            match runtime_draft.map(RuntimeDraftMaterialization::creator) {
+                Some(RuntimeDraftCreator::ScopedPrincipal {
                     gateway_id,
                     principal_id,
-                    *access_class,
-                )
-                .await
-        }
-        Some(RuntimeDraftCreator::Absolute { access_class }) => {
-            crud_store
-                .materialize_new_superuser_completed_message_turn_with_permission_audit(
-                    write(),
-                    *access_class,
-                )
-                .await
-        }
-        None => {
-            crud_store
-                .materialize_completed_message_turn_with_permission_audit(write())
-                .await
-        }
-    }
+                    access_class,
+                }) => {
+                    crud_store
+                        .materialize_new_member_completed_message_turn_with_permission_audit(
+                            write(),
+                            gateway_id,
+                            principal_id,
+                            *access_class,
+                        )
+                        .await
+                }
+                Some(RuntimeDraftCreator::Absolute { access_class }) => {
+                    crud_store
+                        .materialize_new_superuser_completed_message_turn_with_permission_audit(
+                            write(),
+                            *access_class,
+                        )
+                        .await
+                }
+                None => {
+                    crud_store
+                        .materialize_completed_message_turn_with_permission_audit(write())
+                        .await
+                }
+            }
+        })
+        .await;
+    closing.finish(if result.is_ok() {
+        Fact::Confirmed
+    } else {
+        Fact::Unconfirmed
+    });
+    result
 }
 
 enum ExistingMessageTurn {

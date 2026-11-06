@@ -1,6 +1,7 @@
 use super::*;
 use crate::authorization::AuthorizationExternalError;
 use anyhow::{Result, anyhow, bail};
+use pioneer_observability::closing::{Closing, Fact, Phase};
 use pioneer_protocol::{TaskRunStatus, ThreadMode};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -313,12 +314,21 @@ impl MessageProcessor {
         }
         let deliveries = self.crud_store.list_due_task_deliveries(now, limit).await?;
         for delivery in deliveries {
-            let pioneer_crud::TaskDeliveryTransitionOutcome::Applied((delivery, attempt)) =
-                task_service
-                    .start_delivery(delivery.id.as_str(), now)
-                    .await
-                    .map_err(|error| anyhow!("{error:#}"))?
+            let bus = self.task_runtime.event_bus();
+            bus.observe_closing_delivery(&delivery);
+            let parent = bus.closing_delivery_parent(&delivery.id, delivery.attempt_count);
+            let mut closing = Closing::start(Phase::DestinationAttempt, &parent);
+            closing.delivery_schedule(
+                now.saturating_sub(delivery.created_at).max(0) as u64,
+                delivery.attempt_count,
+            );
+            let pioneer_crud::TaskDeliveryTransitionOutcome::Applied((delivery, attempt)) = closing
+                .correlation()
+                .scope(task_service.start_delivery(delivery.id.as_str(), now))
+                .await
+                .map_err(|error| anyhow!("{error:#}"))?
             else {
+                closing.finish(Fact::Superseded);
                 continue;
             };
             // Delivery can enter a deep CRUD projection chain. Run one
@@ -327,15 +337,26 @@ impl MessageProcessor {
             let processor = self.clone();
             let delivery_execution = delivery.clone();
             let attempt_execution = attempt.clone();
+            let correlation = closing.correlation();
+            let failure_correlation = correlation.clone();
             let execution_result = tokio::time::timeout(
                 Duration::from_secs(60),
                 message_fresh_task(async move {
-                    processor
-                        .execute_task_delivery(delivery_execution, attempt_execution)
+                    correlation
+                        .scope(
+                            processor.execute_task_delivery(delivery_execution, attempt_execution),
+                        )
                         .await
                 }),
             )
             .await;
+            closing.finish(match &execution_result {
+                Ok(Ok(Ok(pioneer_crud::TaskDeliveryTransitionOutcome::Superseded))) => {
+                    Fact::Superseded
+                }
+                Ok(Ok(Ok(_))) => Fact::Returned, // webhook rejection also returns Applied
+                _ => Fact::Unconfirmed, // timeout/join/error cannot disprove a late destination commit
+            });
             let failure_class = match execution_result {
                 Ok(Ok(Ok(pioneer_crud::TaskDeliveryTransitionOutcome::Applied(()))))
                 | Ok(Ok(Ok(pioneer_crud::TaskDeliveryTransitionOutcome::Superseded))) => None,
@@ -345,15 +366,15 @@ impl MessageProcessor {
             };
             if let Some(failure_class) = failure_class {
                 let failed_at = now_timestamp_secs();
-                task_service
-                    .fail_delivery(
+                failure_correlation
+                    .scope(task_service.fail_delivery(
                         delivery,
                         attempt,
                         failure_class.to_owned(),
                         None,
                         None,
                         failed_at,
-                    )
+                    ))
                     .await
                     .map_err(|error| anyhow!("{error:#}"))?;
             }
@@ -370,8 +391,17 @@ impl MessageProcessor {
         attempt: TaskDeliveryAttempt,
     ) -> Result<pioneer_crud::TaskDeliveryTransitionOutcome<()>> {
         if delivery.mode != TaskDeliveryMode::None {
-            self.ensure_task_delivery_still_authorized(&delivery)
-                .await?;
+            let mut authorization = Closing::current(Phase::DeliveryAuthorization);
+            let result = authorization
+                .correlation()
+                .scope(self.ensure_task_delivery_still_authorized(&delivery))
+                .await;
+            authorization.finish(if result.is_ok() {
+                Fact::Confirmed
+            } else {
+                Fact::Unconfirmed
+            });
+            result?;
         }
         match delivery.mode {
             TaskDeliveryMode::None => {
@@ -563,29 +593,40 @@ impl MessageProcessor {
         http_status: Option<u16>,
         response_fingerprint: Option<String>,
     ) -> Result<pioneer_crud::TaskDeliveryTransitionOutcome<()>> {
+        let mut closing = Closing::current(Phase::DestinationCommit);
+        let promised = delivery.mode != TaskDeliveryMode::None;
         let title_recovery = self.composer_title_recovery_target(&delivery).await;
-        let outcome = self
-            .task_runtime
-            .background_control_service()
-            .complete_delivery(
-                delivery,
-                attempt,
-                delivered_turn_id,
-                delivered_notification_id,
-                http_status,
-                response_fingerprint,
-                now_timestamp_secs(),
+        let outcome = closing
+            .correlation()
+            .scope(
+                self.task_runtime
+                    .background_control_service()
+                    .complete_delivery(
+                        delivery,
+                        attempt,
+                        delivered_turn_id,
+                        delivered_notification_id,
+                        http_status,
+                        response_fingerprint,
+                        now_timestamp_secs(),
+                    ),
             )
             .await
             .map_err(|error| anyhow!("{error:#}"))?;
         Ok(match outcome {
             pioneer_crud::TaskDeliveryTransitionOutcome::Applied(_) => {
+                closing.finish(if promised {
+                    Fact::Confirmed
+                } else {
+                    Fact::Returned
+                });
                 if let Some(thread_id) = title_recovery {
                     self.recover_thread_title(thread_id).await;
                 }
                 pioneer_crud::TaskDeliveryTransitionOutcome::Applied(())
             }
             pioneer_crud::TaskDeliveryTransitionOutcome::Superseded => {
+                closing.finish(Fact::Superseded);
                 pioneer_crud::TaskDeliveryTransitionOutcome::Superseded
             }
         })

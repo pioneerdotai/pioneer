@@ -992,6 +992,11 @@ impl ClientCore {
     }
 
     pub fn composer_intent(&self, intent: ComposerIntent) -> ClientTransition {
+        let transition = self.composer_intent_observed(intent);
+        self.observe_opening_core();
+        transition
+    }
+    fn composer_intent_observed(&self, intent: ComposerIntent) -> ClientTransition {
         let intent = match intent {
             ComposerIntent::Activate { thread_id } => {
                 let store = self.composer_store.lock().expect("composer store poisoned");

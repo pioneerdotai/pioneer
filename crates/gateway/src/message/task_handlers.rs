@@ -1,5 +1,6 @@
 use super::*;
 use crate::authorization::ResourceAction;
+use pioneer_observability::closing::{Closing, Fact, Phase};
 
 struct TaskObservationAdmission {
     budget: pioneer_protocol::TaskResourceBudget,
@@ -1688,6 +1689,7 @@ impl MessageProcessor {
         request_id: RequestId,
         params: TaskAcceptParams,
     ) {
+        let mut closing = Closing::current(Phase::ReviewRequest);
         if !self
             .require_scoped_task_proof(
                 request_context,
@@ -1698,18 +1700,22 @@ impl MessageProcessor {
             )
             .await
         {
+            closing.finish(Fact::Rejected);
             return;
         }
         let connection_id = request_context.connection_id();
         let context = Self::task_mutation_context(request_context);
-        match message_future(
-            self.task_runtime
-                .service()
-                .accept_task_result_candidate(context, params),
-        )
-        .await
+        match closing
+            .correlation()
+            .scope(message_future(
+                self.task_runtime
+                    .service()
+                    .accept_task_result_candidate(context, params),
+            ))
+            .await
         {
             Ok(response_payload) => {
+                closing.finish(Fact::Returned); // RPC service result alone is not destination delivery
                 self.send_task_response(connection_id, request_id, &response_payload)
                     .await
             }

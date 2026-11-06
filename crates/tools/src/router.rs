@@ -39,6 +39,7 @@ pub struct RawToolCall {
 
 #[derive(Debug, Clone)]
 pub struct ToolCall {
+    pub observation: crate::observation::InvocationObservation,
     pub call_id: String,
     pub tool_name: String,
     pub payload: ToolPayload,
@@ -263,14 +264,35 @@ impl ToolRouter {
         })
     }
 
-    pub async fn build_model_tool_call(&self, call: RawToolCall) -> Result<ToolCall, ToolError> {
-        if self.find_spec(call.tool_name.as_str()).is_some()
-            && !self.is_model_visible_tool(call.tool_name.as_str()).await
-        {
-            return Err(ToolError::not_visible(call.tool_name));
+    fn observation_family(&self, name: &str) -> pioneer_observability::tool_call::Family {
+        use pioneer_observability::tool_call::Family;
+        match self.find_spec(name).map(|spec| spec.spec.payload_kind) {
+            Some(PayloadKind::Mcp) => Family::Mcp,
+            Some(PayloadKind::LocalShell) => Family::Shell,
+            _ => Family::Other,
         }
+    }
 
-        self.build_tool_call(call)
+    pub async fn build_model_tool_call(&self, call: RawToolCall) -> Result<ToolCall, ToolError> {
+        let observation = crate::observation::InvocationObservation::start(
+            self.observation_family(&call.tool_name),
+        );
+        let parent = observation.correlation();
+        let result = parent
+            .scope(async {
+                if self.find_spec(call.tool_name.as_str()).is_some()
+                    && !self.is_model_visible_tool(call.tool_name.as_str()).await
+                {
+                    return Err(ToolError::not_visible(call.tool_name));
+                }
+
+                self.build_tool_call_observed(call, observation.clone())
+            })
+            .await;
+        if let Err(error) = &result {
+            observation.finish(crate::observation::error_fact(error));
+        }
+        result
     }
 
     pub fn find_spec(&self, tool_name: &str) -> Option<&ConfiguredToolSpec> {
@@ -288,100 +310,129 @@ impl ToolRouter {
     }
 
     pub fn build_tool_call(&self, call: RawToolCall) -> Result<ToolCall, ToolError> {
-        let trace_id = self.event_bus.new_trace_id();
-        let trace = self.event_bus.trace_with_id(
-            trace_id.clone(),
-            self.turn_id.clone(),
-            call.call_id.clone(),
-            call.tool_name.clone(),
+        let observation = crate::observation::InvocationObservation::start(
+            self.observation_family(&call.tool_name),
         );
-        trace.emit_stage(
-            1,
-            "router.parse.started",
-            None,
-            Some(serde_json::json!({
-                "arguments_length": call.arguments.len(),
-            })),
+        let result = observation
+            .correlation()
+            .run(|| self.build_tool_call_observed(call, observation.clone()));
+        if let Err(error) = &result {
+            observation.finish(crate::observation::error_fact(error));
+        }
+        result
+    }
+
+    fn build_tool_call_observed(
+        &self,
+        call: RawToolCall,
+        observation: crate::observation::InvocationObservation,
+    ) -> Result<ToolCall, ToolError> {
+        let mut validation = pioneer_observability::tool_call::Measurement::start(
+            pioneer_observability::tool_call::Phase::Validation,
+            &observation.correlation(),
         );
-
-        let configured = match self.find_spec(call.tool_name.as_str()) {
-            Some(spec) => spec.clone(),
-            None => {
-                let error = ToolError::NotFound(call.tool_name.clone());
-                trace.emit_stage(
-                    1,
-                    "router.parse.failed",
-                    Some(error.to_string()),
-                    Some(serde_json::json!({
-                        "reason": "unknown_tool",
-                    })),
-                );
-                return Err(error);
-            }
-        };
-
-        let (payload, argument_coercions) = match self.parse_payload(
-            &configured,
-            call.tool_name.as_str(),
-            call.arguments.as_str(),
-        ) {
-            Ok(parsed) => {
-                trace.emit_stage(1, "router.parse.completed", None, None);
-                parsed
-            }
-            Err(error) => {
-                trace.emit_stage(1, "router.parse.failed", Some(error.to_string()), None);
-                return Err(error);
-            }
-        };
-        if !argument_coercions.is_empty() {
+        let result = (|| {
+            let trace_id = self.event_bus.new_trace_id();
+            let trace = self.event_bus.trace_with_id(
+                trace_id.clone(),
+                self.turn_id.clone(),
+                call.call_id.clone(),
+                call.tool_name.clone(),
+            );
             trace.emit_stage(
                 1,
-                "router.arguments.normalized",
+                "router.parse.started",
                 None,
                 Some(serde_json::json!({
-                    "coercions": argument_coercions,
+                    "arguments_length": call.arguments.len(),
                 })),
             );
-        }
 
-        let call_id = call.call_id;
-        let tool_name = call.tool_name;
+            let configured = match self.find_spec(call.tool_name.as_str()) {
+                Some(spec) => spec.clone(),
+                None => {
+                    let error = ToolError::NotFound(call.tool_name.clone());
+                    trace.emit_stage(
+                        1,
+                        "router.parse.failed",
+                        Some(error.to_string()),
+                        Some(serde_json::json!({
+                            "reason": "unknown_tool",
+                        })),
+                    );
+                    return Err(error);
+                }
+            };
 
-        let session_scope_key =
-            Self::derive_session_scope_key(configured.spec.name.as_str(), &payload);
-        let recovery = if self.computer_use_leaf(&tool_name).is_some() {
-            ToolRecoveryMetadata {
-                retry_class: crate::ToolRetryClass::Never,
-                idempotency_mode: ToolIdempotencyMode::None,
-                max_attempts: 1,
-                can_resume: false,
-                max_wall_clock_secs: None,
+            let (payload, argument_coercions) = match self.parse_payload(
+                &configured,
+                call.tool_name.as_str(),
+                call.arguments.as_str(),
+            ) {
+                Ok(parsed) => {
+                    trace.emit_stage(1, "router.parse.completed", None, None);
+                    parsed
+                }
+                Err(error) => {
+                    trace.emit_stage(1, "router.parse.failed", Some(error.to_string()), None);
+                    return Err(error);
+                }
+            };
+            if !argument_coercions.is_empty() {
+                trace.emit_stage(
+                    1,
+                    "router.arguments.normalized",
+                    None,
+                    Some(serde_json::json!({
+                        "coercions": argument_coercions,
+                    })),
+                );
             }
-        } else {
-            configured.spec.recovery
-        };
-        let idempotency_key = Self::derive_idempotency_key(
-            configured.spec.name.as_str(),
-            &payload,
-            recovery.idempotency_mode,
-            call_id.as_str(),
-        );
 
-        Ok(ToolCall {
-            call_id: call_id.clone(),
-            tool_name: tool_name.clone(),
-            session_scope_key,
-            payload,
-            execution_class: configured.execution_class,
-            turn_item_execution_class: configured.spec.turn_item_execution_class,
-            recovery,
-            permission_metadata: configured.spec.permission_metadata,
-            output_policy: configured.output_policy,
-            output_projection: configured.output_projection,
-            idempotency_key,
-            trace_id,
-        })
+            let call_id = call.call_id;
+            let tool_name = call.tool_name;
+
+            let session_scope_key =
+                Self::derive_session_scope_key(configured.spec.name.as_str(), &payload);
+            let recovery = if self.computer_use_leaf(&tool_name).is_some() {
+                ToolRecoveryMetadata {
+                    retry_class: crate::ToolRetryClass::Never,
+                    idempotency_mode: ToolIdempotencyMode::None,
+                    max_attempts: 1,
+                    can_resume: false,
+                    max_wall_clock_secs: None,
+                }
+            } else {
+                configured.spec.recovery
+            };
+            let idempotency_key = Self::derive_idempotency_key(
+                configured.spec.name.as_str(),
+                &payload,
+                recovery.idempotency_mode,
+                call_id.as_str(),
+            );
+
+            Ok(ToolCall {
+                observation,
+                call_id: call_id.clone(),
+                tool_name: tool_name.clone(),
+                session_scope_key,
+                payload,
+                execution_class: configured.execution_class,
+                turn_item_execution_class: configured.spec.turn_item_execution_class,
+                recovery,
+                permission_metadata: configured.spec.permission_metadata,
+                output_policy: configured.output_policy,
+                output_projection: configured.output_projection,
+                idempotency_key,
+                trace_id,
+            })
+        })();
+        validation.finish(match &result {
+            Ok(_) => pioneer_observability::tool_call::Fact::Returned,
+            Err(error) => crate::observation::error_fact(error),
+        });
+        result
     }
 
     pub async fn dispatch(

@@ -408,6 +408,7 @@ impl ComposerView {
             || next.is_none()
             || next != self.synchronized_thread_inputs;
         self.synchronized_thread_inputs = next;
+        self.observe_opening_inputs();
         if notify {
             cx.notify();
         }
@@ -1667,6 +1668,61 @@ mod tests {
                     assert!(state.marked_text_range(window, cx).is_none());
                 });
             });
+        }
+
+        #[gpui_kit::test]
+        fn native_opening_cannot_promote_startup_inputs_without_connection_authority(
+            cx: &mut TestAppContext,
+        ) {
+            const NAME: &str = "composer::owner::tests::interaction::native_opening_cannot_promote_startup_inputs_without_connection_authority";
+            const CHILD: &str = "PIONEER_OPENING_NATIVE_OBSERVER_CHILD";
+            const DONE: &str = "opening-native-observer-completed";
+            if std::env::var(CHILD).ok().as_deref() != Some(NAME) {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", NAME, "--test-threads=1", "--nocapture"])
+                    .env(CHILD, NAME)
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert!(
+                    String::from_utf8_lossy(&output.stdout).contains(DONE),
+                    "exact child must execute this fixture"
+                );
+                return;
+            }
+            // This existing fixture has native publications, not a live bound
+            // socket/receipt. Startup inspection alone is therefore insufficient.
+            pioneer_observability::set_telemetry_enabled(true);
+            let mut fixture = Fixture::new(cx);
+            fixture.client.navigate(
+                pioneer_client::navigation::NavigationIntent::SelectThread {
+                    workspace_id: Some("workspace".into()),
+                    thread_id: Some("a".into()),
+                },
+                None,
+            );
+            fixture.synchronize();
+            fixture.composer.read_with(fixture.cx, |view, _| {
+                assert_eq!(
+                    view.startup_outcome(),
+                    Some(pioneer_observability::DesktopStartupOutcome::Ready)
+                )
+            });
+            let evidence = fixture.client.opening_evidence("a").unwrap();
+            assert!(!evidence.subscription_acknowledged);
+            assert_eq!(evidence.composer_core, None);
+            assert_eq!(
+                evidence.native_inputs, None,
+                "an applied startup projection cannot invent current connection authority"
+            );
+            assert_eq!(evidence.presentation_observed, None);
+            fixture.client.shutdown();
+            pioneer_observability::set_telemetry_enabled(false);
+            println!("{DONE}");
         }
 
         #[gpui_kit::test]

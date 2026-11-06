@@ -109,3 +109,6 @@ pub mod catalog_test_support;
 
 #[cfg(test)]
 pub(crate) static OBSERVABILITY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+mod scenario_test_support;

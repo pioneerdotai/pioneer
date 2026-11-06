@@ -697,7 +697,7 @@ pub struct MessageProcessor {
     native_permission_pending_requests:
         Arc<Mutex<HashMap<String, PendingNativePermissionApprovalRequest>>>,
     native_permission_approval_worker: Arc<Mutex<Option<JoinHandle<()>>>>,
-    artifact_finalization_retry_turns: Arc<Mutex<HashSet<String>>>,
+    artifact_finalization_retry_turns: Arc<Mutex<HashMap<String, Option<artifact_tools::ArtifactClosing>>>>,
     title_job_runtime: Arc<Mutex<HashMap<String, ThreadTitleJobState>>>,
     thread_title_publication_mutexes: Arc<Mutex<HashMap<String, Weak<Mutex<()>>>>>,
     #[cfg(test)]
@@ -1370,7 +1370,7 @@ impl MessageProcessor {
             turn_final_assistant_texts: Arc::new(Mutex::new(HashMap::new())),
             native_permission_pending_requests: Arc::new(Mutex::new(HashMap::new())),
             native_permission_approval_worker: Arc::new(Mutex::new(None)),
-            artifact_finalization_retry_turns: Arc::new(Mutex::new(HashSet::new())),
+            artifact_finalization_retry_turns: Arc::new(Mutex::new(HashMap::new())),
             title_job_runtime: Arc::new(Mutex::new(HashMap::new())),
             thread_title_publication_mutexes: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(test)]
@@ -5519,7 +5519,7 @@ impl MessageProcessor {
             turn_final_assistant_texts: Arc::new(Mutex::new(HashMap::new())),
             native_permission_pending_requests: Arc::new(Mutex::new(HashMap::new())),
             native_permission_approval_worker: Arc::new(Mutex::new(None)),
-            artifact_finalization_retry_turns: Arc::new(Mutex::new(HashSet::new())),
+            artifact_finalization_retry_turns: Arc::new(Mutex::new(HashMap::new())),
             title_job_runtime: Arc::new(Mutex::new(HashMap::new())),
             thread_title_publication_mutexes: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(test)]

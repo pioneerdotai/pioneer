@@ -134,6 +134,7 @@ pub struct WorkCarrier {
     context: Option<WorkContext>,
     database: Option<DatabaseWorkloadContext>,
     queued: Option<crate::live::QueuedWork>,
+    update: Option<crate::updates::UpdateContext>,
 }
 thread_local! {static CURRENT:RefCell<WorkCarrier>=RefCell::new(WorkCarrier::default());}
 static NEXT: AtomicU64 = AtomicU64::new(1);
@@ -291,16 +292,21 @@ pub fn current() -> Option<WorkContext> {
 }
 pub fn capture() -> WorkCarrier {
     if !crate::telemetry_enabled() {
-        return WorkCarrier::default();
+        return WorkCarrier {
+            update: crate::updates::carried(),
+            ..WorkCarrier::default()
+        };
     }
-    CURRENT.with(|s| {
-        let c = s.borrow();
-        if c.context.is_some_and(|c| c.valid()) {
-            c.clone()
+    let mut carrier = CURRENT.with(|slot| {
+        let carrier = slot.borrow();
+        if carrier.context.is_some_and(|context| context.valid()) {
+            carrier.clone()
         } else {
             WorkCarrier::default()
         }
-    })
+    });
+    carrier.update = crate::updates::carried().or(carrier.update);
+    carrier
 }
 pub fn current_database() -> Option<DatabaseWorkloadContext> {
     if current().is_none() {
@@ -375,7 +381,7 @@ impl WorkCarrier {
         executor: ExecutorRole,
     ) -> Self {
         if !crate::telemetry_enabled() {
-            return Self::default();
+            return capture();
         }
         let mut carrier = capture();
         let parent = carrier.context();
@@ -417,11 +423,15 @@ impl WorkCarrier {
             ),
             database: None,
             queued: None,
+            update: None,
         }
     }
     pub fn received(self, boundary: Boundary, kind: WorkKind, executor: ExecutorRole) -> Self {
         if !crate::telemetry_enabled() {
-            return Self::default();
+            return Self {
+                update: self.update,
+                ..Self::default()
+            };
         }
         match self.context {
             Some(c) if c.valid() => {
@@ -440,6 +450,7 @@ impl WorkCarrier {
                     ),
                     database: None,
                     queued: None,
+                    update: self.update,
                 }
             }
             None => {
@@ -454,6 +465,7 @@ impl WorkCarrier {
                     ),
                     database: None,
                     queued: None,
+                    update: self.update,
                 }
             }
         }
@@ -520,6 +532,11 @@ impl WorkCarrier {
         self.queued = None;
         self
     }
+    pub fn mark_update_incomplete(&mut self) {
+        if let Some(update) = &mut self.update {
+            update.incomplete();
+        }
+    }
     pub fn with_attempt(mut self, attempt: u16) -> Self {
         if let Some(context) = self.context.as_mut() {
             context.attempt = attempt.max(1);
@@ -530,9 +547,17 @@ impl WorkCarrier {
         self
     }
     pub fn merge_link(&mut self, other: &Self) {
+        self.update = match (&self.update, &other.update) {
+            (Some(first), Some(next)) => Some(first.merged(next)),
+            (None, Some(next)) => Some(next.mixed_missing()),
+            (Some(first), None) => Some(first.mixed_missing()),
+            _ => None,
+        };
         if self.context().is_none() {
             if other.context().is_some() {
+                let update = self.update.take();
                 *self = other.clone();
+                self.update = update;
             }
             return;
         }
@@ -552,9 +577,12 @@ impl WorkCarrier {
         } else {
             Self::default()
         };
+        let update_scope =
+            crate::updates::enter(next.update.clone().or_else(|| self.update.clone()));
         let previous = CURRENT.with(|slot| slot.replace(next));
         WorkScope {
             previous: Some(previous),
+            _update: update_scope,
             not_send: std::marker::PhantomData,
         }
     }
@@ -618,6 +646,7 @@ impl WorkCarrier {
 /// Not Send: restoring TLS on another OS thread would corrupt the carrier.
 pub struct WorkScope {
     previous: Option<WorkCarrier>,
+    _update: crate::updates::UpdateScope,
     not_send: std::marker::PhantomData<*mut ()>,
 }
 impl Drop for WorkScope {

@@ -56,6 +56,8 @@ pub enum WorkState {
 }
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct ActiveWork {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opening_phase: Option<crate::opening::Phase>,
     /// Fixed portable payload operation detail; absent for other work.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub portable_payload: Option<crate::portable_payload::LiveOperation>,
@@ -277,6 +279,7 @@ impl WorkGuard {
                 return false;
             }
             let entry = ActiveWork {
+                opening_phase: None,
                 portable_payload: None,
                 portable_hold_rejection: None,
                 pending_outcome: None,
@@ -368,6 +371,19 @@ impl Drop for WorkGuard {
             Outcome::Cancelled
         });
     }
+}
+pub(crate) fn opening_phase(context: Option<WorkContext>, phase: crate::opening::Phase) {
+    let Some(context) = context else {
+        return;
+    };
+    let now = monotonic_ms();
+    with_store(context.consent_generation, |state| {
+        if let Some(entry) = state.active.get_mut(&context.token) {
+            entry.opening_phase = Some(phase);
+            let entry = *entry;
+            record_work(state, entry, now);
+        }
+    });
 }
 pub fn progress(stage: Stage) {
     let Some(context) = crate::work::current() else {
@@ -833,6 +849,7 @@ impl QueuedWork {
                 return None;
             }
             let entry = ActiveWork {
+                opening_phase: None,
                 portable_payload: None,
                 portable_hold_rejection: None,
                 pending_outcome: None,

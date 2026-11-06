@@ -222,6 +222,7 @@ impl std::fmt::Debug for NativeToolDelivery {
 
 #[derive(Debug)]
 struct ExecutedToolResult {
+    tool_correlation: pioneer_observability::scenario::Correlation,
     item_id: String,
     provider_call_id: String,
     ordinal: u32,
@@ -260,6 +261,7 @@ fn unknown_tool_task_result(
 ) -> ExecutedToolResult {
     let outcome = ToolOutcome::fatal(ToolErrorClass::Internal, Some(message.clone()));
     ExecutedToolResult {
+        tool_correlation: Default::default(),
         item_id,
         provider_call_id: provider_call_id.clone(),
         ordinal,
@@ -1207,45 +1209,61 @@ async fn persist_retained_tool_result(
     turn_id: &str,
     result: &ExecutedToolResult,
 ) -> Result<(), ChatTurnError> {
-    if result.message.role != pioneer_provider::Role::Tool
-        || result.message.tool_call_id.as_deref() != Some(result.provider_call_id.as_str())
-        || result.message.name.as_deref() != Some(result.tool_name.as_str())
-    {
-        return Err(ChatTurnError::Terminal(format!(
-            "provider result envelope mismatch for Turn item `{}`",
-            result.item_id
-        )));
-    }
-    let payload = serde_json::to_value(result.full_message.as_ref().unwrap_or(&result.message))
-        .map_err(|error| {
-            ChatTurnError::Terminal(format!(
-                "failed to serialize exact provider tool result: {error}"
-            ))
-        })?;
-    let output_policy_snapshot = result
-        .retained_llm_context
-        .as_ref()
-        .map(|(_, snapshot)| snapshot.clone())
-        .unwrap_or_else(|| {
-            pioneer_protocol::ToolOutputPolicySnapshot::for_tool_name(&result.tool_name)
-        });
-    event_tx
-        .publish_durable_and_wait(AgentDurableEvent::TurnLlmContextAppended {
-            thread_id: thread_id.to_owned(),
-            turn_id: turn_id.to_owned(),
-            item_id: result.item_id.clone(),
-            attempt_id: None,
-            sequence: 0,
-            source: "tool_result_v2".to_owned(),
-            tool_name: result.tool_name.clone(),
-            payload: pioneer_protocol::ToolResultView::Json {
-                value: payload,
-                truncated: false,
-            },
-            output_policy_snapshot,
+    let mut observation = pioneer_observability::tool_call::Measurement::start(
+        pioneer_observability::tool_call::Phase::RetainedResult,
+        &result.tool_correlation,
+    );
+    let retained = observation
+        .correlation()
+        .scope(async {
+            if result.message.role != pioneer_provider::Role::Tool
+                || result.message.tool_call_id.as_deref() != Some(result.provider_call_id.as_str())
+                || result.message.name.as_deref() != Some(result.tool_name.as_str())
+            {
+                return Err(ChatTurnError::Terminal(format!(
+                    "provider result envelope mismatch for Turn item `{}`",
+                    result.item_id
+                )));
+            }
+            let payload =
+                serde_json::to_value(result.full_message.as_ref().unwrap_or(&result.message))
+                    .map_err(|error| {
+                        ChatTurnError::Terminal(format!(
+                            "failed to serialize exact provider tool result: {error}"
+                        ))
+                    })?;
+            let output_policy_snapshot = result
+                .retained_llm_context
+                .as_ref()
+                .map(|(_, snapshot)| snapshot.clone())
+                .unwrap_or_else(|| {
+                    pioneer_protocol::ToolOutputPolicySnapshot::for_tool_name(&result.tool_name)
+                });
+            event_tx
+                .publish_durable_and_wait(AgentDurableEvent::TurnLlmContextAppended {
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    item_id: result.item_id.clone(),
+                    attempt_id: None,
+                    sequence: 0,
+                    source: "tool_result_v2".to_owned(),
+                    tool_name: result.tool_name.clone(),
+                    payload: pioneer_protocol::ToolResultView::Json {
+                        value: payload,
+                        truncated: false,
+                    },
+                    output_policy_snapshot,
+                })
+                .await
+                .map_err(agent_event_error)
         })
-        .await
-        .map_err(agent_event_error)
+        .await;
+    observation.finish(if retained.is_ok() {
+        pioneer_observability::tool_call::Fact::Committed
+    } else {
+        pioneer_observability::tool_call::Fact::Failed
+    });
+    retained
 }
 
 async fn emit_turn_skills_resolved_event(
@@ -5175,14 +5193,14 @@ async fn execute_agent_provider_response(
                 event = tool_event_rx.recv(), if durable_open => {
                     match event {
                         Some(envelope) => {
-                            let result = tooling::forward_tool_event_to_agent(
+                            let result = envelope.correlation.scope(tooling::forward_tool_event_to_agent(
                                 envelope.event.clone(),
                                 &event_tx_for_tools,
                                 tool_ui_for_events.clone(),
                                 workspace_id_for_tools.as_str(),
                                 thread_id_for_tools.as_str(),
                                 turn_id_for_tools.as_str(),
-                            )
+                            ))
                             .await;
                             envelope.acknowledge(
                                 result
@@ -6586,6 +6604,10 @@ async fn execute_agent_provider_response(
                 })
                 .collect::<Vec<_>>();
 
+            let mut batch_observation = pioneer_observability::tool_call::Measurement::start(
+                pioneer_observability::tool_call::Phase::BatchBarrier,
+                &pioneer_observability::scenario::Correlation::capture());
+            let tool_batch_parent = batch_observation.correlation();
             let tool_tasks = guarded_tool_calls
                 .into_iter()
                 .map(|(model_tool_call, item_id, ordinal, no_progress_decision)| {
@@ -6607,6 +6629,7 @@ async fn execute_agent_provider_response(
                     // Tool handlers can execute nested tools. Running each model tool call in its
                     // own task keeps nested dispatch from being polled under the full chat-loop
                     // future, whose execution-window state is intentionally large.
+                    let tool_parent = tool_batch_parent.clone();
                     let handle = tokio::spawn(async move {
                         let provider_call_id = model_tool_call.id.clone();
                         let arguments = model_tool_call.arguments.clone();
@@ -6701,6 +6724,7 @@ async fn execute_agent_provider_response(
                             )
                             .await?;
                             return Ok(ExecutedToolResult {
+                                tool_correlation: tool_parent.clone(),
                                 item_id: item_id.clone(),
                                 provider_call_id: provider_call_id.clone(),
                                 ordinal,
@@ -6863,6 +6887,7 @@ async fn execute_agent_provider_response(
                                 .await?;
 
                                 return Ok(ExecutedToolResult {
+                                    tool_correlation: tool_parent.clone(),
                                     item_id: item_id.clone(),
                                     provider_call_id: provider_call_id.clone(),
                                     ordinal,
@@ -6889,11 +6914,11 @@ async fn execute_agent_provider_response(
                             }
                         }
 
-                        let tool_call = match router.build_model_tool_call(RawToolCall {
+                        let tool_call = match tool_parent.scope(router.build_model_tool_call(RawToolCall {
                             call_id: item_id.clone(),
                             tool_name: tool_name.clone(),
                             arguments: arguments.clone(),
-                        }).await {
+                        })).await {
                             Ok(tool_call) => tool_call,
                             Err(error) => {
                                 let suppress_partial_unknown_tool_ui =
@@ -6953,6 +6978,7 @@ async fn execute_agent_provider_response(
                                     .await?;
                                 }
                                 return Ok(ExecutedToolResult {
+                                    tool_correlation: tool_parent.clone(),
                                     item_id: item_id.clone(),
                                     provider_call_id: provider_call_id.clone(),
                                     ordinal,
@@ -7009,6 +7035,7 @@ async fn execute_agent_provider_response(
                             }
                         });
 
+                        let tool_correlation = tool_call.observation.correlation();
                         let tool_attempt_started = Instant::now();
                         let dispatch_result = if runtime.router().computer_use_leaf(&tool_name).is_some() {
                             runtime.execute_tool_call_with_deferred_delivery(tool_call, attempt_token.clone()).await
@@ -7105,6 +7132,7 @@ async fn execute_agent_provider_response(
                         );
 
                         Ok(ExecutedToolResult {
+                            tool_correlation,
                             item_id: item_id.clone(),
                             provider_call_id,
                             ordinal,
@@ -7137,8 +7165,13 @@ async fn execute_agent_provider_response(
                 .collect::<Vec<_>>();
 
             let parallel_tool_calls = tool_tasks.len().max(1);
+            batch_observation.units(pioneer_observability::tool_call::Unit::BatchCalls, tool_tasks.len());
+            let remaining = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(tool_tasks.len()));
+            let batch_correlation = batch_observation.correlation();
             let mut executed_results = stream::iter(tool_tasks)
                 .map(|task| {
+                    let remaining = remaining.clone();
+                    let batch_correlation = batch_correlation.clone();
                     let event_tx = event_tx.clone();
                     let turn_control = turn_control.clone();
                     let workspace_id = workspace_id.to_owned();
@@ -7204,6 +7237,8 @@ async fn execute_agent_provider_response(
                         }
                     };
                     let mut result = result;
+                    let mut ready_observation = pioneer_observability::tool_call::Measurement::start(
+                        pioneer_observability::tool_call::Phase::NativeResultReady, &result.tool_correlation);
                     let reference = serde_json::json!({"workspace_id": workspace_id, "thread_id": thread_id,
                         "turn_id": turn_id, "item_id": result.item_id}).to_string();
                     let delivery_cancellation = result.delivery.as_ref().map(|delivery| delivery.cancellation.clone());
@@ -7253,10 +7288,19 @@ async fn execute_agent_provider_response(
                         drop(delivery); // failed/undelivered result revokes before cleanup awaits
                         turn_control.complete_attempt(turn_id.as_str(), result.item_id.as_str()).await;
                     }
-                    prepared?;
+                    if let Err(error) = prepared {
+                        ready_observation.finish(pioneer_observability::tool_call::Fact::Failed);
+                        return Err(error);
+                    }
                     if let Some(error) = unknown_side_effect {
                         return Err(ChatTurnError::Terminal(error));
                     }
+                    ready_observation.finish(pioneer_observability::tool_call::Fact::Committed);
+                    let left = remaining.fetch_sub(1, std::sync::atomic::Ordering::Relaxed).saturating_sub(1);
+                    let mut progress = pioneer_observability::tool_call::Measurement::start(
+                        pioneer_observability::tool_call::Phase::BatchProgress, &batch_correlation);
+                    progress.units(pioneer_observability::tool_call::Unit::BatchRemaining, left);
+                    progress.finish(pioneer_observability::tool_call::Fact::Returned);
                     Ok::<ExecutedToolResult, ChatTurnError>(result)
                 }
                 })
@@ -7265,7 +7309,11 @@ async fn execute_agent_provider_response(
                 .await
                 .into_iter()
                 .collect::<Result<Vec<_>, _>>()
-                .map_err(|error| (error, current_thinking_id.clone()))?;
+                .map_err(|error| {
+                    batch_observation.finish(pioneer_observability::tool_call::Fact::Failed);
+                    (error, current_thinking_id.clone())
+                })?;
+            batch_observation.finish(pioneer_observability::tool_call::Fact::Returned);
             executed_results.sort_by_key(|result| result.ordinal);
             if tool_event_forwarder.is_finished() {
                 return Err((
@@ -9209,6 +9257,7 @@ mod tests {
 
     fn task_result(tool_name: &str, success: bool, text: &str) -> ExecutedToolResult {
         ExecutedToolResult {
+            tool_correlation: Default::default(),
             item_id: "item_1234567890123456".to_owned(),
             provider_call_id: "provider_call_1".to_owned(),
             ordinal: 0,

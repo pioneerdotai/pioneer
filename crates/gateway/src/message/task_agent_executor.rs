@@ -9,6 +9,7 @@ use pioneer_crud::{
     AgentIdentityInput, AgentResourceStateInput, PresentationSnapshotInput, canonical_agent_id,
     utc_now,
 };
+use pioneer_observability::closing::{Closing, Fact, Phase};
 use pioneer_observability::turn_startup::{Stage, scope_current_stage};
 use pioneer_promt::{TaskRevisionPromptInput, TaskRunPromptCompiler, TaskRunPromptInput};
 use pioneer_protocol::{
@@ -1793,6 +1794,10 @@ impl TaskAgentExecutor {
                 .then_with(|| right.created_at.cmp(&left.created_at))
         });
         if let Some(candidate) = candidates.first() {
+            processor
+                .task_runtime
+                .event_bus()
+                .observe_closing_review(candidate, run);
             self.start_reviewer_turns_for_candidate(
                 processor,
                 task_response,
@@ -4890,6 +4895,10 @@ impl TaskAgentExecutor {
         let transition = processor
             .cli_runtime_turn_resume_transition(turn_id)
             .await?;
+        let closing_ticket = processor
+            .task_runtime
+            .event_bus()
+            .closing_lifecycle_ticket();
         let outcome = processor
             .crud_store
             .resume_task_owned_turn(
@@ -4916,12 +4925,20 @@ impl TaskAgentExecutor {
                 TaskChildResumeOutcome::Conflict { reason }
             }
             pioneer_crud::TaskOwnedTurnResumeOutcome::Resumed {
+                observation_sequence,
                 recovery_job,
                 task,
                 run,
                 execution,
                 ..
             } => {
+                processor.task_runtime.event_bus().admit_closing_run(
+                    closing_ticket,
+                    &task.id,
+                    &run.id,
+                    observation_sequence,
+                    true,
+                );
                 let handle = TaskExecutionHandle::new(
                     processor.crud_store.clone(),
                     processor.task_runtime.event_bus(),
@@ -5306,9 +5323,63 @@ impl TaskAgentExecutor {
         child_runtime: TaskRunChildRuntime,
         handle: TaskExecutionHandle,
     ) -> Result<()> {
+        let bus = processor.task_runtime.event_bus();
+        let generation = bus.closing_run_generation(&child_runtime.task_run_turn.run_id);
+        let parent = match child_runtime.task_run_turn.reviews_candidate_id.as_deref() {
+            Some(candidate) => {
+                bus.closing_candidate_parent(&child_runtime.task_run_turn.run_id, candidate)
+            }
+            None => bus.closing_run_parent(&child_runtime.task_run_turn.run_id),
+        };
+        let (links, link_count) = if child_runtime.task_run_turn.reviews_candidate_id.is_none() {
+            bus.closing_run_links(&child_runtime.task_run_turn.run_id)
+        } else {
+            (
+                std::array::from_fn(|_| pioneer_observability::scenario::Correlation::default()),
+                0,
+            )
+        };
+        let identity = (child_runtime.task_run_turn.run_id.len() <= 256
+            && child_runtime.task_run_turn.id.len() <= 256)
+            .then(|| {
+                (
+                    child_runtime.task_run_turn.run_id.clone(),
+                    child_runtime.task_run_turn.id.clone(),
+                )
+            });
+        let result_episode = (child_runtime.task_run_turn.kind != TaskRunTurnKind::Review)
+            .then(|| Closing::start_linked(Phase::ResultClosing, &parent, &links[..link_count]));
+        let source = result_episode
+            .as_ref()
+            .map(Closing::correlation)
+            .unwrap_or(parent);
+        let mut closing = Closing::start(Phase::ChildResult, &source);
+        let correlation = closing.correlation();
+        let result = correlation
+            .scope(self.complete_child_turn_observed(
+                processor,
+                child_runtime,
+                handle,
+                &mut closing,
+            ))
+            .await;
+        if let (Some((run, turn)), Some(episode)) = (identity, result_episode) {
+            bus.handoff_result_closing(&run, &turn, episode, generation);
+        }
+        result
+    }
+
+    async fn complete_child_turn_observed(
+        &self,
+        processor: &Arc<MessageProcessor>,
+        child_runtime: TaskRunChildRuntime,
+        handle: TaskExecutionHandle,
+        closing: &mut Closing,
+    ) -> Result<()> {
         if child_runtime.task_run_turn.kind == TaskRunTurnKind::Review {
             self.complete_reviewer_turn(processor, child_runtime, handle)
                 .await?;
+            closing.finish(Fact::Returned);
             return Ok(());
         }
         let task_response = processor
@@ -5318,12 +5389,16 @@ impl TaskAgentExecutor {
             .ok_or_else(|| anyhow!("task `{}` not found", child_runtime.task_run_turn.task_id))?;
         // Freeze the completed source before a pending/accepted candidate can
         // become visible to reviewer acceptance or the delivery worker.
-        crate::compaction::frozen::capture_task_output(
-            processor.crud_store.as_ref(),
-            task_response.task.workspace_id.as_str(),
-            &child_runtime.task_run_turn,
-        )
-        .await?;
+        let mut source = Closing::start(Phase::ResultSource, &closing.correlation());
+        source
+            .correlation()
+            .scope(crate::compaction::frozen::capture_task_output(
+                processor.crud_store.as_ref(),
+                task_response.task.workspace_id.as_str(),
+                &child_runtime.task_run_turn,
+            ))
+            .await?;
+        source.finish(Fact::Confirmed);
         #[cfg(test)]
         if let Some(error) = processor
             .task_output_capture_failures
@@ -5355,6 +5430,7 @@ impl TaskAgentExecutor {
                     candidate.resolved_at.unwrap_or_else(now_timestamp_secs),
                 )
                 .await?;
+            closing.finish(Fact::Duplicate);
             mark_task_run_occurrence_turn_completed(processor, &child_runtime.lineage).await?;
             return Ok(());
         }
@@ -5371,6 +5447,14 @@ impl TaskAgentExecutor {
                     | TaskResultCandidateStatus::Cancelled
             )
         {
+            closing.finish(match candidate.status {
+                TaskResultCandidateStatus::PendingReview => Fact::PendingReview,
+                TaskResultCandidateStatus::ExtractionFailed => Fact::InvalidResult,
+                TaskResultCandidateStatus::Rejected => Fact::Rejected,
+                TaskResultCandidateStatus::Superseded => Fact::Superseded,
+                TaskResultCandidateStatus::Cancelled => Fact::Cancelled,
+                _ => Fact::Returned,
+            });
             return Ok(());
         }
 
@@ -5384,14 +5468,22 @@ impl TaskAgentExecutor {
         } else {
             TaskAgentResultArtifactMode::FinalResult
         };
-        match TaskAgentResultExtractor::extract_with_artifact_mode(
-            processor,
-            &child_runtime.task_run_turn,
-            &child_runtime.lineage,
-            artifact_mode,
-        )
-        .await?
-        {
+        let mut extraction = Closing::start(Phase::ResultExtraction, &closing.correlation());
+        let extraction_correlation = extraction.correlation();
+        let extracted = extraction_correlation
+            .scope(TaskAgentResultExtractor::extract_with_artifact_mode(
+                processor,
+                &child_runtime.task_run_turn,
+                &child_runtime.lineage,
+                artifact_mode,
+            ))
+            .await?;
+        extraction.finish(if extracted.is_ok() {
+            Fact::Confirmed
+        } else {
+            Fact::InvalidResult
+        });
+        match extracted {
             Ok(result) if review_policy.is_some() => {
                 let review_policy = review_policy.as_ref().expect("review policy checked");
                 let completed_at = now_timestamp_secs();
@@ -5421,6 +5513,7 @@ impl TaskAgentExecutor {
                             "child task result extraction failed",
                         )
                         .await?;
+                        closing.finish(Fact::InvalidResult);
                         return Ok(());
                     }
                     None => pending_review_result_candidate(&completed_turn, result, completed_at),
@@ -5429,6 +5522,13 @@ impl TaskAgentExecutor {
                 handle
                     .record_pending_review_result_candidate(completed_turn, candidate, completed_at)
                     .await?;
+                closing.finish(
+                    if candidate_for_review.status == TaskResultCandidateStatus::ExtractionFailed {
+                        Fact::InvalidResult
+                    } else {
+                        Fact::PendingReview
+                    },
+                );
                 self.start_reviewer_turns_for_candidate(
                     processor,
                     &task_response,
@@ -5454,6 +5554,7 @@ impl TaskAgentExecutor {
                     )
                     .await?;
                 handle.complete_run(Some(result), completed_at).await?;
+                closing.finish(Fact::Accepted);
                 mark_task_run_occurrence_turn_completed(processor, &child_runtime.lineage).await?;
             }
             Err(error)
@@ -5470,6 +5571,13 @@ impl TaskAgentExecutor {
                 handle
                     .record_pending_review_result_candidate(completed_turn, candidate, completed_at)
                     .await?;
+                closing.finish(
+                    if candidate_for_review.status == TaskResultCandidateStatus::ExtractionFailed {
+                        Fact::InvalidResult
+                    } else {
+                        Fact::PendingReview
+                    },
+                );
                 let review_policy = review_policy.as_ref().expect("review policy checked");
                 self.start_reviewer_turns_for_candidate(
                     processor,
@@ -5491,6 +5599,7 @@ impl TaskAgentExecutor {
                 )
                 .await?;
                 handle.fail_run(Some(error), failed_at).await?;
+                closing.finish(Fact::InvalidResult);
                 mark_task_run_occurrence_turn_failed(
                     processor,
                     &child_runtime.lineage,
@@ -6413,6 +6522,34 @@ impl TaskAgentExecutor {
     }
 
     async fn complete_reviewer_turn(
+        &self,
+        processor: &Arc<MessageProcessor>,
+        reviewer_runtime: TaskRunChildRuntime,
+        handle: TaskExecutionHandle,
+    ) -> Result<()> {
+        let parent = match reviewer_runtime
+            .task_run_turn
+            .reviews_candidate_id
+            .as_deref()
+        {
+            Some(candidate) => processor
+                .task_runtime
+                .event_bus()
+                .closing_candidate_parent(&reviewer_runtime.task_run_turn.run_id, candidate),
+            None => Closing::capture(),
+        };
+        let mut closing = Closing::start(Phase::ReviewerResult, &parent);
+        let correlation = closing.correlation();
+        let result = correlation
+            .scope(self.complete_reviewer_turn_observed(processor, reviewer_runtime, handle))
+            .await;
+        if result.is_ok() {
+            closing.finish(Fact::Returned);
+        }
+        result
+    }
+
+    async fn complete_reviewer_turn_observed(
         &self,
         processor: &Arc<MessageProcessor>,
         reviewer_runtime: TaskRunChildRuntime,

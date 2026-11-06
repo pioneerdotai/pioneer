@@ -296,6 +296,11 @@ impl MessageProcessor {
         request_id: RequestId,
         params: ThreadTimelinePageParams,
     ) {
+        let mut page_observation = pioneer_observability::opening::Measure::start(
+            pioneer_observability::opening::Phase::TimelinePage,
+            &pioneer_observability::scenario::Correlation::capture(),
+            &[],
+        );
         let connection_id = request_context.connection_id();
         if authorization.thread_id() != params.thread_id.trim() {
             self.send_error(
@@ -303,6 +308,7 @@ impl MessageProcessor {
                 AuthorizationExternalError::NotFound.response(request_id),
             )
             .await;
+            page_observation.finish(pioneer_observability::opening::Result::Rejected);
             return;
         }
         if params.thread_id.trim().is_empty() {
@@ -318,6 +324,7 @@ impl MessageProcessor {
                 ),
             )
             .await;
+            page_observation.finish(pioneer_observability::opening::Result::Rejected);
             return;
         }
 
@@ -330,6 +337,7 @@ impl MessageProcessor {
                         error.into_error_response(request_id, methods::THREAD_TIMELINE_PAGE),
                     )
                     .await;
+                    page_observation.finish(pioneer_observability::opening::Result::Rejected);
                     return;
                 }
             };
@@ -346,6 +354,7 @@ impl MessageProcessor {
                     error.into_error_response(request_id, methods::THREAD_TIMELINE_PAGE),
                 )
                 .await;
+                page_observation.finish(pioneer_observability::opening::Result::Rejected);
                 return;
             }
         };
@@ -394,6 +403,7 @@ impl MessageProcessor {
                     ),
                 )
                 .await;
+                page_observation.finish(pioneer_observability::opening::Result::Failed);
                 trace.finish_failure();
                 return;
             }
@@ -408,6 +418,7 @@ impl MessageProcessor {
                     ),
                 )
                 .await;
+                page_observation.finish(pioneer_observability::opening::Result::Failed);
                 trace.finish_failure();
                 return;
             }
@@ -418,6 +429,7 @@ impl MessageProcessor {
                 AuthorizationExternalError::NotFound.response(request_id),
             )
             .await;
+            page_observation.finish(pioneer_observability::opening::Result::Failed);
             trace.finish_failure();
             return;
         }
@@ -495,6 +507,7 @@ impl MessageProcessor {
                     ),
                 )
                 .await;
+                page_observation.finish(pioneer_observability::opening::Result::Failed);
                 trace.finish_failure();
                 return;
             }
@@ -526,6 +539,7 @@ impl MessageProcessor {
                     ),
                 )
                 .await;
+                page_observation.finish(pioneer_observability::opening::Result::Failed);
                 trace.finish_failure();
                 return;
             }
@@ -554,6 +568,7 @@ impl MessageProcessor {
                     ),
                 )
                 .await;
+                page_observation.finish(pioneer_observability::opening::Result::Failed);
                 trace.finish_failure();
                 return;
             }
@@ -571,6 +586,7 @@ impl MessageProcessor {
                 ),
             )
             .await;
+            page_observation.finish(pioneer_observability::opening::Result::Failed);
             trace.finish_failure();
             return;
         }
@@ -602,6 +618,7 @@ impl MessageProcessor {
                         ),
                     )
                     .await;
+                    page_observation.finish(pioneer_observability::opening::Result::Failed);
                     trace.finish_failure();
                     return;
                 }
@@ -648,6 +665,7 @@ impl MessageProcessor {
                     ),
                 )
                 .await;
+                page_observation.finish(pioneer_observability::opening::Result::Failed);
                 trace.finish_failure();
                 return;
             }
@@ -662,10 +680,12 @@ impl MessageProcessor {
                 error = %format!("{error:#}"),
                 "failed to send thread/timeline/page response"
             );
+            page_observation.finish(pioneer_observability::opening::Result::Failed);
             trace.finish_failure();
             return;
         }
         response_send_stage.succeed();
+        page_observation.finish(pioneer_observability::opening::Result::Returned);
         trace.finish_success();
     }
 

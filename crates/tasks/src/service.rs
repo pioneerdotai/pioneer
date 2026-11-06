@@ -27,6 +27,7 @@ use pioneer_crud::{
     AppendedTaskEvent, ArtifactBindingTargetRecord, CrudStore, NewTaskRunConversationSnapshot,
     TaskDeliveryTransition, TaskDeliveryTransitionOutcome, TaskRootAccessFilter,
 };
+use pioneer_observability::closing::{Closing, Fact, Phase};
 use pioneer_protocol::{
     ArtifactBindingDirection, ArtifactBindingKind, ArtifactRole, TASK_COMPOSER_WORK_VERSION, Task,
     TaskAcceptParams, TaskAcceptResponse, TaskAgendaParams, TaskAgendaResponse, TaskAgentPrompt,
@@ -139,6 +140,7 @@ pub struct TaskRuntime {
 
 impl Drop for TaskRuntime {
     fn drop(&mut self) {
+        self.event_bus.retire_closing();
         // Worker tasks own Arcs of the scheduler/reconciler/service rather than
         // the runtime itself, so dropping the runtime does not cancel them by
         // reference-counting alone.  Abort every task synchronously to keep
@@ -164,6 +166,7 @@ impl Drop for TaskRuntime {
 
 impl TaskRuntime {
     pub async fn shutdown(&self) {
+        self.event_bus.retire_closing();
         for worker in [
             &self.scheduler_task,
             &self.live_reconciliation_task,
@@ -433,6 +436,7 @@ impl TaskRuntime {
                                     if let Some(candidate) =
                                         service.active_review_candidate_for_run(&run.id).await?
                                     {
+                                        service.event_bus.observe_closing_review(&candidate, &run);
                                         if candidate.status
                                             == TaskResultCandidateStatus::PendingReview
                                             && candidate.result.is_some()
@@ -605,6 +609,7 @@ impl TaskService {
         params: RecordTaskResultReviewEventParams,
         agent_action: Option<pioneer_crud::AgentCommitInput>,
     ) -> TaskRuntimeResult<TaskResultReviewRecordResponse> {
+        let mut preparation = Closing::current(Phase::ReviewPreparation);
         let created_at = params.created_at.unwrap_or_else(now_timestamp_secs);
         let candidate = self
             .store
@@ -616,6 +621,23 @@ impl TaskService {
             .get_task(candidate.task_id.as_str())
             .await?
             .ok_or_else(|| anyhow!("task `{}` not found", candidate.task_id))?;
+        if let Some(run) = response.runs.iter().find(|run| run.id == candidate.run_id) {
+            self.event_bus.observe_closing_review(&candidate, run);
+        }
+        preparation.finish(Fact::Returned);
+        let (links, link_count) = self.event_bus.closing_review_links(
+            &candidate.run_id,
+            &candidate.id,
+            Closing::capture(),
+        );
+        let mut closing = Closing::start_linked(
+            Phase::ReviewDecision,
+            &self
+                .event_bus
+                .closing_candidate_parent(&candidate.run_id, &candidate.id),
+            &links[..link_count],
+        );
+        let correlation = closing.correlation();
         let policy = wait_review_policy(
             &response,
             response
@@ -665,10 +687,13 @@ impl TaskService {
             ));
         }
 
-        let appended = self
-            .append_events_with_optional_agent_action(events, created_at, agent_action)
+        let appended = correlation
+            .scope(self.append_events_with_optional_agent_action(events, created_at, agent_action))
             .await?;
-        self.event_bus.publish_many(appended).await;
+        closing.finish(Fact::Confirmed); // committed decision, not accepted run or delivery
+        correlation
+            .scope(self.event_bus.publish_many(appended))
+            .await;
         let candidate = self
             .store
             .get_task_result_candidate(candidate.id.as_str())
@@ -864,6 +889,8 @@ impl TaskService {
         else {
             return Ok(false);
         };
+        self.event_bus
+            .observe_closing_review(&candidate, &current_run);
         if candidate.status != TaskResultCandidateStatus::PendingReview {
             return Ok(false);
         }

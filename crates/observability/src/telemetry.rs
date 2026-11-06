@@ -202,6 +202,11 @@ pub fn init_otlp_observability_for(
         .build();
     let meter = meter_provider.meter(target.instrumentation_name());
     crate::turn_startup::init(&meter);
+    crate::scenario::init(&meter);
+    crate::opening::init(&meter);
+    crate::closing::init(&meter);
+    crate::tool_call::init(&meter);
+    crate::updates::init(&meter);
     crate::work::init(&meter);
     crate::queues::init(&meter);
     crate::live::init(&meter);

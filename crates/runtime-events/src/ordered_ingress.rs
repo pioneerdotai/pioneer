@@ -157,6 +157,11 @@ impl<T: OrderedIngressEvent> OrderedEventIngress<T> {
     }
 
     pub async fn offer(&self, event: T) -> OrderedIngressOffer<T> {
+        let mut offered = pioneer_observability::updates::StageObservation::start(
+            pioneer_observability::updates::Stage::OrderedOffer,
+        );
+        let source = pioneer_observability::updates::capture()
+            .or_else(|| pioneer_observability::updates::UpdateContext::source(None));
         let class = event.ingress_class();
         let durable_permit = if matches!(class, OrderedIngressClass::Durable) {
             let mut wait = self.inner.durable_observer.send_wait();
@@ -172,6 +177,7 @@ impl<T: OrderedIngressEvent> OrderedEventIngress<T> {
                     self.inner
                         .durable_observer
                         .outcome(QueueOutcome::Rejected, 1);
+                    offered.finish(pioneer_observability::updates::Fact::Rejected);
                     return OrderedIngressOffer::Closed(event);
                 }
             }
@@ -180,14 +186,21 @@ impl<T: OrderedIngressEvent> OrderedEventIngress<T> {
         };
         let mut state = self.inner.state.lock().expect("ordered ingress poisoned");
         if state.closed {
+            offered.finish(pioneer_observability::updates::Fact::Rejected);
             return OrderedIngressOffer::Closed(event);
         }
-        let mut event = WorkItem::new(
-            event,
-            Boundary::OrderedIngress,
-            WorkKind::Event,
-            ExecutorRole::Event,
-        );
+        let make_event = || {
+            WorkItem::new(
+                event,
+                Boundary::OrderedIngress,
+                WorkKind::Event,
+                ExecutorRole::Event,
+            )
+        };
+        let mut event = match source {
+            Some(context) => context.run(make_event),
+            None => make_event(),
+        };
         match class {
             OrderedIngressClass::Durable => {
                 event =
@@ -211,6 +224,7 @@ impl<T: OrderedIngressEvent> OrderedEventIngress<T> {
                     existing.value.coalesce(event.value);
                     drop(state);
                     self.inner.notify.notify_one();
+                    offered.finish(pioneer_observability::updates::Fact::Coalesced);
                     return OrderedIngressOffer::Accepted;
                 }
                 if state.pending_coalesced_keys
@@ -219,6 +233,7 @@ impl<T: OrderedIngressEvent> OrderedEventIngress<T> {
                     self.inner
                         .coalesced_observer
                         .outcome(QueueOutcome::Rejected, 1);
+                    offered.finish(pioneer_observability::updates::Fact::Rejected);
                     return OrderedIngressOffer::CoalescedKeyLimit(event.value);
                 }
                 if !matches!(
@@ -244,6 +259,7 @@ impl<T: OrderedIngressEvent> OrderedEventIngress<T> {
         }
         drop(state);
         self.inner.notify.notify_one();
+        offered.finish(pioneer_observability::updates::Fact::Returned);
         OrderedIngressOffer::Accepted
     }
 
@@ -351,6 +367,10 @@ async fn run_ordered_ingress<T: OrderedIngressEvent>(
             }
         };
         if let Some(mut event) = event {
+            pioneer_observability::updates::flushed(
+                pioneer_observability::updates::FlushReason::Ordered,
+                1,
+            );
             if let Some((queue, bytes)) = event.queue.take() {
                 queue.dequeued(bytes);
                 queue.outcome(QueueOutcome::Processed, 1);

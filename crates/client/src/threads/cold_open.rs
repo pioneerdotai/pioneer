@@ -16,6 +16,7 @@ pub(super) enum ColdIngress {
 }
 #[derive(Default)]
 pub(super) struct ColdOpenStaging {
+    pub(super) update: Option<pioneer_observability::updates::UpdateContext>,
     pub(super) events: Vec<ColdIngress>,
     bytes: usize,
     pub(super) overflow: bool,
@@ -27,10 +28,18 @@ impl ColdOpenStaging {
         }
         if self.events.len() >= MAX_EVENTS || bytes > MAX_BYTES.saturating_sub(self.bytes) {
             self.events.clear();
+            self.update = None;
             self.bytes = 0;
             self.overflow = true;
             return;
         }
+        let context = pioneer_observability::updates::carried();
+        self.update = match (&self.update, context) {
+            (Some(old), Some(next)) => Some(old.merged(&next)),
+            (Some(old), None) => Some(old.mixed_missing()),
+            (None, Some(next)) if !self.events.is_empty() => Some(next.mixed_missing()),
+            (None, next) => next,
+        };
         self.bytes += bytes;
         self.events.push(event);
     }
@@ -134,7 +143,15 @@ impl ClientCore {
         };
         let mut flight = request.flight.lock().expect("subscription flight poisoned");
         if let Some(staged) = &mut flight.cold_staging {
+            let overflow = staged.overflow;
             staged.push(ColdIngress::Notification(notification.clone()), bytes);
+            request.consent.fact(if overflow {
+                OpeningFact::ColdDropped
+            } else if staged.overflow {
+                OpeningFact::ColdOverflow
+            } else {
+                OpeningFact::ColdStaged
+            });
             return Some(true);
         }
         // ACK won while serialization was in progress. Apply in this same

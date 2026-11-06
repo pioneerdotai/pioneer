@@ -579,6 +579,15 @@ impl ClientCore {
                 self.reject_intent()
             };
         }
+        // Capture cached-draft opening before the controller lock: identity
+        // publications wake this owner while holding identity, never reverse it.
+        let draft_opening = if let WorkspaceIntent::NewThread { workspace_id } = &intent {
+            self.navigation_snapshot().draft(workspace_id).map(|id| {
+                self.begin_opening(Some(id), pioneer_observability::opening::Fact::Workspace)
+            })
+        } else {
+            None
+        };
         // Identity publications wake this queue while holding the identity owner.
         // Read authorization before taking the queue lock to keep that order acyclic.
         if let WorkspaceIntent::NewThread { workspace_id } = &intent {
@@ -587,6 +596,9 @@ impl ClientCore {
                 .and_then(|snapshot| snapshot.workspace)
                 .is_some_and(|workspace| workspace.capabilities.can_create_thread)
             {
+                if let Some(handle) = &draft_opening {
+                    handle.finish(pioneer_observability::opening::Result::Rejected);
+                }
                 return self.reject_intent();
             }
         }
@@ -598,11 +610,17 @@ impl ClientCore {
             || owner.sender.is_none()
             || owner.commands.len() >= MAX_QUEUED_COMMANDS
         {
+            if let Some(handle) = &draft_opening {
+                handle.finish(pioneer_observability::opening::Result::Rejected);
+            }
             return self.reject_intent();
         }
         if owner.commands.iter().any(|(queued, connection)| {
             queued == &intent && *connection == self.gateway_http_generation()
         }) {
+            if let Some(handle) = &draft_opening {
+                handle.finish(pioneer_observability::opening::Result::Noop);
+            }
             return self.transition(&authority, vec![], vec![]);
         }
         let selection = if let WorkspaceIntent::NewThread { workspace_id } = &intent {
@@ -610,7 +628,12 @@ impl ClientCore {
                 .navigation_snapshot()
                 .draft(workspace_id)
                 .map(str::to_owned);
-            Some(self.open_workspace_thread(workspace_id.clone(), draft, None))
+            Some(self.open_workspace_thread_observed(
+                workspace_id.clone(),
+                draft,
+                None,
+                draft_opening,
+            ))
         } else {
             None
         };

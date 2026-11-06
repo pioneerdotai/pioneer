@@ -91305,3 +91305,6 @@ async fn rehydrate_command_registry(processor: &MessageProcessor) {
         }
     }
 }
+
+#[path = "tests/closing_observation.rs"]
+mod closing_observation;

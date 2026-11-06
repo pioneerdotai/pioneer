@@ -216,6 +216,7 @@ pub(super) type TimelineItemPresentations =
 
 #[derive(Clone)]
 pub(crate) struct TimelineRenderModel {
+    pub(crate) update: pioneer_observability::updates::RenderBatch,
     pub snapshot: Option<std::sync::Arc<pioneer_client::timeline::presentation::TimelineSnapshot>>,
     pub revision: u64,
     pub source_revision: u64,
@@ -233,6 +234,7 @@ pub(crate) struct TimelineRenderModel {
 impl TimelineRenderModel {
     pub(crate) fn empty() -> Self {
         Self {
+            update: Default::default(),
             snapshot: None,
             revision: 0,
             source_revision: 0,

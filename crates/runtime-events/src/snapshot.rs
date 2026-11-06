@@ -80,27 +80,44 @@ impl SnapshotCoalescer {
     }
 
     pub(crate) fn offer(&self, event: ExecutionSnapshotEvent) -> bool {
+        let mut offered = pioneer_observability::updates::StageObservation::start(
+            pioneer_observability::updates::Stage::SnapshotOffer,
+        );
         if self.inner.closed.load(Ordering::Acquire) {
+            offered.finish(pioneer_observability::updates::Fact::Rejected);
             return false;
         }
+        let key = event.key();
+        let hint = pioneer_observability::updates::ContentHint::new(
+            &key.thread_id,
+            Some(&key.item_id),
+            pioneer_observability::updates::Change::Snapshot,
+            0,
+        );
+        let source = pioneer_observability::updates::UpdateContext::source(hint);
         let mut state = self
             .inner
             .state
             .lock()
             .expect("snapshot coalescer poisoned");
         let observer = self.inner.observer.in_current_epoch();
-        let key = event.key();
         if state.pending.contains_key(&key) {
             observer.outcome(QueueOutcome::Coalesced, 1);
         } else {
             observer.enqueued(QueueBytes::Unsupported);
         }
-        let mut item = WorkItem::new(
-            event,
-            Boundary::EventLane,
-            WorkKind::Event,
-            ExecutorRole::Event,
-        );
+        let make_item = || {
+            WorkItem::new(
+                event,
+                Boundary::EventLane,
+                WorkKind::Event,
+                ExecutorRole::Event,
+            )
+        };
+        let mut item = match source {
+            Some(context) => context.run(make_item),
+            None => make_item(),
+        };
         if let Some(previous) = state.pending.get(&key) {
             let mut work = previous.carrier.clone();
             work.merge_link(&item.carrier);
@@ -111,6 +128,7 @@ impl SnapshotCoalescer {
         observer.current(state.pending.len(), QueueBytes::Unsupported);
         drop(state);
         self.inner.notify.notify_one();
+        offered.finish(pioneer_observability::updates::Fact::Returned);
         true
     }
 
@@ -168,6 +186,10 @@ impl SnapshotEventReceiver {
                 (event, observer)
             };
             if let Some(event) = event {
+                pioneer_observability::updates::flushed(
+                    pioneer_observability::updates::FlushReason::Snapshot,
+                    1,
+                );
                 #[cfg(test)]
                 AFTER_POP.with(|hook| {
                     let callback = hook.borrow_mut().take();

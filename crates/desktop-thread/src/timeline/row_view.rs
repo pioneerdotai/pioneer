@@ -319,6 +319,10 @@ impl RowPresentation {
 }
 
 pub(crate) struct TimelineRowView {
+    update: pioneer_observability::updates::RenderBatch,
+    update_generation: u64,
+    update_visible: bool,
+    update_rendered: Option<(u64, u64)>,
     #[cfg(test)]
     renders: usize,
     presentation: RowPresentation,
@@ -326,12 +330,117 @@ pub(crate) struct TimelineRowView {
     html_visible: bool,
 }
 impl TimelineRowView {
+    pub(super) fn bind_update(
+        &mut self,
+        batch: pioneer_observability::updates::RenderBatch,
+        generation: u64,
+        cx: &mut Context<Self>,
+    ) {
+        if !batch.covers_row(
+            &self.presentation.thread_id,
+            generation,
+            self.presentation.snapshot.id().as_str(),
+            self.presentation.snapshot.revision(),
+        ) {
+            self.update = Default::default();
+            self.update_rendered = None;
+            return;
+        }
+        let expected = batch
+            .authorization_generation()
+            .unwrap_or(self.presentation.html_auth_generation);
+        let client = Arc::downgrade(&self.presentation.html_client);
+        batch.require_validity(move || {
+            client
+                .upgrade()
+                .is_some_and(|client| client.authorization_connection_generation() == expected)
+        });
+        self.update = batch;
+        self.update_generation = generation;
+        self.update_rendered = None;
+        self.update_visible = false;
+        let target =
+            self.update_target(pioneer_observability::updates::RendererBoundary::HtmlVisibleLayout);
+        for html in &self.presentation.html {
+            html.update(cx, |html, _| {
+                html.bind_update(self.update.clone(), target.clone())
+            });
+        }
+    }
+    pub(super) fn set_update_visible(&mut self, visible: bool) {
+        self.update_visible = visible;
+        if visible {
+            self.observe_rendered_update();
+        }
+    }
+    fn record_rendered_update(&mut self, rendered: (u64, u64), window: &Window) {
+        let body_visible = (!self.presentation.supports_body() || self.presentation.is_expanded())
+            && (!self
+                .presentation
+                .snapshot
+                .content()
+                .is_some_and(|content| content.task_timeline)
+                || self.presentation.is_expanded());
+        if window.is_visible()
+            && body_visible
+            && self.presentation.actions.owner.upgrade().is_some()
+            && self.update.is_pending()
+            && rendered
+                == (
+                    self.update_generation,
+                    self.presentation.snapshot.revision(),
+                )
+        {
+            self.update_rendered = Some(rendered);
+            if self.update_visible {
+                self.observe_rendered_update();
+            }
+        }
+    }
+    fn observe_rendered_update(&self) {
+        if !self.update.is_pending() {
+            return;
+        }
+        if self.update_rendered
+            == Some((
+                self.update_generation,
+                self.presentation.snapshot.revision(),
+            ))
+        {
+            self.update.observe_row(
+                &self.presentation.thread_id,
+                self.update_generation,
+                self.presentation.snapshot.id().as_str(),
+                self.presentation.snapshot.revision(),
+                pioneer_observability::updates::RendererBoundary::GpuiRender,
+                None,
+            );
+        }
+    }
+    fn update_target(
+        &self,
+        boundary: pioneer_observability::updates::RendererBoundary,
+    ) -> pioneer_observability::updates::RenderTarget {
+        pioneer_observability::updates::RenderTarget {
+            thread: self.presentation.thread_id.clone(),
+            generation: self.update_generation,
+            row: self.presentation.snapshot.id().as_str().to_owned(),
+            revision: self.presentation.snapshot.revision(),
+            boundary,
+            part: None,
+        }
+    }
+
     pub(super) fn new(
         presentation: RowPresentation,
         body_height: Option<Pixels>,
         cx: &mut Context<Self>,
     ) -> Self {
         let mut owner = Self {
+            update: Default::default(),
+            update_generation: 0,
+            update_visible: false,
+            update_rendered: None,
             #[cfg(test)]
             renders: 0,
             presentation,
@@ -466,7 +575,7 @@ impl TimelineRowView {
     }
 }
 impl Render for TimelineRowView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         #[cfg(test)]
         {
             self.renders += 1;
@@ -486,7 +595,31 @@ impl Render for TimelineRowView {
                 pioneer_observability::turn_startup::presented(&item.turn_id);
             }
         }
-        self.presentation.render(cx)
+        let element = self.presentation.render(cx);
+        let owner_visible =
+            self.update.is_pending() && self.presentation.actions.owner.upgrade().is_some();
+        let body_visible = (!self.presentation.supports_body() || self.presentation.is_expanded())
+            && (!self
+                .presentation
+                .snapshot
+                .content()
+                .is_some_and(|content| content.task_timeline)
+                || self.presentation.is_expanded());
+        if window.is_visible() && owner_visible && body_visible {
+            let owner = cx.weak_entity();
+            let rendered = (
+                self.update_generation,
+                self.presentation.snapshot.revision(),
+            );
+            // Render only describes the row. Commit its observation after this
+            // pass, while rejecting a rebind or replacement before delivery.
+            window.defer(cx, move |window, cx| {
+                let _ = owner.update(cx, |view, _| {
+                    view.record_rendered_update(rendered, window);
+                });
+            });
+        }
+        element
     }
 }
 
@@ -874,19 +1007,32 @@ impl TimelineView {
                 {
                     continue;
                 }
-                let terminal =
-                    if terminal_rows.contains(slot.snapshot().id().as_str()) {
-                        slot.snapshot().item().filter(|item| matches!(item.item,
-                        pioneer_client::timeline::types::TurnItem::CommandExecution { .. }))
+                let terminal = if terminal_rows.contains(slot.snapshot().id().as_str()) {
+                    slot.snapshot()
+                        .item()
+                        .filter(|item| {
+                            matches!(
+                                item.item,
+                                pioneer_client::timeline::types::TurnItem::CommandExecution { .. }
+                            )
+                        })
                         .map(|item| {
                             let entry = &slot.projection.timeline[0];
                             let previous = view.read(cx).presentation.terminal.clone();
                             let width = view.read(cx).presentation.key.content_width;
-                            self.prepare_command_terminal(entry, item, width, previous.as_ref(), cx)
+                            let batch = view.read(cx).update.clone();
+                            if batch.is_pending() {
+                                let target = view.read(cx).update_target(
+                                    pioneer_observability::updates::RendererBoundary::TerminalReader);
+                                batch.with_target(target, || self.prepare_command_terminal(
+                                    entry, item, width, previous.as_ref(), cx))
+                            } else {
+                                self.prepare_command_terminal(entry, item, width, previous.as_ref(), cx)
+                            }
                         })
-                    } else {
-                        None
-                    };
+                } else {
+                    None
+                };
                 view.update(cx, |view, cx| {
                     view.set_terminal(terminal, cx);
                 });
@@ -1554,6 +1700,66 @@ mod tests {
             });
         }
         assert!(painted, "the actual retained message must paint");
+        // Reuse the actual retained row and renderer; a callback-shaped unit
+        // test alone cannot establish that GPUI production rendering emits it.
+        let _lock = crate::test_support::UPDATE_OBSERVATION_LOCK.lock().unwrap();
+        let old = pioneer_observability::telemetry_enabled();
+        pioneer_observability::set_telemetry_enabled(true);
+        let (stale, row, generation, target) = cx.update(|_, cx| {
+            timeline.update(cx, |view, cx| {
+                use pioneer_observability::updates::{
+                    RenderBatch, RenderTarget, RendererBoundary, UpdateContext,
+                };
+                let prepared = view.thread_timeline_view_state.prepared.as_ref().unwrap();
+                let slot = &prepared.slots[0];
+                let generation = prepared.model.snapshot.as_ref().unwrap().generation();
+                let target = RenderTarget {
+                    thread: view.thread_id.clone(),
+                    generation,
+                    row: slot.snapshot().id().as_str().to_owned(),
+                    revision: slot.snapshot().revision(),
+                    boundary: RendererBoundary::GpuiRender,
+                    part: None,
+                };
+                let mut newer = target.clone();
+                newer.revision += 1;
+                let batch = RenderBatch::new(UpdateContext::source(None), [newer]);
+                let row = slot.view.as_ref().unwrap().clone();
+                row.update(cx, |row, cx| {
+                    row.bind_update(batch.clone(), generation, cx);
+                    row.set_update_visible(true);
+                    cx.notify();
+                });
+                (batch, row, generation, target)
+            })
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.run_until_parked();
+        assert!(
+            stale.is_pending(),
+            "painting the old snapshot cannot confirm a newer revision"
+        );
+        stale.retire(false);
+        let batch = cx.update(|_, cx| {
+            use pioneer_observability::updates::{RenderBatch, UpdateContext};
+            let batch = RenderBatch::new(UpdateContext::source(None), [target.clone()]);
+            row.update(cx, |row, cx| {
+                row.bind_update(batch.clone(), generation, cx);
+                row.set_update_visible(true);
+                cx.notify();
+            });
+            batch
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.run_until_parked();
+        assert!(
+            !batch.observe(
+                &target,
+                pioneer_observability::updates::RendererBoundary::GpuiRender
+            ),
+            "the actual row render must have consumed this exact target already"
+        );
+        pioneer_observability::set_telemetry_enabled(old);
     }
     #[gpui_kit::test]
     fn large_work_history_retains_only_visible_expanded_terminals(cx: &mut TestAppContext) {

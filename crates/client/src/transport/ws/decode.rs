@@ -25,25 +25,43 @@ pub fn process_text_payload(
     pending_artifact_upload_chunks: &mut PendingJsonRpcRequests,
     event_tx: &super::client::GatewayWsEventSender,
 ) -> Option<GatewayNotification> {
+    let received_at = pioneer_observability::telemetry_enabled().then(std::time::Instant::now);
+    let mut decode = pioneer_observability::updates::StageObservation::start(
+        pioneer_observability::updates::Stage::ClientDecode,
+    );
     let value = match serde_json::from_str::<JsonValue>(payload) {
         Ok(value) => value,
-        Err(_) => return None,
+        Err(_) => {
+            decode.finish(pioneer_observability::updates::Fact::Rejected);
+            return None;
+        }
     };
 
     if let Some((response_id, response)) = decode_json_rpc_response_value(&value) {
         let Some(response_tx) = pending_requests.remove(response_id.as_str()) else {
+            decode.finish(pioneer_observability::updates::Fact::Rejected);
             return None;
         };
 
         let _ = response_tx.send(response);
+        decode.finish(pioneer_observability::updates::Fact::Returned);
         return None;
     }
 
     let mut notification = match serde_json::from_value::<JsonRpcNotification>(value) {
         Ok(notification) => notification,
-        Err(_) => return None,
+        Err(_) => {
+            decode.finish(pioneer_observability::updates::Fact::Rejected);
+            return None;
+        }
     };
 
+    let mut update = notification.params.as_mut().and_then(|params| {
+        pioneer_observability::updates::receive(&notification.method, params, connection_id).0
+    });
+    if let Some(update) = update.as_mut() {
+        update.received_at(received_at);
+    }
     if let Some(params) = notification.params.as_mut() {
         pioneer_observability::turn_startup::observe_notification(&notification.method, params);
         pioneer_observability::turn_startup::strip_notification_metadata(params);
@@ -71,11 +89,19 @@ pub fn process_text_payload(
 
     let notification = GatewayNotification::from_jsonrpc(notification);
     if let Some(notification) = notification.clone() {
-        let _ = event_tx.send(GatewayWsEvent::Notification {
-            connection_id,
-            notification,
-        });
+        let send = || {
+            event_tx.send(GatewayWsEvent::Notification {
+                connection_id,
+                notification,
+            })
+        };
+        let _ = if let Some(update) = update {
+            update.run(send)
+        } else {
+            send()
+        };
     }
+    decode.finish(pioneer_observability::updates::Fact::Returned);
     notification
 }
 
@@ -451,5 +477,50 @@ mod tests {
             Ok(json!({ "ok": true }))
         );
         assert!(pending_requests.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod update_handoff_tests {
+    use super::*;
+    #[test]
+    fn typed_delta_and_optional_correlation_survive_the_real_event_channel() {
+        let _lock = crate::OBSERVABILITY_TEST_LOCK.lock().unwrap();
+        let old = pioneer_observability::telemetry_enabled();
+        pioneer_observability::set_telemetry_enabled(true);
+        let payload = serde_json::json!({"jsonrpc":"2.0","method":"item/agent_message/delta","params":{
+            "workspace_id":"workspace","thread_id":"thread","turn_id":"turn","item_id":"item","delta":"abc",
+            "_pioneer_update":{"v":1,"trace":"11111111111111111111111111111111","span":"2222222222222222","flags":1,"origin":0,"complete":true},
+            "_pioneer_telemetry":{"not_a_valid_startup":true}
+        }}).to_string();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let sender = super::super::client::GatewayWsEventSender::from(sender);
+        process_text_payload(
+            &payload,
+            17,
+            &mut Default::default(),
+            &mut Default::default(),
+            &mut Default::default(),
+            &sender,
+        );
+        let (event, work) = receiver.recv().unwrap().received(
+            pioneer_observability::work::Boundary::EventLane,
+            pioneer_observability::work::WorkKind::Event,
+            pioneer_observability::work::ExecutorRole::ClientController,
+        );
+        assert!(matches!(event, GatewayWsEvent::Notification {
+            connection_id:17, notification: GatewayNotification::ItemDelta(ref delta)
+        } if delta.delta == "abc"));
+        work.run(|| {
+            let context =
+                pioneer_observability::updates::capture().expect("selected decoder sidecar");
+            assert_eq!(context.hint().unwrap().item.as_deref(), Some("item"));
+            assert!(context.elapsed().is_some());
+            assert_eq!(
+                pioneer_observability::work::current().unwrap().trace_id,
+                Some([0x11; 16])
+            );
+        });
+        pioneer_observability::set_telemetry_enabled(old);
     }
 }
