@@ -1135,7 +1135,7 @@ async fn create_waiting_review_agent_task_with_delivery(
         .reserve_execution_for_run(run.id.as_str(), TaskExecutorKind::Agent, run.created_at)
         .await
         .expect("execution should reserve");
-    persist_test_child_agent_execution(runtime, execution.id.as_str()).await;
+    persist_mock_agent_execution(runtime.service().store(), &run).await;
     let handle = TaskExecutionHandle::new(
         runtime.service().store(),
         runtime.event_bus(),

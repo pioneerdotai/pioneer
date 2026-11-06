@@ -443,7 +443,7 @@ mod tests {
         use crate::tool_call::{Fact, Measurement, Phase};
         let _lock = crate::telemetry::tests::TELEMETRY_TEST_LOCK.lock().unwrap();
         let old = crate::telemetry_enabled();
-        crate::set_telemetry_enabled(true);
+        crate::set_telemetry_gate(true);
         let capture = Capture::default();
         let traces = opentelemetry_sdk::trace::SdkTracerProvider::builder()
             .with_simple_exporter(capture.clone())
@@ -468,10 +468,10 @@ mod tests {
             let mut retained = Measurement::start(Phase::RetainedResult, &parent);
             retained.finish(Fact::Failed);
             drop(Measurement::start(Phase::NativeResultReady, &parent));
-            crate::set_telemetry_enabled(false);
+            crate::set_telemetry_gate(false);
             let disabled = Measurement::start(Phase::Invocation, &Correlation::capture());
             let disabled_parent = disabled.correlation();
-            crate::set_telemetry_enabled(true);
+            crate::set_telemetry_gate(true);
             // Both a formerly enabled parent and a disabled handoff stay retired.
             drop(Measurement::start(Phase::RetainedResult, &parent));
             drop(Measurement::start(Phase::RetainedResult, &disabled_parent));
@@ -530,7 +530,7 @@ mod tests {
         }
         traces.shutdown().unwrap();
         metrics.shutdown().unwrap();
-        crate::set_telemetry_enabled(old);
+        crate::set_telemetry_gate(old);
     }
 
     #[test]
@@ -609,7 +609,7 @@ mod tests {
     fn retained_provenance_and_independent_links_have_distinct_consent_semantics() {
         let _lock = crate::telemetry::tests::TELEMETRY_TEST_LOCK.lock().unwrap();
         let previous = crate::telemetry_enabled();
-        crate::set_telemetry_enabled(true);
+        crate::set_telemetry_gate(true);
         let capture = Capture::default();
         let traces = opentelemetry_sdk::trace::SdkTracerProvider::builder()
             .with_simple_exporter(capture.clone())
@@ -643,7 +643,7 @@ mod tests {
                 wire(&old).unwrap()["trace"]
             );
             child.finish(Outcome::Confirmed);
-            crate::set_telemetry_enabled(false);
+            crate::set_telemetry_gate(false);
             let disabled = Correlation::capture();
             let disabled_observation = Observation::start(
                 Scenario::Opening,
@@ -651,7 +651,7 @@ mod tests {
                 &Correlation::default(),
                 &[],
             );
-            crate::set_telemetry_enabled(true);
+            crate::set_telemetry_gate(true);
             assert!(wire(&disabled).is_none());
             for cause in [
                 old.clone(),
@@ -753,7 +753,7 @@ mod tests {
         drop(spans);
         traces.shutdown().unwrap();
         metrics.shutdown().unwrap();
-        crate::set_telemetry_enabled(previous);
+        crate::set_telemetry_gate(previous);
     }
 
     #[test]

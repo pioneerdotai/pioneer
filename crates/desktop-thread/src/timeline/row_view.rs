@@ -373,6 +373,30 @@ impl TimelineRowView {
             self.observe_rendered_update();
         }
     }
+    fn record_rendered_update(&mut self, rendered: (u64, u64), window: &Window) {
+        let body_visible = (!self.presentation.supports_body() || self.presentation.is_expanded())
+            && (!self
+                .presentation
+                .snapshot
+                .content()
+                .is_some_and(|content| content.task_timeline)
+                || self.presentation.is_expanded());
+        if window.is_visible()
+            && body_visible
+            && self.presentation.actions.owner.upgrade().is_some()
+            && self.update.is_pending()
+            && rendered
+                == (
+                    self.update_generation,
+                    self.presentation.snapshot.revision(),
+                )
+        {
+            self.update_rendered = Some(rendered);
+            if self.update_visible {
+                self.observe_rendered_update();
+            }
+        }
+    }
     fn observe_rendered_update(&self) {
         if !self.update.is_pending() {
             return;
@@ -582,13 +606,18 @@ impl Render for TimelineRowView {
                 .is_some_and(|content| content.task_timeline)
                 || self.presentation.is_expanded());
         if window.is_visible() && owner_visible && body_visible {
-            self.update_rendered = Some((
+            let owner = cx.weak_entity();
+            let rendered = (
                 self.update_generation,
                 self.presentation.snapshot.revision(),
-            ));
-            if self.update_visible {
-                self.observe_rendered_update();
-            }
+            );
+            // Render only describes the row. Commit its observation after this
+            // pass, while rejecting a rebind or replacement before delivery.
+            window.defer(cx, move |window, cx| {
+                let _ = owner.update(cx, |view, _| {
+                    view.record_rendered_update(rendered, window);
+                });
+            });
         }
         element
     }
