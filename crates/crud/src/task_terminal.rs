@@ -61,12 +61,22 @@ fn conflict<T>(reason: &'static str) -> Result<T> {
     Err(TaskTerminalConflict(reason).into())
 }
 
+#[derive(Debug)]
+struct AdditionalRunsTerminalRace;
+impl std::fmt::Display for AdditionalRunsTerminalRace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("additional Task runs changed during terminal preparation")
+    }
+}
+impl std::error::Error for AdditionalRunsTerminalRace {}
+
 #[derive(Clone, Debug, PartialEq)]
 struct TerminalState {
     task: pioneer_entity::task::Model,
     run: pioneer_entity::task_run::Model,
     trigger: Option<pioneer_entity::task_trigger::Model>,
     latest_run_number: i64,
+    additional_runs: Option<task_run::AdditionalCompletionRuns>,
     agent_spec: Option<pioneer_entity::task_agent_spec::Model>,
     locks: Vec<pioneer_entity::task_write_lock::Model>,
     actor: TaskActorContract,
@@ -290,6 +300,16 @@ impl CrudStore {
                 .is_some_and(|runs| runs.active.is_none());
             if finish_ready
                 || (!finishing
+                    // Accepted extra work must drain in either execution order.
+                    // A future/paused planned fire still owns work as well. Tasks
+                    // without extra runs retain their original lifecycle behavior.
+                    && state.additional_runs.as_ref().is_none_or(|runs| {
+                        runs.pending_run_id.is_none()
+                            && !response.triggers.iter().any(|trigger| {
+                                matches!(trigger.status, pioneer_protocol::TaskTriggerStatus::Active | pioneer_protocol::TaskTriggerStatus::Paused)
+                                    && trigger.next_fire_at.is_some()
+                            })
+                    })
                     && response
                         .task
                         .lifecycle_policy
@@ -331,14 +351,20 @@ impl CrudStore {
                 };
                 // A successful last sibling cannot erase an earlier real
                 // failure, rejection, or cancellation from the draining set.
-                let prior_failure = state
-                    .finish_runs
-                    .as_ref()
-                    .and_then(|runs| runs.outcome.as_ref())
-                    .filter(|run| run.status != "succeeded");
+                let prior_failure = if finishing {
+                    state
+                        .finish_runs
+                        .as_ref()
+                        .and_then(|runs| runs.outcome.as_ref())
+                        .filter(|run| run.status != "succeeded")
+                } else {
+                    state
+                        .additional_runs
+                        .as_ref()
+                        .and_then(|runs| runs.outcome.as_ref())
+                };
                 events.push(
-                    if finishing
-                        && matches!(terminal, TaskEventPayload::RunCompleted { .. })
+                    if matches!(terminal, TaskEventPayload::RunCompleted { .. })
                         && prior_failure.is_some()
                     {
                         crate::task_finish::outcome_event(&state.task.id, prior_failure, at)?
@@ -469,6 +495,23 @@ impl CrudStore {
                             .await?;
                     }
                 }
+                Err(error) if error.downcast_ref::<AdditionalRunsTerminalRace>().is_some() => {
+                    let refreshed = self
+                        .prepare_task_terminal_transition(terminal.clone())
+                        .await?;
+                    validate_terminal_policy(&prepared.state, &refreshed.state)?;
+                    if !same_after_additional_progress(&prepared.state, &refreshed.state) {
+                        return conflict(
+                            "protected terminal facts changed while reloading additional work",
+                        );
+                    }
+                    prepared = if let Some(revision) = &terminal_revision {
+                        self.prepare_task_terminal_with_revision(refreshed, revision.clone())
+                            .await?
+                    } else {
+                        refreshed
+                    };
+                }
                 Err(error)
                     if error
                         .downcast_ref::<WebhookProgressTerminalRace>()
@@ -496,7 +539,7 @@ impl CrudStore {
                 outcome => return outcome,
             }
         }
-        conflict("finish or webhook progress changed repeatedly")
+        conflict("finish, additional runs or webhook progress changed repeatedly")
     }
 
     async fn commit_task_terminal_transition_once(
@@ -975,6 +1018,9 @@ impl CrudStore {
             });
         }
         if !same_transition_state(&prepared.state, &current) {
+            if same_after_additional_progress(&prepared.state, &current) {
+                return Err(AdditionalRunsTerminalRace.into());
+            }
             if same_after_webhook_progress(&prepared.state, &current)
                 && webhook_progress_is_proven(db, &prepared.state, &current).await?
             {
@@ -1058,7 +1104,9 @@ async fn load_terminal_state<C: ConnectionTrait>(
     }
     let trigger = match run.trigger_id.as_deref() {
         Some(id) => task_trigger::find_trigger_by_id(db, id).await?,
-        None => None,
+        // Manual occurrences have no schedule-fire identity, but completion
+        // must still refresh aggregate status from the current schedule.
+        None => task_trigger::find_latest_trigger_by_task(db, task_id).await?,
     };
     let agent_spec = task_agent_spec::find_terminal_agent_spec(db, task_id, run_id).await?;
     let locks = task_write_lock::list_terminal_locks_by_run(db, run_id).await?;
@@ -1094,6 +1142,18 @@ async fn load_terminal_state<C: ConnectionTrait>(
         }
         None => None,
     };
+    // Preparation and the writer both read these same bounded allocation and
+    // completion facts. No sibling list or unbounded history is materialized.
+    let completion = crate::util::optional_typed_json_from_db::<
+        pioneer_protocol::TaskLifecyclePolicy,
+    >(task.lifecycle_policy_json.clone())?
+    .map(|policy| policy.completion)
+    .unwrap_or(TaskCompletionBehavior::CompleteOnTerminalRun);
+    let additional_runs = if completion == TaskCompletionBehavior::CompleteOnTerminalRun {
+        task_run::additional_completion_runs(db, task_id, run_id).await?
+    } else {
+        None
+    };
     Ok(TerminalState {
         finish_first_run,
         finish_runs,
@@ -1101,6 +1161,7 @@ async fn load_terminal_state<C: ConnectionTrait>(
         run,
         trigger,
         latest_run_number,
+        additional_runs,
         agent_spec,
         locks,
         actor,
@@ -1146,6 +1207,53 @@ fn same_transition_state(expected: &TerminalState, current: &TerminalState) -> b
         expected.task.status = current.task.status.clone();
     }
     expected == current
+}
+
+/// Only sibling admission/terminal progress may invalidate this drain decision.
+/// Policy, current run/attempt, locks, task revision and schedule configuration
+/// remain fenced. A finish change is handled by its existing reconciliation.
+fn same_after_additional_progress(expected: &TerminalState, current: &TerminalState) -> bool {
+    if expected.additional_runs.is_none() && current.additional_runs.is_none() {
+        return false;
+    }
+    if current.latest_run_number < expected.latest_run_number
+        || !matches!(
+            expected.task.status.as_str(),
+            "queued" | "running" | "waiting" | "waiting_review" | "scheduled"
+        )
+        || !matches!(
+            current.task.status.as_str(),
+            "queued" | "running" | "waiting" | "waiting_review" | "scheduled"
+        )
+    {
+        return false;
+    }
+    let mut normalized = expected.clone();
+    normalized.additional_runs = current.additional_runs.clone();
+    normalized.latest_run_number = current.latest_run_number;
+    normalized.task.status = current.task.status.clone();
+    if let (Some(before), Some(after)) = (&mut normalized.trigger, &current.trigger) {
+        // A planned fire can admit a sibling during preparation. Accept only
+        // monotonic consumption of the same assignment, never pause, resume or
+        // replacement of its identity/spec. The full row is still compared.
+        if before.status == "active"
+            && matches!(after.status.as_str(), "active" | "exhausted")
+            && after.last_fire_at.is_some()
+            && after.last_fire_at >= before.last_fire_at
+            && before
+                .next_fire_at
+                .is_some_and(|due| after.last_fire_at.is_some_and(|fired| fired >= due))
+            && (after.next_fire_at > before.next_fire_at
+                || (after.status == "exhausted" && after.next_fire_at.is_none()))
+        {
+            before.status = after.status.clone();
+            before.next_fire_at = after.next_fire_at;
+            before.last_fire_at = after.last_fire_at;
+        }
+        // A terminal refresh changes only this timestamp.
+        before.updated_at = after.updated_at;
+    }
+    same_transition_state(&normalized, current)
 }
 
 /// Permit only webhook queue growth and the sibling activity labels below. The

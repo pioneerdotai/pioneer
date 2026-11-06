@@ -2637,6 +2637,139 @@ impl TaskService {
         bail!("webhook admission busy")
     }
 
+    /// Enqueue an additional occurrence without consuming a schedule fire.
+    /// The caller must supply the canonical durable Agent action identity.
+    pub async fn run_task_now(
+        &self,
+        context: TaskMutationContext,
+        params: pioneer_protocol::TaskRunNowParams,
+    ) -> TaskRuntimeResult<pioneer_protocol::TaskRunNowResponse> {
+        let mut action = context
+            .agent_action_commit
+            .context("task_run_now requires a durable action identity")?;
+        if let Some(existing) =
+            pioneer_crud::load_agent_action(&self.store.database_connection(), &action.action.id)
+                .await?
+            && existing.status == "committed"
+        {
+            anyhow::ensure!(
+                existing.execution_id == action.action.execution_id
+                    && existing.request_fingerprint == action.request_fingerprint,
+                "manual run action identity conflict"
+            );
+            let receipt: serde_json::Value = serde_json::from_str(
+                existing
+                    .response_json
+                    .as_deref()
+                    .context("manual run receipt missing")?,
+            )?;
+            let run_id = receipt["taskRunNow"]["runId"]
+                .as_str()
+                .context("manual run reference missing")?;
+            let run = self
+                .store
+                .get_task_run(run_id)
+                .await?
+                .context("manual run missing")?;
+            anyhow::ensure!(run.task_id == params.task_id, "manual run task mismatch");
+            return Ok(pioneer_protocol::TaskRunNowResponse {
+                task_id: params.task_id,
+                run_id: run.id,
+            });
+        }
+        let run_id = generate_id(ID_LEN);
+        let group_id = generate_id(ID_LEN);
+        for _ in 0..32 {
+            let snapshot = self
+                .store
+                .get_task_queue_admission_snapshot(&params.task_id)
+                .await?
+                .context("task admission unavailable")?;
+            if !matches!(
+                snapshot.trigger.status,
+                TaskTriggerStatus::Active | TaskTriggerStatus::Exhausted
+            ) || is_terminal_task(snapshot.task.status)
+                || snapshot.task.status == TaskStatus::Blocked
+                || snapshot.task.finish_request().is_some()
+            {
+                return Err(crate::TaskOperationError::StateConflict.into());
+            }
+            let now = now_timestamp_secs();
+            let run = TaskRun {
+                trigger_input: None,
+                id: run_id.clone(),
+                task_id: params.task_id.clone(),
+                trigger_id: None,
+                parent_run_id: None,
+                run_group_id: group_id.clone(),
+                attempt_number: 1,
+                retry_of_run_id: None,
+                ready_at: Some(now),
+                run_number: snapshot.next_run_number,
+                status: TaskRunStatus::Queued,
+                executor_kind: snapshot.task.executor_kind,
+                started_at: None,
+                completed_at: None,
+                heartbeat_at: None,
+                locked_by: None,
+                lock_expires_at: None,
+                result: None,
+                error: None,
+                created_at: now,
+                updated_at: now,
+            };
+            let occurrence = build_occurrence_contract(
+                &snapshot.task,
+                &snapshot.actor,
+                &run.id,
+                None,
+                format!("manual:{}", action.action.id),
+                snapshot.execution_generation,
+                now,
+            )?;
+            let spec = snapshot.agent_spec.map(|mut spec| {
+                spec.id = generate_id(ID_LEN);
+                spec.run_id = Some(run.id.clone());
+                spec.updated_at = now;
+                spec
+            });
+            let mut receipt: serde_json::Value =
+                serde_json::from_str(action.receipt_response_json.as_deref().unwrap_or("{}"))?;
+            receipt["taskRunNow"] = serde_json::json!({"taskId": params.task_id, "runId": run.id});
+            action.receipt_response_json = Some(serde_json::to_string(&receipt)?);
+            action.action_response_json = action.receipt_response_json.clone();
+            let events = vec![
+                TaskEventPayload::RunCreated {
+                    run: run.clone(),
+                    agent_spec: spec,
+                },
+                TaskEventPayload::TaskQueued {
+                    task_id: params.task_id.clone(),
+                    run_id: Some(run.id.clone()),
+                },
+            ];
+            if let Some((run_id, appended)) = self
+                .store
+                .accept_task_queued_occurrence(
+                    &snapshot.task,
+                    &snapshot.trigger,
+                    &run,
+                    occurrence,
+                    events,
+                    Some(action.clone()),
+                )
+                .await?
+            {
+                self.publish_and_wake(appended).await;
+                return Ok(pioneer_protocol::TaskRunNowResponse {
+                    task_id: params.task_id,
+                    run_id,
+                });
+            }
+        }
+        bail!("task_run_now admission busy")
+    }
+
     pub async fn wait_tasks(
         &self,
         context: TaskWaitContext,
@@ -3362,6 +3495,7 @@ impl TaskService {
                 if !is_webhook_spec(&trigger_input.spec) {
                     trigger.webhook_secret_ref = None;
                 }
+                trigger.last_fire_at = None;
                 trigger.spec = trigger_input.spec;
                 trigger.status = TaskTriggerStatus::Active;
                 trigger.next_fire_at = next_fire_at;
@@ -3665,10 +3799,8 @@ impl TaskService {
             status: TaskTriggerStatus::Active,
             spec: params.trigger.spec,
             next_fire_at,
-            last_fire_at: response
-                .triggers
-                .last()
-                .and_then(|trigger| trigger.last_fire_at),
+            // A user replacement starts a fresh assignment on the same endpoint.
+            last_fire_at: None,
             created_at: response
                 .triggers
                 .last()
@@ -3717,6 +3849,7 @@ impl TaskService {
             return Ok(TaskPauseResponse {
                 task: response.task,
                 triggers: response.triggers,
+                schedule_outcome: Some(pioneer_protocol::TaskPauseScheduleOutcome::NotApplied),
             });
         }
         let now = now_timestamp_secs();
@@ -3746,7 +3879,21 @@ impl TaskService {
         ))
         .await?;
         self.publish_and_wake(appended).await;
-        Ok(TaskPauseResponse { task, triggers })
+        let schedule_outcome = Some(
+            if triggers
+                .iter()
+                .any(|trigger| trigger.status == TaskTriggerStatus::Paused)
+            {
+                pioneer_protocol::TaskPauseScheduleOutcome::Paused
+            } else {
+                pioneer_protocol::TaskPauseScheduleOutcome::NoFutureFirings
+            },
+        );
+        Ok(TaskPauseResponse {
+            task,
+            triggers,
+            schedule_outcome,
+        })
     }
 
     pub async fn resume_task(
