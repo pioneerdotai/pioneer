@@ -3,6 +3,12 @@
   "title": "TaskPauseResponse",
   "type": "object",
   "properties": {
+    "scheduleOutcome": {
+      "anyOf": [
+        { "$ref": "#/$defs/TaskPauseScheduleOutcome" },
+        { "type": "null" }
+      ]
+    },
     "task": {
       "$ref": "#/$defs/Task"
     },
@@ -18,6 +24,10 @@
     "task"
   ],
   "$defs": {
+    "TaskPauseScheduleOutcome": {
+      "type": "string",
+      "enum": ["paused", "no_future_firings", "not_applied"]
+    },
     "AgentDelegationRouteId": {
       "type": "string",
       "maxLength": 21,

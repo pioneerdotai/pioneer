@@ -139,7 +139,7 @@ After an update, verify the current task state with the tool result or `task_get
 
 Choose the operation from the user's intent:
 
-- `task_pause` temporarily stops future runs so the task can be resumed.
+- `task_pause` temporarily stops future schedule firings so the task can be resumed.
 - `task_cancel` cancels under the existing rules, including interruption of current work and restrictions on cancelling the current execution's own task or its ancestors.
 - `task_finish` permanently stops a task at the user's request. It prevents new runs and lets already started work finish with its results preserved and configured delivery. Use it when the user asks to stop the task while allowing current work to finish.
 
@@ -174,3 +174,30 @@ Do not invent a run result for a scheduled task that has not run yet.
 - Scheduled task instructions must be self-contained.
 - Do not claim a task was created, updated, paused, resumed, rescheduled, cancelled, or delivered unless the relevant tool succeeded.
 - A successful `task_finish` confirms the stop decision; report work completion and delivery only from their own observed state.
+
+## Additional runs and schedule control
+
+For an extra check now on an existing task, call `task_run_now` with `taskId`.
+It queues an additional run with the saved instructions, delivery and limits,
+without changing recurrence or the next planned fire. It does not resume paused
+or blocked work, reopen terminal tasks, or override a finish request. A returned
+`runId` confirms durable admission, not completion; current work is not cancelled.
+Repeat the same invocation identity after a lost response, rather than inventing
+a new call for the same operation.
+
+`task_reschedule` explicitly replaces the schedule. `task_update` can also replace
+its trigger while patching other fields. An immediate or scheduled_at replacement
+is one-shot and removes recurrence. For an early first check followed by recurring
+checks, save an interval/cron trigger and use `task_run_now` for the extra check.
+Recurrence must be present in trigger settings; instructions alone do not schedule
+future runs. When creating an analogous monitor, inspect the original configuration
+and preserve its schedule and all other requested settings explicitly.
+
+Pause affects future schedule firings and leaves current runs running. Its
+`scheduleOutcome` describes the confirmed operation state: `paused`,
+`no_future_firings` (an exhausted one-shot is valid here), or `not_applied`
+(for example a terminal task). Errors also mean the operation was not confirmed.
+Do not demand the literal trigger status `paused` when no future firings remain.
+Pause does not cancel queued work or prohibit later rescheduling. Ordinary resume
+preserves the configured interval/cron trigger; it does not turn recurrence into a
+one-shot. Use `task_get` to inspect settings after changes.

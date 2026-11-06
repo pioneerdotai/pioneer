@@ -223,3 +223,30 @@ Good confirmation:
 ```text
 Done. The Hermes Agent release monitor now runs daily at 05:00 Europe/Moscow. Future results will be posted to this thread as full Markdown, not just as a user notification. The change applies to the next run; today's earlier run was not retroactively posted.
 ```
+
+## Additional runs and schedule control
+
+For an extra check now on an existing task, call `task_run_now` with `taskId`.
+It queues an additional run with the saved instructions, delivery and limits,
+without changing recurrence or the next planned fire. It does not resume paused
+or blocked work, reopen terminal tasks, or override a finish request. A returned
+`runId` confirms durable admission, not completion; current work is not cancelled.
+Repeat the same invocation identity after a lost response, rather than inventing
+a new call for the same operation.
+
+`task_reschedule` explicitly replaces the schedule. `task_update` can also replace
+its trigger while patching other fields. An immediate or scheduled_at replacement
+is one-shot and removes recurrence. For an early first check followed by recurring
+checks, save an interval/cron trigger and use `task_run_now` for the extra check.
+Recurrence must be present in trigger settings; instructions alone do not schedule
+future runs. When creating an analogous monitor, inspect the original configuration
+and preserve its schedule and all other requested settings explicitly.
+
+Pause affects future schedule firings and leaves current runs running. Its
+`scheduleOutcome` describes the confirmed operation state: `paused`,
+`no_future_firings` (an exhausted one-shot is valid here), or `not_applied`
+(for example a terminal task). Errors also mean the operation was not confirmed.
+Do not demand the literal trigger status `paused` when no future firings remain.
+Pause does not cancel queued work or prohibit later rescheduling. Ordinary resume
+preserves the configured interval/cron trigger; it does not turn recurrence into a
+one-shot. Use `task_get` to inspect settings after changes.

@@ -51,6 +51,7 @@ pub enum AgentTaskControl {
     Pause,
     Update,
     Reschedule,
+    RunNow,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

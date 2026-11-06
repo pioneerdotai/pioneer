@@ -585,7 +585,8 @@
         "detach",
         "pause",
         "update",
-        "reschedule"
+        "reschedule",
+        "run_now"
       ]
     },
     "AgentThreadAudienceTemplate": {

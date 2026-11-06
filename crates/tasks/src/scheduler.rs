@@ -821,18 +821,12 @@ impl TaskScheduler {
                 return Ok(0);
             }
         };
-        if task_response.runs.iter().any(|run| {
-            run.trigger_id.as_deref() == Some(trigger.id.as_str()) && !is_recurring(&trigger)
-        }) {
+        // last_fire_at belongs to the current assignment. Explicit replacement
+        // clears it; historical runs remain immutable. The writer compares this
+        // snapshot and atomically consumes next_fire_at with RunCreated.
+        if !is_recurring(&trigger) && trigger.last_fire_at.is_some() {
             return Ok(0);
         }
-        // Authenticate and upcast the immutable Task-owned contract before
-        // calculating or materializing any new occurrence. The completed
-        // one-shot guard above deliberately runs first: a stale trigger that
-        // cannot create another occurrence must not reclassify its Task only
-        // because an otherwise-unused historical contract is unreadable.
-        // Everything after this boundary keeps the scheduler's existing
-        // storage/dispatch retry semantics.
         let Some(actor_contract) = self.load_due_task_actor_contract(&trigger, now).await? else {
             return Ok(0);
         };
@@ -1025,11 +1019,13 @@ impl TaskScheduler {
         catch_up: TaskTriggerCatchUpPlan,
         now: i64,
     ) -> TaskRuntimeResult<usize> {
-        if task_response.runs.iter().any(|run| {
-            run.trigger_id.as_deref() == Some(trigger.id.as_str())
-                && run.status == TaskRunStatus::Queued
-                && run.ready_at.is_none_or(|ready_at| ready_at <= now)
-        }) {
+        if is_recurring(&trigger)
+            && task_response.runs.iter().any(|run| {
+                run.trigger_id.as_deref() == Some(trigger.id.as_str())
+                    && run.status == TaskRunStatus::Queued
+                    && run.ready_at.is_none_or(|ready_at| ready_at <= now)
+            })
+        {
             // The occurrence already represented by the queued run must not
             // be duplicated.  Still consume this due fire, otherwise every
             // scheduler pass observes the same timestamp forever and the

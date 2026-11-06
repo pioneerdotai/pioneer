@@ -17113,37 +17113,37 @@ owned_voice_ingress_test!(
     early
 );
 owned_voice_ingress_test!(
-    owned_voice_context_commit_during_preview_thirteen_seconds,
+    owned_voice_finalized_short_thirteen_seconds_one_call,
     "closed_13",
     "winner",
     early
 );
 owned_voice_ingress_test!(
-    owned_voice_context_commit_during_preview_seventeen_seconds,
+    owned_voice_finalized_short_seventeen_seconds_one_call,
     "closed_17",
     "winner",
     early
 );
 owned_voice_ingress_test!(
-    owned_voice_context_long_backlog_with_rephrased_probes,
+    owned_voice_finalized_long_backlog_preserves_chunk_order,
     "long_context",
     "winner",
     early
 );
 owned_voice_ingress_test!(
-    owned_voice_context_final_error_after_window_advance_has_no_partial_turn,
+    owned_voice_finalized_tail_error_has_no_partial_turn,
     "long_tail_error",
     "winner",
     early
 );
 owned_voice_ingress_test!(
-    owned_voice_context_final_error_discards_confirmed_prefix,
+    owned_voice_finalized_error_after_pause_discards_prior_chunk,
     "sealed_tail_error",
     "winner",
     early
 );
 owned_voice_ingress_test!(
-    owned_voice_context_generation_change_fences_tail,
+    owned_voice_finalized_generation_change_fences_tail,
     "generation_change",
     "winner",
     early
@@ -17255,6 +17255,7 @@ fn owned_voice_ingress_case(
         let entered_tx = std::sync::Mutex::new(Some(entered_tx));
         let captured = Arc::new(std::sync::Mutex::new(Vec::<Vec<f32>>::new()));
         let worker_captured = captured.clone();
+        let live_chunks = early && !buffered && !matches!(terminal, "closed_13" | "closed_17");
         // Every case owns its settings file. Persist through the production
         // settings mutation below; never use a test-only mode override.
         let runtime_home = tempfile::tempdir().unwrap();
@@ -17306,25 +17307,16 @@ fn owned_voice_ingress_case(
             }
             drop(flag);
             if matches!(terminal, "long_context" | "long_tail_error") {
-                if terminal == "long_tail_error" && call_count == 6 {
+                if terminal == "long_tail_error" && call_count == 2 {
                     return Err(transcription_error(
                         VoiceTranscriptionErrorKind::RuntimeFailure,
-                        "controlled final failure after window advance",
+                        "controlled final fragment failure",
                     ));
                 }
-                let samples = buffer.flattened_samples();
-                return Ok(if samples.len() <= 48000 && samples[0] > 0.3 {
-                    "incorrect early boundary"
-                } else if samples[0] > 0.3 && samples.len() == 18 * 16000 {
-                    "Привет, мир. Да, да. Ещё раз, ещё раз."
-                } else if samples[0] > 0.3 {
-                    "Привет. Мир. ДА, ДА!"
-                } else if samples.len() <= 24000 {
-                    "да, да."
-                } else if samples.len() > 9 * 16000 {
-                    "Да, да. Ещё раз, ещё раз. Конец."
+                return Ok(if call_count == 1 {
+                    "Привет, мир. Да, да."
                 } else {
-                    "Ещё раз. ЕЩЁ РАЗ!"
+                    "Ещё раз, ещё раз. Конец."
                 }
                 .to_owned());
             }
@@ -17334,7 +17326,7 @@ fn owned_voice_ingress_case(
                     VoiceTranscriptionErrorKind::RuntimeFailure,
                     "controlled native tail failure",
                 )),
-                "sealed_tail_error" if call_count == 3 => Err(transcription_error(
+                "sealed_tail_error" if call_count == 2 => Err(transcription_error(
                     VoiceTranscriptionErrorKind::RuntimeFailure,
                     "controlled failure after confirmed VAD span",
                 )),
@@ -17343,11 +17335,12 @@ fn owned_voice_ingress_case(
                     "controlled fake failure",
                 )),
                 "no_speech" => Ok("  ".to_owned()),
-                // Context changes the hypothesis across the old 3 s cut. The
-                // final assertion must observe the correction, never append it.
-                _ if early && !buffered && buffer.speech_samples() <= 48000 => {
-                    Ok("incorrect early boundary".to_owned())
+                _ if live_chunks => Ok(if call_count == 1 {
+                    "controlled"
+                } else {
+                    "transcript"
                 }
+                .to_owned()),
                 _ => Ok("controlled transcript".to_owned()),
             }
         }));
@@ -17475,15 +17468,22 @@ fn owned_voice_ingress_case(
         .await;
         let mut entered_rx = Some(entered_rx);
         let last_sequence = match terminal {
-            "long_context" | "long_tail_error" | "buffered_long" => 200,
+            "buffered_long" => 200,
             "closed_13" => 129,
             "closed_17" => 169,
+            _ if live_chunks => 500,
             _ => 60,
         };
-        // Feed the first backlog packet before waiting for the 3 s preview:
-        // 48,000 samples leave an incomplete 512-sample VAD frame. This packet
-        // completes it without changing the source PCM or its total duration.
-        let initial_chunks = if early { 31 } else { 1 };
+        // Continuous live input needs the 40 s maximum plus 5 s lookahead.
+        // One more packet completes the 512-sample VAD frame at that horizon.
+        // Short recordings and buffered mode have no pre-Commit ASR call.
+        let initial_chunks = if live_chunks {
+            451
+        } else if early {
+            31
+        } else {
+            1
+        };
         for sequence in 0..initial_chunks {
             processor
                 .process_binary_frame_for_connection(
@@ -17493,10 +17493,12 @@ fn owned_voice_ingress_case(
                         sequence,
                         if early { 1600 } else { 960 },
                         if terminal == "silence"
-                            || (sequence == 30 && terminal == "sealed_tail_error")
+                            || (sequence >= 450 && terminal == "sealed_tail_error")
                         {
                             0
-                        } else if sequence == 30 {
+                        } else if (live_chunks && sequence >= 450)
+                            || (!live_chunks && sequence == 30)
+                        {
                             6000
                         } else {
                             12000
@@ -17508,10 +17510,10 @@ fn owned_voice_ingress_case(
             let _ = recv_notification_by_method(&mut rx, events::VOICE_CHUNK_ACK).await;
         }
         if early {
-            if buffered {
+            if !live_chunks {
                 assert!(
                     captured.lock().unwrap().is_empty(),
-                    "buffered must not call ASR before Commit"
+                    "short and buffered recordings must not call ASR before Commit"
                 );
             } else {
                 let key = tokio::time::timeout(Duration::from_secs(5), entered_rx.take().unwrap())
@@ -17532,9 +17534,9 @@ fn owned_voice_ingress_case(
                     .state,
                 crate::voice::session_store::GatewayVoiceSessionState::Recording
             );
-            // Duplicate accepted sequences are ACKed without replay. Keep a full
-            // second source span and a seven-sample tail behind native work.
-            for sequence in 29..=last_sequence {
+            // Duplicate accepted sequences are ACKed without replay. Queue the
+            // remaining source and a seven-sample tail behind native work.
+            for sequence in initial_chunks - 2..=last_sequence {
                 let samples = if sequence == last_sequence
                     && !matches!(terminal, "closed_13" | "closed_17")
                 {
@@ -17544,7 +17546,7 @@ fn owned_voice_ingress_case(
                 };
                 let amplitude = if terminal == "silence" {
                     0
-                } else if sequence == 29 {
+                } else if sequence < if live_chunks { 450 } else { 30 } {
                     12000
                 } else if sequence == last_sequence {
                     3000
@@ -17843,8 +17845,8 @@ fn owned_voice_ingress_case(
             );
         }
         if terminal == "generation_change" {
-            // The next contextual call must use the recording's admitted
-            // generation; a successful old preview cannot authorize a new one.
+            // The final chunk must use the recording's admitted generation;
+            // a successful earlier fragment cannot authorize a stale call.
             processor
                 .voice_input_supervisor
                 .as_ref()
@@ -17902,63 +17904,47 @@ fn owned_voice_ingress_case(
                         "one full prepared PCM call, including final residual"
                     );
                 }
-            } else if early
-                && matches!(action, "winner" | "mode_switch")
-                && matches!(terminal, "transcript" | "no_speech" | "tail_error")
-            {
-                assert_eq!(
-                    calls.iter().map(Vec::len).collect::<Vec<_>>(),
-                    vec![48000, 96007],
-                    "Commit coalesces superseded previews into one contextual tail"
-                );
-                assert_eq!(calls[0], vec![12000.0 / 32768.0; 48000]);
-                let mut source = vec![12000.0 / 32768.0; 48000];
-                source.extend(vec![6000.0 / 32768.0; 48000]);
-                source.extend([3000.0 / 32768.0; 7]);
-                assert_eq!(calls[1], source, "overlap must preserve source PCM order");
-            } else if terminal == "sealed_tail_error" {
-                assert_eq!(
-                    calls.iter().map(Vec::len).collect::<Vec<_>>(),
-                    vec![48000, 55296, 7943]
-                );
-                let mut confirmed_source = vec![12000.0 / 32768.0; 48000];
-                // The mixed 512-sample frame ends at 48128, followed by
-                // fourteen real hangover frames before the span is sealed.
-                confirmed_source.extend([0.0; 7296]);
-                assert_eq!(calls[1], confirmed_source);
-                let mut tail = vec![0.0; 7936];
-                tail.extend([3000.0 / 32768.0; 7]);
-                assert_eq!(calls[2], tail);
             } else if matches!(terminal, "closed_13" | "closed_17") {
                 let count = if terminal == "closed_13" {
                     13 * 16000
                 } else {
                     17 * 16000
                 };
-                assert_eq!(
-                    calls.iter().map(Vec::len).collect::<Vec<_>>(),
-                    vec![48000, count]
-                );
-                assert_eq!(calls.iter().map(Vec::len).sum::<usize>(), 48000 + count);
                 let mut source = vec![12000.0 / 32768.0; 48000];
                 source.extend(vec![6000.0 / 32768.0; count - 48000 - 1600]);
                 source.extend([3000.0 / 32768.0; 1600]);
-                assert_eq!(calls[1], source);
-            } else if matches!(terminal, "long_context" | "long_tail_error") {
+                assert_eq!(
+                    *calls,
+                    vec![source],
+                    "short recording decoded exactly once after Commit"
+                );
+            } else if live_chunks
+                && matches!(action, "winner" | "mode_switch")
+                && matches!(
+                    terminal,
+                    "transcript" | "no_speech" | "tail_error" | "long_context" | "long_tail_error"
+                )
+            {
+                let mut source = vec![12000.0 / 32768.0; 720000];
+                source.extend(vec![6000.0 / 32768.0; 80000]);
+                source.extend([3000.0 / 32768.0; 7]);
                 assert_eq!(
                     calls.iter().map(Vec::len).collect::<Vec<_>>(),
-                    vec![48000, 288000, 168000, 120000, 24000, 176007]
+                    vec![640000, 160007]
                 );
-                assert_eq!(calls.iter().map(Vec::len).sum::<usize>(), 824007);
-                assert!(calls.iter().all(|call| call.len() <= 18 * 16000));
-                let mut source = vec![12000.0 / 32768.0; 48000];
-                source.extend(vec![6000.0 / 32768.0; 272000]);
-                source.extend([3000.0 / 32768.0; 7]);
-                assert_eq!(calls[1], source[..288000]);
-                assert_eq!(calls[2], source[..168000]);
-                assert_eq!(calls[3], source[168000..288000]);
-                assert_eq!(calls[4], source[144000..168000]);
-                assert_eq!(calls[5], source[144000..]);
+                assert_eq!(
+                    calls.concat(),
+                    source,
+                    "finalized ranges never overlap or omit source PCM"
+                );
+            } else if terminal == "sealed_tail_error" {
+                assert_eq!(
+                    calls.len(),
+                    2,
+                    "the final fragment fails after a successful finalized fragment"
+                );
+                assert_eq!(calls[0], vec![12000.0 / 32768.0; 640000]);
+                assert_eq!(&calls[1][calls[1].len() - 7..], &[3000.0 / 32768.0; 7]);
             } else {
                 assert_eq!(
                     calls.len(),
@@ -18104,7 +18090,7 @@ fn owned_voice_ingress_case(
                     &next_start,
                 )
                 .await;
-                for sequence in 0..40 {
+                for sequence in 0..if buffered { 451 } else { 40 } {
                     processor
                         .process_binary_frame_for_connection(
                             foreign_id,
@@ -19290,7 +19276,7 @@ async fn voice_session_finalize_without_speech_does_not_create_turn() {
 async fn voice_integrity_barrier_blocks_incomplete_prefix_without_poisoning_a_new_session() {
     for case in [
         "missing_tail",
-        "preview_missing_tail",
+        "finalized_missing_tail",
         "gap",
         "malformed",
         "legacy",
@@ -19311,11 +19297,11 @@ async fn voice_integrity_barrier_blocks_incomplete_prefix_without_poisoning_a_ne
             test_tool_loop_config(),
         )
         .with_test_voice_transcript("controlled transcript");
-        let (preview_tx, mut preview_rx) = tokio::sync::mpsc::unbounded_channel();
-        if case == "preview_missing_tail" {
+        let (fragment_tx, mut fragment_rx) = tokio::sync::mpsc::unbounded_channel();
+        if case == "finalized_missing_tail" {
             processor.voice_test_transcriber = Some(Arc::new(move |_| {
-                let text = "successful preliminary transcript".to_owned();
-                let _ = preview_tx.send(());
+                let text = "successful finalized fragment".to_owned();
+                let _ = fragment_tx.send(());
                 Ok(text)
             }));
         }
@@ -19383,8 +19369,8 @@ async fn voice_integrity_barrier_blocks_incomplete_prefix_without_poisoning_a_ne
                 .await
                 .unwrap();
         }
-        let packets = if case == "preview_missing_tail" {
-            31
+        let packets = if case == "finalized_missing_tail" {
+            451
         } else {
             1
         };
@@ -19395,7 +19381,7 @@ async fn voice_integrity_barrier_blocks_incomplete_prefix_without_poisoning_a_ne
                     &voice_test_frame(
                         &session.session_id,
                         sequence,
-                        if case == "preview_missing_tail" {
+                        if case == "finalized_missing_tail" {
                             1600
                         } else {
                             960
@@ -19407,8 +19393,8 @@ async fn voice_integrity_barrier_blocks_incomplete_prefix_without_poisoning_a_ne
                 .unwrap();
             let _ = recv_notification_by_method(&mut rx, events::VOICE_CHUNK_ACK).await;
         }
-        if case == "preview_missing_tail" {
-            tokio::time::timeout(Duration::from_secs(5), preview_rx.recv())
+        if case == "finalized_missing_tail" {
+            tokio::time::timeout(Duration::from_secs(5), fragment_rx.recv())
                 .await
                 .unwrap()
                 .unwrap();
@@ -19442,7 +19428,7 @@ async fn voice_integrity_barrier_blocks_incomplete_prefix_without_poisoning_a_ne
             }
             "legacy" => JsonValue::Null,
             "late_old" => json!({"next_sequence":1,"normalized_samples":960}),
-            "preview_missing_tail" => json!({"next_sequence":32,"normalized_samples":49607}),
+            "finalized_missing_tail" => json!({"next_sequence":452,"normalized_samples":721607}),
             _ => json!({"next_sequence":2,"normalized_samples":967}),
         };
         let request_id = generate_test_request_id("voice", "integrity_finalize");

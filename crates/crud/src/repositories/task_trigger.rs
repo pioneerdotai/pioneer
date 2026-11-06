@@ -60,6 +60,19 @@ pub async fn list_triggers_by_task<C: ConnectionTrait>(
         .context("failed to list task triggers")
 }
 
+/// Current schedule for occurrences that do not consume a trigger (manual runs).
+pub async fn find_latest_trigger_by_task<C: ConnectionTrait>(
+    db: &C,
+    task_id: &str,
+) -> Result<Option<task_trigger::Model>> {
+    task_trigger::Entity::find()
+        .filter(task_trigger::Column::TaskId.eq(task_id.to_owned()))
+        .order_by_desc(task_trigger::Column::CreatedAt)
+        .one(db)
+        .await
+        .context("failed to query current task trigger")
+}
+
 pub async fn find_trigger_by_id<C: ConnectionTrait>(
     db: &C,
     trigger_id: &str,

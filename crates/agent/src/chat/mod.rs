@@ -9981,6 +9981,7 @@ mod tests {
                 "task_list",
                 "task_get",
                 "task_reschedule",
+                "task_run_now",
                 "task_pause",
                 "task_resume",
             ]
