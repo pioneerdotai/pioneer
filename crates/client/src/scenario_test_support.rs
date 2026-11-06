@@ -102,7 +102,7 @@ impl Capture {
             pioneer_observability::OtlpTelemetryConfig {
                 metrics_endpoint: format!("http://{address}/metrics"),
                 traces_endpoint: format!("http://{address}/traces"),
-                export_interval: Duration::from_secs(3600),
+                export_interval: Duration::from_secs(900),
                 export_timeout: Duration::from_secs(5),
                 deployment_environment: None,
                 service_version: None,
