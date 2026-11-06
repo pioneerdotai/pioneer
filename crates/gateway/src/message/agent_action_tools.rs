@@ -221,6 +221,7 @@ impl AgentActionRuntimeBinding {
                     turn_id: turn_id.to_owned(),
                 },
                 Some(&facts),
+                true,
             )
             .await?;
         let mut target_titles = std::collections::BTreeMap::new();

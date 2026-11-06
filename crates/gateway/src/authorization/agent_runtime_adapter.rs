@@ -2180,6 +2180,8 @@ mod tests {
             let mut duplicate = route.clone();
             duplicate.route_id = "R12345678901234567891".into();
             duplicate.allowed_actions = vec![pioneer_protocol::AgentRouteAction::StartAgent];
+            // Distinct persisted route grants have distinct fingerprints.
+            duplicate.grant_fingerprint = "H".repeat(64);
             restored.bind_persisted_route(duplicate.clone()).unwrap();
             let options = test_options(&mut restored);
             let targets: Vec<_> = options

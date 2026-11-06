@@ -154,7 +154,7 @@ impl MessageProcessor {
         } else {
             None
         };
-        self.thread_read_authority_for_agent(context, facts.as_ref())
+        self.thread_read_authority_for_agent(context, facts.as_ref(), false)
             .await
     }
 
@@ -162,16 +162,31 @@ impl MessageProcessor {
         &self,
         context: &TurnToolContext,
         facts: Option<&crate::authorization::AgentExecutionPersistenceFacts>,
+        catalog_projection: bool,
     ) -> Result<ThreadReadAuthority> {
-        let current = self
-            .revalidate_tool_execution_authorization(
+        // Reviewer selection and committed action responses can project a
+        // catalog after the source Turn finishes. Revalidate its saved scope
+        // and current grants without requiring its foreground lease to live.
+        // Ordinary Threads reads still require the active execution lease.
+        let current = if catalog_projection {
+            self.revalidate_post_turn_execution_authorization(
                 &context.workspace_id,
                 &context.thread_id,
                 &context.turn_id,
                 None,
                 ResourceAction::ThreadRead,
             )
-            .await?;
+            .await?
+        } else {
+            self.revalidate_tool_execution_authorization(
+                &context.workspace_id,
+                &context.thread_id,
+                &context.turn_id,
+                None,
+                ResourceAction::ThreadRead,
+            )
+            .await?
+        };
         let principal = current
             .initiating_principal(self.crud_store.as_ref())
             .await?;
@@ -242,8 +257,8 @@ impl MessageProcessor {
                     )
                     .await?,
                 ProofResolution::Authorized(_)
-            ) && self
-                .revalidate_tool_execution_authorization(
+            ) && if catalog_projection {
+                self.revalidate_post_turn_execution_authorization(
                     &context.workspace_id,
                     &context.thread_id,
                     &context.turn_id,
@@ -252,7 +267,17 @@ impl MessageProcessor {
                 )
                 .await
                 .is_ok()
-            {
+            } else {
+                self.revalidate_tool_execution_authorization(
+                    &context.workspace_id,
+                    &context.thread_id,
+                    &context.turn_id,
+                    None,
+                    action,
+                )
+                .await
+                .is_ok()
+            } {
                 authority.observe_workspace = true;
             }
         }
