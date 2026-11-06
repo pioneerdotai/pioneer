@@ -213,22 +213,40 @@ impl AgentActionRuntimeBinding {
         if current_workspace_id != execution.workspace_id {
             anyhow::bail!("launch catalog Turn workspace differs from execution");
         }
-        let read_authority = processor
-            .thread_read_authority_for_agent(
-                &TurnToolContext {
-                    workspace_id: execution.workspace_id.clone(),
-                    thread_id: current_thread_id.clone(),
-                    turn_id: turn_id.to_owned(),
-                },
-                Some(&facts),
-                true,
+        // Catalog preparation also serves reviewers, whose purpose grant does
+        // not include Threads reads. They get no destination metadata; roles
+        // that can read still pass the full current-authority checks below.
+        let read_action = crate::authorization::ResourceAction::ThreadRead;
+        let can_read_targets = authority.grants_action(read_action)
+            && facts
+                .agent_authorization_allowed_actions
+                .iter()
+                .any(|name| name == read_action.safe_name())
+            && crate::authorization::RoleDefinitionRegistry::new()
+                .agent_policy_allows(&facts.agent_authorization_role_key, read_action);
+        let read_authority = if can_read_targets {
+            Some(
+                processor
+                    .thread_read_authority_for_agent(
+                        &TurnToolContext {
+                            workspace_id: execution.workspace_id.clone(),
+                            thread_id: current_thread_id.clone(),
+                            turn_id: turn_id.to_owned(),
+                        },
+                        Some(&facts),
+                        true,
+                    )
+                    .await?,
             )
-            .await?;
+        } else {
+            None
+        };
         let mut target_titles = std::collections::BTreeMap::new();
         for thread_id in [&current_thread_id, &execution.home_root_thread_id] {
-            if processor
-                .thread_source_readable(&read_authority, thread_id)
-                .await?
+            if let Some(read_authority) = read_authority.as_ref()
+                && processor
+                    .thread_source_readable(read_authority, thread_id)
+                    .await?
             {
                 if let Some(thread) = processor.crud_store.get_thread_model(thread_id).await? {
                     target_titles.insert(thread.id, thread.name);
@@ -261,9 +279,10 @@ impl AgentActionRuntimeBinding {
                 if thread.workspace_id != execution.workspace_id {
                     continue;
                 }
-                if processor
-                    .thread_source_readable(&read_authority, &thread.id)
-                    .await?
+                if let Some(read_authority) = read_authority.as_ref()
+                    && processor
+                        .thread_source_readable(read_authority, &thread.id)
+                        .await?
                 {
                     target_titles.insert(thread.id.clone(), thread.name.clone());
                 }
@@ -348,8 +367,9 @@ impl AgentActionRuntimeBinding {
                 continue;
             }
             if projection.disclosure.allows_anything()
+                && let Some(read_authority) = read_authority.as_ref()
                 && processor
-                    .thread_source_readable(&read_authority, &destination.id)
+                    .thread_source_readable(read_authority, &destination.id)
                     .await?
             {
                 target_titles.insert(destination.id, destination.name);
