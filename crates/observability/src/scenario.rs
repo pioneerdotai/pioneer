@@ -145,13 +145,15 @@ impl Correlation {
         let _guard = self.context().attach();
         f()
     }
-    pub async fn scope<F: Future>(&self, future: F) -> F::Output {
-        let mut future = std::pin::pin!(future);
-        std::future::poll_fn(|cx| {
+    pub fn scope<F: Future>(&self, future: F) -> impl Future<Output = F::Output> {
+        // Allocate before building the scope future. Large runtime futures must
+        // not be embedded again in every nested correlation wrapper: moving
+        // those inline states can exhaust an executor thread's stack.
+        let mut future = Box::pin(future);
+        std::future::poll_fn(move |cx| {
             let _guard = self.context().attach();
             future.as_mut().poll(cx)
         })
-        .await
     }
 }
 
