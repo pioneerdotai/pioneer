@@ -2236,12 +2236,6 @@ async fn unrelated_committed_policy_change_reauthorizes_same_audio_without_loss(
 
 #[tokio::test]
 async fn domain_finalize_drains_slow_tail_with_recording_and_buffered_recognizer() {
-    // nextest isolates this test in its own process. Keep the correlated raw
-    // diagnostic from spawned finalizers when the public result hides it.
-    let _ = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::WARN)
-        .with_test_writer()
-        .try_init();
     for buffered in [false, true] {
         let phase = std::cell::Cell::new("fixture setup");
         tokio::time::timeout(Duration::from_secs(60), async {
