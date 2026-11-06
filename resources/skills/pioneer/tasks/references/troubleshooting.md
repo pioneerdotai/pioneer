@@ -8,6 +8,8 @@ Use this reference after confusing durable task behavior, missing delivered resu
 - `task_wait` Says There Is Nothing To Wait For
 - Task Tool Schema Error
 - Existing Scheduled Task Needs Editing
+- Recurrence Disappeared After An Extra Check
+- Pause Did Not Return A Paused Trigger
 - Duplicate Or Noisy Scheduled Messages
 - Delivery Update Did Not Affect Previous Run
 - Stuck Or Failed Task
@@ -75,6 +77,20 @@ For delivery-only changes, patch only `deliveryPolicy`.
 
 For prompt changes on scheduled tasks, ensure `instructions` and `outputInstructions` remain self-contained for future runs.
 
+## Recurrence Disappeared After An Extra Check
+
+Inspect the saved trigger with `task_get`. If an interval/cron trigger was replaced
+with `immediate` or `scheduled_at`, restore the user-requested recurring schedule
+and verify its next fire time. Follow [Schedule Changes And Extra Runs](delivery-and-scheduled.md#schedule-changes-and-extra-runs)
+for the intended workflow.
+
+## Pause Did Not Return A Paused Trigger
+
+Check [`scheduleOutcome`](tool-schemas.md#task_pause-and-task_resume) and the
+remaining schedule. `no_future_firings` is valid for an exhausted one-shot;
+`not_applied` or an error does not confirm a pause. See
+[Pausing And Resuming Schedules](delivery-and-scheduled.md#pausing-and-resuming-schedules).
+
 ## Duplicate Or Noisy Scheduled Messages
 
 If a recurring task posts too much:
@@ -127,30 +143,3 @@ If there was no active work, a completed task without a new run or result is exp
 Do not repeatedly finish, create a replacement task, or independently post to the delivery thread merely because work or delivery is pending. A repeated finish is safe, but it does not force completion or re-delivery. Resume, update and reschedule after finish are rejected. Use explicit cancel under its existing permissions if the user now wants remaining work interrupted.
 
 A permitted execution can finish its own task. `task_cancel` still rejects self-cancellation and ancestor cancellation; finish does not remove ancestor or scope protections. For `task_access_denied`, inspect the current permissions and scope. For `task_state_conflict`, reload state and preserve the permanent stop decision.
-
-## Additional runs and schedule control
-
-For an extra check now on an existing task, call `task_run_now` with `taskId`.
-It queues an additional run with the saved instructions, delivery and limits,
-without changing recurrence or the next planned fire. It does not resume paused
-or blocked work, reopen terminal tasks, or override a finish request. A returned
-`runId` confirms durable admission, not completion; current work is not cancelled.
-Repeat the same invocation identity after a lost response, rather than inventing
-a new call for the same operation.
-
-`task_reschedule` explicitly replaces the schedule. `task_update` can also replace
-its trigger while patching other fields. An immediate or scheduled_at replacement
-is one-shot and removes recurrence. For an early first check followed by recurring
-checks, save an interval/cron trigger and use `task_run_now` for the extra check.
-Recurrence must be present in trigger settings; instructions alone do not schedule
-future runs. When creating an analogous monitor, inspect the original configuration
-and preserve its schedule and all other requested settings explicitly.
-
-Pause affects future schedule firings and leaves current runs running. Its
-`scheduleOutcome` describes the confirmed operation state: `paused`,
-`no_future_firings` (an exhausted one-shot is valid here), or `not_applied`
-(for example a terminal task). Errors also mean the operation was not confirmed.
-Do not demand the literal trigger status `paused` when no future firings remain.
-Pause does not cancel queued work or prohibit later rescheduling. Ordinary resume
-preserves the configured interval/cron trigger; it does not turn recurrence into a
-one-shot. Use `task_get` to inspect settings after changes.
