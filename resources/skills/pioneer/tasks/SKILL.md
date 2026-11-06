@@ -36,7 +36,7 @@ Before using durable task tools, decide what kind of task work this is.
 
 1. If work should run later or repeatedly, use `task_create` to create a scheduled, interval, or cron task with self-contained future-run instructions.
 2. If existing task behavior must change, inspect it first with `task_get` or `task_list`.
-3. If only the schedule changes, use `task_reschedule` when available.
+3. For an extra run now, use `task_run_now` when available. To replace the schedule, use `task_reschedule`.
 4. If delivery changes, patch only delivery and verify it.
 5. If the task should be temporarily stopped or restarted, use pause/resume tools when visible.
 6. If the user asks to stop permanently while letting current work finish, use `task_finish` when visible. Use `task_cancel` when the user wants cancellation under its existing interruption rules.
@@ -52,7 +52,7 @@ For an inbound HTTP webhook, create an agent task with `trigger: {"kind":"extern
 Keep this file in context for normal durable task work. Load detailed references only for the matching situation:
 
 - Read `references/tool-schemas.md` before constructing non-trivial durable task payloads, after schema errors, or when exact field names matter.
-- Read `references/delivery-and-scheduled.md` before creating or updating scheduled/interval/cron tasks, changing delivery, choosing notification vs thread delivery, or diagnosing why a result did not appear in the main thread.
+- Read [references/delivery-and-scheduled.md](references/delivery-and-scheduled.md) before creating or updating scheduled/interval/cron tasks, requesting an extra run, pausing/resuming schedules, or changing delivery.
 - Read `references/troubleshooting.md` after task tool failures, missing final answers, hidden results, noisy recurring messages, delivery confusion, or stuck/stale tasks.
 
 For current-turn attached child agents, read `system:pioneer/subagents`.
@@ -174,30 +174,3 @@ Do not invent a run result for a scheduled task that has not run yet.
 - Scheduled task instructions must be self-contained.
 - Do not claim a task was created, updated, paused, resumed, rescheduled, cancelled, or delivered unless the relevant tool succeeded.
 - A successful `task_finish` confirms the stop decision; report work completion and delivery only from their own observed state.
-
-## Additional runs and schedule control
-
-For an extra check now on an existing task, call `task_run_now` with `taskId`.
-It queues an additional run with the saved instructions, delivery and limits,
-without changing recurrence or the next planned fire. It does not resume paused
-or blocked work, reopen terminal tasks, or override a finish request. A returned
-`runId` confirms durable admission, not completion; current work is not cancelled.
-Repeat the same invocation identity after a lost response, rather than inventing
-a new call for the same operation.
-
-`task_reschedule` explicitly replaces the schedule. `task_update` can also replace
-its trigger while patching other fields. An immediate or scheduled_at replacement
-is one-shot and removes recurrence. For an early first check followed by recurring
-checks, save an interval/cron trigger and use `task_run_now` for the extra check.
-Recurrence must be present in trigger settings; instructions alone do not schedule
-future runs. When creating an analogous monitor, inspect the original configuration
-and preserve its schedule and all other requested settings explicitly.
-
-Pause affects future schedule firings and leaves current runs running. Its
-`scheduleOutcome` describes the confirmed operation state: `paused`,
-`no_future_firings` (an exhausted one-shot is valid here), or `not_applied`
-(for example a terminal task). Errors also mean the operation was not confirmed.
-Do not demand the literal trigger status `paused` when no future firings remain.
-Pause does not cancel queued work or prohibit later rescheduling. Ordinary resume
-preserves the configured interval/cron trigger; it does not turn recurrence into a
-one-shot. Use `task_get` to inspect settings after changes.

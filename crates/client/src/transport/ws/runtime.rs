@@ -17,18 +17,27 @@ pub(crate) struct SocketReceipt {
     scope: ConnectionScope,
     live: Arc<Mutex<bool>>,
     cancels: tokio::sync::mpsc::Sender<SocketCancel>,
+    voice_cancels: tokio::sync::mpsc::Sender<SocketCancel>,
     cancel_slots: Arc<tokio::sync::Semaphore>,
+    voice_cancel_slots: Arc<tokio::sync::Semaphore>,
+    voice: tokio::sync::mpsc::Sender<super::voice_budget::QueuedVoiceAudio>,
 }
 impl SocketReceipt {
     pub(crate) fn new(connection: u64) -> (Self, SocketCancelReceiver) {
         static NEXT: AtomicU64 = AtomicU64::new(1);
         let (cancels, receiver) = tokio::sync::mpsc::channel(SOCKET_CANCEL_CAPACITY);
+        let (voice_cancels, voice_receiver) = tokio::sync::mpsc::channel(SOCKET_CANCEL_CAPACITY);
         let cancel_slots = Arc::new(tokio::sync::Semaphore::new(SOCKET_CANCEL_CAPACITY));
+        let voice_cancel_slots = Arc::new(tokio::sync::Semaphore::new(SOCKET_CANCEL_CAPACITY));
         let live = Arc::new(Mutex::new(true));
+        let (voice, voice_rx) = tokio::sync::mpsc::channel(128);
         let owner = SocketCancelReceiver {
             receiver,
+            voice_receiver,
+            voice: Some(voice_rx),
             live: live.clone(),
             slots: cancel_slots.clone(),
+            voice_slots: voice_cancel_slots.clone(),
         };
         (
             Self {
@@ -42,10 +51,24 @@ impl SocketReceipt {
                 },
                 live,
                 cancels,
+                voice_cancels,
                 cancel_slots,
+                voice_cancel_slots,
+                voice,
             },
             owner,
         )
+    }
+
+    pub(crate) fn admit_voice(
+        &self,
+        payload: super::voice_budget::QueuedVoiceAudio,
+    ) -> anyhow::Result<()> {
+        let live = self.live.lock().unwrap();
+        anyhow::ensure!(*live, "voice socket retired");
+        self.voice
+            .try_send(payload)
+            .map_err(|_| anyhow::anyhow!("voice socket capacity full or retired"))
     }
 
     pub(crate) fn admit_cancel(
@@ -61,7 +84,17 @@ impl SocketReceipt {
             let _ = response.send(Err(crate::rpc::JsonRpcResponseError::transport(message)));
             return Err(message.into());
         }
-        let slot = match self.cancel_slots.clone().try_acquire_owned() {
+        let voice_cancel = serde_json::from_str::<serde_json::Value>(&payload)
+            .ok()
+            .is_some_and(|v| {
+                v["method"] == pioneer_protocol::constants::methods::VOICE_SESSION_CANCEL
+            });
+        let slots = if voice_cancel {
+            &self.voice_cancel_slots
+        } else {
+            &self.cancel_slots
+        };
+        let slot = match slots.clone().try_acquire_owned() {
             Ok(slot) => slot,
             Err(_) => {
                 let message = "websocket Cancel capacity full or retired";
@@ -75,7 +108,12 @@ impl SocketReceipt {
             return Err("websocket Cancel request retired".into());
         }
         let fallback = response.clone();
-        self.cancels
+        let mailbox = if voice_cancel {
+            &self.voice_cancels
+        } else {
+            &self.cancels
+        };
+        mailbox
             .try_send(SocketCancel {
                 request_id,
                 payload,
@@ -94,21 +132,27 @@ impl SocketReceipt {
     pub(crate) fn retire(&self) {
         *self.live.lock().unwrap() = false;
         self.cancel_slots.close();
+        self.voice_cancel_slots.close();
     }
     fn is_current(&self) -> bool {
         *self.live.lock().unwrap()
     }
 }
-/// Only this exact canonical method bypasses queued ordinary commands. This
+/// Only exact turn/voice Cancel methods bypass queued ordinary commands. This
 /// selects transport admission, not request validity or gateway authorization.
-pub(super) fn is_turn_cancel(payload: &str) -> bool {
+pub(super) fn is_domain_cancel(payload: &str) -> bool {
     #[derive(serde::Deserialize)]
     struct Method<'a> {
         #[serde(borrow)]
         method: std::borrow::Cow<'a, str>,
     }
-    serde_json::from_str::<Method<'_>>(payload)
-        .is_ok_and(|request| request.method == pioneer_protocol::constants::methods::TURN_CANCEL)
+    serde_json::from_str::<Method<'_>>(payload).is_ok_and(|request| {
+        matches!(
+            request.method.as_ref(),
+            pioneer_protocol::constants::methods::TURN_CANCEL
+                | pioneer_protocol::constants::methods::VOICE_SESSION_CANCEL
+        )
+    })
 }
 
 pub(crate) struct SocketCancel {
@@ -119,14 +163,31 @@ pub(crate) struct SocketCancel {
 
 pub(crate) struct SocketCancelReceiver {
     pub(super) receiver: tokio::sync::mpsc::Receiver<SocketCancel>,
+    pub(super) voice_receiver: tokio::sync::mpsc::Receiver<SocketCancel>,
+    pub(super) voice: Option<tokio::sync::mpsc::Receiver<super::voice_budget::QueuedVoiceAudio>>,
     live: Arc<Mutex<bool>>,
     slots: Arc<tokio::sync::Semaphore>,
+    voice_slots: Arc<tokio::sync::Semaphore>,
+}
+impl SocketCancelReceiver {
+    pub(super) async fn recv(&mut self) -> Option<SocketCancel> {
+        tokio::select! { item = self.receiver.recv() => item, item = self.voice_receiver.recv() => item }
+    }
 }
 impl Drop for SocketCancelReceiver {
     fn drop(&mut self) {
         *self.live.lock().unwrap() = false;
         self.slots.close();
+        self.voice_slots.close();
         self.receiver.close();
+        self.voice_receiver.close();
+        while let Ok(command) = self.voice_receiver.try_recv() {
+            let _ = command
+                .response
+                .send(Err(crate::rpc::JsonRpcResponseError::transport(
+                    "voice Cancel owner dropped",
+                )));
+        }
         while let Ok(command) = self.receiver.try_recv() {
             let _ = command
                 .response

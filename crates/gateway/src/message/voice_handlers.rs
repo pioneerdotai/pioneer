@@ -186,6 +186,24 @@ impl MessageProcessor {
             return;
         }
 
+        // Keep at most one pending audio-overload outcome per physical owner.
+        // The ingress worker removes this short-lived failed session after its
+        // terminal notification is admitted to outbound (or transport retires).
+        if self.voice_sessions.has_failed_ingress(connection_id) {
+            self.send_voice_error(
+                connection_id,
+                request_id,
+                INVALID_REQUEST_CODE,
+                methods::VOICE_SESSION_START,
+                VoiceError {
+                    kind: VoiceErrorKind::GatewayBusy,
+                    message: "voice ingress failure is retiring".to_owned(),
+                    public_error: None,
+                },
+            )
+            .await;
+            return;
+        }
         let session_id = format!("voice_{}", generate_id(21));
         let session = match self.voice_sessions.create_authenticated_session(
             session_id.clone(),
@@ -404,10 +422,116 @@ impl MessageProcessor {
                 return;
             }
 
-            if let Err(error) = self
-                .voice_sessions
-                .mark_finalizing_authenticated(params.session_id.as_str(), &owner)
+            pending_session.ingress.seal();
+            pending_session.ingress.drain().await;
+            // The fence may wait on canonical chunk authorization or ACK delivery.
+            // Neither the original access credential nor the pre-fence resource
+            // proof is a lasting permit across that wait.
+            let current = self.session_manager.connection_context(connection_id).await;
+            let lease_live = if let Ok(current) = &current {
+                if let Some(auth) = &self.auth_service {
+                    auth.validate_session_lease(current.principal())
+                        .await
+                        .is_ok()
+                } else {
+                    true
+                }
+            } else {
+                false
+            };
+            if !lease_live
+                || !self
+                    .revalidate_voice_thread_access(
+                        request_context,
+                        pending_session.workspace_id.as_str(),
+                        pending_session.thread_id.as_str(),
+                    )
+                    .await
             {
+                self.send_voice_error(
+                    connection_id,
+                    request_id,
+                    INVALID_REQUEST_CODE,
+                    methods::VOICE_SESSION_FINALIZE,
+                    VoiceError {
+                        kind: VoiceErrorKind::InvalidSession,
+                        message: "voice session target is unavailable".to_owned(),
+                        public_error: None,
+                    },
+                )
+                .await;
+                return;
+            }
+            let mut transition = None;
+            for _ in 0..3 {
+                let generation = self.authorization_invalidation_hub.observed_revision();
+                if !self
+                    .revalidate_voice_thread_access(
+                        request_context,
+                        pending_session.workspace_id.as_str(),
+                        pending_session.thread_id.as_str(),
+                    )
+                    .await
+                {
+                    break;
+                }
+                let Ok(current) = self.session_manager.connection_context(connection_id).await
+                else {
+                    return;
+                };
+                if let Some(auth) = &self.auth_service {
+                    if auth
+                        .validate_session_lease(current.principal())
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                let attempt =
+                    self.session_manager
+                        .with_voice_ingress_connection(
+                            connection_id,
+                            request_context.principal(),
+                            || {
+                                if self.authorization_invalidation_hub.observed_revision()
+                                    != generation
+                                {
+                                    return None;
+                                }
+                                Some(self.voice_sessions.mark_finalizing_authenticated(
+                                    params.session_id.as_str(),
+                                    &owner,
+                                ))
+                            },
+                        )
+                        .await;
+                match attempt {
+                    Some(Some(result)) => {
+                        transition = Some(result);
+                        break;
+                    }
+                    None => return,
+                    Some(None) => continue,
+                }
+            }
+            let Some(transition) = transition else {
+                self.reject_voice_authorization(&pending_session).await;
+                self.send_voice_error(
+                    connection_id,
+                    request_id,
+                    INVALID_REQUEST_CODE,
+                    methods::VOICE_SESSION_FINALIZE,
+                    VoiceError {
+                        kind: VoiceErrorKind::InvalidSession,
+                        message: "voice authorization could not be established".into(),
+                        public_error: None,
+                    },
+                )
+                .await;
+                return;
+            };
+            if let Err(error) = transition {
                 self.send_voice_error(
                     connection_id,
                     request_id,
@@ -1240,13 +1364,30 @@ impl MessageProcessor {
                 pioneer_protocol::PublicErrorStage::Execution,
             ));
         }
-        self.send_thread_scoped_notification_to_connections(
-            thread_id,
-            events::VOICE_SESSION_RESULT,
-            &notification,
-            vec![connection_id],
-        )
-        .await;
+        if self
+            .authorized_thread_connection_recipients(thread_id, vec![connection_id])
+            .await
+            .is_empty()
+        {
+            return;
+        }
+        // A terminal recording outcome is addressed to its authenticated
+        // physical owner, not ordinary notification fanout. Its capacity and
+        // lifecycle checks are the same as audio ACK/overflow delivery.
+        if let Ok(text) =
+            JsonRpcNotification::from_params(events::VOICE_SESSION_RESULT, &notification)
+                .and_then(|notification| serde_json::to_string(&notification))
+        {
+            let _ = self
+                .session_manager
+                .send_voice_text_authorized(connection_id, text, true, || async {
+                    !self
+                        .authorized_thread_connection_recipients(thread_id, vec![connection_id])
+                        .await
+                        .is_empty()
+                })
+                .await;
+        }
     }
 
     async fn send_voice_error(
