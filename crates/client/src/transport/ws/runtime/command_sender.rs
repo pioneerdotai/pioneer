@@ -25,7 +25,7 @@ impl crate::rpc::JsonRpcRequestTransport for GatewayWsCommandSender {
         if let Some(transport) = self.test_requests.lock().unwrap().clone() {
             return transport.send_json_rpc_request(request_id, payload, response_tx);
         }
-        if is_turn_cancel(&payload) {
+        if is_domain_cancel(&payload) {
             let Some(receipt) = self.socket.lock().unwrap().clone() else {
                 let message = "websocket Cancel socket unavailable";
                 let _ = response_tx.send(Err(crate::rpc::JsonRpcResponseError::transport(message)));
@@ -1169,12 +1169,17 @@ impl GatewayWsCommandSender {
             &pcm_chunk,
         )?;
         let payload = self.voice_budget.admit(payload)?;
-        self.command_tx
-            .send(GatewayWsCommand::VoiceBinaryChunk {
-                expected_connection: Some(connection),
-                payload,
-            })
-            .map_err(|_| anyhow!("websocket worker is not available"))
+        let receipt = self
+            .socket
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| anyhow!("voice socket unavailable"))?;
+        anyhow::ensure!(
+            receipt.scope.connection == connection,
+            "voice socket replaced"
+        );
+        receipt.admit_voice(payload)
     }
 
     pub fn send_voice_audio_chunk(
@@ -1195,14 +1200,13 @@ impl GatewayWsCommandSender {
             pcm_chunk.as_slice(),
         )?;
         let payload = self.voice_budget.admit(payload)?;
-        self.command_tx
-            .send(GatewayWsCommand::VoiceBinaryChunk {
-                expected_connection: None,
-                payload,
-            })
-            .map_err(|_| anyhow!("websocket worker is not available"))?;
-
-        Ok(())
+        let receipt = self
+            .socket
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| anyhow!("voice socket unavailable"))?;
+        receipt.admit_voice(payload)
     }
 
     pub fn prepare_composer_turn_with_file_system(
@@ -1316,6 +1320,101 @@ fn http_access_from_spec(
 mod connection_generation_tests {
     use super::*;
     #[tokio::test]
+    async fn cancel_classes_retain_independent_response_lifetimes_bound_and_unbound() {
+        use crate::rpc::JsonRpcRequestTransport;
+        use pioneer_protocol::constants::methods;
+        for bound in [false, true] {
+            for voice_first in [false, true] {
+                let client = GatewayWsClient::new();
+                let sender = client.command_sender();
+                let (receipt, mut owner) = SocketReceipt::new(7);
+                *sender.socket.lock().unwrap() = Some(receipt.clone());
+                sender.connection_generations.lock().unwrap().active = Some(7);
+                let transport: Box<dyn JsonRpcRequestTransport> = if bound {
+                    Box::new(sender.requests_for_connection(7))
+                } else {
+                    Box::new(sender)
+                };
+                let methods = if voice_first {
+                    [methods::VOICE_SESSION_CANCEL, methods::TURN_CANCEL]
+                } else {
+                    [methods::TURN_CANCEL, methods::VOICE_SESSION_CANCEL]
+                };
+                let mut requests = Vec::new();
+                let mut responses = Vec::new();
+                for (index, method) in methods.iter().enumerate() {
+                    let id = format!("cancel-class-{index}");
+                    let payload =
+                        serde_json::json!({"jsonrpc":"2.0","id":id,"method":method,"params":{}})
+                            .to_string();
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    transport
+                        .send_json_rpc_request(
+                            id,
+                            payload,
+                            crate::rpc::JsonRpcResponseSender::new(
+                                tx,
+                                std::time::Instant::now() + Duration::from_secs(30),
+                            ),
+                        )
+                        .unwrap();
+                    requests.push(owner.recv().await.unwrap());
+                    responses.push(rx);
+                }
+                assert!(requests[0].response.is_active());
+                requests[1]
+                    .response
+                    .send(Ok(serde_json::json!({"cancelled":true})))
+                    .unwrap();
+                assert_eq!(responses[1].try_recv().unwrap().unwrap()["cancelled"], true);
+                assert!(requests[0].response.is_active());
+                requests[0].response.cancel();
+                assert!(!requests[0].response.is_active());
+                assert!(receipt.cancel_slots.available_permits() == 1);
+                assert!(receipt.voice_cancel_slots.available_permits() == 1);
+                for method in methods {
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    let expired =
+                        crate::rpc::JsonRpcResponseSender::new(tx, std::time::Instant::now());
+                    assert!(transport.send_json_rpc_request("expired-control".into(),
+                        serde_json::json!({"jsonrpc":"2.0","id":"expired-control","method":method,"params":{}}).to_string(), expired).is_err());
+                    assert!(rx.try_recv().unwrap().is_err());
+                }
+                // A retired item may still occupy its own mailbox, but cannot
+                // consume the other class's guaranteed mailbox or writer claim.
+                let (tx, _rx) = std::sync::mpsc::channel();
+                let stale = crate::rpc::JsonRpcResponseSender::new(
+                    tx,
+                    std::time::Instant::now() + Duration::from_secs(30),
+                );
+                transport.send_json_rpc_request("stale-control".into(),
+                    serde_json::json!({"jsonrpc":"2.0","id":"stale-control","method":methods[0],"params":{}}).to_string(), stale.clone()).unwrap();
+                stale.cancel();
+                let (tx, rx) = std::sync::mpsc::channel();
+                transport.send_json_rpc_request("other-control".into(),
+                    serde_json::json!({"jsonrpc":"2.0","id":"other-control","method":methods[1],"params":{}}).to_string(),
+                    crate::rpc::JsonRpcResponseSender::new(tx,std::time::Instant::now()+Duration::from_secs(30))).unwrap();
+                for _ in 0..2 {
+                    let request = owner.recv().await.unwrap();
+                    if request.request_id == "stale-control" {
+                        assert!(!request.response.try_start_write());
+                    } else {
+                        request
+                            .response
+                            .send(Ok(serde_json::json!({"cancelled":true})))
+                            .unwrap();
+                    }
+                }
+                assert_eq!(rx.try_recv().unwrap().unwrap()["cancelled"], true);
+                assert_eq!(receipt.cancel_slots.available_permits(), 1);
+                assert_eq!(receipt.voice_cancel_slots.available_permits(), 1);
+                drop(owner);
+                assert!(!receipt.is_current());
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn typed_turn_cancel_uses_exact_socket_admission_for_bound_and_unbound_callers() {
         for bound in [false, true] {
             let client = GatewayWsClient::new();
@@ -1338,7 +1437,7 @@ mod connection_generation_tests {
                     },
                 )
             });
-            let request = tokio::time::timeout(Duration::from_secs(3), owner.receiver.recv())
+            let request = tokio::time::timeout(Duration::from_secs(3), owner.recv())
                 .await
                 .unwrap()
                 .unwrap();
@@ -1861,7 +1960,7 @@ impl crate::rpc::JsonRpcRequestTransport for ConnectionRequestTransport {
         if let Some(transport) = self.sender.test_requests.lock().unwrap().clone() {
             return transport.send_json_rpc_request(request_id, payload, response_tx);
         }
-        if is_turn_cancel(&payload) {
+        if is_domain_cancel(&payload) {
             if self.sender.connection_generations.lock().unwrap().active != Some(self.connection) {
                 response_tx.cancel();
                 return Err("websocket Cancel route retired".into());
