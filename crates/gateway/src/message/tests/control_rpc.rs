@@ -2274,13 +2274,17 @@ async fn domain_finalize_drains_slow_tail_with_recording_and_buffered_recognizer
             }));
             f.processor = Arc::new(processor);
             let settings_context = registered_request_context(&f.processor, f.connection, "settings/update").await;
-            f.processor.update_gateway_settings(&settings_context, pioneer_protocol::GatewaySettingsUpdate {
+            let settings = f.processor.update_gateway_settings(&settings_context, pioneer_protocol::GatewaySettingsUpdate {
                 voice_input: Some(pioneer_protocol::GatewayVoiceInputSettingsUpdate {
                     enabled: Some(true), provider: Some(Some(pioneer_protocol::GatewayVoiceInputProvider::Local)),
                     model: Some(Some("moonshine-base".into())),
                     transcribe_while_recording: Some(!buffered), ..Default::default()
                 }), ..Default::default()
             }).await.unwrap();
+            assert_eq!(settings.voice_input.transcribe_while_recording, !buffered);
+            let mut effective = settings.voice_input.clone();
+            f.processor.apply_persisted_voice_input_mode(&mut effective).unwrap();
+            assert_eq!(effective.transcribe_while_recording, !buffered);
             assert!(f.processor.thread_manager.subscribe_connection(THREAD, f.connection).await);
             phase.set("start recording");
             let started = start_test_voice_session(&f.processor, f.connection, &mut f.responses,
@@ -2320,7 +2324,23 @@ async fn domain_finalize_drains_slow_tail_with_recording_and_buffered_recognizer
                     // but VAD still retains a partial 512-sample frame. The extra
                     // packet crosses the stride before we gate the final prefix.
                     phase.set("recording recognizer entry");
-                    native_entered.notified().await;
+                    if tokio::time::timeout(Duration::from_secs(5), native_entered.notified()).await.is_err() {
+                        // Finish the real worker before reporting a missing preview.
+                        // Its outcome distinguishes failed processing from a worker
+                        // that only enters inference once Commit closes its inbox.
+                        native_release.release();
+                        let completion = f.processor.voice_session_buffers
+                            .finish_processing_verified(&started.session_id, None).unwrap();
+                        let outcome = completion.await.unwrap().outcome;
+                        let diagnostic = match outcome {
+                            Err(error) => format!("worker failed: {error:?}"),
+                            Ok(crate::voice::incremental::GatewayVoiceSessionPipelineOutcome::Transcript { transcript, .. }) =>
+                                format!("worker completed: {:?}", transcript.diagnostics),
+                            Ok(crate::voice::incremental::GatewayVoiceSessionPipelineOutcome::NoSpeech { no_speech, .. }) =>
+                                format!("worker detected no speech: {no_speech:?}"),
+                        };
+                        panic!("recording preview did not enter inference before Commit; calls={}, {diagnostic}", calls.load(std::sync::atomic::Ordering::SeqCst));
+                    }
                 }
                 let (entered, at_proof) = tokio::sync::oneshot::channel();
                 let (release, resumed) = tokio::sync::oneshot::channel();
