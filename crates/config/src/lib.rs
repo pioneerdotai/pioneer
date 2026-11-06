@@ -4257,8 +4257,8 @@ hard_secs = 0
         assert_eq!(config.provider_stream_items.hard_secs, 1_800);
     }
 
-    // Contract: older config files retain eight hours; user layers may override
-    // it, but invalid durations cannot accidentally admit unbounded warming.
+    // Contract: shipped defaults use 24 hours, while older config files retain
+    // eight hours. User layers may override either; invalid durations are rejected.
     // Existing resilience tests exercise operation deadlines, not this layer.
     #[test]
     fn conversation_compaction_window_defaults_and_user_override() {
@@ -4268,7 +4268,7 @@ hard_secs = 0
                 .gateway
                 .context_compaction
                 .hot_conversation_window_secs,
-            28_800
+            86_400
         );
         let mut legacy: toml::Value = toml::from_str(DEFAULT_CONFIG_TOML).unwrap();
         legacy["gateway"]

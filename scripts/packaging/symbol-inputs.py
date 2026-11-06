@@ -71,11 +71,14 @@ def export(args):
                 raise ValueError("empty release object debug map")
             # N_OSO lists objects/archives, but not the Clang modules referenced
             # by their DWARF when Swift bridges are built with -gmodules. Retain
-            # the PCM files from those dependencies' Cargo OUT_DIRs as well.
-            # Scope discovery to linked build outputs, not the entire target or
-            # the runner's global caches. Keep original paths for oso-prepend-path.
-            output_dirs = {parent for path in paths for parent in path.parents
-                           if parent.name == "out" and parent.parent.parent.name == "build"}
+            # their PCM files as well. Rust bundles native objects into .rlib
+            # archives in deps/, so N_OSO does not necessarily expose OUT_DIR.
+            # Include caches from this executable's Cargo target/profile build
+            # tree, including transitive modules, without scanning other targets
+            # or profiles. Keep original paths for oso-prepend-path.
+            output_dirs = {binary.parent / "build"}
+            output_dirs.update(parent for path in paths for parent in path.parents
+                               if parent.name == "out" and parent.parent.parent.name == "build")
             paths.update(module for directory in output_dirs
                          for module in directory.rglob("*.pcm"))
             for path in paths:

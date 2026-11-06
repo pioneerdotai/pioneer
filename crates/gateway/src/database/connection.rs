@@ -62,8 +62,12 @@ const WRITER_MAX_CONNECTIONS: u32 = 1;
 #[path = "query_fingerprint.rs"]
 mod query_fingerprint;
 use query_fingerprint::QueryFingerprintLimiter;
+#[path = "query_observer.rs"]
+pub(super) mod query_observer;
 #[cfg(test)]
 use query_fingerprint::QueryFingerprintState;
+#[cfg(test)]
+use query_observer::sqlite_operation;
 
 /// Existing DB owner boundary for installer preflight. No writable connection,
 /// migration execution, extension registration, startup repair or journal changes.
@@ -330,119 +334,12 @@ fn configure_observability(
     max_connections: u32,
     query_fingerprints: Arc<QueryFingerprintLimiter>,
 ) {
-    // SeaORM's callback belongs to the connection wrapper, not the SQLx pool.
-    // Keep this anchor there; the global metrics registry must not own a pool
-    // (and hence its native writer ownership) after bootstrap is discarded.
-    let pool_lifetime = Arc::new(connection.get_sqlite_connection_pool().clone());
-    let observed_pool = Arc::downgrade(&pool_lifetime);
-    connection.set_metric_callback(move |info| {
-        let _pool_lifetime = &pool_lifetime;
-        let (enabled, generation) = pioneer_observability::telemetry_consent_snapshot();
-        if !enabled {
-            return;
-        }
-        let operation = sqlite_operation(info.statement.sql.as_str());
-        let workload = super::attribution::current_database_workload();
-        let workload_name =
-            workload.unwrap_or(pioneer_observability::DatabaseWorkload::Unclassified);
-        let fingerprints = query_fingerprints.metric_fingerprint(
-            info.statement.sql.as_str(),
-            role,
-            operation,
-            workload_name,
-            info.failed,
-        );
-        pioneer_observability::query_cpu::record_fingerprint(fingerprints.canonical);
-        let query_fingerprint = fingerprints.metric;
-        super::attribution::record_database_query(
-            query_fingerprint,
-            database_query_kind(operation),
-            info.elapsed,
-        );
-        fingerprints.series.record_for_consent(
-            pioneer_observability::DatabaseOperationMetric {
-                role,
-                operation,
-                workload: workload_name,
-                query_fingerprint,
-                elapsed: info.elapsed,
-                failed: info.failed,
-            },
-            Some(generation),
-        );
-    });
+    let observer = query_observer::install_query_observer(connection, role, query_fingerprints);
     pioneer_observability::register_database_pool_observer(
         role,
         u64::from(max_connections),
-        move || {
-            let Some(pool) = observed_pool.upgrade() else {
-                return pioneer_observability::DatabasePoolSnapshot { size: 0, idle: 0 };
-            };
-            pioneer_observability::DatabasePoolSnapshot {
-                size: u64::from(pool.size()),
-                idle: u64::try_from(pool.num_idle()).unwrap_or(u64::MAX),
-            }
-        },
+        observer,
     );
-}
-
-fn database_query_kind(
-    operation: pioneer_observability::DatabaseOperation,
-) -> pioneer_observability::DatabaseQueryKind {
-    use pioneer_observability::{DatabaseOperation, DatabaseQueryKind};
-
-    match operation {
-        DatabaseOperation::Select | DatabaseOperation::Pragma => DatabaseQueryKind::Read,
-        DatabaseOperation::Insert
-        | DatabaseOperation::Update
-        | DatabaseOperation::Delete
-        | DatabaseOperation::Replace
-        | DatabaseOperation::Transaction
-        | DatabaseOperation::Schema => DatabaseQueryKind::Write,
-        DatabaseOperation::Other => DatabaseQueryKind::Other,
-    }
-}
-
-fn sqlite_operation(sql: &str) -> pioneer_observability::DatabaseOperation {
-    use pioneer_observability::DatabaseOperation;
-
-    let token = sql
-        .trim_start()
-        .split(|character: char| !character.is_ascii_alphabetic())
-        .next()
-        .unwrap_or_default();
-    if token.eq_ignore_ascii_case("select") || token.eq_ignore_ascii_case("explain") {
-        DatabaseOperation::Select
-    } else if token.eq_ignore_ascii_case("insert") {
-        DatabaseOperation::Insert
-    } else if token.eq_ignore_ascii_case("update") {
-        DatabaseOperation::Update
-    } else if token.eq_ignore_ascii_case("delete") {
-        DatabaseOperation::Delete
-    } else if token.eq_ignore_ascii_case("replace") {
-        DatabaseOperation::Replace
-    } else if token.eq_ignore_ascii_case("begin")
-        || token.eq_ignore_ascii_case("commit")
-        || token.eq_ignore_ascii_case("rollback")
-        || token.eq_ignore_ascii_case("savepoint")
-        || token.eq_ignore_ascii_case("release")
-    {
-        DatabaseOperation::Transaction
-    } else if token.eq_ignore_ascii_case("create")
-        || token.eq_ignore_ascii_case("alter")
-        || token.eq_ignore_ascii_case("drop")
-        || token.eq_ignore_ascii_case("vacuum")
-        || token.eq_ignore_ascii_case("reindex")
-        || token.eq_ignore_ascii_case("analyze")
-        || token.eq_ignore_ascii_case("attach")
-        || token.eq_ignore_ascii_case("detach")
-    {
-        DatabaseOperation::Schema
-    } else if token.eq_ignore_ascii_case("pragma") {
-        DatabaseOperation::Pragma
-    } else {
-        DatabaseOperation::Other
-    }
 }
 
 pub(crate) fn gateway_database_path(
