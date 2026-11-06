@@ -41,6 +41,10 @@ jobs:
           targets: ${{ matrix.target }}
           components: rustfmt
 
+      - name: test-macos-symbol-inputs
+        if: runner.os == 'macOS'
+        run: python3 -m unittest discover -s scripts/packaging -p 'test_symbol_inputs.py' -v
+
       - name: rust-cache
         uses: Swatinem/rust-cache@v2
         with:

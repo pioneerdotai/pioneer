@@ -19,9 +19,9 @@ inputs = runpy.run_path(str(Path(__file__).with_name("symbol-inputs.py")))
 
 
 class ReleaseInputTests(unittest.TestCase):
-    @unittest.skipUnless(sys.platform == "darwin" and shutil.which("xcrun"),
-                         "requires the macOS compiler and dsymutil")
-    def test_macho_module_debug_info_survives_transfer_without_original_build(self):
+    @unittest.skipUnless(sys.platform == "darwin" and shutil.which("xcrun")
+                         and shutil.which("rustc"), "requires macOS tools and rustc")
+    def test_rlib_module_debug_info_survives_transfer_without_original_build(self):
         repository = Path(__file__).resolve().parents[2]
         script = Path(__file__).with_name("symbol-inputs.py").resolve()
         with tempfile.TemporaryDirectory() as directory:
@@ -32,18 +32,41 @@ class ReleaseInputTests(unittest.TestCase):
             (output / "value.h").write_text("typedef struct { int number; } FixtureValue;\n")
             (output / "module.modulemap").write_text(
                 'module Fixture { header "value.h" export * }\n')
-            source = root / "main.m"
-            source.write_text('@import Fixture; int main(void) { '
+            source = root / "bridge.m"
+            source.write_text('@import Fixture; int bridge(void) { '
                               'FixtureValue value = {1}; return value.number; }\n')
-            obj = output / "main.o"
+            obj = output / "bridge.o"
             binary = root / "target/release/pioneer"
             subprocess.run(["xcrun", "clang", "-gmodules", "-fmodules",
                             "-fmodules-cache-path=" + str(cache), "-I" + str(output),
                             "-c", str(source), "-o", str(obj)], check=True)
-            subprocess.run(["xcrun", "clang", str(obj), "-o", str(binary)], check=True)
+            subprocess.run(["xcrun", "ar", "rcs", str(output / "libFixture.a"), str(obj)],
+                           check=True)
+            # rustc bundles native objects into the .rlib: the final link's OSO
+            # paths then point into deps/, concealing the original Cargo OUT_DIR.
+            library = root / "lib.rs"
+            library.write_text('#[link(name="Fixture", kind="static")]\n'
+                               'unsafe extern "C" { pub fn bridge() -> i32; }\n')
+            deps = binary.parent / "deps"
+            deps.mkdir()
+            archive = deps / "libfixture.rlib"
+            subprocess.run(["rustc", "--crate-type=rlib", "--crate-name=fixture", "-g",
+                            "-L", "native=" + str(output), str(library),
+                            "-o", str(archive)], check=True)
+            main = root / "main.c"
+            main.write_text("int bridge(void); int main(void) { return bridge(); }\n")
+            main_object = deps / "main.o"
+            subprocess.run(["xcrun", "clang", "-g", "-c", str(main),
+                            "-o", str(main_object)], check=True)
+            subprocess.run(["xcrun", "clang", str(main_object), str(archive),
+                            "-o", str(binary)], check=True)
+            debug_map = subprocess.check_output(
+                ["xcrun", "dsymutil", "--dump-debug-map", str(binary)], text=True)
+            self.assertIn(str(archive) + "(bridge.o)", debug_map)
+            self.assertNotIn(str(obj), debug_map)
             modules = list(cache.rglob("*.pcm"))
             self.assertTrue(modules, "fixture must actually depend on a Clang module")
-            unrelated = root / "target/release/build/unlinked-456/out/unused.pcm"
+            unrelated = root / "target/debug/build/bridge-456/out/unused.pcm"
             unrelated.parent.mkdir(parents=True)
             unrelated.write_bytes(b"unrelated dependency")
             transferred = root / "inputs"
