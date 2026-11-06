@@ -832,8 +832,9 @@ async fn finish_preserves_same_run_review_revision_and_acceptance() {
         )
         .is_empty()
     );
-    let parent = runtime.event_bus().closing_run_parent(&run_id);
-    parent
+    // This fixture supplies the revision execution directly. Carry its source
+    // just as the runtime does, rather than recovering an ambiguous old run.
+    source
         .scope(handle.record_pending_review_result_candidate(turn, candidate.clone(), at))
         .await
         .unwrap();

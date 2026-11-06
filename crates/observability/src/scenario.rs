@@ -89,10 +89,16 @@ impl Correlation {
         Self::from_span(SpanContext::empty_context(), epoch)
     }
     fn from_span(span: SpanContext, epoch: u64) -> Self {
+        // An invalid span is no parent. Attaching it still makes the SDK's
+        // parent-based sampler see an active, unsampled parent and drop roots.
+        let context = Context::new().with_value(ScenarioEpoch(epoch));
+        let context = if span.is_valid() {
+            context.with_remote_span_context(span)
+        } else {
+            context
+        };
         Self {
-            context: Context::new()
-                .with_remote_span_context(span)
-                .with_value(ScenarioEpoch(epoch)),
+            context,
             epoch: Some(epoch),
         }
     }
@@ -624,7 +630,7 @@ mod tests {
             let mut parent = Observation::start(
                 Scenario::Opening,
                 Boundary::Episode,
-                &Correlation::default(),
+                &Correlation::capture(),
                 &[],
             );
             let old = parent.correlation();

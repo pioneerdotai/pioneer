@@ -6674,6 +6674,13 @@ mod tests {
                     loaded.native_inputs, None,
                     "core and history cannot acknowledge native application"
                 );
+                // A visible timeline consumer owns presentation demand.
+                let _timeline_subscription = core.subscribe(
+                    ClientScope::Timeline {
+                        thread_id: "a".into(),
+                    },
+                    NonZeroUsize::new(8).unwrap(),
+                );
                 core.materialize_thread_timeline("a");
                 let content_publication = core
                     .snapshot(&ClientScope::Timeline {
@@ -15983,6 +15990,15 @@ mod tests {
                 let response = responses.recv_timeout(Duration::from_secs(2)).unwrap();
                 pioneer_observability::set_telemetry_enabled(false);
                 pioneer_observability::set_telemetry_enabled(true);
+                // Opt-in reopens only after the real SDK buffers are drained.
+                let consent_deadline = Instant::now() + Duration::from_secs(5);
+                while !pioneer_observability::telemetry_enabled() {
+                    assert!(
+                        Instant::now() < consent_deadline,
+                        "telemetry opt-in timed out"
+                    );
+                    std::thread::yield_now();
+                }
                 let (joined, ready) = core
                     .admit_thread_subscription("a", "ws", None, false, None)
                     .unwrap();

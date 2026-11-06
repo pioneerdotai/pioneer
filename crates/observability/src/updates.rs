@@ -1273,7 +1273,7 @@ mod tests {
     fn recorded(callback: impl FnOnce()) -> Vec<opentelemetry_sdk::trace::SpanData> {
         let _lock = crate::telemetry::tests::TELEMETRY_TEST_LOCK.lock().unwrap();
         let old = crate::telemetry_enabled();
-        crate::set_telemetry_enabled(true);
+        crate::set_telemetry_gate(true);
         let capture = Capture::default();
         let tracer = opentelemetry_sdk::trace::SdkTracerProvider::builder()
             .with_simple_exporter(capture.clone())
@@ -1285,7 +1285,7 @@ mod tests {
         tracer.force_flush().unwrap();
         tracer.shutdown().unwrap();
         meter.shutdown().unwrap();
-        crate::set_telemetry_enabled(old);
+        crate::set_telemetry_gate(old);
         let result = capture.0.lock().unwrap().clone();
         result
     }
@@ -1437,9 +1437,9 @@ mod tests {
             let prepared = Correlation::independent_at(input.epoch);
             let (disabled_recapture, recaptured) = old.run(|| {
                 // Keep the old valid context attached across both toggles.
-                crate::set_telemetry_enabled(false);
+                crate::set_telemetry_gate(false);
                 let disabled = Correlation::capture();
-                crate::set_telemetry_enabled(true);
+                crate::set_telemetry_gate(true);
                 (disabled, Correlation::capture())
             });
             for retired in [old.clone(), recaptured, disabled_recapture] {
@@ -1656,14 +1656,14 @@ mod tests {
                     assert!(local.hint().is_none(), "ignored payload does not prove encoded scope");
                 }
             });
-            crate::set_telemetry_enabled(false);
+            crate::set_telemetry_gate(false);
             let mut params = json!({"thread_id":"thread","_pioneer_update":wire});
             assert_eq!(
                 receive("item/agent_message/delta", &mut params, 17).1,
                 Peer::Disabled
             );
             assert!(params.get(WIRE).is_none());
-            crate::set_telemetry_enabled(true);
+            crate::set_telemetry_gate(true);
         });
     }
     #[test]
@@ -1710,7 +1710,7 @@ mod tests {
             old_empty.revision -= 1;
             assert!(!empty_batch.observe(&old_empty, RendererBoundary::GpuiEmpty));
             assert!(empty_batch.observe(&empty, RendererBoundary::GpuiEmpty));
-            crate::set_telemetry_enabled(false);
+            crate::set_telemetry_gate(false);
             let disabled_descendant = source.run(|| {
                 WorkItem::new(
                     3,
@@ -1719,7 +1719,7 @@ mod tests {
                     ExecutorRole::Event,
                 )
             });
-            crate::set_telemetry_enabled(true);
+            crate::set_telemetry_gate(true);
             let (_, disabled_work) = disabled_descendant.received(
                 WorkBoundary::EventLane,
                 WorkKind::Event,

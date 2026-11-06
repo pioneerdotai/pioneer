@@ -315,6 +315,8 @@ impl std::fmt::Debug for Closing {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // These injected SDK fixtures exercise epoch fencing synchronously; the
+    // public opt-in API drains production buffers on a separate worker.
     use std::sync::{Arc, Mutex};
 
     #[derive(Clone, Debug, Default)]
@@ -333,7 +335,7 @@ mod tests {
     fn closing_exports_owner_fact_once_and_never_revives_stale_descendant() {
         let _lock = crate::telemetry::tests::TELEMETRY_TEST_LOCK.lock().unwrap();
         let old = crate::telemetry_enabled();
-        crate::set_telemetry_enabled(true);
+        crate::set_telemetry_gate(true);
         let capture = Capture::default();
         let traces = opentelemetry_sdk::trace::SdkTracerProvider::builder()
             .with_simple_exporter(capture.clone())
@@ -349,9 +351,9 @@ mod tests {
             result.finish(Fact::Confirmed);
             result.finish(Fact::Returned);
             drop(result);
-            crate::set_telemetry_enabled(false);
+            crate::set_telemetry_gate(false);
             let disabled = Closing::current(Phase::TerminalCandidate);
-            crate::set_telemetry_enabled(true);
+            crate::set_telemetry_gate(true);
             let mut late = Closing::start(Phase::DurableConsumer, &disabled.correlation());
             late.finish(Fact::Confirmed);
             drop(disabled);
@@ -425,7 +427,7 @@ mod tests {
         }
         traces.shutdown().unwrap();
         metrics.shutdown().unwrap();
-        crate::set_telemetry_enabled(old);
+        crate::set_telemetry_gate(old);
     }
     // Rotates from the SDK's public construction callback, without a timing
     // race or a production hook between the owner's check and SDK creation.
@@ -438,8 +440,8 @@ mod tests {
             _parent: &opentelemetry::Context,
         ) {
             if self.0.swap(false, std::sync::atomic::Ordering::SeqCst) {
-                crate::set_telemetry_enabled(false);
-                crate::set_telemetry_enabled(true);
+                crate::set_telemetry_gate(false);
+                crate::set_telemetry_gate(true);
             }
         }
         fn on_end(&self, _span: opentelemetry_sdk::trace::SpanData) {}
@@ -459,7 +461,7 @@ mod tests {
     fn rotation_during_sdk_construction_preserves_origin_through_drop_and_descendant() {
         let _lock = crate::telemetry::tests::TELEMETRY_TEST_LOCK.lock().unwrap();
         let old = crate::telemetry_enabled();
-        crate::set_telemetry_enabled(true);
+        crate::set_telemetry_gate(true);
         let capture = Capture::default();
         let traces = opentelemetry_sdk::trace::SdkTracerProvider::builder()
             .with_span_processor(RotateOnStart(std::sync::atomic::AtomicBool::new(true)))
@@ -487,8 +489,8 @@ mod tests {
             // Closing wrapper: an outer stale check cannot repair this contract.
             let admitted = Closing::capture();
             assert!(admitted.is_current());
-            crate::set_telemetry_enabled(false);
-            crate::set_telemetry_enabled(true);
+            crate::set_telemetry_gate(false);
+            crate::set_telemetry_gate(true);
             let mut delayed =
                 Observation::start(Scenario::Closing, Boundary::ExecutionResult, &admitted, &[]);
             let mut propagated = serde_json::json!({});
@@ -530,6 +532,6 @@ mod tests {
         }
         traces.shutdown().unwrap();
         metrics.shutdown().unwrap();
-        crate::set_telemetry_enabled(old);
+        crate::set_telemetry_gate(old);
     }
 }
