@@ -66,7 +66,7 @@ Use the response's actual full-result reference as `threads_tools_result_read` i
 
 ## Add A Message Without Starting A Model
 
-Choose an existing destination from `threads_start_options.targetOptions`, or refreshed creation `targetOptions`, whose label identifies the intended permitted destination. Call `thread_message_send`:
+Choose an existing destination from `threads_start_options.targetOptions`, or refreshed creation `targetOptions`, matching the intended `threadId` and permitting `send_message` in `allowedActions`. Call `thread_message_send`:
 
 ```json
 {"targetOptionId":"SELECTED_MESSAGE_TARGET_ID","input":[{"type":"text","text":"The requested source is now available for review."}]}

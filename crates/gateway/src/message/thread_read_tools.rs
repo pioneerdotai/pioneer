@@ -148,6 +148,21 @@ impl MessageProcessor {
         &self,
         context: &TurnToolContext,
     ) -> Result<ThreadReadAuthority> {
+        let facts = if let Some(binding) = self.agent_action_binding(&context.turn_id).await {
+            let facts = binding.adapter.lock().await.persistence_facts();
+            Some(facts)
+        } else {
+            None
+        };
+        self.thread_read_authority_for_agent(context, facts.as_ref())
+            .await
+    }
+
+    pub(super) async fn thread_read_authority_for_agent(
+        &self,
+        context: &TurnToolContext,
+        facts: Option<&crate::authorization::AgentExecutionPersistenceFacts>,
+    ) -> Result<ThreadReadAuthority> {
         let current = self
             .revalidate_tool_execution_authorization(
                 &context.workspace_id,
@@ -165,8 +180,7 @@ impl MessageProcessor {
             .await?;
         let mut agent_observe = false;
         let mut observe_children = false;
-        if let Some(binding) = self.agent_action_binding(&context.turn_id).await {
-            let facts = binding.adapter.lock().await.persistence_facts();
+        if let Some(facts) = facts {
             let grants = &facts.agent_authorization_allowed_actions;
             let policy = RoleDefinitionRegistry::new();
             ensure!(

@@ -76,7 +76,7 @@ A native response may give a short working-context excerpt and a reference to a 
 
 ## Creating, Sending, And Starting
 
-Call `threads_start_options` to inspect `threadCreationOptions` and `targetOptions`. Pass a returned creation `id` as `thread_create.optionId`; pass a returned destination `id` as `targetOptionId` for send/start. Do not fabricate IDs or replace them with a `threadId`. After creation, use the refreshed `targetOptions` returned by that action. Select the option whose label matches the intended destination and action.
+Call `threads_start_options` to inspect `threadCreationOptions` and `targetOptions`. Pass a returned creation `id` as `thread_create.optionId`; pass a returned destination `id` as `targetOptionId` for send/start. Do not fabricate IDs or replace them with a `threadId`. After creation, use the refreshed `targetOptions` returned by that action. Match the intended destination by exact `threadId`, then choose an option whose `allowedActions` includes `send_message` or `start_agent` as needed. `title` is the current saved name (possibly null, duplicated, or renamed); `label` describes the option. Neither is an identity. Multiple options may reach the same thread with different permissions: keep each opaque `id` with its own actions. Obtain fresh options in each execution; never reuse an earlier execution’s option ID or infer a route from order or name.
 
 For a user-visible workspace conversation, select the server's delegated-root creation option when available. The home-capsule option creates a hidden internal thread. Do not promise arbitrary child threads appear in the sidebar. Creation accepts only `optionId`, not a title, sidebar setting, message, or launch.
 

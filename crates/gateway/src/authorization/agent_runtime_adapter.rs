@@ -24,7 +24,7 @@ use pioneer_protocol::{
     AgentToolThreadCreationOption,
 };
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AgentToolAdapterError {
@@ -51,6 +51,11 @@ pub(crate) struct BoundAgentActionAdapter {
     envelope: AgentSecurityEnvelope,
     routes: Vec<AgentRouteFacts>,
     same_capsule_targets: Vec<(String, String)>,
+    target_metadata: Option<(
+        String,
+        BTreeMap<String, Option<String>>,
+        Vec<pioneer_protocol::AgentRouteAction>,
+    )>,
     policy: AgentWorkResourcePolicy,
     branch_key: String,
     attempt_generation: u64,
@@ -159,6 +164,7 @@ impl BoundAgentActionAdapter {
             envelope,
             routes: route.into_iter().collect(),
             same_capsule_targets: Vec::new(),
+            target_metadata: None,
             policy,
             branch_key: branch_key.into(),
             attempt_generation,
@@ -236,6 +242,7 @@ impl BoundAgentActionAdapter {
             &capabilities,
             &mut safe,
         );
+        self.apply_target_metadata(&mut safe);
         safe
     }
 
@@ -261,6 +268,7 @@ impl BoundAgentActionAdapter {
             &task_agent_capabilities(&self.envelope),
             &mut safe,
         );
+        self.apply_target_metadata(&mut safe);
         safe
     }
 
@@ -432,6 +440,54 @@ impl BoundAgentActionAdapter {
         targets.dedup_by(|left, right| left.0 == right.0);
         self.same_capsule_targets = targets;
         Ok(())
+    }
+
+    /// Metadata is installed only after the existing read authority has checked
+    /// each destination. Keep route identity and option generation independent
+    /// of mutable display names.
+    pub(crate) fn install_target_metadata(
+        &mut self,
+        current_thread_id: String,
+        titles: BTreeMap<String, Option<String>>,
+        allowed_actions: Vec<pioneer_protocol::AgentRouteAction>,
+    ) {
+        self.target_metadata = Some((current_thread_id, titles, allowed_actions));
+    }
+
+    fn apply_target_metadata(&self, options: &mut AgentToolOptionsProjection) {
+        let Some((current_thread_id, titles, allowed_actions)) = &self.target_metadata else {
+            // Unrefreshed bindings must not disclose guessed destination facts.
+            options.target_options.clear();
+            return;
+        };
+        // Source export is an Agent grant, not a Turn runtime action. The
+        // envelope already intersects the role and persisted Agent grants.
+        let export_allowed = self.envelope.allows(ResourceAction::AgentSourceExport)
+            && RoleDefinitionRegistry::new()
+                .agent_policy_allows(&self.envelope.role_key, ResourceAction::AgentSourceExport);
+        let non_exportable_options = if export_allowed {
+            BTreeSet::new()
+        } else {
+            self.routes
+                .iter()
+                .map(|route| target_option_id(&self.root, Some(route), "route"))
+                .collect()
+        };
+        for option in &mut options.target_options {
+            if non_exportable_options.contains(&option.id) {
+                option.allowed_actions.clear();
+            }
+            if option.id == self.current_target_option_id() {
+                option.thread_id = current_thread_id.clone();
+            }
+            option.title = titles.get(&option.thread_id).cloned().flatten();
+            option
+                .allowed_actions
+                .retain(|action| allowed_actions.contains(action));
+        }
+        options
+            .target_options
+            .retain(|option| titles.contains_key(&option.thread_id));
     }
 
     pub(crate) fn presentation_snapshot(&self) -> pioneer_protocol::AgentPresentationSnapshot {
@@ -1190,6 +1246,8 @@ pub(crate) fn materialize_child_agent_action_binding(
     // authorize child mutations. A separately issued return/outbound route
     // must be bound explicitly when that operation is prepared.
     populate_binding_options(&root, &[], &[], &capabilities, &mut options);
+    // Destination facts are available only after the runtime catalog refresh.
+    options.target_options.clear();
     let adapter = BoundAgentActionAdapter::new(
         CanonicalAgentActionService::default(),
         root,
@@ -1332,6 +1390,8 @@ pub(crate) fn materialize_persisted_task_agent_action_binding(
     )
     .safe_tool_projection();
     populate_binding_options(&root, &[], &[], &capabilities, &mut options);
+    // Destination facts are available only after the runtime catalog refresh.
+    options.target_options.clear();
     let mut adapter = BoundAgentActionAdapter::new(
         CanonicalAgentActionService::default(),
         root,
@@ -1449,14 +1509,44 @@ fn populate_binding_options(
     capabilities: &BTreeSet<AgentToolCapability>,
     options: &mut AgentToolOptionsProjection,
 ) {
+    use pioneer_protocol::{AgentActionKind, AgentRouteAction};
+    let actions = |route: Option<&AgentRouteFacts>| {
+        [
+            (
+                AgentToolCapability::MessageCreate,
+                AgentRouteAction::SendMessage,
+                AgentActionKind::SendMessage,
+            ),
+            (
+                AgentToolCapability::ChildStart,
+                AgentRouteAction::StartAgent,
+                AgentActionKind::StartAgent,
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(capability, action, kind)| {
+            (capabilities.contains(&capability)
+                && route.is_none_or(|route| {
+                    route.permits_action(kind) && route.disclosure.allows_anything()
+                }))
+            .then_some(action)
+        })
+        .collect::<Vec<_>>()
+    };
     options.target_options = vec![
         AgentToolTargetOption {
             id: target_option_id(root, None, "current"),
             label: "Current thread".to_owned(),
+            thread_id: root.home_root_thread_id.clone(),
+            title: None,
+            allowed_actions: actions(None),
         },
         AgentToolTargetOption {
             id: target_option_id(root, None, "home"),
             label: "Current collaboration".to_owned(),
+            thread_id: root.home_root_thread_id.clone(),
+            title: None,
+            allowed_actions: actions(None),
         },
     ];
     options
@@ -1467,6 +1557,9 @@ fn populate_binding_options(
                 .map(|(thread_id, label)| AgentToolTargetOption {
                     id: same_capsule_target_option_id(root, thread_id),
                     label: label.clone(),
+                    thread_id: thread_id.clone(),
+                    title: None,
+                    allowed_actions: actions(None),
                 }),
         );
     options
@@ -1474,6 +1567,9 @@ fn populate_binding_options(
         .extend(routes.iter().map(|route| AgentToolTargetOption {
             id: target_option_id(root, Some(route), "route"),
             label: "Approved routed destination".to_owned(),
+            thread_id: route.destination_thread_id.clone(),
+            title: None,
+            allowed_actions: actions(Some(route)),
         }));
     if capabilities.contains(&AgentToolCapability::ThreadCreate) {
         let mut audiences = Vec::new();
@@ -2081,6 +2177,119 @@ mod tests {
                 matches!(restored.resolve_target_option(&options, &option_id).unwrap(),
                 pioneer_protocol::AgentStartTarget::RoutedThread { thread_id, .. } if thread_id == route.destination_thread_id)
             );
+            let mut duplicate = route.clone();
+            duplicate.route_id = "R12345678901234567891".into();
+            duplicate.allowed_actions = vec![pioneer_protocol::AgentRouteAction::StartAgent];
+            restored.bind_persisted_route(duplicate.clone()).unwrap();
+            let options = test_options(&mut restored);
+            let targets: Vec<_> = options
+                .target_options
+                .iter()
+                .filter(|o| o.thread_id == route.destination_thread_id)
+                .collect();
+            assert_eq!(targets.len(), 2);
+            assert_ne!(targets[0].id, targets[1].id);
+            assert_eq!(
+                targets
+                    .iter()
+                    .find(|o| o.id == option_id)
+                    .unwrap()
+                    .allowed_actions,
+                vec![pioneer_protocol::AgentRouteAction::SendMessage]
+            );
+            let start_id = targets
+                .iter()
+                .find(|o| o.id != option_id)
+                .unwrap()
+                .id
+                .clone();
+            assert_eq!(
+                targets
+                    .iter()
+                    .find(|o| o.id == start_id)
+                    .unwrap()
+                    .allowed_actions,
+                vec![pioneer_protocol::AgentRouteAction::StartAgent]
+            );
+            assert!(targets.iter().all(|o| o.title.is_none()));
+            // A title change leaves both route identities selectable.
+            let mut titles = BTreeMap::new();
+            titles.insert(route.destination_thread_id.clone(), Some("Renamed".into()));
+            restored.install_target_metadata(
+                restored.root.home_root_thread_id.clone(),
+                titles,
+                vec![
+                    pioneer_protocol::AgentRouteAction::SendMessage,
+                    pioneer_protocol::AgentRouteAction::StartAgent,
+                ],
+            );
+            let renamed = restored.install_selected_launch_profiles(vec![profile.clone()]);
+            assert!(
+                renamed
+                    .target_options
+                    .iter()
+                    .all(|o| o.title.as_deref() == Some("Renamed"))
+            );
+            assert!(
+                matches!(restored.resolve_target_option(&renamed, &start_id).unwrap(),
+                pioneer_protocol::AgentStartTarget::RoutedThread { route_id, .. }
+                if route_id.as_str() == duplicate.route_id)
+            );
+            // Source export is independent of send/start. Its absence must
+            // suppress routed actions while retaining same-capsule actions.
+            restored
+                .envelope
+                .allowed_actions
+                .remove(&ResourceAction::AgentSourceExport);
+            let no_export = test_options(&mut restored);
+            assert_eq!(
+                no_export
+                    .target_options
+                    .iter()
+                    .filter(|o| o.thread_id == route.destination_thread_id)
+                    .count(),
+                2
+            );
+            assert_eq!(
+                no_export
+                    .target_options
+                    .iter()
+                    .filter(|o| o.thread_id == restored.root.home_root_thread_id)
+                    .count(),
+                2
+            );
+            assert!(
+                no_export
+                    .target_options
+                    .iter()
+                    .filter(|o| o.thread_id == route.destination_thread_id)
+                    .all(|o| o.allowed_actions.is_empty())
+            );
+            assert!(
+                no_export
+                    .target_options
+                    .iter()
+                    .filter(|o| o.thread_id == restored.root.home_root_thread_id)
+                    .all(|o| o.allowed_actions
+                        == vec![
+                            pioneer_protocol::AgentRouteAction::SendMessage,
+                            pioneer_protocol::AgentRouteAction::StartAgent
+                        ])
+            );
+            restored
+                .envelope
+                .allowed_actions
+                .insert(ResourceAction::AgentSourceExport);
+            // Narrow execution permissions even if the route grants start.
+            restored
+                .envelope
+                .allowed_actions
+                .remove(&ResourceAction::ChildStart);
+            let narrowed = test_options(&mut restored);
+            assert!(narrowed.target_options.iter().all(|o| {
+                !o.allowed_actions
+                    .contains(&pioneer_protocol::AgentRouteAction::StartAgent)
+            }));
             let mut foreign = route.clone();
             foreign.source_capsule_id = route.destination_capsule_id.clone();
             assert!(restored.bind_persisted_route(foreign).is_err());
@@ -2100,6 +2309,22 @@ mod tests {
     fn test_options(adapter: &mut BoundAgentActionAdapter) -> AgentToolOptionsProjection {
         let identity = adapter.root.identity.clone();
         let profile = adapter.root.profile.clone();
+        let mut titles = BTreeMap::new();
+        titles.insert(adapter.root.home_root_thread_id.clone(), None);
+        for route in &adapter.routes {
+            titles.insert(route.destination_thread_id.clone(), None);
+        }
+        for (thread_id, _) in &adapter.same_capsule_targets {
+            titles.insert(thread_id.clone(), None);
+        }
+        adapter.install_target_metadata(
+            adapter.root.home_root_thread_id.clone(),
+            titles,
+            vec![
+                pioneer_protocol::AgentRouteAction::SendMessage,
+                pioneer_protocol::AgentRouteAction::StartAgent,
+            ],
+        );
         adapter.install_start_options_catalog(
             vec![identity],
             vec![profile],
