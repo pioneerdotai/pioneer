@@ -64,6 +64,7 @@ pub struct DiagnosticStream<S> {
     scope: QueryScope,
     failed: bool,
     pool: Option<PoolContext>,
+    history_sql: pioneer_observability::turn_startup::HistorySqlContext,
 }
 impl<S> DiagnosticStream<S> {
     pub(crate) fn new(inner: S, scope: QueryScope, pool: Option<PoolContext>) -> Self {
@@ -72,6 +73,7 @@ impl<S> DiagnosticStream<S> {
             scope,
             failed: false,
             pool,
+            history_sql: pioneer_observability::turn_startup::HistorySqlContext::capture(),
         }
     }
 }
@@ -82,6 +84,7 @@ impl<S: Stream<Item = Result<QueryResult, DbErr>> + Unpin> Stream for Diagnostic
         let Some(inner) = this.inner.as_mut() else {
             return Poll::Ready(None);
         };
+        let _history_sql = this.history_sql.enter();
         let _pool = pool_context::enter(this.pool);
         let entered = this.scope.enter();
         let result = Pin::new(inner).poll_next(cx);
@@ -108,6 +111,7 @@ impl<S: Stream<Item = Result<QueryResult, DbErr>> + Unpin> Stream for Diagnostic
 }
 impl<S> Drop for DiagnosticStream<S> {
     fn drop(&mut self) {
+        let _history_sql = self.history_sql.enter();
         let _pool = pool_context::enter(self.pool);
         let _entered = self.scope.enter();
         drop(self.inner.take());
@@ -146,6 +150,7 @@ pub(crate) trait PoolFutureExt: Future + Sized {
             inner: std::mem::ManuallyDrop::new(self),
             live: true,
             context,
+            history_sql: pioneer_observability::turn_startup::HistorySqlContext::capture(),
         }
     }
 }
@@ -154,6 +159,7 @@ pub(crate) struct PoolFuture<F> {
     inner: std::mem::ManuallyDrop<F>,
     live: bool,
     context: PoolContext,
+    history_sql: pioneer_observability::turn_startup::HistorySqlContext,
 }
 impl<F: Future> Future for PoolFuture<F> {
     type Output = F::Output;
@@ -161,6 +167,7 @@ impl<F: Future> Future for PoolFuture<F> {
         // SAFETY: inner is structurally pinned, never exposed or moved.
         let this = unsafe { self.get_unchecked_mut() };
         assert!(this.live, "polled completed pool future");
+        let _history_sql = this.history_sql.enter();
         let _entered = this.context.enter();
         let result = unsafe { Pin::new_unchecked(&mut *this.inner) }.poll(cx);
         if result.is_ready() {
@@ -175,6 +182,7 @@ impl<F: Future> Future for PoolFuture<F> {
 }
 impl<F> Drop for PoolFuture<F> {
     fn drop(&mut self) {
+        let _history_sql = self.history_sql.enter();
         let _entered = self.context.enter();
         if self.live {
             self.live = false;
