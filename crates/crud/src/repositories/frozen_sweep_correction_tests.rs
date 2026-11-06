@@ -931,3 +931,174 @@ async fn generated_sweep_entities_preserve_defaults_conflicts_and_null_cursor_de
         first.work_row
     );
 }
+
+// Primary finite-pass proof: actual protected layouts, actual owner admission,
+// overlapping visits, one committed fanout cause, then no further mutations.
+#[tokio::test]
+async fn protected_overlapping_visits_exhaust_one_invalidation_and_reach_eof() {
+    for kind in [0, 1] {
+        let store = blank(false).await;
+        header(&store, "fanout-event", 0, 0, 0).await;
+        for index in 0..7 {
+            let id = format!("protected-{index}");
+            let consumer = format!("candidate-{index}");
+            header_kind(&store, &id, kind, 0, 0, 1).await;
+            header_kind(&store, &consumer, kind, 0, 0, 0).await;
+            row(&store, &id, kind, 0).await;
+            store.connection.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+                "INSERT INTO compaction_frozen_layout(manifest_id,kind,candidate,active,pending) VALUES(?1,?2,?3,0,1)",
+                [consumer.into(), kind.into(), id.into()])).await.unwrap();
+        }
+        drain_metadata(&store).await;
+        let revision = work(&store, "protected-0", kind).await.revision;
+        let mut progress = FrozenStorageLifetimeProgress::default();
+        let mut overlapped = false;
+        for _ in 0..200 {
+            assert!(progress.sweep_quantum(&store).await.unwrap());
+            if progress
+                .sweep
+                .iter()
+                .chain(progress.sweep_pending.iter())
+                .count()
+                == ACTIVE_CONTAINERS
+            {
+                overlapped = true;
+                break;
+            }
+        }
+        assert!(overlapped, "fill the real owner before the event");
+        exec(
+            &store,
+            "UPDATE compaction_frozen_history SET identity_sha256='event' WHERE id='fanout-event'",
+        )
+        .await;
+        if kind == 1 {
+            // Let the real owner commit the event ACK while visits overlap,
+            // then fail a physical finish rather than the producer transaction.
+            let mut delivered = false;
+            for _ in 0..200 {
+                assert!(progress.sweep_quantum(&store).await.unwrap());
+                if query(&store, "SELECT count(*) AS n FROM compaction_frozen_sweep_consumer WHERE manifest_id='fanout-event' AND pending=1").await == 0 {
+                    delivered = true;
+                    break;
+                }
+            }
+            assert!(delivered);
+            assert!(progress.sweep.is_some() || !progress.sweep_pending.is_empty());
+            // A failed finish must retain the old visit and its overlap debt.
+            exec(&store, "CREATE TRIGGER fixture_protected_finish_fault BEFORE UPDATE ON compaction_frozen_sweep_work WHEN NEW.manifest_id LIKE 'protected-%' AND NEW.revision=OLD.revision BEGIN SELECT RAISE(ABORT,'finish fault'); END").await;
+            let mut failed = false;
+            for _ in 0..200 {
+                if progress.sweep_quantum(&store).await.is_err() {
+                    failed = true;
+                    break;
+                }
+            }
+            assert!(failed);
+            exec(&store, "DROP TRIGGER fixture_protected_finish_fault").await;
+        }
+        drain(&store, &mut progress).await;
+        assert!(
+            progress.accounting.refused >= 7,
+            "real writer guards blocked deletion before EOF"
+        );
+        assert_eq!(work(&store, "protected-0", kind).await.revision, revision);
+        assert_eq!(query(&store, "SELECT count(*) AS n FROM compaction_frozen_sweep_work WHERE manifest_id LIKE 'protected-%' AND pending=1 AND retry_at=0").await, 7);
+        let (table, _) = physical_table(kind);
+        assert_eq!(
+            query(
+                &store,
+                &format!("SELECT count(*) AS n FROM {table} WHERE manifest_id LIKE 'protected-%'")
+            )
+            .await,
+            7
+        );
+        // A later dependency change releases old keys without a synthetic retry.
+        exec(&store, "UPDATE compaction_frozen_layout SET candidate=NULL,pending=0 WHERE manifest_id LIKE 'candidate-%'").await;
+        drain(&store, &mut FrozenStorageLifetimeProgress::default()).await;
+        assert_eq!(
+            query(
+                &store,
+                &format!("SELECT count(*) AS n FROM {table} WHERE manifest_id LIKE 'protected-%'")
+            )
+            .await,
+            0
+        );
+    }
+}
+
+#[tokio::test]
+async fn fanout_ack_reopens_blocked_visit_without_another_work_revision() {
+    for kind in [0, 1] {
+        let store = batch_fixture(kind, 4).await;
+        header_kind(&store, "ack-consumer", kind, 1, 1, 0).await;
+        store.connection.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+            "INSERT INTO compaction_frozen_layout(manifest_id,kind,active,pending) VALUES('ack-consumer',?1,0,0)", [kind.into()])).await.unwrap();
+        store.connection.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+            "INSERT INTO compaction_frozen_span(manifest_id,kind,start,end,source_manifest) VALUES('ack-consumer',?1,0,1,'batch-physical')", [kind.into()])).await.unwrap();
+        exec(
+            &store,
+            "UPDATE compaction_frozen_layout SET active=1 WHERE manifest_id='ack-consumer'",
+        )
+        .await;
+        // Stop after delivery, before ACK. The source Work revision is now the
+        // final one; the remaining consumer ACK only removes its fence.
+        while frozen_sweep_work::bootstrap_step(&store).await.unwrap() {}
+        for _ in 0..100 {
+            assert!(frozen_sweep_work::fanout_step(&store).await.unwrap());
+            if query(&store, "SELECT count(*) AS n FROM compaction_frozen_sweep_consumer WHERE manifest_id='ack-consumer' AND pending=1 AND after_source='batch-physical'").await == 1 { break; }
+        }
+        assert_eq!(query(&store, "SELECT count(*) AS n FROM compaction_frozen_sweep_consumer WHERE manifest_id='ack-consumer' AND pending=1 AND after_source='batch-physical'").await, 1);
+        let revision = work(&store, "batch-physical", kind).await.revision;
+        let mut progress = FrozenStorageLifetimeProgress::default();
+        let mut prepared = false;
+        for _ in 0..200 {
+            // Exercise the pre-ACK preparation interleaving deterministically;
+            // retain all actual repository reads, validation and writer work.
+            progress.sweep_fanout = false;
+            progress.sweep_kind = kind;
+            if progress
+                .sweep
+                .iter()
+                .chain(progress.sweep_pending.iter())
+                .any(|s| s.manifest == "batch-physical")
+            {
+                progress.sweep_discover = false;
+            }
+            assert!(progress.sweep_quantum(&store).await.unwrap());
+            if progress
+                .sweep
+                .iter()
+                .chain(progress.sweep_pending.iter())
+                .any(|s| s.manifest == "batch-physical" && s.prepared.is_some())
+            {
+                prepared = true;
+                break;
+            }
+        }
+        assert!(prepared);
+        // This visit really encounters the fence before ACK; no fake Blocked.
+        for _ in 0..ACTIVE_CONTAINERS {
+            progress.sweep_discover = false;
+            assert!(progress.sweep_quantum(&store).await.unwrap());
+            if !progress
+                .sweep
+                .iter()
+                .chain(progress.sweep_pending.iter())
+                .any(|s| s.manifest == "batch-physical")
+            {
+                break;
+            }
+        }
+        assert!(progress.accounting.refused > 0);
+        assert_eq!(batch_ordinals(&store, kind).await, vec![0, 1, 2, 3]);
+        assert_eq!(pending(&store, "batch-physical", kind).await, 1);
+        drain(&store, &mut progress).await;
+        assert_eq!(
+            work(&store, "batch-physical", kind).await.revision,
+            revision
+        );
+        assert_eq!(batch_ordinals(&store, kind).await, vec![0]);
+        assert_eq!(pending(&store, "batch-physical", kind).await, 0);
+    }
+}
