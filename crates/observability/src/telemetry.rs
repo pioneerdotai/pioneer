@@ -202,6 +202,11 @@ pub fn init_otlp_observability_for(
         .build();
     let meter = meter_provider.meter(target.instrumentation_name());
     crate::turn_startup::init(&meter);
+    crate::scenario::init(&meter);
+    crate::opening::init(&meter);
+    crate::closing::init(&meter);
+    crate::tool_call::init(&meter);
+    crate::updates::init(&meter);
     crate::work::init(&meter);
     crate::queues::init(&meter);
     crate::live::init(&meter);
@@ -785,8 +790,13 @@ pub(crate) mod tests {
         callback()
     }
     pub(crate) fn gateway_test_state(provider: SdkMeterProvider) -> &'static ObservabilityState {
+        gateway_test_state_with_tracer(provider, SdkTracerProvider::builder().build())
+    }
+    pub(crate) fn gateway_test_state_with_tracer(
+        provider: SdkMeterProvider,
+        tracer_provider: SdkTracerProvider,
+    ) -> &'static ObservabilityState {
         let meter = provider.meter("db-integration-fixture");
-        let tracer_provider = SdkTracerProvider::builder().build();
         Box::leak(Box::new(ObservabilityState {
             target: TelemetryTarget::Gateway,
             resource_sampler: None,

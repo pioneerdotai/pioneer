@@ -73,6 +73,8 @@ impl Drop for Reservation {
 pub(crate) struct OutboundEnvelope {
     pub(crate) item: WorkItem<Message>,
     pub(crate) reservation: Reservation,
+    pub(crate) observation: pioneer_observability::updates::StageObservation,
+    pub(crate) update_delivery: Option<pioneer_observability::scenario::Observation>,
 }
 pub(crate) struct OutboundReceiver {
     rx: mpsc::Receiver<OutboundEnvelope>,
@@ -322,6 +324,16 @@ impl SessionOutbound {
         message: Message,
         class: AdmissionClass,
     ) -> Result<(), mpsc::error::TrySendError<Message>> {
+        let mut admission = pioneer_observability::updates::StageObservation::start(
+            pioneer_observability::updates::Stage::OutboundAdmission,
+        );
+        let context = match &message {
+            Message::Text(text) => pioneer_observability::updates::outgoing(text),
+            _ => None,
+        };
+        let mut update_delivery = context
+            .as_ref()
+            .map(|context| context.boundary(pioneer_observability::scenario::Boundary::Delivery));
         let bytes = message_bytes(&message);
         let mut u = self
             .admission
@@ -329,6 +341,13 @@ impl SessionOutbound {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         if u.closed || self.tx.is_closed() {
+            admission.finish(pioneer_observability::updates::Fact::Rejected);
+            if let Some(update) = update_delivery.as_mut() {
+                pioneer_observability::updates::finish_delivery(
+                    update,
+                    pioneer_observability::updates::DeliveryOutcome::Disconnected,
+                );
+            }
             return Err(mpsc::error::TrySendError::Closed(message));
         }
         let ceiling = if class == AdmissionClass::Data {
@@ -347,6 +366,13 @@ impl SessionOutbound {
                 reason_code = "payload_oversized"
             );
             self.observer.outcome(QueueOutcome::Rejected, 1);
+            admission.finish(pioneer_observability::updates::Fact::Rejected);
+            if let Some(update) = update_delivery.as_mut() {
+                pioneer_observability::updates::finish_delivery(
+                    update,
+                    pioneer_observability::updates::DeliveryOutcome::Oversized,
+                );
+            }
             return Err(mpsc::error::TrySendError::Closed(message));
         }
         // Subtraction avoids overflow for all accepted configurations.
@@ -357,24 +383,52 @@ impl SessionOutbound {
                     || bytes > self.admission.data_bytes - u.data_bytes))
         {
             self.observer.outcome(QueueOutcome::Rejected, 1);
+            admission.finish(pioneer_observability::updates::Fact::Rejected);
+            if let Some(update) = update_delivery.as_mut() {
+                pioneer_observability::updates::finish_delivery(
+                    update,
+                    pioneer_observability::updates::DeliveryOutcome::Full,
+                );
+            }
             return Err(mpsc::error::TrySendError::Full(message));
         }
         let permit = match self.tx.try_reserve() {
             Ok(p) => p,
             Err(mpsc::error::TrySendError::Full(_)) => {
+                admission.finish(pioneer_observability::updates::Fact::Rejected);
+                if let Some(update) = update_delivery.as_mut() {
+                    pioneer_observability::updates::finish_delivery(
+                        update,
+                        pioneer_observability::updates::DeliveryOutcome::Full,
+                    );
+                }
                 return Err(mpsc::error::TrySendError::Full(message));
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
+                admission.finish(pioneer_observability::updates::Fact::Rejected);
+                if let Some(update) = update_delivery.as_mut() {
+                    pioneer_observability::updates::finish_delivery(
+                        update,
+                        pioneer_observability::updates::DeliveryOutcome::Disconnected,
+                    );
+                }
                 return Err(mpsc::error::TrySendError::Closed(message));
             }
         };
-        let item = WorkItem::new(
-            message,
-            Boundary::EventLane,
-            WorkKind::Event,
-            ExecutorRole::Gateway,
-        )
-        .observed(self.observer.clone(), QueueBytes::Known(bytes as u64));
+        let make_item = || {
+            WorkItem::new(
+                message,
+                Boundary::EventLane,
+                WorkKind::Event,
+                ExecutorRole::Gateway,
+            )
+            .observed(self.observer.clone(), QueueBytes::Known(bytes as u64))
+        };
+        let item = if let Some(context) = context {
+            context.run(make_item)
+        } else {
+            make_item()
+        };
         u.count += 1;
         u.bytes += bytes;
         if class == AdmissionClass::Data {
@@ -390,7 +444,16 @@ impl SessionOutbound {
             class,
             bytes,
         };
-        permit.send(OutboundEnvelope { item, reservation });
+        let observation = pioneer_observability::updates::StageObservation::start(
+            pioneer_observability::updates::Stage::QueuedSocketWrite,
+        );
+        permit.send(OutboundEnvelope {
+            item,
+            reservation,
+            observation,
+            update_delivery,
+        });
+        admission.finish(pioneer_observability::updates::Fact::Returned);
         drop(u);
         Ok(())
     }

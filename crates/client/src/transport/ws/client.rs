@@ -777,21 +777,37 @@ struct WriterFrame {
     message: Message,
     request: Option<JsonRpcResponseSender>,
     carrier: pioneer_observability::work::WorkCarrier,
+    correlation: Option<pioneer_observability::scenario::Correlation>,
     voice_reservation: Option<super::voice_budget::VoiceReservation>,
 }
 
 impl WriterFrame {
     fn new(message: Message, request: Option<JsonRpcResponseSender>) -> Self {
+        let (correlation, request_work) = request
+            .as_ref()
+            .and_then(|request| request.observation_context())
+            .map(|(correlation, work)| {
+                let writer_work = correlation
+                    .run(|| work.execution_child(WorkKind::ClientRpc, ExecutorRole::ClientWs));
+                (Some(correlation), writer_work)
+            })
+            .unwrap_or_else(|| {
+                (
+                    None,
+                    pioneer_observability::work::WorkCarrier::child(
+                        Boundary::ClientRpc,
+                        WorkKind::ClientRpc,
+                        pioneer_observability::work::Trigger::Rpc,
+                        ExecutorRole::ClientWs,
+                    ),
+                )
+            });
         Self {
             message,
+            correlation,
             request,
             voice_reservation: None,
-            carrier: pioneer_observability::work::WorkCarrier::child(
-                Boundary::ClientRpc,
-                WorkKind::ClientRpc,
-                pioneer_observability::work::Trigger::Rpc,
-                ExecutorRole::ClientWs,
-            ),
+            carrier: request_work,
         }
     }
 
@@ -883,27 +899,31 @@ async fn connection_writer<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unp
             request,
             carrier,
             voice_reservation,
+            correlation,
         } = frame;
-        let result = carrier
-            .scope_result(async {
-                if let Some(request) = request.as_ref() {
-                    if !request.try_start_write() {
-                        return Ok(());
-                    }
+        let write = carrier.scope_result(async {
+            if let Some(request) = request.as_ref() {
+                if !request.try_start_write() {
+                    return Ok(());
                 }
-                let startup_write = match &message {
-                    Message::Text(payload) if request.is_some() => {
-                        pioneer_observability::turn_startup::client_write(payload, connection_id)
-                    }
-                    _ => None,
-                };
-                // Once claimed, finish this write even if the local request retires.
-                // Dropping this future is allowed only together with both socket halves.
-                let result = writer.send(message).await;
-                drop(startup_write);
-                result
-            })
-            .await;
+            }
+            let startup_write = match &message {
+                Message::Text(payload) if request.is_some() => {
+                    pioneer_observability::turn_startup::client_write(payload, connection_id)
+                }
+                _ => None,
+            };
+            // Once claimed, finish this write even if the local request retires.
+            // Dropping this future is allowed only together with both socket halves.
+            let result = writer.send(message).await;
+            drop(startup_write);
+            result
+        });
+        let result = if let Some(correlation) = correlation {
+            correlation.scope(write).await
+        } else {
+            write.await
+        };
         drop(voice_reservation);
         if let Err(error) = result {
             return websocket_write_failed_message(error);

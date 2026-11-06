@@ -970,6 +970,7 @@ struct GatewayOperationStageRecord {
 
 #[derive(Debug)]
 struct GatewayOperationState {
+    parent: Option<crate::scenario::Correlation>,
     operation: GatewayOperation,
     variant: Option<GatewayOperationVariant>,
     consent_generation: Option<u64>,
@@ -990,6 +991,11 @@ impl GatewayOperationTimeline {
         let (telemetry_enabled, consent_generation) = super::telemetry_consent_snapshot();
         Self {
             inner: Arc::new(Mutex::new(GatewayOperationState {
+                parent: matches!(
+                    operation,
+                    GatewayOperation::ThreadOpen | GatewayOperation::ThreadTimelinePage
+                )
+                .then(crate::scenario::Correlation::capture),
                 operation,
                 variant: None,
                 consent_generation: telemetry_enabled.then_some(consent_generation),
@@ -1059,6 +1065,7 @@ impl GatewayOperationTimeline {
             }
             state.finalized = true;
             GatewayOperationSnapshot {
+                parent: state.parent.clone(),
                 operation: state.operation,
                 variant: state.variant,
                 consent_generation: state.consent_generation,
@@ -1188,6 +1195,7 @@ impl Drop for GatewayOperationStageGuard {
 }
 
 struct GatewayOperationSnapshot {
+    parent: Option<crate::scenario::Correlation>,
     operation: GatewayOperation,
     variant: Option<GatewayOperationVariant>,
     consent_generation: Option<u64>,
@@ -1270,6 +1278,14 @@ fn emit_gateway_operation(snapshot: &GatewayOperationSnapshot) {
     }
 
     let mut root_attributes = attributes;
+    if snapshot.parent.is_some() {
+        if let Some(epoch) = snapshot.consent_generation {
+            root_attributes.push(KeyValue::new(
+                "pioneer.consent.generation",
+                epoch.to_string(),
+            ));
+        }
+    }
     for item in &snapshot.items {
         root_attributes.push(KeyValue::new(
             item.kind.span_attribute(),
@@ -1280,7 +1296,12 @@ fn emit_gateway_operation(snapshot: &GatewayOperationSnapshot) {
         .with_kind(SpanKind::Internal)
         .with_start_time(snapshot.started_at)
         .with_attributes(root_attributes);
-    let root_span = state.tracer.build(root_builder);
+    let root_span = match &snapshot.parent {
+        Some(parent) => state
+            .tracer
+            .build_with_context(root_builder, &parent.context()),
+        None => state.tracer.build(root_builder),
+    };
     let root_context = Context::new().with_span(root_span);
     for stage in &snapshot.stages {
         let mut stage_attributes = vec![
@@ -1288,6 +1309,14 @@ fn emit_gateway_operation(snapshot: &GatewayOperationSnapshot) {
             KeyValue::new("operation.stage", stage.name),
             KeyValue::new("outcome", stage.outcome.as_str()),
         ];
+        if snapshot.parent.is_some() {
+            if let Some(epoch) = snapshot.consent_generation {
+                stage_attributes.push(KeyValue::new(
+                    "pioneer.consent.generation",
+                    epoch.to_string(),
+                ));
+            }
+        }
         if let Some(operations) = stage.operations {
             stage_attributes.push(KeyValue::new(
                 "operation.stage.occurrences",

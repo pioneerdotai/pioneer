@@ -466,6 +466,7 @@ impl ClientCore {
                         return;
                     };
                     core.refresh_composer_model_selections();
+                    core.observe_opening_core();
                 }
             })
             .expect("composer model worker");

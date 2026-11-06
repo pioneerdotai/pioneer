@@ -4,17 +4,31 @@ use pioneer_protocol::Thread;
 
 impl ClientCore {
     pub fn open_thread_by_id(&self, id: &str) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            !id.trim().is_empty() && !self.is_stopped(),
-            "thread_open_cancelled"
-        );
-        self.open_existing_thread_subscription(id)
+        self.open_thread_observed(id, pioneer_observability::opening::Fact::IdOnly)
+    }
+    fn open_thread_observed(
+        &self,
+        id: &str,
+        source: pioneer_observability::opening::Fact,
+    ) -> anyhow::Result<()> {
+        let opening = self.begin_opening(Some(id), source);
+        let correlation = opening.correlation();
+        let result = correlation.run(|| {
+            anyhow::ensure!(
+                !id.trim().is_empty() && !self.is_stopped(),
+                "thread_open_cancelled"
+            );
+            self.open_existing_thread_subscription(id, &opening)
+        });
+        if let Err(error) = &result {
+            opening.finish(super::opening::failure(error));
+        }
+        result
     }
 
-    /// A shell's cached record identifies the target; only the authoritative read
-    /// may supply domain data for opening it in the current authorization epoch.
+    /// A cached record is only a target hint; subscription authority is unchanged.
     pub fn open_thread(&self, thread: Thread) -> anyhow::Result<()> {
-        self.open_thread_by_id(&thread.id)
+        self.open_thread_observed(&thread.id, pioneer_observability::opening::Fact::CachedHint)
     }
     /// Reuses the canonical Workspace draft before creating a new one.
     pub fn open_workspace_draft(

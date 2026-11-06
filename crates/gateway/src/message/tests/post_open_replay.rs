@@ -946,3 +946,52 @@ async fn old_authorization_error_cannot_seal_a_resubscribed_member_socket() {
     .await
     .expect("old authorization recovery watchdog");
 }
+
+#[tokio::test]
+async fn opening_reply_ack_and_owned_replay_have_separate_live_boundaries() {
+    const NAME: &str = "message::tests::post_open_replay::opening_reply_ack_and_owned_replay_have_separate_live_boundaries";
+    const CHILD: &str = "PIONEER_OPENING_REPLAY_OBSERVER_CHILD";
+    const DONE: &str = "opening-replay-observer-completed";
+    if std::env::var(CHILD).ok().as_deref() != Some(NAME) {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", NAME, "--test-threads=1", "--nocapture"])
+            .env(CHILD, NAME)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains(DONE),
+            "exact child must execute its assertions"
+        );
+        return;
+    }
+    use pioneer_observability::{
+        live::{JournalPayload, WorkState},
+        opening::Phase,
+        work::Outcome,
+    };
+    pioneer_observability::set_telemetry_enabled(true);
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let mut fixture = Fixture::new(false).await;
+        let (entered, release) = fixture.pause();
+        let (id, mut opening) = fixture.open("observed-boundaries").await;
+        entered.await.unwrap();
+        opening.join().await.unwrap();
+        recv_response_by_id(&mut fixture.rx, &id).await;
+        let snapshot = pioneer_observability::live::snapshot().unwrap();
+        assert!(snapshot.active.iter().any(|work| work.opening_phase == Some(Phase::ReplayTail)), "owned replay is still live after dispatcher return and local reply handoff");
+        for phase in [Phase::ReplyAdmission, Phase::Acknowledge] {
+            assert!(!snapshot.active.iter().any(|work| work.opening_phase == Some(phase)));
+            assert!(snapshot.journal.iter().any(|entry| matches!(&entry.payload, JournalPayload::Work(work) if work.opening_phase == Some(phase) && work.state == WorkState::Terminal(Outcome::Completed))));
+        }
+        release.send(()).unwrap();
+        fixture.processor.session_manager.drain_thread_replays(fixture.connection).await;
+        assert!(!pioneer_observability::live::snapshot().unwrap().active.iter().any(|work| work.opening_phase == Some(Phase::ReplayTail)));
+    }).await.expect("observed replay owner watchdog");
+    pioneer_observability::set_telemetry_enabled(false);
+    println!("{DONE}");
+}

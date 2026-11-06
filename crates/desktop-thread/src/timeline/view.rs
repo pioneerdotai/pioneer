@@ -12,6 +12,7 @@ use gpui_kit::*;
 
 #[derive(Clone)]
 pub(crate) struct PreparedTimeline {
+    pub(crate) update_rows: Vec<usize>,
     pub(crate) row_inputs: Vec<(
         super::layout_store::RowMeasurementKey,
         Option<pioneer_client::timeline::types::TurnAuthorSnapshot>,
@@ -26,6 +27,9 @@ pub(crate) struct PreparedTimeline {
 
 impl TimelineView {
     pub(crate) fn reconcile_timeline(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let mut build = pioneer_observability::updates::StageObservation::start(
+            pioneer_observability::updates::Stage::TimelineBuild,
+        );
         let model = self.thread_timeline_view_state.model.clone();
         let changes = self.thread_bindings.take_timeline_changes();
         if let Some(snapshot) = &model.snapshot {
@@ -119,6 +123,10 @@ impl TimelineView {
             window,
             cx,
         );
+        build.finish(pioneer_observability::updates::Fact::Returned);
+        let mut measure = pioneer_observability::updates::StageObservation::start(
+            pioneer_observability::updates::Stage::TimelineMeasure,
+        );
         let row_inputs = measurement.row_inputs.clone();
         let order = model
             .snapshot
@@ -129,12 +137,14 @@ impl TimelineView {
             .measurement_coordinator
             .begin(model.revision, self.layout_store.context_revision);
         if measurement.entries.is_empty() {
+            measure.finish(pioneer_observability::updates::Fact::Accepted);
             self.measurement_coordinator.accept(ticket);
             let item_sizes = self.layout_store.commit(order, Vec::new());
             let layout_index =
                 TimelineLayoutIndex::from_store(grouping.clone(), self.layout_store.index.clone());
             self.commit_timeline_layout(
                 PreparedTimeline {
+                    update_rows: Vec::new(),
                     row_inputs,
                     slots: self.row_registry.slots(),
                     model,
@@ -156,10 +166,24 @@ impl TimelineView {
                 let (measured, bodies) = measurement.measure(window, cx);
                 window.defer(cx, move |window, cx| {
                     let _ = entity.update(cx, |view, cx| {
+                        if view
+                            .thread_timeline_view_state
+                            .model
+                            .snapshot
+                            .as_ref()
+                            .map(|snapshot| (snapshot.thread_id(), snapshot.generation()))
+                            != model
+                                .snapshot
+                                .as_ref()
+                                .map(|snapshot| (snapshot.thread_id(), snapshot.generation()))
+                        {
+                            model.update.retire(true);
+                        }
                         if view.thread_timeline_view_state.model.revision != ticket.presentation
                             || view.layout_store.context_revision != ticket.context
                             || !view.measurement_coordinator.is_pending(ticket)
                         {
+                            measure.finish(pioneer_observability::updates::Fact::Stale);
                             return;
                         }
                         if view.thread_timeline_view_state.layout_rem != measured_rem
@@ -169,11 +193,13 @@ impl TimelineView {
                             view.thread_timeline_view_state.layout_rem = measured_rem;
                             view.thread_timeline_view_state.layout_text_style = measured_style;
                             view.thread_timeline_view_state.layout_locale = measured_locale;
+                            measure.finish(pioneer_observability::updates::Fact::Stale);
                             view.layout_store.context_changed();
                             view.reconcile_timeline(window, cx);
                             cx.notify();
                             return;
                         }
+                        measure.finish(pioneer_observability::updates::Fact::Accepted);
                         view.measurement_coordinator.accept(ticket);
                         view.measurement_coordinator.draw = None;
                         view.layout_store.body_heights.extend(bodies);
@@ -184,6 +210,7 @@ impl TimelineView {
                         );
                         view.commit_timeline_layout(
                             PreparedTimeline {
+                                update_rows: Vec::new(),
                                 row_inputs,
                                 slots: view.row_registry.slots(),
                                 model,
@@ -270,7 +297,33 @@ impl TimelineView {
                 self.prepare_markdown_highlights(document, cx);
             }
         }
-        for (slot, (key, author)) in prepared.slots.iter_mut().zip(&prepared.row_inputs) {
+        prepared.update_rows.clear();
+        for (index, (slot, (key, author))) in prepared
+            .slots
+            .iter_mut()
+            .zip(&prepared.row_inputs)
+            .enumerate()
+        {
+            let update = prepared.model.update.clone();
+            let generation = prepared
+                .model
+                .snapshot
+                .as_ref()
+                .map_or(0, |s| s.generation());
+            if update.covers_row(
+                &self.thread_id,
+                generation,
+                slot.snapshot().id().as_str(),
+                slot.snapshot().revision(),
+            ) && prepared.update_rows.len() < 4
+            {
+                prepared.update_rows.push(index);
+            }
+            if let Some(view) = &slot.view {
+                view.update(cx, |view, cx| {
+                    view.bind_update(update.clone(), generation, cx)
+                });
+            }
             if slot
                 .view
                 .as_ref()
@@ -303,6 +356,7 @@ impl TimelineView {
                     )
                 })
             };
+            view.update(cx, |view, cx| view.bind_update(update, generation, cx));
             std::sync::Arc::make_mut(slot).view = Some(view);
             self.row_registry.publish_slot(slot.clone());
         }
@@ -385,7 +439,7 @@ impl TimelineView {
 
     pub(crate) fn render_timeline(
         &mut self,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let Some(prepared) = self
@@ -395,7 +449,7 @@ impl TimelineView {
             .filter(|p| !p.model.rows.is_empty())
         else {
             let empty = self.thread_timeline_view_state.model.rows.is_empty();
-            return div()
+            let element = div()
                 .debug_selector(|| "thread-empty-timeline".into())
                 .relative()
                 .size_full()
@@ -425,11 +479,47 @@ impl TimelineView {
                 })
                 .child(self.timeline_measurement_pass(cx))
                 .into_any_element();
+            // The empty placeholder is content evidence only after the exact
+            // empty model has been accepted. An old painted model cannot match.
+            let state = &self.thread_timeline_view_state;
+            if empty && state.visible && window.is_visible() {
+                if let Some(snapshot) = state.model.snapshot.as_ref().filter(|snapshot| {
+                    state
+                        .prepared
+                        .as_ref()
+                        .and_then(|prepared| prepared.model.snapshot.as_ref())
+                        .is_some_and(|prepared| {
+                            prepared.thread_id() == snapshot.thread_id()
+                                && prepared.generation() == snapshot.generation()
+                                && prepared.revision() == snapshot.revision()
+                                && prepared.rows().is_empty()
+                        })
+                }) {
+                    state.model.update.observe_row(
+                        snapshot.thread_id(),
+                        snapshot.generation(),
+                        "",
+                        snapshot.revision(),
+                        pioneer_observability::updates::RendererBoundary::GpuiEmpty,
+                        None,
+                    );
+                    if let Some(content) = state.model.update.correlation() {
+                        self.client.observe_opening_content_structure(
+                            snapshot.thread_id(),
+                            snapshot.generation(),
+                            snapshot.revision(),
+                            &content,
+                        );
+                    }
+                }
+            }
+            return element;
         };
         let PreparedTimeline {
+            update_rows: _,
             row_inputs: _,
             slots,
-            model: _,
+            model,
             item_sizes,
             layout_index,
             content_width,
@@ -444,7 +534,7 @@ impl TimelineView {
             cx,
         );
 
-        div()
+        let element = div()
             .w_full()
             .h_full()
             .relative()
@@ -493,6 +583,41 @@ impl TimelineView {
                     .bottom_0()
                     .child(Scrollbar::vertical(&self.thread_timeline_view_state.scroll_handle)),
             )
-            .into_any_element()
+            .into_any_element();
+        let state = &self.thread_timeline_view_state;
+        let bounds = state.scroll_handle.bounds();
+        if state.visible
+            && window.is_visible()
+            && bounds.size.width > px(0.)
+            && bounds.size.height > px(0.)
+        {
+            if let Some(snapshot) = model.snapshot.as_ref().filter(|snapshot| {
+                state.model.snapshot.as_ref().is_some_and(|current| {
+                    current.thread_id() == snapshot.thread_id()
+                        && current.generation() == snapshot.generation()
+                        && current.revision() == snapshot.revision()
+                })
+            }) {
+                // Exactly this accepted membership/order was supplied to the
+                // virtual list. This does not confirm offscreen row content.
+                model.update.observe_row(
+                    snapshot.thread_id(),
+                    snapshot.generation(),
+                    "",
+                    snapshot.revision(),
+                    pioneer_observability::updates::RendererBoundary::GpuiStructureRender,
+                    None,
+                );
+                if let Some(content) = model.update.correlation() {
+                    self.client.observe_opening_content_structure(
+                        snapshot.thread_id(),
+                        snapshot.generation(),
+                        snapshot.revision(),
+                        &content,
+                    );
+                }
+            }
+        }
+        element
     }
 }

@@ -776,10 +776,22 @@ async fn executing_task_can_finish_self_and_external_task_but_not_ancestor_and_c
 
 #[tokio::test]
 async fn finish_preserves_same_run_review_revision_and_acceptance() {
+    pioneer_observability::set_telemetry_enabled(true);
+    let source = super::closing::remote("99999999999999999999999999999999");
     let runtime = runtime_with_review_config().await;
-    let (task_id, run_id, candidate_id) =
-        create_waiting_review_agent_task(&runtime, 2, 0, TaskResultCandidateStatus::PendingReview)
-            .await;
+    let (task_id, run_id, candidate_id) = source
+        .scope(create_waiting_review_agent_task(
+            &runtime,
+            2,
+            0,
+            TaskResultCandidateStatus::PendingReview,
+        ))
+        .await;
+    let old_wait = super::closing::waits(
+        [0x99; 16],
+        pioneer_observability::live::WaitKind::UserOrProvider,
+    );
+    assert_eq!(old_wait.len(), 1);
     let context = parent_accept_context_for_candidate(&runtime, &task_id, &candidate_id).await;
     let before = read(&runtime, &task_id).await;
     let accepted = finish(&runtime, &task_id).await;
@@ -813,10 +825,24 @@ async fn finish_preserves_same_run_review_revision_and_acceptance() {
         task_id.clone(),
         run_id.clone(),
     );
-    handle
-        .record_pending_review_result_candidate(turn, candidate.clone(), at)
+    assert!(
+        super::closing::waits(
+            [0x99; 16],
+            pioneer_observability::live::WaitKind::UserOrProvider
+        )
+        .is_empty()
+    );
+    let parent = runtime.event_bus().closing_run_parent(&run_id);
+    parent
+        .scope(handle.record_pending_review_result_candidate(turn, candidate.clone(), at))
         .await
         .unwrap();
+    let new_wait = super::closing::waits(
+        [0x99; 16],
+        pioneer_observability::live::WaitKind::UserOrProvider,
+    );
+    assert_eq!(new_wait.len(), 1);
+    assert_ne!(old_wait, new_wait);
     let waiting = read(&runtime, &task_id).await;
     assert_eq!(waiting.task.status, TaskStatus::WaitingReview);
     assert!(waiting.task.finish_request().is_some());
@@ -834,6 +860,13 @@ async fn finish_preserves_same_run_review_revision_and_acceptance() {
     assert_eq!(done.runs[0].status, TaskRunStatus::Succeeded);
     assert_eq!(done.runs[0].result, candidate.result);
     assert!(done.task.finish_request().is_some());
+    assert!(
+        super::closing::waits(
+            [0x99; 16],
+            pioneer_observability::live::WaitKind::UserOrProvider
+        )
+        .is_empty()
+    );
 }
 
 #[tokio::test]

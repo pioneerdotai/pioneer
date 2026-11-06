@@ -8,6 +8,7 @@ use crate::output_projection::{ToolProjectionInput, project_tool_result};
 use crate::permissions::PermissionEvaluationContext;
 use crate::router::{ToolCall, ToolRouter};
 use crate::spec::ExecutionClass;
+use pioneer_observability::tool_call::{Fact, Measurement, Phase};
 use pioneer_protocol::TurnExecutionSecuritySnapshot;
 use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
@@ -170,6 +171,44 @@ impl ToolCallRuntime {
         workdir: PathBuf,
         commit_delivery: bool,
     ) -> Result<AnyToolResult, ToolError> {
+        let correlation = call.observation.correlation();
+        let mut observation = call.observation.take();
+        let work = if correlation.is_current() {
+            correlation.run(|| {
+                pioneer_observability::work::capture().execution_child(
+                    pioneer_observability::work::WorkKind::Child,
+                    pioneer_observability::work::ExecutorRole::Task,
+                )
+            })
+        } else {
+            Default::default()
+        };
+        let result = work
+            .scope_result(correlation.scope(self.execute_tool_call_observed(
+                call,
+                cancellation,
+                source,
+                workdir,
+                commit_delivery,
+            )))
+            .await;
+        if let Some(observation) = &mut observation {
+            observation.finish(match &result {
+                Ok(_) => pioneer_observability::tool_call::Fact::Returned,
+                Err(error) => crate::observation::error_fact(error),
+            });
+        }
+        result
+    }
+
+    async fn execute_tool_call_observed(
+        &self,
+        call: ToolCall,
+        cancellation: CancellationToken,
+        source: ToolCallSource,
+        workdir: PathBuf,
+        commit_delivery: bool,
+    ) -> Result<AnyToolResult, ToolError> {
         if take_patch_mutation_fallback(self.last_patch_failed.as_ref(), call.tool_name.as_str()) {
             crate::apply_patch::patch_telemetry().record_shell_fallback();
             pioneer_observability::record_patch_mutation_fallback(
@@ -213,12 +252,20 @@ impl ToolCallRuntime {
                         "execution_class": "shared",
                     })),
                 );
+                let mut lock_observation = Measurement::start(
+                    Phase::SharedLock,
+                    &pioneer_observability::scenario::Correlation::capture(),
+                );
+                let lock_wait = pioneer_observability::live::WaitGuard::new(
+                    pioneer_observability::live::WaitKind::Lock,
+                );
                 let wait_started = std::time::Instant::now();
                 let read_guard = if self.inherited_barrier(&call).is_some() {
                     None
                 } else {
                     Some(tokio::select! {
                         _ = cancellation.cancelled() => {
+                            lock_observation.finish(Fact::Cancelled);
                             let error = ToolError::cancelled("cancelled before shared lock acquisition");
                             trace.emit_stage(1, "runtime.lock_wait.failed", Some(error.to_string()), None);
                             Err(error)
@@ -238,6 +285,12 @@ impl ToolCallRuntime {
                     }?)
                 };
 
+                lock_observation.finish(if self.inherited_barrier(&call).is_some() {
+                    Fact::Inherited
+                } else {
+                    Fact::Acquired
+                });
+                drop(lock_wait);
                 let output = self
                     .dispatch_call(call.clone(), &cancellation, &trace, source, &workdir)
                     .await;
@@ -253,6 +306,13 @@ impl ToolCallRuntime {
                         "execution_class": "mutation_scoped",
                     })),
                 );
+                let mut lock_observation = Measurement::start(
+                    Phase::MutationBarrier,
+                    &pioneer_observability::scenario::Correlation::capture(),
+                );
+                let lock_wait = pioneer_observability::live::WaitGuard::new(
+                    pioneer_observability::live::WaitKind::Lock,
+                );
                 let wait_started = std::time::Instant::now();
                 // Mutation-scoped calls share the global barrier with ordinary
                 // reads, but do not take the exclusive write guard.  The
@@ -263,6 +323,7 @@ impl ToolCallRuntime {
                 } else {
                     Some(tokio::select! {
                         _ = cancellation.cancelled() => {
+                            lock_observation.finish(Fact::Cancelled);
                             let error = ToolError::cancelled("cancelled before mutation-scoped lock acquisition");
                             trace.emit_stage(1, "runtime.lock_wait.failed", Some(error.to_string()), None);
                             Err(error)
@@ -282,6 +343,12 @@ impl ToolCallRuntime {
                     }?)
                 };
 
+                lock_observation.finish(if self.inherited_barrier(&call).is_some() {
+                    Fact::Inherited
+                } else {
+                    Fact::Acquired
+                });
+                drop(lock_wait);
                 let output = self
                     .dispatch_call(call.clone(), &cancellation, &trace, source, &workdir)
                     .await;
@@ -302,13 +369,21 @@ impl ToolCallRuntime {
                             "execution_class": "exclusive",
                         })),
                     );
+                    let mut lock_observation = Measurement::start(
+                        Phase::ExclusiveLock,
+                        &pioneer_observability::scenario::Correlation::capture(),
+                    );
+                    let lock_wait = pioneer_observability::live::WaitGuard::new(
+                        pioneer_observability::live::WaitKind::Lock,
+                    );
                     let wait_started = std::time::Instant::now();
                     let write_guard = if self.inherited_barrier(&call).is_some() {
                         None
                     } else {
                         Some(tokio::select! {
                             _ = cancellation.cancelled() => {
-                                let error = ToolError::cancelled("cancelled before exclusive lock acquisition");
+                                lock_observation.finish(Fact::Cancelled);
+                            let error = ToolError::cancelled("cancelled before exclusive lock acquisition");
                                 trace.emit_stage(1, "runtime.lock_wait.failed", Some(error.to_string()), None);
                                 Err(error)
                             }
@@ -327,6 +402,12 @@ impl ToolCallRuntime {
                         }?)
                     };
 
+                    lock_observation.finish(if self.inherited_barrier(&call).is_some() {
+                        Fact::Inherited
+                    } else {
+                        Fact::Acquired
+                    });
+                    drop(lock_wait);
                     let output = self
                         .dispatch_call(call.clone(), &cancellation, &trace, source, &workdir)
                         .await;
@@ -343,12 +424,20 @@ impl ToolCallRuntime {
                         "execution_class": "session_scoped",
                     })),
                 );
+                let mut lock_observation = Measurement::start(
+                    Phase::SessionLock,
+                    &pioneer_observability::scenario::Correlation::capture(),
+                );
+                let lock_wait = pioneer_observability::live::WaitGuard::new(
+                    pioneer_observability::live::WaitKind::Lock,
+                );
                 let wait_started = std::time::Instant::now();
                 let read_guard = if self.inherited_barrier(&call).is_some() {
                     None
                 } else {
                     Some(tokio::select! {
                         _ = cancellation.cancelled() => {
+                            lock_observation.finish(Fact::Cancelled);
                             let error = ToolError::cancelled("cancelled before session lock acquisition");
                             trace.emit_stage(1, "runtime.lock_wait.failed", Some(error.to_string()), None);
                             Err(error)
@@ -364,7 +453,7 @@ impl ToolCallRuntime {
                 let session_lock = {
                     let mut map = tokio::select! {
                         _ = cancellation.cancelled() => {
-                            Err(ToolError::cancelled("cancelled before session map acquisition"))
+                            { lock_observation.finish(Fact::Cancelled); Err(ToolError::cancelled("cancelled before session map acquisition")) }
                         }
                         map = self.session_locks.lock() => Ok(map),
                     }?;
@@ -374,7 +463,8 @@ impl ToolCallRuntime {
                 };
                 let session_guard = tokio::select! {
                     _ = cancellation.cancelled() => {
-                        let error = ToolError::cancelled("cancelled before session-scoped execution");
+                        lock_observation.finish(Fact::Cancelled);
+                            let error = ToolError::cancelled("cancelled before session-scoped execution");
                         trace.emit_stage(1, "runtime.lock_wait.failed", Some(error.to_string()), None);
                         Err(error)
                     }
@@ -391,6 +481,8 @@ impl ToolCallRuntime {
                     })),
                 );
 
+                lock_observation.finish(Fact::Acquired);
+                drop(lock_wait);
                 let output = self
                     .dispatch_call(call.clone(), &cancellation, &trace, source, &workdir)
                     .await;
@@ -409,6 +501,10 @@ impl ToolCallRuntime {
                     self.last_patch_failed.as_ref(),
                     call.tool_name.as_str(),
                     output.success(),
+                );
+                let mut output_observation = Measurement::start(
+                    Phase::Output,
+                    &pioneer_observability::scenario::Correlation::capture(),
                 );
                 let raw_output_text = output.raw_output_text();
                 let raw_output_json = output.raw_output_json();
@@ -429,6 +525,12 @@ impl ToolCallRuntime {
                 } else {
                     project_tool_result(projection_input)
                 };
+                crate::observation::output_completeness(&mut output_observation, &projection);
+                output_observation.units(
+                    pioneer_observability::tool_call::Unit::OutputBytes,
+                    raw_output_text.len(),
+                );
+                output_observation.finish(Fact::Returned);
                 if let Some((stream, delta_text)) =
                     output_delta_from_projection(&projection.display, &call.output_policy.deltas)
                     && !matches!(call.tool_name.as_str(), "exec_command" | "write_stdin")
@@ -438,6 +540,11 @@ impl ToolCallRuntime {
                         .await?;
                 }
                 output.set_projection(projection);
+                let mut business_observation = Measurement::start(
+                    Phase::BusinessResult,
+                    &pioneer_observability::scenario::Correlation::capture(),
+                );
+                business_observation.finish(crate::observation::result_fact(&output));
                 trace.emit_stage(
                     1,
                     "runtime.completed",
@@ -854,6 +961,7 @@ mod tests {
 
     fn function_call(tool_name: &str, call_id: &str, class: ExecutionClass) -> ToolCall {
         ToolCall {
+            observation: Default::default(),
             call_id: call_id.to_owned(),
             tool_name: tool_name.to_owned(),
             payload: ToolPayload::Function {
@@ -873,6 +981,7 @@ mod tests {
 
     fn session_call(tool_name: &str, call_id: &str, session_id: u64) -> ToolCall {
         ToolCall {
+            observation: Default::default(),
             call_id: call_id.to_owned(),
             tool_name: tool_name.to_owned(),
             payload: ToolPayload::LocalShell(LocalShellPayload::WriteStdin(WriteStdinArgs {

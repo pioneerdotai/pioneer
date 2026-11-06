@@ -509,61 +509,90 @@ mod tests {
 
     #[test]
     fn workspace_authorization_from_session_driver_unblocks_existing_thread_selection() {
-        use pioneer_protocol::*;
-        let core = crate::catalog_test_support::settings_client();
-        let mut capabilities = core.authorization_snapshot(None, None).unwrap();
-        ready(&core);
-        core.upsert_thread(
-            serde_json::from_value(serde_json::json!({
-                "id":"thread","workspace_id":"workspace","preview":"","mode":"Chat",
-                "model":"model","model_provider":"provider","created_at":1,"updated_at":1,
-                "status":"Idle","turns":[]
-            }))
-            .unwrap(),
-        );
-        core.navigate(
-            crate::navigation::NavigationIntent::SelectWorkspace {
-                workspace_id: Some("workspace".into()),
-            },
-            None,
-        );
-        let select = crate::workspaces::intents::WorkspaceIntent::SelectThread {
-            workspace_id: "workspace".into(),
-            thread_id: "thread".into(),
-        };
-        assert!(core.execute_workspace_intent(select.clone()).is_err());
-        assert!(core.navigation_snapshot().active_thread_id().is_none());
-        let resources = AuthorizationOperationalResourceProjection {
-            fingerprint: "synthetic".into(),
-            ..Default::default()
-        };
-        capabilities.workspace = Some(AuthorizationWorkspaceCapabilitySnapshot {
-            workspace_id: "workspace".into(),
-            capabilities: Default::default(),
-            operational_resources: resources.clone(),
-            execution_draft_policy: AuthorizationExecutionDraftPolicyProjection {
-                fingerprint: "synthetic".into(),
-                resources,
-                permission_options: vec![],
-                can_attach_artifacts: false,
-                mcp_invocation_limits: Default::default(),
-            },
-        });
-        core.drive_session_demand_with_ports(
-            |_| panic!("verified transport"),
-            |params| {
-                assert_eq!(params.workspace_id.as_deref(), Some("workspace"));
-                let (generation, connection) = core.current_auth_ticket();
+        crate::scenario_test_support::isolated(
+            "gateway::session_driver::tests::workspace_authorization_from_session_driver_unblocks_existing_thread_selection",
+            |capture| {
+                use pioneer_protocol::*;
+                let core = crate::catalog_test_support::settings_client();
+                let mut capabilities = core.authorization_snapshot(None, None).unwrap();
+                ready(&core);
+                core.upsert_thread(
+                    serde_json::from_value(serde_json::json!({
+                        "id":"thread","workspace_id":"workspace","preview":"","mode":"Chat",
+                        "model":"model","model_provider":"provider","created_at":1,"updated_at":1,
+                        "status":"Idle","turns":[]
+                    }))
+                    .unwrap(),
+                );
+                core.navigate(
+                    crate::navigation::NavigationIntent::SelectWorkspace {
+                        workspace_id: Some("workspace".into()),
+                    },
+                    None,
+                );
+                let select = crate::workspaces::intents::WorkspaceIntent::SelectThread {
+                    workspace_id: "workspace".into(),
+                    thread_id: "thread".into(),
+                };
+                assert!(core.execute_workspace_intent(select.clone()).is_err());
+                assert!(core.navigation_snapshot().active_thread_id().is_none());
+                let resources = AuthorizationOperationalResourceProjection {
+                    fingerprint: "synthetic".into(),
+                    ..Default::default()
+                };
+                capabilities.workspace = Some(AuthorizationWorkspaceCapabilitySnapshot {
+                    workspace_id: "workspace".into(),
+                    capabilities: Default::default(),
+                    operational_resources: resources.clone(),
+                    execution_draft_policy: AuthorizationExecutionDraftPolicyProjection {
+                        fingerprint: "synthetic".into(),
+                        resources,
+                        permission_options: vec![],
+                        can_attach_artifacts: false,
+                        mcp_invocation_limits: Default::default(),
+                    },
+                });
+                core.drive_session_demand_with_ports(
+                    |_| panic!("verified transport"),
+                    |params| {
+                        assert_eq!(params.workspace_id.as_deref(), Some("workspace"));
+                        let (generation, connection) = core.current_auth_ticket();
+                        assert_eq!(
+                            core.accept_authorization_projection(
+                                generation,
+                                connection,
+                                capabilities
+                            ),
+                            crate::authorization::AuthorizationProjectionAcceptance::Accepted
+                        );
+                    },
+                );
+                core.execute_workspace_intent(select).unwrap();
                 assert_eq!(
-                    core.accept_authorization_projection(generation, connection, capabilities),
-                    crate::authorization::AuthorizationProjectionAcceptance::Accepted
+                    core.navigation_snapshot().active_thread_id(),
+                    Some("thread")
+                );
+
+                core.navigate(
+                    crate::navigation::NavigationIntent::SelectWorkspace {
+                        workspace_id: Some("other".into()),
+                    },
+                    None,
+                );
+                core.shutdown();
+                let episodes: Vec<_> = capture
+                    .spans()
+                    .into_iter()
+                    .filter(|span| {
+                        span.attributes.get("opening.phase").map(String::as_str) == Some("Intent")
+                    })
+                    .collect();
+                assert_eq!(
+                    episodes.len(),
+                    2,
+                    "one rejected and one accepted workspace intent, without a second episode in the navigation helper"
                 );
             },
-        );
-        core.execute_workspace_intent(select).unwrap();
-        assert_eq!(
-            core.navigation_snapshot().active_thread_id(),
-            Some("thread")
         );
     }
 

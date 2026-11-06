@@ -1,3 +1,5 @@
+pub(crate) static UPDATE_OBSERVATION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 use pioneer_client::core::{ClientCore, ClientScope, ClientSubscription, ClientSubscriptionEvent};
 use pioneer_desktop_foundation::{
     ClientBindingRegistrar, ClientBindingRegistration, ClientPublicationSink,

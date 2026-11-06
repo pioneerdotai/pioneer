@@ -2521,6 +2521,8 @@ pub enum BlockedTurnRecoveryResumeOutcome {
 #[derive(Debug, Clone)]
 pub enum TaskOwnedTurnResumeOutcome {
     Resumed {
+        /// Existing committed TaskRecovered sequence; diagnostic lifecycle fence only.
+        observation_sequence: i64,
         recovery_job: RecoveryJobRecord,
         task: Task,
         run: TaskRun,
@@ -33218,8 +33220,9 @@ impl CrudStore {
                 run.task_id
             );
 
-            self.append_task_events_in_connection(&tx, prepared_events, now_unix)
+            let resume_events = self.append_task_events_in_connection(&tx, prepared_events, now_unix)
                 .await?;
+            let observation_sequence = resume_events.iter().filter(|event| event.append_status.is_inserted()).map(|event| event.sequence).max().unwrap_or(0);
             anyhow::ensure!(
                 turn_execution::reacquire_blocked(
                     &tx,
@@ -33300,6 +33303,7 @@ impl CrudStore {
                     .transpose()?;
 
             Ok(Some(TaskOwnedTurnResumeOutcome::Resumed {
+                observation_sequence,
                 recovery_job,
                 task,
                 run: updated_run,

@@ -52,8 +52,9 @@ impl ProgressMergeBehavior {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct PendingProgress {
+    observation: pioneer_observability::updates::StageObservation,
     work: WorkCarrier,
     enqueued_monotonic_ms: Option<u64>,
     notification: ItemDeltaNotification,
@@ -61,9 +62,29 @@ struct PendingProgress {
 }
 
 impl PendingProgress {
-    fn new(notification: ItemDeltaNotification, behavior: ProgressMergeBehavior) -> Self {
+    fn new(
+        notification: ItemDeltaNotification,
+        behavior: ProgressMergeBehavior,
+        source: Option<pioneer_observability::updates::UpdateContext>,
+    ) -> Self {
         Self {
-            work: pioneer_observability::work::capture(),
+            observation: pioneer_observability::updates::StageObservation::start(
+                pioneer_observability::updates::Stage::ProgressPending,
+            ),
+            work: {
+                let capture = || {
+                    WorkCarrier::child(
+                        Boundary::EventLane,
+                        WorkKind::Event,
+                        pioneer_observability::work::Trigger::Event,
+                        ExecutorRole::Event,
+                    )
+                };
+                match source {
+                    Some(context) => context.run(capture),
+                    None => capture(),
+                }
+            },
             enqueued_monotonic_ms: pioneer_observability::telemetry_enabled()
                 .then(|| pioneer_observability::work::clock_ms()),
             notification,
@@ -71,9 +92,25 @@ impl PendingProgress {
         }
     }
 
-    fn merge(&mut self, mut next: ItemDeltaNotification, config: &ProgressCoalescerConfig) {
-        self.work
-            .merge_link(&pioneer_observability::work::capture());
+    fn merge(
+        &mut self,
+        mut next: ItemDeltaNotification,
+        config: &ProgressCoalescerConfig,
+        source: Option<pioneer_observability::updates::UpdateContext>,
+    ) {
+        let capture = || {
+            WorkCarrier::child(
+                Boundary::EventLane,
+                WorkKind::Event,
+                pioneer_observability::work::Trigger::Event,
+                ExecutorRole::Event,
+            )
+        };
+        let work = match source {
+            Some(context) => context.run(capture),
+            None => capture(),
+        };
+        self.work.merge_link(&work);
         match self.behavior {
             ProgressMergeBehavior::Append => {
                 self.notification.delta.push_str(next.delta.as_str());
@@ -90,10 +127,16 @@ impl PendingProgress {
                 if next.payload.is_some() {
                     self.notification.payload = next.payload.take();
                 }
+                if truncated {
+                    self.work.mark_update_incomplete();
+                }
                 annotate_progress_payload(&mut self.notification, true, truncated);
             }
             ProgressMergeBehavior::Snapshot => {
                 let truncated = bound_delta(&mut next.delta, config.max_snapshot_bytes_per_key);
+                if truncated {
+                    self.work.mark_update_incomplete();
+                }
                 annotate_progress_payload(&mut next, true, truncated);
                 self.notification = next;
             }
@@ -303,9 +346,18 @@ impl ProgressCoalescer {
                 .lock()
                 .expect("progress coalescer poisoned");
             remove_progress(&mut state, key)
-                .map(|pending| vec![progress_event(pending)])
+                .map(|pending| {
+                    vec![progress_event(
+                        pending,
+                        pioneer_observability::updates::FlushReason::Key,
+                    )]
+                })
                 .unwrap_or_default()
         };
+        pioneer_observability::updates::flushed_batch(
+            pioneer_observability::updates::FlushReason::Key,
+            events.len(),
+        );
         self.send_live_events(events);
     }
 
@@ -380,7 +432,10 @@ impl ProgressCoalescer {
             let mut events = Vec::with_capacity(keys.len() + heartbeat_keys.len());
             for key in keys {
                 if let Some(pending) = remove_progress(&mut state, &key) {
-                    events.push(progress_event(pending));
+                    events.push(progress_event(
+                        pending,
+                        pioneer_observability::updates::FlushReason::Item,
+                    ));
                 }
             }
             for key in heartbeat_keys {
@@ -391,6 +446,10 @@ impl ProgressCoalescer {
             update_flush_scheduled(&mut state);
             events
         };
+        pioneer_observability::updates::flushed_batch(
+            pioneer_observability::updates::FlushReason::Item,
+            events.len(),
+        );
         self.send_live_events(events);
     }
 
@@ -416,7 +475,10 @@ impl ProgressCoalescer {
             let mut events = Vec::with_capacity(keys.len() + heartbeat_keys.len());
             for key in keys {
                 if let Some(pending) = remove_progress(&mut state, &key) {
-                    events.push(progress_event(pending));
+                    events.push(progress_event(
+                        pending,
+                        pioneer_observability::updates::FlushReason::Turn,
+                    ));
                 }
             }
             for key in heartbeat_keys {
@@ -427,6 +489,10 @@ impl ProgressCoalescer {
             update_flush_scheduled(&mut state);
             events
         };
+        pioneer_observability::updates::flushed_batch(
+            pioneer_observability::updates::FlushReason::Turn,
+            events.len(),
+        );
         self.send_live_events(events);
     }
 
@@ -471,7 +537,8 @@ impl ProgressCoalescer {
 
     pub async fn flush_all(&self) {
         loop {
-            let (events, has_more) = self.drain_batch();
+            let (events, has_more) =
+                self.drain_batch(pioneer_observability::updates::FlushReason::Forced);
             if events.is_empty() && !has_more {
                 break;
             }
@@ -483,8 +550,23 @@ impl ProgressCoalescer {
     }
 
     fn offer_notification(&self, notification: ItemDeltaNotification) {
+        let mut offer = pioneer_observability::updates::StageObservation::start(
+            pioneer_observability::updates::Stage::ProgressOffer,
+        );
         let key = progress_key_from_notification(&notification);
         let behavior = ProgressMergeBehavior::for_stream(key.stream);
+        let source = pioneer_observability::updates::UpdateContext::source(
+            pioneer_observability::updates::ContentHint::new(
+                &notification.thread_id,
+                Some(&notification.item_id),
+                if behavior == ProgressMergeBehavior::Append {
+                    pioneer_observability::updates::Change::Append
+                } else {
+                    pioneer_observability::updates::Change::Snapshot
+                },
+                notification.delta.len(),
+            ),
+        );
         let mut should_schedule = false;
         {
             let mut state = self
@@ -503,24 +585,29 @@ impl ProgressCoalescer {
                     ?behavior,
                     "dropping redundant progress at coalescer key limit"
                 );
+                offer.finish(pioneer_observability::updates::Fact::Rejected);
                 return;
             }
             if let Some(pending) = state.pending.get_mut(&key) {
                 self.inner.observer.outcome(QueueOutcome::Coalesced, 1);
                 let before = pending.notification.delta.len() as u64;
-                pending.merge(notification, &self.inner.config);
+                pending.merge(notification, &self.inner.config, source);
+                offer.finish(pioneer_observability::updates::Fact::Coalesced);
                 let after = pending.notification.delta.len() as u64;
                 state.pending_delta_bytes = state
                     .pending_delta_bytes
                     .saturating_sub(before)
                     .saturating_add(after);
             } else {
-                let mut pending = PendingProgress::new(notification, behavior);
+                let mut pending = PendingProgress::new(notification, behavior, source);
                 let limit = match behavior {
                     ProgressMergeBehavior::Append => self.inner.config.max_append_bytes_per_key,
                     ProgressMergeBehavior::Snapshot => self.inner.config.max_snapshot_bytes_per_key,
                 };
                 let truncated = bound_delta(&mut pending.notification.delta, limit);
+                if truncated {
+                    pending.work.mark_update_incomplete();
+                }
                 annotate_progress_payload(&mut pending.notification, true, truncated);
                 state.pending_delta_bytes = state
                     .pending_delta_bytes
@@ -529,6 +616,7 @@ impl ProgressCoalescer {
                     .observer
                     .enqueued(QueueBytes::Estimate(pending.notification.delta.len() as u64));
                 state.pending.insert(key, pending);
+                offer.finish(pioneer_observability::updates::Fact::Returned);
             }
             if !state.flush_scheduled {
                 state.flush_scheduled = true;
@@ -576,7 +664,8 @@ impl ProgressCoalescer {
                 tokio::time::sleep(coalescer.inner.config.flush_interval),
             )
             .await;
-            let (events, has_more) = coalescer.drain_batch();
+            let (events, has_more) =
+                coalescer.drain_batch(pioneer_observability::updates::FlushReason::Timer);
             coalescer.send_live_events(events);
             if has_more {
                 coalescer.schedule_flush();
@@ -584,7 +673,10 @@ impl ProgressCoalescer {
         }));
     }
 
-    fn drain_batch(&self) -> (Vec<WorkItem<AgentProgressEvent>>, bool) {
+    fn drain_batch(
+        &self,
+        reason: pioneer_observability::updates::FlushReason,
+    ) -> (Vec<WorkItem<AgentProgressEvent>>, bool) {
         let mut state = self
             .inner
             .state
@@ -595,7 +687,7 @@ impl ProgressCoalescer {
         let progress_keys = state.pending.keys().take(max).cloned().collect::<Vec<_>>();
         for key in progress_keys {
             if let Some(pending) = remove_progress(&mut state, &key) {
-                events.push(progress_event(pending));
+                events.push(progress_event(pending, reason));
             }
         }
         if events.len() < max {
@@ -613,6 +705,7 @@ impl ProgressCoalescer {
         }
         let has_more = !(state.pending.is_empty() && state.heartbeats.is_empty());
         state.flush_scheduled = has_more;
+        pioneer_observability::updates::flushed_batch(reason, events.len());
         (events, has_more)
     }
 
@@ -866,7 +959,15 @@ mod fanout_tests {
     }
 }
 
-fn progress_event(pending: PendingProgress) -> WorkItem<AgentProgressEvent> {
+fn progress_event(
+    mut pending: PendingProgress,
+    reason: pioneer_observability::updates::FlushReason,
+) -> WorkItem<AgentProgressEvent> {
+    pioneer_observability::updates::flushed(reason, 1);
+    // This is removal from the pending buffer, before broadcast admission.
+    pending
+        .observation
+        .finish(pioneer_observability::updates::Fact::Returned);
     WorkItem::from_carrier(
         AgentProgressEvent::ItemDelta {
             notification: pending.notification,

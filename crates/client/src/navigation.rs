@@ -423,14 +423,32 @@ impl ClientCore {
         thread: Option<String>,
         expected_revision: Option<u64>,
     ) -> ClientTransition {
+        let opening = thread.as_deref().map(|id| {
+            self.begin_opening(Some(id), pioneer_observability::opening::Fact::Navigation)
+        });
+        self.open_workspace_thread_observed(workspace, thread, expected_revision, opening)
+    }
+    pub(crate) fn open_workspace_thread_observed(
+        &self,
+        workspace: String,
+        thread: Option<String>,
+        expected_revision: Option<u64>,
+        opening: Option<crate::threads::opening::Handle>,
+    ) -> ClientTransition {
         let mut registry = self
             .thread_registry
             .lock()
             .expect("thread registry poisoned");
         if self.is_stopped() {
+            if let Some(handle) = &opening {
+                handle.finish(pioneer_observability::opening::Result::Rejected);
+            }
             return self.navigation_outcome(ClientTransitionOutcome::Rejected);
         }
         if expected_revision.is_some_and(|revision| revision != registry.navigation_revision) {
+            if let Some(handle) = &opening {
+                handle.finish(pioneer_observability::opening::Result::Superseded);
+            }
             return self.navigation_outcome(ClientTransitionOutcome::Stale);
         }
         registry.navigation.apply(NavigationIntent::ClearLineage);
@@ -441,12 +459,36 @@ impl ClientCore {
             workspace_id: Some(workspace),
             thread_id: thread,
         });
-        self.publish_navigation(&mut registry)
+        self.publish_navigation_observed(&mut registry, opening.as_ref())
     }
     pub fn navigate(
         &self,
         intent: NavigationIntent,
         expected_revision: Option<u64>,
+    ) -> ClientTransition {
+        let opening = match &intent {
+            NavigationIntent::SelectThread {
+                thread_id: Some(id),
+                ..
+            } => {
+                Some(self.begin_opening(Some(id), pioneer_observability::opening::Fact::Navigation))
+            }
+            NavigationIntent::PushTaskThread { entry } => Some(self.begin_opening(
+                Some(entry.child_thread_id()),
+                pioneer_observability::opening::Fact::Task,
+            )),
+            NavigationIntent::PopTaskThread => {
+                Some(self.begin_opening(None, pioneer_observability::opening::Fact::Task))
+            }
+            _ => None,
+        };
+        self.navigate_observed(intent, expected_revision, opening)
+    }
+    pub(crate) fn navigate_observed(
+        &self,
+        intent: NavigationIntent,
+        expected_revision: Option<u64>,
+        opening: Option<crate::threads::opening::Handle>,
     ) -> ClientTransition {
         // Non-settings navigation also runs while applying an authorization fence.
         // Only a protected Settings destination needs to acquire the identity owner.
@@ -495,8 +537,17 @@ impl ClientCore {
             registry.navigation.apply(intent)
         };
         if outcome == ClientTransitionOutcome::Changed {
-            self.publish_navigation(&mut registry)
+            self.publish_navigation_observed(&mut registry, opening.as_ref())
         } else {
+            if let Some(handle) = &opening {
+                handle.finish(match outcome {
+                    ClientTransitionOutcome::Noop => pioneer_observability::opening::Result::Noop,
+                    ClientTransitionOutcome::Stale => {
+                        pioneer_observability::opening::Result::Superseded
+                    }
+                    _ => pioneer_observability::opening::Result::Rejected,
+                });
+            }
             self.navigation_outcome(outcome)
         }
     }
@@ -504,7 +555,22 @@ impl ClientCore {
         &self,
         registry: &mut crate::threads::registry::ThreadRegistry,
     ) -> ClientTransition {
-        match registry.navigation_change() {
+        self.publish_navigation_observed(registry, None)
+    }
+    fn publish_navigation_observed(
+        &self,
+        registry: &mut crate::threads::registry::ThreadRegistry,
+        opening: Option<&crate::threads::opening::Handle>,
+    ) -> ClientTransition {
+        let publication = registry.navigation_change_observed(opening);
+        if let Some(handle) = opening {
+            if publication.is_some() {
+                registry.accept_opening(handle);
+            } else {
+                handle.finish(pioneer_observability::opening::Result::Noop);
+            }
+        }
+        match publication {
             Some(publication) => self.transition_directory(
                 registry,
                 &ClientMutationAuthority { _private: () },
@@ -532,9 +598,16 @@ impl crate::threads::registry::ThreadRegistry {
         self.navigation = ClientNavigationState::default();
     }
     pub(crate) fn navigation_change(&mut self) -> Option<crate::core::ClientPublicationDraft> {
+        self.navigation_change_observed(None)
+    }
+    pub(crate) fn navigation_change_observed(
+        &mut self,
+        opening: Option<&crate::threads::opening::Handle>,
+    ) -> Option<crate::core::ClientPublicationDraft> {
         if self.navigation_publication.as_deref() == Some(&self.navigation) {
             return None;
         }
+        self.opening_navigation(opening);
         // Draft membership changes the directory even when thread metadata is equal
         // (a thread notification may precede the creation response).
         let previous = self.navigation_publication.as_deref();

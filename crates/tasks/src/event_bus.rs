@@ -1,5 +1,6 @@
 use pioneer_crud::AppendedTaskEvent;
-use std::sync::Arc;
+use pioneer_observability::{closing::Closing, scenario::Correlation};
+use std::sync::{Arc, Mutex};
 use tokio::sync::{Notify, broadcast};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,6 +89,7 @@ pub enum TaskEventWakeDelivery {
 pub struct TaskEventBus {
     sender: broadcast::Sender<TaskEventWake>,
     scheduler_notify: Arc<Notify>,
+    closing: Arc<Mutex<crate::closing_observer::ClosingObserver>>,
 }
 
 impl Default for TaskEventBus {
@@ -102,6 +104,7 @@ impl TaskEventBus {
         Self {
             sender,
             scheduler_notify: Arc::new(Notify::new()),
+            closing: Arc::new(Mutex::new(Default::default())),
         }
     }
 
@@ -116,9 +119,123 @@ impl TaskEventBus {
         }
     }
 
+    /// Exact local publication provenance; absence means recovery/missing,
+    /// never permission to borrow the latest run or candidate parent.
+    pub fn closing_publication_parent(&self, task: &str, sequence: i64) -> Option<Correlation> {
+        self.closing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .publication_parent(task, sequence)
+    }
+    pub fn closing_lifecycle_ticket(&self) -> u64 {
+        self.closing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .ticket()
+    }
+    pub fn closing_run_generation(&self, run: &str) -> Option<u64> {
+        self.closing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .generation(run)
+    }
+    /// Only accepted, inserted lifecycle transitions may provide this receipt.
+    pub fn admit_closing_run(
+        &self,
+        ticket: u64,
+        task: &str,
+        run: &str,
+        sequence: i64,
+        resume: bool,
+    ) {
+        self.closing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .admit(ticket, task, run, sequence, resume);
+    }
+    pub fn handoff_result_closing(
+        &self,
+        run: &str,
+        turn: &str,
+        result: Closing,
+        generation: Option<u64>,
+    ) {
+        self.closing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .handoff_result(run, turn, result, generation);
+    }
+    pub fn closing_run_parent(&self, run: &str) -> Correlation {
+        self.closing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .run_parent(run)
+    }
+    pub fn closing_run_links(&self, run: &str) -> ([Correlation; 5], usize) {
+        self.closing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .run_links(run)
+    }
+    pub fn closing_candidate_parent(&self, run: &str, candidate: &str) -> Correlation {
+        self.closing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .candidate_parent(run, candidate)
+    }
+    pub(crate) fn closing_review_links(
+        &self,
+        run: &str,
+        candidate: &str,
+        source: Correlation,
+    ) -> ([Correlation; 5], usize) {
+        self.closing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .review_links(run, candidate, source)
+    }
+    pub fn closing_delivery_parent(&self, id: &str, attempt: u32) -> Correlation {
+        self.closing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .delivery_parent(id, attempt)
+    }
+    pub fn observe_closing_delivery(&self, delivery: &pioneer_protocol::TaskDelivery) {
+        self.closing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .recover_delivery(delivery);
+    }
+    pub fn observe_closing_review(
+        &self,
+        candidate: &pioneer_protocol::TaskResultCandidate,
+        run: &pioneer_protocol::TaskRun,
+    ) {
+        self.closing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .recover_review(candidate, run);
+    }
+    pub(crate) fn retire_closing(&self) {
+        self.closing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retire();
+    }
     pub async fn publish(&self, event: AppendedTaskEvent) {
         if !event.append_status.is_inserted() {
             return;
+        }
+        if pioneer_observability::telemetry_enabled()
+            && crate::closing_observer::ClosingObserver::observes(&event.payload)
+        {
+            let parent = Closing::capture();
+            let mut closing = self
+                .closing
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            closing.publication(&event.task_id, event.sequence, parent.clone());
+            closing.committed(&event.payload, event.sequence, parent);
         }
         let _ = self.sender.send(TaskEventWake::from_committed_event(event));
         // A permit survives publication between processing and registering a wait.
