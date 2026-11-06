@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "turn")]
 pub struct Model {
+    pub plugin_selection_json: Option<String>,
     #[sea_orm(primary_key, auto_increment = false)]
     pub id: String,
     pub thread_id: String,

@@ -4858,6 +4858,13 @@ async fn codex_usage_receipts_survive_database_replay_without_range_attribution(
         blocked_observation_fixture(&temp.path().join("usage-receipts.sqlite"), "codex", true)
             .await;
     let key = CLIAgentRuntimeSessionKey::new(&workspace, "codex", BLOCKED_THREAD).unwrap();
+    let handle = processor
+        .cli_runtime_manager
+        .as_ref()
+        .unwrap()
+        .existing_session(&key)
+        .await
+        .expect("the fixture must have a managed CLI session");
     let context = crate::cli_runtime::projector::CLIRuntimeProjectorContext {
         workspace_id: workspace.clone(),
         thread_id: BLOCKED_THREAD.into(),
@@ -4951,12 +4958,12 @@ async fn codex_usage_receipts_survive_database_replay_without_range_attribution(
         let projected = crate::cli_runtime::projector::project_cli_runtime_event(&context, &event);
         for durable in projected.durable {
             processor
-                .publish_cli_runtime_durable_and_wait(&key.to_session_instance(), durable.clone())
+                .publish_cli_runtime_durable_and_wait(handle.instance(), durable.clone())
                 .await
                 .unwrap();
             // Actual duplicate delivery of the same persisted receipt.
             processor
-                .publish_cli_runtime_durable_and_wait(&key.to_session_instance(), durable)
+                .publish_cli_runtime_durable_and_wait(handle.instance(), durable)
                 .await
                 .unwrap();
         }
@@ -5020,6 +5027,13 @@ async fn cli_statistics_materialization_failure_rejects_ack_without_opening_reco
         )
         .await;
         let key = CLIAgentRuntimeSessionKey::new(&workspace, "codex", BLOCKED_THREAD).unwrap();
+        let handle = processor
+            .cli_runtime_manager
+            .as_ref()
+            .unwrap()
+            .existing_session(&key)
+            .await
+            .expect("the fixture must have a managed CLI session");
         let context = crate::cli_runtime::projector::CLIRuntimeProjectorContext {
             workspace_id: workspace.clone(),
             thread_id: BLOCKED_THREAD.into(),
@@ -5093,7 +5107,7 @@ async fn cli_statistics_materialization_failure_rejects_ack_without_opening_reco
              BEGIN SELECT RAISE(ABORT,'injected statistics storage failure'); END;"
         ).await.unwrap();
         let result = processor
-            .publish_cli_runtime_durable_and_wait(&key.to_session_instance(), event)
+            .publish_cli_runtime_durable_and_wait(handle.instance(), event)
             .await;
         match result {
             Err(pioneer_runtime_events::ExecutionEventHubError::CommitRejected(rejection)) => {
@@ -5140,13 +5154,6 @@ async fn cli_statistics_materialization_failure_rejects_ack_without_opening_reco
                     .status,
                 "running"
             );
-            let handle = processor
-                .cli_runtime_manager
-                .as_ref()
-                .unwrap()
-                .existing_session(&key)
-                .await
-                .unwrap();
             processor
                 .handle_cli_runtime_timeline_event(
                     handle.instance(),

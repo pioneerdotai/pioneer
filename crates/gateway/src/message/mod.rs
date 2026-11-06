@@ -26,6 +26,7 @@ mod native_health;
 mod notifications;
 mod patch_history_handlers;
 mod permission_handlers;
+pub(crate) mod plugins;
 mod provider_handlers;
 mod provider_readiness;
 mod reconciliation_diagnostics;
@@ -722,6 +723,7 @@ pub struct MessageProcessor {
     mcp_snapshot_version: Arc<AtomicU64>,
     mcp_service: Arc<McpService>,
     skills_write_lock: Arc<tokio::sync::Mutex<()>>,
+    plugin_mutation_locks: Arc<Mutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>>,
     cli_runtime_skill_destination_locks: CliRuntimeSkillDestinationLocks,
     #[cfg(test)]
     cli_runtime_skill_preflight_test_events: Arc<Mutex<Vec<String>>>,
@@ -1157,6 +1159,7 @@ impl MessageProcessor {
                 resilience_config.context_compaction_timeout,
             ),
         ));
+        let plugin_mutation_locks = Arc::new(Mutex::new(HashMap::new()));
         let recovery_coordinator = Arc::new(
             RecoveryCoordinator::new(
                 crud_store.clone(),
@@ -1167,6 +1170,7 @@ impl MessageProcessor {
                 ),
                 normalized_tool_loop_config.clone(),
             )
+            .with_plugin_launch_locks(plugin_mutation_locks.clone())
             .with_authorization_invalidation_hub(authorization_invalidation_hub.clone())
             .with_execution_leases(execution_leases.clone())
             .with_turn_execution_owner_id(turn_execution_owner_id.clone()),
@@ -1399,6 +1403,7 @@ impl MessageProcessor {
             mcp_snapshot_version,
             mcp_service,
             skills_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            plugin_mutation_locks,
             cli_runtime_skill_destination_locks: new_cli_runtime_skill_destination_locks(),
             #[cfg(test)]
             cli_runtime_skill_preflight_test_events: Arc::new(Mutex::new(Vec::new())),
@@ -2995,6 +3000,10 @@ impl MessageProcessor {
                 return Err(error).context("execution admission lease reconciliation failed");
             }
         }
+
+        // Startup reconciliation is a bounded Maintenance DB action, not
+        // an automatic installer replay. Unfinished parents remain closed.
+        background.crud_store.interrupt_unfinished_plugins().await?;
 
         let task_runtime_stage =
             trace.stage(pioneer_observability::GatewayOperationStage::ResilienceTaskRuntimeStart);
@@ -5337,6 +5346,7 @@ impl MessageProcessor {
             retry: pioneer_tools::ToolRetryBudgetConfig::default(),
         }
         .normalized();
+        let plugin_mutation_locks = Arc::new(Mutex::new(HashMap::new()));
         let recovery_coordinator = Arc::new(
             RecoveryCoordinator::new(
                 crud_store.clone(),
@@ -5345,6 +5355,7 @@ impl MessageProcessor {
                 RecoveryPolicyRegistry::default(),
                 normalized_tool_loop_config.clone(),
             )
+            .with_plugin_launch_locks(plugin_mutation_locks.clone())
             .with_authorization_invalidation_hub(authorization_invalidation_hub.clone())
             .with_execution_leases(execution_leases.clone())
             .with_turn_execution_owner_id(turn_execution_owner_id.clone()),
@@ -5548,6 +5559,7 @@ impl MessageProcessor {
             mcp_snapshot_version,
             mcp_service,
             skills_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            plugin_mutation_locks,
             cli_runtime_skill_destination_locks: new_cli_runtime_skill_destination_locks(),
             #[cfg(test)]
             cli_runtime_skill_preflight_test_events: Arc::new(Mutex::new(Vec::new())),

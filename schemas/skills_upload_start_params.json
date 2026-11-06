@@ -14,6 +14,10 @@
     "file_name": {
       "type": "string"
     },
+    "purpose": {
+      "$ref": "#/$defs/SkillUploadPurpose",
+      "default": "skill"
+    },
     "sha256": {
       "type": "string"
     },
@@ -41,6 +45,13 @@
       "type": "string",
       "enum": [
         "tar_gz"
+      ]
+    },
+    "SkillUploadPurpose": {
+      "type": "string",
+      "enum": [
+        "skill",
+        "plugin"
       ]
     }
   }

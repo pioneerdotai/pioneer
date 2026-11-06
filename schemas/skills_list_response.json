@@ -32,6 +32,21 @@
     "generated_at"
   ],
   "$defs": {
+    "PluginOwner": {
+      "type": "object",
+      "properties": {
+        "member_key": {
+          "type": "string"
+        },
+        "plugin_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "plugin_id",
+        "member_key"
+      ]
+    },
     "SkillDependencyDiagnostic": {
       "type": "object",
       "properties": {
@@ -153,6 +168,16 @@
           "anyOf": [
             {
               "$ref": "#/$defs/SkillPackMembership"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "plugin_owner": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PluginOwner"
             },
             {
               "type": "null"

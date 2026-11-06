@@ -424,6 +424,7 @@ mod tests {
 
     fn server(id: &str, name: &str) -> McpListItem {
         McpListItem {
+            plugin_owner: None,
             id: id.to_owned(),
             name: name.to_owned(),
             display_name: None,
@@ -734,5 +735,43 @@ mod tests {
         assert!(!reduction.queue_details_refresh);
         assert!(!reduction.clear_selected_details);
         assert!(reduction.rollback_policy);
+    }
+}
+
+/// Existing native config editor embedded under a plugin edits one server body.
+/// Its native identity is supplied by the authoritative catalog, never by text.
+pub fn owned_server_config_for_submit(body: &str, native_name: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let object = value.as_object()?;
+    if native_name.is_empty() || object.contains_key("mcpServers") {
+        return None;
+    }
+    let config = serde_json::json!({"mcpServers":{(native_name):value}}).to_string();
+    validate_mcp_config_for_submit(&config).ok()?;
+    Some(config)
+}
+#[cfg(test)]
+mod owned_editor_tests {
+    // NOT_RUN / NOT_COMPILED. Typed mapping uses the same native validation.
+    #[test]
+    fn embedded_configuration_keeps_owned_identity_and_rejects_multiple_servers() {
+        let config = super::owned_server_config_for_submit(
+            r#"{"url":"https://example.org/mcp","headers":{"Authorization":"explicit"}}"#,
+            "pplugin_owned",
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&config).unwrap();
+        assert_eq!(value["mcpServers"].as_object().unwrap().len(), 1);
+        assert_eq!(
+            value["mcpServers"]["pplugin_owned"]["headers"]["Authorization"],
+            "explicit"
+        );
+        assert!(
+            super::owned_server_config_for_submit(
+                r#"{"mcpServers":{"foreign":{"command":"node"}}}"#,
+                "pplugin_owned"
+            )
+            .is_none()
+        );
     }
 }

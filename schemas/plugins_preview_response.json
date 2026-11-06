@@ -1,0 +1,111 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PluginsPreviewResponse",
+  "type": "object",
+  "properties": {
+    "components": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/PluginComponentItem"
+      }
+    },
+    "diagnostics": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/PluginDiagnostic"
+      }
+    },
+    "fingerprint": {
+      "type": "string"
+    },
+    "name": {
+      "type": "string"
+    },
+    "version": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "name",
+    "fingerprint",
+    "components",
+    "diagnostics"
+  ],
+  "$defs": {
+    "PluginComponentItem": {
+      "type": "object",
+      "properties": {
+        "diagnostic": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kind": {
+          "type": "string"
+        },
+        "mcp_installation_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "member_key": {
+          "type": "string"
+        },
+        "runtime_status": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "skill_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SkillId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "member_key",
+        "status"
+      ]
+    },
+    "PluginDiagnostic": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "path",
+        "message"
+      ]
+    },
+    "SkillId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    }
+  }
+}

@@ -143,6 +143,9 @@ pub struct SkillPolicyHints {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SkillDefinition {
+    /// Host runtime constraint; independent of editable workspace policy.
+    #[serde(default)]
+    pub host_explicit_only: bool,
     pub identity: SkillIdentity,
     pub instructions: SkillInstructions,
     pub runtime: SkillRuntime,
@@ -169,6 +172,7 @@ pub enum SkillAvailability {
 #[serde(rename_all = "snake_case")]
 pub enum SkillUnavailableReason {
     ImportPending,
+    HostPolicy,
     MissingPackage,
     InvalidPackage,
 }
@@ -177,6 +181,7 @@ impl SkillUnavailableReason {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::ImportPending => "import_pending",
+            Self::HostPolicy => "host_policy",
             Self::MissingPackage => "missing_package",
             Self::InvalidPackage => "invalid_package",
         }
@@ -230,6 +235,7 @@ pub fn compile_skill_definition(input: CompileSkillInput) -> SkillDefinition {
     let policy_hints = compile_policy_hints(&input.conformance);
 
     SkillDefinition {
+        host_explicit_only: false,
         identity: SkillIdentity {
             skill_id: input.skill_id,
             owner: input.owner,

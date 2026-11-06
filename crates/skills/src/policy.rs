@@ -76,6 +76,10 @@ pub fn apply_skill_policy_constraints(
     skill: &SkillDefinition,
     effective: &mut EffectiveSkillPolicy,
 ) {
+    if skill.host_explicit_only {
+        effective.allow_implicit_invocation = false;
+        return;
+    }
     if !skill_implicit_invocation_editable(skill) {
         effective.allow_implicit_invocation = true;
     }

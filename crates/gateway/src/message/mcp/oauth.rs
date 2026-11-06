@@ -7,6 +7,7 @@ impl MessageProcessor {
         request_id: RequestId,
         params: McpOAuthParams,
     ) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
         let client = context.connection_id();
         let workspace = match self
             .validate_mcp_workspace(
@@ -84,6 +85,65 @@ impl MessageProcessor {
                 return;
             }
         };
+        // Parent admission precedes the existing native/OAuth lifecycle lock.
+        // Status/consent operations do not bump revision; explicit revocation
+        // fences execution and records only its current opaque effect outcome.
+        let mut mutation = None;
+        let _plugin = if matches!(&params.action, McpOAuthAction::Disconnect) {
+            match self
+                .begin_native_plugin_change(
+                    context,
+                    &request_id,
+                    &workspace,
+                    "mcp",
+                    id,
+                    "oauth_disconnect",
+                    &[],
+                    deadline,
+                )
+                .await
+            {
+                Ok(change) => {
+                    mutation = change;
+                    None
+                }
+                Err(error) => {
+                    self.send_error(
+                        client,
+                        mcp_error(
+                            Some(request_id),
+                            INVALID_REQUEST_CODE,
+                            MCP_ERROR_INVALID_REQUEST,
+                            super::super::plugins::native_plugin_error_code(&error),
+                            json!({}),
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+            }
+        } else {
+            match self
+                .acquire_plugin_child_admission(&workspace, "mcp", id)
+                .await
+            {
+                Ok(guard) => guard,
+                Err(error) => {
+                    self.send_error(
+                        client,
+                        mcp_error(
+                            Some(request_id),
+                            INVALID_REQUEST_CODE,
+                            MCP_ERROR_INVALID_REQUEST,
+                            super::super::plugins::native_plugin_error_code(&error),
+                            json!({}),
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+            }
+        };
         #[cfg(test)]
         let read_barrier = self
             .mcp_service
@@ -157,45 +217,85 @@ impl MessageProcessor {
             .await;
             return;
         }
-        let result = match params.action {
-            McpOAuthAction::SignIn { redirect_uri } => {
-                service
-                    .sign_in_in_workspace(id, &installation, client, &redirect_uri, &workspace)
-                    .await
-            }
-            McpOAuthAction::Disconnect => {
-                let result = service
-                    .disconnect_managed(id, &installation, client, &workspace)
-                    .await;
-                if result.is_ok() {
-                    self.mcp_service.stop_oauth_connection(&row).await;
+        let work = async {
+            match params.action {
+                McpOAuthAction::SignIn { redirect_uri } => {
+                    service
+                        .sign_in_in_workspace(id, &installation, client, &redirect_uri, &workspace)
+                        .await
                 }
-                result
-            }
-            McpOAuthAction::Cancel { flow_id } => service.cancel(id, client, &flow_id).await,
-            McpOAuthAction::Callback {
-                flow_id,
-                state,
-                code,
-                issuer,
-                error,
-            } => {
-                service
-                    .callback(
-                        id,
-                        client,
-                        pioneer_mcp_oauth::OAuthCallback {
-                            flow_id,
-                            state: state.expose_secret().into(),
-                            code: code.map(|s| s.expose_secret().into()),
-                            issuer,
-                            error,
-                        },
-                    )
-                    .await
+                McpOAuthAction::Disconnect => {
+                    let result = service
+                        .disconnect_managed(id, &installation, client, &workspace)
+                        .await;
+                    if result.is_ok() {
+                        self.mcp_service.stop_oauth_connection(&row).await;
+                    }
+                    result
+                }
+                McpOAuthAction::Cancel { flow_id } => service.cancel(id, client, &flow_id).await,
+                McpOAuthAction::Callback {
+                    flow_id,
+                    state,
+                    code,
+                    issuer,
+                    error,
+                } => {
+                    service
+                        .callback(
+                            id,
+                            client,
+                            pioneer_mcp_oauth::OAuthCallback {
+                                flow_id,
+                                state: state.expose_secret().into(),
+                                code: code.map(|s| s.expose_secret().into()),
+                                issuer,
+                                error,
+                            },
+                        )
+                        .await
+                }
             }
         };
+        let mut result = if mutation.is_some() || _plugin.is_some() {
+            tokio::time::timeout_at(deadline, work)
+                .await
+                .unwrap_or_else(|_| {
+                    Err(pioneer_mcp::McpRuntimeError::failed(
+                        "plugins.oauth_timeout",
+                    ))
+                })
+        } else {
+            work.await
+        };
+
+        if let Some(change) = &mutation {
+            if result.is_ok() {
+                if self
+                    .crud_store
+                    .complete_plugin_native_effect(&change.write, &workspace, "mcp")
+                    .await
+                    .is_err()
+                {
+                    result = Err(pioneer_mcp::McpRuntimeError::failed(
+                        "plugins.native_commit_unconfirmed",
+                    ));
+                }
+            }
+            if result.is_err() {
+                let _ = self
+                    .interrupt_native_plugin_change(change, "plugins.oauth_cleanup_unconfirmed")
+                    .await;
+            }
+        }
         drop(admission);
+        if result.is_ok()
+            && let Some(change) = mutation.take()
+        {
+            if self.finish_native_plugin_change(change).await.is_err() {
+                result = Err(pioneer_mcp::McpRuntimeError::failed("plugins.interrupted"));
+            }
+        }
         match result {
             Ok(()) => {
                 if let Ok(response) =

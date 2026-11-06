@@ -601,7 +601,8 @@ pub fn build_prepared_composer_turn_with_skill_selections(
         .iter()
         .filter_map(|capability| match &capability.kind {
             TurnCapabilityKind::Skill { skill_id, .. } => Some(skill_id),
-            TurnCapabilityKind::SkillPack { .. }
+            TurnCapabilityKind::Plugin { .. }
+            | TurnCapabilityKind::SkillPack { .. }
             | TurnCapabilityKind::McpServer { .. }
             | TurnCapabilityKind::McpTool { .. } => None,
         })

@@ -269,7 +269,9 @@ pub fn reduce_gateway_notification(
 ) -> Option<ClientRuntimeNotification> {
     match notification {
         // Scoped push is applied by ClientCore before the legacy shell reducer.
-        GatewayNotification::WorkspacePush(_) | GatewayNotification::McpOAuthChanged(_) => None,
+        GatewayNotification::WorkspacePush(_)
+        | GatewayNotification::McpOAuthChanged(_)
+        | GatewayNotification::PluginsChanged(_) => None,
         GatewayNotification::AccessChanged(notification) => {
             Some(ClientRuntimeNotification::AccessChanged(notification))
         }

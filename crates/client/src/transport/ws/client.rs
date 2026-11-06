@@ -176,6 +176,7 @@ pub enum GatewayWsCommand {
         response_tx: JsonRpcResponseSender,
     },
     BinaryUploadChunk {
+        expected_connection: Option<u64>,
         upload_id: String,
         offset: u64,
         payload: Vec<u8>,
@@ -526,6 +527,7 @@ async fn handle_command(
             }
         }
         GatewayWsCommand::BinaryUploadChunk {
+            expected_connection,
             upload_id,
             offset,
             payload,
@@ -536,6 +538,10 @@ async fn handle_command(
                 return true;
             };
 
+            if expected_connection.is_some_and(|id| id != connection_task.connection_id) {
+                let _ = response_tx.send(Err("websocket connection changed".to_owned()));
+                return true;
+            }
             let fallback_tx = response_tx.clone();
             if connection_task
                 .rpc_tx

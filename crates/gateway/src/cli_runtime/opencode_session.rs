@@ -709,7 +709,8 @@ struct OpenCodeServerProcess {
     version: Option<String>,
     process: Mutex<CLIAgentProcess>,
     stdin: Mutex<Option<ChildStdin>>,
-    stdout_reader: JoinHandle<()>,
+    stdout_reader: Mutex<Option<JoinHandle<()>>>,
+    stdout_failure: std::sync::Mutex<Option<String>>,
     stderr: pioneer_cli_agent_runtime::process::StderrRing,
     shutdown_grace: Duration,
     _catalog_plugin: tempfile::TempDir,
@@ -718,16 +719,46 @@ struct OpenCodeServerProcess {
 impl OpenCodeServerProcess {
     async fn close(&self) -> Result<()> {
         self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
-        self.stdout_reader.abort();
+        let mut stdout_reader = self.stdout_reader.lock().await;
+        if let Some(reader) = stdout_reader.as_ref() {
+            reader.abort();
+        }
         self.stdin.lock().await.take();
         let mut process = self.process.lock().await;
-        terminate_opencode_process(&mut process, self.shutdown_grace).await
+        let process_result = terminate_opencode_process(&mut process, self.shutdown_grace).await;
+        drop(process);
+        if let Some(reader) = stdout_reader.as_mut() {
+            let result = reader.await;
+            stdout_reader.take();
+            if let Err(error) = result
+                && !error.is_cancelled()
+            {
+                *self
+                    .stdout_failure
+                    .lock()
+                    .expect("OpenCode stdout failure poisoned") =
+                    Some("OpenCode stdout worker failed".to_owned());
+            }
+        }
+        process_result?;
+        // A consumed worker panic remains a failed stop on subsequent attempts.
+        match self
+            .stdout_failure
+            .lock()
+            .expect("OpenCode stdout failure poisoned")
+            .clone()
+        {
+            Some(error) => Err(anyhow!("{error}")),
+            None => Ok(()),
+        }
     }
 }
 
 impl Drop for OpenCodeServerProcess {
     fn drop(&mut self) {
-        self.stdout_reader.abort();
+        if let Some(reader) = self.stdout_reader.get_mut().as_ref() {
+            reader.abort();
+        }
         self.process.get_mut().abort_service();
     }
 }
@@ -1262,7 +1293,10 @@ async fn spawn_opencode_server_attempt(
         version,
         process: Mutex::new(owner.process.take().expect("startup owns process")),
         stdin: Mutex::new(Some(stdin)),
-        stdout_reader: owner.stdout_reader.take().expect("startup stdout reader"),
+        stdout_reader: Mutex::new(Some(
+            owner.stdout_reader.take().expect("startup stdout reader"),
+        )),
+        stdout_failure: std::sync::Mutex::new(None),
         stderr,
         shutdown_grace: Duration::from_secs(5),
         _catalog_plugin: catalog_plugin,
@@ -3173,6 +3207,14 @@ enum OpenCodeRequiredMcpBridgeState {
         server: JoinHandle<Result<(), crate::cli_runtime::mcp::server::CliMcpBridgeServerError>>,
         active_turn: Option<OpenCodeActiveMcpTurn>,
     },
+    Stopping {
+        handle: Option<CliMcpBridgeFacadeHandle>,
+        server: Option<
+            JoinHandle<Result<(), crate::cli_runtime::mcp::server::CliMcpBridgeServerError>>,
+        >,
+        outcome: Option<Result<(), String>>,
+        cleanup_done: bool,
+    },
     Failed,
 }
 
@@ -3201,7 +3243,8 @@ impl OpenCodeRequiredMcpBridge {
             let mut state = self.state.lock().await;
             match &*state {
                 OpenCodeRequiredMcpBridgeState::Ready { .. } => return Ok(()),
-                OpenCodeRequiredMcpBridgeState::Failed => {
+                OpenCodeRequiredMcpBridgeState::Failed
+                | OpenCodeRequiredMcpBridgeState::Stopping { .. } => {
                     bail!("OpenCode required MCP bridge generation is failed")
                 }
                 OpenCodeRequiredMcpBridgeState::Serving { bound_grant, .. } => bound_grant.clone(),
@@ -3282,16 +3325,76 @@ impl OpenCodeRequiredMcpBridge {
         }
     }
 
-    async fn fail_closed(&self) {
+    async fn request_stop(&self) {
         let mut state = self.state.lock().await;
-        let previous = std::mem::replace(&mut *state, OpenCodeRequiredMcpBridgeState::Failed);
-        match previous {
-            OpenCodeRequiredMcpBridgeState::Serving { server, .. }
-            | OpenCodeRequiredMcpBridgeState::Ready { server, .. } => server.abort(),
-            OpenCodeRequiredMcpBridgeState::Pending | OpenCodeRequiredMcpBridgeState::Failed => {}
+        if let OpenCodeRequiredMcpBridgeState::Stopping { handle, .. } = &*state {
+            if let Some(handle) = handle {
+                handle.request_shutdown();
+            }
+            return;
         }
-        drop(state);
-        self.supervisor.revoke_session(&self.process_instance).await;
+        let previous = std::mem::replace(&mut *state, OpenCodeRequiredMcpBridgeState::Failed);
+        *state = match previous {
+            OpenCodeRequiredMcpBridgeState::Serving { handle, server, .. }
+            | OpenCodeRequiredMcpBridgeState::Ready { handle, server, .. } => {
+                handle.request_shutdown();
+                OpenCodeRequiredMcpBridgeState::Stopping {
+                    handle: Some(handle),
+                    server: Some(server),
+                    outcome: None,
+                    cleanup_done: false,
+                }
+            }
+            _ => OpenCodeRequiredMcpBridgeState::Stopping {
+                handle: None,
+                server: None,
+                outcome: Some(Ok(())),
+                cleanup_done: false,
+            },
+        };
+    }
+    async fn stop_and_wait(&self) -> Result<()> {
+        self.request_stop().await;
+        let mut state = self.state.lock().await;
+        let OpenCodeRequiredMcpBridgeState::Stopping {
+            server,
+            outcome,
+            cleanup_done,
+            ..
+        } = &mut *state
+        else {
+            bail!("OpenCode bridge stop ownership changed");
+        };
+        if outcome.is_none() {
+            let task = server
+                .as_mut()
+                .ok_or_else(|| anyhow!("OpenCode bridge completion is unknown"))?;
+            let result = match task.await {
+                Ok(result) => result.map_err(|e| e.to_string()),
+                Err(_) => Err("OpenCode MCP facade worker failed".to_owned()),
+            };
+            server.take();
+            *outcome = Some(result);
+        }
+        outcome.clone().unwrap().map_err(|e| anyhow!("{e}"))?;
+        if !*cleanup_done {
+            if !self.launch.cleanup_confirmed()
+                && !self
+                    .supervisor
+                    .revoke_session_result(&self.process_instance)
+                    .await?
+                && !self.launch.cleanup_confirmed()
+            {
+                bail!("CLI MCP cleanup owner is unknown");
+            }
+            *cleanup_done = true;
+        }
+        Ok(())
+    }
+    async fn fail_closed(&self) {
+        if let Err(error) = self.stop_and_wait().await {
+            tracing::warn!(error = %error, "OpenCode MCP bridge cleanup retained");
+        }
     }
 
     async fn prepare_turn(
@@ -3448,7 +3551,9 @@ impl CLIAgentRuntimeSessionFactory for OpenCodeCLIAgentRuntimeSessionFactory {
         &self,
         process_instance: &CliSessionInstanceId,
         launch_spec: &CliSessionLaunchSpec,
+        startup: &crate::cli_runtime::manager::CLIAgentRuntimeSessionStartup,
     ) -> Result<Arc<dyn CLIAgentRuntimeSession>> {
+        startup.check_admission()?;
         let native_session_id = match &launch_spec.continuation {
             CliProviderContinuation::OpenCodeServerSession { native_session_id } => {
                 native_session_id.clone()
@@ -3552,6 +3657,10 @@ impl CLIAgentRuntimeSessionFactory for OpenCodeCLIAgentRuntimeSessionFactory {
                 return Err(error);
             }
         };
+        startup.retain_session(Arc::new(OpenCodeStartupSession {
+            server: server.clone(),
+        }));
+        startup.check_admission()?;
         let request_timeout = Duration::from_millis(instance.request_timeout_ms.max(1));
         let initialized: Result<Option<Arc<OpenCodeRequiredMcpBridge>>> = async {
             if let Some(projection) = launch_projection.as_ref() {
@@ -3686,7 +3795,8 @@ impl CLIAgentRuntimeSessionFactory for OpenCodeCLIAgentRuntimeSessionFactory {
                 runtime_kind: "opencode".to_owned(),
                 events: event_rx,
             })),
-            event_stream: std::sync::Mutex::new(Some(event_stream)),
+            event_stream: Mutex::new(Some(event_stream)),
+            event_stream_failure: std::sync::Mutex::new(None),
             cancellation,
             required_mcp_bridge,
             stream_ready: ready_rx,
@@ -3698,6 +3808,19 @@ impl CLIAgentRuntimeSessionFactory for OpenCodeCLIAgentRuntimeSessionFactory {
     }
 }
 
+// Retain the spawned process in the manager's factory owner until the full
+// session is published, including failures or cancellation during initialization.
+struct OpenCodeStartupSession {
+    server: Arc<OpenCodeServerProcess>,
+}
+
+#[async_trait]
+impl CLIAgentRuntimeSession for OpenCodeStartupSession {
+    async fn close(&self) -> Result<()> {
+        self.server.close().await
+    }
+}
+
 struct OpenCodeCLIAgentRuntimeSession {
     runtime_id: String,
     process_instance: CliSessionInstanceId,
@@ -3706,7 +3829,8 @@ struct OpenCodeCLIAgentRuntimeSession {
     request_timeout: Duration,
     event_tx: mpsc::Sender<pioneer_observability::work::WorkItem<RuntimeEvent>>,
     event_receivers: std::sync::Mutex<Option<CLIAgentRuntimeEventReceivers>>,
-    event_stream: std::sync::Mutex<Option<JoinHandle<()>>>,
+    event_stream: Mutex<Option<JoinHandle<()>>>,
+    event_stream_failure: std::sync::Mutex<Option<String>>,
     cancellation: CancellationToken,
     required_mcp_bridge: Option<Arc<OpenCodeRequiredMcpBridge>>,
     stream_ready: watch::Receiver<bool>,
@@ -3720,19 +3844,41 @@ struct OpenCodeCLIAgentRuntimeSession {
 impl CLIAgentRuntimeSession for OpenCodeCLIAgentRuntimeSession {
     async fn close(&self) -> Result<()> {
         self.cancellation.cancel();
-        if let Some(stream) = self
-            .event_stream
-            .lock()
-            .expect("OpenCode event stream mutex should not be poisoned")
-            .take()
-        {
-            stream.abort();
+        if let Some(bridge) = &self.required_mcp_bridge {
+            bridge.request_stop().await;
+        }
+        let mut stream = self.event_stream.lock().await;
+        if let Some(task) = stream.as_mut() {
+            task.abort();
+            let result = task.await;
+            stream.take();
+            if let Err(error) = result
+                && !error.is_cancelled()
+            {
+                *self
+                    .event_stream_failure
+                    .lock()
+                    .expect("OpenCode stream failure poisoned") =
+                    Some("OpenCode event stream worker failed".to_owned());
+            }
         }
         self.pending_prompt.lock().await.take();
-        if let Some(bridge) = self.required_mcp_bridge.as_ref() {
-            bridge.fail_closed().await;
+        let server_result = self.server.close().await;
+        let bridge_result = if let Some(bridge) = &self.required_mcp_bridge {
+            bridge.stop_and_wait().await
+        } else {
+            Ok(())
+        };
+        if let Some(error) = self
+            .event_stream_failure
+            .lock()
+            .expect("OpenCode stream failure poisoned")
+            .clone()
+        {
+            return Err(anyhow!("{error}"));
         }
-        self.server.close().await
+        server_result?;
+        bridge_result
     }
 
     async fn validate_replacement_launch(&self, launch: &CliSessionLaunchSpec) -> Result<()> {

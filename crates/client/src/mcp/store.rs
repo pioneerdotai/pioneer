@@ -1101,6 +1101,7 @@ mod tests {
             servers: names
                 .iter()
                 .map(|id| McpListItem {
+                    plugin_owner: None,
                     id: (*id).into(),
                     name: (*id).into(),
                     display_name: None,

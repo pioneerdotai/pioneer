@@ -216,6 +216,8 @@ pub mod workspace_membership;
 pub mod compaction_checkpoint_event_input;
 pub mod compaction_checkpoint_import;
 pub mod compaction_checkpoint_replay_alias;
+pub mod plugin_component;
+pub mod plugin_installation;
 
 pub mod portable_payload_dictionary;
 

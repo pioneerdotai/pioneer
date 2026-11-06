@@ -18,6 +18,7 @@ use std::{
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ComposerCatalogKind {
+    Plugins,
     Skills,
     McpServers,
     McpTools { server_id: String },
@@ -50,6 +51,7 @@ impl ComposerCatalogRequest {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ComposerPickerKind {
+    Plugins,
     Skills,
     Mcp,
 }
@@ -78,6 +80,8 @@ pub struct ComposerCatalogPublication {
     pub thread_id: String,
     pub draft_id: DraftId,
     pub revision: u64,
+    pub plugins: Vec<pioneer_protocol::PluginItem>,
+    pub plugin_request: ComposerCatalogRequest,
     pub skills: SkillManagementProjection,
     pub skill_request: ComposerCatalogRequest,
     pub mcp_servers: Vec<SelectableMcpCapability>,
@@ -92,6 +96,8 @@ impl ComposerCatalogPublication {
             thread_id: thread.into(),
             draft_id,
             revision: 0,
+            plugins: vec![],
+            plugin_request: Default::default(),
             skills: Default::default(),
             skill_request: Default::default(),
             mcp_servers: vec![],
@@ -103,6 +109,7 @@ impl ComposerCatalogPublication {
     }
     fn request_mut(&mut self, kind: &ComposerCatalogKind) -> &mut ComposerCatalogRequest {
         match kind {
+            ComposerCatalogKind::Plugins => &mut self.plugin_request,
             ComposerCatalogKind::Skills => &mut self.skill_request,
             ComposerCatalogKind::McpServers => &mut self.mcp_request,
             ComposerCatalogKind::McpTools { server_id } => {
@@ -112,6 +119,7 @@ impl ComposerCatalogPublication {
     }
     fn request(&self, kind: &ComposerCatalogKind) -> Option<&ComposerCatalogRequest> {
         match kind {
+            ComposerCatalogKind::Plugins => Some(&self.plugin_request),
             ComposerCatalogKind::Skills => Some(&self.skill_request),
             ComposerCatalogKind::McpServers => Some(&self.mcp_request),
             ComposerCatalogKind::McpTools { server_id } => self.tool_requests.get(server_id),
@@ -143,6 +151,10 @@ pub enum ComposerCatalogIntent {
         picker: ComposerPickerKind,
         deferred: bool,
     },
+    TogglePlugin {
+        identity: ComposerOperationIdentity,
+        plugin_id: String,
+    },
     ToggleSkill {
         identity: ComposerOperationIdentity,
         selection: ComposerSkillSelection,
@@ -166,6 +178,7 @@ struct CatalogWork {
     auth: ((u64, u64), Option<u64>),
 }
 enum CatalogResult {
+    Plugins(Vec<pioneer_protocol::PluginItem>),
     Skills(SkillManagementProjection),
     Servers(Vec<SelectableMcpCapability>, Vec<String>),
     Tools(Vec<SelectableMcpCapability>),
@@ -269,6 +282,9 @@ impl ClientCore {
             .is_some_and(|p| {
                 let capabilities = crate::authorization::principal_presentation_capabilities(&p);
                 match kind {
+                    ComposerCatalogKind::Plugins => {
+                        capabilities.can_use_skills && capabilities.can_use_mcp
+                    }
                     ComposerCatalogKind::Skills => capabilities.can_use_skills,
                     _ => capabilities.can_use_mcp,
                 }
@@ -416,6 +432,7 @@ impl ClientCore {
                 deferred,
             } => {
                 let catalog = match picker {
+                    ComposerPickerKind::Plugins => ComposerCatalogKind::Plugins,
                     ComposerPickerKind::Skills => ComposerCatalogKind::Skills,
                     ComposerPickerKind::Mcp => ComposerCatalogKind::McpServers,
                 };
@@ -466,6 +483,7 @@ impl ClientCore {
                         ComposerPickerSelection::Immediate
                     } else {
                         match picker {
+                            ComposerPickerKind::Plugins => ComposerPickerSelection::Immediate,
                             ComposerPickerKind::Skills => ComposerPickerSelection::Skills {
                                 selections: draft.domain().skill_selections.clone(),
                             },
@@ -490,7 +508,8 @@ impl ClientCore {
     }
     fn composer_picker_action(&self, intent: ComposerCatalogIntent) -> ClientTransition {
         let identity = match &intent {
-            ComposerCatalogIntent::ToggleSkill { identity, .. }
+            ComposerCatalogIntent::TogglePlugin { identity, .. }
+            | ComposerCatalogIntent::ToggleSkill { identity, .. }
             | ComposerCatalogIntent::ToggleMcp { identity, .. }
             | ComposerCatalogIntent::CommitPicker { identity }
             | ComposerCatalogIntent::ClosePicker { identity } => identity.clone(),
@@ -504,6 +523,7 @@ impl ClientCore {
                 .composer_catalog_snapshot(&identity.thread_id)
                 .and_then(|p| {
                     p.session.as_ref().map(|s| match s.kind {
+                        ComposerPickerKind::Plugins => ComposerCatalogKind::Plugins,
                         ComposerPickerKind::Skills => ComposerCatalogKind::Skills,
                         ComposerPickerKind::Mcp => ComposerCatalogKind::McpServers,
                     })
@@ -568,6 +588,33 @@ impl ClientCore {
                 } else {
                     action = Some(ComposerDomainAction::ToggleSkillSelection { picker, selection });
                 }
+            }
+            ComposerCatalogIntent::TogglePlugin { plugin_id, .. } => {
+                if session.kind != ComposerPickerKind::Plugins {
+                    return self.reject_intent();
+                }
+                let key = pioneer_protocol::plugin_capability_key(&plugin_id);
+                action = Some(if draft.domain().capabilities.iter().any(|c| c.id == key) {
+                    ComposerDomainAction::RemoveCapability { id: key }
+                } else {
+                    if !crate::plugins::plugin_picker_target_supported(
+                        draft.domain().capability_target,
+                    ) {
+                        return self.reject_intent();
+                    }
+                    let Some(capability) = next
+                        .plugins
+                        .iter()
+                        .find(|p| p.id == plugin_id)
+                        .and_then(crate::plugins::plugin_capability)
+                    else {
+                        return self.reject_intent();
+                    };
+                    ComposerDomainAction::AddCapabilities {
+                        capabilities: vec![capability],
+                    }
+                });
+                // Target-only toggle: never refresh revisions of other selected parents.
             }
             ComposerCatalogIntent::ToggleMcp { key, .. } => {
                 if session.kind != ComposerPickerKind::Mcp {
@@ -707,6 +754,7 @@ impl ClientCore {
             Ok(result) => {
                 next.request_mut(&work.kind).state = ComposerCatalogRequestState::Ready;
                 match result {
+                    CatalogResult::Plugins(plugins) => next.plugins = plugins,
                     CatalogResult::Skills(management) => next.skills = management,
                     CatalogResult::Servers(rows, ids) => {
                         next.mcp_servers = rows;
@@ -741,6 +789,7 @@ impl ClientCore {
         let mut store = self.composer_store.lock().expect("composer store poisoned");
         if let Some(current) = store.catalogs.get(thread).cloned() {
             let mut next = ComposerCatalogPublication::new(thread, current.draft_id);
+            next.plugin_request.state = ComposerCatalogRequestState::Cancelled;
             next.skill_request.state = ComposerCatalogRequestState::Cancelled;
             next.mcp_request.state = ComposerCatalogRequestState::Cancelled;
             self.publish_composer_catalog(&mut store, next);
@@ -785,6 +834,25 @@ impl ClientCore {
         drop(store);
         self.cancel_composer_catalog(thread_id);
     }
+    pub(crate) fn refresh_composer_plugins(&self, workspace: &str) {
+        let targets: Vec<_> = {
+            let store = self.composer_store.lock().expect("composer store poisoned");
+            store
+                .catalogs
+                .values()
+                .filter(|p| p.plugin_request.state != ComposerCatalogRequestState::Idle)
+                .map(|p| (p.thread_id.clone(), p.draft_id))
+                .collect()
+        };
+        for (thread, draft) in targets {
+            if self
+                .thread_coordinator_snapshot(&thread)
+                .is_some_and(|p| p.workspace_id == workspace)
+            {
+                self.request_composer_catalog(&thread, draft, ComposerCatalogKind::Plugins, true);
+            }
+        }
+    }
     pub(crate) fn start_composer_catalog_controller(self: &Arc<Self>) {
         let (sender, receiver) = mpsc::sync_channel::<CatalogWork>(64);
         let weak = Arc::downgrade(self);
@@ -803,6 +871,9 @@ impl ClientCore {
                             .is_some_and(|core| core.catalog_work_current(&work))
                     };
                     let result = match &work.kind {
+                        ComposerCatalogKind::Plugins => core
+                            .read_plugins(&work.workspace)
+                            .map(|p| CatalogResult::Plugins(p.plugins)),
                         ComposerCatalogKind::Skills => {
                             let read = core.read_skills_catalog(&work.workspace);
                             drop(core);
@@ -1033,6 +1104,64 @@ mod tests {
             selectable: true,
             unavailable_reason: None,
         }
+    }
+    // NOT_RUN / NOT_COMPILED. Same shared domain drives phone and desktop.
+    #[test]
+    fn plugin_toggle_never_refreshes_other_selected_parents_or_adds_children() {
+        fn parent(id: char, revision: i64) -> PluginItem {
+            PluginItem {
+                id: id.to_string().repeat(21),
+                name: "Mixed".into(),
+                version: None,
+                enabled: true,
+                state: "installed".into(),
+                revision,
+                status: "partial".into(),
+                components: vec![],
+                diagnostics: vec![],
+            }
+        }
+        let (core, receiver) = fixture();
+        let identity = open(&core, ComposerPickerKind::Plugins, false);
+        core.complete_composer_catalog(
+            receiver.try_recv().unwrap(),
+            Ok(CatalogResult::Plugins(vec![parent('P', 7), parent('Q', 1)])),
+        );
+        core.composer_catalog_intent(ComposerCatalogIntent::TogglePlugin {
+            identity: identity.clone(),
+            plugin_id: "P".repeat(21),
+        });
+        observe(&core, ComposerCatalogKind::Plugins, true);
+        core.complete_composer_catalog(
+            receiver.try_recv().unwrap(),
+            Ok(CatalogResult::Plugins(vec![parent('P', 8), parent('Q', 1)])),
+        );
+        core.composer_catalog_intent(ComposerCatalogIntent::TogglePlugin {
+            identity: identity.clone(),
+            plugin_id: "Q".repeat(21),
+        });
+        let draft = core.composer_snapshot("a").unwrap();
+        assert_eq!(draft.domain().capabilities.len(), 2);
+        assert!(matches!(
+            draft.domain().capabilities[0].kind,
+            capabilities::ComposerCapabilityKind::Plugin {
+                expected_revision: 7,
+                ..
+            }
+        ));
+        assert!(draft.domain().skill_selections.is_empty());
+        core.composer_catalog_intent(ComposerCatalogIntent::TogglePlugin {
+            identity,
+            plugin_id: "P".repeat(21),
+        });
+        assert_eq!(
+            core.composer_snapshot("a")
+                .unwrap()
+                .domain()
+                .capabilities
+                .len(),
+            1
+        );
     }
     #[test]
     fn persistent_failure_requires_retry_and_equal_observation_does_not_schedule_work() {

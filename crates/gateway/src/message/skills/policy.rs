@@ -144,6 +144,7 @@ impl MessageProcessor {
         request_id: RequestId,
         params: SkillsPolicySetParams,
     ) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
         let connection_id = request_context.connection_id();
         let workspace_id = match self
             .validate_skills_workspace(
@@ -216,13 +217,73 @@ impl MessageProcessor {
             .await;
             return;
         };
+        // Parent admission precedes the existing native policy write. Policy
+        // reset intentionally overrides both fields; a partial edit records only
+        // the supplied fields. Native policy remains the sole settings store.
+        let fields = if params.enabled.is_none() && params.allow_implicit_invocation.is_none() {
+            vec!["enabled", "allow_implicit_invocation"]
+        } else {
+            let mut fields = Vec::new();
+            if params.enabled.is_some() {
+                fields.push("enabled");
+            }
+            if params.allow_implicit_invocation.is_some() {
+                fields.push("allow_implicit_invocation");
+            }
+            fields
+        };
+        let mut native = match self
+            .begin_native_plugin_change(
+                request_context,
+                &request_id,
+                &workspace_id,
+                "skill",
+                params.skill_id.as_str(),
+                "policy",
+                &fields,
+                deadline,
+            )
+            .await
+        {
+            Ok(change) => change,
+            Err(error) => {
+                self.send_error(
+                    connection_id,
+                    skills_error(
+                        Some(request_id),
+                        INVALID_REQUEST_CODE,
+                        SKILLS_ERROR_INVALID_REQUEST,
+                        super::super::plugins::native_plugin_error_code(&error),
+                        json!({}),
+                    ),
+                )
+                .await;
+                return;
+            }
+        };
         let now = now_timestamp_secs();
         if params.enabled.is_none() && params.allow_implicit_invocation.is_none() {
-            if let Err(error) = self
+            let write = self
                 .crud_store
-                .delete_workspace_skill_policy(workspace_id.as_str(), &params.skill_id)
-                .await
-            {
+                .delete_workspace_skill_policy_with_plugin_change(
+                    workspace_id.as_str(),
+                    &params.skill_id,
+                    native.as_ref().map(|change| &change.write),
+                );
+            let written = if native.is_some() {
+                tokio::time::timeout_at(deadline, write)
+                    .await
+                    .map_err(|_| anyhow::anyhow!("plugins.outcome_unconfirmed"))
+                    .and_then(|result| result)
+            } else {
+                write.await
+            };
+            if let Err(error) = written {
+                if let Some(change) = &native {
+                    let _ = self
+                        .interrupt_native_plugin_change(change, "plugins.component_change_failed")
+                        .await;
+                }
                 self.send_error(
                     connection_id,
                     skills_error(
@@ -237,6 +298,22 @@ impl MessageProcessor {
                 return;
             }
 
+            if let Some(change) = native.take() {
+                if let Err(error) = self.finish_native_plugin_change(change).await {
+                    self.send_error(
+                        connection_id,
+                        skills_error(
+                            Some(request_id),
+                            INVALID_REQUEST_CODE,
+                            SKILLS_ERROR_INTERNAL,
+                            super::super::plugins::native_plugin_error_code(&error),
+                            json!({}),
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+            }
             let policy = SkillWorkspacePolicy {
                 workspace_id: workspace_id.clone(),
                 skill_id: params.skill_id.clone(),
@@ -299,6 +376,11 @@ impl MessageProcessor {
 
         if matches!(params.allow_implicit_invocation, Some(false)) {
             if !skill_implicit_invocation_editable(target) {
+                if let Some(change) = &native {
+                    let _ = self
+                        .interrupt_native_plugin_change(change, "plugins.component_change_failed")
+                        .await;
+                }
                 self.send_error(
                     connection_id,
                     skills_error(
@@ -324,11 +406,27 @@ impl MessageProcessor {
             enabled: params.enabled,
             allow_implicit_invocation: params.allow_implicit_invocation,
         };
-        if let Err(error) = self
+        let write = self
             .crud_store
-            .upsert_workspace_skill_policy(&record, now)
-            .await
-        {
+            .upsert_workspace_skill_policy_with_plugin_change(
+                &record,
+                native.as_ref().map(|change| &change.write),
+                now,
+            );
+        let written = if native.is_some() {
+            tokio::time::timeout_at(deadline, write)
+                .await
+                .map_err(|_| anyhow::anyhow!("plugins.outcome_unconfirmed"))
+                .and_then(|result| result)
+        } else {
+            write.await
+        };
+        if let Err(error) = written {
+            if let Some(change) = &native {
+                let _ = self
+                    .interrupt_native_plugin_change(change, "plugins.component_change_failed")
+                    .await;
+            }
             self.send_error(
                 connection_id,
                 skills_error(
@@ -343,6 +441,22 @@ impl MessageProcessor {
             return;
         }
 
+        if let Some(change) = native.take() {
+            if let Err(error) = self.finish_native_plugin_change(change).await {
+                self.send_error(
+                    connection_id,
+                    skills_error(
+                        Some(request_id),
+                        INVALID_REQUEST_CODE,
+                        SKILLS_ERROR_INTERNAL,
+                        super::super::plugins::native_plugin_error_code(&error),
+                        json!({}),
+                    ),
+                )
+                .await;
+                return;
+            }
+        }
         let payload = SkillsPolicySetResponse {
             policy: SkillWorkspacePolicy {
                 workspace_id: record.workspace_id.clone(),
