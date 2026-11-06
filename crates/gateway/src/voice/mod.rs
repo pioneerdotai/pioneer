@@ -1,6 +1,7 @@
 pub(crate) mod audio_normalization;
 pub(crate) mod finalization;
 pub(crate) mod incremental;
+pub(crate) mod ingress;
 pub(crate) mod model_catalog;
 pub(crate) mod model_install;
 pub(crate) mod runtime;

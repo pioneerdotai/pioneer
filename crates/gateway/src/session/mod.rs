@@ -339,6 +339,33 @@ impl SessionManager {
         connection_ids
     }
 
+    /// Revalidate the mutable physical owner after async voice authorization.
+    /// The synchronous effect may take short in-memory locks, but must never
+    /// perform I/O, send, join, or await while the registry read guard is held.
+    pub(crate) async fn with_voice_ingress_connection<T>(
+        &self,
+        connection_id: ConnectionId,
+        expected: &AuthenticatedSessionPrincipal,
+        effect: impl FnOnce() -> T,
+    ) -> Option<T> {
+        let connections = self.connections.read().await;
+        let connection = connections.get(&connection_id)?;
+        let current = connection.principal.as_ref();
+        let now = crate::helpers::unix_timestamp_secs().ok()?;
+        if current.gateway_id != expected.gateway_id
+            || current.principal_id != expected.principal_id
+            || current.device_id != expected.device_id
+            || current.session_id != expected.session_id
+            || current.kind != expected.kind
+            || current.role_key != expected.role_key
+            || connection.termination_tx.borrow().is_some()
+            || now >= current.access_expires_at_unix
+        {
+            return None;
+        }
+        Some(effect())
+    }
+
     pub(crate) async fn connection_context(
         &self,
         connection_id: ConnectionId,
@@ -389,6 +416,83 @@ impl SessionManager {
         if workspace_id != connection.workspace_id {
             connection.scope_change_tx.send_replace(());
             connection.workspace_id = workspace_id;
+        }
+    }
+
+    pub(crate) async fn send_voice_text(
+        &self,
+        id: ConnectionId,
+        payload: String,
+        terminal: bool,
+    ) -> Result<()> {
+        self.send_voice_text_authorized(id, payload, terminal, || async { true })
+            .await
+    }
+
+    pub(crate) async fn send_voice_text_authorized<F, Fut>(
+        &self,
+        id: ConnectionId,
+        payload: String,
+        terminal: bool,
+        mut authorize: F,
+    ) -> Result<()>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        let original = self.connection_context(id).await?;
+        let sender = {
+            let connections = self.connections.read().await;
+            connections
+                .get(&id)
+                .ok_or_else(|| anyhow!("voice connection retired"))?
+                .sender
+                .clone()
+        };
+        let mut scope = self.connection_scope_receiver(id).await?;
+        let mut termination = self.connection_termination_receiver(id).await?;
+        let mut message = Message::Text(payload.into());
+        loop {
+            let changed = sender.audio_capacity_changed().notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            // A capacity wake grants no authority. Recheck the resource before
+            // every enqueue attempt, without holding the connection registry.
+            anyhow::ensure!(authorize().await, "voice delivery resource retired");
+            let admission = self
+                .with_voice_ingress_connection(id, original.principal(), || {
+                    sender.try_send_audio(message, terminal)
+                })
+                .await;
+            match admission {
+                Some(Ok(())) => return Ok(()),
+                Some(Err(tokio::sync::mpsc::error::TrySendError::Full(returned))) => {
+                    message = returned;
+                    #[cfg(test)]
+                    self.pause_delivery(
+                        id,
+                        if terminal {
+                            pioneer_protocol::constants::events::VOICE_SESSION_RESULT
+                        } else {
+                            pioneer_protocol::constants::events::VOICE_CHUNK_ACK
+                        },
+                    )
+                    .await;
+                }
+                _ => anyhow::bail!("voice delivery owner retired"),
+            }
+            let current = self.connection_context(id).await?;
+            let now = crate::helpers::unix_timestamp_secs()?;
+            anyhow::ensure!(
+                now < current.principal().access_expires_at_unix,
+                "voice access expired"
+            );
+            tokio::select! {
+                _ = &mut changed => {},
+                _ = scope.changed() => {},
+                _ = termination.changed() => {},
+                _ = tokio::time::sleep(Duration::from_secs(current.principal().access_expires_at_unix - now)) => {},
+            }
         }
     }
 

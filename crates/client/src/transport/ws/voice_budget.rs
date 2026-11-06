@@ -1,4 +1,4 @@
-//! Voice-only capacity retained across the existing command FIFOs and socket write.
+//! Voice-only capacity retained across the socket mailbox, finalize fence, and write.
 use std::sync::{Arc, Mutex};
 
 const MAX_VOICE_BYTES: usize = 256 * 1024;

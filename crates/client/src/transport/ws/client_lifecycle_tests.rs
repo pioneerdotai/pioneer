@@ -412,9 +412,16 @@ fn request(commands: &WsSender<ConnectionRpcCommand>, method: &str) -> Request {
 }
 
 fn cancel_request(receipt: &SocketReceipt) -> Request {
+    cancel_request_for(receipt, pioneer_protocol::constants::methods::TURN_CANCEL)
+}
+fn cancel_request_for(receipt: &SocketReceipt, method: &str) -> Request {
     let request = crate::rpc::build_json_rpc_request_payload(
-        pioneer_protocol::constants::methods::TURN_CANCEL,
-        json!({"thread_id":"control-thread", "turn_id":"control-turn"}),
+        method,
+        if method == pioneer_protocol::constants::methods::VOICE_SESSION_CANCEL {
+            json!({"session_id":"control-voice-session"})
+        } else {
+            json!({"thread_id":"control-thread", "turn_id":"control-turn"})
+        },
     )
     .unwrap();
     let (tx, rx) = mpsc::channel();
@@ -690,15 +697,12 @@ async fn delayed_voice_tail_and_finalize_keep_socket_order_without_per_packet_ac
         fixture.gate.block();
         let budget = Arc::new(super::super::voice_budget::VoiceTransportBudget::default());
         fixture
-            .commands
-            .send(ConnectionRpcCommand::VoiceBinaryChunk {
-                payload: budget.admit(pcm.clone()).unwrap(),
-            })
+            .receipt
+            .admit_voice(budget.admit(pcm.clone()).unwrap())
             .unwrap();
         fixture.gate.wait_entered().await;
         // The in-flight socket write still owns its capacity reservation.
         assert!(budget.admit(vec![0; 256 * 1024]).is_err());
-        let epoch = fixture.idle.epoch();
         let mut frames = vec![pcm.clone()];
         for sequence in 1..3 {
             let frame = crate::transport::ws::frames::encode_voice_audio_chunk_frame(
@@ -711,15 +715,12 @@ async fn delayed_voice_tail_and_finalize_keep_socket_order_without_per_packet_ac
             )
             .unwrap();
             fixture
-                .commands
-                .send(ConnectionRpcCommand::VoiceBinaryChunk {
-                    payload: budget.admit(frame.clone()).unwrap(),
-                })
+                .receipt
+                .admit_voice(budget.admit(frame.clone()).unwrap())
                 .unwrap();
             frames.push(frame);
         }
-        fixture.idle.after(epoch).await;
-        // A is at the gate, B fills the handoff, C prevents further FIFO dequeue.
+        // A is at the socket gate; B/C occupy the separate voice mailbox.
         fixture.reply(&first.id).await;
         assert!(receive(first.rx).await.is_ok());
         assert!(fixture.gate.state.lock().unwrap().blocked);
@@ -821,21 +822,15 @@ async fn blocked_voice_burst(
 ) {
     f.consume_initial_heartbeat().await;
     f.gate.block();
-    f.commands
-        .send(ConnectionRpcCommand::VoiceBinaryChunk {
-            payload: budget.admit(vec![1]).unwrap(),
-        })
+    f.receipt
+        .admit_voice(budget.admit(vec![1]).unwrap())
         .unwrap();
     f.gate.wait_entered().await;
-    let epoch = f.idle.epoch();
     for byte in [2, 3] {
-        f.commands
-            .send(ConnectionRpcCommand::VoiceBinaryChunk {
-                payload: budget.admit(vec![byte]).unwrap(),
-            })
+        f.receipt
+            .admit_voice(budget.admit(vec![byte]).unwrap())
             .unwrap();
     }
-    f.idle.after(epoch).await;
 }
 
 #[tokio::test]
@@ -849,13 +844,11 @@ async fn pending_voice_teardown_releases_budget_and_never_migrates_frames() {
             let mut f = Fixture::start().await;
             let budget = Arc::new(super::super::voice_budget::VoiceTransportBudget::default());
             blocked_voice_burst(&mut f, &budget).await;
-            // Three reservations span writer, handoff and pending; the rest stay
-            // in the existing FIFO. Neither stage bypasses the frame/byte limits.
+            // Reservations span the active writer and its separate voice mailbox.
+            // Every stage retains the same frame/byte admission budget.
             for _ in 3..128 {
-                f.commands
-                    .send(ConnectionRpcCommand::VoiceBinaryChunk {
-                        payload: budget.admit(vec![4]).unwrap(),
-                    })
+                f.receipt
+                    .admit_voice(budget.admit(vec![4]).unwrap())
                     .unwrap();
             }
             assert!(budget.admit(vec![5]).is_err());
@@ -902,17 +895,13 @@ async fn pending_finalize_preserves_completion_cancellation_and_deadline() {
             f.consume_initial_heartbeat().await;
             f.gate.block();
             let budget = Arc::new(super::super::voice_budget::VoiceTransportBudget::default());
-            f.commands
-                .send(ConnectionRpcCommand::VoiceBinaryChunk {
-                    payload: budget.admit(vec![1]).unwrap(),
-                })
+            f.receipt
+                .admit_voice(budget.admit(vec![1]).unwrap())
                 .unwrap();
             f.gate.wait_entered().await;
             let epoch = f.idle.epoch();
-            f.commands
-                .send(ConnectionRpcCommand::VoiceBinaryChunk {
-                    payload: budget.admit(vec![2]).unwrap(),
-                })
+            f.receipt
+                .admit_voice(budget.admit(vec![2]).unwrap())
                 .unwrap();
             let rpc = crate::rpc::build_json_rpc_request_payload(
                 pioneer_protocol::constants::methods::VOICE_SESSION_FINALIZE,
@@ -1208,12 +1197,12 @@ async fn assert_teardown(termination: Termination) {
     let control = cancel_request(&f.receipt);
     assert_eq!(f.next_request().await["id"], control.id);
     f.gate.block();
-    f.commands
-        .send(ConnectionRpcCommand::VoiceBinaryChunk {
-            payload: Arc::new(super::super::voice_budget::VoiceTransportBudget::default())
+    f.receipt
+        .admit_voice(
+            Arc::new(super::super::voice_budget::VoiceTransportBudget::default())
                 .admit(vec![5, 6])
                 .unwrap(),
-        })
+        )
         .unwrap();
     f.gate.wait_entered().await;
     let queued = request(&f.commands, "synthetic/queued");
@@ -1515,4 +1504,54 @@ async fn subscription_retirement_fences_queued_json_and_artifact_on_live_socket(
     })
     .await
     .expect("subscription scope regression must complete");
+}
+
+#[tokio::test]
+async fn voice_and_turn_cancel_cross_actual_writer_while_other_response_is_pending() {
+    use pioneer_protocol::constants::methods;
+    for voice_first in [false, true] {
+        for cancel_first in [false, true] {
+            timeout(Duration::from_secs(10), async {
+                let mut f = Fixture::start().await;
+                let first_method = if voice_first {
+                    methods::VOICE_SESSION_CANCEL
+                } else {
+                    methods::TURN_CANCEL
+                };
+                let second_method = if voice_first {
+                    methods::TURN_CANCEL
+                } else {
+                    methods::VOICE_SESSION_CANCEL
+                };
+                let first = cancel_request_for(&f.receipt, first_method);
+                let observed = f.next_request().await;
+                assert_eq!(observed["id"], first.id);
+                assert_eq!(observed["method"], first_method);
+                let second = cancel_request_for(&f.receipt, second_method);
+                let observed = f.next_request().await;
+                assert_eq!(observed["id"], second.id);
+                assert_eq!(observed["method"], second_method);
+                assert!(first.response.is_active());
+                if cancel_first {
+                    first.response.cancel();
+                }
+                f.reply(&second.id).await;
+                assert!(receive(second.rx).await.is_ok());
+                if !cancel_first {
+                    assert!(first.response.is_active());
+                }
+                f.reply(&first.id).await;
+                assert_eq!(receive(first.rx).await.is_ok(), !cancel_first);
+                let next = cancel_request_for(&f.receipt, first_method);
+                assert_eq!(f.next_request().await["id"], next.id);
+                f.reply(&next.id).await;
+                assert!(receive(next.rx).await.is_ok());
+                assert!(!f.task.is_finished());
+                f.task.abort();
+                let _ = f.task.await;
+            })
+            .await
+            .expect("one Cancel class cannot occupy the other class's response lifetime");
+        }
+    }
 }

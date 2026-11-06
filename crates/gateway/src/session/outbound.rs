@@ -77,18 +77,104 @@ pub(crate) struct OutboundEnvelope {
 pub(crate) struct OutboundReceiver {
     rx: mpsc::Receiver<OutboundEnvelope>,
     admission: Arc<Admission>,
+    audio: Option<Box<OutboundReceiver>>,
+    prefer_audio: bool,
+    ordinary_done: bool,
+    audio_done: bool,
 }
 impl OutboundReceiver {
     pub(crate) fn seal(&mut self) {
         self.admission.close();
         self.rx.close();
+        if let Some(audio) = &mut self.audio {
+            audio.seal();
+        }
+    }
+    #[cfg(test)]
+    pub(super) async fn recv_ordinary(&mut self) -> Option<OutboundEnvelope> {
+        self.rx.recv().await
     }
     #[cfg(test)]
     pub(crate) fn try_recv(&mut self) -> Result<OutboundEnvelope, mpsc::error::TryRecvError> {
-        self.rx.try_recv()
+        for audio_first in [self.prefer_audio, !self.prefer_audio] {
+            let result = if audio_first {
+                match &mut self.audio {
+                    Some(audio) if !self.audio_done => audio.rx.try_recv(),
+                    _ => {
+                        self.audio_done = true;
+                        continue;
+                    }
+                }
+            } else if !self.ordinary_done {
+                self.rx.try_recv()
+            } else {
+                continue;
+            };
+            match result {
+                Ok(item) => {
+                    self.prefer_audio = !audio_first;
+                    return Ok(item);
+                }
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    if audio_first {
+                        self.audio_done = true;
+                    } else {
+                        self.ordinary_done = true;
+                    }
+                }
+                Err(mpsc::error::TryRecvError::Empty) => {}
+            }
+        }
+        if self.audio.is_none() {
+            self.audio_done = true;
+        }
+        Err(if self.ordinary_done && self.audio_done {
+            mpsc::error::TryRecvError::Disconnected
+        } else {
+            mpsc::error::TryRecvError::Empty
+        })
     }
     pub(crate) async fn recv(&mut self) -> Option<OutboundEnvelope> {
-        self.rx.recv().await
+        std::future::poll_fn(|cx| {
+            for audio_first in [self.prefer_audio, !self.prefer_audio] {
+                let polled = if audio_first {
+                    match &mut self.audio {
+                        Some(audio) if !self.audio_done => audio.rx.poll_recv(cx),
+                        _ => {
+                            self.audio_done = true;
+                            continue;
+                        }
+                    }
+                } else if !self.ordinary_done {
+                    self.rx.poll_recv(cx)
+                } else {
+                    continue;
+                };
+                match polled {
+                    std::task::Poll::Ready(Some(item)) => {
+                        self.prefer_audio = !audio_first;
+                        return std::task::Poll::Ready(Some(item));
+                    }
+                    std::task::Poll::Ready(None) => {
+                        if audio_first {
+                            self.audio_done = true;
+                        } else {
+                            self.ordinary_done = true;
+                        }
+                    }
+                    std::task::Poll::Pending => {}
+                }
+            }
+            if self.audio.is_none() {
+                self.audio_done = true;
+            }
+            if self.ordinary_done && self.audio_done {
+                std::task::Poll::Ready(None)
+            } else {
+                std::task::Poll::Pending
+            }
+        })
+        .await
     }
 }
 impl Drop for OutboundReceiver {
@@ -101,6 +187,7 @@ pub(crate) struct SessionOutbound {
     tx: mpsc::Sender<OutboundEnvelope>,
     admission: Arc<Admission>,
     observer: QueueObserver,
+    audio: Option<Box<SessionOutbound>>,
 }
 impl SessionOutbound {
     pub(crate) fn channel(
@@ -108,9 +195,27 @@ impl SessionOutbound {
         bytes: usize,
         reserved_bytes: usize,
     ) -> (Self, OutboundReceiver) {
+        let (mut sender, mut receiver) = Self::channel_inner(
+            capacity,
+            bytes,
+            reserved_bytes,
+            16.min((capacity / 8).max(1)),
+        );
+        // ACKs never consume ordinary Data or ReplyControl capacity. Two slots
+        // and 8 KiB within this audio lane remain reserved for terminal outcome.
+        let (audio, audio_rx) = Self::channel_inner(130, 128 * 1024, 8 * 1024, 2);
+        sender.audio = Some(Box::new(audio));
+        receiver.audio = Some(Box::new(audio_rx));
+        (sender, receiver)
+    }
+    fn channel_inner(
+        capacity: usize,
+        bytes: usize,
+        reserved_bytes: usize,
+        reserve: usize,
+    ) -> (Self, OutboundReceiver) {
         assert!(capacity >= 2 && capacity <= tokio::sync::Semaphore::MAX_PERMITS);
         assert!(reserved_bytes > 0 && reserved_bytes < bytes);
-        let reserve = 16.min((capacity / 8).max(1));
         let admission = Arc::new(Admission {
             usage: Mutex::new(Usage::default()),
             changed: Notify::new(),
@@ -130,15 +235,29 @@ impl SessionOutbound {
                 tx,
                 admission: admission.clone(),
                 observer,
+                audio: None,
             },
-            OutboundReceiver { rx, admission },
+            OutboundReceiver {
+                rx,
+                admission,
+                audio: None,
+                prefer_audio: false,
+                ordinary_done: false,
+                audio_done: false,
+            },
         )
     }
     pub(crate) fn close(&self) {
         self.admission.close();
+        if let Some(audio) = &self.audio {
+            audio.close();
+        }
     }
     pub(crate) fn abort(&self) {
         self.admission.abort();
+        if let Some(audio) = &self.audio {
+            audio.abort();
+        }
     }
     /// Graceful seal stops producers immediately but permits FIFO drain until
     /// its original deadline. Repeated seal cannot extend that deadline.
@@ -287,9 +406,57 @@ impl SessionOutbound {
     ) -> Result<(), mpsc::error::TrySendError<Message>> {
         self.try_send_class(message, AdmissionClass::Data)
     }
+    pub(crate) fn audio_capacity_changed(&self) -> &Notify {
+        &self.audio.as_ref().expect("audio lane").admission.changed
+    }
+    pub(crate) fn try_send_audio(
+        &self,
+        message: Message,
+        terminal: bool,
+    ) -> Result<(), mpsc::error::TrySendError<Message>> {
+        self.audio
+            .as_ref()
+            .expect("audio lane attached to outbound")
+            .try_send_class(
+                message,
+                if terminal {
+                    AdmissionClass::ReplyControl
+                } else {
+                    AdmissionClass::Data
+                },
+            )
+    }
+    /// Test owner admission primitive; production delivery revalidates through SessionManager.
+    #[cfg(test)]
+    pub(crate) async fn send_audio(
+        &self,
+        message: Message,
+        terminal: bool,
+    ) -> Result<(), mpsc::error::SendError<Message>> {
+        let lane = self
+            .audio
+            .as_ref()
+            .expect("audio lane attached to outbound");
+        lane.send_class(
+            message,
+            if terminal {
+                AdmissionClass::ReplyControl
+            } else {
+                AdmissionClass::Data
+            },
+        )
+        .await
+    }
     pub(crate) async fn send(
         &self,
+        message: Message,
+    ) -> Result<(), mpsc::error::SendError<Message>> {
+        self.send_class(message, AdmissionClass::ReplyControl).await
+    }
+    async fn send_class(
+        &self,
         mut message: Message,
+        class: AdmissionClass,
     ) -> Result<(), mpsc::error::SendError<Message>> {
         let mut wait = self.observer.send_wait();
         let _live_wait = pioneer_observability::live::WaitGuard::new(
@@ -299,7 +466,7 @@ impl SessionOutbound {
             let notified = self.admission.changed.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            match self.try_send(message) {
+            match self.try_send_class(message, class) {
                 Ok(()) => {
                     wait.complete();
                     return Ok(());
@@ -326,6 +493,129 @@ mod tests {
 
     fn text(bytes: usize) -> Message {
         Message::Text("x".repeat(bytes).into())
+    }
+
+    #[tokio::test]
+    async fn audio_reservation_survives_dequeue_and_terminal_lifecycle_wakes_waiter() {
+        for terminal in ["drop", "abort", "seal"] {
+            let (tx, mut rx) = SessionOutbound::channel(8, 100, 20);
+            for _ in 0..128 {
+                tx.try_send_audio(text(1), false).unwrap();
+            }
+            let held = rx.recv().await.unwrap();
+            let waiting = tx.send_audio(text(1), false);
+            tokio::pin!(waiting);
+            assert!(waiting.as_mut().now_or_never().is_none());
+            tx.try_send(text(20)).unwrap();
+            if terminal == "drop" {
+                drop(rx);
+            } else if terminal == "abort" {
+                tx.abort();
+            } else {
+                tx.close();
+            }
+            assert!(waiting.await.is_err());
+            drop(held);
+            assert!(tx.send_audio(text(1), false).await.is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn combined_receiver_drains_all_sealed_tails_exactly_once() {
+        for (ordinary, audio) in [(3, 0), (0, 3), (3, 3)] {
+            for synchronous in [false, true] {
+                let (tx, mut rx) = SessionOutbound::channel(8, 100, 20);
+                for _ in 0..ordinary {
+                    tx.try_send(text(2)).unwrap();
+                }
+                if ordinary > 0 {
+                    tx.try_send(Message::Close(None)).unwrap();
+                }
+                for _ in 0..audio {
+                    tx.try_send_audio(text(1), false).unwrap();
+                }
+                rx.seal();
+                let mut lengths = Vec::new();
+                if synchronous {
+                    loop {
+                        match rx.try_recv() {
+                            Ok(envelope) => lengths.push(message_bytes(&envelope.item.value)),
+                            Err(mpsc::error::TryRecvError::Disconnected) => break,
+                            Err(e) => panic!("sealed queues cannot return {e:?}"),
+                        }
+                    }
+                } else {
+                    while let Some(envelope) = rx.recv().await {
+                        lengths.push(message_bytes(&envelope.item.value));
+                    }
+                }
+                assert_eq!(lengths.iter().filter(|&&n| n == 2).count(), ordinary);
+                assert_eq!(lengths.iter().filter(|&&n| n == 1).count(), audio);
+                assert_eq!(
+                    lengths.iter().filter(|&&n| n == 0).count(),
+                    usize::from(ordinary > 0)
+                );
+                assert!(rx.recv().await.is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn one_lane_eof_does_not_end_live_peer_or_spin() {
+        for end_audio in [false, true] {
+            let (tx, mut rx) = SessionOutbound::channel(8, 100, 20);
+            if end_audio {
+                rx.audio.as_mut().unwrap().rx.close();
+            } else {
+                rx.rx.close();
+            }
+            assert!(rx.recv().now_or_never().is_none());
+            assert!(matches!(
+                rx.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
+            if end_audio {
+                tx.try_send(text(2)).unwrap();
+            } else {
+                tx.try_send_audio(text(2), false).unwrap();
+            }
+            let frame = rx.recv().await.unwrap();
+            assert_eq!(message_bytes(&frame.item.value), 2);
+            drop(frame);
+            rx.seal();
+            assert!(rx.recv().await.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn audio_pressure_does_not_spend_ordinary_reply_or_data_capacity() {
+        let (tx, mut rx) = SessionOutbound::channel(8, 100, 20);
+        tx.try_send_data(text(80)).unwrap();
+        for _ in 0..128 {
+            tx.try_send_audio(text(1), false).unwrap();
+        }
+        assert!(matches!(
+            tx.try_send_audio(text(1), false),
+            Err(mpsc::error::TrySendError::Full(_))
+        ));
+        let waiting = tx.send_audio(text(1), false);
+        tokio::pin!(waiting);
+        assert!(waiting.as_mut().now_or_never().is_none());
+        tx.try_send(text(20)).unwrap();
+        tx.try_send_audio(text(1), true).unwrap();
+        // The real receiver advances ordinary and audio lanes independently.
+        let ordinary = rx.recv().await.unwrap();
+        assert_eq!(message_bytes(&ordinary.item.value), 80);
+        drop(ordinary);
+        drop(rx.recv().await.unwrap()); // fair audio progress between ordinary frames
+        let reply = rx.recv().await.unwrap();
+        assert_eq!(message_bytes(&reply.item.value), 20);
+        drop(reply);
+        drop(rx.recv().await.unwrap());
+        waiting.await.unwrap();
+        assert!(tx.try_send(text(1)).is_ok());
+        drop(rx);
+        assert!(tx.send_audio(text(1), false).await.is_err());
     }
 
     #[tokio::test]

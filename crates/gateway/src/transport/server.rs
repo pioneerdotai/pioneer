@@ -41,6 +41,7 @@ const MAX_READ_HANDLERS: usize = 4;
 #[derive(Clone, Copy)]
 enum ConnectionRequestClass {
     Cancel,
+    VoiceCancel,
     TaskWait,
     Read,
 }
@@ -72,6 +73,7 @@ fn connection_request_class(
     use pioneer_protocol::constants::methods;
     match request.method.as_str() {
         methods::TURN_CANCEL => Some(ConnectionRequestClass::Cancel),
+        methods::VOICE_SESSION_CANCEL => Some(ConnectionRequestClass::VoiceCancel),
         methods::TASK_WAIT => Some(ConnectionRequestClass::TaskWait),
         _ => None,
     }
@@ -84,17 +86,53 @@ fn connection_request_class(
 #[derive(Default)]
 pub(crate) struct ConnectionHandlers {
     cancels: JoinSet<()>,
+    voice_cancels: JoinSet<()>,
     waits: JoinSet<()>,
     reads: JoinSet<()>,
     closed: bool,
+    audio: Option<super::voice_ingress::VoiceIngressOwner>,
 }
 
 impl ConnectionHandlers {
+    pub(crate) fn enable_audio(
+        &mut self,
+        processor: Arc<MessageProcessor>,
+        sessions: Arc<SessionManager>,
+        auth: Arc<GatewayAuthService>,
+        connection_id: crate::session::ConnectionId,
+        outbound: SessionOutbound,
+    ) {
+        self.audio = Some(super::voice_ingress::VoiceIngressOwner::new(
+            processor,
+            sessions,
+            auth,
+            connection_id,
+            outbound,
+        ));
+    }
+    #[cfg(test)]
+    pub(crate) fn pause_audio_once(
+        &self,
+        entered: tokio::sync::oneshot::Sender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        self.audio.as_ref().unwrap().pause_once(entered, release);
+    }
     fn is_empty(&self) -> bool {
-        self.cancels.is_empty() && self.waits.is_empty() && self.reads.is_empty()
+        self.cancels.is_empty()
+            && self.voice_cancels.is_empty()
+            && self.waits.is_empty()
+            && self.reads.is_empty()
+            && self.audio.is_none()
     }
 
     fn reap(&mut self) -> Result<()> {
+        if let Some(audio) = &mut self.audio {
+            audio.reap()?;
+        }
+        while let Some(result) = self.voice_cancels.try_join_next() {
+            result?;
+        }
         while let Some(result) = self.cancels.try_join_next() {
             result?;
         }
@@ -109,6 +147,8 @@ impl ConnectionHandlers {
 
     async fn next(&mut self) -> Result<()> {
         tokio::select! {
+            result = async { self.audio.as_mut().expect("audio owner").next().await }, if self.audio.is_some() => { result?; }
+            result = self.voice_cancels.join_next(), if !self.voice_cancels.is_empty() => { result.expect("active voice cancel")?; }
             result = self.cancels.join_next(), if !self.cancels.is_empty() => { result.expect("active cancel")?; }
             result = self.waits.join_next(), if !self.waits.is_empty() => { result.expect("active wait")?; }
             result = self.reads.join_next(), if !self.reads.is_empty() => { result.expect("active read")?; }
@@ -124,6 +164,7 @@ impl ConnectionHandlers {
         self.reap()?;
         let (tasks, capacity) = match class {
             ConnectionRequestClass::Cancel => (&mut self.cancels, MAX_CANCEL_HANDLERS),
+            ConnectionRequestClass::VoiceCancel => (&mut self.voice_cancels, 1),
             ConnectionRequestClass::TaskWait => (&mut self.waits, MAX_TASK_WAITERS),
             ConnectionRequestClass::Read => (&mut self.reads, MAX_READ_HANDLERS),
         };
@@ -142,9 +183,14 @@ impl ConnectionHandlers {
 
     pub(crate) async fn shutdown(&mut self) {
         self.closed = true;
+        if let Some(mut audio) = self.audio.take() {
+            audio.shutdown().await;
+        }
+        self.voice_cancels.abort_all();
         self.cancels.abort_all();
         self.waits.abort_all();
         self.reads.abort_all();
+        while self.voice_cancels.join_next().await.is_some() {}
         while self.cancels.join_next().await.is_some() {}
         while self.waits.join_next().await.is_some() {}
         while self.reads.join_next().await.is_some() {}
@@ -563,6 +609,13 @@ pub(crate) async fn run_normal_connection_inner(
     let mut writer_completion = None;
     let mut deferred_ingress = VecDeque::new();
     let mut handlers = ConnectionHandlers::default();
+    handlers.enable_audio(
+        message_processor.clone(),
+        session_manager.clone(),
+        auth_service.clone(),
+        connection_id,
+        outbound_tx.clone(),
+    );
     let dispatch_owned = |context: crate::request_context::ConnectionContext, payload: String| {
         let processor = message_processor.clone();
         let auth = auth_service.clone();
@@ -643,6 +696,13 @@ pub(crate) async fn run_normal_connection_inner(
             };
             let message = payload.context("websocket read failed")?;
 
+            if let Some(audio) = &handlers.audio {
+                match &message {
+                    Message::Binary(payload) if audio.admit(&connection_context, payload) => continue,
+                    Message::Text(text) => audio.seal(&connection_context, text),
+                    _ => {},
+                }
+            }
             match message {
                 Message::Text(payload) => {
                     // This transport control request deliberately bypasses domain dispatch;
@@ -650,6 +710,10 @@ pub(crate) async fn run_normal_connection_inner(
                     let request = serde_json::from_str::<pioneer_protocol::JsonRpcRequest>(&payload).ok();
                     if let Some(class) = request.as_ref().and_then(connection_request_class) {
                         if handlers.admit(class, dispatch_owned(connection_context.clone(), payload.to_string())).is_err() {
+                            if matches!(class, ConnectionRequestClass::VoiceCancel) {
+                                reject_voice_cancel_capacity(&outbound_tx, request.as_ref().expect("classified request").id.clone());
+                                continue;
+                            }
                             send_close_bounded(&outbound_tx, 1013, "connection_control_overloaded").await;
                             break;
                         }
@@ -1012,6 +1076,13 @@ where
                     send_close_bounded(outbound, 1009, "ingress_message_too_large").await;
                     return false;
                 }
+                if let Some(audio) = &handlers.audio {
+                    match &message {
+                        Message::Binary(payload) if audio.admit(connection, payload) => continue,
+                        Message::Text(text) => audio.seal(connection, text),
+                        _ => {},
+                    }
+                }
                 if let Message::Text(payload) = &message {
                     if let Ok(request) = serde_json::from_str::<pioneer_protocol::JsonRpcRequest>(payload) {
                         if request.method == pioneer_protocol::constants::methods::AUTH_ACCESS_RENEW {
@@ -1033,6 +1104,10 @@ where
                         }
                         if let Some(class) = connection_request_class(&request) {
                             if handlers.admit(class, dispatch(connection.clone(), payload.to_string())).is_err() {
+                                if matches!(class, ConnectionRequestClass::VoiceCancel) {
+                                    reject_voice_cancel_capacity(outbound, request.id.clone());
+                                    continue;
+                                }
                                 send_close_bounded(outbound, 1013, "connection_control_overloaded").await;
                                 return false;
                             }
@@ -1225,6 +1300,38 @@ async fn normal_ingress_lease_failure(
         })
 }
 
+fn reject_voice_cancel_capacity(outbound: &SessionOutbound, id: pioneer_protocol::RequestId) {
+    let response = pioneer_protocol::JsonRpcErrorResponse {
+        jsonrpc: pioneer_protocol::JSONRPC_VERSION.into(),
+        id: Some(id),
+        error: pioneer_protocol::JsonRpcError {
+            code: -32029,
+            message: "voice control capacity exhausted".into(),
+            data: None,
+        },
+    };
+    if let Ok(text) = serde_json::to_string(&response) {
+        // An untrusted request id must not retire the audio lane through its
+        // oversized-message guard while reporting a rejected control request.
+        if text.len() > 8 * 1024 {
+            record_outbound_queue_saturation("voice_cancel_rejection_deadline_outcome");
+            return;
+        }
+        // Nonblocking and recording-control scoped. A hostile duplicate stream
+        // cannot spend the turn Cancel slot or evict the socket on Full.
+        match outbound.try_send_audio(Message::Text(text.into()), true) {
+            Ok(()) => {}
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                // The request was not admitted. Delivery cannot be promised
+                // after its own terminal reserve is exhausted: bounded clients
+                // retain their original RPC deadline and retire their waiter.
+                record_outbound_queue_saturation("voice_cancel_unadmitted_deadline_outcome");
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
+        }
+    }
+}
+
 async fn send_close_bounded(sender: &SessionOutbound, code: u16, reason: &'static str) {
     if sender.capacity() == 0 {
         record_outbound_queue_saturation("close_waited");
@@ -1264,11 +1371,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn saturated_voice_cancel_rejection_keeps_other_rpc_capacity_and_drain() {
+        let (outbound, mut receiver) = SessionOutbound::channel(8, 100, 20);
+        for _ in 0..128 {
+            outbound
+                .try_send_audio(Message::Text("a".into()), false)
+                .unwrap();
+        }
+        for _ in 0..2 {
+            outbound
+                .try_send_audio(Message::Text("t".into()), true)
+                .unwrap();
+        }
+        reject_voice_cancel_capacity(
+            &outbound,
+            pioneer_protocol::RequestId::new("R00000000000000000001").unwrap(),
+        );
+        assert!(outbound.closed().now_or_never().is_none());
+        outbound.send(Message::Text("rpc".into())).await.unwrap();
+        let envelope = receiver.recv().await.unwrap();
+        assert!(matches!(envelope.item.value, Message::Text(text) if text == "rpc"));
+        drop(envelope.reservation);
+        receiver.seal();
+        let mut drained = 0;
+        while receiver.recv().await.is_some() {
+            drained += 1;
+        }
+        assert_eq!(
+            drained, 130,
+            "rejected request promises deadline failure, not a delivered error frame"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_classes_keep_independent_outstanding_slots() {
+        let mut owner = ConnectionHandlers::default();
+        for class in [
+            ConnectionRequestClass::Cancel,
+            ConnectionRequestClass::VoiceCancel,
+        ] {
+            owner.admit(class, std::future::pending()).unwrap();
+            assert!(owner.admit(class, async {}).is_err());
+        }
+        assert_eq!(owner.cancels.len(), 1);
+        assert_eq!(owner.voice_cancels.len(), 1);
+        owner.shutdown().await;
+        assert!(owner.is_empty());
+    }
+
+    #[tokio::test]
     async fn control_owner_joins_unpolled_children_and_reaps_panic_before_retirement() {
         let mut owner = ConnectionHandlers::default();
         let mut drops = Vec::new();
         for class in [
             ConnectionRequestClass::Cancel,
+            ConnectionRequestClass::VoiceCancel,
             ConnectionRequestClass::TaskWait,
             ConnectionRequestClass::Read,
         ] {
