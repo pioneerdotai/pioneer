@@ -135,7 +135,10 @@ async fn connection(limiter: Arc<QueryFingerprintLimiter>) -> DatabaseConnection
 }
 fn expect_summary(span: &SpanData, fingerprint: Option<&str>, count: i64) {
     let attrs = &span.attributes;
-    let fingerprints = fingerprint.into_iter().map(Into::into).collect();
+    let fingerprints = fingerprint
+        .into_iter()
+        .map(|value| value.to_owned().into())
+        .collect();
     assert!(attrs.contains(&KeyValue::new(
         "history.sql.top.fingerprints",
         Value::Array(Array::String(fingerprints))
