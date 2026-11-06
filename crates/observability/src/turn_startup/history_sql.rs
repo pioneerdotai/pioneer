@@ -257,7 +257,7 @@ mod tests {
         .collect();
         assert!(attrs.contains(&KeyValue::new(
             "history.sql.top.fingerprints",
-            Array::String(top)
+            Value::Array(Array::String(top))
         )));
         for (category, count, ms) in [
             ("observed", 67, 3016.),

@@ -138,11 +138,11 @@ fn expect_summary(span: &SpanData, fingerprint: Option<&str>, count: i64) {
     let fingerprints = fingerprint.into_iter().map(Into::into).collect();
     assert!(attrs.contains(&KeyValue::new(
         "history.sql.top.fingerprints",
-        Array::String(fingerprints)
+        Value::Array(Array::String(fingerprints))
     )));
     assert!(attrs.contains(&KeyValue::new(
         "history.sql.top.counts",
-        Array::I64(if count == 0 { vec![] } else { vec![count] })
+        Value::Array(Array::I64(if count == 0 { vec![] } else { vec![count] }))
     )));
     assert!(attrs.contains(&KeyValue::new("history.sql.observed.count", count)));
     assert!(attrs.contains(&KeyValue::new("history.sql.exported.count", count)));
