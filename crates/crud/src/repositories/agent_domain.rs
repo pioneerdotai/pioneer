@@ -1493,6 +1493,7 @@ async fn validate_agent_delegation_route_input<C: ConnectionTrait>(
     let kind = match input.route_kind.as_str() {
         "execution_bound" => AgentRouteKind::ExecutionBound,
         "identity_bound" => AgentRouteKind::IdentityBound,
+        "capsule_bound" => AgentRouteKind::CapsuleBound,
         _ => bail!("agent delegation route has an invalid binding kind"),
     };
     let authority_actor: PersistedActorRef = serde_json::from_str(&input.authority_actor_json)
@@ -1613,13 +1614,13 @@ async fn validate_agent_delegation_route_input<C: ConnectionTrait>(
         && !matches!(
             (&kind, &authority_actor),
             (
-                AgentRouteKind::ExecutionBound,
+                AgentRouteKind::ExecutionBound | AgentRouteKind::CapsuleBound,
                 PersistedActorRef::AgentExecution(actor_execution_id)
             ) if actor_execution_id.as_str() == input.source_execution_id
         )
     {
         bail!(
-            "cross-capsule route without a timestamp boundary must be server-owned and execution-bound"
+            "cross-capsule route without a timestamp boundary must be server-owned and execution/capsule-bound"
         );
     }
     let source_execution = agent_execution::Entity::find_by_id(input.source_execution_id.clone())
@@ -1779,6 +1780,7 @@ pub fn agent_delegation_route_projection(
     let kind = match route.route_kind.as_str() {
         "execution_bound" => AgentRouteKind::ExecutionBound,
         "identity_bound" => AgentRouteKind::IdentityBound,
+        "capsule_bound" => AgentRouteKind::CapsuleBound,
         other => bail!("unknown agent delegation route kind `{other}`"),
     };
     let status = match route.status.as_str() {
@@ -1919,17 +1921,37 @@ pub async fn list_agent_delegation_routes<C: ConnectionTrait>(
 }
 
 /// List every route that can be bound to this exact execution: direct
-/// execution-bound edges plus identity-bound capsule policy for its immutable
-/// source identity. Callers still revalidate status, expiry, generations and
+/// execution-bound edges, identity-bound policy for its immutable source identity,
+/// and capsule-bound policy for its persisted home root. Callers still revalidate status, expiry, generations and
 /// destination policy before projecting an opaque target option.
 pub async fn list_agent_delegation_routes_for_source<C: ConnectionTrait>(
     db: &C,
     source_execution_id: &str,
     source_identity_id: &str,
 ) -> Result<Vec<agent_delegation_route::Model>> {
+    // The caller supplies only the execution key; capsule authority comes from storage.
+    let execution = agent_execution::Entity::find_by_id(source_execution_id.to_owned())
+        .one(db)
+        .await?
+        .context("route source execution is missing")?;
+    if execution.agent_identity_id != source_identity_id {
+        bail!("route source identity differs from persisted execution");
+    }
     agent_delegation_route::Entity::find()
         .filter(
             Condition::any()
+                .add(
+                    Condition::all()
+                        .add(agent_delegation_route::Column::RouteKind.eq("capsule_bound"))
+                        .add(
+                            agent_delegation_route::Column::SourceCapsuleId
+                                .eq(execution.home_root_thread_id),
+                        )
+                        .add(
+                            agent_delegation_route::Column::SourceWorkspaceId
+                                .eq(execution.workspace_id),
+                        ),
+                )
                 .add(
                     agent_delegation_route::Column::SourceExecutionId
                         .eq(source_execution_id.to_owned()),
@@ -4490,14 +4512,16 @@ async fn revalidate_agent_route_for_commit(
     {
         bail!("Agent route receipt facts differ from the committed route");
     }
-    if route.source_identity_id.as_deref() != Some(execution.agent_identity_id.as_str()) {
+    if route.route_kind != "capsule_bound"
+        && route.source_identity_id.as_deref() != Some(execution.agent_identity_id.as_str())
+    {
         bail!("Agent route source identity differs from the committing execution");
     }
     match route.route_kind.as_str() {
         "execution_bound" if route.source_execution_id != execution.id => {
             bail!("Agent route is bound to a different source execution")
         }
-        "execution_bound" | "identity_bound" => {}
+        "execution_bound" | "identity_bound" | "capsule_bound" => {}
         _ => bail!("Agent route has an invalid binding kind"),
     }
     let allowed_actions: Vec<pioneer_protocol::AgentRouteAction> =

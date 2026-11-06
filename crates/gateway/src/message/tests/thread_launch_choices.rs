@@ -460,7 +460,7 @@ async fn fixture_with_principal_probe(
     (processor, context, tools)
 }
 
-async fn invoke_with_mutation(
+pub(super) async fn invoke_with_mutation(
     tools: &pioneer_agent::TurnToolMaterialization,
     name: &str,
     id: &str,
@@ -508,6 +508,88 @@ pub(super) async fn call(
     invoke_with_mutation(tools, name, id, arguments, None)
         .await
         .unwrap_or_else(|error| panic!("{name} ({id}) failed: {error}"))
+}
+
+#[tokio::test]
+async fn delegated_root_route_survives_creator_completion_and_persisted_descendants() {
+    use sea_orm::{ActiveModelTrait, IntoActiveModel, Set};
+    let (processor, context, tools) = fixture().await;
+    let binding = processor
+        .agent_action_binding(&context.turn_id)
+        .await
+        .unwrap();
+    let facts = binding.adapter.lock().await.persistence_facts();
+    let option = binding
+        .options
+        .thread_creation_options
+        .iter()
+        .find(|option| option.label == "New delegated root")
+        .unwrap();
+    let result = call(
+        &tools,
+        "thread_create",
+        "capsule-create",
+        json!({"optionId":option.id}),
+    )
+    .await;
+    assert!(result["threadResult"]["threadId"].is_string());
+    let db = processor.crud_store.database_connection();
+    let routes = pioneer_crud::list_agent_delegation_routes_for_source(
+        &db,
+        facts.execution_id.as_str(),
+        facts.identity.id.as_str(),
+    )
+    .await
+    .unwrap();
+    let route = routes
+        .iter()
+        .find(|r| r.destination_thread_id == result["threadResult"]["threadId"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(route.route_kind, "capsule_bound");
+    assert!(route.expires_at.is_none());
+    let creator = pioneer_crud::load_agent_execution(&db, facts.execution_id.as_str())
+        .await
+        .unwrap()
+        .unwrap();
+    let mut completed = creator.clone().into_active_model();
+    completed.status = Set("completed".into());
+    completed.finished_at = Set(Some(pioneer_crud::utc_now()));
+    completed.update(&db).await.unwrap();
+    // Persisted execution facts are the discovery boundary. No live ancestor
+    // adapter, tree traversal, or per-descendant copy of the route is available.
+    let mut parent = creator.id.clone();
+    for depth in 0..8 {
+        let id = pioneer_crud::canonical_agent_id('E', &format!("capsule-descendant-{depth}"));
+        let mut child = creator.clone().into_active_model();
+        child.id = Set(id.clone());
+        child.parent_execution_id = Set((depth > 0).then(|| parent.clone()));
+        child.insert(&db).await.unwrap();
+        let loaded = pioneer_crud::list_agent_delegation_routes_for_source(
+            &db,
+            &id,
+            facts.identity.id.as_str(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(loaded.iter().filter(|r| r.id == route.id).count(), 1);
+        parent = id;
+    }
+    let mut foreign = creator.into_active_model();
+    let foreign_id = pioneer_crud::canonical_agent_id('E', "foreign-capsule");
+    foreign.id = Set(foreign_id.clone());
+    foreign.home_root_thread_id = Set(route.destination_thread_id.clone());
+    foreign.insert(&db).await.unwrap();
+    assert!(
+        pioneer_crud::list_agent_delegation_routes_for_source(
+            &db,
+            &foreign_id,
+            facts.identity.id.as_str()
+        )
+        .await
+        .unwrap()
+        .iter()
+        .all(|r| r.id != route.id)
+    );
 }
 
 #[tokio::test]
