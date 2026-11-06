@@ -2329,8 +2329,14 @@ async fn domain_finalize_drains_slow_tail_with_recording_and_buffered_recognizer
                         // Its outcome distinguishes failed processing from a worker
                         // that only enters inference once Commit closes its inbox.
                         native_release.release();
+                        // All 31 packets above were acknowledged. Diagnostics
+                        // must close with their exact peer proof, just like a
+                        // real finalizer, or integrity rejection hides the worker.
                         let completion = f.processor.voice_session_buffers
-                            .finish_processing_verified(&started.session_id, None).unwrap();
+                            .finish_processing_verified(&started.session_id, Some(pioneer_protocol::VoiceAudioIntegrity {
+                                next_sequence: 31,
+                                normalized_samples: 49600,
+                            })).unwrap();
                         let outcome = completion.await.unwrap().outcome;
                         let diagnostic = match outcome {
                             Err(error) => format!("worker failed: {error:?}"),
