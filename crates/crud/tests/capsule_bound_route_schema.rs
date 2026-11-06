@@ -185,7 +185,8 @@ async fn fk_on_error_after_setting_change_restores_physical_connection() {
     .await
     .unwrap();
     let error = Migrator::migrations()
-        .pop()
+        .into_iter()
+        .find(|migration| migration.name() == NAME)
         .unwrap()
         .up(&migration::SchemaManager::new(&db))
         .await
@@ -226,7 +227,10 @@ async fn commit_failure_with_unsettled_transaction_discards_connection() {
         // its ensuing ROLLBACK reports no active transaction, for ON and OFF.
         reject_commits(&mut connection).await;
         drop(connection);
-        let migration = Migrator::migrations().pop().unwrap();
+        let migration = Migrator::migrations()
+            .into_iter()
+            .find(|migration| migration.name() == NAME)
+            .unwrap();
         let error = migration
             .up(&migration::SchemaManager::new(&db))
             .await
@@ -269,7 +273,10 @@ async fn preexisting_unsettled_transaction_is_rejected_and_discarded() {
         .unwrap();
     assert!(connection.is_in_transaction());
     drop(connection);
-    let migration = Migrator::migrations().pop().unwrap();
+    let migration = Migrator::migrations()
+        .into_iter()
+        .find(|migration| migration.name() == NAME)
+        .unwrap();
     let error = migration
         .up(&migration::SchemaManager::new(&db))
         .await
@@ -312,7 +319,8 @@ async fn fk_on_cancellation_during_rebuild_discards_physical_connection() {
     let migration_db = db.clone();
     let work = tokio::spawn(async move {
         Migrator::migrations()
-            .pop()
+            .into_iter()
+            .find(|migration| migration.name() == NAME)
             .unwrap()
             .up(&migration::SchemaManager::new(&migration_db))
             .await
@@ -334,7 +342,10 @@ async fn fk_settings_survive_success_and_ambient_transaction_is_rejected_without
     use sea_orm::TransactionTrait;
     let (_directory, db) = pooled_upgrade_fixture().await;
     let migrations = Migrator::migrations();
-    let migration = migrations.last().unwrap();
+    let migration = migrations
+        .iter()
+        .find(|migration| migration.name() == NAME)
+        .unwrap();
     let txn = db.begin().await.unwrap();
     let error = migration
         .up(&migration::SchemaManager::new(&txn))

@@ -1352,3 +1352,416 @@ async fn action_outbox_concurrent_range_move_does_not_duplicate_an_input() {
     );
     assert_eq!(load(&db, "moving").await.next_attempt_at, Some(now));
 }
+
+// One repository-level proof for each head population. These assert behavior,
+// not SQL text or a planner choice; scan/VM-step evidence needs later execution.
+#[tokio::test]
+async fn future_outbox_head_preserves_retry_and_exhausted_start_population() {
+    let db = database().await;
+    let now = DateTime::from_timestamp(1_700_000_000, 0)
+        .unwrap()
+        .fixed_offset();
+    let future = now + Duration::milliseconds(1250);
+    // status, attempts, canonical kind, payload, clock, eligible
+    let cases = [
+        ("pending", 9, None, "broken", Some(future), true),
+        ("pending", 8, Some("send_message"), "{}", Some(future), true),
+        ("failed", 7, None, "broken", Some(future), true),
+        ("failed", 8, Some("start_agent"), "{}", Some(future), true),
+        (
+            "failed",
+            8,
+            Some("start_agent"),
+            "broken",
+            Some(future),
+            true,
+        ),
+        (
+            "failed",
+            8,
+            Some("start_agent"),
+            r#"{"kind":null}"#,
+            Some(future),
+            true,
+        ),
+        (
+            "failed",
+            8,
+            Some("start_agent"),
+            r#"{"kind":42}"#,
+            Some(future),
+            false,
+        ),
+        (
+            "failed",
+            8,
+            Some("start_agent"),
+            r#"{"kind":"start_agent"}"#,
+            Some(future),
+            true,
+        ),
+        (
+            "failed",
+            8,
+            Some("start_agent"),
+            r#"{"kind":"send_message"}"#,
+            Some(future),
+            false,
+        ),
+        ("failed", 8, Some("send_message"), "{}", Some(future), false),
+        ("failed", 8, None, "{}", Some(future), false),
+        ("failed", 9, Some("start_agent"), "{}", Some(future), false),
+        ("failed", 8, Some("start_agent"), "{}", None, false),
+        ("pending", 0, None, "{}", Some(now), false),
+        (
+            "failed",
+            8,
+            Some("start_agent"),
+            "{}",
+            Some(now - Duration::seconds(1)),
+            false,
+        ),
+        (
+            "delivered",
+            0,
+            Some("start_agent"),
+            "{}",
+            Some(future),
+            false,
+        ),
+    ];
+    for (i, (status, attempts, canonical, payload, clock, eligible)) in
+        cases.into_iter().enumerate()
+    {
+        let id = format!("head-case-{i}");
+        seed(&db, &id, status, attempts, now, clock).await;
+        if let Some(kind) = canonical {
+            seed_action_for_discovery(&db, &id, kind, now).await;
+        }
+        let mut row: agent_action_outbox::ActiveModel = load(&db, &id).await.into();
+        row.payload_json = Set(payload.into());
+        row.update(&db).await.unwrap();
+        assert_eq!(
+            next_agent_action_outbox_deadline(&db, now).await.unwrap(),
+            eligible.then_some(now.timestamp() + 2),
+            "case {i}"
+        );
+        agent_action_outbox::Entity::delete_by_id(id)
+            .exec(&db)
+            .await
+            .unwrap();
+    }
+
+    for i in 0..512 {
+        seed(
+            &db,
+            &format!("closed-{i}"),
+            "delivered",
+            1,
+            now - Duration::days(90),
+            Some(future),
+        )
+        .await;
+    }
+    assert_eq!(
+        next_agent_action_outbox_deadline(&db, now).await.unwrap(),
+        None
+    );
+    seed(
+        &db,
+        "later",
+        "pending",
+        9,
+        now,
+        Some(now + Duration::seconds(10)),
+    )
+    .await;
+    seed(&db, "earlier", "failed", 8, now, Some(future)).await;
+    seed_action_for_discovery(&db, "earlier", "start_agent", now).await;
+    let mut earlier: agent_action_outbox::ActiveModel = load(&db, "earlier").await.into();
+    earlier.payload_json = Set("{}".into());
+    earlier.update(&db).await.unwrap();
+    assert_eq!(
+        next_agent_action_outbox_deadline(&db, now).await.unwrap(),
+        Some(now.timestamp() + 2)
+    );
+    // A tied ordinary head survives removal of the exhausted head.
+    seed(&db, "tie", "failed", 7, now, Some(future)).await;
+    agent_action_outbox::Entity::delete_by_id("earlier")
+        .exec(&db)
+        .await
+        .unwrap();
+    assert_eq!(
+        next_agent_action_outbox_deadline(&db, now).await.unwrap(),
+        Some(now.timestamp() + 2)
+    );
+    let mut tie: agent_action_outbox::ActiveModel = load(&db, "tie").await.into();
+    tie.status = Set("delivered".into());
+    tie.update(&db).await.unwrap();
+    assert_eq!(
+        next_agent_action_outbox_deadline(&db, now).await.unwrap(),
+        Some(now.timestamp() + 10)
+    );
+    agent_action_outbox::Entity::delete_by_id("later")
+        .exec(&db)
+        .await
+        .unwrap();
+    assert_eq!(
+        next_agent_action_outbox_deadline(&db, now).await.unwrap(),
+        None
+    );
+    // Preserve the old stored-text ORDER BY even for legacy mixed offsets.
+    let east = chrono::FixedOffset::east_opt(3600).unwrap();
+    seed(
+        &db,
+        "offset-ordinary",
+        "pending",
+        0,
+        now,
+        Some(now + Duration::seconds(10)),
+    )
+    .await;
+    seed(
+        &db,
+        "offset-start",
+        "failed",
+        8,
+        now,
+        Some((now + Duration::seconds(1)).with_timezone(&east)),
+    )
+    .await;
+    seed_action_for_discovery(&db, "offset-start", "start_agent", now).await;
+    let mut row: agent_action_outbox::ActiveModel = load(&db, "offset-start").await.into();
+    row.payload_json = Set("{}".into());
+    row.update(&db).await.unwrap();
+    assert_eq!(
+        next_agent_action_outbox_deadline(&db, now).await.unwrap(),
+        Some(now.timestamp() + 10)
+    );
+}
+
+#[tokio::test]
+async fn retention_head_preserves_terminal_and_legacy_marker_policy() {
+    let db = database().await;
+    let now = DateTime::from_timestamp(1_700_000_000, 0)
+        .unwrap()
+        .fixed_offset();
+    let cutoff = now - Duration::days(30);
+    let created = cutoff + Duration::milliseconds(1250);
+    // status, attempts, canonical kind, error, delivered clock, retry, payload, eligible
+    let cases = [
+        ("delivered", 1, None, None, Some(now), None, "{}", true),
+        ("delivered", 1, None, None, None, None, "{}", false),
+        (
+            "failed",
+            8,
+            Some("send_message"),
+            None,
+            None,
+            None,
+            "{}",
+            true,
+        ),
+        (
+            "failed",
+            9,
+            Some("send_message"),
+            None,
+            None,
+            None,
+            "{}",
+            true,
+        ),
+        (
+            "failed",
+            7,
+            Some("send_message"),
+            None,
+            None,
+            None,
+            "{}",
+            false,
+        ),
+        (
+            "failed",
+            8,
+            Some("start_agent"),
+            None,
+            None,
+            None,
+            "{}",
+            false,
+        ),
+        ("failed", 8, None, None, None, None, "{}", false),
+        (
+            "failed",
+            8,
+            Some("send_message"),
+            None,
+            None,
+            Some(now),
+            "{}",
+            false,
+        ),
+        (
+            "pending",
+            8,
+            Some("send_message"),
+            None,
+            Some(now),
+            None,
+            "{}",
+            false,
+        ),
+        // Exact existing LIKE: underscores are wildcards; ASCII case is insensitive.
+        (
+            "delivered",
+            1,
+            None,
+            None,
+            Some(now),
+            None,
+            r#"{"_pioneer_compacted":{}}"#,
+            false,
+        ),
+        (
+            "delivered",
+            1,
+            None,
+            None,
+            Some(now),
+            None,
+            r#"{"XPIONEERXCOMPACTED":0}"#,
+            false,
+        ),
+        ("delivered", 1, None, None, Some(now), None, "broken", true),
+    ];
+    for (i, (status, attempts, canonical, error, delivered, retry, payload, eligible)) in
+        cases.into_iter().enumerate()
+    {
+        let id = format!("retention-case-{i}");
+        seed(&db, &id, status, attempts, created, retry).await;
+        if let Some(kind) = canonical {
+            seed_action_for_discovery(&db, &id, kind, created).await;
+        }
+        let mut row: agent_action_outbox::ActiveModel = load(&db, &id).await.into();
+        row.delivered_at = Set(delivered);
+        row.last_error = Set(error.map(str::to_owned));
+        row.payload_json = Set(payload.into());
+        row.update(&db).await.unwrap();
+        assert_eq!(
+            next_agent_ledger_retention_at(&db, now).await.unwrap(),
+            eligible.then_some(now.timestamp() + 2),
+            "case {i}"
+        );
+        agent_action_outbox::Entity::delete_by_id(id)
+            .exec(&db)
+            .await
+            .unwrap();
+    }
+    // Every existing terminal failure class is sufficient even below the budget
+    // and without canonical proof; unresolved starts without a class are not.
+    for (i, class) in AGENT_START_TERMINAL_FAILURE_CLASSES.into_iter().enumerate() {
+        let id = format!("terminal-{i}");
+        seed(&db, &id, "failed", 0, created, None).await;
+        seed_action_for_discovery(&db, &id, "start_agent", created).await;
+        let mut row: agent_action_outbox::ActiveModel = load(&db, &id).await.into();
+        row.last_error = Set(Some(class.into()));
+        row.update(&db).await.unwrap();
+        assert_eq!(
+            next_agent_ledger_retention_at(&db, now).await.unwrap(),
+            Some(now.timestamp() + 2)
+        );
+        agent_action_outbox::Entity::delete_by_id(id)
+            .exec(&db)
+            .await
+            .unwrap();
+    }
+    for i in 0..512 {
+        let id = format!("old-{i}");
+        seed(&db, &id, "delivered", 1, cutoff, None).await;
+        let mut row: agent_action_outbox::ActiveModel = load(&db, &id).await.into();
+        row.delivered_at = Set(Some(now));
+        row.update(&db).await.unwrap();
+    }
+    assert_eq!(
+        next_agent_ledger_retention_at(&db, now).await.unwrap(),
+        None
+    );
+    seed(
+        &db,
+        "retention-later",
+        "failed",
+        8,
+        cutoff + Duration::seconds(10),
+        None,
+    )
+    .await;
+    seed_action_for_discovery(&db, "retention-later", "send_message", created).await;
+    assert_eq!(
+        next_agent_ledger_retention_at(&db, now).await.unwrap(),
+        Some(now.timestamp() + 10)
+    );
+    seed(&db, "retention-earlier", "delivered", 1, created, None).await;
+    let mut row: agent_action_outbox::ActiveModel = load(&db, "retention-earlier").await.into();
+    row.delivered_at = Set(Some(now));
+    row.update(&db).await.unwrap();
+    assert_eq!(
+        next_agent_ledger_retention_at(&db, now).await.unwrap(),
+        Some(now.timestamp() + 2)
+    );
+    // Same-clock failed and delivered lanes both remain eligible.
+    seed(&db, "retention-tie", "failed", 8, created, None).await;
+    seed_action_for_discovery(&db, "retention-tie", "send_message", created).await;
+    agent_action_outbox::Entity::delete_by_id("retention-earlier")
+        .exec(&db)
+        .await
+        .unwrap();
+    assert_eq!(
+        next_agent_ledger_retention_at(&db, now).await.unwrap(),
+        Some(now.timestamp() + 2)
+    );
+    agent_action_outbox::Entity::delete_by_id("retention-tie")
+        .exec(&db)
+        .await
+        .unwrap();
+    assert_eq!(
+        next_agent_ledger_retention_at(&db, now).await.unwrap(),
+        Some(now.timestamp() + 10)
+    );
+    agent_action_outbox::Entity::delete_by_id("retention-later")
+        .exec(&db)
+        .await
+        .unwrap();
+    assert_eq!(
+        next_agent_ledger_retention_at(&db, now).await.unwrap(),
+        None
+    );
+    let east = chrono::FixedOffset::east_opt(3600).unwrap();
+    seed(
+        &db,
+        "offset-delivered",
+        "delivered",
+        1,
+        cutoff + Duration::seconds(10),
+        None,
+    )
+    .await;
+    let mut row: agent_action_outbox::ActiveModel = load(&db, "offset-delivered").await.into();
+    row.delivered_at = Set(Some(now));
+    row.update(&db).await.unwrap();
+    seed(
+        &db,
+        "offset-failed",
+        "failed",
+        8,
+        (cutoff + Duration::seconds(1)).with_timezone(&east),
+        None,
+    )
+    .await;
+    seed_action_for_discovery(&db, "offset-failed", "send_message", now).await;
+    assert_eq!(
+        next_agent_ledger_retention_at(&db, now).await.unwrap(),
+        Some(now.timestamp() + 10)
+    );
+}
