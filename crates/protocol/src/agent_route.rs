@@ -15,6 +15,8 @@ use std::collections::{BTreeMap, BTreeSet};
 pub enum AgentRouteKind {
     ExecutionBound,
     IdentityBound,
+    // Authority scoped to the persisted source capsule; creator fields are provenance.
+    CapsuleBound,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]

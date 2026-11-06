@@ -23,7 +23,7 @@
 //! Closing takes and frees the summary even if streams retain recorder handles.
 //! Consent generation is checked on creation, mutation, close, and again by the
 //! existing startup span exporter gate. There is no query_cpu session activation.
-use opentelemetry::{Array, Context, ContextGuard, KeyValue};
+use opentelemetry::{Array, Context, ContextGuard, KeyValue, Value};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -104,9 +104,15 @@ impl Summary {
         }
         let mut attrs = vec![
             KeyValue::new("history.sql.coverage", "completed_callbacks_before_close"),
-            KeyValue::new("history.sql.top.fingerprints", Array::String(fingerprints)),
-            KeyValue::new("history.sql.top.counts", Array::I64(counts)),
-            KeyValue::new("history.sql.top.elapsed_ms", Array::F64(elapsed_ms)),
+            KeyValue::new(
+                "history.sql.top.fingerprints",
+                Value::Array(Array::String(fingerprints)),
+            ),
+            KeyValue::new("history.sql.top.counts", Value::Array(Array::I64(counts))),
+            KeyValue::new(
+                "history.sql.top.elapsed_ms",
+                Value::Array(Array::F64(elapsed_ms)),
+            ),
             KeyValue::new("history.sql.accepted_fingerprints", self.known.len() as i64),
             KeyValue::new("history.sql.fingerprint_limit", FINGERPRINT_LIMIT as i64),
             KeyValue::new("history.sql.export_limit", TOP_LIMIT as i64),

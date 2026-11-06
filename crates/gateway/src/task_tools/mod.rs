@@ -53,6 +53,7 @@ const TASK_DETACH_TOOL: &str = "task_detach";
 const TASK_LIST_TOOL: &str = "task_list";
 const TASK_GET_TOOL: &str = "task_get";
 const TASK_RESULT_TOOL: &str = "task_result";
+const TASK_RUN_NOW_TOOL: &str = "task_run_now";
 const TASK_RESCHEDULE_TOOL: &str = "task_reschedule";
 const TASK_PAUSE_TOOL: &str = "task_pause";
 const TASK_RESUME_TOOL: &str = "task_resume";
@@ -745,7 +746,7 @@ pub(crate) fn agent_bound_task_tool_visible(
             capabilities.contains(&AgentToolCapability::TaskReview)
         }
         TASK_CANCEL_TOOL | TASK_FINISH_TOOL | TASK_DETACH_TOOL | TASK_RESUME_TOOL
-        | TASK_UPDATE_TOOL | TASK_RESCHEDULE_TOOL | TASK_PAUSE_TOOL => {
+        | TASK_UPDATE_TOOL | TASK_RUN_NOW_TOOL | TASK_RESCHEDULE_TOOL | TASK_PAUSE_TOOL => {
             capabilities.contains(&AgentToolCapability::TaskControl)
         }
         _ => false,
@@ -1263,7 +1264,7 @@ pub(crate) fn task_tool_resource_action(
         TASK_CANCEL_TOOL => ResourceAction::TaskCancel,
         TASK_DETACH_TOOL => ResourceAction::TaskDetach,
         TASK_FINISH_TOOL | TASK_UPDATE_TOOL | TASK_PAUSE_TOOL | TASK_RESUME_TOOL
-        | TASK_RESCHEDULE_TOOL => ResourceAction::TaskScheduleManage,
+        | TASK_RESCHEDULE_TOOL | TASK_RUN_NOW_TOOL => ResourceAction::TaskScheduleManage,
         _ => return Err(ToolError::NotFound(name.to_owned())),
     })
 }
@@ -1469,6 +1470,9 @@ impl TaskToolHandler {
             TASK_RESULT_TOOL => {
                 task_tool_future(self.handle_result(invocation, &authorization)).await
             }
+            TASK_RUN_NOW_TOOL => {
+                task_tool_future(self.handle_run_now(invocation, &authorization)).await
+            }
             TASK_RESCHEDULE_TOOL => {
                 task_tool_future(self.handle_reschedule(invocation, &authorization)).await
             }
@@ -1580,7 +1584,7 @@ impl TaskToolHandler {
         invocation: &ToolInvocation,
         plan: &mut crate::authorization::AgentActionCommitPlan,
     ) -> Result<(), ToolError> {
-        if !self.cli_replay {
+        if !self.cli_replay && invocation.tool_name != TASK_RUN_NOW_TOOL {
             return Ok(());
         }
         let ToolPayload::Function { arguments } = &invocation.payload else {
@@ -1644,7 +1648,7 @@ impl TaskToolHandler {
         let Some(cache_key) = cache_key else {
             return Ok(None);
         };
-        if self.cli_replay {
+        if self.cli_replay || invocation.tool_name == TASK_RUN_NOW_TOOL {
             let ToolPayload::Function { arguments } = &invocation.payload else {
                 return Err(ToolError::invalid_arguments("task_invalid_arguments"));
             };
@@ -2917,6 +2921,70 @@ impl TaskToolHandler {
         Ok(function_output(payload))
     }
 
+    async fn handle_run_now(
+        &self,
+        invocation: ToolInvocation,
+        authorization: &TaskToolAuthorizationScope,
+    ) -> Result<Box<dyn ToolOutput>, ToolError> {
+        let input: TaskRunNowToolInput = decode_tool_args(invocation.clone())?;
+        let params = pioneer_protocol::TaskRunNowParams {
+            task_id: validate_entity_id(input.task_id, "taskId")?,
+        };
+        authorization
+            .authorize_task(
+                self.processor.crud_store.as_ref(),
+                params.task_id.as_str(),
+                crate::authorization::ResourceAction::TaskScheduleManage,
+            )
+            .await?;
+        let cache_key = self.mutation_cache_key(&invocation);
+        let _mutation_guard = self.mutation_key_guard(cache_key.as_deref()).await;
+        if let Some(output) = self
+            .cached_or_prior_mutation_output(&invocation, cache_key.as_deref())
+            .await?
+        {
+            return Ok(function_output(output));
+        }
+        let action_plan = self
+            .prepare_bound_task_action(
+                &invocation,
+                AgentModelToolName::ControlTask,
+                serde_json::to_value(AgentControlTaskToolInput {
+                    task_id: params.task_id.clone(),
+                    control: AgentTaskControl::RunNow,
+                })
+                .map_err(|_| ToolError::internal("task control encoding failed"))?,
+                AgentToolCapability::TaskControl,
+                std::slice::from_ref(&params.task_id),
+            )
+            .await?;
+        if action_plan.is_none() {
+            return Err(task_tool_authorization_error());
+        }
+        let mut mutation_context = authorization.mutation_context(&self.context);
+        mutation_context.agent_action_commit = action_plan.as_ref().map(|plan| plan.input.clone());
+        let response = self
+            .processor
+            .task_runtime
+            .service()
+            .run_task_now(
+                mutation_context,
+                pioneer_protocol::TaskRunNowParams {
+                    task_id: params.task_id,
+                },
+            )
+            .await
+            .map_err(task_runtime_tool_error)?;
+        let mut output = json!({
+            "taskId": response.task_id,
+            "runId": response.run_id,
+        });
+        Self::attach_agent_action_result(&mut output, action_plan.as_ref())?;
+        self.cache_mutation_output(cache_key.as_deref(), &output)
+            .await;
+        Ok(function_output(output))
+    }
+
     async fn handle_reschedule(
         &self,
         invocation: ToolInvocation,
@@ -3016,6 +3084,7 @@ impl TaskToolHandler {
             .await
             .map_err(task_runtime_tool_error)?;
         let mut output = json!({
+            "scheduleOutcome": response.schedule_outcome,
             "task": task_summary(&response.task),
             "triggers": task_trigger_details_output(&response.triggers),
         });
@@ -3229,7 +3298,7 @@ impl TaskToolHandler {
         else {
             return Ok(None);
         };
-        if self.cli_replay {
+        if self.cli_replay || invocation.tool_name == TASK_RUN_NOW_TOOL {
             let binding = self
                 .processor
                 .agent_action_binding(&self.context.turn_id)
@@ -3266,6 +3335,11 @@ impl TaskToolHandler {
                 {
                     return Err(ToolError::invalid_arguments(
                         "task mutation identity was reused with different input",
+                    ));
+                }
+                if let Some(created) = response.get("taskRunNow") {
+                    return Ok(Some(
+                        json!({"alreadyCommitted": true, "taskId": created["taskId"], "runId": created["runId"]}),
                     ));
                 }
                 if let Some(created) = response.get("taskCreation") {
@@ -4206,6 +4280,14 @@ struct TaskListToolInput {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct TaskRunNowToolInput {
+    task_id: String,
+    #[serde(default, alias = "idempotency_key")]
+    idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 /// Model-facing input for task_reschedule.
 struct TaskRescheduleToolInput {
     /// Task id to reschedule. Pioneer entity ids are exactly 21 characters.
@@ -4372,13 +4454,19 @@ pub(crate) fn task_tool_specs() -> Vec<ConfiguredToolSpec> {
         ),
         task_tool_spec(
             TASK_RESCHEDULE_TOOL,
-            "Reschedule a non-terminal task through the task service. Pass trigger directly, choose the trigger kind, and fill trigger leaf fields such as scheduledAt, cronExpr, and timezone. Do not wrap trigger in spec.",
+            "Replace the schedule of a non-terminal task. For an additional run now use task_run_now; rescheduling to immediate replaces recurrence. Pass trigger directly, choose the trigger kind, and fill trigger leaf fields such as scheduledAt, cronExpr, and timezone. Do not wrap trigger in spec.",
             task_reschedule_schema(),
             safe_mutation_recovery(),
         ),
         task_tool_spec(
+            TASK_RUN_NOW_TOOL,
+            "Enqueue one additional run of an existing non-paused, non-terminal task without changing its schedule or next planned fire. Uses the same instructions, delivery and execution limits. Does not resume paused or blocked work, reopen terminal/finished tasks, or cancel running work. Returns the durable taskId and runId, or an error. Replays of the same tool call return the same run.",
+            tool_input_schema::<TaskRunNowToolInput>(),
+            safe_mutation_recovery(),
+        ),
+        task_tool_spec(
             TASK_PAUSE_TOOL,
-            "Pause a non-terminal task through the task service. Running task runs are not cancelled.",
+            "Pause future schedule firings. Running runs continue. scheduleOutcome is paused, no_future_firings (including exhausted schedules), or not_applied. This does not cancel queued work or prevent later rescheduling.",
             task_pause_schema(),
             safe_mutation_recovery(),
         ),
@@ -4537,6 +4625,7 @@ fn task_tool_schema_for_name(tool_name: &str) -> JsonValue {
         TASK_UPDATE_TOOL => task_update_schema(),
         TASK_DETACH_TOOL | TASK_GET_TOOL => task_id_schema(),
         TASK_LIST_TOOL => task_list_schema(),
+        TASK_RUN_NOW_TOOL => tool_input_schema::<TaskRunNowToolInput>(),
         TASK_RESCHEDULE_TOOL => task_reschedule_schema(),
         TASK_PAUSE_TOOL => task_pause_schema(),
         TASK_RESUME_TOOL => task_resume_schema(),
@@ -4568,7 +4657,7 @@ fn task_tool_argument_hint(tool_name: &str) -> &'static str {
             "Expected fields: taskId, runId, candidateId, and feedback. Use candidate ids returned by task_wait reviewRequired and provide concrete fix instructions."
         }
         TASK_CANCEL_TOOL | TASK_FINISH_TOOL | TASK_DETACH_TOOL | TASK_GET_TOOL
-        | TASK_PAUSE_TOOL | TASK_RESUME_TOOL => {
+        | TASK_PAUSE_TOOL | TASK_RESUME_TOOL | TASK_RUN_NOW_TOOL => {
             "Expected field: taskId. The value must be a 21-character Pioneer entity id."
         }
         TASK_LIST_TOOL => {
@@ -6242,6 +6331,7 @@ mod tests {
                 TASK_UPDATE_TOOL,
                 TASK_PAUSE_TOOL,
                 TASK_RESCHEDULE_TOOL,
+                TASK_RUN_NOW_TOOL,
                 TASK_RESUME_TOOL,
             ]
             .contains(&name)

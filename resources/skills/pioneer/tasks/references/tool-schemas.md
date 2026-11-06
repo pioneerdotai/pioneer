@@ -10,6 +10,7 @@ Use this reference when exact task tool arguments matter for durable, scheduled,
 - task_list
 - task_get
 - task_update
+- task_run_now
 - task_reschedule
 - task_pause and task_resume
 - task_finish
@@ -214,7 +215,7 @@ For scheduled, interval, and cron agent tasks, do not clear `instructions` or `o
 
 ## task_reschedule
 
-Use to change only the schedule.
+Use to explicitly replace the schedule. An immediate replacement removes recurrence; use task_run_now for an extra check.
 
 ```json
 {
@@ -302,3 +303,22 @@ Do not call `task_wait` after creating scheduled future work unless the returned
 For active attached work, `timedOut:true` means only the requested wait window expired. It does not stop or diagnose a run; waiting again with `taskIds` or `runIds` is allowed. A run's own timeout is reported in its status and error.
 
 Scheduled, interval, and cron tasks often return `waitable:false` or `runId:null` at creation. Confirm the schedule instead of waiting.
+
+## task_run_now
+
+```json
+{"taskId":"TASK_ID"}
+```
+
+Returns confirmed `taskId` and `runId` references (and `alreadyCommitted` on
+receipt replay). Creates one queued occurrence using saved task configuration;
+the schedule and next planned fire stay unchanged. Running work continues and
+ordinary concurrency/admission applies. Paused, blocked, terminal and finished
+tasks are refused. Omit idempotencyKey in normal model calls: the runtime derives
+the durable operation identity. Retry the same operation identity after response
+loss. A new identity intentionally requests another run.
+
+`task_pause` additionally returns `scheduleOutcome`: `paused`,
+`no_future_firings`, or `not_applied`. Exhausted one-shot triggers stay exhausted;
+this is not a pause error. Running work is not cancelled. Resume preserves the
+saved recurring trigger.

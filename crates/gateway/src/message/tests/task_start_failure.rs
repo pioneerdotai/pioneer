@@ -3986,3 +3986,327 @@ fn gateway_partial_task_startup_keeps_independent_registrations_and_unknown_fail
         }
     });
 }
+
+#[tokio::test]
+async fn capsule_delegation_survives_nested_task_binding_recovery_and_revocation() {
+    use super::thread_launch_choices::{call, invoke_with_mutation};
+    use crate::message::task_agent_executor::materialize_task_agent_action_binding_for_execution;
+    use pioneer_agent::{TaskToolProvider, TurnToolContext};
+
+    // Existing recording CLI session acknowledges activation without starting
+    // any external process/model. Task admission, lineage, grants and handlers
+    // remain the production paths.
+    let (harness, processor) = review_cli_fixture().await;
+    let (creator_task, creator) =
+        create_review_cli_child(&harness, &processor, "capsule-creator", false, false).await;
+    let creator_context = TurnToolContext {
+        workspace_id: harness.workspace_id.clone(),
+        thread_id: creator.child_thread_id.clone(),
+        turn_id: creator.child_turn_id.clone(),
+    };
+    let creator_binding = processor
+        .agent_action_binding(&creator.child_turn_id)
+        .await
+        .unwrap();
+    let creator_facts = creator_binding.adapter.lock().await.persistence_facts();
+    let creation = creator_binding
+        .options
+        .thread_creation_options
+        .iter()
+        .find(|option| option.label == "New delegated root")
+        .unwrap();
+    let creator_tools = processor
+        .materialize_agent_action_tools(creator_context.clone())
+        .await
+        .unwrap();
+    let created = call(
+        &creator_tools,
+        "thread_create",
+        "nested-capsule-destination",
+        json!({"optionId":creation.id}),
+    )
+    .await;
+    let destination = created["threadResult"]["threadId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // Create the second-level Task through the actual agent task handler, not
+    // by assigning home roots, copying route rows, or fabricating admissions.
+    harness
+        .cli_session
+        .set_next_native_turn_id("native-capsule-descendant")
+        .await;
+    let task_tools = crate::task_tools::GatewayTaskToolProvider::new(Arc::downgrade(&processor))
+        .materialize_task_tools(pioneer_agent::TaskTurnContext {
+            workspace_id: harness.workspace_id.clone(),
+            thread_id: creator.child_thread_id.clone(),
+            turn_id: creator.child_turn_id.clone(),
+        })
+        .await
+        .unwrap();
+    let task_tools = pioneer_agent::TurnToolMaterialization {
+        bundles: task_tools.bundles,
+        ..Default::default()
+    };
+    let nested = call(
+        &task_tools,
+        "task_create",
+        "nested-capsule-task",
+        json!({"title":"Nested capsule recovery", "goal":"Wait for controlled recovery"}),
+    )
+    .await;
+    let task_id = nested["taskId"].as_str().unwrap();
+    let run_id = wait_for_task_run_id(harness.crud_store.clone(), task_id).await;
+    let descendant = wait_for_child_lineage_for_run(harness.crud_store.clone(), &run_id).await;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let activated = harness
+                .crud_store
+                .get_cli_runtime_turn_binding(&descendant.child_turn_id)
+                .await
+                .unwrap()
+                .is_some_and(|binding| {
+                    binding.native_turn_id.as_deref() == Some("native-capsule-descendant")
+                });
+            let running = harness
+                .crud_store
+                .get_task_run(&run_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status
+                == TaskRunStatus::Running;
+            if activated
+                && running
+                && processor
+                    .agent_action_binding(&descendant.child_turn_id)
+                    .await
+                    .is_some()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let response = harness.crud_store.get_task(task_id).await.unwrap().unwrap();
+    let admission = harness
+        .crud_store
+        .get_task_execution_admission(task_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(admission.root_thread_id, creator_facts.home_root_thread_id);
+    assert!(response.agent_specs[0].depth > 1);
+    let lineage = harness
+        .crud_store
+        .get_task_thread_lineage(&descendant.child_thread_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(lineage.root_thread_id, admission.root_thread_id);
+    assert_eq!(lineage.parent_thread_id, creator.child_thread_id);
+    let execution = harness
+        .crud_store
+        .load_execution_for_run(&run_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let db = harness.crud_store.database_connection();
+    let route = pioneer_crud::list_agent_delegation_routes_for_source(
+        &db,
+        creator_facts.execution_id.as_str(),
+        creator_facts.identity.id.as_str(),
+    )
+    .await
+    .unwrap()
+    .into_iter()
+    .find(|route| route.destination_thread_id == destination)
+    .unwrap();
+    assert_eq!(route.route_kind, "capsule_bound");
+    harness
+        .crud_store
+        .finalize_agent_execution(
+            creator_facts.execution_id.as_str(),
+            "completed",
+            pioneer_crud::utc_now(),
+        )
+        .await
+        .unwrap();
+    let completed_creator =
+        pioneer_crud::load_agent_execution(&db, creator_facts.execution_id.as_str())
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(completed_creator.status, "completed");
+    assert!(completed_creator.finished_at.is_some());
+    processor
+        .unregister_agent_action_binding(&creator.child_turn_id)
+        .await;
+    drop(creator_binding);
+    drop(creator_tools);
+    drop(task_tools);
+
+    let context = TurnToolContext {
+        workspace_id: harness.workspace_id.clone(),
+        thread_id: descendant.child_thread_id.clone(),
+        turn_id: descendant.child_turn_id.clone(),
+    };
+    let mut latest_tools = None;
+    let mut latest_target = None;
+    for launch in 0..2 {
+        // Two cold launches of the admitted execution exercise the persisted
+        // branch of task restoration. No bind_persisted_route is used here.
+        drop(latest_tools.take());
+        processor
+            .unregister_agent_action_binding(&context.turn_id)
+            .await;
+        let (adapter, options, capabilities) = materialize_task_agent_action_binding_for_execution(
+            &processor,
+            &response.task,
+            &response.agent_specs[0],
+            &execution.id,
+            &run_id,
+            &admission.root_thread_id,
+            processor.current_authorization_revision().await.unwrap(),
+            false,
+        )
+        .await
+        .unwrap();
+        let recovered = adapter.persistence_facts();
+        assert_ne!(recovered.execution_id, creator_facts.execution_id);
+        assert_eq!(recovered.home_root_thread_id, admission.root_thread_id);
+        let binding = crate::message::agent_action_tools::AgentActionRuntimeBinding::new(
+            adapter,
+            options,
+            capabilities,
+        );
+        let binding = processor
+            .prepare_agent_action_binding(context.turn_id.clone(), binding)
+            .await
+            .unwrap();
+        processor
+            .register_agent_action_binding(context.turn_id.clone(), binding)
+            .await;
+        let tools = processor
+            .materialize_agent_action_tools(context.clone())
+            .await
+            .unwrap();
+        let catalog = call(
+            &tools,
+            "threads_start_options",
+            &format!("capsule-options-{launch}"),
+            json!({}),
+        )
+        .await;
+        let targets: Vec<pioneer_protocol::AgentToolTargetOption> =
+            serde_json::from_value(catalog["targetOptions"].clone()).unwrap();
+        let target = targets
+            .iter()
+            .find(|option| option.label == "Approved routed destination")
+            .unwrap();
+        let call_id = format!("capsule-restored-send-{launch}");
+        let result = call(&tools, "thread_message_send", &call_id,
+            json!({"targetOptionId":target.id, "input":[{"type":"text","text":format!("Recovered launch {launch}")}]})).await;
+        assert_eq!(result["threadResult"]["threadId"], destination);
+        let outbox = pioneer_crud::load_agent_action_outbox(
+            &db,
+            crate::authorization::action_id_for_call(&call_id).as_str(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(outbox.owner_execution_id, recovered.execution_id.as_str());
+        let receipt = pioneer_crud::load_agent_action_receipt(
+            &db,
+            crate::authorization::action_id_for_call(&call_id).as_str(),
+        )
+        .await
+        .unwrap();
+        let receipt = receipt.expect("canonical commit must retain its receipt");
+        assert_eq!(
+            receipt.actor_id.as_deref(),
+            Some(recovered.execution_id.as_str())
+        );
+        assert_eq!(
+            receipt.source_scope_id.as_deref(),
+            Some(admission.root_thread_id.as_str())
+        );
+        assert_eq!(
+            receipt.destination_scope_id.as_deref(),
+            Some(destination.as_str())
+        );
+        let route_receipt: serde_json::Value =
+            serde_json::from_str(receipt.route_receipt_json.as_deref().unwrap()).unwrap();
+        assert_eq!(route_receipt["routeId"], route.id);
+        latest_target = Some(target.id.clone());
+        latest_tools = Some(tools);
+    }
+    let principal = serde_json::to_string(&pioneer_protocol::PersistedActorRef::Principal(
+        authenticated_test_superuser().principal_id.clone(),
+    ))
+    .unwrap();
+    assert!(
+        harness
+            .crud_store
+            .revoke_agent_delegation_route(
+                &route.id,
+                route.route_generation,
+                processor.current_authorization_revision().await.unwrap() as i64,
+                &principal,
+                "capsule-review-revocation",
+                pioneer_crud::utc_now()
+            )
+            .await
+            .unwrap()
+    );
+    let stale_target = latest_target.unwrap();
+    let denied = invoke_with_mutation(
+        latest_tools.as_ref().unwrap(),
+        "thread_message_send",
+        "capsule-revoked-send",
+        json!({"targetOptionId":stale_target, "input":[{"type":"text","text":"must not commit"}]}),
+        None,
+    )
+    .await;
+    assert!(
+        matches!(&denied, Err(pioneer_tools::ToolError::InvalidArguments(message))
+        if message == pioneer_protocol::AgentPublicOutcome::AgentActionNotAllowed.as_str()),
+        "revoked route must fail opaque target resolution: {denied:?}"
+    );
+    assert!(
+        pioneer_crud::load_agent_action_outbox(
+            &db,
+            crate::authorization::action_id_for_call("capsule-revoked-send").as_str()
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
+    let refreshed = processor
+        .agent_action_binding(&context.turn_id)
+        .await
+        .unwrap();
+    assert!(
+        refreshed
+            .options
+            .target_options
+            .iter()
+            .all(|option| option.id != stale_target),
+        "the handler must reload revocation before resolving the saved opaque target"
+    );
+    assert!(
+        pioneer_crud::load_agent_action_receipt(
+            &db,
+            crate::authorization::action_id_for_call("capsule-revoked-send").as_str()
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
+    // The original Task and nested Task are kept live only by recording sessions;
+    // no provider output or fabricated task completion is used by the oracle.
+    assert_ne!(creator_task.task.id, task_id);
+}

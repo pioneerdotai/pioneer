@@ -288,7 +288,8 @@ impl AgentActionRuntimeBinding {
                 || projection.source_capsule_id != execution.home_root_thread_id
                 || projection.source_policy_generation != route_policy_generation
                 || projection.destination_policy_generation != route_policy_generation
-                || projection.source_agent_identity_id != facts.identity.id
+                || (projection.kind != pioneer_protocol::AgentRouteKind::CapsuleBound
+                    && projection.source_agent_identity_id != facts.identity.id)
             {
                 continue;
             }
@@ -6017,7 +6018,7 @@ impl AgentActionToolHandler {
                 destination_agent_identity_id: None,
                 destination_profile_id: None,
                 home_capsule_id: Some(facts.home_root_thread_id.clone()),
-                route_kind: "execution_bound".to_owned(),
+                route_kind: "capsule_bound".to_owned(),
                 authority_actor_json: serde_json::to_string(
                     &pioneer_protocol::PersistedActorRef::AgentExecution(execution_id.clone()),
                 )
