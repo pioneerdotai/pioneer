@@ -36804,6 +36804,16 @@ impl CrudStore {
         occurrence_contracts: Vec<pioneer_protocol::TaskOccurrenceContract>,
         reserve_executions: Vec<(String, TaskExecutorKind)>,
     ) -> Result<Vec<AppendedTaskEvent>> {
+        // A manual/webhook admission can win after scheduler preparation.
+        // Revalidate allocation facts inside the same writer as consumption;
+        // a stale plan leaves the trigger due for the next scheduler pass.
+        let expected_run_number = events.iter().find_map(|event| match event {
+            TaskEventPayload::RunCreated { run, .. } => Some(run.run_number),
+            _ => None,
+        });
+        let expected_generation = occurrence_contracts
+            .first()
+            .map(|contract| contract.execution_generation);
         let events = self.prepare_task_events_for_write(events).await?;
         if occurrence_contracts.len() > MAX_ATOMIC_TASK_EVENT_BATCH_SIZE
             || reserve_executions.len() > MAX_ATOMIC_TASK_EVENT_BATCH_SIZE
@@ -36842,6 +36852,21 @@ impl CrudStore {
                 return Ok(Vec::new());
             }
 
+            if let Some(expected) = expected_run_number
+                && task_run::next_run_number(&transaction, &trigger.task_id).await? != expected
+            {
+                return Ok(Vec::new());
+            }
+            if let Some(expected) = expected_generation
+                && task_actor_contract::next_task_occurrence_execution_generation(
+                    &transaction,
+                    &trigger.task_id,
+                )
+                .await?
+                    != expected
+            {
+                return Ok(Vec::new());
+            }
             if task_repository::finish_requested(&transaction, &trigger.task_id).await? {
                 return Ok(Vec::new());
             }
@@ -39327,21 +39352,12 @@ mod tests {
         let connection = Database::connect("sqlite::memory:")
             .await
             .expect("must connect to sqlite memory");
-        // This private fixture has no published state yet. Pin its initial
-        // migration chain to one connection instead of reacquiring the pool
-        // for each schema statement. Runtime/domain transactions are unchanged.
-        let database = pioneer_sqlite::SqliteDatabase::from_single_connection(connection.clone());
-        let migration = database
-            .begin()
-            .await
-            .expect("fixture migration transaction");
-        M::up(&*migration, None)
+        // Bootstrap through the writer so migrations can own a physical lease
+        // outside an enclosing transaction. No fixture consumer exists yet.
+        pioneer_sqlite::SqliteWriteExecutor::new(connection.clone())
+            .run_migrations::<M>(pioneer_sqlite::SqliteWriteClass::Maintenance, None)
             .await
             .expect("migrations must succeed");
-        migration
-            .commit()
-            .await
-            .expect("fixture schema must commit");
 
         let timestamp = unix_to_datetime(1_700_000_000);
         pioneer_entity::workspace::Entity::insert(pioneer_entity::workspace::ActiveModel {

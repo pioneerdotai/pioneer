@@ -5,6 +5,8 @@ mod m20261018_000001_html_preview_work_selection;
 mod m20261101_000101_idle_task_child_work;
 mod m20261101_000102_idle_task_occurrence_tracking_cutover;
 mod m20261101_000103_idle_html_preview_io_work;
+mod m20261104_000001_capsule_bound_routes;
+mod m20261105_000001_portable_pending_indexes;
 pub use sea_orm_migration::prelude::*;
 
 mod m20261023_000001_task_webhook;
@@ -21,7 +23,6 @@ mod m20261027_000003_portable_cli_mapping;
 mod m20261027_000004_portable_task_history;
 mod m20261027_000005_portable_task_event;
 mod m20261029_000001_thread_read_creation_order;
-mod m20261105_000001_task_event_portable_pending_index;
 mod portable_payload_target;
 
 pub struct Migrator;
@@ -238,7 +239,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20261101_000101_idle_task_child_work::Migration),
             Box::new(m20261101_000102_idle_task_occurrence_tracking_cutover::Migration),
             Box::new(m20261101_000103_idle_html_preview_io_work::Migration),
-            Box::new(m20261105_000001_task_event_portable_pending_index::Migration),
+            Box::new(m20261105_000001_portable_pending_indexes::Migration),
+            Box::new(m20261104_000001_capsule_bound_routes::Migration),
         ]
     }
 }

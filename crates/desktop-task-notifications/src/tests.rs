@@ -41,7 +41,7 @@ impl DesktopNotificationPort for FakePort {
 }
 fn input(revision: u64, actionable: bool) -> Arc<TaskInboxPublication> {
     Arc::new(serde_json::from_value(serde_json::json!({
-        "workspace_id":"a", "revision":revision, "next_cursor":null,"unread_count":if actionable {1}else{0}, "loading":false, "request_busy":false, "error":null, "opened":null, "native_notifications":[],
+        "workspace_id":"a", "revision":revision, "next_cursor":null,"unread_count":if actionable {1}else{0}, "loading":false, "request_busy":false, "completed_operation_id":null, "error":null, "opened":null, "native_notifications":[],
         "items":[{"revision":revision,"dismissing":false,"notification":{"workspaceId":"a","taskId":"t","runId":"r","title":"Task","threadId":"root","threadTitle":"Root","status":"succeeded","completedAt":1,"readAt":if actionable { None } else { Some(2) }}}]
     })).unwrap())
 }

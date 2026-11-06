@@ -622,7 +622,9 @@ async fn before_tracking() -> CrudStore {
     CrudStore::new(db)
 }
 async fn install_tracking(store: &CrudStore) {
-    install_tracking_with_migrator::<Migrator>(store).await;
+    // Install the tracking prefix under test, retaining its rollback boundary.
+    // Later unrelated schema rebuilds require standalone bootstrap.
+    install_tracking_with_migrator::<FanoutFixtureMigrator>(store).await;
 }
 async fn install_tracking_with_migrator<M: MigratorTrait>(store: &CrudStore) {
     let tx = store

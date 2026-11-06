@@ -11,13 +11,16 @@ use sea_orm::{Database, TransactionTrait};
 
 async fn store() -> CrudStore {
     let db = Database::connect("sqlite::memory:").await.unwrap();
-    let database = pioneer_sqlite::SqliteDatabase::from_single_connection(db);
-    pioneer_sqlite::apply_sqlite_pragmas(&database)
+    let writer = pioneer_sqlite::SqliteWriteExecutor::new(db.clone());
+    writer
+        .apply_pragmas(pioneer_sqlite::SqliteWriteClass::Maintenance)
         .await
         .unwrap();
-    let tx = database.begin().await.unwrap();
-    Migrator::up(&*tx, None).await.unwrap();
-    tx.commit().await.unwrap();
+    writer
+        .run_migrations::<Migrator>(pioneer_sqlite::SqliteWriteClass::Maintenance, None)
+        .await
+        .unwrap();
+    let database = pioneer_sqlite::SqliteDatabase::from_executor(db, writer);
     CrudStore::new(database).with_maintenance_access()
 }
 async fn seed(store: &CrudStore) {

@@ -78646,21 +78646,13 @@ async fn setup_workspace_manager_with_connection(
     // This helper invokes current Gateway bootstrap and authorization, so it
     // requires the complete schema rather than a historical migration prefix.
     crate::compaction::load_test_catalog();
-    // Keep fresh fixture initialization on one physical connection. There is
-    // no concurrent fixture consumer until migration commits; bootstrap and
-    // every tested Gateway operation still use their normal storage paths.
-    let database = pioneer_sqlite::SqliteDatabase::from_single_connection(connection.clone());
-    let migration = database
-        .begin()
-        .await
-        .expect("fixture migration transaction");
-    Migrator::up(&*migration, None)
+    // Use the normal writer bootstrap path: migrations that change connection
+    // pragmas must own their physical lease outside any enclosing transaction.
+    // Each migration retains its own atomicity; no fixture consumer exists yet.
+    pioneer_sqlite::SqliteWriteExecutor::new(connection.clone())
+        .run_migrations::<Migrator>(pioneer_sqlite::SqliteWriteClass::Maintenance, None)
         .await
         .expect("migrations must succeed");
-    migration
-        .commit()
-        .await
-        .expect("fixture schema must commit");
     bootstrap(&connection)
         .await
         .expect("gateway bootstrap should create default workspace");

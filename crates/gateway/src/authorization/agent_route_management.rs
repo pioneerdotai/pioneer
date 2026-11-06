@@ -304,6 +304,7 @@ impl AgentRouteManagementService {
             route_kind: match params.kind {
                 pioneer_protocol::AgentRouteKind::ExecutionBound => "execution_bound",
                 pioneer_protocol::AgentRouteKind::IdentityBound => "identity_bound",
+                pioneer_protocol::AgentRouteKind::CapsuleBound => "capsule_bound",
             }
             .to_owned(),
             authority_actor_json,

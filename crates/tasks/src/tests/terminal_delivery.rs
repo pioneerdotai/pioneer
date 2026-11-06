@@ -1758,10 +1758,10 @@ async fn revision_terminal_fixture_with_retry(
         .map_sqlx_sqlite_opts(|options| options.pragma("foreign_keys", "OFF"));
     let writer = Database::connect(writer_options).await.unwrap();
     pioneer_sqlite::apply_sqlite_pragmas(&writer).await.unwrap();
-    let bootstrap = SqliteDatabase::from_single_connection(writer.clone());
-    let migration = bootstrap.begin().await.unwrap();
-    Migrator::up(&*migration, None).await.unwrap();
-    migration.commit().await.unwrap();
+    SqliteWriteExecutor::new(writer.clone())
+        .run_migrations::<Migrator>(pioneer_sqlite::SqliteWriteClass::Maintenance, None)
+        .await
+        .unwrap();
     seed_task_test_workspace(&writer).await;
     let mut reader_options =
         ConnectOptions::new(pioneer_sqlite::sqlite_read_only_connection_url(&path));
