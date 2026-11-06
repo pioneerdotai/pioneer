@@ -1142,6 +1142,10 @@ enum SweepStep {
 }
 
 struct SweepPreparation {
+    // A real fanout turn overlapped this visit. Its old preparation may have
+    // observed a fence released by ACK without another Work revision change.
+    // Consumed on successful finish; newly admitted visits start unmarked.
+    invalidated: bool,
     work: Option<frozen_sweep_work::Work>,
     poison: bool,
     manifest: String,
@@ -1164,6 +1168,7 @@ impl SweepPreparation {
     fn new(manifest: String, kind: i64, until: i64) -> Self {
         Self {
             work: None,
+            invalidated: false,
             poison: false,
             checks: VecDeque::from([manifest.clone()]),
             manifest,
@@ -2208,6 +2213,15 @@ impl FrozenStorageLifetimeProgress {
             Ok(false)
         }
     }
+    fn invalidate_sweep(&mut self) {
+        for round in &mut self.sweep_round {
+            round.invalidate();
+        }
+        for sweep in self.sweep.iter_mut().chain(self.sweep_pending.iter_mut()) {
+            sweep.invalidated = true;
+        }
+    }
+
     async fn sweep_quantum(&mut self, store: &CrudStore) -> Result<bool> {
         let active = self.sweep_pending.len() + usize::from(self.sweep.is_some());
         if active > 0 && (!self.sweep_discover || active >= ACTIVE_CONTAINERS) {
@@ -2236,6 +2250,12 @@ impl FrozenStorageLifetimeProgress {
                         return Err(error);
                     }
                 }
+                if sweep.invalidated {
+                    // Do not consume the overlap obligation on writer error.
+                    // Cursor progress is retained; revisit only this family at
+                    // its next frontier boundary, after the old visit settled.
+                    self.sweep_round[sweep.kind as usize].invalidate();
+                }
             } else {
                 self.sweep_pending.push_back(sweep);
             }
@@ -2256,9 +2276,7 @@ impl FrozenStorageLifetimeProgress {
         if fanout_checked {
             self.sweep_fanout = false;
             if frozen_sweep_work::fanout_step(store).await? {
-                for round in &mut self.sweep_round {
-                    round.invalidate();
-                }
+                self.invalidate_sweep();
                 return Ok(true);
             }
         }
@@ -2297,9 +2315,7 @@ impl FrozenStorageLifetimeProgress {
                 // Empty physical admission is not EOF while propagation continues.
                 let propagated = !fanout_checked && frozen_sweep_work::fanout_step(store).await?;
                 if propagated {
-                    for round in &mut self.sweep_round {
-                        round.invalidate();
-                    }
+                    self.invalidate_sweep();
                 }
                 let more = propagated || active > 0;
                 if !more {
