@@ -785,8 +785,13 @@ pub(crate) mod tests {
         callback()
     }
     pub(crate) fn gateway_test_state(provider: SdkMeterProvider) -> &'static ObservabilityState {
+        gateway_test_state_with_tracer(provider, SdkTracerProvider::builder().build())
+    }
+    pub(crate) fn gateway_test_state_with_tracer(
+        provider: SdkMeterProvider,
+        tracer_provider: SdkTracerProvider,
+    ) -> &'static ObservabilityState {
         let meter = provider.meter("db-integration-fixture");
-        let tracer_provider = SdkTracerProvider::builder().build();
         Box::leak(Box::new(ObservabilityState {
             target: TelemetryTarget::Gateway,
             resource_sampler: None,

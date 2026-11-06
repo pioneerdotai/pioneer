@@ -2,20 +2,10 @@ use pioneer_observability::{DatabaseOperationSite, DatabaseWorkload, DatabaseWor
 use std::future::Future;
 use std::pin::Pin;
 
-pub(crate) fn current_database_workload() -> Option<DatabaseWorkload> {
-    pioneer_observability::work::current_database().map(|context| context.workload())
-}
-
-pub(crate) fn record_database_query(
-    fingerprint: u64,
-    kind: pioneer_observability::DatabaseQueryKind,
-    elapsed: std::time::Duration,
-) {
-    if let Some(context) = pioneer_observability::work::current_database() {
-        context.record_query(fingerprint, kind, elapsed);
-        pioneer_observability::live::progress(pioneer_observability::live::Stage::Database);
-    }
-}
+#[cfg(test)]
+pub(crate) use super::connection::query_observer::{
+    current_database_workload, record_database_query,
+};
 
 pub(crate) fn scope_database_workload<'a, F>(
     workload: DatabaseWorkload,
