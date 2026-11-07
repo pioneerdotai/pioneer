@@ -377,7 +377,10 @@ pub(crate) async fn previous_delivered_parent_turn(
             && turn.message_deleted
         {
             if store.get_turn_execution(id).await?.is_some()
-                || store.get_cli_runtime_turn_binding(id).await?.is_some()
+                || store
+                    .get_cli_runtime_turn_binding_control(id)
+                    .await?
+                    .is_some()
                 || store.latest_cli_runtime_turn_attempt(id).await?.is_some()
             {
                 return Ok(previous);
@@ -463,7 +466,7 @@ pub(crate) async fn previous_delivered_parent_turn(
                         && !e.status.is_active()
                 })
             || store
-                .get_cli_runtime_turn_binding(&execution_turn)
+                .get_cli_runtime_turn_binding_control(&execution_turn)
                 .await?
                 .is_some()
             || store
@@ -1400,7 +1403,7 @@ pub(crate) async fn service_child_context_basis_from_binding(
         return Ok(None);
     }
     let Some(child_turn) = store
-        .get_cli_runtime_turn_binding(receipt.accepted_turn_id.as_str())
+        .get_cli_runtime_turn_binding_control(receipt.accepted_turn_id.as_str())
         .await?
     else {
         return Ok(None);
@@ -1581,7 +1584,10 @@ async fn current_context_basis_for_receipt(
     {
         return Ok(None);
     }
-    let Some(accepted) = store.get_cli_runtime_turn_binding(previous_turn_id).await? else {
+    let Some(accepted) = store
+        .get_cli_runtime_turn_binding_control(previous_turn_id)
+        .await?
+    else {
         return Ok(None);
     };
     if accepted.status != "completed"
@@ -1712,7 +1718,7 @@ pub(crate) async fn record_cli_runtime_completed_context(
     // while the provider binding belongs to the parent. Check the durable
     // turn binding instead of assuming both Pioneer IDs are identical.
     let turn_binding = store
-        .get_cli_runtime_turn_binding(accepted_turn.turn_id.as_str())
+        .get_cli_runtime_turn_binding_control(accepted_turn.turn_id.as_str())
         .await?
         .context("CLI runtime accepted turn binding is missing")?;
     if turn_binding.thread_id

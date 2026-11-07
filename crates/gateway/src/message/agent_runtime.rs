@@ -1936,7 +1936,7 @@ impl MessageProcessor {
         }
         match self
             .crud_store
-            .get_cli_runtime_turn_binding(&notification.turn_id)
+            .get_cli_runtime_turn_binding_control(&notification.turn_id)
             .await
         {
             Ok(Some(binding)) => {
@@ -2115,7 +2115,7 @@ impl MessageProcessor {
                 {
                     let binding = self
                         .crud_store
-                        .get_cli_runtime_turn_binding(turn_id)
+                        .get_cli_runtime_turn_binding_control(turn_id)
                         .await
                         .map_err(|_| {
                             DurableCommitRejection::retryable(
@@ -2126,7 +2126,7 @@ impl MessageProcessor {
                     if let Some(binding) = binding {
                         let expected = self
                             .crud_store
-                            .cli_runtime_turn_terminal_guard(&binding)
+                            .cli_runtime_turn_terminal_control_guard(&binding)
                             .await
                             .map_err(|_| {
                                 DurableCommitRejection::retryable(
@@ -2154,7 +2154,7 @@ impl MessageProcessor {
                         if expected.is_none()
                             || self
                                 .crud_store
-                                .cli_runtime_turn_terminal_guard(&binding)
+                                .cli_runtime_turn_terminal_control_guard(&binding)
                                 .await
                                 .map_err(|_| {
                                     DurableCommitRejection::retryable(
@@ -4195,7 +4195,7 @@ impl MessageProcessor {
     ) -> Result<()> {
         let selected = self
             .crud_store
-            .get_cli_runtime_turn_binding(&expected.turn_id)
+            .get_cli_runtime_turn_binding_control(&expected.turn_id)
             .await?
             .ok_or(pioneer_crud::UnactivatedTurnPhaseChanged)?;
         let selected_attempt = self
@@ -4212,7 +4212,7 @@ impl MessageProcessor {
         // another durable owner/generation inherits this early Stop's proof.
         let binding = self
             .crud_store
-            .get_cli_runtime_turn_binding(&expected.turn_id)
+            .get_cli_runtime_turn_binding_control(&expected.turn_id)
             .await?
             .ok_or(pioneer_crud::UnactivatedTurnPhaseChanged)?;
         anyhow::ensure!(
@@ -4227,7 +4227,7 @@ impl MessageProcessor {
         );
         let source = self
             .crud_store
-            .cli_runtime_turn_terminal_guard(&binding)
+            .cli_runtime_turn_terminal_control_guard(&binding)
             .await?
             .ok_or(pioneer_crud::UnactivatedTurnPhaseChanged)?;
         anyhow::ensure!(
@@ -8772,7 +8772,7 @@ impl MessageProcessor {
             .await;
         let result = self
             .crud_store
-            .cli_runtime_turn_terminal_guard(binding)
+            .cli_runtime_turn_terminal_control_guard(binding)
             .await;
         let diagnostic = match result {
             Ok(Some(snapshot)) => return Some(snapshot),
@@ -9253,7 +9253,7 @@ impl MessageProcessor {
 
         let is_cli_runtime_turn = self
             .crud_store
-            .get_cli_runtime_turn_binding(turn_id)
+            .get_cli_runtime_turn_binding_control(turn_id)
             .await?
             .is_some();
         if !is_cli_runtime_turn {
@@ -10580,11 +10580,15 @@ impl MessageProcessor {
             // Cancellation wins over Blocked, but still cannot bypass a CLI
             // transition already performing terminal effects or admission.
             let _acquired = if transition.is_none() {
-                match self.crud_store.get_cli_runtime_turn_binding(&turn_id).await {
+                match self
+                    .crud_store
+                    .get_cli_runtime_turn_binding_control(&turn_id)
+                    .await
+                {
                     Ok(Some(binding)) => {
                         let expected = self
                             .crud_store
-                            .cli_runtime_turn_terminal_guard(&binding)
+                            .cli_runtime_turn_terminal_control_guard(&binding)
                             .await
                             .ok()
                             .flatten();
@@ -10599,7 +10603,7 @@ impl MessageProcessor {
                         if expected.is_none()
                             || self
                                 .crud_store
-                                .cli_runtime_turn_terminal_guard(&binding)
+                                .cli_runtime_turn_terminal_control_guard(&binding)
                                 .await
                                 .ok()
                                 .flatten()
@@ -10765,11 +10769,15 @@ impl MessageProcessor {
         let turn_transition = if turn_transition.is_some() {
             turn_transition
         } else {
-            match self.crud_store.get_cli_runtime_turn_binding(&turn_id).await {
+            match self
+                .crud_store
+                .get_cli_runtime_turn_binding_control(&turn_id)
+                .await
+            {
                 Ok(Some(binding)) => {
                     let expected = match self
                         .crud_store
-                        .cli_runtime_turn_terminal_guard(&binding)
+                        .cli_runtime_turn_terminal_control_guard(&binding)
                         .await
                     {
                         Ok(Some(expected)) => expected,
@@ -10781,7 +10789,7 @@ impl MessageProcessor {
                     };
                     if self
                         .crud_store
-                        .cli_runtime_turn_terminal_guard(&binding)
+                        .cli_runtime_turn_terminal_control_guard(&binding)
                         .await
                         .ok()
                         .flatten()
@@ -11304,7 +11312,11 @@ impl MessageProcessor {
         reason: Option<&str>,
         transition: Option<&Arc<tokio::sync::OwnedMutexGuard<()>>>,
     ) -> bool {
-        match self.crud_store.get_cli_runtime_turn_binding(turn_id).await {
+        match self
+            .crud_store
+            .get_cli_runtime_turn_binding_control(turn_id)
+            .await
+        {
             Ok(Some(binding)) => {
                 if binding.thread_id != thread_id
                     || !self

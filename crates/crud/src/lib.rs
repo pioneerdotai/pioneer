@@ -993,14 +993,28 @@ pub use crate::repositories::cli_runtime_binding::{
 };
 /// Facts used by terminal projection repair. Captured in one reader snapshot;
 /// validated again in the binding/attempt/projection writer transaction.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct CliRuntimeTurnTerminalGuard {
+    /// Control guards omit mapping bytes. Ordinary terminal guards retain their
+    /// logical read API; both fence the same durable identity/revision.
     pub binding: CliRuntimeTurnBindingRecord,
     pub attempt: Option<CliRuntimeTurnAttemptRecord>,
     pub segment: Option<CliRuntimeExecutionSegmentRecord>,
     pub execution_owner: Option<(String, u64)>,
     pub turn_status: TurnStatus,
+    mapping_loaded: bool,
 }
+
+impl PartialEq for CliRuntimeTurnTerminalGuard {
+    fn eq(&self, other: &Self) -> bool {
+        cli_runtime_binding::same_binding_version(&self.binding, &other.binding)
+            && self.attempt == other.attempt
+            && self.segment == other.segment
+            && self.execution_owner == other.execution_owner
+            && self.turn_status == other.turn_status
+    }
+}
+impl Eq for CliRuntimeTurnTerminalGuard {}
 
 impl CliRuntimeTurnTerminalGuard {
     pub fn terminal_event_source(&self) -> Option<pioneer_protocol::CliRuntimeBlockedTurnGuard> {
@@ -1115,11 +1129,17 @@ async fn cli_runtime_turn_terminal_snapshot<C: ConnectionTrait>(
     connection: &C,
     turn_id: &str,
 ) -> Result<Option<CliRuntimeTurnTerminalGuard>> {
-    let Some(binding) = cli_runtime_binding::find_turn_binding(connection, turn_id).await? else {
+    let Some(binding) = cli_runtime_binding::find_turn_binding_control(connection, turn_id).await?
+    else {
         return Ok(None);
     };
-    let Some(turn) =
-        turn::find_turn_by_thread_and_id(connection, &binding.thread_id, turn_id).await?
+    let Some(status) = pioneer_entity::turn::Entity::find_by_id(turn_id.to_owned())
+        .select_only()
+        .column(pioneer_entity::turn::Column::Status)
+        .filter(pioneer_entity::turn::Column::ThreadId.eq(&binding.thread_id))
+        .into_tuple::<String>()
+        .one(connection)
+        .await?
     else {
         return Ok(None);
     };
@@ -1137,7 +1157,8 @@ async fn cli_runtime_turn_terminal_snapshot<C: ConnectionTrait>(
         attempt,
         segment,
         execution_owner,
-        turn_status: turn_status_from_db(&turn.status).context("unknown canonical Turn status")?,
+        turn_status: turn_status_from_db(&status).context("unknown canonical Turn status")?,
+        mapping_loaded: false,
     }))
 }
 
@@ -6609,6 +6630,50 @@ impl CrudStore {
         expected: Option<CliRuntimeTurnTerminalGuard>,
         execution_owner_id: &str,
     ) -> Result<Option<CliRuntimeTurnBindingRecord>> {
+        self.set_cli_runtime_turn_native_goal_state_projection(
+            turn_id,
+            status,
+            native_goal_turn_id,
+            observed_at,
+            expected,
+            execution_owner_id,
+            true,
+        )
+        .await
+    }
+
+    /// Control transition: the returned binding omits mapping bytes and read holds.
+    pub async fn set_cli_runtime_turn_native_goal_control_state(
+        &self,
+        turn_id: &str,
+        status: Option<String>,
+        native_goal_turn_id: Option<String>,
+        observed_at: sea_orm::entity::prelude::DateTimeWithTimeZone,
+        expected: Option<CliRuntimeTurnTerminalGuard>,
+        execution_owner_id: &str,
+    ) -> Result<Option<CliRuntimeTurnBindingRecord>> {
+        self.set_cli_runtime_turn_native_goal_state_projection(
+            turn_id,
+            status,
+            native_goal_turn_id,
+            observed_at,
+            expected,
+            execution_owner_id,
+            false,
+        )
+        .await
+    }
+
+    async fn set_cli_runtime_turn_native_goal_state_projection(
+        &self,
+        turn_id: &str,
+        status: Option<String>,
+        native_goal_turn_id: Option<String>,
+        observed_at: sea_orm::entity::prelude::DateTimeWithTimeZone,
+        expected: Option<CliRuntimeTurnTerminalGuard>,
+        execution_owner_id: &str,
+        capture_mapping: bool,
+    ) -> Result<Option<CliRuntimeTurnBindingRecord>> {
         let cli_changes = [
             self.connection.work_signal("gateway.control").changing(),
             self.connection.work_signal("gateway.cli").changing(),
@@ -6639,19 +6704,24 @@ impl CrudStore {
                             return Ok(None);
                         }
                     }
-                    let binding = cli_runtime_binding::set_turn_native_goal_state(
+                    let binding = cli_runtime_binding::set_turn_native_goal_state_projection(
                         &transaction,
                         turn_id.as_str(),
                         status.clone(),
                         native_goal_turn_id.clone(),
                         observed_at,
+                        capture_mapping,
                     )
                     .await?;
                     transaction.commit().await?;
                     Ok(Some(binding))
                 })
                 .await?;
-            hydrate_cli_binding_optional(&self.connection, result).await
+            if capture_mapping {
+                hydrate_cli_binding_optional(&self.connection, result).await
+            } else {
+                Ok(result)
+            }
         }
         .await;
         if cli_result.is_ok() {
@@ -6806,6 +6876,37 @@ impl CrudStore {
         .await
     }
 
+    /// Background control projection. `input_mapping_json` is absent, including
+    /// for inline storage; payload holds/decompression are not part of discovery.
+    pub async fn list_active_cli_runtime_turn_binding_control_page_through(
+        &self,
+        status: CliRuntimeActiveTurnBindingStatus,
+        after: Option<&(DateTimeWithTimeZone, String)>,
+        through: &(DateTimeWithTimeZone, String),
+    ) -> Result<Vec<CliRuntimeTurnBindingRecord>> {
+        self.run_scoped_database_quantum(|| async {
+            cli_runtime_binding::list_active_turn_binding_control_page_through(
+                &self.connection,
+                status,
+                after,
+                through,
+            )
+            .await
+        })
+        .await
+    }
+
+    /// Metadata-only counterpart of the ordinary logical binding read.
+    pub async fn get_cli_runtime_turn_binding_control(
+        &self,
+        turn_id: &str,
+    ) -> Result<Option<CliRuntimeTurnBindingRecord>> {
+        self.run_scoped_database_quantum(|| async {
+            cli_runtime_binding::find_turn_binding_control(&self.connection, turn_id).await
+        })
+        .await
+    }
+
     pub async fn list_cli_runtime_turn_bindings(
         &self,
         filter: CliRuntimeTurnBindingListFilter,
@@ -6814,6 +6915,17 @@ impl CrudStore {
             let filter = filter.clone();
             let result = cli_runtime_binding::list_turn_bindings(&self.connection, filter).await?;
             hydrate_cli_binding_list(&self.connection, result).await
+        })
+        .await
+    }
+
+    /// Routing/status discovery without mapping bytes or payload read holds.
+    pub async fn list_cli_runtime_turn_binding_controls(
+        &self,
+        filter: CliRuntimeTurnBindingListFilter,
+    ) -> Result<Vec<CliRuntimeTurnBindingRecord>> {
+        self.run_scoped_database_quantum(|| async {
+            cli_runtime_binding::list_turn_binding_controls(&self.connection, filter.clone()).await
         })
         .await
     }
@@ -6886,6 +6998,24 @@ impl CrudStore {
         .await
     }
 
+    /// Native event ownership needs execution facts, not the provider input.
+    /// Content consumers reload the mapping with its logical version fence.
+    pub async fn resolve_cli_runtime_native_turn_control_owner(
+        &self,
+        runtime_id: &str,
+        native_turn_id: &str,
+    ) -> Result<Option<CliRuntimeNativeTurnOwner>> {
+        self.run_scoped_database_quantum(|| async {
+            cli_runtime_binding::resolve_native_turn_control_owner(
+                &self.connection,
+                runtime_id,
+                native_turn_id,
+            )
+            .await
+        })
+        .await
+    }
+
     pub async fn latest_cli_runtime_execution_segment_for_attempt(
         &self,
         attempt_id: &str,
@@ -6913,6 +7043,50 @@ impl CrudStore {
         CliRuntimeTurnAttemptRecord,
         CliRuntimeExecutionSegmentRecord,
     )> {
+        self.register_cli_runtime_execution_segment_projection(
+            turn_id,
+            native_thread_id,
+            native_turn_id,
+            started_at,
+            true,
+        )
+        .await
+    }
+
+    /// Control transition: the returned binding omits mapping bytes and read holds.
+    pub async fn register_cli_runtime_control_execution_segment(
+        &self,
+        turn_id: &str,
+        native_thread_id: &str,
+        native_turn_id: &str,
+        started_at: sea_orm::entity::prelude::DateTimeWithTimeZone,
+    ) -> Result<(
+        CliRuntimeTurnBindingRecord,
+        CliRuntimeTurnAttemptRecord,
+        CliRuntimeExecutionSegmentRecord,
+    )> {
+        self.register_cli_runtime_execution_segment_projection(
+            turn_id,
+            native_thread_id,
+            native_turn_id,
+            started_at,
+            false,
+        )
+        .await
+    }
+
+    async fn register_cli_runtime_execution_segment_projection(
+        &self,
+        turn_id: &str,
+        native_thread_id: &str,
+        native_turn_id: &str,
+        started_at: sea_orm::entity::prelude::DateTimeWithTimeZone,
+        capture_mapping: bool,
+    ) -> Result<(
+        CliRuntimeTurnBindingRecord,
+        CliRuntimeTurnAttemptRecord,
+        CliRuntimeExecutionSegmentRecord,
+    )> {
         let cli_changes = [
             self.connection.work_signal("gateway.control").changing(),
             self.connection.work_signal("gateway.cli").changing(),
@@ -6934,7 +7108,7 @@ impl CrudStore {
                     .await
                     .context("failed to begin CLI runtime execution segment transaction")?;
                 let binding =
-                    cli_runtime_binding::find_turn_binding(&transaction, turn_id.as_str())
+                    cli_runtime_binding::find_turn_binding_projection(&transaction, turn_id.as_str(), capture_mapping)
                         .await?
                         .context("CLI runtime turn binding is missing for execution segment")?;
                 if binding.status != "running" || binding.native_thread_id != native_thread_id {
@@ -7022,7 +7196,7 @@ impl CrudStore {
             }
         })
         .await?;
-            hydrate_cli_binding_triple(&self.connection, result).await
+            if capture_mapping { hydrate_cli_binding_triple(&self.connection, result).await } else { Ok(result) }
         }
         .await;
         if cli_result.is_ok() {
@@ -7040,6 +7214,58 @@ impl CrudStore {
         status: CliRuntimeExecutionSegmentStatus,
         failure_reason: Option<String>,
         completed_at: sea_orm::entity::prelude::DateTimeWithTimeZone,
+    ) -> Result<
+        Option<(
+            CliRuntimeTurnBindingRecord,
+            CliRuntimeTurnAttemptRecord,
+            CliRuntimeExecutionSegmentRecord,
+        )>,
+    > {
+        self.terminalize_cli_runtime_execution_segment_projection(
+            runtime_id,
+            native_turn_id,
+            status,
+            failure_reason,
+            completed_at,
+            true,
+        )
+        .await
+    }
+
+    /// Control transition: the returned binding omits mapping bytes and read holds.
+    pub async fn terminalize_cli_runtime_control_execution_segment(
+        &self,
+        runtime_id: &str,
+        native_turn_id: &str,
+        status: CliRuntimeExecutionSegmentStatus,
+        failure_reason: Option<String>,
+        completed_at: sea_orm::entity::prelude::DateTimeWithTimeZone,
+    ) -> Result<
+        Option<(
+            CliRuntimeTurnBindingRecord,
+            CliRuntimeTurnAttemptRecord,
+            CliRuntimeExecutionSegmentRecord,
+        )>,
+    > {
+        self.terminalize_cli_runtime_execution_segment_projection(
+            runtime_id,
+            native_turn_id,
+            status,
+            failure_reason,
+            completed_at,
+            false,
+        )
+        .await
+    }
+
+    async fn terminalize_cli_runtime_execution_segment_projection(
+        &self,
+        runtime_id: &str,
+        native_turn_id: &str,
+        status: CliRuntimeExecutionSegmentStatus,
+        failure_reason: Option<String>,
+        completed_at: sea_orm::entity::prelude::DateTimeWithTimeZone,
+        capture_mapping: bool,
     ) -> Result<
         Option<(
             CliRuntimeTurnBindingRecord,
@@ -7071,10 +7297,13 @@ impl CrudStore {
                     transaction.rollback().await.ok();
                     return Ok((None, false));
                 };
-                let binding =
-                    cli_runtime_binding::find_turn_binding(&transaction, segment.turn_id.as_str())
-                        .await?
-                        .context("execution segment turn binding is missing")?;
+                let binding = cli_runtime_binding::find_turn_binding_projection(
+                    &transaction,
+                    segment.turn_id.as_str(),
+                    capture_mapping,
+                )
+                .await?
+                .context("execution segment turn binding is missing")?;
                 let attempt = cli_runtime_binding::find_turn_attempt(
                     &transaction,
                     segment.attempt_id.as_str(),
@@ -7122,7 +7351,11 @@ impl CrudStore {
             }
         }
         let (binding, _) = result?;
-        hydrate_cli_binding_optional_triple(&self.connection, binding).await
+        if capture_mapping {
+            hydrate_cli_binding_optional_triple(&self.connection, binding).await
+        } else {
+            Ok(binding)
+        }
     }
 
     pub async fn mark_cli_runtime_turn_attempt_terminal(
@@ -8057,17 +8290,62 @@ impl CrudStore {
     ) -> Result<Option<CliRuntimeTurnTerminalGuard>> {
         self.run_scoped_database_quantum(|| async {
             let snapshot = self.connection.begin_read().await?;
-            let result = cli_runtime_turn_terminal_snapshot(&snapshot, turn_id).await?;
+            let mut result = cli_runtime_turn_terminal_snapshot(&snapshot, turn_id).await?;
+            // This API promises logical JSON. Capture its full source in the same
+            // read snapshot, then decode only after releasing reader capacity.
+            if let Some(guard) = result.as_mut() {
+                guard.binding = cli_runtime_binding::find_turn_binding(&snapshot, turn_id)
+                    .await?
+                    .context("CLI terminal binding disappeared inside its snapshot")?;
+            }
             snapshot.commit().await?;
             if let Some(mut guard) = result {
                 guard.binding =
                     cli_runtime_binding::hydrate_record(&self.connection, guard.binding).await?;
+                guard.mapping_loaded = true;
                 Ok(Some(guard))
             } else {
                 Ok(None)
             }
         })
         .await
+    }
+
+    /// State/version authority only: mapping JSON is intentionally absent.
+    /// A content/recovery reader must use the ordinary logical binding API.
+    pub async fn cli_runtime_turn_terminal_control_guard_by_id(
+        &self,
+        turn_id: &str,
+    ) -> Result<Option<CliRuntimeTurnTerminalGuard>> {
+        self.run_scoped_database_quantum(|| async {
+            let snapshot = self.connection.begin_read().await?;
+            let result = cli_runtime_turn_terminal_snapshot(&snapshot, turn_id).await?;
+            snapshot.commit().await?;
+            Ok(result)
+        })
+        .await
+    }
+
+    pub async fn cli_runtime_turn_terminal_control_guard(
+        &self,
+        expected: &CliRuntimeTurnBindingRecord,
+    ) -> Result<Option<CliRuntimeTurnTerminalGuard>> {
+        Ok(self
+            .cli_runtime_turn_terminal_control_guard_by_id(&expected.turn_id)
+            .await?
+            .filter(|guard| cli_runtime_binding::same_binding_version(&guard.binding, expected)))
+    }
+
+    /// Reload actual bytes only for a content consumer, keeping the selected
+    /// logical binding identity and version authoritative across the handoff.
+    pub async fn load_cli_runtime_control_mapping(
+        &self,
+        expected: &CliRuntimeTurnBindingRecord,
+    ) -> Result<Option<CliRuntimeTurnBindingRecord>> {
+        Ok(self
+            .get_cli_runtime_turn_binding(&expected.turn_id)
+            .await?
+            .filter(|binding| cli_runtime_binding::same_binding_version(binding, expected)))
     }
 
     /// A previously completed native attempt can still belong to an unfinished
@@ -8078,7 +8356,7 @@ impl CrudStore {
         binding: &CliRuntimeTurnBindingRecord,
     ) -> Result<Option<pioneer_protocol::CliRuntimeBlockedTurnGuard>> {
         Ok(self
-            .cli_runtime_turn_terminal_guard(binding)
+            .cli_runtime_turn_terminal_control_guard(binding)
             .await?
             .as_ref()
             .filter(|snapshot| {
@@ -8100,7 +8378,7 @@ impl CrudStore {
         native_turn_id: &str,
     ) -> Result<Option<pioneer_protocol::CliRuntimeBlockedTurnGuard>> {
         Ok(self
-            .cli_runtime_turn_terminal_guard(binding)
+            .cli_runtime_turn_terminal_control_guard(binding)
             .await?
             .as_ref()
             .and_then(cli_runtime_event_guard_from_snapshot)
@@ -8124,7 +8402,10 @@ impl CrudStore {
     /// A point seek for current physical execution; never a journal/history scan.
     /// Recovery must let an accepted outcome run before replacing that execution.
     pub async fn has_pending_cli_runtime_terminal_event(&self, turn_id: &str) -> Result<bool> {
-        let Some(snapshot) = self.cli_runtime_turn_terminal_guard_by_id(turn_id).await? else {
+        let Some(snapshot) = self
+            .cli_runtime_turn_terminal_control_guard_by_id(turn_id)
+            .await?
+        else {
             return Ok(false);
         };
         let Some(source) = cli_runtime_event_guard_from_snapshot(&snapshot) else {
@@ -8257,6 +8538,7 @@ impl CrudStore {
                 let actual = if let Some(turn) = turn {
                     Some(CliRuntimeTurnTerminalGuard {
                         binding,
+                        mapping_loaded: false,
                         attempt,
                         segment,
                         execution_owner,
@@ -8314,7 +8596,10 @@ impl CrudStore {
         binding: &CliRuntimeTurnBindingRecord,
         native_turn_id: &str,
     ) -> Result<Option<pioneer_protocol::CliRuntimeBlockedTurnGuard>> {
-        let Some(snapshot) = self.cli_runtime_turn_terminal_guard(binding).await? else {
+        let Some(snapshot) = self
+            .cli_runtime_turn_terminal_control_guard(binding)
+            .await?
+        else {
             return Ok(None);
         };
         Ok(
@@ -8437,6 +8722,7 @@ impl CrudStore {
                     turn.and_then(|turn| turn_status_from_db(&turn.status))
                         .map(|turn_status| CliRuntimeTurnTerminalGuard {
                             binding,
+                            mapping_loaded: false,
                             attempt,
                             segment,
                             execution_owner,
@@ -8570,6 +8856,50 @@ impl CrudStore {
         completed_at: sea_orm::entity::prelude::DateTimeWithTimeZone,
         expected: Option<&CliRuntimeTurnTerminalGuard>,
     ) -> Result<Option<CliRuntimeTurnBindingRecord>> {
+        self.terminalize_cli_runtime_turn_binding_guarded_projection(
+            turn_id,
+            binding_status,
+            attempt_status,
+            failure_reason,
+            completed_at,
+            expected,
+            true,
+        )
+        .await
+    }
+
+    /// Control transition: the returned binding omits mapping bytes and read holds.
+    pub async fn terminalize_cli_runtime_turn_control_binding_guarded(
+        &self,
+        turn_id: &str,
+        binding_status: &str,
+        attempt_status: CliRuntimeTurnAttemptStatus,
+        failure_reason: Option<String>,
+        completed_at: sea_orm::entity::prelude::DateTimeWithTimeZone,
+        expected: Option<&CliRuntimeTurnTerminalGuard>,
+    ) -> Result<Option<CliRuntimeTurnBindingRecord>> {
+        self.terminalize_cli_runtime_turn_binding_guarded_projection(
+            turn_id,
+            binding_status,
+            attempt_status,
+            failure_reason,
+            completed_at,
+            expected,
+            false,
+        )
+        .await
+    }
+
+    async fn terminalize_cli_runtime_turn_binding_guarded_projection(
+        &self,
+        turn_id: &str,
+        binding_status: &str,
+        attempt_status: CliRuntimeTurnAttemptStatus,
+        failure_reason: Option<String>,
+        completed_at: sea_orm::entity::prelude::DateTimeWithTimeZone,
+        expected: Option<&CliRuntimeTurnTerminalGuard>,
+        capture_mapping: bool,
+    ) -> Result<Option<CliRuntimeTurnBindingRecord>> {
         let changes = [
             "gateway.control",
             "gateway.cli",
@@ -8591,10 +8921,11 @@ impl CrudStore {
             {
                 bail!("terminal binding projection does not match its canonical Turn decision");
             }
-            // Preserve the original mapping comparison outside writer capacity.
-            // A logical update after preflight increments the revision checked in
-            // the transaction; physical compression leaves that revision intact.
-            if let Some(expected) = expected {
+            // Logical guards preserve their byte comparison outside writer capacity.
+            // Control guards use only the durable identity/revision, revalidated
+            // with all execution facts in the writer below. Logical updates
+            // increment that revision; physical compression leaves it intact.
+            if let Some(expected) = expected.filter(|guard| guard.mapping_loaded) {
                 let Some(current) = self.get_cli_runtime_turn_binding(turn_id).await? else {
                     return Ok((None, false, false));
                 };
@@ -8612,8 +8943,12 @@ impl CrudStore {
                     .begin()
                     .await
                     .context("failed to begin CLI runtime terminal binding transaction")?;
-                let Some(binding) =
-                    cli_runtime_binding::find_turn_binding(&transaction, turn_id.as_str()).await?
+                let Some(binding) = cli_runtime_binding::find_turn_binding_projection(
+                    &transaction,
+                    turn_id.as_str(),
+                    capture_mapping,
+                )
+                .await?
                 else {
                     transaction.rollback().await.ok();
                     return Ok((None, false, false));
@@ -8676,7 +9011,7 @@ impl CrudStore {
                 }
                 let task_changed = attempt_changed || binding.status != binding_status;
                 let changed = task_changed || binding.updated_at != completed_at;
-                let stored_binding = cli_runtime_binding::update_turn_control(
+                let stored_binding = cli_runtime_binding::update_turn_control_projection(
                     &transaction,
                     NewCliRuntimeTurnBinding {
                         turn_id: binding.turn_id,
@@ -8697,6 +9032,7 @@ impl CrudStore {
                         created_at: binding.created_at,
                         updated_at: completed_at,
                     },
+                    capture_mapping,
                 )
                 .await?;
                 self.project_cli_runtime_turn_binding_state(
@@ -8721,7 +9057,11 @@ impl CrudStore {
             task_change.completed(*task_changed);
         }
         let (binding, _, _) = result?;
-        hydrate_cli_binding_optional(&self.connection, binding).await
+        if capture_mapping {
+            hydrate_cli_binding_optional(&self.connection, binding).await
+        } else {
+            Ok(binding)
+        }
     }
 
     pub async fn create_cli_runtime_pending_request(
@@ -29631,7 +29971,7 @@ impl CrudStore {
             return Ok(None);
         };
         let source = self
-            .cli_runtime_turn_terminal_guard_by_id(&job.turn_id)
+            .cli_runtime_turn_terminal_control_guard_by_id(&job.turn_id)
             .await?
             .and_then(|snapshot| snapshot.terminal_event_source());
         Ok(source.map(|mut source| {

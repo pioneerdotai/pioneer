@@ -516,73 +516,184 @@ async fn commit_guard(
         .await
 }
 
+async fn commit_control_guard(
+    store: &CrudStore,
+    guard: &crate::CliRuntimeTurnTerminalGuard,
+) -> anyhow::Result<Option<crate::CliRuntimeTurnBindingRecord>> {
+    store
+        .terminalize_cli_runtime_turn_control_binding_guarded(
+            &guard.binding.turn_id,
+            "blocked",
+            CliRuntimeTurnAttemptStatus::Interrupted,
+            Some("old decision".into()),
+            unix_to_datetime(1_700_000_000),
+            Some(guard),
+        )
+        .await
+}
+
 #[tokio::test]
 async fn cli_terminal_guard_rejects_starting_activation_terminal_and_canonical_resume() {
-    for change in ["running", "terminal", "resume"] {
-        let (store, guard) = terminal_guard_fixture().await;
-        match change {
-            "running" => {
-                store
-                    .activate_cli_runtime_turn_attempt(
-                        &guard.binding.turn_id,
-                        &guard.attempt.as_ref().unwrap().id,
-                        "native_running",
-                        None,
-                        guard.binding.updated_at,
-                    )
-                    .await
-                    .unwrap();
-            }
-            "terminal" => {
-                store
-                    .terminalize_cli_runtime_turn_binding(
-                        &guard.binding.turn_id,
-                        "completed",
-                        CliRuntimeTurnAttemptStatus::Completed,
-                        None,
-                        guard.binding.updated_at,
-                    )
-                    .await
-                    .unwrap();
-            }
-            "resume" => {
-                store
-                    .update_turn_status(
-                        &guard.binding.thread_id,
-                        &guard.binding.turn_id,
-                        TurnStatus::InProgress,
-                        None,
-                        1_700_000_000,
-                    )
-                    .await
-                    .unwrap();
-            }
-            _ => unreachable!(),
-        }
-        let current = store
-            .get_cli_runtime_turn_binding(&guard.binding.turn_id)
-            .await
-            .unwrap();
-        let attempt = store
-            .latest_cli_runtime_turn_attempt(&guard.binding.turn_id)
-            .await
-            .unwrap();
-        assert!(commit_guard(&store, &guard).await.unwrap().is_none());
-        assert_eq!(
+    for control_only in [false, true] {
+        for change in ["running", "terminal", "resume"] {
+            let (store, logical_guard) = terminal_guard_fixture().await;
             store
+                .database_connection()
+                .execute_unprepared("PRAGMA foreign_keys=OFF")
+                .await
+                .unwrap();
+            let guard = if control_only {
+                store
+                    .cli_runtime_turn_terminal_control_guard(&logical_guard.binding)
+                    .await
+                    .unwrap()
+                    .unwrap()
+            } else {
+                logical_guard
+            };
+            match change {
+                "running" => {
+                    store
+                        .activate_cli_runtime_turn_attempt(
+                            &guard.binding.turn_id,
+                            &guard.attempt.as_ref().unwrap().id,
+                            "native_running",
+                            None,
+                            guard.binding.updated_at,
+                        )
+                        .await
+                        .unwrap();
+                }
+                "terminal" => {
+                    store
+                        .terminalize_cli_runtime_turn_binding(
+                            &guard.binding.turn_id,
+                            "completed",
+                            CliRuntimeTurnAttemptStatus::Completed,
+                            None,
+                            guard.binding.updated_at,
+                        )
+                        .await
+                        .unwrap();
+                }
+                "resume" => {
+                    store
+                        .update_turn_status(
+                            &guard.binding.thread_id,
+                            &guard.binding.turn_id,
+                            TurnStatus::InProgress,
+                            None,
+                            1_700_000_000,
+                        )
+                        .await
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let current = store
                 .get_cli_runtime_turn_binding(&guard.binding.turn_id)
                 .await
-                .unwrap(),
-            current
-        );
-        assert_eq!(
-            store
+                .unwrap();
+            let attempt = store
                 .latest_cli_runtime_turn_attempt(&guard.binding.turn_id)
                 .await
-                .unwrap(),
-            attempt
-        );
+                .unwrap();
+            let committed = if control_only {
+                commit_control_guard(&store, &guard).await.unwrap()
+            } else {
+                commit_guard(&store, &guard).await.unwrap()
+            };
+            assert!(committed.is_none());
+            assert_eq!(
+                store
+                    .get_cli_runtime_turn_binding(&guard.binding.turn_id)
+                    .await
+                    .unwrap(),
+                current
+            );
+            assert_eq!(
+                store
+                    .latest_cli_runtime_turn_attempt(&guard.binding.turn_id)
+                    .await
+                    .unwrap(),
+                attempt
+            );
+        }
     }
+}
+
+#[tokio::test]
+async fn cli_control_terminal_guard_fences_mapping_replacement_at_same_timestamp() {
+    let (store, logical_guard) = terminal_guard_fixture().await;
+    store
+        .database_connection()
+        .execute_unprepared("PRAGMA foreign_keys=OFF")
+        .await
+        .unwrap();
+    let selected = store
+        .cli_runtime_turn_terminal_control_guard(&logical_guard.binding)
+        .await
+        .unwrap()
+        .unwrap();
+    let replacement = r#"{"sent":"replacement context"}"#;
+    binding::Entity::update_many()
+        .col_expr(binding::Column::InputMappingJson, Expr::value(replacement))
+        .filter(binding::Column::TurnId.eq(&selected.binding.turn_id))
+        .exec(&store.database_connection())
+        .await
+        .unwrap();
+    let current = store
+        .cli_runtime_turn_terminal_control_guard_by_id(&selected.binding.turn_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.binding.updated_at, selected.binding.updated_at);
+    assert_ne!(current, selected);
+    assert!(
+        store
+            .cli_runtime_turn_terminal_control_guard(&selected.binding)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        commit_control_guard(&store, &selected)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        store
+            .latest_cli_runtime_turn_attempt(&selected.binding.turn_id)
+            .await
+            .unwrap(),
+        selected.attempt
+    );
+    let committed = commit_control_guard(&store, &current)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(committed.input_mapping_json.is_empty());
+    assert!(committed.input_mapping_read_hold.is_none());
+    assert_eq!(
+        store
+            .get_cli_runtime_turn_binding(&selected.binding.turn_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .input_mapping_json,
+        replacement
+    );
+    assert_eq!(committed.status, "blocked");
+    assert_eq!(
+        store
+            .latest_cli_runtime_turn_attempt(&selected.binding.turn_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        CliRuntimeTurnAttemptStatus::Interrupted
+    );
 }
 
 #[tokio::test]

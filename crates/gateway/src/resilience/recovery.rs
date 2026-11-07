@@ -2096,7 +2096,7 @@ impl RecoveryCoordinator {
             .is_some();
         let has_cli_binding = self
             .crud_store
-            .get_cli_runtime_turn_binding(execution.turn_id.as_str())
+            .get_cli_runtime_turn_binding_control(execution.turn_id.as_str())
             .await?
             .is_some();
         let recoverable = match execution.executor_kind {
@@ -2748,7 +2748,7 @@ impl RecoveryCoordinator {
         if job.action == RecoveryAction::RehydrateTurnState {
             let Some(binding) = self
                 .crud_store
-                .get_cli_runtime_turn_binding(job.turn_id.as_str())
+                .get_cli_runtime_turn_binding_control(job.turn_id.as_str())
                 .await?
             else {
                 let reason =
@@ -2853,7 +2853,7 @@ impl RecoveryCoordinator {
 
         let cli_runtime_binding = if job.action == RecoveryAction::RestartTurn {
             self.crud_store
-                .get_cli_runtime_turn_binding(job.turn_id.as_str())
+                .get_cli_runtime_turn_binding_control(job.turn_id.as_str())
                 .await?
         } else {
             None
@@ -4071,7 +4071,7 @@ impl RecoveryCoordinator {
                     .is_some()
                     || self
                         .crud_store
-                        .get_cli_runtime_turn_binding(turn_id)
+                        .get_cli_runtime_turn_binding_control(turn_id)
                         .await?
                         .is_some();
                 has_cli_execution.then_some(1)
@@ -4198,7 +4198,7 @@ impl RecoveryCoordinator {
                 .is_some()
                 || self
                     .crud_store
-                    .get_cli_runtime_turn_binding(turn_id)
+                    .get_cli_runtime_turn_binding_control(turn_id)
                     .await?
                     .is_some();
             if has_cli_execution
@@ -4249,7 +4249,7 @@ impl RecoveryCoordinator {
             let snapshot = self.crud_store.get_turn_runtime_snapshot(turn_id).await?;
             let binding = self
                 .crud_store
-                .get_cli_runtime_turn_binding(turn_id)
+                .get_cli_runtime_turn_binding_control(turn_id)
                 .await?;
             let input = snapshot
                 .as_ref()
@@ -4309,7 +4309,7 @@ impl RecoveryCoordinator {
             && candidate.item_type == TurnItemType::CommandExecution
             && let Some(binding) = self
                 .crud_store
-                .get_cli_runtime_turn_binding(candidate.turn_id.as_str())
+                .get_cli_runtime_turn_binding_control(candidate.turn_id.as_str())
                 .await?
             && matches!(
                 binding.status.as_str(),

@@ -2311,7 +2311,7 @@ impl MessageProcessor {
             };
             if !self
                 .crud_store
-                .get_cli_runtime_turn_binding(child_turn)
+                .get_cli_runtime_turn_binding_control(child_turn)
                 .await?
                 .is_some_and(|binding| {
                     binding.runtime_kind == "codex"

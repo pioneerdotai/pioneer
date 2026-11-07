@@ -4256,7 +4256,7 @@ impl TaskAgentExecutor {
                 let child_turn_id = child_runtime.task_run_turn.turn_id.as_str();
                 if let Some(binding) = processor
                     .crud_store
-                    .get_cli_runtime_turn_binding(child_turn_id)
+                    .get_cli_runtime_turn_binding_control(child_turn_id)
                     .await?
                 {
                     let parent = resolve_parent_context(processor, &task_response.task).await?;
@@ -5881,7 +5881,7 @@ impl TaskAgentExecutor {
                     .context("reviewer task continuation authorization is no longer active")?;
                     let cli_binding = processor
                         .crud_store
-                        .get_cli_runtime_turn_binding(task_run_turn.turn_id.as_str())
+                        .get_cli_runtime_turn_binding_control(task_run_turn.turn_id.as_str())
                         .await?;
                     match (turn_settings.cli_runtime.as_ref(), cli_binding.as_ref()) {
                         (Some((runtime_id, runtime_kind)), Some(binding))

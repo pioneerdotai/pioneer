@@ -869,9 +869,25 @@ async fn portable_cli_mapping_preserves_sent_bytes_control_updates_and_upsert() 
         updated_at: at,
     };
     store
-        .upsert_cli_runtime_turn_binding(binding.clone())
+        .update_turn_status(
+            "thread",
+            "turn",
+            pioneer_protocol::TurnStatus::InProgress,
+            None,
+            at.timestamp(),
+        )
         .await
         .unwrap();
+    store
+        .prepare_cli_runtime_initial_turn_attempt(binding.clone(), "mapping-attempt".into(), 1)
+        .await
+        .unwrap();
+    store
+        .activate_cli_runtime_turn_attempt("turn", "mapping-attempt", "native-control-1", None, at)
+        .await
+        .unwrap();
+    binding.status = "running".into();
+    binding.native_turn_id = Some("native-control-1".into());
     let mut progress = pioneer_crud::PortablePayloadProgress::default();
     let mut staged = false;
     for _ in 0..100 {
@@ -891,9 +907,26 @@ async fn portable_cli_mapping_preserves_sent_bytes_control_updates_and_upsert() 
         .upsert_cli_runtime_turn_binding(binding.clone())
         .await
         .unwrap();
+    let inline_guard = store
+        .cli_runtime_turn_terminal_control_guard_by_id("turn")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(inline_guard.binding.input_mapping_json.is_empty());
+    assert!(inline_guard.binding.input_mapping_read_hold.is_none());
+    assert!(inline_guard.binding.input_mapping_payload_id.is_none());
     for _ in 0..180 {
         progress.quantum(&store).await.unwrap();
     }
+    assert_eq!(
+        store
+            .cli_runtime_turn_terminal_control_guard_by_id("turn")
+            .await
+            .unwrap()
+            .unwrap(),
+        inline_guard,
+        "physical compression must preserve a control decision"
+    );
     assert_eq!(scalar(&store,"SELECT count(*) n FROM turn_cli_runtime_binding WHERE input_mapping_json_payload_id IS NOT NULL AND octet_length(input_mapping_json)<256").await,1);
     assert_eq!(
         store
@@ -913,6 +946,166 @@ async fn portable_cli_mapping_preserves_sent_bytes_control_updates_and_upsert() 
         original
     );
     assert_eq!(scalar(&store,"SELECT coalesce(json_extract(input_mapping_json,'$.pioneerContextBasis.historyJson'),'[]')<>'[]' n FROM turn_cli_runtime_binding WHERE turn_id='turn'").await,1);
+    let compressed_guard = store
+        .cli_runtime_turn_terminal_control_guard_by_id("turn")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(compressed_guard.binding.input_mapping_payload_id.is_some());
+    // Damage the actual persisted body: a control probe must still succeed,
+    // while a consumer of sent context must report the missing content.
+    store.database_connection().execute_unprepared(
+        "DELETE FROM portable_payload_block WHERE payload_id=(SELECT input_mapping_json_payload_id FROM turn_cli_runtime_binding WHERE turn_id='turn')"
+    ).await.unwrap();
+    let metadata = store
+        .get_cli_runtime_turn_binding_control("turn")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(metadata.input_mapping_json.is_empty());
+    assert!(metadata.input_mapping_read_hold.is_none());
+    let frontier = store
+        .active_cli_runtime_turn_binding_frontier(
+            pioneer_crud::CliRuntimeActiveTurnBindingStatus::Running,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let page = store
+        .list_active_cli_runtime_turn_binding_control_page_through(
+            pioneer_crud::CliRuntimeActiveTurnBindingStatus::Running,
+            None,
+            &frontier,
+        )
+        .await
+        .unwrap();
+    assert_eq!(page.len(), 1);
+    assert_eq!(page[0], metadata);
+    assert!(page[0].input_mapping_read_hold.is_none());
+    assert_eq!(
+        store
+            .cli_runtime_turn_terminal_control_guard(&metadata)
+            .await
+            .unwrap()
+            .unwrap(),
+        compressed_guard
+    );
+    assert!(store.get_cli_runtime_turn_binding("turn").await.is_err());
+    assert!(
+        store
+            .cli_runtime_turn_terminal_guard_by_id("turn")
+            .await
+            .is_err()
+    );
+    assert!(
+        store
+            .load_cli_runtime_control_mapping(&metadata)
+            .await
+            .is_err()
+    );
+    let owner = store
+        .resolve_cli_runtime_native_turn_control_owner("codex", "native-control-1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(owner.attempt.id, "mapping-attempt");
+    assert_eq!(owner.binding, metadata);
+    assert!(owner.binding.input_mapping_read_hold.is_none());
+    assert!(
+        store
+            .resolve_cli_runtime_native_turn_owner("codex", "native-control-1")
+            .await
+            .is_err()
+    );
+    let terminal_segment = store
+        .terminalize_cli_runtime_control_execution_segment(
+            "codex",
+            "native-control-1",
+            pioneer_crud::CliRuntimeExecutionSegmentStatus::Completed,
+            None,
+            at,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(terminal_segment.0.input_mapping_json.is_empty());
+    assert!(terminal_segment.0.input_mapping_read_hold.is_none());
+    assert_eq!(
+        terminal_segment.2.status,
+        pioneer_crud::CliRuntimeExecutionSegmentStatus::Completed
+    );
+    let next_segment = store
+        .register_cli_runtime_control_execution_segment("turn", "native", "native-control-2", at)
+        .await
+        .unwrap();
+    assert!(next_segment.0.input_mapping_json.is_empty());
+    assert!(next_segment.0.input_mapping_read_hold.is_none());
+    assert_eq!(
+        next_segment.2.segment_index,
+        terminal_segment.2.segment_index + 1
+    );
+    let selected = store
+        .cli_runtime_turn_terminal_control_guard_by_id("turn")
+        .await
+        .unwrap()
+        .unwrap();
+    let goal = store
+        .set_cli_runtime_turn_native_goal_control_state(
+            "turn",
+            Some("active".into()),
+            Some("native-control-2".into()),
+            at,
+            Some(selected),
+            "fixture-owner",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(goal.native_goal_status.as_deref(), Some("active"));
+    assert!(goal.input_mapping_json.is_empty());
+    assert!(goal.input_mapping_read_hold.is_none());
+    let selected = store
+        .cli_runtime_turn_terminal_control_guard_by_id("turn")
+        .await
+        .unwrap()
+        .unwrap();
+    let cleared = store
+        .set_cli_runtime_turn_native_goal_control_state(
+            "turn",
+            None,
+            None,
+            at,
+            Some(selected),
+            "fixture-owner",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(cleared.native_goal_status, None);
+    assert!(cleared.input_mapping_json.is_empty());
+    let metadata = store
+        .get_cli_runtime_turn_binding_control("turn")
+        .await
+        .unwrap()
+        .unwrap();
+    let listed = store
+        .list_cli_runtime_turn_binding_controls(pioneer_crud::CliRuntimeTurnBindingListFilter {
+            workspace_id: Some("ws".into()),
+            runtime_id: Some("codex".into()),
+            statuses: vec!["running".into()],
+            limit: Some(1),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(listed, vec![metadata.clone()]);
+    assert!(listed[0].input_mapping_read_hold.is_none());
+    assert!(
+        store
+            .load_cli_runtime_control_mapping(&metadata)
+            .await
+            .is_err()
+    );
     binding.input_mapping_json =
         r#"{ "pioneerContextBasis": {"historyJson":"[]","executionThreadId":"thread","pendingTurn":{"turnId":"turn","messageRevision":0,"messageDeleted":false}}, "input":"replacement" }"#.into();
     let replacement = binding.input_mapping_json.clone();
@@ -923,6 +1116,20 @@ async fn portable_cli_mapping_preserves_sent_bytes_control_updates_and_upsert() 
             .unwrap()
             .input_mapping_json,
         replacement
+    );
+    assert!(
+        store
+            .cli_runtime_turn_terminal_control_guard(&metadata)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .load_cli_runtime_control_mapping(&metadata)
+            .await
+            .unwrap()
+            .is_none()
     );
     for _ in 0..100 {
         progress.quantum(&store).await.unwrap();

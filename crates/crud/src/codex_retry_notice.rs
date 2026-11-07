@@ -38,7 +38,10 @@ impl CrudStore {
         if child.access_class != "internal" || child.sidebar_visibility != "hidden" {
             return Ok(None);
         }
-        let Some(binding) = self.get_cli_runtime_turn_binding(source_turn_id).await? else {
+        let Some(binding) = self
+            .get_cli_runtime_turn_binding_control(source_turn_id)
+            .await?
+        else {
             return Ok(None);
         };
         if binding.thread_id != source_thread_id

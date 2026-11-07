@@ -3864,7 +3864,7 @@ impl MessageProcessor {
         for attempt in attempts {
             let binding = match self
                 .crud_store
-                .get_cli_runtime_turn_binding(attempt.turn_id.as_str())
+                .get_cli_runtime_turn_binding_control(attempt.turn_id.as_str())
                 .await
             {
                 Ok(Some(binding)) => binding,
@@ -3943,7 +3943,7 @@ impl MessageProcessor {
             };
             let owner = match self
                 .crud_store
-                .resolve_cli_runtime_native_turn_owner(
+                .resolve_cli_runtime_native_turn_control_owner(
                     binding.runtime_id.as_str(),
                     native_turn_id.as_str(),
                 )
@@ -4014,7 +4014,7 @@ impl MessageProcessor {
             let key = item.key.clone();
             let owner = match self
                 .crud_store
-                .resolve_cli_runtime_native_turn_owner(
+                .resolve_cli_runtime_native_turn_control_owner(
                     key.runtime_id.as_str(),
                     item.native_turn_id(),
                 )
