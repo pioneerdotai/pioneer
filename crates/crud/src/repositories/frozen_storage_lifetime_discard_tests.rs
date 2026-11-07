@@ -38,6 +38,60 @@ async fn ready(store: &CrudStore) {
     );
 }
 
+#[tokio::test]
+async fn cached_read_shapes_rebind_ranges_and_do_not_cache_eligibility() {
+    let (eligible, _) = fixture(false).await;
+    ready(&eligible).await;
+    let (unexpired, _) = fixture(false).await;
+    let eligible = eligible.with_maintenance_access();
+    let unexpired = unexpired.with_maintenance_access();
+
+    assert!(discard_preflight(&eligible, "cp-1").await.unwrap());
+    assert!(!discard_preflight(&eligible, "missing").await.unwrap());
+    assert!(!discard_preflight(&unexpired, "cp-1").await.unwrap());
+    assert!(discard_preflight(&eligible, "cp-1").await.unwrap());
+
+    let tail = read_queries::discard_page(&eligible, "cp-0", "cp-1")
+        .await
+        .unwrap();
+    assert_eq!(tail, VecDeque::from([(Some("cp-1".into()), true)]));
+    assert!(
+        read_queries::discard_page(&eligible, "cp-1", "cp-1")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let head = read_queries::discard_page(&eligible, "", "cp-0")
+        .await
+        .unwrap();
+    assert_eq!(
+        head.into_iter()
+            .map(|(id, _)| id.unwrap())
+            .collect::<Vec<_>>(),
+        ["cp-0"]
+    );
+
+    let headers = read_queries::expiry_page(&unexpired, "origim", "origin")
+        .await
+        .unwrap();
+    assert_eq!(
+        headers.into_iter().map(|h| h.header.id).collect::<Vec<_>>(),
+        ["origin"]
+    );
+    assert!(
+        read_queries::expiry_page(&eligible, "origim", "origin")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        read_queries::expiry_page(&unexpired, "origin", "origin")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
 // Reuse the original terminal runner and staged input, with an independent,
 // unsealed operation/binding so ordinary schema guards allow rebinding it.
 async fn later_candidate(store: &CrudStore) {

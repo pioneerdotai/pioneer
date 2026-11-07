@@ -30,6 +30,9 @@ impl Routes {
         self.writes.lock().unwrap().clear();
     }
     fn assert_reads(&self, outcome: SqliteReadOutcome, count: usize) {
+        self.assert_read_outcomes(&vec![outcome; count]);
+    }
+    fn assert_read_outcomes(&self, outcomes: &[SqliteReadOutcome]) {
         let reads = self.reads.lock().unwrap();
         let operations: Vec<_> = reads
             .iter()
@@ -42,7 +45,10 @@ impl Routes {
             .collect();
         assert_eq!(
             operations,
-            vec![(SqliteReadClass::Maintenance, outcome); count]
+            outcomes
+                .iter()
+                .map(|outcome| (SqliteReadClass::Maintenance, *outcome))
+                .collect::<Vec<_>>()
         );
         assert!(reads.iter().any(|event| matches!(
             event,
@@ -242,6 +248,14 @@ async fn direct_roots_and_task_release_set_match_final_guard_without_preparation
         assert_eq!(accounting.held, u64::from(held));
         assert_eq!(accounting.expired + accounting.refused, 0);
         routes.assert_reads(SqliteReadOutcome::Ok, 1);
+        let page = read_queries::expiry_page(&store.with_maintenance_access(), "", "origin")
+            .await
+            .unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(
+            page[0].held, held,
+            "paged admission: kind={kind}, status={status}, missing={missing}"
+        );
         // Independently execute the unchanged final writer guard. Terminal
         // Tasks release an otherwise unreferenced, mature empty history.
         assert_eq!(
@@ -254,11 +268,23 @@ async fn direct_roots_and_task_release_set_match_final_guard_without_preparation
 }
 
 #[tokio::test]
-async fn negative_preflight_runs_once_and_final_writer_observes_late_root() {
+async fn negative_page_admission_keeps_final_writer_check_for_late_roots() {
     for late_root in [false, true] {
         let (_directory, store, routes, descriptor) = observed_fixture().await;
         let store = store.with_maintenance_access();
-        let mut preparation = prepared_expiry(&store).await;
+        let mut progress = FrozenStorageLifetimeProgress::default();
+        assert!(progress.expiry_quantum(&store).await.unwrap());
+        for _ in 0..64 {
+            let preparation = progress.expiry.as_ref().unwrap();
+            if preparation.layout_kind == 2
+                && preparation.operations_done
+                && preparation.checkpoints_done
+            {
+                break;
+            }
+            progress.expiry_quantum(&store).await.unwrap();
+        }
+        let mut preparation = progress.expiry.take().unwrap();
         assert!(preparation.roots_checked);
         assert_eq!(preparation.layout_kind, 2);
         assert!(preparation.operations_done && preparation.checkpoints_done);
@@ -329,23 +355,13 @@ async fn positive_visit_keeps_cursor_accounting_and_periodic_revisit_after_root_
     progress.phase = 2;
     routes.clear();
     assert!(progress.quantum(&store).await.unwrap());
-    // Discovery captures the finite frontier and then the lightweight header;
-    // the next quantum still owns the independent root/hold preflight.
+    // Discovery and root admission share a page. A hold needs no individual
+    // preparation or a later root-query quantum.
     routes.assert_reads(SqliteReadOutcome::Ok, 2);
-    assert_eq!(
-        progress.expiry.as_ref().unwrap().header.id,
-        descriptor.manifest_id
-    );
-    assert!(!progress.expiry.as_ref().unwrap().roots_checked);
-    assert_eq!(progress.expiry_after, "origin");
-    routes.clear();
-    progress.phase = 2;
-    assert!(progress.quantum(&store).await.unwrap());
-    assert!(progress.expiry.is_none() && !progress.pass_done[2]);
+    assert!(progress.expiry.is_none());
     assert_eq!(progress.expiry_after, "origin");
     assert_eq!(progress.accounting.held, 1);
     assert_eq!(progress.accounting.expired, 0);
-    routes.assert_reads(SqliteReadOutcome::Ok, 1);
     progress.phase = 2;
     assert!(progress.quantum(&store).await.unwrap());
     assert!(progress.pass_done[2] && progress.expiry_after.is_empty());
@@ -363,7 +379,7 @@ async fn positive_visit_keeps_cursor_accounting_and_periodic_revisit_after_root_
     assert!(!progress.pass_done[2]);
     progress.phase = 2;
     assert!(progress.quantum(&store).await.unwrap());
-    assert!(!progress.expiry.as_ref().unwrap().roots_checked);
+    assert!(progress.expiry.as_ref().unwrap().roots_checked);
     for _ in 0..64 {
         if progress.expiry.is_none() {
             break;
@@ -388,11 +404,10 @@ async fn positive_visit_keeps_cursor_accounting_and_periodic_revisit_after_root_
 }
 
 #[tokio::test]
-async fn preflight_db_error_preserves_visit_and_retries_before_preparation() {
+async fn page_root_error_preserves_cursor_and_retries_before_preparation() {
     let (_directory, store, routes, descriptor) = observed_fixture().await;
     let mut progress = FrozenStorageLifetimeProgress::default();
     progress.scope.done = true;
-    assert!(progress.expiry_quantum(&store).await.unwrap());
     store
         .connection
         .execute_unprepared("ALTER TABLE compaction_task_output RENAME TO unavailable_output")
@@ -402,17 +417,14 @@ async fn preflight_db_error_preserves_visit_and_retries_before_preparation() {
     progress.phase = 2;
     let error = progress.quantum(&store).await.unwrap_err();
     assert!(error.downcast_ref::<sea_orm::DbErr>().is_some());
-    assert_eq!(progress.expiry_after, "origin");
+    assert!(progress.expiry_after.is_empty());
     assert!(!progress.pass_done[2]);
-    let retry = progress.expiry.as_ref().unwrap();
-    assert_eq!(retry.header.id, "origin");
-    assert!(!retry.roots_checked);
-    assert_unprepared(retry);
+    assert!(progress.expiry.is_none() && progress.expiry_pending.is_empty());
     assert_eq!(
         progress.accounting.held + progress.accounting.expired + progress.accounting.refused,
         0
     );
-    routes.assert_reads(SqliteReadOutcome::Error, 1);
+    routes.assert_read_outcomes(&[SqliteReadOutcome::Ok, SqliteReadOutcome::Error]);
     store
         .connection
         .execute_unprepared("ALTER TABLE unavailable_output RENAME TO compaction_task_output")
@@ -430,7 +442,7 @@ async fn preflight_db_error_preserves_visit_and_retries_before_preparation() {
 }
 
 #[tokio::test]
-async fn cancelled_preflight_wait_preserves_attempt_and_restart_releases_capacity() {
+async fn cancelled_paged_preparation_preserves_attempt_and_restart_releases_capacity() {
     let (_directory, store, routes, _descriptor) = observed_fixture().await;
     let mut progress = FrozenStorageLifetimeProgress::default();
     progress.scope.done = true;
@@ -442,7 +454,7 @@ async fn cancelled_preflight_wait_preserves_attempt_and_restart_releases_capacit
     let mut pending = Box::pin(progress.quantum(&store));
     tokio::time::timeout(Duration::from_secs(2), async {
         tokio::select! {
-            result = &mut pending => panic!("preflight should wait: {result:?}"),
+            result = &mut pending => panic!("preparation should wait: {result:?}"),
             _ = routes.blocked.notified() => {}
         }
     })
@@ -452,7 +464,7 @@ async fn cancelled_preflight_wait_preserves_attempt_and_restart_releases_capacit
     assert_eq!(progress.expiry_after, "origin");
     assert!(!progress.pass_done[2]);
     let attempt = progress.expiry.as_ref().unwrap();
-    assert!(!attempt.roots_checked);
+    assert!(attempt.roots_checked);
     assert_unprepared(attempt);
     assert_eq!(
         progress.accounting.held + progress.accounting.expired + progress.accounting.refused,
@@ -608,7 +620,7 @@ async fn expiry_prefetched_stale_header_cannot_authorize_expiration() {
 }
 
 #[tokio::test]
-async fn expiry_page16_preserves_each_positive_root_and_uses_no_writer() {
+async fn expiry_pages_skip_holds_without_per_header_work_or_writer() {
     let (_directory, store, routes, _descriptor) = observed_fixture().await;
     let store = store.with_maintenance_access();
     for index in 0..17 {
@@ -632,8 +644,12 @@ async fn expiry_page16_preserves_each_positive_root_and_uses_no_writer() {
         .unwrap();
     routes.clear();
     let mut progress = FrozenStorageLifetimeProgress::default();
-    for _ in 0..34 {
+    for _ in 0..2 {
         assert!(progress.expiry_quantum(&store).await.unwrap());
+        assert!(
+            progress.expiry.is_none(),
+            "held pages must not allocate preparations"
+        );
     }
     assert_eq!(progress.accounting.held, 17);
     assert!(routes.writes.lock().unwrap().is_empty());
@@ -644,8 +660,8 @@ async fn expiry_page16_preserves_each_positive_root_and_uses_no_writer() {
         .iter()
         .filter(|event| matches!(event, SqliteReadEvent::OperationFinished { .. }))
         .count();
-    // One finite frontier, two header pages and seventeen individual root queries.
-    assert_eq!(reads, 20);
+    // One frontier and two pages, including root checks. No per-header query.
+    assert_eq!(reads, 3);
     assert!(!progress.expiry_quantum(&store).await.unwrap());
     assert_eq!(
         history::Entity::find()

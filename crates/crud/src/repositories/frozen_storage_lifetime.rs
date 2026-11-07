@@ -28,6 +28,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[path = "frozen_storage_read_queries.rs"]
+mod read_queries;
+use read_queries::discard_preflight;
+
 const FRAGMENT_BYTES: i64 = 64 * 1024;
 const META_ROWS: u64 = 64;
 // Bound only the added multi-key page, not the legacy TEXT ID domain. A key
@@ -61,7 +65,7 @@ pub struct FrozenStorageLifetimeProgress {
     proof: Option<checkpoint_proofs::GraphPreparation>,
     expiry_after: String,
     expiry_upper: Option<String>,
-    expiry_pending: VecDeque<history::Model>,
+    expiry_pending: VecDeque<read_queries::ExpiryHeader>,
     expiry: Option<ExpiryPreparation>,
     sweep: Option<SweepPreparation>,
     sweep_pending: VecDeque<SweepPreparation>,
@@ -604,17 +608,7 @@ impl ExpiryPreparation {
             // Advisory positive hold only, once per attempt. Release the reader
             // before any preparation; a negative result leaves every final
             // writer guard in place. Ordinary passes revisit released roots.
-            let held = store.connection.query_one_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
-                r#"SELECT 1 WHERE
-EXISTS(SELECT 1 FROM task_run_conversation_snapshot s LEFT JOIN task t ON t.id=s.task_id WHERE s.frozen_manifest_id=?1 AND (t.id IS NULL OR t.status NOT IN ('completed','failed','cancelled')))
-OR EXISTS(SELECT 1 FROM turn_runtime_snapshot s WHERE s.frozen_manifest_id=?1)
-OR EXISTS(SELECT 1 FROM thread_cli_runtime_binding s WHERE s.frozen_manifest_id=?1)
-OR EXISTS(SELECT 1 FROM turn_cli_runtime_binding s WHERE s.frozen_manifest_id=?1)
-OR EXISTS(SELECT 1 FROM compaction_task_output s WHERE s.manifest_id=?1)
-LIMIT 1"#,
-                [self.header.id.clone().into()],
-            )).await?.is_some();
+            let held = read_queries::directly_held(store, &self.header.id).await?;
             self.roots_checked = true;
             if held {
                 accounting.held += 1;
@@ -2187,9 +2181,10 @@ impl FrozenStorageLifetimeProgress {
             }
             return Ok(true);
         }
-        // Only lightweight headers live in this Entity; payloads remain in
-        // separate tables. Prefetch is advisory: ExpiryPreparation and expire
-        // preserve individual root/hold checks and exact writer revalidation.
+        // One bounded metadata page includes direct-root admission. No separate
+        // query/continuation is needed for each retained history. A page's
+        // negative admission is advisory; expire still checks current roots,
+        // reader holds and the exact header in its serialized writer.
         if self.expiry_pending.is_empty() {
             if self.expiry_upper.is_none() {
                 self.expiry_upper = Some(
@@ -2203,28 +2198,37 @@ impl FrozenStorageLifetimeProgress {
                         .unwrap_or_default(),
                 );
             }
-            self.expiry_pending = history::Entity::find()
-                .filter(history::Column::Expired.eq(0))
-                .filter(history::Column::Ready.eq(1))
-                .filter(history::Column::Id.gt(&self.expiry_after))
-                .filter(history::Column::Id.lte(self.expiry_upper.as_deref().unwrap_or_default()))
-                .order_by_asc(history::Column::Id)
-                .limit(16)
-                .all(&store.connection)
-                .await?
-                .into();
+            self.expiry_pending = read_queries::expiry_page(
+                store,
+                &self.expiry_after,
+                self.expiry_upper.as_deref().unwrap_or_default(),
+            )
+            .await?;
+            if self.expiry_pending.is_empty() {
+                // Only an empty physical page is EOF, never a page of holds.
+                self.expiry_after.clear();
+                self.expiry_upper = None;
+                return Ok(false);
+            }
         }
-        let header = self.expiry_pending.pop_front();
-        if let Some(header) = header {
+        while let Some(read_queries::ExpiryHeader { header, held }) =
+            self.expiry_pending.pop_front()
+        {
             self.expiry_after = header.id.clone();
             ensure!(counter_health(&header), "corrupt expiry counters");
-            self.expiry = Some(ExpiryPreparation::new(header));
-            Ok(true)
-        } else {
-            self.expiry_after.clear();
-            self.expiry_upper = None;
-            Ok(false)
+            if held {
+                self.accounting.held += 1;
+                continue;
+            }
+            let mut preparation = ExpiryPreparation::new(header);
+            preparation.roots_checked = true;
+            self.expiry = Some(preparation);
+            return Ok(true);
         }
+        // At most the current 16-row page is skipped in one quantum. Root
+        // changes during a pass remain pending in the existing invalidation
+        // protocol and are rediscovered behind the cursor on the next pass.
+        Ok(true)
     }
     fn invalidate_sweep(&mut self) {
         for round in &mut self.sweep_round {
@@ -2420,38 +2424,12 @@ impl FrozenStorageLifetimeProgress {
                         .unwrap_or_default(),
                 );
             }
-            // Page physical PKs even when every row is ineligible. Keep the
-            // advisory gate in SELECT: filtering by it would let SQLite search
-            // beyond this bounded page to fill it. No runner payload is read.
-            let bounded_key = Expr::cust(format!(
-                "length(CAST(id AS BLOB)) <= {SCOPE_PAGE_KEY_BYTES}"
-            ));
-            let key: SimpleExpr =
-                Expr::case(bounded_key.clone(), Expr::col(checkpoint::Column::Id))
-                    .finally(Expr::val(Option::<String>::None))
-                    .into();
-            let candidate: SimpleExpr = Expr::case(
-                Condition::all()
-                    .add(bounded_key)
-                    .add(discard_candidate_filter()),
-                true,
+            self.discard_pending = read_queries::discard_page(
+                store,
+                &self.discard_after,
+                self.discard_upper.as_deref().unwrap_or_default(),
             )
-            .finally(false)
-            .into();
-            self.discard_pending = checkpoint::Entity::find()
-                .select_only()
-                .column_as(key, "id")
-                .column_as(candidate, "candidate")
-                .filter(checkpoint::Column::Id.gt(&self.discard_after))
-                .filter(
-                    checkpoint::Column::Id.lte(self.discard_upper.as_deref().unwrap_or_default()),
-                )
-                .order_by_asc(checkpoint::Column::Id)
-                .limit(META_ROWS)
-                .into_tuple::<(Option<String>, bool)>()
-                .all(&store.connection)
-                .await?
-                .into();
+            .await?;
         }
         let (id, candidate) = match self.discard_pending.front() {
             Some((Some(id), candidate)) => (Some(id.clone()), *candidate),
@@ -2529,7 +2507,11 @@ fn discard_candidate_filter() -> Condition {
                 Expr::col((operation::Entity, operation::Column::Owner))
                     .eq(Expr::col((checkpoint::Entity, checkpoint::Column::Owner))),
             )
-            .filter(operation::Column::Status.is_in(["failed", "cancelled", "stale"]))
+            .filter(
+                Expr::col((operation::Entity, operation::Column::Status)).is_in(
+                    ["failed", "cancelled", "stale"].map(|status| Expr::Constant(status.into())),
+                ),
+            )
             .filter(Expr::exists(
                 projection::Entity::find()
                     .select_only()
@@ -2545,7 +2527,10 @@ fn discard_candidate_filter() -> Condition {
                             .filter(Expr::col((history::Entity, history::Column::Id)).eq(
                                 Expr::col((projection::Entity, projection::Column::ManifestId)),
                             ))
-                            .filter(history::Column::Expired.eq(1))
+                            .filter(
+                                Expr::col((history::Entity, history::Column::Expired))
+                                    .eq(Expr::Constant(1.into())),
+                            )
                             .into_query(),
                     ))
                     .into_query(),
@@ -2573,42 +2558,21 @@ fn discard_candidate_filter() -> Condition {
         )
         .into_query();
     Condition::all()
-        .add(checkpoint::Column::Status.ne("applied"))
+        .add(
+            Expr::col((checkpoint::Entity, checkpoint::Column::Status))
+                .ne(Expr::Constant("applied".into())),
+        )
         .add(Expr::exists(binding))
         .add(
             Condition::any()
-                .add(checkpoint::Column::ProofVersion.eq(1))
+                .add(
+                    Expr::col((checkpoint::Entity, checkpoint::Column::ProofVersion))
+                        .eq(Expr::Constant(1.into())),
+                )
                 .add(Expr::exists(imports))
                 .add(Expr::exists(aliases))
                 .add(Expr::exists(events)),
         )
-}
-
-// Advisory only: mutable facts are all rechecked by cleanup's serialized writer.
-// Use the same broad incoming-edge predicates as its final guard, including
-// unknown foreign scope/version combinations that must conservatively retain.
-async fn discard_preflight(store: &CrudStore, id: &str) -> Result<bool> {
-    let previous = checkpoint::Entity::find()
-        .select_only()
-        .column(checkpoint::Column::Id)
-        .filter(checkpoint::Column::Previous.eq(id))
-        .into_query();
-    let incoming = coverage::Entity::find()
-        .select_only()
-        .column(coverage::Column::CheckpointId)
-        .filter(coverage::Column::SourceId.eq(id))
-        .filter(coverage::Column::SourceScope.like("checkpoint:%"))
-        .into_query();
-    Ok(checkpoint::Entity::find_by_id(id)
-        .select_only()
-        .column(checkpoint::Column::ProofVersion)
-        .filter(discard_candidate_filter())
-        .filter(Expr::exists(previous).not())
-        .filter(Expr::exists(incoming).not())
-        .into_tuple::<i64>()
-        .one(&store.connection)
-        .await?
-        .is_some())
 }
 
 // Both reads are advisory: cleanup still owns final authorization in its
