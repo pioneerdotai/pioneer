@@ -306,8 +306,7 @@ impl SqliteWriteObserver for Routes {
     }
 }
 
-#[tokio::test]
-async fn cancelled_discovery_or_late_read_releases_maintenance_capacity_for_retry_and_restart() {
+async fn observed_store() -> (tempfile::TempDir, CrudStore, Arc<Routes>) {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("discard.db");
     let mut options = sea_orm::ConnectOptions::new(pioneer_sqlite::sqlite_connection_url(&path));
@@ -342,6 +341,58 @@ async fn cancelled_discovery_or_late_read_releases_maintenance_capacity_for_retr
     )
     .await;
     assert!(store.connection.reader_query_only_enabled().await.unwrap());
+    (directory, store, routes)
+}
+
+#[tokio::test]
+async fn ineligible_checkpoint_pages_have_bounded_database_work() {
+    let (_directory, store, routes) = observed_store().await;
+    let count = META_ROWS * 2 + 1;
+    for n in 0..count {
+        private_key(&store, &format!("a-{n:04}"), (n + 2) as i64, "applied").await;
+    }
+    // No expired origin exists, so every physical key is a metadata refusal.
+    // Even touching runner payload must fail, independently of SQL text/shape.
+    store
+        .connection
+        .execute_unprepared(
+            "ALTER TABLE compaction_runner_state RENAME COLUMN state TO unavailable_state",
+        )
+        .await
+        .unwrap();
+    routes.reads.lock().unwrap().clear();
+    let mut progress = FrozenStorageLifetimeProgress::default();
+    let mut visited = 0_u64;
+    let mut finished = false;
+    for _ in 0..count + 3 {
+        if !progress.discard_quantum(&store).await.unwrap() {
+            finished = true;
+            break;
+        }
+        visited += 1;
+        assert!(progress.discard.is_none());
+    }
+    assert!(finished, "ineligible pages must reach physical EOF");
+    assert_eq!(visited, count + 2);
+    let reads = routes
+        .reads
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|event| matches!(event, SqliteReadEvent::OperationFinished { .. }))
+        .count() as u64;
+    // Allow discovery plus one admission per page and the frontier/EOF reads.
+    // This protects the resource budget, not a particular SQL implementation.
+    let budget = 2 + 2 * visited.div_ceil(META_ROWS);
+    assert!(
+        reads <= budget,
+        "{visited} ineligible keys issued {reads} reads; page budget is {budget}"
+    );
+}
+
+#[tokio::test]
+async fn cancelled_discovery_or_late_read_releases_maintenance_capacity_for_retry_and_restart() {
+    let (_directory, store, routes) = observed_store().await;
     ready(&store).await;
     for stage in ["page", "pending_preflight", "late"] {
         let mut progress = FrozenStorageLifetimeProgress::default();
@@ -507,7 +558,7 @@ async fn sparse_physical_pages_yield_without_false_eof_and_keep_tail_after_clean
             progress
                 .discard_pending
                 .iter()
-                .flatten()
+                .filter_map(|(id, _)| id.as_ref())
                 .map(String::len)
                 .sum::<usize>()
                 <= META_ROWS as usize * SCOPE_PAGE_KEY_BYTES as usize

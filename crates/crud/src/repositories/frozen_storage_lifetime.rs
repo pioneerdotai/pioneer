@@ -72,7 +72,7 @@ pub struct FrozenStorageLifetimeProgress {
     accounting: SweepAccounting,
     discard_after: String,
     discard_upper: Option<String>,
-    discard_pending: VecDeque<Option<String>>,
+    discard_pending: VecDeque<(Option<String>, bool)>,
     discard: Option<DiscardPreparation>,
     pub(super) conversion: Option<super::compaction_frozen_storage::StagedCopyCheck>,
     pub(super) conversion_upper: Option<String>,
@@ -2420,39 +2420,47 @@ impl FrozenStorageLifetimeProgress {
                         .unwrap_or_default(),
                 );
             }
-            // Physical PK seek only: no eligibility predicate/JOIN can make
-            // SQLite search past this page to fill it. Bound actual UTF-8 key
-            // bytes as well as rows, like ScopeDiscovery's metadata pages.
-            let key: SimpleExpr = Expr::case(
-                Expr::cust(format!(
-                    "length(CAST(id AS BLOB)) <= {SCOPE_PAGE_KEY_BYTES}"
-                )),
-                Expr::col(checkpoint::Column::Id),
+            // Page physical PKs even when every row is ineligible. Keep the
+            // advisory gate in SELECT: filtering by it would let SQLite search
+            // beyond this bounded page to fill it. No runner payload is read.
+            let bounded_key = Expr::cust(format!(
+                "length(CAST(id AS BLOB)) <= {SCOPE_PAGE_KEY_BYTES}"
+            ));
+            let key: SimpleExpr =
+                Expr::case(bounded_key.clone(), Expr::col(checkpoint::Column::Id))
+                    .finally(Expr::val(Option::<String>::None))
+                    .into();
+            let candidate: SimpleExpr = Expr::case(
+                Condition::all()
+                    .add(bounded_key)
+                    .add(discard_candidate_filter()),
+                true,
             )
-            .finally(Expr::val(Option::<String>::None))
+            .finally(false)
             .into();
             self.discard_pending = checkpoint::Entity::find()
                 .select_only()
                 .column_as(key, "id")
+                .column_as(candidate, "candidate")
                 .filter(checkpoint::Column::Id.gt(&self.discard_after))
                 .filter(
                     checkpoint::Column::Id.lte(self.discard_upper.as_deref().unwrap_or_default()),
                 )
                 .order_by_asc(checkpoint::Column::Id)
                 .limit(META_ROWS)
-                .into_tuple::<Option<String>>()
+                .into_tuple::<(Option<String>, bool)>()
                 .all(&store.connection)
                 .await?
                 .into();
         }
-        let id = match self.discard_pending.front() {
-            Some(Some(id)) => Some(id.clone()),
-            Some(None) => {
+        let (id, candidate) = match self.discard_pending.front() {
+            Some((Some(id), candidate)) => (Some(id.clone()), *candidate),
+            Some((None, _)) => {
                 // Preserve the legacy TEXT ID domain without retaining a page
                 // of oversized keys. A fresh single seek also handles deletion
                 // of the sentinel row. Never acknowledge its old cached tail.
                 self.discard_pending.clear();
-                checkpoint::Entity::find()
+                let id = checkpoint::Entity::find()
                     .select_only()
                     .column(checkpoint::Column::Id)
                     .filter(checkpoint::Column::Id.gt(&self.discard_after))
@@ -2463,9 +2471,10 @@ impl FrozenStorageLifetimeProgress {
                     .order_by_asc(checkpoint::Column::Id)
                     .into_tuple::<String>()
                     .one(&store.connection)
-                    .await?
+                    .await?;
+                (id, true)
             }
-            None => None,
+            None => (None, false),
         };
         let Some(id) = id else {
             // Only an empty physical seek is EOF. Rejected eligibility on a
@@ -2475,11 +2484,12 @@ impl FrozenStorageLifetimeProgress {
             self.discard_upper = None;
             return Ok(false);
         };
-        // One exact-key eligibility/preflight read, after physical selection.
-        // A failed read acknowledges nothing; a successful refusal advances the
-        // keyset without allocating a reverse traversal or decoding runner JSON.
-        let admitted = discard_preflight(store, &id).await?;
-        if !admitted {
+        // Most keys have no discard work and need no individual SQL/AST at all.
+        // A cached positive is not authority: recheck current incoming edges
+        // and binding before touching runner payload. A negative can become
+        // eligible later; the existing finite-pass invalidation/revisit keeps
+        // that change pending, including keys behind the cursor.
+        if !candidate || !discard_preflight(store, &id).await? {
             self.discard_after = id;
             self.discard_pending.pop_front();
             return Ok(true);
@@ -2495,10 +2505,10 @@ impl FrozenStorageLifetimeProgress {
     }
 }
 
-// Advisory only: mutable facts are all rechecked by cleanup's serialized writer.
-// Use the same broad incoming-edge predicates as its final guard, including
-// unknown foreign scope/version combinations that must conservatively retain.
-async fn discard_preflight(store: &CrudStore, id: &str) -> Result<bool> {
+// Necessary metadata-only conditions, shared by page admission and fresh
+// preflight. Every subquery is correlated to the physical checkpoint's exact
+// keys; no failed-operation or staging-payload inventory is searched per row.
+fn discard_candidate_filter() -> Condition {
     use pioneer_entity::{
         compaction_checkpoint_event_input as event_input, compaction_checkpoint_import as import,
         compaction_checkpoint_replay_alias as replay_alias,
@@ -2541,6 +2551,43 @@ async fn discard_preflight(store: &CrudStore, id: &str) -> Result<bool> {
                     .into_query(),
             ))
             .into_query();
+    let candidate_id = Expr::col((checkpoint::Entity, checkpoint::Column::Id));
+    let imports = import::Entity::find()
+        .select_only()
+        .column(import::Column::CheckpointId)
+        .filter(Expr::col((import::Entity, import::Column::CheckpointId)).eq(candidate_id.clone()))
+        .into_query();
+    let aliases = replay_alias::Entity::find()
+        .select_only()
+        .column(replay_alias::Column::CheckpointId)
+        .filter(
+            Expr::col((replay_alias::Entity, replay_alias::Column::CheckpointId))
+                .eq(candidate_id.clone()),
+        )
+        .into_query();
+    let events = event_input::Entity::find()
+        .select_only()
+        .column(event_input::Column::CheckpointId)
+        .filter(
+            Expr::col((event_input::Entity, event_input::Column::CheckpointId)).eq(candidate_id),
+        )
+        .into_query();
+    Condition::all()
+        .add(checkpoint::Column::Status.ne("applied"))
+        .add(Expr::exists(binding))
+        .add(
+            Condition::any()
+                .add(checkpoint::Column::ProofVersion.eq(1))
+                .add(Expr::exists(imports))
+                .add(Expr::exists(aliases))
+                .add(Expr::exists(events)),
+        )
+}
+
+// Advisory only: mutable facts are all rechecked by cleanup's serialized writer.
+// Use the same broad incoming-edge predicates as its final guard, including
+// unknown foreign scope/version combinations that must conservatively retain.
+async fn discard_preflight(store: &CrudStore, id: &str) -> Result<bool> {
     let previous = checkpoint::Entity::find()
         .select_only()
         .column(checkpoint::Column::Id)
@@ -2552,35 +2599,12 @@ async fn discard_preflight(store: &CrudStore, id: &str) -> Result<bool> {
         .filter(coverage::Column::SourceId.eq(id))
         .filter(coverage::Column::SourceScope.like("checkpoint:%"))
         .into_query();
-    let imports = import::Entity::find()
-        .select_only()
-        .column(import::Column::CheckpointId)
-        .filter(import::Column::CheckpointId.eq(id))
-        .into_query();
-    let aliases = replay_alias::Entity::find()
-        .select_only()
-        .column(replay_alias::Column::CheckpointId)
-        .filter(replay_alias::Column::CheckpointId.eq(id))
-        .into_query();
-    let events = event_input::Entity::find()
-        .select_only()
-        .column(event_input::Column::CheckpointId)
-        .filter(event_input::Column::CheckpointId.eq(id))
-        .into_query();
     Ok(checkpoint::Entity::find_by_id(id)
         .select_only()
         .column(checkpoint::Column::ProofVersion)
-        .filter(checkpoint::Column::Status.ne("applied"))
-        .filter(Expr::exists(binding))
+        .filter(discard_candidate_filter())
         .filter(Expr::exists(previous).not())
         .filter(Expr::exists(incoming).not())
-        .filter(
-            Condition::any()
-                .add(checkpoint::Column::ProofVersion.eq(1))
-                .add(Expr::exists(imports))
-                .add(Expr::exists(aliases))
-                .add(Expr::exists(events)),
-        )
         .into_tuple::<i64>()
         .one(&store.connection)
         .await?
