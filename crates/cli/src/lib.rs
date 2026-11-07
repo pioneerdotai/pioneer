@@ -195,7 +195,9 @@ fn run_with_args(mut args: impl Iterator<Item = String>) -> Result<()> {
             service::stop_gateway_service()
         }
         Some(service::SERVICE_MODE_ARG) => {
-            ensure_no_extra_args(args)?;
+            if let Some(environment) = parse_gateway_service_environment(args)? {
+                environment.select_for_foreground_gateway()?;
+            }
             service::run_gateway_service()
         }
         Some("help") | Some("--help") | Some("-h") | None => {
@@ -214,6 +216,34 @@ fn ensure_no_extra_args(mut args: impl Iterator<Item = String>) -> Result<()> {
         return Err(usage_error(format!("unexpected argument: {extra}")));
     }
     Ok(())
+}
+
+fn parse_gateway_service_environment(
+    mut args: impl Iterator<Item = String>,
+) -> Result<Option<pioneer_config::RuntimeEnvironment>> {
+    match args.next().as_deref() {
+        None => Ok(None),
+        Some("--environment") => {
+            match args.next().as_deref() {
+                Some("production") => {}
+                Some(value) => {
+                    return Err(usage_error(format!(
+                        "invalid environment: {value}; expected `production`"
+                    )));
+                }
+                None => {
+                    return Err(usage_error(
+                        "missing value for --environment; expected `production`",
+                    ));
+                }
+            }
+            ensure_no_extra_args(args)?;
+            Ok(Some(pioneer_config::RuntimeEnvironment::Production))
+        }
+        Some(flag) => Err(usage_error(format!(
+            "unexpected argument: {flag}; expected `--environment production`"
+        ))),
+    }
 }
 
 fn parse_optional_json_flag(mut args: impl Iterator<Item = String>) -> Result<bool> {
@@ -666,6 +696,8 @@ fn help_text() -> String {
   {command} secrets status [--json]  Show keystore status without secret values
   {command} secrets garbage-collection [--dry-run] [--json]  Clean orphan MCP secret values
   {command} stop                Stop and uninstall the persistent gateway service
+  {command} gateway-service [--environment production]
+                                Run Gateway in the foreground; optionally use production configuration in a debug build
   {command} version [--json]    Show {command} version
   {command} help                Show this help"
     )
@@ -723,6 +755,31 @@ mod tests {
 
         assert!(is_usage_error(&error));
         assert!(format!("{error:#}").contains("expected `--json`"));
+    }
+
+    #[test]
+    fn foreground_environment_requires_an_explicit_valid_selection() {
+        assert_eq!(parse_gateway_service_environment(args(&[])).unwrap(), None);
+        assert_eq!(
+            parse_gateway_service_environment(args(&["--environment", "production"])).unwrap(),
+            Some(pioneer_config::RuntimeEnvironment::Production)
+        );
+        for values in [
+            vec!["--environment"],
+            vec!["--environment", "prod"],
+            vec!["--unknown"],
+            vec!["--environment", "production", "extra"],
+            vec!["--environment", "production", "--environment", "production"],
+        ] {
+            let error = parse_gateway_service_environment(args(&values)).unwrap_err();
+            assert!(is_usage_error(&error), "{values:?}");
+        }
+        // These must reject the flag before service or installer side effects.
+        for command in ["start", "stop", "install", "update"] {
+            let error = run_with_args(args(&[command, "--environment", "production"]))
+                .expect_err("only the foreground command may select an environment");
+            assert!(is_usage_error(&error), "{command}");
+        }
     }
 
     #[test]
