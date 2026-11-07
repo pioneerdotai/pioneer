@@ -781,7 +781,6 @@ impl CrudStore {
             "gateway.control",
             "projection",
             "compaction",
-            "maintenance.zstd",
             "maintenance.html",
         ]
         .map(|domain| {
@@ -1531,7 +1530,6 @@ impl CrudStore {
             "gateway.control",
             "projection",
             "compaction",
-            "maintenance.zstd",
             "maintenance.html",
         ]
         .map(|domain| {

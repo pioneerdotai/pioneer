@@ -69,7 +69,6 @@ impl CrudStore {
             "gateway.cli",
             "projection",
             "compaction",
-            "maintenance.zstd",
             "tasks.lifecycle",
         ]
         .map(|domain| {

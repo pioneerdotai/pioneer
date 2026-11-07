@@ -8666,6 +8666,7 @@ impl CrudStore {
         execution_owner_id: &str,
         event_timestamp_secs: i64,
     ) -> Result<bool> {
+        let payload_change = terminal_cleanup::Change::payload(&self.connection);
         let control_wakes = vec![
             GatewayControlWake::Turn(notification.turn.id.clone()),
             GatewayControlWake::Resources,
@@ -8682,7 +8683,6 @@ impl CrudStore {
             "gateway.cli",
             "projection",
             "compaction",
-            "maintenance.zstd",
             "maintenance.native",
             "maintenance.html",
             "tasks.lifecycle",
@@ -8868,6 +8868,9 @@ impl CrudStore {
         }
         .await;
         if let Ok(changed) = &result {
+            payload_change
+                .complete(&self.connection, *changed, &receipt_keys)
+                .await;
             receipt_change.completed_keys(if *changed { &receipt_keys } else { &[] });
             for change in changes {
                 change.completed(*changed);
@@ -9820,7 +9823,7 @@ impl CrudStore {
         // history; started/checkpointed/continued also update recovery liveness.
         let cleanup_turns = vec![transition.event_payload().turn_id().to_owned()];
         let cleanup_change = terminal_cleanup::Change::events(&self.connection);
-        let changes = ["gateway.control", "projection", "maintenance.zstd"]
+        let changes = ["gateway.control", "projection"]
             .map(|domain| self.control_work_change(domain, &control_wakes));
         let result = async {
         let _release_wake = matches!(&transition, NativeExecutionWindowTransition::Blocked { .. })
@@ -17061,6 +17064,7 @@ impl CrudStore {
         turn_id: &str,
         event_timestamp_secs: i64,
     ) -> Result<TurnFinalizationCommitOutcome> {
+        let payload_change = terminal_cleanup::Change::payload(&self.connection);
         let control_wakes = vec![
             GatewayControlWake::Turn(turn_id.into()),
             GatewayControlWake::Resources,
@@ -17079,7 +17083,6 @@ impl CrudStore {
             "gateway.cli",
             "projection",
             "compaction",
-            "maintenance.zstd",
             "maintenance.native",
             "maintenance.html",
         ]
@@ -17361,6 +17364,9 @@ impl CrudStore {
         }
         .await;
         if let Ok((_, changed)) = &result {
+            payload_change
+                .complete(&self.connection, *changed, &receipt_keys)
+                .await;
             receipt_change.completed_keys(if *changed { &receipt_keys } else { &[] });
             for change in changes {
                 change.completed(*changed);
@@ -17417,14 +17423,11 @@ impl CrudStore {
         notification: pioneer_protocol::ItemUpdatedNotification,
         event_timestamp_secs: i64,
     ) -> Result<()> {
+        let payload_change = terminal_cleanup::Change::payload(&self.connection);
+        let payload_turns = vec![notification.turn_id.clone()];
         let control_wakes = vec![GatewayControlWake::Activity(notification.turn_id.clone())];
-        let maintenance_changes = [
-            "gateway.control",
-            "compaction",
-            "maintenance.zstd",
-            "maintenance.html",
-        ]
-        .map(|domain| self.control_work_change(domain, &control_wakes));
+        let maintenance_changes = ["gateway.control", "compaction", "maintenance.html"]
+            .map(|domain| self.control_work_change(domain, &control_wakes));
         let maintenance_result = async {
         let updated_at = unix_to_datetime(event_timestamp_secs);
         let status =
@@ -17541,6 +17544,9 @@ impl CrudStore {
         }.await;
         let maintenance_changed = maintenance_result.is_ok();
         if maintenance_result.is_ok() {
+            payload_change
+                .complete(&self.connection, maintenance_changed, &payload_turns)
+                .await;
             for change in maintenance_changes {
                 change.completed(maintenance_changed);
             }
@@ -21626,6 +21632,7 @@ impl CrudStore {
         &self,
         request: EditTurnMessageRequest,
     ) -> Result<TurnMessageEditedEvent> {
+        let payload_change = terminal_cleanup::Change::payload(&self.connection);
         let receipt_keys = vec![request.turn_id.clone()];
         let receipt_change = self
             .connection
@@ -21634,7 +21641,6 @@ impl CrudStore {
         let maintenance_changes = [
             "projection",
             "compaction",
-            "maintenance.zstd",
             "maintenance.html",
             "maintenance.native",
         ]
@@ -21839,6 +21845,9 @@ impl CrudStore {
         .await;
         let maintenance_changed = maintenance_result.is_ok();
         if maintenance_result.is_ok() {
+            payload_change
+                .complete(&self.connection, maintenance_changed, &receipt_keys)
+                .await;
             receipt_change.completed_keys(if maintenance_changed {
                 &receipt_keys
             } else {
@@ -21866,6 +21875,7 @@ impl CrudStore {
         &self,
         request: DeleteTurnMessageRequest,
     ) -> Result<DeleteTurnMessageResult> {
+        let payload_change = terminal_cleanup::Change::payload(&self.connection);
         let receipt_keys = vec![request.turn_id.clone()];
         let receipt_change = self
             .connection
@@ -21874,7 +21884,6 @@ impl CrudStore {
         let maintenance_changes = [
             "projection",
             "compaction",
-            "maintenance.zstd",
             "maintenance.html",
             "maintenance.portable",
             "maintenance.native",
@@ -22080,6 +22089,9 @@ impl CrudStore {
             .as_ref()
             .is_ok_and(|outcome| outcome.event.is_some());
         if maintenance_result.is_ok() {
+            payload_change
+                .complete(&self.connection, maintenance_changed, &receipt_keys)
+                .await;
             receipt_change.completed_keys(if maintenance_changed {
                 &receipt_keys
             } else {
@@ -22438,6 +22450,8 @@ impl CrudStore {
         error: Option<&str>,
         event_timestamp_secs: i64,
     ) -> Result<bool> {
+        let payload_change = terminal_cleanup::Change::payload(&self.connection);
+        let payload_turns = vec![turn_id.to_owned()];
         let mut control_wakes = vec![GatewayControlWake::Turn(turn_id.to_owned())];
         if status != TurnStatus::InProgress {
             control_wakes.extend([
@@ -22528,7 +22542,10 @@ impl CrudStore {
             maintenance_result
         }
         .await;
-        if result.is_ok() {
+        if let Ok(changed) = &result {
+            payload_change
+                .complete(&self.connection, *changed, &payload_turns)
+                .await;
             for change in changes {
                 change.completed(true);
             }
@@ -33054,6 +33071,7 @@ impl CrudStore {
         cleanup_plan: RecoveryTerminalCleanupPlan,
         event_timestamp_secs: i64,
     ) -> Result<RecoveryTerminalizationApplyOutcome> {
+        let payload_change = terminal_cleanup::Change::payload(&self.connection);
         let control_wakes = vec![
             GatewayControlWake::Turn(record.turn_id.clone()),
             GatewayControlWake::Resources,
@@ -33073,7 +33091,6 @@ impl CrudStore {
             "gateway.cli",
             "projection",
             "compaction",
-            "maintenance.zstd",
             "maintenance.html",
             "tasks.lifecycle",
         ]
@@ -33356,6 +33373,9 @@ impl CrudStore {
         }.await;
         if let Ok(value) = &control_result {
             let published = matches!(value, RecoveryTerminalizationApplyOutcome::Applied(applied) if applied.newly_terminal_turn.is_some() || applied.final_item.is_some());
+            payload_change
+                .complete(&self.connection, published, &receipt_keys)
+                .await;
             receipt_change.completed_keys(if published { &receipt_keys } else { &[] });
             for change in changes {
                 change.completed(published);
@@ -35165,13 +35185,8 @@ impl CrudStore {
             .then(|| self.connection.work_signal("maintenance.html").changing());
         let mut html_changed = false;
         let cleanup_change = terminal_cleanup::Change::events(&self.connection);
-        let changes = [
-            "gateway.control",
-            "projection",
-            "compaction",
-            "maintenance.zstd",
-        ]
-        .map(|domain| self.control_work_change(domain, &control_wakes));
+        let changes = ["gateway.control", "projection", "compaction"]
+            .map(|domain| self.control_work_change(domain, &control_wakes));
         let result = async {
         let task_turns = events.iter().map(|event| event.turn_id().to_owned()).collect::<Vec<_>>();
         let task_change = if task_turns.is_empty() { None } else {
@@ -35735,14 +35750,8 @@ impl CrudStore {
         let control_wakes = gateway_control::event_wakes(std::slice::from_ref(&event));
         let cleanup_turns = vec![event.turn_id().to_owned()];
         let cleanup_change = terminal_cleanup::Change::events(&self.connection);
-        let changes = [
-            "gateway.control",
-            "gateway.cli",
-            "projection",
-            "compaction",
-            "maintenance.zstd",
-        ]
-        .map(|domain| self.control_work_change(domain, &control_wakes));
+        let changes = ["gateway.control", "gateway.cli", "projection", "compaction"]
+            .map(|domain| self.control_work_change(domain, &control_wakes));
         let result = async {
             let _release_wake = (terminal_turn_execution_status_for_event(&event).is_some())
                 .then(|| execution_heartbeat::ReleaseWake(self.execution_heartbeats.clone()));
@@ -36025,14 +36034,8 @@ impl CrudStore {
             .then(|| self.connection.work_signal("maintenance.html").changing());
         let mut html_changed = false;
         let cleanup_change = terminal_cleanup::Change::events(&self.connection);
-        let changes = [
-            "gateway.control",
-            "gateway.cli",
-            "projection",
-            "compaction",
-            "maintenance.zstd",
-        ]
-        .map(|domain| self.control_work_change(domain, &control_wakes));
+        let changes = ["gateway.control", "gateway.cli", "projection", "compaction"]
+            .map(|domain| self.control_work_change(domain, &control_wakes));
         let result = async {
             let task_change = Some(
                 crate::task_events::TaskTurnChange::begin(
@@ -47305,7 +47308,7 @@ mod tests {
         .await;
         use futures_util::FutureExt;
         let database = store.database_connection();
-        let mut consumers = ["gateway.control", "projection", "maintenance.zstd"]
+        let mut consumers = ["gateway.control", "projection"]
             .map(|domain| database.work_signal(domain).subscribe());
         for consumer in &mut consumers {
             consumer.begin_pass(&database).await.unwrap();
@@ -63945,18 +63948,17 @@ mod tests {
         frozen.begin_pass(&database).await.unwrap();
         let mut html = database.work_signal("maintenance.html").subscribe();
         html.begin_pass(&database).await.unwrap();
-        let mut consumers = [
-            "gateway.control",
-            "maintenance.zstd",
-            "projection",
-            "compaction",
-        ]
-        .map(|domain| database.work_signal(domain).subscribe());
+        let mut consumers = ["gateway.control", "projection", "compaction"]
+            .map(|domain| database.work_signal(domain).subscribe());
         for consumer in &mut consumers {
             consumer.begin_pass(&database).await.unwrap();
         }
-        let mut cleanup = ["maintenance.native", "maintenance.receipts"]
-            .map(|domain| database.work_signal(domain).subscribe());
+        let mut cleanup = [
+            "maintenance.native",
+            "maintenance.receipts",
+            "maintenance.zstd",
+        ]
+        .map(|domain| database.work_signal(domain).subscribe());
         for consumer in &mut cleanup {
             consumer.begin_pass(&database).await.unwrap();
         }

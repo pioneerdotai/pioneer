@@ -79,14 +79,22 @@ pub(crate) struct Change(Vec<WorkChange>);
 impl Change {
     pub(crate) fn events(db: &SqliteDatabase) -> Self {
         Self(
-            ["maintenance.native", "maintenance.receipts"]
-                .map(|domain| db.work_signal(domain).changing())
-                .into(),
+            [
+                "maintenance.native",
+                "maintenance.receipts",
+                "maintenance.zstd",
+            ]
+            .map(|domain| db.work_signal(domain).changing())
+            .into(),
         )
     }
 
     pub(crate) fn native(db: &SqliteDatabase) -> Self {
         Self(vec![db.work_signal("maintenance.native").changing()])
+    }
+
+    pub(crate) fn payload(db: &SqliteDatabase) -> Self {
+        Self(vec![db.work_signal("maintenance.zstd").changing()])
     }
 
     pub(crate) async fn complete(self, db: &SqliteDatabase, changed: bool, turns: &[String]) {
