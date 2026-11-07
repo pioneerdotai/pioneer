@@ -991,11 +991,8 @@ impl CrudStore {
                     "frozen history publication failed"
                 );
                 crate::frozen_lifetime::exact_header(&tx, workspace, descriptor).await?;
-                let hold = crate::FrozenReadHold::register_on(
-                    &self.frozen_readers,
-                    &descriptor.manifest_id,
-                    &self.connection,
-                );
+                let hold =
+                    crate::FrozenReadHold::register(&self.frozen_readers, &descriptor.manifest_id);
                 tx.commit().await?;
                 Ok(hold)
             })

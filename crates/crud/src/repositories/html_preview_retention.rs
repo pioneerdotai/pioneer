@@ -627,6 +627,7 @@ async fn unowned<C: ConnectionTrait>(
     turn: &str,
     root_execution: &str,
     readers: &crate::frozen_lifetime::ReaderCounts,
+    released: &pioneer_sqlite::WorkSignal,
 ) -> Result<bool> {
     let row = db
         .query_one(&queries::unowned(workspace, thread, turn, root_execution))
@@ -636,16 +637,20 @@ async fn unowned<C: ConnectionTrait>(
     }
     // Acquisition uses the same serialized writer as retirement. Inspect only
     // currently held roots, not the unbounded set of permanent archive roots.
-    let held_ids: Vec<String> = readers
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .keys()
-        .take(65)
-        .cloned()
-        .collect();
-    if held_ids.len() > 64 {
-        return Ok(false);
-    }
+    let held_ids: Vec<String> = {
+        let mut readers = readers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if readers.len() > 64 {
+            // Falling below the bound necessarily releases one of these roots.
+            // Register while holding the release lock; do not retain all roots.
+            for held in readers.values_mut().take(65) {
+                held.block_cleanup(released);
+            }
+            return Ok(false);
+        }
+        readers.keys().cloned().collect()
+    };
     for manifest in held_ids {
         let held = Query::select()
             .expr(Expr::val(1))
@@ -656,13 +661,15 @@ async fn unowned<C: ConnectionTrait>(
                 "h",
                 col("h", history::Column::Id).eq(col("p", frozen_turn::Column::ManifestId)),
             )
-            .and_where(col("p", frozen_turn::Column::ManifestId).eq(manifest))
+            .and_where(col("p", frozen_turn::Column::ManifestId).eq(&manifest))
             .and_where(col("p", frozen_turn::Column::TurnId).eq(turn))
             .and_where(col("h", history::Column::WorkspaceId).eq(workspace))
             .and_where(col("h", history::Column::Expired).eq(0))
             .limit(1)
             .to_owned();
-        if db.query_one(&held).await?.is_some() {
+        if db.query_one(&held).await?.is_some()
+            && crate::frozen_lifetime::cleanup_blocked(readers, &manifest, released)
+        {
             return Ok(false);
         }
     }
@@ -850,6 +857,7 @@ impl HtmlPreviewRetentionProgress {
 }
 
 async fn release(store: &CrudStore, candidate: artifact::Model) -> Result<()> {
+    let released = store.connection.work_signal("maintenance.html.release");
     let metadata: Value = serde_json::from_str(&candidate.metadata_json)?;
     let origin = &metadata["htmlTool"];
     ensure!(
@@ -882,6 +890,7 @@ async fn release(store: &CrudStore, candidate: artifact::Model) -> Result<()> {
         turn,
         &root_execution,
         &store.frozen_readers,
+        &released,
     )
     .await?
     {
@@ -1099,6 +1108,7 @@ async fn release(store: &CrudStore, candidate: artifact::Model) -> Result<()> {
                 turn,
                 &root_execution,
                 &store.frozen_readers,
+                &released,
             )
             .await?
             {

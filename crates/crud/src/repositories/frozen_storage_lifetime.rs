@@ -839,12 +839,11 @@ async fn expire(store: &CrudStore, header: &history::Model) -> Result<bool> {
                 .ok_or_else(|| anyhow::anyhow!("expiry header missing"))?;
             crate::frozen_lifetime::logical_bounds(&h)?;
             ensure!(h.ready == 1 && h == *header, "expiry header changed");
-            if store
-                .frozen_readers
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .contains_key(&h.id)
-            {
+            if crate::frozen_lifetime::cleanup_blocked(
+                &store.frozen_readers,
+                &h.id,
+                &store.connection.work_signal("maintenance.frozen.release"),
+            ) {
                 tx.commit().await?;
                 return Ok(false);
             }
@@ -2701,12 +2700,11 @@ impl DiscardPreparation {
         store
             .run_serialized_write(|| async {
                 let tx = store.connection.begin().await?;
-                if store
-                    .frozen_readers
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .contains_key(&self.manifest)
-                {
+                if crate::frozen_lifetime::cleanup_blocked(
+                    &store.frozen_readers,
+                    &self.manifest,
+                    &store.connection.work_signal("maintenance.frozen.release"),
+                ) {
                     tx.commit().await?;
                     return Ok(());
                 }
@@ -6842,10 +6840,10 @@ mod tests {
         assert!(restart.discard_after.is_empty());
     }
 
-    // The graph-refusal tests protect retained data; they do not exercise the
-    // release invalidation that used to reopen the same unchanged proof.
+    // The graph-refusal tests protect retained data; ordinary proof reads must
+    // also leave finished cleanup parked when nobody waited on their holds.
     #[tokio::test]
-    async fn refused_proof_release_rechecks_cleanup_without_revalidating_origin() {
+    async fn refused_proof_reads_do_not_wake_cleanup_or_revalidate_origin() {
         use futures_util::FutureExt;
         let (store, _) = fixture(true).await;
         // Model pre-existing damaged legacy input; the production identity
@@ -6880,7 +6878,7 @@ mod tests {
         assert!(idle && progress.accounting.refused > 0);
         assert!(store.frozen_readers.lock().unwrap().is_empty());
         assert!(source.wait(None).now_or_never().is_none());
-        assert!(released.wait(None).now_or_never().is_some());
+        assert!(released.wait(None).now_or_never().is_none());
         // Expiry may have notified HTML for unrelated rows. Acknowledge before
         // the release-only pass whose proof reads must stay parked.
         html.begin_pass(&database).await.unwrap();
@@ -6898,8 +6896,8 @@ mod tests {
         assert!(released.wait(None).now_or_never().is_none());
         assert!(source.wait(None).now_or_never().is_none());
         assert!(html.wait(None).now_or_never().is_none());
-        // An internal reader can be the last holder after an external reader.
-        // Both workers must still observe the final protection release.
+        // Even a mixed internal/external read family stays quiet if neither
+        // cleanup owner actually refused work because of these readers.
         let header = history::Entity::find_by_id("origin")
             .one(&store.connection)
             .await
@@ -6922,7 +6920,7 @@ mod tests {
         drop(external);
         assert!(released.wait(None).now_or_never().is_none());
         drop(internal);
-        assert!(released.wait(None).now_or_never().is_some());
+        assert!(released.wait(None).now_or_never().is_none());
     }
 
     #[tokio::test]

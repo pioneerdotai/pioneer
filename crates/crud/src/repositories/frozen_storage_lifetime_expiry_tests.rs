@@ -319,6 +319,7 @@ async fn negative_page_admission_keeps_final_writer_check_for_late_roots() {
 
 #[tokio::test]
 async fn negative_preflight_does_not_bypass_active_reader_hold() {
+    use futures_util::FutureExt;
     let (_directory, store, routes, descriptor) = observed_fixture().await;
     let store = store.with_maintenance_access();
     let mut preparation = prepared_expiry(&store).await;
@@ -326,6 +327,15 @@ async fn negative_preflight_does_not_bypass_active_reader_hold() {
         .compaction_acquire_frozen_history("ws", &descriptor)
         .await
         .unwrap();
+    let (_, internal_hold) = store
+        .acquire_frozen_header("ws", &descriptor)
+        .await
+        .unwrap();
+    let database = store.database_connection();
+    let mut released = database
+        .work_signal("maintenance.frozen.release")
+        .subscribe();
+    let mut html = database.work_signal("maintenance.html.release").subscribe();
     routes.clear();
     let mut accounting = SweepAccounting::default();
     assert!(preparation.step(&store, &mut accounting).await.unwrap());
@@ -339,6 +349,13 @@ async fn negative_preflight_does_not_bypass_active_reader_hold() {
         }
     )));
     drop(hold);
+    assert!(released.changed().now_or_never().is_none());
+    drop(internal_hold);
+    assert!(released.changed().now_or_never().is_some());
+    assert!(
+        html.changed().now_or_never().is_none(),
+        "HTML did not wait on this hold"
+    );
     let mut preparation = prepared_expiry(&store).await;
     assert!(preparation.step(&store, &mut accounting).await.unwrap());
     assert_eq!(accounting.expired, 1);
