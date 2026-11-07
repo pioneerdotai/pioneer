@@ -67338,6 +67338,19 @@ async fn codex_retry_notice_is_durable_semantic_work_in_an_internal_execution_th
         )
         .await
         .unwrap();
+        // No notice exists yet for either backend. Mixed/duplicate page targets
+        // must not manufacture notices from the mere existence of CLI attempts.
+        assert!(
+            store
+                .codex_retry_notice_reads(&[
+                    child.child_turn_id.clone(),
+                    child.child_turn_id.clone(),
+                    "api-turn-with-no-cli-attempt".into(),
+                ])
+                .await
+                .unwrap()
+                .is_empty()
+        );
         let initial = request_live_thread_timeline_page(&mut harness, "retry-before").await;
         let core = ClientCore::new();
         core.upsert_thread(
@@ -67782,18 +67795,81 @@ async fn codex_retry_notice_is_durable_semantic_work_in_an_internal_execution_th
             .insert(&store.database_connection())
             .await
             .unwrap();
+        // Exercise both the page-target and attempt batch boundaries. A page
+        // may mix API cards, the same child twice, and a long retry history.
+        let mut page_sources = (0..65)
+            .map(|i| format!("api-page-turn-{i:03}"))
+            .collect::<Vec<_>>();
+        page_sources.extend([child.child_turn_id.clone(), child.child_turn_id.clone()]);
+        let reads = store.codex_retry_notice_reads(&page_sources).await.unwrap();
+        assert_eq!(reads.len(), 1);
+        let selected = reads.get(&child.child_turn_id).unwrap();
         let read = store
-            .codex_retry_notices_for_task(
+            .codex_retry_notices_for_task_read(
                 &target.workspace_id,
                 &target.thread_id,
                 &target.turn_id,
                 &target.task,
+                selected,
             )
             .await
             .unwrap();
         assert_eq!(read.len(), 2);
+        assert!(
+            store
+                .codex_retry_notices_for_task_read(
+                    "another-workspace",
+                    &target.thread_id,
+                    &target.turn_id,
+                    &target.task,
+                    selected,
+                )
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .codex_retry_notices_for_task_read(
+                    &target.workspace_id,
+                    &target.thread_id,
+                    &target.turn_id,
+                    &wrong_link,
+                    selected,
+                )
+                .await
+                .unwrap()
+                .is_empty()
+        );
         assert!(read.iter().any(|notice| notice.item_id == notice_id));
         assert!(read.iter().any(|notice| notice.item_id == history_id));
+        // Graph and notice payload batches must preserve per-card isolation and
+        // input positions, including continuation beyond the first group.
+        let mut cards = vec![target.clone(); 65];
+        cards[17].workspace_id = "another-workspace".into();
+        cards[33].task = wrong_link.clone();
+        cards[50].task.child_thread_id = Some("unrelated-child".into());
+        let batch = store
+            .codex_retry_notices_for_tasks(&cards, &reads)
+            .await
+            .unwrap();
+        assert_eq!(batch.len(), 65);
+        for (index, notices) in batch.iter().enumerate() {
+            if [17, 33, 50].contains(&index) {
+                assert!(notices.is_empty());
+            } else {
+                assert_eq!(notices.len(), 2);
+                assert!(
+                    notices
+                        .iter()
+                        .any(|n| n.item_id == notice_id && n.source_turn_id == child.child_turn_id)
+                );
+                assert!(notices.iter().any(
+                    |n| n.item_id == history_id && n.source_thread_id == child.child_thread_id
+                ));
+            }
+        }
+
         let original_payload = notice_row.payload.clone();
         let mut corrupt: pioneer_entity::turn_item::ActiveModel = notice_row.clone().into();
         corrupt.payload = Set("{corrupt requested retry notice".into());

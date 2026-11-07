@@ -6018,6 +6018,10 @@ impl MessageProcessor {
         turn_transition: Option<&Arc<tokio::sync::OwnedMutexGuard<()>>>,
         terminal_delivery: Option<&pioneer_protocol::CliRuntimeBlockedTurnGuard>,
     ) -> bool {
+        if matches!(&event, RuntimeEvent::TurnCompleted(_)) {
+            self.observe_cli_terminal_phase(&turn_binding.turn_id, "terminal_event")
+                .await;
+        }
         let mut closing = matches!(&event, RuntimeEvent::TurnCompleted(_))
             .then(|| Closing::current(Phase::CliCandidate));
         let correlation = closing.as_ref().map(Closing::correlation);
@@ -6757,6 +6761,8 @@ impl MessageProcessor {
             closing.finish(Fact::Returned);
         }
         if matches!(&event, RuntimeEvent::TurnCompleted(_)) {
+            self.observe_cli_terminal_phase(&turn_binding.turn_id, "capture_completed_context")
+                .await;
             let completed_context = async {
                 let (_, completed_turn) = self
                     .crud_store
@@ -6803,6 +6809,10 @@ impl MessageProcessor {
                 );
             }
         }
+        if terminal_status.is_some() {
+            self.observe_cli_terminal_phase(&turn_binding.turn_id, "terminal_event_hub")
+                .await;
+        }
         let event_hub = self.ensure_cli_runtime_execution_event_hub(instance).await;
         for snapshot in projected.snapshot {
             if !event_hub.publish_snapshot(snapshot) {
@@ -6829,6 +6839,10 @@ impl MessageProcessor {
         for progress in projected.progress {
             event_hub.publish_progress(progress);
         }
+        if terminal_status.is_some() {
+            self.observe_cli_terminal_phase(&turn_binding.turn_id, "terminal_command_registry")
+                .await;
+        }
         self.update_cli_runtime_command_item_registry(instance, &turn_binding, &event)
             .await;
         if cli_runtime_event_confirms_recovery(&event)
@@ -6838,6 +6852,8 @@ impl MessageProcessor {
                 .await;
         }
         if terminal_status.is_some() {
+            self.observe_cli_terminal_phase(&turn_binding.turn_id, "finalize_cli_attempt")
+                .await;
             if let Some(attempt) = turn_attempt {
                 let attempt_status = match &event {
                     RuntimeEvent::TurnCompleted(_) => {
@@ -11018,6 +11034,8 @@ impl MessageProcessor {
         native_turn_id: Option<&str>,
         session: Option<&CLIAgentRuntimeSessionHandle>,
     ) {
+        self.observe_cli_terminal_phase(&binding.turn_id, "finalize_cli_history")
+            .await;
         if !self.finalize_codex_history(binding).await {
             warn!(
                 thread_id = binding.thread_id.as_str(),
@@ -11027,6 +11045,8 @@ impl MessageProcessor {
         }
         self.mcp_service
             .cancel_turn_mcp_invocations(binding.turn_id.as_str());
+        self.observe_cli_terminal_phase(&binding.turn_id, "terminal_mcp")
+            .await;
         if let Some(handle) = session
             && let Err(error) = handle
                 .session()
@@ -11036,6 +11056,8 @@ impl MessageProcessor {
             warn!(turn_id = binding.turn_id.as_str(), error = %error,
                 "failed to terminalize CLI MCP turn lease");
         }
+        self.observe_cli_terminal_phase(&binding.turn_id, "expire_pending_requests")
+            .await;
         self.expire_cli_runtime_pending_requests_for_turn(binding.turn_id.as_str())
             .await;
         if matches!(
@@ -11050,6 +11072,8 @@ impl MessageProcessor {
             )
             .await;
         }
+        self.observe_cli_terminal_phase(&binding.turn_id, "invalidate_binding_cache")
+            .await;
         self.invalidate_cli_runtime_turn_binding_cache(binding)
             .await;
         // Last: new native admission cannot run until the transition gate drops.

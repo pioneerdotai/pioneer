@@ -5,7 +5,9 @@ pub use repositories::portable_payload::PortablePayloadProgress;
 mod cli_mcp_call;
 mod codex_retry_notice;
 pub use cli_mcp_call::{CliMcpCallIdentity, is_managed_cli_mcp_item};
-pub use codex_retry_notice::{CodexRetryNoticeTarget, codex_retry_notice_item_id};
+pub use codex_retry_notice::{
+    CodexRetryNoticeRead, CodexRetryNoticeTarget, codex_retry_notice_item_id,
+};
 mod execution_heartbeat;
 mod frozen_lifetime;
 mod gateway_control;
@@ -163,11 +165,12 @@ pub use repositories::authorization_persistence::{
     scan_authorization_persistence_invariants_cooperative,
 };
 pub use repositories::authorization_scope::{
-    ArtifactAuthorizationScope, CapabilityAuthorizationScope, PersistedCapabilityScopeKind,
-    RunningTaskScopePage, RuntimeDraftArtifactAuthorizationScope, SessionAuthorizationScope,
-    TaskAuthorizationScope, ThreadAuthorizationScope, ThreadStartAuthorizationScope,
-    TurnAuthorizationScope, WorkspaceAuthorizationScope, list_abandoned_runtime_draft_artifact_ids,
-    list_running_task_scopes, resolve_artifact_authorization_scope,
+    ArtifactAuthorizationScope, CapabilityAuthorizationScope, InternalThreadAuthorizationFacts,
+    PersistedCapabilityScopeKind, RunningTaskScopePage, RuntimeDraftArtifactAuthorizationScope,
+    SessionAuthorizationScope, TaskAuthorizationScope, ThreadAuthorizationScope,
+    ThreadStartAuthorizationScope, TurnAuthorizationScope, WorkspaceAuthorizationScope,
+    list_abandoned_runtime_draft_artifact_ids, list_running_task_scopes,
+    load_internal_thread_authorization_facts, resolve_artifact_authorization_scope,
     resolve_artifact_binding_authorization_root, resolve_persisted_capability_authorization_scope,
     resolve_runtime_draft_artifact_authorization_scope, resolve_session_authorization_scope,
     resolve_task_authorization_scope, resolve_thread_authorization_scope,
@@ -22428,6 +22431,34 @@ impl CrudStore {
             .await
         })
         .await
+    }
+
+    /// Bounded read-only authority envelope selection for page validation.
+    /// Durable derivation must still be verified by the authorization owner.
+    pub async fn get_turn_execution_authorization_contexts(
+        &self,
+        turn_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, String>> {
+        use pioneer_entity::turn as entity;
+        let mut result = std::collections::HashMap::new();
+        for ids in turn_ids.chunks(64) {
+            let rows = entity::Entity::find()
+                .select_only()
+                .columns([
+                    entity::Column::Id,
+                    entity::Column::ExecutionAuthorizationContextJson,
+                ])
+                .filter(entity::Column::Id.is_in(ids.iter().cloned()))
+                .into_tuple::<(String, Option<String>)>()
+                .all(&self.connection)
+                .await?;
+            for (id, encoded) in rows {
+                if let Some(encoded) = encoded.filter(|s| !s.trim().is_empty()) {
+                    result.insert(id, encoded);
+                }
+            }
+        }
+        Ok(result)
     }
 
     pub async fn get_turn_execution_authorization_context(

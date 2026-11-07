@@ -1097,6 +1097,7 @@ fn execution_backend_allows_agent_skill_overlay(
 pub(super) struct CliRuntimeSessionTurnLocks {
     lease: Arc<tokio::sync::Mutex<()>>,
     transition: Arc<tokio::sync::Mutex<()>>,
+    terminal_phase: Option<(String, &'static str, std::time::Instant)>,
 }
 
 impl MessageProcessor {
@@ -5054,6 +5055,7 @@ impl MessageProcessor {
                             {
                                 Ok(true) => {}
                                 Ok(false) => {
+                                    self.report_cli_admission_wait_owner(&session_key, &response_turn_id).await;
                                     send_turn_start_failure!(
                                         "task run ended while waiting for its CLI runtime continuation"
                                             .to_owned()
@@ -5102,6 +5104,7 @@ impl MessageProcessor {
                             {
                                 Ok(true) => {}
                                 Ok(false) => {
+                                    self.report_cli_admission_wait_owner(&session_key, &response_turn_id).await;
                                     send_turn_start_failure!(
                                         "task run ended while waiting for its CLI runtime continuation"
                                             .to_owned()
@@ -9783,6 +9786,62 @@ impl MessageProcessor {
             .lock()
             .await
             .insert(turn_id.to_owned(), (lease, session));
+    }
+
+    // Advisory phase state lives in the existing session gate, not a new
+    // worker/map. Never hold the lease registry while awaiting the gate registry.
+    pub(crate) async fn observe_cli_terminal_phase(&self, turn_id: &str, phase: &'static str) {
+        let key = {
+            let leases = self.cli_runtime_session_turn_leases.lock().await;
+            leases
+                .get(turn_id)
+                .map(|(_, session)| session.instance().key().clone())
+        };
+        if let Some(key) = key {
+            let mut gates = self.cli_runtime_session_turn_mutexes.lock().await;
+            if let Some(gate) = gates.get_mut(&key) {
+                gate.terminal_phase = Some((turn_id.to_owned(), phase, std::time::Instant::now()));
+            }
+        }
+    }
+
+    async fn report_cli_admission_wait_owner(
+        &self,
+        key: &crate::cli_runtime::manager::CLIAgentRuntimeSessionKey,
+        waiting_turn_id: &str,
+    ) {
+        let owner = {
+            let leases = self.cli_runtime_session_turn_leases.lock().await;
+            leases
+                .iter()
+                .find(|(_, (_, session))| session.instance().key() == key)
+                .map(|(turn, (_, session))| (turn.clone(), session.instance().generation()))
+        };
+        if let Some((blocking_turn_id, session_generation)) = owner {
+            let progress = {
+                let gates = self.cli_runtime_session_turn_mutexes.lock().await;
+                gates
+                    .get(key)
+                    .and_then(|g| g.terminal_phase.as_ref())
+                    .filter(|(turn, _, _)| turn == &blocking_turn_id)
+                    .map(|(_, phase, since)| (*phase, since.elapsed().as_millis() as u64))
+            };
+            let (last_phase, phase_elapsed_ms) = progress.unwrap_or(("native_turn", 0));
+            warn!(
+                waiting_turn_id,
+                blocking_turn_id,
+                session_generation,
+                last_phase,
+                phase_elapsed_ms,
+                "CLI admission stopped while waiting for retained turn ownership"
+            );
+        } else {
+            warn!(
+                waiting_turn_id,
+                last_phase = "owner_not_retained",
+                "CLI admission stopped without a retained turn owner"
+            );
+        }
     }
 
     pub(crate) async fn release_cli_runtime_session_turn_lease(&self, turn_id: &str) {

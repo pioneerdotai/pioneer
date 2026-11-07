@@ -10061,6 +10061,8 @@ impl MessageProcessor {
         // projection does not inherit the complete native-event listener stack.
         // Abort-on-drop is safe here: an interrupted reconciliation remains
         // discoverable by the durable terminal-child reconciler.
+        self.observe_cli_terminal_phase(&turn_id, "reconcile_task_result")
+            .await;
         let task_reconciliation = {
             let executor = Arc::clone(&self.task_agent_executor);
             let reconciliation_thread_id = thread_id.clone();
@@ -10111,6 +10113,8 @@ impl MessageProcessor {
         // the immutable provider/result input.  Keep both durable records
         // until the live/startup reconciler completes the task transition.
         if task_reconciliation_succeeded {
+            self.observe_cli_terminal_phase(&turn_id, "delete_task_context")
+                .await;
             if let Err(error) = self
                 .crud_store
                 .delete_turn_llm_context_for_turn(turn_id.as_str())
@@ -10123,6 +10127,8 @@ impl MessageProcessor {
                     "failed to delete turn_llm_context rows after turn completion"
                 );
             }
+            self.observe_cli_terminal_phase(&turn_id, "delete_runtime_snapshot")
+                .await;
             self.delete_turn_runtime_snapshot_for_closed_turn(
                 thread_id.as_str(),
                 turn_id.as_str(),
@@ -10130,9 +10136,13 @@ impl MessageProcessor {
             )
             .await;
         }
+        self.observe_cli_terminal_phase(&turn_id, "clear_artifact_state")
+            .await;
         self.clear_artifact_finalization_state(turn_id.as_str())
             .await;
 
+        self.observe_cli_terminal_phase(&turn_id, "reconcile_terminal_recovery")
+            .await;
         match self
             .recovery_coordinator
             .complete_active_recovery_for_turn(turn_id.as_str(), recovery.as_ref(), event_timestamp)
@@ -10153,6 +10163,8 @@ impl MessageProcessor {
             }
         }
 
+        self.observe_cli_terminal_phase(&turn_id, "retire_terminal_actor")
+            .await;
         if task_reconciliation_succeeded
             && self
                 .thread_manager

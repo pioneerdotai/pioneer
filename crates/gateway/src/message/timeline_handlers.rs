@@ -2279,12 +2279,22 @@ impl MessageProcessor {
         request_context: &RequestContext,
         blocks: &mut [TimelineBlock],
     ) -> Result<()> {
-        use crate::authorization::{
-            AuthorizationResolver, AuthorizationService, ProofResolution, ResourceAction,
-        };
+        use crate::authorization::{AuthorizationResolver, AuthorizationService, ResourceAction};
+        let source_turns = blocks
+            .iter()
+            .filter_map(|block| match &block.kind {
+                TimelineBlockKind::DetachedTaskRun { task, .. } => task.child_turn_id.clone(),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let reads = self
+            .crud_store
+            .codex_retry_notice_reads(&source_turns)
+            .await?;
+        if reads.is_empty() {
+            return Ok(());
+        }
         let principal = request_context.principal();
-        // The resolver authorizes this read through the root and separately
-        // requires ChildObserve for the internal execution child.
         let action = ResourceAction::ThreadRead;
         let gate = AuthorizationService::new().authorize_action(
             principal.kind,
@@ -2292,54 +2302,64 @@ impl MessageProcessor {
             action,
         );
         let resolver = AuthorizationResolver::new((*self.crud_store).clone());
-        for block in blocks {
-            let TimelineBlockKind::DetachedTaskRun {
-                task,
+        let requested = blocks
+            .iter()
+            .filter_map(|block| match &block.kind {
+                TimelineBlockKind::DetachedTaskRun { task, .. }
+                    if task
+                        .child_turn_id
+                        .as_ref()
+                        .is_some_and(|id| reads.contains_key(id)) =>
+                {
+                    task.child_thread_id
+                        .as_ref()
+                        .map(|child| (block.workspace_id.clone(), child.clone()))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let authorized = resolver
+            .authorize_internal_thread_page(principal, &gate, action, &requested)
+            .await?;
+        let mut indices = Vec::new();
+        let mut targets = Vec::new();
+        for (index, block) in blocks.iter().enumerate() {
+            let TimelineBlockKind::DetachedTaskRun { task, .. } = &block.kind else {
+                continue;
+            };
+            let (Some(child), Some(child_turn), Some(turn_id)) =
+                (&task.child_thread_id, &task.child_turn_id, &block.turn_id)
+            else {
+                continue;
+            };
+            if reads.contains_key(child_turn)
+                && authorized.contains(&(block.workspace_id.clone(), child.clone()))
+            {
+                indices.push(index);
+                targets.push(pioneer_crud::CodexRetryNoticeTarget {
+                    workspace_id: block.workspace_id.clone(),
+                    thread_id: block.thread_id.clone(),
+                    turn_id: turn_id.clone(),
+                    task: task.clone(),
+                });
+            }
+        }
+        let notices = self
+            .crud_store
+            .codex_retry_notices_for_tasks(&targets, &reads)
+            .await?;
+        anyhow::ensure!(
+            notices.len() == indices.len(),
+            "retry notice batch lost a page target"
+        );
+        for (index, notices) in indices.into_iter().zip(notices) {
+            if let TimelineBlockKind::DetachedTaskRun {
                 codex_retry_notices,
                 ..
-            } = &mut block.kind
-            else {
-                continue;
-            };
-            let (Some(child), Some(turn_id)) =
-                (task.child_thread_id.as_deref(), block.turn_id.as_deref())
-            else {
-                continue;
-            };
-            let Some(child_turn) = task.child_turn_id.as_deref() else {
-                continue;
-            };
-            if !self
-                .crud_store
-                .get_cli_runtime_turn_binding_control(child_turn)
-                .await?
-                .is_some_and(|binding| {
-                    binding.runtime_kind == "codex"
-                        && binding.thread_id == child
-                        && binding.workspace_id == block.workspace_id
-                })
+            } = &mut blocks[index].kind
             {
-                continue;
+                *codex_retry_notices = notices;
             }
-            // Reading the presentation thread alone is not a child-observation grant.
-            if !matches!(
-                resolver
-                    .authorize_internal_thread_via_root(
-                        principal,
-                        &gate,
-                        action,
-                        child,
-                        Some(&block.workspace_id)
-                    )
-                    .await?,
-                ProofResolution::Authorized(_)
-            ) {
-                continue;
-            }
-            *codex_retry_notices = self
-                .crud_store
-                .codex_retry_notices_for_task(&block.workspace_id, &block.thread_id, turn_id, task)
-                .await?;
         }
         Ok(())
     }
