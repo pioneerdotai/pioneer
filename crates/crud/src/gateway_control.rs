@@ -189,7 +189,7 @@ impl CrudStore {
     /// Other consumers of a multi-domain publisher retain their old protocol.
     pub(crate) fn control_work_change(
         &self,
-        domain: &str,
+        domain: &'static str,
         work: &[GatewayControlWake],
     ) -> pioneer_sqlite::WorkChange {
         let change = self.connection.work_signal(domain).changing();
