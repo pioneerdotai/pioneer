@@ -254,6 +254,12 @@ pub struct AgentToolThreadCreationOption {
 pub struct AgentToolTargetOption {
     pub id: String,
     pub label: String,
+    /// Navigation identity for matching destinations, never an authorization token.
+    pub thread_id: String,
+    /// Current saved name; null means the thread has no name.
+    pub title: Option<String>,
+    /// Effective execution/route intersection, using the route action vocabulary.
+    pub allowed_actions: Vec<crate::AgentRouteAction>,
 }
 
 impl AgentToolOptionsProjection {

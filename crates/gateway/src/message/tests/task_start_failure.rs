@@ -4031,6 +4031,44 @@ async fn capsule_delegation_survives_nested_task_binding_recovery_and_revocation
         .unwrap()
         .to_owned();
 
+    // A/B/C have identical saved names. A later execution must select A by
+    // threadId, without knowing route order or retaining the creator's option.
+    let creator_targets: Vec<pioneer_protocol::AgentToolTargetOption> =
+        serde_json::from_value(created["targetOptions"].clone()).unwrap();
+    let creator_target = creator_targets
+        .iter()
+        .find(|o| o.thread_id == destination)
+        .unwrap();
+    let mut destinations = vec![destination.clone()];
+    for suffix in ["b", "c"] {
+        let other = call(
+            &creator_tools,
+            "thread_create",
+            &format!("same-name-{suffix}"),
+            json!({"optionId":creation.id}),
+        )
+        .await;
+        destinations.push(
+            other["threadResult"]["threadId"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+        );
+    }
+    for id in &destinations {
+        use sea_orm::{ActiveModelTrait, EntityTrait, Set};
+        let model = pioneer_entity::thread::Entity::find_by_id(id.clone())
+            .one(&processor.crud_store.database_connection())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut row: pioneer_entity::thread::ActiveModel = model.into();
+        row.name = Set(Some("Same destination".to_owned()));
+        row.update(&processor.crud_store.database_connection())
+            .await
+            .unwrap();
+    }
+
     // Create the second-level Task through the actual agent task handler, not
     // by assigning home roots, copying route rows, or fabricating admissions.
     harness
@@ -4203,14 +4241,59 @@ async fn capsule_delegation_survives_nested_task_binding_recovery_and_revocation
         .await;
         let targets: Vec<pioneer_protocol::AgentToolTargetOption> =
             serde_json::from_value(catalog["targetOptions"].clone()).unwrap();
+        assert!(
+            targets
+                .iter()
+                .any(|o| o.label == "Current thread" && o.thread_id == context.thread_id)
+        );
+        assert!(
+            targets
+                .iter()
+                .any(|o| o.label == "Current collaboration"
+                    && o.thread_id == admission.root_thread_id)
+        );
         let target = targets
             .iter()
-            .find(|option| option.label == "Approved routed destination")
+            .find(|option| {
+                option.thread_id == destination
+                    && option
+                        .allowed_actions
+                        .contains(&pioneer_protocol::AgentRouteAction::SendMessage)
+            })
             .unwrap();
+        assert!(
+            target
+                .allowed_actions
+                .contains(&pioneer_protocol::AgentRouteAction::StartAgent)
+        );
+        assert_ne!(target.id, creator_target.id);
+        assert_eq!(target.title.as_deref(), Some("Same destination"));
+        for id in &destinations {
+            assert!(
+                targets
+                    .iter()
+                    .any(|o| &o.thread_id == id && o.title.as_deref() == Some("Same destination"))
+            );
+        }
+        if launch == 0 {
+            let stale = invoke_with_mutation(&tools, "thread_message_send", "old-execution-target",
+                json!({"targetOptionId":creator_target.id,"input":[{"type":"text","text":"stale"}]}), None).await;
+            assert!(matches!(
+                stale,
+                Err(pioneer_tools::ToolError::InvalidArguments(_))
+            ));
+        }
         let call_id = format!("capsule-restored-send-{launch}");
         let result = call(&tools, "thread_message_send", &call_id,
             json!({"targetOptionId":target.id, "input":[{"type":"text","text":format!("Recovered launch {launch}")}]})).await;
         assert_eq!(result["threadResult"]["threadId"], destination);
+        let refreshed: Vec<pioneer_protocol::AgentToolTargetOption> =
+            serde_json::from_value(result["targetOptions"].clone()).unwrap();
+        assert!(
+            refreshed
+                .iter()
+                .any(|o| o.thread_id == destination && o.id == target.id)
+        );
         let outbox = pioneer_crud::load_agent_action_outbox(
             &db,
             crate::authorization::action_id_for_call(&call_id).as_str(),
@@ -4244,6 +4327,28 @@ async fn capsule_delegation_survives_nested_task_binding_recovery_and_revocation
         latest_target = Some(target.id.clone());
         latest_tools = Some(tools);
     }
+    let started = tokio::time::timeout(
+        Duration::from_secs(5),
+        call(
+            latest_tools.as_ref().unwrap(),
+            "threads_turn_start",
+            "addressed-start-a",
+            json!({"targetOptionId":latest_target.as_ref().unwrap(),
+        "input":[{"type":"text","text":"Start in A"}]}),
+        ),
+    )
+    .await
+    .expect(
+        "committed detached start must return refreshed targets without holding its admission lock",
+    );
+    assert_eq!(started["threadResult"]["threadId"], destination);
+    assert!(
+        started["targetOptions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|o| o["threadId"] == destination)
+    );
     let principal = serde_json::to_string(&pioneer_protocol::PersistedActorRef::Principal(
         authenticated_test_superuser().principal_id.clone(),
     ))

@@ -148,15 +148,45 @@ impl MessageProcessor {
         &self,
         context: &TurnToolContext,
     ) -> Result<ThreadReadAuthority> {
-        let current = self
-            .revalidate_tool_execution_authorization(
+        let facts = if let Some(binding) = self.agent_action_binding(&context.turn_id).await {
+            let facts = binding.adapter.lock().await.persistence_facts();
+            Some(facts)
+        } else {
+            None
+        };
+        self.thread_read_authority_for_agent(context, facts.as_ref(), false)
+            .await
+    }
+
+    pub(super) async fn thread_read_authority_for_agent(
+        &self,
+        context: &TurnToolContext,
+        facts: Option<&crate::authorization::AgentExecutionPersistenceFacts>,
+        catalog_projection: bool,
+    ) -> Result<ThreadReadAuthority> {
+        // Reviewer selection and committed action responses can project a
+        // catalog after the source Turn finishes. Revalidate its saved scope
+        // and current grants without requiring its foreground lease to live.
+        // Ordinary Threads reads still require the active execution lease.
+        let current = if catalog_projection {
+            self.revalidate_post_turn_execution_authorization(
                 &context.workspace_id,
                 &context.thread_id,
                 &context.turn_id,
                 None,
                 ResourceAction::ThreadRead,
             )
-            .await?;
+            .await?
+        } else {
+            self.revalidate_tool_execution_authorization(
+                &context.workspace_id,
+                &context.thread_id,
+                &context.turn_id,
+                None,
+                ResourceAction::ThreadRead,
+            )
+            .await?
+        };
         let principal = current
             .initiating_principal(self.crud_store.as_ref())
             .await?;
@@ -165,8 +195,7 @@ impl MessageProcessor {
             .await?;
         let mut agent_observe = false;
         let mut observe_children = false;
-        if let Some(binding) = self.agent_action_binding(&context.turn_id).await {
-            let facts = binding.adapter.lock().await.persistence_facts();
+        if let Some(facts) = facts {
             let grants = &facts.agent_authorization_allowed_actions;
             let policy = RoleDefinitionRegistry::new();
             ensure!(
@@ -228,8 +257,8 @@ impl MessageProcessor {
                     )
                     .await?,
                 ProofResolution::Authorized(_)
-            ) && self
-                .revalidate_tool_execution_authorization(
+            ) && if catalog_projection {
+                self.revalidate_post_turn_execution_authorization(
                     &context.workspace_id,
                     &context.thread_id,
                     &context.turn_id,
@@ -238,7 +267,17 @@ impl MessageProcessor {
                 )
                 .await
                 .is_ok()
-            {
+            } else {
+                self.revalidate_tool_execution_authorization(
+                    &context.workspace_id,
+                    &context.thread_id,
+                    &context.turn_id,
+                    None,
+                    action,
+                )
+                .await
+                .is_ok()
+            } {
                 authority.observe_workspace = true;
             }
         }

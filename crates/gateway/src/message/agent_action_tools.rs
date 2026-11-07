@@ -197,6 +197,62 @@ impl AgentActionRuntimeBinding {
         {
             anyhow::bail!("launch catalog authority differs from its AgentExecution");
         }
+        // A prepared binding can precede the runtime owner lease. The saved
+        // runtime snapshot and the owner record both pin the actual Turn thread.
+        let (current_thread_id, current_workspace_id) =
+            if let Some(owner) = processor.crud_store.get_turn_execution(turn_id).await? {
+                (owner.thread_id, owner.workspace_id)
+            } else {
+                let snapshot = processor
+                    .crud_store
+                    .get_turn_runtime_snapshot(turn_id)
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("launch catalog Turn binding is missing"))?;
+                (snapshot.thread_id, snapshot.workspace_id)
+            };
+        if current_workspace_id != execution.workspace_id {
+            anyhow::bail!("launch catalog Turn workspace differs from execution");
+        }
+        // Catalog preparation also serves reviewers, whose purpose grant does
+        // not include Threads reads. They get no destination metadata; roles
+        // that can read still pass the full current-authority checks below.
+        let read_action = crate::authorization::ResourceAction::ThreadRead;
+        let can_read_targets = authority.grants_action(read_action)
+            && facts
+                .agent_authorization_allowed_actions
+                .iter()
+                .any(|name| name == read_action.safe_name())
+            && crate::authorization::RoleDefinitionRegistry::new()
+                .agent_policy_allows(&facts.agent_authorization_role_key, read_action);
+        let read_authority = if can_read_targets {
+            Some(
+                processor
+                    .thread_read_authority_for_agent(
+                        &TurnToolContext {
+                            workspace_id: execution.workspace_id.clone(),
+                            thread_id: current_thread_id.clone(),
+                            turn_id: turn_id.to_owned(),
+                        },
+                        Some(&facts),
+                        true,
+                    )
+                    .await?,
+            )
+        } else {
+            None
+        };
+        let mut target_titles = std::collections::BTreeMap::new();
+        for thread_id in [&current_thread_id, &execution.home_root_thread_id] {
+            if let Some(read_authority) = read_authority.as_ref()
+                && processor
+                    .thread_source_readable(read_authority, thread_id)
+                    .await?
+            {
+                if let Some(thread) = processor.crud_store.get_thread_model(thread_id).await? {
+                    target_titles.insert(thread.id, thread.name);
+                }
+            }
+        }
         let mut same_capsule_targets = Vec::new();
         let mut lineage_after = None;
         loop {
@@ -222,6 +278,13 @@ impl AgentActionRuntimeBinding {
                 };
                 if thread.workspace_id != execution.workspace_id {
                     continue;
+                }
+                if let Some(read_authority) = read_authority.as_ref()
+                    && processor
+                        .thread_source_readable(read_authority, &thread.id)
+                        .await?
+                {
+                    target_titles.insert(thread.id.clone(), thread.name.clone());
                 }
                 let label = thread
                     .name
@@ -303,6 +366,14 @@ impl AgentActionRuntimeBinding {
             if destination.workspace_id != execution.workspace_id {
                 continue;
             }
+            if projection.disclosure.allows_anything()
+                && let Some(read_authority) = read_authority.as_ref()
+                && processor
+                    .thread_source_readable(read_authority, &destination.id)
+                    .await?
+            {
+                target_titles.insert(destination.id, destination.name);
+            }
             routes.push(
                 crate::authorization::AgentRouteFacts::from_projection(&projection)
                     .map_err(|message| anyhow::anyhow!(message))?,
@@ -336,6 +407,16 @@ impl AgentActionRuntimeBinding {
         adapter
             .replace_persisted_routes(routes)
             .map_err(|error| anyhow::anyhow!("failed to bind launch routes: {error:?}"))?;
+        let mut target_actions = Vec::new();
+        if authority.grants_action(crate::authorization::ResourceAction::MessageCreate) {
+            target_actions.push(pioneer_protocol::AgentRouteAction::SendMessage);
+        }
+        // Turn manifests admit runtime actions. ChildStart and SourceExport
+        // belong to the independently constrained Agent envelope/role.
+        if authority.grants_action(crate::authorization::ResourceAction::AgentTurnStart) {
+            target_actions.push(pioneer_protocol::AgentRouteAction::StartAgent);
+        }
+        adapter.install_target_metadata(current_thread_id, target_titles, target_actions);
         self.options = adapter.install_start_options_catalog(
             projected_identities,
             projected_profiles,
@@ -4386,6 +4467,25 @@ async fn dispatch_agent_action_outbox_row_inner(
 }
 
 impl AgentActionToolHandler {
+    async fn refreshed_target_options(
+        &self,
+        processor: &MessageProcessor,
+    ) -> Result<Vec<pioneer_protocol::AgentToolTargetOption>, ToolError> {
+        let mut binding = processor
+            .agent_action_binding(&self.context.turn_id)
+            .await
+            .ok_or_else(|| ToolError::execution_failed("agent_execution_stale"))?;
+        binding
+            .refresh_start_options_catalog(processor, &self.context.turn_id)
+            .await
+            .map_err(|_| ToolError::execution_failed("agent_execution_stale"))?;
+        let targets = binding.options.target_options.clone();
+        processor
+            .register_agent_action_binding(self.context.turn_id.clone(), binding)
+            .await;
+        Ok(targets)
+    }
+
     async fn launch_catalog_page(
         &self,
         processor: &MessageProcessor,
@@ -4743,13 +4843,7 @@ impl ToolHandler for AgentActionToolHandler {
                     outbox_id: Some(outbox.id),
                     public_message: None,
                     thread_result,
-                    target_options: if replay_kind
-                        == pioneer_protocol::AgentActionKind::CreateThread
-                    {
-                        options.target_options.clone()
-                    } else {
-                        Vec::new()
-                    },
+                    target_options: options.target_options.clone(),
                 };
                 let payload = serde_json::to_value(&safe).map_err(|error| {
                     ToolError::internal(format!("failed to encode replay result: {error}"))
@@ -4947,7 +5041,9 @@ impl AgentActionToolHandler {
         // concurrent delivery must see the first receipt before it can prepare
         // another parent message. Cross-process races remain fenced by the
         // existing atomic Task/action transaction and immutable receipt.
-        let _commit_guard = self.adapter.lock().await;
+        // Release on each successful path before refreshing metadata, which
+        // reacquires this same adapter through the registered runtime binding.
+        let commit_guard = self.adapter.lock().await;
         if let Some(action) = pioneer_crud::load_agent_action(
             &processor.crud_store.database_connection(),
             plan.projection.action_id.as_str(),
@@ -4989,6 +5085,8 @@ impl AgentActionToolHandler {
             }
             let mut safe = BoundAgentActionAdapter::safe_result(&plan.projection);
             safe.thread_result = saved_thread_action_result(receipt.response_json.as_deref())?;
+            drop(commit_guard);
+            safe.target_options = self.refreshed_target_options(&processor).await?;
             return Ok(Box::new(FunctionToolOutput::with_payload(
                 "thread work already committed",
                 true,
@@ -5349,6 +5447,8 @@ impl AgentActionToolHandler {
                 .ok_or_else(|| ToolError::execution_failed("committed action has no receipt"))?;
                 let mut safe = BoundAgentActionAdapter::safe_result(&plan.projection);
                 safe.thread_result = saved_thread_action_result(receipt.response_json.as_deref())?;
+                drop(commit_guard);
+                safe.target_options = self.refreshed_target_options(&processor).await?;
                 return Ok(Box::new(FunctionToolOutput::with_payload(
                     "thread work committed",
                     true,
@@ -5803,6 +5903,8 @@ impl AgentActionToolHandler {
         }
         let mut safe = BoundAgentActionAdapter::safe_result(&plan.projection);
         safe.thread_result = Some(thread_result);
+        drop(commit_guard);
+        safe.target_options = self.refreshed_target_options(&processor).await?;
         let payload = serde_json::to_value(&safe).map_err(|error| {
             ToolError::internal(format!("failed to encode agent result: {error}"))
         })?;
@@ -6307,6 +6409,7 @@ impl AgentActionToolHandler {
         }
         Self::mark_outbox_delivered(processor.as_ref(), plan.projection.outbox_id.as_str()).await;
 
+        safe.target_options = self.refreshed_target_options(&processor).await?;
         let payload = serde_json::to_value(&safe).map_err(|error| {
             ToolError::internal(format!("failed to encode agent result: {error}"))
         })?;
