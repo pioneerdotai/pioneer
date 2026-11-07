@@ -1815,50 +1815,21 @@ impl MessageProcessor {
             }
         }
 
-        let item_turn_ids = item_targets
-            .iter()
-            .map(|(turn_id, _)| turn_id.clone())
-            .collect::<HashSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
-        let turn_items = if item_turn_ids.is_empty() {
-            HashMap::new()
-        } else {
-            self.crud_store
-                .list_turn_items_with_status_by_type_for_turns(
-                    item_turn_ids.as_slice(),
-                    "agent_message",
-                )
-                .await?
-        };
+        let turn_items = self
+            .crud_store
+            .get_timeline_assistant_items(&rows[0].workspace_id, thread_id, &item_targets)
+            .await?;
         let mut items = HashMap::new();
         let mut statuses = HashMap::new();
         let mut html = HashMap::new();
         for (turn_id, item_id) in &item_targets {
-            let (item, status) = turn_items
-                .get(turn_id.as_str())
-                .and_then(|items| items.iter().find(|(item, _)| item.item_id() == item_id))
+            let (item, status, is_final) = turn_items
+                .get(&(turn_id.clone(), item_id.clone()))
                 .with_context(|| {
                     format!("assistant message item `{item_id}` for turn `{turn_id}` was not found")
                 })?;
-            if !matches!(item, TurnItem::AgentMessage { .. }) {
-                bail!("assistant message timeline target is not an Agent message");
-            }
-            let is_final = turn_items
-                .get(turn_id)
-                .and_then(|items| {
-                    items.iter().rev().find(|(item, _)| {
-                        matches!(
-                            item,
-                            TurnItem::AgentMessage {
-                                phase: pioneer_protocol::AgentMessagePhase::FinalAnswer,
-                                ..
-                            }
-                        )
-                    })
-                })
-                .is_some_and(|(final_item, _)| final_item.item_id() == item_id);
-            if is_final || pioneer_protocol::task_delivery_id_from_result_item_id(item_id).is_some()
+            if *is_final
+                || pioneer_protocol::task_delivery_id_from_result_item_id(item_id).is_some()
             {
                 let publications = self
                     .html_publications_for_agent_response(

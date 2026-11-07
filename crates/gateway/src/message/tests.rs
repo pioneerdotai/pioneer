@@ -68226,6 +68226,160 @@ async fn live_semantic_timeline_final_answer_collapses_work_without_work_flood()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn timeline_page_isolates_off_page_bodies_and_keeps_last_final_html() {
+    use pioneer_artifacts::{ArtifactBindingTarget, IngestArtifactBytesRequest};
+    use pioneer_protocol::{
+        ArtifactBindingDirection, ArtifactBindingKind, ArtifactCreatedByKind, ArtifactKind,
+        ArtifactRole,
+    };
+    use sea_orm::{ActiveModelTrait, Set};
+    let mut harness = setup_live_semantic_timeline_harness("exact_assistant_page").await;
+    let store = harness.processor.crud_store.clone();
+    crate::session::test_support::ensure_test_superuser_execution_authority(store.as_ref()).await;
+    let generation = pioneer_crud::current_policy_generation(&store.database_connection())
+        .await
+        .unwrap()
+        .get();
+    let publication=harness.processor.artifact_service.ingest_tool_bytes(IngestArtifactBytesRequest {
+        workspace_id:harness.workspace_id.clone(),primary_thread_id:Some(harness.thread_id.clone()),
+        bytes:b"<p>page publication</p>".to_vec(),display_name:"page publication".into(),
+        kind:ArtifactKind::File,mime_type:Some("text/html".into()),created_by_kind:ArtifactCreatedByKind::Tool,
+        created_by_actor_id:Some("html_render".into()),
+        binding:Some(ArtifactBindingTarget {
+            thread_id:Some(harness.thread_id.clone()),turn_id:Some(harness.turn_id.clone()),
+            message_id:None,turn_item_id:Some("exact_page_html".into()),tool_call_id:Some("exact_page_html".into()),
+            task_id:None,task_run_id:None,binding_kind:ArtifactBindingKind::ToolOutput,
+            direction:ArtifactBindingDirection::Output,role:Some(ArtifactRole::Tool),item_index:Some(0),
+        }),
+        metadata:std::collections::BTreeMap::from([("htmlTool".into(),json!({
+            "version":1,"publication":true,"turnId":harness.turn_id,"callId":"exact_page_html",
+            "index":"document","title":"page publication"
+        }))]),
+    },"exact-page-html".into(),generation,tokio_util::sync::CancellationToken::new()).await.unwrap();
+    let timestamp = now_timestamp_secs();
+    // Equal timestamps exercise the canonical item-ID tie-break, while a
+    // newer commentary message must never take the final-answer position.
+    for index in 0..66 {
+        store
+            .materialize_item_completed(
+                ItemCompletedNotification {
+                    workspace_id: harness.workspace_id.clone(),
+                    thread_id: harness.thread_id.clone(),
+                    turn_id: harness.turn_id.clone(),
+                    item: TurnItem::AgentMessage {
+                        id: format!("exact-page-{index:03}"),
+                        text: format!("page body {index}"),
+                        phase: if index == 65 {
+                            pioneer_protocol::AgentMessagePhase::Commentary
+                        } else {
+                            pioneer_protocol::AgentMessagePhase::FinalAnswer
+                        },
+                        markdown: None,
+                        markdown_version: None,
+                    },
+                },
+                timestamp,
+            )
+            .await
+            .unwrap();
+    }
+    let seed = request_live_thread_timeline_page(&mut harness, "exact-page-seed").await;
+    assert!(seed.page.has_more_before);
+    let off_page = pioneer_entity::turn_item::Entity::find()
+        .filter(pioneer_entity::turn_item::Column::TurnId.eq(&harness.turn_id))
+        .filter(pioneer_entity::turn_item::Column::ItemId.eq("exact-page-000"))
+        .one(&store.database_connection())
+        .await
+        .unwrap()
+        .unwrap();
+    let mut corrupt: pioneer_entity::turn_item::ActiveModel = off_page.into();
+    corrupt.payload = Set("{invalid off-page message".into());
+    corrupt.update(&store.database_connection()).await.unwrap();
+    let page = request_live_thread_timeline_page(&mut harness, "exact-page-newest").await;
+    let mut final_seen = false;
+    for block in &page.blocks {
+        if let pioneer_protocol::TimelineBlockKind::AssistantMessage {
+            item_id,
+            text,
+            html_publications,
+            ..
+        } = &block.kind
+        {
+            assert_ne!(item_id, "exact-page-000");
+            if item_id == "exact-page-064" {
+                final_seen = true;
+                assert_eq!(text, "page body 64");
+                assert_eq!(html_publications.len(), 1);
+                assert_eq!(html_publications[0].artifact, publication.artifact);
+            } else {
+                assert!(html_publications.is_empty());
+            }
+        }
+    }
+    assert!(final_seen);
+    let cursor = page
+        .page
+        .before_cursor
+        .expect("earlier page remains available");
+    let thread_id = harness.thread_id.clone();
+    let earlier = request_live_thread_timeline_page_for_thread_at_anchor(
+        &mut harness,
+        "exact-page-before",
+        &thread_id,
+        json!({"kind":"before","cursor":cursor}),
+    )
+    .await;
+    let mut earlier_seen = false;
+    for block in &earlier.blocks {
+        if let pioneer_protocol::TimelineBlockKind::AssistantMessage {
+            item_id,
+            html_publications,
+            ..
+        } = &block.kind
+        {
+            earlier_seen = true;
+            assert_ne!(item_id, "exact-page-064");
+            assert!(
+                html_publications.is_empty(),
+                "an off-page final must keep its HTML ownership"
+            );
+        }
+    }
+    assert!(earlier_seen);
+    // A multi-quantum request still reads only its exact targets. The corrupt
+    // first message is deliberately excluded; duplicate IDs cannot duplicate output.
+    let mut exact = (1..66)
+        .map(|i| (harness.turn_id.clone(), format!("exact-page-{i:03}")))
+        .collect::<Vec<_>>();
+    exact.push((harness.turn_id.clone(), "exact-page-064".into()));
+    let selected = store
+        .get_timeline_assistant_items(&harness.workspace_id, &harness.thread_id, &exact)
+        .await
+        .unwrap();
+    assert_eq!(selected.len(), 65);
+    for ((_, id), (item, status, is_final)) in &selected {
+        assert_eq!(item.item_id(), id);
+        assert_eq!(status.as_deref(), Some("completed"));
+        assert_eq!(*is_final, id == "exact-page-064");
+    }
+    let targets = [(harness.turn_id.clone(), "exact-page-064".to_owned())];
+    assert!(
+        store
+            .get_timeline_assistant_items("wrong-workspace", &harness.thread_id, &targets)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store
+            .get_timeline_assistant_items(&harness.workspace_id, "wrong-thread", &targets)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn historical_task_snapshot_does_not_refresh_terminal_work_summary() {
     let harness = setup_live_semantic_timeline_harness("historical_task_snapshot").await;
     let base = super::now_timestamp_secs();

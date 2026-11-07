@@ -22659,6 +22659,53 @@ impl CrudStore {
         }))
     }
 
+    /// Requested page items only. Bodies/status and last-final metadata share
+    /// each bounded query snapshot; no reader is held during JSON decoding.
+    pub async fn get_timeline_assistant_items(
+        &self,
+        workspace_id: &str,
+        thread_id: &str,
+        targets: &[(String, String)],
+    ) -> Result<HashMap<(String, String), (TurnItem, Option<String>, bool)>> {
+        let targets = targets
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let rows =
+            turn::timeline_assistant_items(&self.connection, workspace_id, thread_id, &targets)
+                .await?;
+        let mut result = HashMap::new();
+        for row in rows {
+            let item = serde_json::from_str::<TurnItem>(&row.payload).with_context(|| {
+                format!(
+                    "failed to decode timeline item `{}/{}`",
+                    row.turn_id, row.item_id
+                )
+            })?;
+            anyhow::ensure!(
+                row.item_type == "agent_message"
+                    && item.item_id() == row.item_id
+                    && matches!(&item, TurnItem::AgentMessage { .. }),
+                "timeline assistant item identity/type mismatch"
+            );
+            let is_last_final = row.is_last_final
+                && matches!(
+                    &item,
+                    TurnItem::AgentMessage {
+                        phase: pioneer_protocol::AgentMessagePhase::FinalAnswer,
+                        ..
+                    }
+                );
+            result.insert(
+                (row.turn_id, row.item_id),
+                (item, row.status, is_last_final),
+            );
+        }
+        Ok(result)
+    }
+
     pub async fn get_turn_items_by_ids(
         &self,
         turn_id: &str,

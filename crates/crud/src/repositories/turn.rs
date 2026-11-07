@@ -7,10 +7,10 @@ use pioneer_protocol::{
     generate_id,
 };
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
-use sea_orm::sea_query::{Expr, OnConflict};
+use sea_orm::sea_query::{Alias, Expr, ExprTrait, OnConflict, Query};
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, DatabaseBackend, EntityTrait, FromQueryResult, PaginatorTrait,
-    QueryFilter, QueryOrder, QuerySelect, QueryTrait, Set, Statement,
+    ColumnTrait, Condition, ConnectionTrait, DatabaseBackend, EntityTrait, FromQueryResult,
+    JoinType, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, QueryTrait, Set, Statement,
 };
 
 use crate::convention::{
@@ -1672,6 +1672,130 @@ pub(crate) async fn is_completed_agent_message<C: ConnectionTrait>(
         .await
         .context("failed to validate completed response position")?
         > 0)
+}
+
+/// Exact page bodies plus a metadata-only final-answer decision from the same
+/// SQL snapshot. No non-page body participates in the final-answer lookup.
+#[derive(Debug, FromQueryResult)]
+pub(crate) struct TimelineAssistantItemRow {
+    pub turn_id: String,
+    pub item_id: String,
+    pub item_type: String,
+    pub payload: String,
+    pub status: Option<String>,
+    pub is_last_final: bool,
+}
+
+pub(crate) async fn timeline_assistant_items<C: ConnectionTrait>(
+    db: &C,
+    workspace_id: &str,
+    thread_id: &str,
+    targets: &[(String, String)],
+) -> Result<Vec<TimelineAssistantItemRow>> {
+    use pioneer_entity::{thread, thread_timeline_block as block};
+    let mut result = Vec::with_capacity(targets.len());
+    for targets in targets.chunks(64) {
+        let mut exact = Condition::any();
+        for (turn, item) in targets {
+            exact = exact.add(
+                Condition::all()
+                    .add(turn_item::Column::TurnId.eq(turn.clone()))
+                    .add(turn_item::Column::ItemId.eq(item.clone())),
+            );
+        }
+        // The projection classifies final answers, including legacy messages
+        // whose omitted phase defaults to FinalAnswer. Canonical item order is
+        // (created_at,item_id), not publication/sort_key or completion time.
+        let newer = Query::select()
+            .expr(Expr::val(1_i64))
+            .from_as(turn_item::Entity, Alias::new("later_item"))
+            .join(
+                JoinType::InnerJoin,
+                block::Entity,
+                Condition::all()
+                    .add(
+                        Expr::col((block::Entity, block::Column::TurnId)).eq(Expr::col((
+                            Alias::new("later_item"),
+                            turn_item::Column::TurnId,
+                        ))),
+                    )
+                    .add(
+                        Expr::col((block::Entity, block::Column::SourceKey)).eq(Expr::col((
+                            Alias::new("later_item"),
+                            turn_item::Column::ItemId,
+                        ))),
+                    ),
+            )
+            .and_where(
+                Expr::col((Alias::new("later_item"), turn_item::Column::TurnId))
+                    .eq(Expr::col((turn_item::Entity, turn_item::Column::TurnId))),
+            )
+            .and_where(block::Column::WorkspaceId.eq(workspace_id))
+            .and_where(block::Column::ThreadId.eq(thread_id))
+            .and_where(
+                block::Column::BlockKind
+                    .eq(super::thread_timeline_projection::BLOCK_KIND_ASSISTANT_MESSAGE),
+            )
+            .and_where(
+                Expr::col((Alias::new("later_item"), turn_item::Column::ItemType))
+                    .eq("agent_message"),
+            )
+            .cond_where(
+                Condition::any()
+                    .add(
+                        Expr::col((Alias::new("later_item"), turn_item::Column::CreatedAt))
+                            .gt(Expr::col((turn_item::Entity, turn_item::Column::CreatedAt))),
+                    )
+                    .add(
+                        Condition::all()
+                            .add(
+                                Expr::col((Alias::new("later_item"), turn_item::Column::CreatedAt))
+                                    .eq(Expr::col((
+                                        turn_item::Entity,
+                                        turn_item::Column::CreatedAt,
+                                    ))),
+                            )
+                            .add(
+                                Expr::col((Alias::new("later_item"), turn_item::Column::ItemId))
+                                    .gt(Expr::col((turn_item::Entity, turn_item::Column::ItemId))),
+                            ),
+                    ),
+            )
+            .to_owned();
+        let rows = turn_item::Entity::find()
+            .select_only()
+            .columns([
+                turn_item::Column::TurnId,
+                turn_item::Column::ItemId,
+                turn_item::Column::ItemType,
+                turn_item::Column::Payload,
+                turn_item::Column::Status,
+            ])
+            .column_as(Expr::exists(newer).not(), "is_last_final")
+            .join(
+                JoinType::InnerJoin,
+                turn_item::Entity::belongs_to(turn::Entity)
+                    .from(turn_item::Column::TurnId)
+                    .to(turn::Column::Id)
+                    .into(),
+            )
+            .join(
+                JoinType::InnerJoin,
+                turn::Entity::belongs_to(thread::Entity)
+                    .from(turn::Column::ThreadId)
+                    .to(thread::Column::Id)
+                    .into(),
+            )
+            .filter(thread::Column::WorkspaceId.eq(workspace_id))
+            .filter(turn::Column::ThreadId.eq(thread_id))
+            .filter(exact)
+            .into_model::<TimelineAssistantItemRow>()
+            .all(db)
+            .await
+            .context("failed to load exact timeline assistant items")?;
+        result.extend(rows);
+    }
+    Ok(result)
 }
 
 pub async fn list_turn_items_by_ids<C: ConnectionTrait>(
