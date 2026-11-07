@@ -183,7 +183,8 @@ impl MessageProcessor {
             .crud_store
             .database_connection()
             .work_signal("gateway.control")
-            .changing();
+            .changing()
+            .with_keys(&[pioneer_crud::GatewayControlWake::Skills.key()]);
         if let Err(error) = fs::create_dir_all(workspace_upload_dir.as_path())
             .and_then(|()| fs::create_dir(upload_dir.as_path()))
         {
@@ -843,7 +844,8 @@ impl MessageProcessor {
             .crud_store
             .database_connection()
             .work_signal("gateway.control")
-            .changing();
+            .changing()
+            .with_keys(&[pioneer_crud::GatewayControlWake::Skills.key()]);
         let cleanup_root = context.materialized_root.join(request_id.as_str());
         let _ = fs::remove_dir_all(cleanup_root.as_path());
         fs::create_dir_all(cleanup_root.as_path()).map_err(|error| {

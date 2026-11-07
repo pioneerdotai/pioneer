@@ -221,7 +221,13 @@ impl CrudStore {
                 events.push(outcome_event(task_id, runs.outcome.as_ref(), at)?);
             }
             let prepared = self.prepare_task_events_for_write(events).await?;
-            let control_change = self.connection.work_signal("gateway.control").changing();
+            let control_change = self.control_work_change(
+                "gateway.control",
+                &[
+                    crate::GatewayControlWake::Resources,
+                    crate::GatewayControlWake::Actions,
+                ],
+            );
             let mut action_changed = false;
             let tx = self.connection.begin().await?;
             let result: Result<Option<Vec<DeferredAppendedTaskEvent>>> = async {

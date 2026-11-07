@@ -8118,8 +8118,22 @@ impl MessageProcessor {
         &self,
         now: i64,
     ) -> anyhow::Result<Option<i64>> {
+        let (_, next, _) = self.capture_cli_background_deadlines(now).await?;
+        Ok(next
+            .into_iter()
+            .chain(self.next_cli_buffer_deadline(now).await)
+            .chain(self.cli_runtime_command_heartbeats.next_deadline().await)
+            .min())
+    }
+
+    pub(super) async fn capture_cli_background_deadlines(
+        &self,
+        now: i64,
+    ) -> anyhow::Result<(std::collections::BTreeMap<String, i64>, Option<i64>, bool)> {
         use pioneer_crud::CliRuntimeActiveTurnBindingStatus::{Running, Starting};
         let discovery = self.crud_store.with_maintenance_access();
+        let mut per_turn = std::collections::BTreeMap::new();
+        let mut overflow = false;
         let mut next_ms = None::<i64>;
         let mut include = |deadline: i64| {
             next_ms = Some(next_ms.map_or(deadline, |current| current.min(deadline)));
@@ -8146,81 +8160,15 @@ impl MessageProcessor {
                     .last()
                     .map(|binding| (binding.created_at, binding.turn_id.clone()));
                 for binding in bindings {
-                    let request_through = discovery
-                        .cli_runtime_pending_request_frontier_for_turn(&binding.turn_id)
-                        .await?;
-                    let mut request_after = None;
-                    let mut human_wait = false;
-                    while request_through.is_some() {
-                        let requests = discovery
-                            .list_cli_runtime_pending_requests(
-                                pioneer_crud::CliRuntimePendingRequestListFilter {
-                                    turn_id: Some(binding.turn_id.clone()),
-                                    open_only: true,
-                                    after: request_after.clone(),
-                                    through: request_through.clone(),
-                                    ..Default::default()
-                                },
-                            )
-                            .await?;
-                        let full = requests.len()
-                            == pioneer_crud::CLI_RUNTIME_PENDING_REQUEST_PAGE_MAX as usize;
-                        request_after = requests
-                            .last()
-                            .map(|request| (request.created_at, request.request_id.clone()));
-                        for request in requests {
-                            if request.workspace_id == binding.workspace_id
-                                && request.runtime_id == binding.runtime_id
-                                && request.thread_id == binding.thread_id
-                                && cli_runtime_pending_request_is_human_wait(&request.request_kind)
-                            {
-                                human_wait = true;
-                                include(
-                                    request
-                                        .created_at
-                                        .timestamp_millis()
-                                        .saturating_add(CLI_RUNTIME_HUMAN_RESPONSE_TIMEOUT_MS),
-                                );
-                                if matches!(
-                                    request.status,
-                                    StoredCliRuntimePendingRequestStatus::ResponseAccepted
-                                        | StoredCliRuntimePendingRequestStatus::Delivering
-                                ) {
-                                    include(
-                                        request
-                                            .updated_at
-                                            .timestamp_millis()
-                                            .saturating_add(30_000),
-                                    );
-                                }
+                    if let Some(at) = self.next_cli_binding_deadline(&binding, now).await? {
+                        include(at.saturating_mul(1000));
+                        if !overflow {
+                            per_turn.insert(binding.turn_id, at);
+                            if per_turn.len() > 4096 {
+                                per_turn.clear();
+                                overflow = true;
                             }
                         }
-                        if !full {
-                            break;
-                        }
-                    }
-                    // Reconciliation defers stale runtime observation while a
-                    // human response is pending; its own deadline owns the wake.
-                    if !human_wait {
-                        let observed =
-                            self.latest_cli_runtime_native_event_timestamp_ms(&binding)
-                                .await?
-                                .into_iter()
-                                .chain(
-                                    discovery.get_turn_liveness(&binding.turn_id).await?.map(
-                                        |value| value.last_activity_at_unix.saturating_mul(1000),
-                                    ),
-                                )
-                                .max();
-                        include(
-                            observed
-                                .unwrap_or(binding.updated_at.timestamp_millis())
-                                .saturating_add(if observed.is_some() {
-                                    CLI_RUNTIME_EVENTED_TURN_STALE_AFTER_MS
-                                } else {
-                                    CLI_RUNTIME_SILENT_TURN_STALE_AFTER_MS
-                                }),
-                        );
                     }
                 }
                 if !full {
@@ -8228,6 +8176,110 @@ impl MessageProcessor {
                 }
             }
         }
+        let next = next_ms.map(|ms| ms.saturating_add(999).div_euclid(1000));
+        Ok((per_turn, next, overflow))
+    }
+
+    async fn next_cli_binding_deadline(
+        &self,
+        binding: &pioneer_crud::CliRuntimeTurnBindingRecord,
+        now: i64,
+    ) -> anyhow::Result<Option<i64>> {
+        Ok(self
+            .next_cli_binding_deadline_raw(binding)
+            .await?
+            .map(|at| if at <= now { now.saturating_add(2) } else { at }))
+    }
+
+    async fn next_cli_binding_deadline_raw(
+        &self,
+        binding: &pioneer_crud::CliRuntimeTurnBindingRecord,
+    ) -> anyhow::Result<Option<i64>> {
+        let discovery = self.crud_store.with_maintenance_access();
+        let mut next_ms = None::<i64>;
+        let mut include = |at: i64| {
+            next_ms = Some(next_ms.map_or(at, |old| old.min(at)));
+        };
+        let request_through = discovery
+            .cli_runtime_pending_request_frontier_for_turn(&binding.turn_id)
+            .await?;
+        let mut request_after = None;
+        let mut human_wait = false;
+        while request_through.is_some() {
+            let requests = discovery
+                .list_cli_runtime_pending_requests(
+                    pioneer_crud::CliRuntimePendingRequestListFilter {
+                        turn_id: Some(binding.turn_id.clone()),
+                        open_only: true,
+                        after: request_after.clone(),
+                        through: request_through.clone(),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            let full =
+                requests.len() == pioneer_crud::CLI_RUNTIME_PENDING_REQUEST_PAGE_MAX as usize;
+            request_after = requests
+                .last()
+                .map(|request| (request.created_at, request.request_id.clone()));
+            for request in requests {
+                if request.workspace_id == binding.workspace_id
+                    && request.runtime_id == binding.runtime_id
+                    && request.thread_id == binding.thread_id
+                    && cli_runtime_pending_request_is_human_wait(&request.request_kind)
+                {
+                    human_wait = true;
+                    include(
+                        request
+                            .created_at
+                            .timestamp_millis()
+                            .saturating_add(CLI_RUNTIME_HUMAN_RESPONSE_TIMEOUT_MS),
+                    );
+                    if matches!(
+                        request.status,
+                        StoredCliRuntimePendingRequestStatus::ResponseAccepted
+                            | StoredCliRuntimePendingRequestStatus::Delivering
+                    ) {
+                        include(request.updated_at.timestamp_millis().saturating_add(30_000));
+                    }
+                }
+            }
+            if !full {
+                break;
+            }
+        }
+        // Reconciliation defers stale runtime observation while a
+        // human response is pending; its own deadline owns the wake.
+        if !human_wait {
+            let observed = self
+                .latest_cli_runtime_native_event_timestamp_ms(&binding)
+                .await?
+                .into_iter()
+                .chain(
+                    discovery
+                        .get_turn_liveness(&binding.turn_id)
+                        .await?
+                        .map(|value| value.last_activity_at_unix.saturating_mul(1000)),
+                )
+                .max();
+            include(
+                observed
+                    .unwrap_or(binding.updated_at.timestamp_millis())
+                    .saturating_add(if observed.is_some() {
+                        CLI_RUNTIME_EVENTED_TURN_STALE_AFTER_MS
+                    } else {
+                        CLI_RUNTIME_SILENT_TURN_STALE_AFTER_MS
+                    }),
+            );
+        }
+        Ok(next_ms.map(|ms| ms.saturating_add(999).div_euclid(1000)))
+    }
+
+    pub(super) async fn next_cli_buffer_deadline(&self, now: i64) -> Option<i64> {
+        let mut next_ms = None::<i64>;
+        let mut include = |at: i64| {
+            next_ms = Some(next_ms.map_or(at, |old| old.min(at)));
+        };
         for events in self.cli_runtime_pending_turn_events.lock().await.values() {
             if let Some(last) = events.iter().map(|event| event.received_at_unix_ms).max() {
                 include(last.saturating_add(CLI_RUNTIME_PENDING_UNBOUND_EVENT_TTL_MS));
@@ -8247,22 +8299,53 @@ impl MessageProcessor {
                 include(last.saturating_add(CLI_RUNTIME_PENDING_UNBOUND_EVENT_TTL_MS));
             }
         }
-        // A due obligation that remains after reconciliation needs a bounded
-        // retry (observation unavailable, transition lock busy, etc.). It is
-        // active work, never an empty-catalog fallback.
-        let durable = next_ms
+        next_ms
             .map(|ms| ms.saturating_add(999).div_euclid(1000))
-            .map(|deadline| {
-                if deadline <= now {
-                    now.saturating_add(2)
-                } else {
-                    deadline
-                }
-            });
-        Ok(durable
-            .into_iter()
-            .chain(self.cli_runtime_command_heartbeats.next_deadline().await)
-            .min())
+            .map(|at| if at <= now { now.saturating_add(2) } else { at })
+    }
+
+    pub(super) async fn prune_cli_control_buffers(&self, now: i64) {
+        self.prune_stale_cli_runtime_pending_turn_events(now.saturating_mul(1000))
+            .await;
+        self.prune_stale_cli_runtime_pending_turn_server_requests(now.saturating_mul(1000))
+            .await;
+    }
+
+    pub(super) async fn refresh_cli_control_turn(
+        &self,
+        turn_id: &str,
+        now: i64,
+        check_state: bool,
+    ) -> anyhow::Result<Option<i64>> {
+        let Some(binding) = self
+            .crud_store
+            .get_cli_runtime_turn_binding_control(turn_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        if !cli_runtime_turn_binding_status_is_active(&binding.status) {
+            return Ok(None);
+        }
+        if !check_state {
+            let next = self.next_cli_binding_deadline_raw(&binding).await?;
+            if next.is_none_or(|at| at > now) {
+                return Ok(next);
+            }
+        }
+        self.fail_stale_cli_runtime_turn_binding(binding, now.saturating_mul(1000))
+            .await?;
+        let Some(binding) = self
+            .crud_store
+            .get_cli_runtime_turn_binding_control(turn_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        if !cli_runtime_turn_binding_status_is_active(&binding.status) {
+            return Ok(None);
+        }
+        self.next_cli_binding_deadline(&binding, now).await
     }
 
     pub(super) async fn fail_stale_cli_runtime_turns(
@@ -9379,7 +9462,7 @@ impl MessageProcessor {
         self.crud_store
             .database_connection()
             .work_signal("gateway.control")
-            .notify();
+            .notify_keys(&[pioneer_crud::GatewayControlWake::Buffers.key()]);
     }
 
     async fn buffer_cli_runtime_codex_server_request_until_turn_binding(
@@ -9425,7 +9508,7 @@ impl MessageProcessor {
         self.crud_store
             .database_connection()
             .work_signal("gateway.control")
-            .notify();
+            .notify_keys(&[pioneer_crud::GatewayControlWake::Buffers.key()]);
         for request in evicted {
             self.fail_codex_machine_request(
                 &request.responder,

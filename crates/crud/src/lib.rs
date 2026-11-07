@@ -9,7 +9,7 @@ pub use codex_retry_notice::{CodexRetryNoticeTarget, codex_retry_notice_item_id}
 mod execution_heartbeat;
 mod frozen_lifetime;
 mod gateway_control;
-pub use gateway_control::GatewayControlConnection;
+pub use gateway_control::{GatewayControlConnection, GatewayControlWake};
 mod recovery_wake;
 pub use frozen_lifetime::FrozenReadHold;
 pub use pioneer_sqlite::{WorkSignal, WorkSubscription};
@@ -6076,10 +6076,14 @@ impl CrudStore {
         &self,
         binding: NewCliRuntimeThreadBinding,
     ) -> Result<CliRuntimeThreadBindingRecord> {
+        let control_wakes = vec![GatewayControlWake::Thread(
+            binding.runtime_id.clone(),
+            binding.thread_id.clone(),
+        )];
         let html_change = self.connection.work_signal("maintenance.html").changing();
         let frozen_change = self.connection.work_signal("maintenance.frozen").changing();
         let changes = ["gateway.control", "gateway.cli"]
-            .map(|domain| self.connection.work_signal(domain).changing());
+            .map(|domain| self.control_work_change(domain, &control_wakes));
         let result = async {
             let root = frozen_lifetime::PreparedFrozenRoot::cli(&binding.resume_cursor_json, true)?;
             self.run_serialized_write(|| async {
@@ -6509,6 +6513,10 @@ impl CrudStore {
         &self,
         binding: NewCliRuntimeTurnBinding,
     ) -> Result<CliRuntimeTurnBindingRecord> {
+        let control_wakes = vec![
+            GatewayControlWake::Turn(binding.turn_id.clone()),
+            GatewayControlWake::CommandTurn(binding.turn_id.clone()),
+        ];
         let html_change = self.connection.work_signal("maintenance.html").changing();
         let frozen_change = self.connection.work_signal("maintenance.frozen").changing();
         let changes = [
@@ -6517,7 +6525,7 @@ impl CrudStore {
             "maintenance.portable",
             "maintenance.native",
         ]
-        .map(|domain| self.connection.work_signal(domain).changing());
+        .map(|domain| self.control_work_change(domain, &control_wakes));
         let task_change = self.connection.work_signal("tasks.lifecycle").changing();
         let result = async {
             let root =
@@ -6674,9 +6682,13 @@ impl CrudStore {
         execution_owner_id: &str,
         capture_mapping: bool,
     ) -> Result<Option<CliRuntimeTurnBindingRecord>> {
+        let control_wakes = vec![
+            GatewayControlWake::Turn(turn_id.to_owned()),
+            GatewayControlWake::CommandTurn(turn_id.to_owned()),
+        ];
         let cli_changes = [
-            self.connection.work_signal("gateway.control").changing(),
-            self.connection.work_signal("gateway.cli").changing(),
+            self.control_work_change("gateway.control", &control_wakes),
+            self.control_work_change("gateway.cli", &control_wakes),
         ];
         let cli_result = async {
             let turn_id = turn_id.to_owned();
@@ -7087,9 +7099,13 @@ impl CrudStore {
         CliRuntimeTurnAttemptRecord,
         CliRuntimeExecutionSegmentRecord,
     )> {
+        let control_wakes = vec![
+            GatewayControlWake::Turn(turn_id.to_owned()),
+            GatewayControlWake::CommandTurn(turn_id.to_owned()),
+        ];
         let cli_changes = [
-            self.connection.work_signal("gateway.control").changing(),
-            self.connection.work_signal("gateway.cli").changing(),
+            self.control_work_change("gateway.control", &control_wakes),
+            self.control_work_change("gateway.cli", &control_wakes),
         ];
         let cli_result = async {
             let turn_id = turn_id.to_owned();
@@ -7273,13 +7289,17 @@ impl CrudStore {
             CliRuntimeExecutionSegmentRecord,
         )>,
     > {
+        let control_wakes = vec![GatewayControlWake::Native(
+            runtime_id.to_owned(),
+            native_turn_id.to_owned(),
+        )];
         let changes = [
             "gateway.control",
             "gateway.cli",
             "tasks.lifecycle",
             "maintenance.native",
         ]
-        .map(|domain| self.connection.work_signal(domain).changing());
+        .map(|domain| self.control_work_change(domain, &control_wakes));
         let result = async {
             let runtime_id = runtime_id.to_owned();
             let native_turn_id = native_turn_id.to_owned();
@@ -7365,13 +7385,14 @@ impl CrudStore {
         failure_reason: Option<String>,
         completed_at: sea_orm::entity::prelude::DateTimeWithTimeZone,
     ) -> Result<bool> {
+        let control_wakes = vec![GatewayControlWake::Attempt(id.to_owned())];
         let changes = [
             "gateway.control",
             "gateway.cli",
             "maintenance.native",
             "tasks.lifecycle",
         ]
-        .map(|domain| self.connection.work_signal(domain).changing());
+        .map(|domain| self.control_work_change(domain, &control_wakes));
         let result = async {
             self.run_serialized_write(|| async {
                 let transaction = self
@@ -7411,8 +7432,9 @@ impl CrudStore {
         recovery_attempt_id: &str,
         confirmed_at: sea_orm::entity::prelude::DateTimeWithTimeZone,
     ) -> Result<bool> {
+        let control_wakes = vec![GatewayControlWake::Attempt(id.to_owned())];
         let changes = ["gateway.control", "gateway.cli", "maintenance.native"]
-            .map(|domain| self.connection.work_signal(domain).changing());
+            .map(|domain| self.control_work_change(domain, &control_wakes));
         let result = async {
             self.run_serialized_write(|| async {
                 cli_runtime_binding::mark_turn_attempt_recovery_confirmed(
@@ -7441,10 +7463,14 @@ impl CrudStore {
         attempt_id: String,
         execution_window_index: u32,
     ) -> Result<(CliRuntimeTurnBindingRecord, CliRuntimeTurnAttemptRecord)> {
+        let control_wakes = vec![
+            GatewayControlWake::Turn(binding.turn_id.clone()),
+            GatewayControlWake::CommandTurn(binding.turn_id.clone()),
+        ];
         let html_change = self.connection.work_signal("maintenance.html").changing();
         let frozen_change = self.connection.work_signal("maintenance.frozen").changing();
         let changes = ["gateway.control", "gateway.cli", "maintenance.portable"]
-            .map(|domain| self.connection.work_signal(domain).changing());
+            .map(|domain| self.control_work_change(domain, &control_wakes));
         let result = async {
             let root =
                 frozen_lifetime::PreparedFrozenRoot::cli(&binding.input_mapping_json, false)?;
@@ -7604,9 +7630,13 @@ impl CrudStore {
         continuation: NewCliRuntimeNativeEvent,
         ack: NewCliRuntimeNativeEvent,
     ) -> Result<(CliRuntimeTurnBindingRecord, CliRuntimeTurnAttemptRecord)> {
+        let control_wakes = vec![
+            GatewayControlWake::Turn(source.turn_id.clone()),
+            GatewayControlWake::CommandTurn(source.turn_id.clone()),
+        ];
         let cli_changes = [
-            self.connection.work_signal("gateway.control").changing(),
-            self.connection.work_signal("gateway.cli").changing(),
+            self.control_work_change("gateway.control", &control_wakes),
+            self.control_work_change("gateway.cli", &control_wakes),
         ];
         let cli_result = async {
             let source_terminal_id = source.terminal_delivery_id();
@@ -7821,9 +7851,13 @@ impl CrudStore {
         prepared_at: sea_orm::entity::prelude::DateTimeWithTimeZone,
         terminal_source: Option<(pioneer_protocol::CliRuntimeBlockedTurnGuard, String, String)>,
     ) -> Result<(CliRuntimeTurnBindingRecord, CliRuntimeTurnAttemptRecord)> {
+        let control_wakes = vec![
+            GatewayControlWake::Turn(turn_id.to_owned()),
+            GatewayControlWake::CommandTurn(turn_id.to_owned()),
+        ];
         let cli_changes = [
-            self.connection.work_signal("gateway.control").changing(),
-            self.connection.work_signal("gateway.cli").changing(),
+            self.control_work_change("gateway.control", &control_wakes),
+            self.control_work_change("gateway.cli", &control_wakes),
         ];
         let cli_result = async {
         if execution_window_index == 0 {
@@ -8088,8 +8122,12 @@ impl CrudStore {
         execution_owner_id: Option<&str>,
         execution_lease_until: Option<sea_orm::entity::prelude::DateTimeWithTimeZone>,
     ) -> Result<(CliRuntimeTurnBindingRecord, CliRuntimeTurnAttemptRecord)> {
+        let control_wakes = vec![
+            GatewayControlWake::Turn(turn_id.to_owned()),
+            GatewayControlWake::CommandTurn(turn_id.to_owned()),
+        ];
         let changes = ["gateway.control", "gateway.cli", "maintenance.native"]
-            .map(|domain| self.connection.work_signal(domain).changing());
+            .map(|domain| self.control_work_change(domain, &control_wakes));
         let task_change = self.connection.work_signal("tasks.lifecycle").changing();
         let turn_id = turn_id.to_owned();
         let attempt_id = attempt_id.to_owned();
@@ -8478,8 +8516,13 @@ impl CrudStore {
         expected: &pioneer_protocol::CliRuntimeBlockedTurnGuard,
         owner_id: &str,
     ) -> Result<bool> {
+        let control_wakes = event
+            .turn_id
+            .as_ref()
+            .map(|id| vec![GatewayControlWake::Turn(id.clone())])
+            .unwrap_or_default();
         let changes = ["gateway.control", "gateway.cli", "maintenance.native"]
-            .map(|domain| self.connection.work_signal(domain).changing());
+            .map(|domain| self.control_work_change(domain, &control_wakes));
         let result = async {
             anyhow::ensure!(
                 event.runtime_id == expected.runtime_id
@@ -8623,6 +8666,12 @@ impl CrudStore {
         execution_owner_id: &str,
         event_timestamp_secs: i64,
     ) -> Result<bool> {
+        let control_wakes = vec![
+            GatewayControlWake::Turn(notification.turn.id.clone()),
+            GatewayControlWake::Resources,
+            GatewayControlWake::Supervision,
+            GatewayControlWake::Terminalization,
+        ];
         let receipt_keys = vec![notification.turn.id.clone()];
         let receipt_change = self
             .connection
@@ -8638,7 +8687,7 @@ impl CrudStore {
             "maintenance.html",
             "tasks.lifecycle",
         ]
-        .map(|domain| self.connection.work_signal(domain).changing());
+        .map(|domain| self.control_work_change(domain, &control_wakes));
         let result = async {
             let _release_wake = execution_heartbeat::ReleaseWake(self.execution_heartbeats.clone());
             anyhow::ensure!(
@@ -8900,6 +8949,10 @@ impl CrudStore {
         expected: Option<&CliRuntimeTurnTerminalGuard>,
         capture_mapping: bool,
     ) -> Result<Option<CliRuntimeTurnBindingRecord>> {
+        let control_wakes = vec![
+            GatewayControlWake::Turn(turn_id.to_owned()),
+            GatewayControlWake::CommandTurn(turn_id.to_owned()),
+        ];
         let changes = [
             "gateway.control",
             "gateway.cli",
@@ -8907,7 +8960,7 @@ impl CrudStore {
             "maintenance.portable",
             "maintenance.html",
         ]
-        .map(|domain| self.connection.work_signal(domain).changing());
+        .map(|domain| self.control_work_change(domain, &control_wakes));
         let task_change = self.connection.work_signal("tasks.lifecycle").changing();
         let result = async {
             if attempt_status.is_active() {
@@ -9068,9 +9121,12 @@ impl CrudStore {
         &self,
         request: NewCliRuntimePendingRequest,
     ) -> Result<CliRuntimePendingRequestRecord> {
+        let control_wakes = vec![GatewayControlWake::Request(
+            request.request_id.as_str().to_owned(),
+        )];
         let cli_changes = [
-            self.connection.work_signal("gateway.control").changing(),
-            self.connection.work_signal("gateway.cli").changing(),
+            self.control_work_change("gateway.control", &control_wakes),
+            self.control_work_change("gateway.cli", &control_wakes),
         ];
         let cli_result =
             async {
@@ -9111,9 +9167,12 @@ impl CrudStore {
         &self,
         request: NewCliRuntimePendingRequest,
     ) -> Result<CliRuntimePendingRequestRecord> {
+        let control_wakes = vec![GatewayControlWake::Request(
+            request.request_id.as_str().to_owned(),
+        )];
         let cli_changes = [
-            self.connection.work_signal("gateway.control").changing(),
-            self.connection.work_signal("gateway.cli").changing(),
+            self.control_work_change("gateway.control", &control_wakes),
+            self.control_work_change("gateway.cli", &control_wakes),
         ];
         let cli_result = async {
             self.run_serialized_write(|| async {
@@ -9158,9 +9217,12 @@ impl CrudStore {
         authorization: CliRuntimeRequestAuthorizationBinding,
         max_pending_requests: usize,
     ) -> Result<CliRuntimePendingRequestRecord> {
+        let control_wakes = vec![GatewayControlWake::Request(
+            request.request_id.as_str().to_owned(),
+        )];
         let cli_changes = [
-            self.connection.work_signal("gateway.control").changing(),
-            self.connection.work_signal("gateway.cli").changing(),
+            self.control_work_change("gateway.control", &control_wakes),
+            self.control_work_change("gateway.cli", &control_wakes),
         ];
         let cli_result = async {
             self.run_serialized_write(|| async {
@@ -9376,9 +9438,12 @@ impl CrudStore {
         &self,
         resolution: ResolveCliRuntimePendingRequest,
     ) -> Result<Option<CliRuntimePendingRequestRecord>> {
+        let control_wakes = vec![GatewayControlWake::Request(
+            resolution.request_id.as_str().to_owned(),
+        )];
         let cli_changes = [
-            self.connection.work_signal("gateway.control").changing(),
-            self.connection.work_signal("gateway.cli").changing(),
+            self.control_work_change("gateway.control", &control_wakes),
+            self.control_work_change("gateway.cli", &control_wakes),
         ];
         let cli_result = async {
             self.run_serialized_write(|| async {
@@ -9421,9 +9486,12 @@ impl CrudStore {
         &self,
         response: AcceptCliRuntimePendingRequestResponse,
     ) -> Result<Option<CliRuntimePendingRequestRecord>> {
+        let control_wakes = vec![GatewayControlWake::Request(
+            response.request_id.as_str().to_owned(),
+        )];
         let cli_changes = [
-            self.connection.work_signal("gateway.control").changing(),
-            self.connection.work_signal("gateway.cli").changing(),
+            self.control_work_change("gateway.control", &control_wakes),
+            self.control_work_change("gateway.cli", &control_wakes),
         ];
         let cli_result = async {
             self.run_serialized_write(|| async {
@@ -9468,9 +9536,12 @@ impl CrudStore {
         &self,
         transition: TransitionCliRuntimePendingRequestDelivery,
     ) -> Result<Option<CliRuntimePendingRequestRecord>> {
+        let control_wakes = vec![GatewayControlWake::Request(
+            transition.request_id.as_str().to_owned(),
+        )];
         let cli_changes = [
-            self.connection.work_signal("gateway.control").changing(),
-            self.connection.work_signal("gateway.cli").changing(),
+            self.control_work_change("gateway.control", &control_wakes),
+            self.control_work_change("gateway.cli", &control_wakes),
         ];
         let cli_result = async {
             self.run_serialized_write(|| async {
@@ -9518,9 +9589,10 @@ impl CrudStore {
         response_json: Option<String>,
         updated_at: sea_orm::entity::prelude::DateTimeWithTimeZone,
     ) -> Result<Option<CliRuntimePendingRequestRecord>> {
+        let control_wakes = vec![GatewayControlWake::Request(request_id.to_owned())];
         let cli_changes = [
-            self.connection.work_signal("gateway.control").changing(),
-            self.connection.work_signal("gateway.cli").changing(),
+            self.control_work_change("gateway.control", &control_wakes),
+            self.control_work_change("gateway.cli", &control_wakes),
         ];
         let cli_result =
             async {
@@ -9569,9 +9641,10 @@ impl CrudStore {
         response_json: Option<String>,
         updated_at: sea_orm::entity::prelude::DateTimeWithTimeZone,
     ) -> Result<Option<CliRuntimePendingRequestRecord>> {
+        let control_wakes = vec![GatewayControlWake::Request(request_id.to_owned())];
         let cli_changes = [
-            self.connection.work_signal("gateway.control").changing(),
-            self.connection.work_signal("gateway.cli").changing(),
+            self.control_work_change("gateway.control", &control_wakes),
+            self.control_work_change("gateway.cli", &control_wakes),
         ];
         let cli_result =
             async {
@@ -9618,10 +9691,15 @@ impl CrudStore {
         &self,
         event: NewCliRuntimeNativeEvent,
     ) -> Result<CliRuntimeNativeEventRecord> {
+        let control_wakes = event
+            .turn_id
+            .as_ref()
+            .map(|id| vec![GatewayControlWake::Activity(id.clone())])
+            .unwrap_or_default();
         let cleanup_turns = event.turn_id.iter().cloned().collect::<Vec<_>>();
         let cli_changes = [
-            self.connection.work_signal("gateway.control").changing(),
-            self.connection.work_signal("gateway.cli").changing(),
+            self.control_work_change("gateway.control", &control_wakes),
+            self.control_work_change("gateway.cli", &control_wakes),
         ];
         let cli_result = async {
             let cleanup_change = terminal_cleanup::Change::native(&self.connection);
@@ -9653,20 +9731,21 @@ impl CrudStore {
         &self,
         event: NewCliRuntimeNativeEvent,
     ) -> Result<CliRuntimeNativeEventRecord> {
+        let control_wakes = event
+            .turn_id
+            .as_ref()
+            .map(|id| vec![GatewayControlWake::Activity(id.clone())])
+            .unwrap_or_default();
         let cleanup_turns = event.turn_id.iter().cloned().collect::<Vec<_>>();
         let cli_changes = [
-            self.connection.work_signal("gateway.control").changing(),
-            self.connection.work_signal("gateway.cli").changing(),
+            self.control_work_change("gateway.control", &control_wakes),
+            self.control_work_change("gateway.cli", &control_wakes),
         ];
-        let cli_existed = self
-            .get_cli_runtime_native_event(&event.id)
-            .await?
-            .is_some();
         let cli_result = async {
             let cleanup_change = terminal_cleanup::Change::native(&self.connection);
             let maintenance_result = async {
                 self.run_serialized_write(|| async {
-                    cli_runtime_binding::append_native_event_if_absent(
+                    cli_runtime_binding::append_native_event_if_absent_with_outcome(
                         &self.connection,
                         event.clone(),
                     )
@@ -9675,10 +9754,9 @@ impl CrudStore {
                 .await
             }
             .await;
-            // The earlier existence probe is advisory: a concurrent cleanup
-            // can remove that row before this append commits. Preserve the
-            // terminal-turn wake even when the earlier reader saw a duplicate.
-            let maintenance_changed = maintenance_result.is_ok();
+            let maintenance_changed = maintenance_result
+                .as_ref()
+                .is_ok_and(|(_, changed)| *changed);
             if maintenance_result.is_ok() {
                 cleanup_change
                     .complete(&self.connection, maintenance_changed, &cleanup_turns)
@@ -9687,12 +9765,12 @@ impl CrudStore {
             maintenance_result
         }
         .await;
-        if cli_result.is_ok() {
+        if let Ok((_, changed)) = &cli_result {
             for cli_change in cli_changes {
-                cli_change.completed(cli_result.is_ok() && !cli_existed);
+                cli_change.completed(*changed);
             }
         }
-        cli_result
+        cli_result.map(|(record, _)| record)
     }
 
     pub async fn list_cli_runtime_native_events(
@@ -9736,12 +9814,14 @@ impl CrudStore {
         transition: NativeExecutionWindowTransition,
         event_timestamp_secs: i64,
     ) -> Result<()> {
+        let control_wakes =
+            gateway_control::event_wakes(std::slice::from_ref(&transition.event_payload()));
         // These events advance replay/delivery receipts and compressed raw
         // history; started/checkpointed/continued also update recovery liveness.
         let cleanup_turns = vec![transition.event_payload().turn_id().to_owned()];
         let cleanup_change = terminal_cleanup::Change::events(&self.connection);
         let changes = ["gateway.control", "projection", "maintenance.zstd"]
-            .map(|domain| self.connection.work_signal(domain).changing());
+            .map(|domain| self.control_work_change(domain, &control_wakes));
         let result = async {
         let _release_wake = matches!(&transition, NativeExecutionWindowTransition::Blocked { .. })
             .then(|| execution_heartbeat::ReleaseWake(self.execution_heartbeats.clone()));
@@ -16520,7 +16600,8 @@ impl CrudStore {
         expected: &TurnExecutionRecord,
         lease_seconds: i64,
     ) -> Result<bool> {
-        let control_change = self.connection.work_signal("gateway.control").changing();
+        let control_wakes = vec![GatewayControlWake::Supervision];
+        let control_change = self.control_work_change("gateway.control", &control_wakes);
         let control_result = async {
             self.run_serialized_write(|| async {
                 let tx = self.connection.begin().await?;
@@ -16555,7 +16636,11 @@ impl CrudStore {
         &self,
         expected: &TurnExecutionRecord,
     ) -> Result<bool> {
-        let control_change = self.connection.work_signal("gateway.control").changing();
+        let control_wakes = vec![
+            GatewayControlWake::Supervision,
+            GatewayControlWake::Terminalization,
+        ];
+        let control_change = self.control_work_change("gateway.control", &control_wakes);
         let control_result = async {
             self.run_serialized_write(|| async {
                 let tx = self.connection.begin().await?;
@@ -16601,7 +16686,8 @@ impl CrudStore {
         started_at_unix: i64,
         lease_until_unix: i64,
     ) -> Result<bool> {
-        let control_change = self.connection.work_signal("gateway.control").changing();
+        let control_wakes = vec![GatewayControlWake::Supervision];
+        let control_change = self.control_work_change("gateway.control", &control_wakes);
         let control_result = async {
             let turn_id = turn_id.to_owned();
             let owner_id = owner_id.to_owned();
@@ -16679,7 +16765,8 @@ impl CrudStore {
         claimed_at_unix: i64,
         lease_until_unix: i64,
     ) -> Result<Option<TurnExecutionRecord>> {
-        let control_change = self.connection.work_signal("gateway.control").changing();
+        let control_wakes = vec![GatewayControlWake::Supervision];
+        let control_change = self.control_work_change("gateway.control", &control_wakes);
         let control_result = async {
             let _ownership_change = self.execution_heartbeats.changing(new_owner_id);
             let expected = expected.clone();
@@ -16974,6 +17061,14 @@ impl CrudStore {
         turn_id: &str,
         event_timestamp_secs: i64,
     ) -> Result<TurnFinalizationCommitOutcome> {
+        let control_wakes = vec![
+            GatewayControlWake::Turn(turn_id.into()),
+            GatewayControlWake::Resources,
+            GatewayControlWake::Ledger,
+            GatewayControlWake::NativeRetention,
+            GatewayControlWake::Supervision,
+            GatewayControlWake::Terminalization,
+        ];
         let receipt_keys = vec![turn_id.to_owned()];
         let receipt_change = self
             .connection
@@ -16988,7 +17083,7 @@ impl CrudStore {
             "maintenance.native",
             "maintenance.html",
         ]
-        .map(|domain| self.connection.work_signal(domain).changing());
+        .map(|domain| self.control_work_change(domain, &control_wakes));
         let task_change =
             crate::task_events::TaskTurnChange::begin(&self.connection, vec![turn_id.to_owned()])
                 .await?;
@@ -17322,13 +17417,14 @@ impl CrudStore {
         notification: pioneer_protocol::ItemUpdatedNotification,
         event_timestamp_secs: i64,
     ) -> Result<()> {
+        let control_wakes = vec![GatewayControlWake::Activity(notification.turn_id.clone())];
         let maintenance_changes = [
             "gateway.control",
             "compaction",
             "maintenance.zstd",
             "maintenance.html",
         ]
-        .map(|domain| self.connection.work_signal(domain).changing());
+        .map(|domain| self.control_work_change(domain, &control_wakes));
         let maintenance_result = async {
         let updated_at = unix_to_datetime(event_timestamp_secs);
         let status =
@@ -19223,7 +19319,8 @@ impl CrudStore {
         &self,
         input: AgentExecutionGraphCommitInput,
     ) -> Result<AgentExecutionGraphCommitResult> {
-        let control_change = self.connection.work_signal("gateway.control").changing();
+        let control_wakes = vec![GatewayControlWake::Resources, GatewayControlWake::Actions];
+        let control_change = self.control_work_change("gateway.control", &control_wakes);
         let control_result = async {
             self.run_serialized_write(|| {
                 let input = input.clone();
@@ -19269,7 +19366,8 @@ impl CrudStore {
         idle_timeout_secs: i64,
         hard_timeout_secs: i64,
     ) -> Result<Vec<PromotedAgentExecution>> {
-        let control_change = self.connection.work_signal("gateway.control").changing();
+        let control_wakes = vec![GatewayControlWake::Resources, GatewayControlWake::Actions];
+        let control_change = self.control_work_change("gateway.control", &control_wakes);
         let control_result = async {
             let change = crate::task_events::TaskWorkChange::new(&self.connection);
             let task_result = async {
@@ -19325,7 +19423,12 @@ impl CrudStore {
         terminal_status: &str,
         finished_at: sea_orm::prelude::DateTimeWithTimeZone,
     ) -> Result<bool> {
-        let control_change = self.connection.work_signal("gateway.control").changing();
+        let control_wakes = vec![
+            GatewayControlWake::Resources,
+            GatewayControlWake::Actions,
+            GatewayControlWake::Ledger,
+        ];
+        let control_change = self.control_work_change("gateway.control", &control_wakes);
         let control_result = async {
             let task_change = self.connection.work_signal("tasks.lifecycle").changing();
             let task_result =
@@ -19374,7 +19477,12 @@ impl CrudStore {
         execution_id: &str,
         now: DateTimeWithTimeZone,
     ) -> Result<bool> {
-        let control_change = self.connection.work_signal("gateway.control").changing();
+        let control_wakes = vec![
+            GatewayControlWake::Resources,
+            GatewayControlWake::Actions,
+            GatewayControlWake::Ledger,
+        ];
+        let control_change = self.control_work_change("gateway.control", &control_wakes);
         let control_result = async {
             let task_change = self.connection.work_signal("tasks.lifecycle").changing();
             let task_result = async {
@@ -19599,7 +19707,8 @@ impl CrudStore {
         started_at: i64,
         lease_until: Option<i64>,
     ) -> Result<Option<TaskRunExecution>> {
-        let control_change = self.connection.work_signal("gateway.control").changing();
+        let control_wakes = vec![GatewayControlWake::Resources, GatewayControlWake::Actions];
+        let control_change = self.control_work_change("gateway.control", &control_wakes);
         let control_result = async {
             let change =
                 crate::task_events::TaskWorkChange::for_source(&self.connection, "e", execution_id);
@@ -19645,7 +19754,12 @@ impl CrudStore {
         result: Option<&TaskResult>,
         error: Option<&TaskError>,
     ) -> Result<Option<TaskRunExecution>> {
-        let control_change = self.connection.work_signal("gateway.control").changing();
+        let control_wakes = vec![
+            GatewayControlWake::Resources,
+            GatewayControlWake::Actions,
+            GatewayControlWake::Ledger,
+        ];
+        let control_change = self.control_work_change("gateway.control", &control_wakes);
         let control_result = async {
             let change =
                 crate::task_events::TaskWorkChange::for_source(&self.connection, "e", execution_id);
@@ -20058,7 +20172,8 @@ impl CrudStore {
         &self,
         candidate: TaskResultCandidate,
     ) -> Result<TaskResultCandidate> {
-        let control_change = self.connection.work_signal("gateway.control").changing();
+        let control_wakes = vec![GatewayControlWake::Actions];
+        let control_change = self.control_work_change("gateway.control", &control_wakes);
         let control_result =
             async {
                 let change = crate::task_events::TaskWorkChange::for_tasks(
@@ -20206,7 +20321,8 @@ impl CrudStore {
         resolved_at: Option<i64>,
         updated_at: i64,
     ) -> Result<Option<TaskResultCandidate>> {
-        let control_change = self.connection.work_signal("gateway.control").changing();
+        let control_wakes = vec![GatewayControlWake::Actions];
+        let control_change = self.control_work_change("gateway.control", &control_wakes);
         let control_result = async {
             let persisted = self
                 .run_serialized_write(|| async {
@@ -22322,7 +22438,19 @@ impl CrudStore {
         error: Option<&str>,
         event_timestamp_secs: i64,
     ) -> Result<bool> {
+        let mut control_wakes = vec![GatewayControlWake::Turn(turn_id.to_owned())];
+        if status != TurnStatus::InProgress {
+            control_wakes.extend([
+                GatewayControlWake::Resources,
+                GatewayControlWake::Actions,
+                GatewayControlWake::Ledger,
+                GatewayControlWake::NativeRetention,
+                GatewayControlWake::Supervision,
+                GatewayControlWake::Terminalization,
+            ]);
+        }
         let changes = [
+            self.control_work_change("gateway.control", &control_wakes),
             self.connection.work_signal("projection").changing(),
             self.connection.work_signal("compaction").changing(),
         ];
@@ -25342,7 +25470,8 @@ impl CrudStore {
         &self,
         record: &SkillUploadSessionRecord,
     ) -> Result<()> {
-        let control_change = self.connection.work_signal("gateway.control").changing();
+        let control_wakes = vec![GatewayControlWake::Skills];
+        let control_change = self.control_work_change("gateway.control", &control_wakes);
         let control_result = async {
             self.run_serialized_write(|| async {
                 let created_at = unix_to_datetime(record.created_at_unix);
@@ -25403,7 +25532,8 @@ impl CrudStore {
         aborted_at_unix: Option<i64>,
         updated_at_unix: i64,
     ) -> Result<Option<SkillUploadSessionRecord>> {
-        let control_change = self.connection.work_signal("gateway.control").changing();
+        let control_wakes = vec![GatewayControlWake::Skills];
+        let control_change = self.control_work_change("gateway.control", &control_wakes);
         let control_result = async {
             self.run_serialized_write(|| async {
                 let updated_at = unix_to_datetime(updated_at_unix);
@@ -27749,7 +27879,8 @@ impl CrudStore {
         idle_deadline_at_unix: Option<i64>,
         hard_deadline_at_unix: Option<i64>,
     ) -> Result<bool> {
-        let control_change = self.connection.work_signal("gateway.control").changing();
+        let control_wakes = vec![GatewayControlWake::Turn(turn_id.into())];
+        let control_change = self.control_work_change("gateway.control", &control_wakes);
         let control_result = async {
             self.run_serialized_write(|| async {
                 turn_item_attempt::configure_running_attempt_deadlines(
@@ -27807,7 +27938,8 @@ impl CrudStore {
         hard_deadline_at_unix: Option<i64>,
         activity_kind: &str,
     ) -> Result<bool> {
-        let control_change = self.connection.work_signal("gateway.control").changing();
+        let control_wakes = vec![GatewayControlWake::Activity(turn_id.into())];
+        let control_change = self.control_work_change("gateway.control", &control_wakes);
         let control_result = async {
             self.run_serialized_write(|| async {
                 let heartbeat_at = unix_to_datetime(heartbeat_at_unix);
@@ -27871,7 +28003,8 @@ impl CrudStore {
         activity_kind: &str,
         observed_at_unix: i64,
     ) -> Result<bool> {
-        let cli_change = self.connection.work_signal("gateway.control").changing();
+        let control_wakes = vec![GatewayControlWake::Activity(turn_id.into())];
+        let cli_change = self.control_work_change("gateway.control", &control_wakes);
         let cli_result = async {
             self.run_serialized_write(|| async {
                 let Some(turn_model) = turn::find_turn_by_id(&self.connection, turn_id).await?
@@ -27938,11 +28071,34 @@ impl CrudStore {
         limit: u64,
         after: Option<&TimeoutCandidateCursor>,
     ) -> Result<(Vec<TimeoutCandidate>, Option<TimeoutCandidateCursor>)> {
-        let (rows, next) = turn_item_attempt::list_expired_running_attempt_page(
+        self.list_timeout_candidate_page_scoped(None, now_unix, limit, after)
+            .await
+    }
+
+    pub async fn list_timeout_candidate_page_for_turn(
+        &self,
+        turn_id: &str,
+        now_unix: i64,
+        limit: u64,
+        after: Option<&TimeoutCandidateCursor>,
+    ) -> Result<(Vec<TimeoutCandidate>, Option<TimeoutCandidateCursor>)> {
+        self.list_timeout_candidate_page_scoped(Some(turn_id), now_unix, limit, after)
+            .await
+    }
+
+    async fn list_timeout_candidate_page_scoped(
+        &self,
+        turn_id: Option<&str>,
+        now_unix: i64,
+        limit: u64,
+        after: Option<&TimeoutCandidateCursor>,
+    ) -> Result<(Vec<TimeoutCandidate>, Option<TimeoutCandidateCursor>)> {
+        let (rows, next) = turn_item_attempt::list_expired_running_attempt_page_scoped(
             &self.connection,
             unix_to_datetime(now_unix),
             limit,
             after,
+            turn_id,
         )
         .await?;
 
@@ -28146,14 +28302,48 @@ impl CrudStore {
         upper_id: &str,
         limit: u64,
     ) -> Result<(Vec<RunningTurnItemAttempt>, Option<String>)> {
-        let (rows, next) = turn_item_attempt::list_running_attempt_page_by_item_type_bounded(
-            &self.connection,
+        self.list_running_turn_item_attempt_page_by_type_bounded_scoped(
+            None, item_type, after_id, upper_id, limit,
+        )
+        .await
+    }
+
+    pub async fn list_running_turn_item_attempt_page_by_type_bounded_for_turn(
+        &self,
+        turn_id: &str,
+        item_type: TurnItemType,
+        after_id: Option<&str>,
+        upper_id: &str,
+        limit: u64,
+    ) -> Result<(Vec<RunningTurnItemAttempt>, Option<String>)> {
+        self.list_running_turn_item_attempt_page_by_type_bounded_scoped(
+            Some(turn_id),
             item_type,
             after_id,
             upper_id,
             limit,
         )
-        .await?;
+        .await
+    }
+
+    async fn list_running_turn_item_attempt_page_by_type_bounded_scoped(
+        &self,
+        turn_id: Option<&str>,
+        item_type: TurnItemType,
+        after_id: Option<&str>,
+        upper_id: &str,
+        limit: u64,
+    ) -> Result<(Vec<RunningTurnItemAttempt>, Option<String>)> {
+        let (rows, next) =
+            turn_item_attempt::list_running_attempt_page_by_item_type_bounded_scoped(
+                &self.connection,
+                item_type,
+                after_id,
+                upper_id,
+                limit,
+                turn_id,
+            )
+            .await?;
         let attempts = rows
             .into_iter()
             .filter_map(|row| {
@@ -29427,7 +29617,11 @@ impl CrudStore {
         candidate: &TimeoutCandidate,
         now_unix: i64,
     ) -> Result<bool> {
-        let control_change = self.connection.work_signal("gateway.control").changing();
+        let control_wakes = vec![
+            GatewayControlWake::Turn(candidate.turn_id.clone()),
+            GatewayControlWake::Supervision,
+        ];
+        let control_change = self.control_work_change("gateway.control", &control_wakes);
         let control_result = async {
             let now = unix_to_datetime(now_unix);
             let snapshot = turn_item_attempt::RunningAttemptSnapshot {
@@ -29523,7 +29717,11 @@ impl CrudStore {
         heartbeat_at_unix: i64,
         deadlines: TurnItemAttemptDeadlines,
     ) -> Result<bool> {
-        let control_change = self.connection.work_signal("gateway.control").changing();
+        let control_wakes = vec![
+            GatewayControlWake::Timeouts,
+            GatewayControlWake::Supervision,
+        ];
+        let control_change = self.control_work_change("gateway.control", &control_wakes);
         let control_result = async {
             let attempt_id = attempt_id.to_owned();
             let Some(prepared) = turn_item_attempt::prepare_timed_out_attempt_reactivation(
@@ -29594,9 +29792,13 @@ impl CrudStore {
         policy_snapshot: serde_json::Value,
         now_unix: i64,
     ) -> Result<RecoveryJobRecord> {
+        let control_wakes = vec![
+            GatewayControlWake::Supervision,
+            GatewayControlWake::Terminalization,
+        ];
         let _recovery_change = recovery_wake::RecoveryChange(self.recovery_work.clone());
         let changes = ["gateway.control", "recovery.due"]
-            .map(|domain| self.connection.work_signal(domain).changing());
+            .map(|domain| self.control_work_change(domain, &control_wakes));
         let result = async {
             self.run_serialized_write(|| async {
                 let now = unix_to_datetime(now_unix);
@@ -29705,9 +29907,13 @@ impl CrudStore {
         diagnostic: Option<pioneer_protocol::RecoveryDiagnostic>,
         now_unix: i64,
     ) -> Result<AtomicRecoveryJobEnqueueOutcome> {
+        let control_wakes = vec![
+            GatewayControlWake::Supervision,
+            GatewayControlWake::Terminalization,
+        ];
         let _recovery_change = recovery_wake::RecoveryChange(self.recovery_work.clone());
         let changes = ["gateway.control", "recovery.due"]
-            .map(|domain| self.connection.work_signal(domain).changing());
+            .map(|domain| self.control_work_change(domain, &control_wakes));
         let result = async {
             let diagnostic_json = diagnostic.as_ref().map(serde_json::to_string).transpose()?;
             self.run_serialized_write(|| async {
@@ -29796,7 +30002,11 @@ impl CrudStore {
         action: RecoveryAction,
         now_unix: i64,
     ) -> Result<bool> {
-        let control_change = self.connection.work_signal("gateway.control").changing();
+        let control_wakes = vec![
+            GatewayControlWake::Supervision,
+            GatewayControlWake::Terminalization,
+        ];
+        let control_change = self.control_work_change("gateway.control", &control_wakes);
         let control_result = async {
             self.run_serialized_write(|| async {
                 turn_item_attempt::mark_recovery_action(
@@ -30013,9 +30223,13 @@ impl CrudStore {
         now_unix: i64,
         accepted_cli_outcome: Option<&pioneer_protocol::CliRuntimeBlockedTurnGuard>,
     ) -> Result<bool> {
+        let control_wakes = vec![
+            GatewayControlWake::Supervision,
+            GatewayControlWake::Terminalization,
+        ];
         let _recovery_change = recovery_wake::RecoveryChange(self.recovery_work.clone());
         let changes = ["gateway.control", "recovery.due"]
-            .map(|domain| self.connection.work_signal(domain).changing());
+            .map(|domain| self.control_work_change(domain, &control_wakes));
         let result = async {
             let diagnostic_json = diagnostic.as_ref().map(serde_json::to_string).transpose()?;
             let last_error_value = last_error.clone();
@@ -30071,9 +30285,13 @@ impl CrudStore {
         last_error: Option<String>,
         now_unix: i64,
     ) -> Result<bool> {
+        let control_wakes = vec![
+            GatewayControlWake::Supervision,
+            GatewayControlWake::Terminalization,
+        ];
         let _recovery_change = recovery_wake::RecoveryChange(self.recovery_work.clone());
         let changes = ["gateway.control", "recovery.due"]
-            .map(|domain| self.connection.work_signal(domain).changing());
+            .map(|domain| self.control_work_change(domain, &control_wakes));
         let result = async {
             let last_error_value = last_error.clone();
             let cli_source = self
@@ -30118,9 +30336,13 @@ impl CrudStore {
         last_error: Option<String>,
         now_unix: i64,
     ) -> Result<bool> {
+        let control_wakes = vec![
+            GatewayControlWake::Supervision,
+            GatewayControlWake::Terminalization,
+        ];
         let _recovery_change = recovery_wake::RecoveryChange(self.recovery_work.clone());
         let changes = ["gateway.control", "recovery.due"]
-            .map(|domain| self.connection.work_signal(domain).changing());
+            .map(|domain| self.control_work_change(domain, &control_wakes));
         let result = async {
             let last_error_value = last_error.clone();
             self.run_serialized_write(|| async {
@@ -30152,7 +30374,11 @@ impl CrudStore {
         active_attempt_id: &str,
         now_unix: i64,
     ) -> Result<ClaimedRecoveryActivation> {
-        let control_change = self.connection.work_signal("gateway.control").changing();
+        let control_wakes = vec![
+            GatewayControlWake::Supervision,
+            GatewayControlWake::Terminalization,
+        ];
+        let control_change = self.control_work_change("gateway.control", &control_wakes);
         let control_result = async {
             self.run_serialized_write(|| async {
                 let outcome = recovery_job::mark_claimed_job_active(
@@ -30192,7 +30418,11 @@ impl CrudStore {
         last_error: Option<String>,
         now_unix: i64,
     ) -> Result<bool> {
-        let control_change = self.connection.work_signal("gateway.control").changing();
+        let control_wakes = vec![
+            GatewayControlWake::Supervision,
+            GatewayControlWake::Terminalization,
+        ];
+        let control_change = self.control_work_change("gateway.control", &control_wakes);
         let control_result = async {
             let last_error_value = last_error.clone();
             self.run_serialized_write(|| async {
@@ -30238,8 +30468,12 @@ impl CrudStore {
         diagnostic: Option<pioneer_protocol::RecoveryDiagnostic>,
         now_unix: i64,
     ) -> Result<bool> {
+        let control_wakes = vec![
+            GatewayControlWake::Supervision,
+            GatewayControlWake::Terminalization,
+        ];
         let changes = ["gateway.control", "maintenance.native", "recovery.due"]
-            .map(|domain| self.connection.work_signal(domain).changing());
+            .map(|domain| self.control_work_change(domain, &control_wakes));
         let _recovery_change = recovery_wake::RecoveryChange(self.recovery_work.clone());
         let result = async {
             let diagnostic_json = diagnostic.as_ref().map(serde_json::to_string).transpose()?;
@@ -30326,8 +30560,12 @@ impl CrudStore {
         diagnostic: Option<pioneer_protocol::RecoveryDiagnostic>,
         now_unix: i64,
     ) -> Result<bool> {
+        let control_wakes = vec![
+            GatewayControlWake::Supervision,
+            GatewayControlWake::Terminalization,
+        ];
         let changes = ["gateway.control", "maintenance.native", "recovery.due"]
-            .map(|domain| self.connection.work_signal(domain).changing());
+            .map(|domain| self.control_work_change(domain, &control_wakes));
         let _recovery_change = recovery_wake::RecoveryChange(self.recovery_work.clone());
         let result = async {
             let diagnostic_json = diagnostic.as_ref().map(serde_json::to_string).transpose()?;
@@ -30402,8 +30640,12 @@ impl CrudStore {
         last_error: Option<String>,
         now_unix: i64,
     ) -> Result<bool> {
+        let control_wakes = vec![
+            GatewayControlWake::Supervision,
+            GatewayControlWake::Terminalization,
+        ];
         let changes = ["gateway.control", "maintenance.native", "recovery.due"]
-            .map(|domain| self.connection.work_signal(domain).changing());
+            .map(|domain| self.control_work_change(domain, &control_wakes));
         let _recovery_change = recovery_wake::RecoveryChange(self.recovery_work.clone());
         let result = async {
             let last_error_value = last_error.clone();
@@ -30488,8 +30730,12 @@ impl CrudStore {
         diagnostic: Option<pioneer_protocol::RecoveryDiagnostic>,
         now_unix: i64,
     ) -> Result<bool> {
+        let control_wakes = vec![
+            GatewayControlWake::Supervision,
+            GatewayControlWake::Terminalization,
+        ];
         let changes = ["gateway.control", "maintenance.native", "recovery.due"]
-            .map(|domain| self.connection.work_signal(domain).changing());
+            .map(|domain| self.control_work_change(domain, &control_wakes));
         let _recovery_change = recovery_wake::RecoveryChange(self.recovery_work.clone());
         let result = async {
             let diagnostic_json = diagnostic.as_ref().map(serde_json::to_string).transpose()?;
@@ -30586,8 +30832,12 @@ impl CrudStore {
         now_unix: i64,
         accepted_cli_outcome: Option<&pioneer_protocol::CliRuntimeBlockedTurnGuard>,
     ) -> Result<bool> {
+        let control_wakes = vec![
+            GatewayControlWake::Supervision,
+            GatewayControlWake::Terminalization,
+        ];
         let changes = ["gateway.control", "maintenance.native", "recovery.due"]
-            .map(|domain| self.connection.work_signal(domain).changing());
+            .map(|domain| self.control_work_change(domain, &control_wakes));
         let _recovery_change = recovery_wake::RecoveryChange(self.recovery_work.clone());
         let result = async {
             let diagnostic_json = diagnostic.as_ref().map(serde_json::to_string).transpose()?;
@@ -30700,9 +30950,13 @@ impl CrudStore {
         diagnostic: Option<pioneer_protocol::RecoveryDiagnostic>,
         now_unix: i64,
     ) -> Result<bool> {
+        let control_wakes = vec![
+            GatewayControlWake::Supervision,
+            GatewayControlWake::Terminalization,
+        ];
         let _recovery_change = recovery_wake::RecoveryChange(self.recovery_work.clone());
         let changes = ["gateway.control", "recovery.due"]
-            .map(|domain| self.connection.work_signal(domain).changing());
+            .map(|domain| self.control_work_change(domain, &control_wakes));
         let result = async {
             anyhow::ensure!(
                 matches!(
@@ -31135,7 +31389,11 @@ impl CrudStore {
         preparation: pioneer_protocol::NativeTerminalEffectPreparation,
         now_unix: i64,
     ) -> Result<()> {
-        let control_change = self.connection.work_signal("gateway.control").changing();
+        let control_wakes = vec![
+            GatewayControlWake::NativeRetention,
+            GatewayControlWake::Actions,
+        ];
+        let control_change = self.control_work_change("gateway.control", &control_wakes);
         let control_result = async {
             let prepared = native_terminal_effect_outbox::prepare_input(preparation)?;
             self.run_serialized_write(|| {
@@ -31512,7 +31770,11 @@ impl CrudStore {
         claim_token: &str,
         now_unix: i64,
     ) -> Result<bool> {
-        let control_change = self.connection.work_signal("gateway.control").changing();
+        let control_wakes = vec![
+            GatewayControlWake::NativeRetention,
+            GatewayControlWake::Actions,
+        ];
+        let control_change = self.control_work_change("gateway.control", &control_wakes);
         let control_result = async {
             self.run_serialized_write(|| {
                 native_terminal_effect_outbox::mark_succeeded(
@@ -31745,7 +32007,8 @@ impl CrudStore {
         claim_lease_secs: u64,
         limit: u64,
     ) -> Result<Vec<ClaimedRecoveryTerminalizationRecord>> {
-        let control_change = self.connection.work_signal("gateway.control").changing();
+        let control_wakes = vec![GatewayControlWake::Terminalization];
+        let control_change = self.control_work_change("gateway.control", &control_wakes);
         let native_change = self.connection.work_signal("maintenance.native").changing();
         let result = self
             .run_serialized_write(|| async {
@@ -31862,7 +32125,8 @@ impl CrudStore {
         limit: u64,
         now_unix: i64,
     ) -> Result<u64> {
-        let control_change = self.connection.work_signal("gateway.control").changing();
+        let control_wakes = vec![GatewayControlWake::Terminalization];
+        let control_change = self.control_work_change("gateway.control", &control_wakes);
         let control_result = async {
             if limit == 0 {
                 return Ok(0);
@@ -31942,7 +32206,8 @@ impl CrudStore {
         retry_at_unix: i64,
         now_unix: i64,
     ) -> Result<bool> {
-        let control_change = self.connection.work_signal("gateway.control").changing();
+        let control_wakes = vec![GatewayControlWake::Terminalization];
+        let control_change = self.control_work_change("gateway.control", &control_wakes);
         let control_result = async {
             self.run_serialized_write(|| async {
                 recovery_terminalization_outbox::mark_failed(
@@ -32789,6 +33054,15 @@ impl CrudStore {
         cleanup_plan: RecoveryTerminalCleanupPlan,
         event_timestamp_secs: i64,
     ) -> Result<RecoveryTerminalizationApplyOutcome> {
+        let control_wakes = vec![
+            GatewayControlWake::Turn(record.turn_id.clone()),
+            GatewayControlWake::Resources,
+            GatewayControlWake::Actions,
+            GatewayControlWake::Supervision,
+            GatewayControlWake::Terminalization,
+            GatewayControlWake::Ledger,
+            GatewayControlWake::NativeRetention,
+        ];
         let receipt_keys = vec![record.turn_id.clone()];
         let receipt_change = self
             .connection
@@ -32803,7 +33077,7 @@ impl CrudStore {
             "maintenance.html",
             "tasks.lifecycle",
         ]
-        .map(|domain| self.connection.work_signal(domain).changing());
+        .map(|domain| self.control_work_change(domain, &control_wakes));
         let native_change = self.connection.work_signal("maintenance.native").changing();
         let control_result = async {
         let _release_wake = execution_heartbeat::ReleaseWake(self.execution_heartbeats.clone());
@@ -33119,9 +33393,13 @@ impl CrudStore {
         execution_owner_id: &str,
         execution_lease_until_unix: i64,
     ) -> Result<BlockedTurnRecoveryResumeOutcome> {
+        let control_wakes = vec![
+            GatewayControlWake::Supervision,
+            GatewayControlWake::Terminalization,
+        ];
         let _recovery_change = recovery_wake::RecoveryChange(self.recovery_work.clone());
         let changes = ["gateway.control", "recovery.due"]
-            .map(|domain| self.connection.work_signal(domain).changing());
+            .map(|domain| self.control_work_change(domain, &control_wakes));
         let result = async {
             let _ownership_change = self.execution_heartbeats.changing(execution_owner_id);
             self.run_serialized_write(|| async {
@@ -33288,9 +33566,15 @@ impl CrudStore {
         execution_owner_id: &str,
         execution_lease_until_unix: i64,
     ) -> Result<Option<TaskOwnedTurnResumeOutcome>> {
+        let control_wakes = vec![
+            GatewayControlWake::Turn(turn_id.to_owned()),
+            GatewayControlWake::Resources,
+            GatewayControlWake::Actions,
+            GatewayControlWake::Supervision,
+        ];
         let task_change =
             crate::task_events::TaskWorkChange::for_source(&self.connection, "y", turn_id);
-        let control_change = self.connection.work_signal("gateway.control").changing();
+        let control_change = self.control_work_change("gateway.control", &control_wakes);
         let control_result = async {
             let _recovery_change = recovery_wake::RecoveryChange(self.recovery_work.clone());
             let change = self.connection.work_signal("recovery.due").changing();
@@ -34006,9 +34290,13 @@ impl CrudStore {
         now_unix: i64,
         observed_liveness: Option<&TurnLivenessRecord>,
     ) -> Result<bool> {
+        let control_wakes = vec![
+            GatewayControlWake::Supervision,
+            GatewayControlWake::Terminalization,
+        ];
         let _recovery_change = recovery_wake::RecoveryChange(self.recovery_work.clone());
         let changes = ["gateway.control", "recovery.due"]
-            .map(|domain| self.connection.work_signal(domain).changing());
+            .map(|domain| self.control_work_change(domain, &control_wakes));
         let result = async {
             let Some(raw) =
                 repositories::recovery_watchdog::raw_policy(&self.connection, &expected.id, None)
@@ -34193,8 +34481,12 @@ impl CrudStore {
         reason: Option<String>,
         now_unix: i64,
     ) -> Result<Vec<RecoveryJobRecord>> {
+        let control_wakes = vec![
+            GatewayControlWake::Supervision,
+            GatewayControlWake::Terminalization,
+        ];
         let changes = ["gateway.control", "maintenance.native", "recovery.due"]
-            .map(|domain| self.connection.work_signal(domain).changing());
+            .map(|domain| self.control_work_change(domain, &control_wakes));
         let _recovery_change = recovery_wake::RecoveryChange(self.recovery_work.clone());
         let result = async {
             let reason_value = reason.clone();
@@ -34842,6 +35134,17 @@ impl CrudStore {
         execution_graph: Option<AgentExecutionGraphCommitInput>,
         agent_turn_response: Option<AgentTurnResponseInput>,
     ) -> Result<Option<AgentExecutionGraphCommitResult>> {
+        let control_wakes = {
+            let mut wakes = gateway_control::event_wakes(&events);
+            if agent_action.is_some() {
+                wakes.push(GatewayControlWake::Actions);
+            }
+            if execution_graph.is_some() || admission.is_some() || execution.is_some() {
+                wakes.push(GatewayControlWake::Resources);
+                wakes.push(GatewayControlWake::Supervision);
+            }
+            wakes
+        };
         // Optional graph/action receipts may change without a new event.
         let mut changed = false;
         let cleanup_turns = events
@@ -34868,7 +35171,7 @@ impl CrudStore {
             "compaction",
             "maintenance.zstd",
         ]
-        .map(|domain| self.connection.work_signal(domain).changing());
+        .map(|domain| self.control_work_change(domain, &control_wakes));
         let result = async {
         let task_turns = events.iter().map(|event| event.turn_id().to_owned()).collect::<Vec<_>>();
         let task_change = if task_turns.is_empty() { None } else {
@@ -35429,6 +35732,7 @@ impl CrudStore {
         execution_owner_id: Option<&str>,
         operation_guard: Option<sea_orm::Statement>,
     ) -> Result<Option<crate::events::AppendedTurnEvent>> {
+        let control_wakes = gateway_control::event_wakes(std::slice::from_ref(&event));
         let cleanup_turns = vec![event.turn_id().to_owned()];
         let cleanup_change = terminal_cleanup::Change::events(&self.connection);
         let changes = [
@@ -35438,7 +35742,7 @@ impl CrudStore {
             "compaction",
             "maintenance.zstd",
         ]
-        .map(|domain| self.connection.work_signal(domain).changing());
+        .map(|domain| self.control_work_change(domain, &control_wakes));
         let result = async {
             let _release_wake = (terminal_turn_execution_status_for_event(&event).is_some())
                 .then(|| execution_heartbeat::ReleaseWake(self.execution_heartbeats.clone()));
@@ -35710,6 +36014,8 @@ impl CrudStore {
         claim_token: String,
         projected_at: DateTimeWithTimeZone,
     ) -> Result<TurnEventProjectionOutcome> {
+        let control_wakes =
+            gateway_control::event_wakes(std::slice::from_ref(&appended_event.payload));
         let cleanup_turns = vec![appended_event.turn_id.clone()];
         let html_turns = terminal_cleanup::html_lifetime_turn(&appended_event.payload)
             .map(str::to_owned)
@@ -35726,7 +36032,7 @@ impl CrudStore {
             "compaction",
             "maintenance.zstd",
         ]
-        .map(|domain| self.connection.work_signal(domain).changing());
+        .map(|domain| self.control_work_change(domain, &control_wakes));
         let result = async {
             let task_change = Some(
                 crate::task_events::TaskTurnChange::begin(
@@ -36820,7 +37126,8 @@ impl CrudStore {
         event_timestamp_secs: i64,
         agent_action: AgentCommitInput,
     ) -> Result<Vec<AppendedTaskEvent>> {
-        let control_change = self.connection.work_signal("gateway.control").changing();
+        let control_wakes = vec![GatewayControlWake::Resources, GatewayControlWake::Actions];
+        let control_change = self.control_work_change("gateway.control", &control_wakes);
         let mut action_changed = false;
         let control_result = async {
             let events = self.prepare_task_events_for_write(events).await?;
@@ -36870,7 +37177,8 @@ impl CrudStore {
         notification: NewUserNotificationOutbox,
         agent_action: Option<AgentCommitInput>,
     ) -> Result<pioneer_entity::user_notification_outbox::Model> {
-        let control_change = self.connection.work_signal("gateway.control").changing();
+        let control_wakes = vec![GatewayControlWake::Resources, GatewayControlWake::Actions];
+        let control_change = self.control_work_change("gateway.control", &control_wakes);
         let mut action_changed = false;
         let control_result = async {
         let payload: pioneer_protocol::TaskUserNotificationDeliveredNotification =
@@ -37043,7 +37351,8 @@ impl CrudStore {
         admission: NewTaskExecutionAdmission,
         agent_action: AgentCommitInput,
     ) -> Result<Vec<AppendedTaskEvent>> {
-        let control_change = self.connection.work_signal("gateway.control").changing();
+        let control_wakes = vec![GatewayControlWake::Resources, GatewayControlWake::Actions];
+        let control_change = self.control_work_change("gateway.control", &control_wakes);
         let mut action_changed = false;
         let control_result = async {
             let events = self.prepare_task_events_for_write(events).await?;
@@ -37094,7 +37403,8 @@ impl CrudStore {
         input: TaskCreationCommitInput,
         root: Option<frozen_lifetime::PreparedFrozenRoot>,
     ) -> Result<Vec<AppendedTaskEvent>> {
-        let control_change = self.connection.work_signal("gateway.control").changing();
+        let control_wakes = vec![GatewayControlWake::Resources, GatewayControlWake::Actions];
+        let control_change = self.control_work_change("gateway.control", &control_wakes);
         let mut action_changed = false;
         let control_result = async {
             // Prepare the bounded admission binding outside writer capacity. The
@@ -37291,7 +37601,8 @@ impl CrudStore {
         updated_at: DateTimeWithTimeZone,
         agent_action: AgentCommitInput,
     ) -> Result<()> {
-        let control_change = self.connection.work_signal("gateway.control").changing();
+        let control_wakes = vec![GatewayControlWake::Resources, GatewayControlWake::Actions];
+        let control_change = self.control_work_change("gateway.control", &control_wakes);
         let mut action_changed = false;
         let control_result = async {
             let transaction = self

@@ -527,7 +527,13 @@ impl CrudStore {
         #[cfg(any(test, feature = "test-support"))]
         self.pause_delivery_commit_for_test(TaskDeliveryCommitTestKind::Cancellation)
             .await;
-        let control_change = self.connection.work_signal("gateway.control").changing();
+        let control_change = self.control_work_change(
+            "gateway.control",
+            &[
+                crate::GatewayControlWake::Resources,
+                crate::GatewayControlWake::Actions,
+            ],
+        );
         let mut action_changed = false;
         let tx = self.connection.begin().await?;
         let result = async {

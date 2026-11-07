@@ -83,19 +83,30 @@ impl WorkSignal {
     /// Create before dispatching a relevant mutation. Explicit completion is
     /// required even for a known rollback/no-change; cancellation is unknown.
     pub fn changing(&self) -> WorkChange {
-        WorkChange(Some(self.clone()))
+        WorkChange(Some(self.clone()), None)
     }
 }
 
-pub struct WorkChange(Option<WorkSignal>);
+pub struct WorkChange(Option<WorkSignal>, Option<Vec<String>>);
 
 impl WorkChange {
+    /// Retain exact domain hints before dispatch. An uncertain outcome still
+    /// publishes UNKNOWN and settles the writer; hints never replace authority.
+    pub fn with_keys(mut self, keys: &[String]) -> Self {
+        self.1 = Some(keys.to_vec());
+        self
+    }
+
     /// The operation has finished and released its DB resources. `changed`
     /// distinguishes useful invalidation from ACK/no-change self-wakes.
     pub fn completed(mut self, changed: bool) {
         if let Some(signal) = self.0.take() {
             if changed {
-                signal.notify();
+                if let Some(keys) = self.1.take() {
+                    signal.notify_keys(&keys);
+                } else {
+                    signal.notify();
+                }
             }
         }
     }
@@ -237,7 +248,10 @@ mod tests {
         let mut second = signal.subscribe();
         assert!(first.begin_keyed_pass(&database).await.unwrap().is_none());
         assert!(second.begin_keyed_pass(&database).await.unwrap().is_none());
-        signal.changing().completed_keys(&["a".into(), "b".into()]);
+        signal
+            .changing()
+            .with_keys(&["a".into(), "b".into()])
+            .completed(true);
         assert_eq!(
             first.begin_keyed_pass(&database).await.unwrap(),
             Some(vec!["a".into(), "b".into()])
@@ -269,7 +283,12 @@ mod tests {
         signal.notify();
         signal.notify_keys(&["after-full".into()]);
         assert!(first.begin_keyed_pass(&database).await.unwrap().is_none());
-        drop(signal.changing());
+        signal
+            .changing()
+            .with_keys(&["quiet".into()])
+            .completed(false);
+        assert!(first.wait(None).now_or_never().is_none());
+        drop(signal.changing().with_keys(&["cancelled-source".into()]));
         assert!(first.begin_keyed_pass(&database).await.unwrap().is_none());
         signal.notify_keys(&["x".repeat(MAX_KEY_BYTES + 1)]);
         assert!(first.begin_keyed_pass(&database).await.unwrap().is_none());

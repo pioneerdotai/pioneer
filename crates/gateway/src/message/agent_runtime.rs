@@ -3524,7 +3524,9 @@ impl MessageProcessor {
                 if !self.complete {
                     self.running.store(false, Ordering::Release);
                     if !self.shutdown.is_cancelled() {
-                        self.control.notify();
+                        self.control.notify_keys(&[
+                            pioneer_crud::GatewayControlWake::NativeRetention.key(),
+                        ]);
                     }
                 }
             }
@@ -7435,10 +7437,43 @@ impl MessageProcessor {
         Vec<TimeoutCandidate>,
         Option<pioneer_crud::TimeoutCandidateCursor>,
     )> {
-        let (candidates, next) = self
-            .timeout_supervisor
-            .list_timeout_candidate_page(now_unix, limit, after)
-            .await?;
+        self.poll_timeout_candidate_page_scoped(None, now_unix, limit, after)
+            .await
+    }
+
+    pub(super) async fn poll_timeout_candidate_page_for_turn(
+        &self,
+        turn_id: &str,
+        now_unix: i64,
+        limit: u64,
+        after: Option<&pioneer_crud::TimeoutCandidateCursor>,
+    ) -> Result<(
+        Vec<TimeoutCandidate>,
+        Option<pioneer_crud::TimeoutCandidateCursor>,
+    )> {
+        self.poll_timeout_candidate_page_scoped(Some(turn_id), now_unix, limit, after)
+            .await
+    }
+
+    async fn poll_timeout_candidate_page_scoped(
+        &self,
+        turn_id: Option<&str>,
+        now_unix: i64,
+        limit: u64,
+        after: Option<&pioneer_crud::TimeoutCandidateCursor>,
+    ) -> Result<(
+        Vec<TimeoutCandidate>,
+        Option<pioneer_crud::TimeoutCandidateCursor>,
+    )> {
+        let (candidates, next) = if let Some(turn_id) = turn_id {
+            self.crud_store
+                .list_timeout_candidate_page_for_turn(turn_id, now_unix, limit, after)
+                .await?
+        } else {
+            self.timeout_supervisor
+                .list_timeout_candidate_page(now_unix, limit, after)
+                .await?
+        };
         let now_unix_ms = now_unix.saturating_mul(1_000);
         let mut timed_out = Vec::new();
         let mut human_waits = HashMap::<String, bool>::new();

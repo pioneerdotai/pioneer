@@ -72,7 +72,14 @@ impl CrudStore {
             "maintenance.zstd",
             "tasks.lifecycle",
         ]
-        .map(|domain| self.connection.work_signal(domain).changing());
+        .map(|domain| {
+            self.control_work_change(
+                domain,
+                &[crate::GatewayControlWake::Turn(
+                    notification.turn_id.clone(),
+                )],
+            )
+        });
         let result = async {
             anyhow::ensure!(
                 notification.item.item_id() == identity.native_item_id,

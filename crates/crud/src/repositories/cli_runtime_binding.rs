@@ -2484,16 +2484,26 @@ pub async fn append_native_event_if_absent<C: ConnectionTrait>(
     db: &C,
     event: NewCliRuntimeNativeEvent,
 ) -> Result<CliRuntimeNativeEventRecord> {
-    let id = event.id.clone();
-    cli_runtime_native_event::Entity::insert(active_native_event_from_new(event.clone()))
-        .on_conflict(
-            OnConflict::column(cli_runtime_native_event::Column::Id)
-                .do_nothing()
-                .to_owned(),
-        )
-        .exec_without_returning(db)
+    append_native_event_if_absent_with_outcome(db, event)
         .await
-        .context("failed to persist idempotent CLI runtime native event")?;
+        .map(|(record, _)| record)
+}
+
+pub async fn append_native_event_if_absent_with_outcome<C: ConnectionTrait>(
+    db: &C,
+    event: NewCliRuntimeNativeEvent,
+) -> Result<(CliRuntimeNativeEventRecord, bool)> {
+    let id = event.id.clone();
+    let inserted =
+        cli_runtime_native_event::Entity::insert(active_native_event_from_new(event.clone()))
+            .on_conflict(
+                OnConflict::column(cli_runtime_native_event::Column::Id)
+                    .do_nothing()
+                    .to_owned(),
+            )
+            .exec_without_returning(db)
+            .await
+            .context("failed to persist idempotent CLI runtime native event")?;
     let existing = find_native_event(db, id.as_str())
         .await?
         .context("idempotent CLI runtime native event disappeared")?;
@@ -2509,7 +2519,7 @@ pub async fn append_native_event_if_absent<C: ConnectionTrait>(
             && existing.payload_redacted_json == event.payload_redacted_json,
         "idempotent CLI runtime native event conflicts with existing identity"
     );
-    Ok(existing)
+    Ok((existing, inserted != 0))
 }
 
 pub async fn find_native_event<C: ConnectionTrait>(

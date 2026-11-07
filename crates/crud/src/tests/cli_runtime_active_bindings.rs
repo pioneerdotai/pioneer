@@ -1799,3 +1799,175 @@ async fn cli_stalled_task_blocked_commits_accepted_outcome_ack_atomically() {
             .unwrap()
     );
 }
+
+#[tokio::test]
+async fn addressed_timeout_pages_keep_turn_scope_and_revisit_changes_behind_cursor() {
+    let store = test_store_with_zstd_turn_items().await;
+    store
+        .database_connection()
+        .execute_unprepared("PRAGMA foreign_keys=OFF")
+        .await
+        .unwrap();
+    let at = 1_700_000_000;
+    let thread = sample_thread("ws_addressed_control", "thread_addressed_control", at);
+    for turn_id in ["api_addressed", "other_addressed"] {
+        store
+            .materialize_turn_start(
+                &thread,
+                SandboxMode::FullAccess,
+                &sample_turn(turn_id),
+                &[],
+                pioneer_protocol::PersistedActorRef::System,
+            )
+            .await
+            .unwrap();
+    }
+    for (turn_id, item, started) in [
+        ("other_addressed", "foreign-first", at),
+        ("api_addressed", "a1", at + 1),
+        ("api_addressed", "a2", at + 2),
+        ("api_addressed", "a3", at + 3),
+    ] {
+        store
+            .materialize_item_started_with_attempt_deadlines(
+                ItemStartedNotification {
+                    workspace_id: thread.workspace_id.clone(),
+                    thread_id: thread.id.clone(),
+                    turn_id: turn_id.into(),
+                    item: safe_web_fetch_item(item),
+                },
+                started,
+                crate::TurnItemAttemptDeadlines {
+                    lease_expires_at_unix: Some(at + 4),
+                    idle_deadline_at_unix: Some(at + 4),
+                    hard_deadline_at_unix: Some(at + 4),
+                },
+            )
+            .await
+            .unwrap();
+    }
+    let database = store.database_connection();
+    let mut changes = database.work_signal("gateway.control").subscribe();
+    changes.begin_keyed_pass(&database).await.unwrap();
+    store
+        .observe_turn_runtime_activity("api_addressed", "provider/delta", at + 5)
+        .await
+        .unwrap();
+    assert_eq!(
+        changes.begin_keyed_pass(&database).await.unwrap(),
+        Some(vec![
+            crate::GatewayControlWake::Activity("api_addressed".into()).key()
+        ])
+    );
+    let (first, cursor) = store
+        .list_timeout_candidate_page_for_turn("api_addressed", at + 10, 2, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        first
+            .iter()
+            .map(|row| row.item_id.as_str())
+            .collect::<Vec<_>>(),
+        ["a1", "a2"]
+    );
+    assert!(first.iter().all(|row| row.turn_id == "api_addressed"));
+    let cursor = cursor.unwrap();
+    // A real committed event arrives behind the current page frontier.
+    store
+        .materialize_item_started_with_attempt_deadlines(
+            ItemStartedNotification {
+                workspace_id: thread.workspace_id.clone(),
+                thread_id: thread.id.clone(),
+                turn_id: "api_addressed".into(),
+                item: safe_web_fetch_item("behind"),
+            },
+            at - 1,
+            crate::TurnItemAttemptDeadlines {
+                lease_expires_at_unix: Some(at + 4),
+                idle_deadline_at_unix: Some(at + 4),
+                hard_deadline_at_unix: Some(at + 4),
+            },
+        )
+        .await
+        .unwrap();
+    let (tail, next) = store
+        .list_timeout_candidate_page_for_turn("api_addressed", at + 10, 2, Some(&cursor))
+        .await
+        .unwrap();
+    assert_eq!(
+        tail.iter()
+            .map(|row| row.item_id.as_str())
+            .collect::<Vec<_>>(),
+        ["a3"]
+    );
+    assert!(next.is_none());
+    assert_eq!(
+        changes.begin_keyed_pass(&database).await.unwrap(),
+        Some(vec![
+            crate::GatewayControlWake::Activity("api_addressed".into()).key()
+        ])
+    );
+    let (restarted, _) = store
+        .list_timeout_candidate_page_for_turn("api_addressed", at + 10, 2, None)
+        .await
+        .unwrap();
+    assert_eq!(restarted[0].item_id, "behind");
+    let upper = store
+        .running_turn_item_attempt_upper_id_by_type(TurnItemType::WebFetch)
+        .await
+        .unwrap()
+        .unwrap();
+    let (commands, _) = store
+        .list_running_turn_item_attempt_page_by_type_bounded_for_turn(
+            "api_addressed",
+            TurnItemType::WebFetch,
+            None,
+            &upper,
+            2,
+        )
+        .await
+        .unwrap();
+    assert_eq!(commands.len(), 2);
+    assert!(commands.iter().all(|row| row.turn_id == "api_addressed"));
+}
+
+#[tokio::test]
+async fn native_ack_replay_keeps_control_quiet_and_reinsert_wakes_its_turn() {
+    let (store, source, event) = native_delivery_fixture().await;
+    let database = store.database_connection();
+    let mut changes = database.work_signal("gateway.control").subscribe();
+    changes.begin_keyed_pass(&database).await.unwrap();
+    let first = store
+        .append_cli_runtime_native_event_if_absent(event.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        changes.begin_keyed_pass(&database).await.unwrap(),
+        Some(vec![
+            crate::GatewayControlWake::Activity(source.turn_id.clone()).key()
+        ])
+    );
+    let duplicate = store
+        .append_cli_runtime_native_event_if_absent(event.clone())
+        .await
+        .unwrap();
+    assert_eq!(duplicate, first);
+    assert_eq!(
+        changes.begin_keyed_pass(&database).await.unwrap(),
+        Some(Vec::new())
+    );
+    pioneer_entity::cli_runtime_native_event::Entity::delete_by_id(event.id.clone())
+        .exec(&database)
+        .await
+        .unwrap();
+    store
+        .append_cli_runtime_native_event_if_absent(event)
+        .await
+        .unwrap();
+    assert_eq!(
+        changes.begin_keyed_pass(&database).await.unwrap(),
+        Some(vec![
+            crate::GatewayControlWake::Activity(source.turn_id).key()
+        ])
+    );
+}

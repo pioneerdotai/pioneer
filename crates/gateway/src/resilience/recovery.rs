@@ -1725,9 +1725,9 @@ impl RecoveryCoordinator {
         finish_recovery_phases(batch.events, batch.errors)
     }
 
-    /// Raw-page continuation is independent of emitted events. Keep source
-    /// invalidations unacknowledged until has_more is false; retry errors with a
-    /// bounded error delay and still dispatch the independent successful events.
+    /// Row failures do not stop raw-page continuation or discard successful
+    /// events. The owner retains invalidations and errors until the finite pass
+    /// reaches EOF, then retries failures from the head after its error delay.
     pub async fn run_supervision_quantum(
         &self,
         now_unix: i64,
@@ -1744,25 +1744,37 @@ impl RecoveryCoordinator {
         let mut events = Vec::new();
         let mut phase_errors = Vec::new();
         if !done[0] {
-            match self.reconcile_orphan_turn_executions(now_unix, limit).await {
-                Ok(more) => done[0] = !more,
+            match self
+                .reconcile_orphan_turn_executions_quantum(now_unix, limit)
+                .await
+            {
+                Ok(mut batch) => {
+                    done[0] = !batch.has_more;
+                    events.append(&mut batch.events);
+                    phase_errors.append(&mut batch.errors);
+                }
                 Err(error) => phase_errors.push(format!("orphan Turn executions: {error:#}")),
             }
         }
         if !done[1] {
             match self.backfill_timeout_jobs(now_unix, limit).await {
-                Ok((mut found, more)) => {
-                    done[1] = !more;
-                    events.append(&mut found);
+                Ok(mut batch) => {
+                    done[1] = !batch.has_more;
+                    events.append(&mut batch.events);
+                    phase_errors.append(&mut batch.errors);
                 }
                 Err(error) => phase_errors.push(format!("timeout backfill: {error:#}")),
             }
         }
         if !done[2] {
-            match self.expire_active_recovery_jobs(now_unix, limit).await {
-                Ok(mut found) => {
-                    done[2] = self.active_scan.lock().await.0.is_none();
-                    events.append(&mut found);
+            match self
+                .expire_active_recovery_jobs_quantum(now_unix, limit)
+                .await
+            {
+                Ok(mut batch) => {
+                    done[2] = !batch.has_more;
+                    events.append(&mut batch.events);
+                    phase_errors.append(&mut batch.errors);
                 }
                 Err(error) => phase_errors.push(format!("active expiration: {error:#}")),
             }
@@ -1772,9 +1784,10 @@ impl RecoveryCoordinator {
                 .repair_due_terminal_recovery_jobs_quantum(now_unix, limit)
                 .await
             {
-                Ok((mut found, more)) => {
-                    done[3] = !more;
-                    events.append(&mut found);
+                Ok(mut batch) => {
+                    done[3] = !batch.has_more;
+                    events.append(&mut batch.events);
+                    phase_errors.append(&mut batch.errors);
                 }
                 Err(error) => phase_errors.push(format!("terminal repair: {error:#}")),
             }
@@ -1896,14 +1909,32 @@ impl RecoveryCoordinator {
     /// Gateway which admitted them is gone. Executor kind is persisted at the
     /// same boundary as the Turn, so a missing provider binding is never used
     /// to guess whether work is native or CLI-backed.
+    #[cfg(test)]
     async fn reconcile_orphan_turn_executions(&self, now_unix: i64, limit: u64) -> Result<bool> {
+        let batch = self
+            .reconcile_orphan_turn_executions_quantum(now_unix, limit)
+            .await?;
+        finish_recovery_phases(batch.events, batch.errors)?;
+        Ok(batch.has_more)
+    }
+
+    async fn reconcile_orphan_turn_executions_quantum(
+        &self,
+        now_unix: i64,
+        limit: u64,
+    ) -> Result<SupervisionAuditBatch> {
+        let mut errors = Vec::new();
         let mut scan = self.orphan_scan.lock().await.clone();
         if scan.upper.is_none() {
             scan.upper = self.crud_store.control_turn_execution_upper_id().await?;
             *self.orphan_scan.lock().await = scan.clone();
         }
         let Some(upper) = scan.upper.as_deref() else {
-            return Ok(false);
+            return Ok(SupervisionAuditBatch {
+                events: Vec::new(),
+                has_more: false,
+                errors,
+            });
         };
         if !scan.complete[0] {
             let (expired, next) = self
@@ -1917,23 +1948,31 @@ impl RecoveryCoordinator {
                 )
                 .await?;
             for execution in expired {
-                let Some(claimed) = self
-                    .crud_store
-                    .claim_expired_turn_execution(
-                        &execution,
-                        self.turn_execution_owner_id.as_ref(),
-                        now_unix,
-                        now_unix.saturating_add(RECOVERY_JOB_CLAIM_LEASE_SECS as i64),
-                    )
-                    .await?
-                else {
-                    continue;
-                };
-                self.enqueue_claimed_turn_execution_recovery(&claimed, now_unix)
-                    .await?;
+                let result: Result<()> = async {
+                    let execution = execution?;
+                    let Some(claimed) = self
+                        .crud_store
+                        .claim_expired_turn_execution(
+                            &execution,
+                            self.turn_execution_owner_id.as_ref(),
+                            now_unix,
+                            now_unix.saturating_add(RECOVERY_JOB_CLAIM_LEASE_SECS as i64),
+                        )
+                        .await?
+                    else {
+                        return Ok(());
+                    };
+                    self.enqueue_claimed_turn_execution_recovery(&claimed, now_unix)
+                        .await
+                }
+                .await;
+                if let Err(error) = result {
+                    errors.push(format!("orphan Turn execution: {error:#}"));
+                }
             }
             scan.complete[0] = next.is_none();
             scan.foreign_after = next;
+            *self.orphan_scan.lock().await = scan.clone();
         }
         // Revisit owned rows after a crash between ownership CAS and job creation.
         // Both inputs share a fixed ceiling; a continuous new suffix cannot keep
@@ -1949,8 +1988,16 @@ impl RecoveryCoordinator {
                 )
                 .await?;
             for claimed in recovering {
-                self.enqueue_claimed_turn_execution_recovery(&claimed, now_unix)
-                    .await?;
+                let result = match claimed {
+                    Ok(claimed) => {
+                        self.enqueue_claimed_turn_execution_recovery(&claimed, now_unix)
+                            .await
+                    }
+                    Err(error) => Err(error),
+                };
+                if let Err(error) = result {
+                    errors.push(format!("owned recovering Turn execution: {error:#}"));
+                }
             }
             scan.complete[1] = next.is_none();
             scan.owned_after = next;
@@ -1962,7 +2009,11 @@ impl RecoveryCoordinator {
             OrphanExecutionScan::default()
         };
 
-        Ok(has_more)
+        Ok(SupervisionAuditBatch {
+            events: Vec::new(),
+            has_more,
+            errors,
+        })
     }
 
     async fn enqueue_claimed_turn_execution_recovery(
@@ -2198,21 +2249,26 @@ impl RecoveryCoordinator {
     ) -> Result<Vec<RecoveryCoordinatorEvent>> {
         self.repair_due_terminal_recovery_jobs_quantum(now_unix, limit)
             .await
-            .map(|(events, _)| events)
+            .and_then(|batch| finish_recovery_phases(batch.events, batch.errors))
     }
 
     async fn repair_due_terminal_recovery_jobs_quantum(
         &self,
         now_unix: i64,
         limit: u64,
-    ) -> Result<(Vec<RecoveryCoordinatorEvent>, bool)> {
+    ) -> Result<SupervisionAuditBatch> {
         let (after, mut upper) = self.terminal_scan.lock().await.clone();
+        let mut errors = Vec::new();
         if upper.is_none() {
             upper = self.crud_store.control_recovery_job_upper_id().await?;
             self.terminal_scan.lock().await.1 = upper.clone();
         }
         let Some(upper) = upper.as_deref() else {
-            return Ok((Vec::new(), false));
+            return Ok(SupervisionAuditBatch {
+                events: Vec::new(),
+                has_more: false,
+                errors,
+            });
         };
         let (jobs, next) = self
             .crud_store
@@ -2222,14 +2278,21 @@ impl RecoveryCoordinator {
         let mut events = Vec::new();
 
         for job in jobs {
-            events.extend(
-                self.terminalize_pending_mark_failed_job(job, now_unix)
-                    .await?,
-            );
+            match self
+                .terminalize_pending_mark_failed_job(job, now_unix)
+                .await
+            {
+                Ok(mut found) => events.append(&mut found),
+                Err(error) => errors.push(format!("terminal recovery job: {error:#}")),
+            }
         }
 
         *self.terminal_scan.lock().await = (next, has_more.then(|| upper.to_owned()));
-        Ok((events, has_more))
+        Ok(SupervisionAuditBatch {
+            events,
+            has_more,
+            errors,
+        })
     }
 
     pub async fn terminalize_pending_mark_failed_job(
@@ -2279,22 +2342,42 @@ impl RecoveryCoordinator {
         Ok(Vec::new())
     }
 
+    #[cfg(test)]
     async fn expire_active_recovery_jobs(
         &self,
         now_unix: i64,
         limit: u64,
     ) -> Result<Vec<RecoveryCoordinatorEvent>> {
+        let batch = self
+            .expire_active_recovery_jobs_quantum(now_unix, limit)
+            .await?;
+        finish_recovery_phases(batch.events, batch.errors)
+    }
+
+    async fn expire_active_recovery_jobs_quantum(
+        &self,
+        now_unix: i64,
+        limit: u64,
+    ) -> Result<SupervisionAuditBatch> {
         if limit == 0 {
-            return Ok(Vec::new());
+            return Ok(SupervisionAuditBatch {
+                events: Vec::new(),
+                has_more: false,
+                errors: Vec::new(),
+            });
         }
-        let jobs = {
+        let (jobs, has_more) = {
             // Serialize only discovery cursor updates, never domain work.
             let mut scan = self.active_scan.lock().await;
             if scan.1.is_none() {
                 scan.1 = self.crud_store.active_recovery_job_upper_id().await?;
             }
             let Some(upper) = scan.1.as_deref() else {
-                return Ok(Vec::new());
+                return Ok(SupervisionAuditBatch {
+                    events: Vec::new(),
+                    has_more: false,
+                    errors: Vec::new(),
+                });
             };
             let jobs = self
                 .crud_store
@@ -2309,7 +2392,7 @@ impl RecoveryCoordinator {
             } else {
                 *scan = (None, None);
             }
-            jobs
+            (jobs, scan.0.is_some())
         };
         let mut events = Vec::new();
         let mut errors = Vec::new();
@@ -2322,7 +2405,11 @@ impl RecoveryCoordinator {
                 }
             }
         }
-        finish_recovery_phases(events, errors)
+        Ok(SupervisionAuditBatch {
+            events,
+            has_more,
+            errors,
+        })
     }
 
     async fn expire_active_recovery_job(
@@ -4393,14 +4480,19 @@ impl RecoveryCoordinator {
         &self,
         now_unix: i64,
         limit: u64,
-    ) -> Result<(Vec<RecoveryCoordinatorEvent>, bool)> {
+    ) -> Result<SupervisionAuditBatch> {
+        let mut errors = Vec::new();
         let (after, mut upper) = self.timeout_backfill_scan.lock().await.clone();
         if upper.is_none() {
             upper = self.crud_store.control_turn_item_attempt_upper_id().await?;
             self.timeout_backfill_scan.lock().await.1 = upper.clone();
         }
         let Some(upper) = upper.as_deref() else {
-            return Ok((Vec::new(), false));
+            return Ok(SupervisionAuditBatch {
+                events: Vec::new(),
+                has_more: false,
+                errors,
+            });
         };
         let (candidates, next) = self
             .crud_store
@@ -4410,51 +4502,62 @@ impl RecoveryCoordinator {
         let mut events = Vec::new();
 
         for candidate in candidates {
-            let liveness = self
-                .crud_store
-                .get_turn_liveness(candidate.turn_id.as_str())
-                .await?;
-            if let TimeoutRecoveryClassification::SuppressRecoveryBecauseTurnProgressed {
-                liveness,
-            } = classify_timeout_candidate_liveness(&candidate, liveness.as_ref())
-            {
-                let context = timeout_recovery_suppression_context(&candidate, &liveness);
-                let _ = self
+            let result: Result<()> = async {
+                let liveness = self
                     .crud_store
-                    .suppress_timeout_candidate_recovery(
-                        &candidate,
-                        TIMEOUT_RECOVERY_SUPPRESSED_TURN_PROGRESS,
-                        context,
-                        now_unix,
-                    )
+                    .get_turn_liveness(candidate.turn_id.as_str())
                     .await?;
-                continue;
-            }
+                if let TimeoutRecoveryClassification::SuppressRecoveryBecauseTurnProgressed {
+                    liveness,
+                } = classify_timeout_candidate_liveness(&candidate, liveness.as_ref())
+                {
+                    let context = timeout_recovery_suppression_context(&candidate, &liveness);
+                    let _ = self
+                        .crud_store
+                        .suppress_timeout_candidate_recovery(
+                            &candidate,
+                            TIMEOUT_RECOVERY_SUPPRESSED_TURN_PROGRESS,
+                            context,
+                            now_unix,
+                        )
+                        .await?;
+                    return Ok(());
+                }
 
-            if self
-                .suppress_timeout_recovery_if_turn_not_in_progress(&candidate, now_unix)
-                .await?
-            {
-                continue;
-            }
+                if self
+                    .suppress_timeout_recovery_if_turn_not_in_progress(&candidate, now_unix)
+                    .await?
+                {
+                    return Ok(());
+                }
 
-            if let Some((_job_id, active_events)) = self
-                .record_recovery_timeout_failure(&candidate, now_unix)
-                .await?
-            {
-                events.extend(active_events);
-            } else {
-                let outcome = self.enqueue_timeout_job(&candidate, now_unix).await?;
-                events.push(recovery_enqueue_event_from_outcome(
-                    &candidate,
-                    RecoveryTrigger::Timeout,
-                    outcome,
-                ));
+                if let Some((_job_id, active_events)) = self
+                    .record_recovery_timeout_failure(&candidate, now_unix)
+                    .await?
+                {
+                    events.extend(active_events);
+                } else {
+                    let outcome = self.enqueue_timeout_job(&candidate, now_unix).await?;
+                    events.push(recovery_enqueue_event_from_outcome(
+                        &candidate,
+                        RecoveryTrigger::Timeout,
+                        outcome,
+                    ));
+                }
+                Ok(())
+            }
+            .await;
+            if let Err(error) = result {
+                errors.push(format!("timeout backfill candidate: {error:#}"));
             }
         }
 
         *self.timeout_backfill_scan.lock().await = (next, has_more.then(|| upper.to_owned()));
-        Ok((events, has_more))
+        Ok(SupervisionAuditBatch {
+            events,
+            has_more,
+            errors,
+        })
     }
 
     async fn policy_for_recovery_job(&self, job: &RecoveryJobRecord) -> Result<RecoveryPolicy> {

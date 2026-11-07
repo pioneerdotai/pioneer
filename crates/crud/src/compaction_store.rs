@@ -784,7 +784,16 @@ impl CrudStore {
             "maintenance.zstd",
             "maintenance.html",
         ]
-        .map(|domain| self.connection.work_signal(domain).changing());
+        .map(|domain| {
+            self.control_work_change(
+                domain,
+                &cleanup_turns
+                    .iter()
+                    .cloned()
+                    .map(crate::GatewayControlWake::Turn)
+                    .collect::<Vec<_>>(),
+            )
+        });
         let maintenance = self.with_maintenance_access();
         let result = repositories::portable_payload::after_database_owners(
             repositories::compaction::lifecycle::repair_lifecycle(
@@ -1525,7 +1534,16 @@ impl CrudStore {
             "maintenance.zstd",
             "maintenance.html",
         ]
-        .map(|domain| self.connection.work_signal(domain).changing());
+        .map(|domain| {
+            self.control_work_change(
+                domain,
+                &cleanup_turns
+                    .iter()
+                    .cloned()
+                    .map(crate::GatewayControlWake::Turn)
+                    .collect::<Vec<_>>(),
+            )
+        });
         let result = repositories::portable_payload::after_database_owners(
             repositories::compaction::lifecycle::compaction_materialize_lifecycle(
                 self,
