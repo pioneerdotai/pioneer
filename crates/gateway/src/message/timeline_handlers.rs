@@ -1821,7 +1821,7 @@ impl MessageProcessor {
             .await?;
         let mut items = HashMap::new();
         let mut statuses = HashMap::new();
-        let mut html = HashMap::new();
+        let mut html_targets = Vec::new();
         for (turn_id, item_id) in &item_targets {
             let (item, status, is_final) = turn_items
                 .get(&(turn_id.clone(), item_id.clone()))
@@ -1831,15 +1831,17 @@ impl MessageProcessor {
             if *is_final
                 || pioneer_protocol::task_delivery_id_from_result_item_id(item_id).is_some()
             {
-                let publications = self
-                    .html_publications_for_agent_response(
-                        &rows[0].workspace_id,
-                        thread_id,
-                        turn_id,
-                        item_id,
-                    )
-                    .await?;
-                html.insert((turn_id.clone(), item_id.clone()), publications);
+                html_targets.push((
+                    turn_id.clone(),
+                    item_id.clone(),
+                    matches!(
+                        item,
+                        pioneer_protocol::TurnItem::AgentMessage {
+                            phase: pioneer_protocol::AgentMessagePhase::FinalAnswer,
+                            ..
+                        }
+                    ),
+                ));
             }
             statuses.insert(
                 (turn_id.clone(), item_id.clone()),
@@ -1847,6 +1849,10 @@ impl MessageProcessor {
             );
             items.insert((turn_id.clone(), item_id.clone()), item.clone());
         }
+
+        let html = self
+            .html_publications_for_agent_responses(&rows[0].workspace_id, thread_id, &html_targets)
+            .await?;
 
         let authors = self
             .timeline_row_authors(&turns, turn_ids.as_slice())

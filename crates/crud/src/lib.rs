@@ -10998,6 +10998,17 @@ impl CrudStore {
             .map_err(Into::into)
     }
 
+    pub async fn html_publication_summaries(
+        &self,
+        workspace_id: &str,
+        sources: &[(String, String)],
+    ) -> Result<HashMap<(String, String), Vec<ArtifactSummary>>> {
+        artifact_repository::ArtifactRepository::new()
+            .html_publication_summaries(&self.connection, workspace_id, sources)
+            .await
+            .map_err(Into::into)
+    }
+
     pub async fn list_exact_artifact_refs(
         &self,
         workspace_id: &str,
@@ -21196,6 +21207,84 @@ impl CrudStore {
             .into_iter()
             .map(task_trigger_from_db_model)
             .collect()
+    }
+
+    pub async fn get_task_deliveries_by_ids(
+        &self,
+        workspace: &str,
+        thread: &str,
+        ids: &[String],
+    ) -> Result<HashMap<String, TaskDelivery>> {
+        task_delivery::find_deliveries_by_ids(&self.connection, workspace, thread, ids)
+            .await?
+            .into_iter()
+            .map(|row| {
+                let value = task_delivery_from_db_model(row)?;
+                Ok((value.id.clone(), value))
+            })
+            .collect()
+    }
+
+    pub async fn get_task_run_turns_by_sources(
+        &self,
+        workspace: &str,
+        sources: &[(String, String)],
+    ) -> Result<HashMap<(String, String), TaskRunTurn>> {
+        task_run_turn::find_turns_by_sources(&self.connection, workspace, sources)
+            .await?
+            .into_iter()
+            .map(|row| {
+                let value = task_run_turn_from_db_model(row)?;
+                Ok(((value.thread_id.clone(), value.turn_id.clone()), value))
+            })
+            .collect()
+    }
+
+    pub async fn get_task_result_candidates_by_turns(
+        &self,
+        ids: &[String],
+    ) -> Result<HashMap<String, TaskResultCandidate>> {
+        task_result_candidate::find_candidates_by_turns(&self.connection, ids)
+            .await?
+            .into_iter()
+            .map(|row| {
+                let value = task_result_candidate_from_db_model(row)?;
+                Ok((value.task_run_turn_id.clone(), value))
+            })
+            .collect()
+    }
+
+    pub async fn get_final_agent_message_keys(
+        &self,
+        workspace: &str,
+        targets: &[(String, String, String)],
+    ) -> Result<HashSet<(String, String, String)>> {
+        let targets = targets
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let rows = turn::exact_agent_messages(&self.connection, workspace, &targets).await?;
+        let mut keys = HashSet::new();
+        for row in rows {
+            let item: TurnItem = serde_json::from_str(&row.payload)
+                .context("failed to decode exact HTML response source")?;
+            anyhow::ensure!(
+                item.item_id() == row.item_id,
+                "HTML response source identity mismatch"
+            );
+            if matches!(
+                item,
+                TurnItem::AgentMessage {
+                    phase: pioneer_protocol::AgentMessagePhase::FinalAnswer,
+                    ..
+                }
+            ) {
+                keys.insert((row.thread_id, row.turn_id, row.item_id));
+            }
+        }
+        Ok(keys)
     }
 
     pub async fn get_task_delivery(&self, delivery_id: &str) -> Result<Option<TaskDelivery>> {

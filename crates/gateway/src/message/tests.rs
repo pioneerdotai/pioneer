@@ -68256,6 +68256,58 @@ async fn timeline_page_isolates_off_page_bodies_and_keeps_last_final_html() {
             "index":"document","title":"page publication"
         }))]),
     },"exact-page-html".into(),generation,tokio_util::sync::CancellationToken::new()).await.unwrap();
+    let db = store.database_connection();
+    let original_version = pioneer_entity::artifact_version::Entity::find_by_id(
+        publication.artifact.version_id.clone().unwrap(),
+    )
+    .one(&db)
+    .await
+    .unwrap()
+    .unwrap();
+    // A broken newer, unbound version must not make the pinned response
+    // unreadable. This also catches loading the current summary before the pin.
+    let newer_id = "exact-page-unbound-version".to_owned();
+    let mut newer: pioneer_entity::artifact_version::ActiveModel = original_version.clone().into();
+    newer.id = Set(newer_id.clone());
+    newer.version_number = Set(original_version.version_number + 1);
+    newer.blob_id = Set("missing-unbound-blob".into());
+    newer.insert(&db).await.unwrap();
+    let artifact = pioneer_entity::artifact::Entity::find_by_id(&publication.artifact.artifact_id)
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut artifact: pioneer_entity::artifact::ActiveModel = artifact.into();
+    artifact.current_version_id = Set(Some(newer_id));
+    artifact.update(&db).await.unwrap();
+    let now = chrono::Utc::now().fixed_offset();
+    pioneer_entity::artifact_projection::ActiveModel {
+        id: Set("exact-page-pinned-preview".into()),
+        workspace_id: Set(harness.workspace_id.clone()),
+        artifact_id: Set(publication.artifact.artifact_id.clone()),
+        artifact_version_id: Set(original_version.id.clone()),
+        projection_kind: Set("plain_text".into()),
+        status: Set("ready".into()),
+        blob_id: Set(Some(original_version.blob_id.clone())),
+        text_content: Set(Some("preview text is not a publication body".into())),
+        metadata_json: Set("{}".into()),
+        created_at: Set(now),
+        updated_at: Set(now),
+    }
+    .insert(&db)
+    .await
+    .unwrap();
+    let mut expected_artifact = publication.artifact.clone();
+    expected_artifact.preview = Some(pioneer_protocol::ArtifactPreviewRef {
+        projection_kind: pioneer_protocol::ArtifactProjectionKind::PlainText,
+        status: pioneer_protocol::ArtifactProjectionStatus::Ready,
+        artifact_id: publication.artifact.artifact_id.clone(),
+        version_id: original_version.id,
+        blob_id: Some(original_version.blob_id),
+        mime_type: Some("text/html".into()),
+        size_bytes: publication.artifact.size_bytes,
+        sha256: publication.artifact.sha256.clone(),
+    });
     let timestamp = now_timestamp_secs();
     // Equal timestamps exercise the canonical item-ID tie-break, while a
     // newer commentary message must never take the final-answer position.
@@ -68310,7 +68362,7 @@ async fn timeline_page_isolates_off_page_bodies_and_keeps_last_final_html() {
                 final_seen = true;
                 assert_eq!(text, "page body 64");
                 assert_eq!(html_publications.len(), 1);
-                assert_eq!(html_publications[0].artifact, publication.artifact);
+                assert_eq!(html_publications[0].artifact, expected_artifact);
             } else {
                 assert!(html_publications.is_empty());
             }
@@ -68373,6 +68425,43 @@ async fn timeline_page_isolates_off_page_bodies_and_keeps_last_final_html() {
     assert!(
         store
             .get_timeline_assistant_items(&harness.workspace_id, "wrong-thread", &targets)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let artifact = pioneer_entity::artifact::Entity::find_by_id(&publication.artifact.artifact_id)
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut artifact: pioneer_entity::artifact::ActiveModel = artifact.into();
+    artifact.status = Set("deleted".into());
+    artifact.deleted_at = Set(Some(now));
+    artifact.update(&db).await.unwrap();
+    let deleted = request_live_thread_timeline_page(&mut harness, "exact-page-deleted-html").await;
+    let deleted_html = deleted
+        .blocks
+        .iter()
+        .find_map(|block| match &block.kind {
+            pioneer_protocol::TimelineBlockKind::AssistantMessage {
+                item_id,
+                html_publications,
+                ..
+            } if item_id == "exact-page-064" => Some(html_publications),
+            _ => None,
+        })
+        .unwrap();
+    expected_artifact.status = pioneer_protocol::ArtifactStatus::Deleted;
+    assert_eq!(deleted_html.len(), 1);
+    assert_eq!(deleted_html[0].artifact, expected_artifact);
+    assert!(
+        harness
+            .processor
+            .html_publications_for_response_turn(
+                "wrong-workspace",
+                &harness.thread_id,
+                &harness.turn_id,
+            )
             .await
             .unwrap()
             .is_empty()

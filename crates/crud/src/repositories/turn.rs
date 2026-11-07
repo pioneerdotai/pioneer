@@ -1798,6 +1798,67 @@ pub(crate) async fn timeline_assistant_items<C: ConnectionTrait>(
     Ok(result)
 }
 
+/// Only exact source messages, never all bodies in a source Turn.
+#[derive(FromQueryResult)]
+pub(crate) struct ExactAgentMessageRow {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub item_id: String,
+    pub payload: String,
+}
+
+pub(crate) async fn exact_agent_messages<C: ConnectionTrait>(
+    db: &C,
+    workspace: &str,
+    targets: &[(String, String, String)],
+) -> Result<Vec<ExactAgentMessageRow>> {
+    use pioneer_entity::thread;
+    let mut rows = Vec::new();
+    for targets in targets.chunks(64) {
+        let mut exact = Condition::any();
+        for (thread, turn, item) in targets {
+            exact = exact.add(
+                Condition::all()
+                    .add(turn::Column::ThreadId.eq(thread.clone()))
+                    .add(turn_item::Column::TurnId.eq(turn.clone()))
+                    .add(turn_item::Column::ItemId.eq(item.clone())),
+            );
+        }
+        rows.extend(
+            turn_item::Entity::find()
+                .select_only()
+                .column_as(turn::Column::ThreadId, "thread_id")
+                .columns([
+                    turn_item::Column::TurnId,
+                    turn_item::Column::ItemId,
+                    turn_item::Column::Payload,
+                ])
+                .join(
+                    JoinType::InnerJoin,
+                    turn_item::Entity::belongs_to(turn::Entity)
+                        .from(turn_item::Column::TurnId)
+                        .to(turn::Column::Id)
+                        .into(),
+                )
+                .join(
+                    JoinType::InnerJoin,
+                    turn::Entity::belongs_to(thread::Entity)
+                        .from(turn::Column::ThreadId)
+                        .to(thread::Column::Id)
+                        .into(),
+                )
+                .filter(thread::Column::WorkspaceId.eq(workspace))
+                .filter(turn_item::Column::ItemType.eq("agent_message"))
+                .filter(exact)
+                .into_model::<ExactAgentMessageRow>()
+                .all(db)
+                .await
+                .context("failed to load exact source messages")?,
+        );
+    }
+    Ok(rows)
+}
+
 pub async fn list_turn_items_by_ids<C: ConnectionTrait>(
     db: &C,
     turn_id: &str,
