@@ -69,7 +69,7 @@ pub(crate) async fn run(store: Arc<CrudStore>, cancellation: CancellationToken) 
             Ok(true) => BATCH_PAUSE,
             Ok(false) if retry_pending => {
                 retry_pending = false;
-                progress = FrozenStorageLifetimeProgress::default();
+                progress.restart_discovery();
                 admission = DiscoveryAdmission::default();
                 IDLE_INTERVAL
             }
@@ -83,7 +83,7 @@ pub(crate) async fn run(store: Arc<CrudStore>, cancellation: CancellationToken) 
                                 _ = cancellation.cancelled() => return,
                                 _ = tokio::time::sleep(IDLE_INTERVAL) => {},
                             }
-                            progress = FrozenStorageLifetimeProgress::default();
+                            progress.restart_discovery();
                             admission = DiscoveryAdmission::default();
                             begin = true;
                             continue;
@@ -102,9 +102,9 @@ pub(crate) async fn run(store: Arc<CrudStore>, cancellation: CancellationToken) 
                     admission.done = [true, false];
                     continue;
                 }
-                // Invalidate all finished keysets, including changed old rows.
-                // No unfinished preparation is discarded at a quantum boundary.
-                progress = FrozenStorageLifetimeProgress::default();
+                // Revisit changed old rows without repeating the startup scope
+                // inventory. This is EOF, never a quantum boundary.
+                progress.restart_discovery();
                 admission = DiscoveryAdmission::default();
                 begin = true;
                 continue;
@@ -561,6 +561,86 @@ mod tests {
             assert!(!admission.ready(1 - first));
         }
     }
+    #[tokio::test]
+    async fn source_invalidation_registers_new_work_without_repeating_legacy_inventory() {
+        use pioneer_entity::compaction_frozen_history as history;
+        use sea_orm::EntityTrait;
+        use sha2::{Digest, Sha256};
+
+        let (_directory, store, observer) = fixture_with_metadata(128).await;
+        let mut progress = FrozenStorageLifetimeProgress::default();
+        let mut lifetime = false;
+        let mut admission = DiscoveryAdmission::default();
+        let mut idle = false;
+        for _ in 0..2048 {
+            if !batch(
+                &store,
+                &mut progress,
+                &mut lifetime,
+                &mut admission,
+                BATCH_STEPS,
+                BATCH_TIME,
+            )
+            .await
+            .unwrap()
+            {
+                idle = true;
+                break;
+            }
+        }
+        assert!(idle, "the initial legacy inventory must finish");
+        let db = store.database_connection();
+        let mut wake = db.work_signal("maintenance.frozen").subscribe();
+        wake.begin_pass(&db).await.unwrap();
+        store
+            .compaction_begin_frozen_history(
+                "ws",
+                "thread",
+                &FrozenHistoryRef {
+                    format: 1,
+                    manifest_id: "new-after-idle".into(),
+                    messages: 0,
+                    identity_sha256: hex::encode(Sha256::digest([])),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(futures_util::FutureExt::now_or_never(wake.wait(None)).is_some());
+        wake.begin_pass(&db).await.unwrap();
+        progress.restart_discovery();
+        admission = DiscoveryAdmission::default();
+        lifetime = false;
+        let before = observer.operations();
+        // One new manifest must not pay for another 128-header legacy walk.
+        // Count all reader operations, not a particular SQL shape or call order.
+        for _ in 0..16 {
+            batch(
+                &store,
+                &mut progress,
+                &mut lifetime,
+                &mut admission,
+                1,
+                BATCH_TIME,
+            )
+            .await
+            .unwrap();
+            let registered = history::Entity::find_by_id("new-after-idle")
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap()
+                .storage_registered;
+            assert!(
+                observer.operations() - before < 64,
+                "source invalidation must not repeat the old scope inventory"
+            );
+            if registered == 1 {
+                return;
+            }
+        }
+        panic!("new supported work must be registered without a legacy scan");
+    }
+
     #[tokio::test]
     async fn conversion_release_reopens_lifetime_after_eof() {
         use pioneer_entity::compaction_frozen_history as history;
