@@ -1749,6 +1749,19 @@ AND NOT EXISTS(SELECT 1 FROM compaction_frozen_span s JOIN compaction_frozen_his
 }
 
 impl FrozenStorageLifetimeProgress {
+    /// Reopen finite discovery after a source invalidation or retry. Legacy
+    /// scope validation is a startup prerequisite: supported writers preserve
+    /// it, so a new cleanup pass must not inventory all old metadata again.
+    /// Keep an unfinished scope cursor too; failed steps already discard their
+    /// unacknowledged page and retry from the last checked key.
+    pub fn restart_discovery(&mut self) {
+        let scope = std::mem::take(&mut self.scope);
+        *self = Self {
+            scope,
+            ..Self::default()
+        };
+    }
+
     /// Called only after worker EOF. A hold release changes cleanup eligibility,
     /// not legacy proof/locator validity. Keep scope and conversion knowledge.
     pub fn recheck_released_holds(&mut self) {
