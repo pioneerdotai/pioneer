@@ -79,7 +79,7 @@ impl Drop for FrozenReadHold {
                 let held = readers.remove(&self.manifest).expect("last frozen reader");
                 drop(readers);
                 for signal in held.blocked_cleanup {
-                    signal.notify();
+                    signal.notify_keys(&[format!("m:{}", self.manifest)]);
                 }
             }
         }
@@ -565,5 +565,94 @@ mod tests {
                 .locator(),
             Some("m".into())
         );
+    }
+}
+
+/// Exact root delta prepared by the authoritative writer. An opaque legacy
+/// locator cannot identify released dependencies and requests recovery instead.
+pub(crate) fn changed_root_keys(
+    before: Option<String>,
+    after: Option<String>,
+) -> Option<Vec<String>> {
+    if before == after {
+        return Some(Vec::new());
+    }
+    if before.as_deref() == Some("") || after.as_deref() == Some("") {
+        return None;
+    }
+    Some(
+        before
+            .into_iter()
+            .chain(after)
+            .map(|id| format!("m:{id}"))
+            .collect(),
+    )
+}
+
+pub(crate) fn complete_keys(
+    change: pioneer_sqlite::WorkChange,
+    keys: &Option<Vec<String>>,
+    changed: bool,
+) {
+    if !changed {
+        change.completed(false);
+        return;
+    }
+    match keys {
+        Some(keys) => change.completed_keys(keys),
+        None => change.completed(true),
+    }
+}
+
+/// Compare only the CLI facts consulted by HTML retention, after releasing the
+/// writer. Model/session/timestamp and cursor bookkeeping are not dependencies.
+/// `before` is captured by the same transaction that stores `after`.
+pub(crate) fn html_cli_root_changed(
+    before: Option<&(String, String)>,
+    workspace: &str,
+    json: &str,
+    thread: bool,
+) -> bool {
+    fn root(json: &str, thread: bool) -> Option<(Option<String>, bool)> {
+        let value: serde_json::Value = serde_json::from_str(json).ok()?;
+        let basis = value.get(if thread {
+            "pioneerContext"
+        } else {
+            "pioneerContextBasis"
+        });
+        let history = basis.and_then(|basis| {
+            basis.get(if thread {
+                "contextHistoryJson"
+            } else {
+                "historyJson"
+            })
+        });
+        let text = match history {
+            None | Some(serde_json::Value::Null) => "[]",
+            Some(value) => value.as_str()?,
+        };
+        let history: serde_json::Value = serde_json::from_str(text).ok()?;
+        if history.is_array() {
+            // Match the existing conservative opaque-history predicate exactly.
+            Some((None, text != "[]"))
+        } else {
+            let descriptor: FrozenHistoryRef = serde_json::from_value(history).ok()?;
+            Some((Some(descriptor.manifest_id), false))
+        }
+    }
+    if let Some((old_workspace, old_json)) = before {
+        if old_workspace == workspace && old_json == json {
+            return false;
+        }
+        match (root(old_json, thread), root(json, thread)) {
+            (Some(before), Some(after)) => {
+                before != after
+                    || (old_workspace != workspace
+                        && (before.0.is_some() || before.1 || after.0.is_some() || after.1))
+            }
+            _ => true,
+        }
+    } else {
+        root(json, thread).is_none_or(|(manifest, opaque)| manifest.is_some() || opaque)
     }
 }

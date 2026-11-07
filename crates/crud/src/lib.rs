@@ -13,6 +13,7 @@ pub use gateway_control::GatewayControlConnection;
 mod recovery_wake;
 pub use frozen_lifetime::FrozenReadHold;
 pub use pioneer_sqlite::{WorkSignal, WorkSubscription};
+mod terminal_cleanup;
 mod tool_output;
 pub use repositories::compaction;
 mod compaction_store;
@@ -5092,6 +5093,31 @@ impl CrudStore {
         after_turn_id: Option<&str>,
         through_turn_id: Option<&str>,
     ) -> Result<ProjectionReceiptCleanupOutcome> {
+        self.cleanup_projection_receipts_quantum_inner(after_turn_id, through_turn_id, None)
+            .await
+    }
+
+    /// Drain one notified Turn without inventorying other streams. The sequence
+    /// frontier is carried by the worker across bounded, fair batch portions.
+    pub async fn cleanup_projection_receipts_for_turn(
+        &self,
+        turn_id: &str,
+        through_sequence: Option<i64>,
+    ) -> Result<ProjectionReceiptCleanupOutcome> {
+        self.cleanup_projection_receipts_quantum_inner(
+            None,
+            None,
+            Some((turn_id, through_sequence)),
+        )
+        .await
+    }
+
+    async fn cleanup_projection_receipts_quantum_inner(
+        &self,
+        after_turn_id: Option<&str>,
+        through_turn_id: Option<&str>,
+        addressed: Option<(&str, Option<i64>)>,
+    ) -> Result<ProjectionReceiptCleanupOutcome> {
         let change = self.connection.work_signal("maintenance.native").changing();
         let result = async {
             use repositories::projection_receipt_cleanup as cleanup;
@@ -5103,11 +5129,19 @@ impl CrudStore {
                     backfill_ready: true,
                     ..Default::default()
                 };
-                let Some(stream) =
-                    cleanup::next_stream(&self.connection, after_turn_id, through_turn_id).await?
-                else {
+                let stream = match addressed {
+                    Some((turn_id, through)) => {
+                        cleanup::addressed_stream(&self.connection, turn_id, through).await?
+                    }
+                    None => {
+                        cleanup::next_stream(&self.connection, after_turn_id, through_turn_id)
+                            .await?
+                    }
+                };
+                let Some(stream) = stream else {
                     return Ok(outcome);
                 };
+                outcome.through_sequence = Some(stream.through_sequence());
                 outcome.last_turn_id = Some(stream.turn_id.clone());
                 let prepared = match cleanup::prepare(&self.connection, stream).await {
                     Ok(prepared) => prepared,
@@ -5158,7 +5192,11 @@ impl CrudStore {
         }
         .await;
         if let Ok(outcome) = &result {
-            change.completed(outcome.rows_deleted > 0);
+            if outcome.rows_deleted > 0 {
+                change.completed_keys(&outcome.last_turn_id.iter().cloned().collect::<Vec<_>>());
+            } else {
+                change.completed(false);
+            }
         }
         result
     }
@@ -5396,8 +5434,8 @@ impl CrudStore {
         thread_id: &str,
         turn_id: &str,
     ) -> Result<Option<bool>> {
+        let frozen_change = self.connection.work_signal("maintenance.frozen").changing();
         let maintenance_changes = [
-            self.connection.work_signal("maintenance.frozen").changing(),
             self.connection
                 .work_signal("maintenance.portable")
                 .changing(),
@@ -5409,6 +5447,15 @@ impl CrudStore {
                 let tx =
                     repositories::task_child_cleanup::begin_authoritative(&self.connection).await?;
                 repositories::task_child_cleanup::lock_authority(&tx, thread_id, turn_id).await?;
+                let old_root =
+                    pioneer_entity::turn_runtime_snapshot::Entity::find_by_id(turn_id.to_owned())
+                        .select_only()
+                        .column(pioneer_entity::turn_runtime_snapshot::Column::FrozenManifestId)
+                        .into_tuple::<Option<String>>()
+                        .one(&tx)
+                        .await?
+                        .flatten();
+
                 let ready =
                     repositories::task_child_cleanup::ready(&tx, thread_id, turn_id).await?;
                 if ready == Some(true) {
@@ -5416,20 +5463,29 @@ impl CrudStore {
                     turn_runtime_snapshot::delete_turn_runtime_snapshot(&tx, turn_id).await?;
                 }
                 tx.commit().await?;
-                Ok(ready)
+                Ok((
+                    ready,
+                    frozen_lifetime::changed_root_keys(
+                        old_root.clone(),
+                        if ready == Some(true) { None } else { old_root },
+                    ),
+                ))
             })
             .await
         }
         .await;
         let maintenance_changed = maintenance_result
             .as_ref()
-            .is_ok_and(|changed| *changed == Some(true));
+            .is_ok_and(|(changed, _)| *changed == Some(true));
+        if let Ok((_, keys)) = &maintenance_result {
+            frozen_lifetime::complete_keys(frozen_change, keys, maintenance_changed);
+        }
         if maintenance_result.is_ok() {
             for change in maintenance_changes {
                 change.completed(maintenance_changed);
             }
         }
-        maintenance_result
+        maintenance_result.map(|(ready, _)| ready)
     }
 
     pub async fn list_active_execution_authorities(
@@ -5635,13 +5691,8 @@ impl CrudStore {
         claim_token: &str,
         now_unix: i64,
     ) -> Result<bool> {
-        let changes = [
-            "projection",
-            "compaction",
-            "maintenance.receipts",
-            "maintenance.native",
-        ]
-        .map(|domain| self.connection.work_signal(domain).changing());
+        let changes = ["projection", "compaction"]
+            .map(|domain| self.connection.work_signal(domain).changing());
         let id = id.to_owned();
         let claim_token = claim_token.to_owned();
         let result = self
@@ -5763,10 +5814,7 @@ impl CrudStore {
     }
 
     pub async fn delete_turn_llm_context_for_terminal_turns(&self) -> Result<u64> {
-        let maintenance_changes = [
-            self.connection.work_signal("maintenance.html").changing(),
-            self.connection.work_signal("maintenance.frozen").changing(),
-        ];
+        let maintenance_changes = [self.connection.work_signal("maintenance.html").changing()];
         let maintenance_result = async {
             turn_llm_context::delete_turn_llm_context_for_terminal_turns(&self.connection).await
         }
@@ -5811,10 +5859,8 @@ impl CrudStore {
                 .await?;
         let task_requested = (snapshot.thread_id.clone(), snapshot.workspace_id.clone());
         let task_result = async {
-            let maintenance_changes = [
-                self.connection.work_signal("maintenance.frozen").changing(),
-                self.connection.work_signal("maintenance.html").changing(),
-            ];
+            let frozen_change = self.connection.work_signal("maintenance.frozen").changing();
+            let html_change = self.connection.work_signal("maintenance.html").changing();
             let maintenance_result = async {
                 let root = frozen_lifetime::PreparedFrozenRoot::history(&snapshot.history_json)?;
                 // Preparation reads these epochs without writer capacity. Edits can
@@ -5826,6 +5872,22 @@ impl CrudStore {
                 );
                 self.run_serialized_write(|| async {
                     let transaction = self.connection.begin().await?;
+                    let before = pioneer_entity::turn_runtime_snapshot::Entity::find_by_id(
+                        snapshot.turn_id.clone(),
+                    )
+                    .select_only()
+                    .columns([
+                        pioneer_entity::turn_runtime_snapshot::Column::FrozenManifestId,
+                        pioneer_entity::turn_runtime_snapshot::Column::WorkspaceId,
+                    ])
+                    .into_tuple::<(Option<String>, String)>()
+                    .one(&transaction)
+                    .await?;
+                    let html_changed = before
+                        .as_ref()
+                        .is_none_or(|(_, workspace)| workspace != &snapshot.workspace_id);
+                    let old_root = before.and_then(|(root, _)| root);
+
                     let result = async {
                         turn_runtime_snapshot::verify_source_epochs(
                             &transaction,
@@ -5842,18 +5904,20 @@ impl CrudStore {
                     }
                     .await?;
                     transaction.commit().await?;
-                    Ok(result)
+                    Ok((
+                        result,
+                        frozen_lifetime::changed_root_keys(old_root, root.locator()),
+                        html_changed,
+                    ))
                 })
                 .await
             }
             .await;
-            let maintenance_changed = maintenance_result.is_ok();
-            if maintenance_result.is_ok() {
-                for change in maintenance_changes {
-                    change.completed(maintenance_changed);
-                }
+            if let Ok((_, keys, html_changed)) = &maintenance_result {
+                html_change.completed(*html_changed);
+                frozen_lifetime::complete_keys(frozen_change, keys, true);
             }
-            maintenance_result
+            maintenance_result.map(|(record, _, _)| record)
         }
         .await;
         if task_result.is_ok() {
@@ -5897,31 +5961,43 @@ impl CrudStore {
     }
 
     pub async fn delete_turn_runtime_snapshot(&self, turn_id: &str) -> Result<u64> {
-        let maintenance_changes = [
-            self.connection.work_signal("maintenance.frozen").changing(),
-            self.connection.work_signal("maintenance.html").changing(),
-        ];
+        let frozen_change = self.connection.work_signal("maintenance.frozen").changing();
+        let maintenance_changes = [self.connection.work_signal("maintenance.html").changing()];
         let maintenance_result = async {
             let turn_id = turn_id.to_owned();
             self.run_serialized_write(|| async {
-                turn_runtime_snapshot::delete_turn_runtime_snapshot(
-                    &self.connection,
+                let transaction = self.connection.begin().await?;
+                let old_root =
+                    pioneer_entity::turn_runtime_snapshot::Entity::find_by_id(turn_id.to_owned())
+                        .select_only()
+                        .column(pioneer_entity::turn_runtime_snapshot::Column::FrozenManifestId)
+                        .into_tuple::<Option<String>>()
+                        .one(&transaction)
+                        .await?
+                        .flatten();
+                let deleted = turn_runtime_snapshot::delete_turn_runtime_snapshot(
+                    &transaction,
                     turn_id.as_str(),
                 )
-                .await
+                .await?;
+                transaction.commit().await?;
+                Ok((deleted, frozen_lifetime::changed_root_keys(old_root, None)))
             })
             .await
         }
         .await;
         let maintenance_changed = maintenance_result
             .as_ref()
-            .is_ok_and(|changed| *changed > 0);
+            .is_ok_and(|(changed, _)| *changed > 0);
+        if let Ok((_, keys)) = &maintenance_result {
+            frozen_lifetime::complete_keys(frozen_change, keys, maintenance_changed);
+        }
         if maintenance_result.is_ok() {
             for change in maintenance_changes {
                 change.completed(maintenance_changed);
             }
         }
-        maintenance_result
+        maintenance_result.map(|(deleted, _)| deleted)
     }
 
     pub async fn delete_turn_runtime_snapshots_for_closed_turns(&self) -> Result<u64> {
@@ -5979,17 +6055,24 @@ impl CrudStore {
         &self,
         binding: NewCliRuntimeThreadBinding,
     ) -> Result<CliRuntimeThreadBindingRecord> {
-        let changes = [
-            "gateway.control",
-            "gateway.cli",
-            "maintenance.frozen",
-            "maintenance.html",
-        ]
-        .map(|domain| self.connection.work_signal(domain).changing());
+        let html_change = self.connection.work_signal("maintenance.html").changing();
+        let frozen_change = self.connection.work_signal("maintenance.frozen").changing();
+        let changes = ["gateway.control", "gateway.cli"]
+            .map(|domain| self.connection.work_signal(domain).changing());
         let result = async {
             let root = frozen_lifetime::PreparedFrozenRoot::cli(&binding.resume_cursor_json, true)?;
             self.run_serialized_write(|| async {
                 let transaction = self.connection.begin().await?;
+                let old_root = pioneer_entity::thread_cli_runtime_binding::Entity::find_by_id(
+                    binding.thread_id.clone(),
+                )
+                .select_only()
+                .column(pioneer_entity::thread_cli_runtime_binding::Column::FrozenManifestId)
+                .into_tuple::<Option<String>>()
+                .one(&transaction)
+                .await?
+                .flatten();
+
                 let before =
                     cli_runtime_binding::find_thread_binding(&transaction, &binding.thread_id)
                         .await?;
@@ -6000,30 +6083,57 @@ impl CrudStore {
                 )
                 .await?;
                 let changed = before.as_ref() != Some(&result);
+                let html_before =
+                    before.map(|value| (value.workspace_id, value.resume_cursor_json));
                 transaction.commit().await?;
-                Ok((result, changed))
+                Ok((
+                    result,
+                    changed,
+                    frozen_lifetime::changed_root_keys(old_root, root.locator()),
+                    html_before,
+                ))
             })
             .await
         }
         .await;
-        if let Ok((_, changed)) = &result {
+        if let Ok((binding, changed, keys, html_before)) = &result {
+            html_change.completed(
+                *changed
+                    && frozen_lifetime::html_cli_root_changed(
+                        html_before.as_ref(),
+                        &binding.workspace_id,
+                        &binding.resume_cursor_json,
+                        true,
+                    ),
+            );
+            frozen_lifetime::complete_keys(frozen_change, keys, *changed);
             for change in changes {
                 change.completed(*changed);
             }
         }
-        result.map(|(binding, _)| binding)
+        result.map(|(binding, _, _, _)| binding)
     }
 
     pub async fn insert_cli_fork_intent_if_absent(
         &self,
         pending: NewCliRuntimeThreadBinding,
     ) -> Result<bool> {
-        let changes = ["maintenance.frozen", "maintenance.html"]
-            .map(|domain| self.connection.work_signal(domain).changing());
+        let html_change = self.connection.work_signal("maintenance.html").changing();
+        let frozen_change = self.connection.work_signal("maintenance.frozen").changing();
         let result = async {
             let root = frozen_lifetime::PreparedFrozenRoot::cli(&pending.resume_cursor_json, true)?;
             self.run_serialized_write(|| async {
                 let transaction = self.connection.begin().await?;
+                let old_root = pioneer_entity::thread_cli_runtime_binding::Entity::find_by_id(
+                    pending.thread_id.clone(),
+                )
+                .select_only()
+                .column(pioneer_entity::thread_cli_runtime_binding::Column::FrozenManifestId)
+                .into_tuple::<Option<String>>()
+                .one(&transaction)
+                .await?
+                .flatten();
+
                 let result = async {
                     cli_runtime_binding::insert_fork_intent_if_absent(
                         &transaction,
@@ -6034,17 +6144,27 @@ impl CrudStore {
                 }
                 .await?;
                 transaction.commit().await?;
-                Ok(result)
+                Ok((
+                    result,
+                    frozen_lifetime::changed_root_keys(old_root, root.locator()),
+                ))
             })
             .await
         }
         .await;
-        if let Ok(value) = &result {
-            for change in changes {
-                change.completed(*value);
-            }
+        if let Ok((value, keys)) = &result {
+            html_change.completed(
+                *value
+                    && frozen_lifetime::html_cli_root_changed(
+                        None,
+                        &pending.workspace_id,
+                        &pending.resume_cursor_json,
+                        true,
+                    ),
+            );
+            frozen_lifetime::complete_keys(frozen_change, keys, *value);
         }
-        result
+        result.map(|(record, _)| record)
     }
 
     pub async fn get_cli_runtime_thread_binding(
@@ -6062,10 +6182,16 @@ impl CrudStore {
         source_native_thread_id: &str,
         expected_cursor_json: &str,
     ) -> Result<bool> {
-        let maintenance_changes = [
-            self.connection.work_signal("maintenance.frozen").changing(),
-            self.connection.work_signal("maintenance.html").changing(),
-        ];
+        let html_change = self.connection.work_signal("maintenance.html").changing();
+        let frozen_change = self.connection.work_signal("maintenance.frozen").changing();
+        let frozen_keys = frozen_lifetime::PreparedFrozenRoot::cli(expected_cursor_json, true)
+            .ok()
+            .map(|root| {
+                root.locator()
+                    .into_iter()
+                    .map(|id| format!("m:{id}"))
+                    .collect::<Vec<_>>()
+            });
         let maintenance_result = async {
             self.run_serialized_write(|| async {
                 cli_runtime_binding::discard_rejected_fork_intent(
@@ -6082,9 +6208,11 @@ impl CrudStore {
         .await;
         let maintenance_changed = maintenance_result.as_ref().is_ok_and(|changed| *changed);
         if maintenance_result.is_ok() {
-            for change in maintenance_changes {
-                change.completed(maintenance_changed);
-            }
+            html_change.completed(
+                maintenance_changed
+                    && frozen_lifetime::html_cli_root_changed(None, "", expected_cursor_json, true),
+            );
+            frozen_lifetime::complete_keys(frozen_change, &frozen_keys, maintenance_changed);
         }
         maintenance_result
     }
@@ -6098,12 +6226,26 @@ impl CrudStore {
         resume_cursor_json: String,
         updated_at: sea_orm::entity::prelude::DateTimeWithTimeZone,
     ) -> Result<CliRuntimeThreadBindingRecord> {
-        let changes = ["maintenance.frozen", "maintenance.html"]
-            .map(|domain| self.connection.work_signal(domain).changing());
+        let frozen_change = self.connection.work_signal("maintenance.frozen").changing();
+        let html_change = self.connection.work_signal("maintenance.html").changing();
         let result = async {
             let root = frozen_lifetime::PreparedFrozenRoot::cli(&resume_cursor_json, true)?;
             self.run_serialized_write(|| async {
                 let transaction = self.connection.begin().await?;
+                let old_root = pioneer_entity::thread_cli_runtime_binding::Entity::find_by_id(
+                    pending.thread_id.clone(),
+                )
+                .select_only()
+                .column(pioneer_entity::thread_cli_runtime_binding::Column::FrozenManifestId)
+                .into_tuple::<Option<String>>()
+                .one(&transaction)
+                .await?
+                .flatten();
+
+                let html_before =
+                    cli_runtime_binding::find_thread_binding(&transaction, &pending.thread_id)
+                        .await?
+                        .map(|value| (value.workspace_id, value.resume_cursor_json));
                 let result = async {
                     cli_runtime_binding::confirm_marked_fork_intent(
                         &transaction,
@@ -6119,17 +6261,25 @@ impl CrudStore {
                 }
                 .await?;
                 transaction.commit().await?;
-                Ok(result)
+                Ok((
+                    result,
+                    frozen_lifetime::changed_root_keys(old_root, root.locator()),
+                    html_before,
+                ))
             })
             .await
         }
         .await;
-        if result.is_ok() {
-            for change in changes {
-                change.completed(true);
-            }
+        if let Ok((binding, keys, html_before)) = &result {
+            html_change.completed(frozen_lifetime::html_cli_root_changed(
+                html_before.as_ref(),
+                &binding.workspace_id,
+                &binding.resume_cursor_json,
+                true,
+            ));
+            frozen_lifetime::complete_keys(frozen_change, keys, true);
         }
-        result
+        result.map(|(record, _, _)| record)
     }
 
     pub async fn update_cli_runtime_thread_resume_cursor(
@@ -6140,10 +6290,8 @@ impl CrudStore {
         resume_cursor_json: String,
         updated_at: sea_orm::entity::prelude::DateTimeWithTimeZone,
     ) -> Result<CliRuntimeThreadBindingRecord> {
-        let maintenance_changes = [
-            self.connection.work_signal("maintenance.frozen").changing(),
-            self.connection.work_signal("maintenance.html").changing(),
-        ];
+        let frozen_change = self.connection.work_signal("maintenance.frozen").changing();
+        let html_change = self.connection.work_signal("maintenance.html").changing();
         let maintenance_result = async {
             let thread_id = thread_id.to_owned();
             let expected_native_thread_id = expected_native_thread_id.to_owned();
@@ -6151,6 +6299,20 @@ impl CrudStore {
             let root = frozen_lifetime::PreparedFrozenRoot::cli(&resume_cursor_json, true)?;
             self.run_serialized_write(|| async {
                 let transaction = self.connection.begin().await?;
+                let old_root = pioneer_entity::thread_cli_runtime_binding::Entity::find_by_id(
+                    thread_id.clone(),
+                )
+                .select_only()
+                .column(pioneer_entity::thread_cli_runtime_binding::Column::FrozenManifestId)
+                .into_tuple::<Option<String>>()
+                .one(&transaction)
+                .await?
+                .flatten();
+
+                let html_before =
+                    cli_runtime_binding::find_thread_binding(&transaction, &thread_id)
+                        .await?
+                        .map(|value| (value.workspace_id, value.resume_cursor_json));
                 let result = async {
                     cli_runtime_binding::update_thread_resume_cursor(
                         &transaction,
@@ -6165,26 +6327,33 @@ impl CrudStore {
                 }
                 .await?;
                 transaction.commit().await?;
-                Ok(result)
+                Ok((
+                    result,
+                    frozen_lifetime::changed_root_keys(old_root, root.locator()),
+                    html_before,
+                ))
             })
             .await
         }
         .await;
-        let maintenance_changed = maintenance_result.is_ok();
-        if maintenance_result.is_ok() {
-            for change in maintenance_changes {
-                change.completed(maintenance_changed);
-            }
+        if let Ok((binding, keys, html_before)) = &maintenance_result {
+            html_change.completed(frozen_lifetime::html_cli_root_changed(
+                html_before.as_ref(),
+                &binding.workspace_id,
+                &binding.resume_cursor_json,
+                true,
+            ));
+            frozen_lifetime::complete_keys(frozen_change, keys, true);
         }
-        maintenance_result
+        maintenance_result.map(|(record, _, _)| record)
     }
 
     pub async fn prepare_claude_provider_session_binding(
         &self,
         request: PrepareClaudeProviderSessionBinding,
     ) -> Result<PreparedClaudeProviderSessionBinding> {
-        let changes = ["maintenance.frozen", "maintenance.html"]
-            .map(|domain| self.connection.work_signal(domain).changing());
+        let html_change = self.connection.work_signal("maintenance.html").changing();
+        let frozen_change = self.connection.work_signal("maintenance.frozen").changing();
         let result = async {
             let root = frozen_lifetime::PreparedFrozenRoot::cli(
                 &request.thread_binding.resume_cursor_json,
@@ -6192,6 +6361,16 @@ impl CrudStore {
             )?;
             self.run_serialized_write(|| async {
                 let transaction = self.connection.begin().await?;
+                let old_root = pioneer_entity::thread_cli_runtime_binding::Entity::find_by_id(
+                    request.thread_binding.thread_id.clone(),
+                )
+                .select_only()
+                .column(pioneer_entity::thread_cli_runtime_binding::Column::FrozenManifestId)
+                .into_tuple::<Option<String>>()
+                .one(&transaction)
+                .await?
+                .flatten();
+
                 let before = cli_runtime_binding::find_thread_binding(
                     &transaction,
                     &request.thread_binding.thread_id,
@@ -6207,18 +6386,32 @@ impl CrudStore {
                 }
                 .await?;
                 let changed = before.as_ref() != Some(&result.binding);
+                let html_before =
+                    before.map(|value| (value.workspace_id, value.resume_cursor_json));
                 transaction.commit().await?;
-                Ok((result, changed))
+                Ok((
+                    result,
+                    changed,
+                    frozen_lifetime::changed_root_keys(old_root, root.locator()),
+                    html_before,
+                ))
             })
             .await
         }
         .await;
         if let Ok(value) = &result {
-            for change in changes {
-                change.completed(value.1);
-            }
+            html_change.completed(
+                value.1
+                    && frozen_lifetime::html_cli_root_changed(
+                        value.3.as_ref(),
+                        &value.0.binding.workspace_id,
+                        &value.0.binding.resume_cursor_json,
+                        true,
+                    ),
+            );
+            frozen_lifetime::complete_keys(frozen_change, &value.2, value.1);
         }
-        result.map(|(binding, _)| binding)
+        result.map(|(binding, _, _, _)| binding)
     }
 
     pub async fn verify_claude_provider_session_binding(
@@ -6295,12 +6488,12 @@ impl CrudStore {
         &self,
         binding: NewCliRuntimeTurnBinding,
     ) -> Result<CliRuntimeTurnBindingRecord> {
+        let html_change = self.connection.work_signal("maintenance.html").changing();
+        let frozen_change = self.connection.work_signal("maintenance.frozen").changing();
         let changes = [
             "gateway.control",
             "gateway.cli",
-            "maintenance.frozen",
             "maintenance.portable",
-            "maintenance.html",
             "maintenance.native",
         ]
         .map(|domain| self.connection.work_signal(domain).changing());
@@ -6310,6 +6503,16 @@ impl CrudStore {
                 frozen_lifetime::PreparedFrozenRoot::cli(&binding.input_mapping_json, false)?;
             self.run_serialized_write(|| async {
                 let transaction = self.connection.begin().await?;
+                let old_root = pioneer_entity::turn_cli_runtime_binding::Entity::find_by_id(
+                    binding.turn_id.clone(),
+                )
+                .select_only()
+                .column(pioneer_entity::turn_cli_runtime_binding::Column::FrozenManifestId)
+                .into_tuple::<Option<String>>()
+                .one(&transaction)
+                .await?
+                .flatten();
+
                 let before =
                     cli_runtime_binding::find_turn_binding(&transaction, &binding.turn_id).await?;
                 let stored =
@@ -6324,19 +6527,37 @@ impl CrudStore {
                         || before.status != stored.status
                         || before.native_turn_id != stored.native_turn_id
                 });
+                let html_before =
+                    before.map(|value| (value.workspace_id, value.input_mapping_json));
                 transaction.commit().await?;
-                Ok((stored, changed, task_changed))
+                Ok((
+                    stored,
+                    changed,
+                    task_changed,
+                    frozen_lifetime::changed_root_keys(old_root, root.locator()),
+                    html_before,
+                ))
             })
             .await
         }
         .await;
-        if let Ok((_, changed, task_changed)) = &result {
+        if let Ok((binding, changed, task_changed, keys, html_before)) = &result {
+            html_change.completed(
+                *changed
+                    && frozen_lifetime::html_cli_root_changed(
+                        html_before.as_ref(),
+                        &binding.workspace_id,
+                        &binding.input_mapping_json,
+                        false,
+                    ),
+            );
+            frozen_lifetime::complete_keys(frozen_change, keys, *changed);
             for change in changes {
                 change.completed(*changed);
             }
             task_change.completed(*task_changed);
         }
-        let (binding, _, _) = result?;
+        let (binding, _, _, _, _) = result?;
         cli_runtime_binding::hydrate_record(&self.connection, binding).await
     }
 
@@ -6987,14 +7208,10 @@ impl CrudStore {
         attempt_id: String,
         execution_window_index: u32,
     ) -> Result<(CliRuntimeTurnBindingRecord, CliRuntimeTurnAttemptRecord)> {
-        let changes = [
-            "gateway.control",
-            "gateway.cli",
-            "maintenance.portable",
-            "maintenance.html",
-            "maintenance.frozen",
-        ]
-        .map(|domain| self.connection.work_signal(domain).changing());
+        let html_change = self.connection.work_signal("maintenance.html").changing();
+        let frozen_change = self.connection.work_signal("maintenance.frozen").changing();
+        let changes = ["gateway.control", "gateway.cli", "maintenance.portable"]
+            .map(|domain| self.connection.work_signal(domain).changing());
         let result = async {
             let root =
                 frozen_lifetime::PreparedFrozenRoot::cli(&binding.input_mapping_json, false)?;
@@ -7117,6 +7334,24 @@ impl CrudStore {
         }
         .await;
         if let Ok((_, inserted)) = &result {
+            html_change.completed(
+                *inserted
+                    && frozen_lifetime::html_cli_root_changed(
+                        None,
+                        &binding.workspace_id,
+                        &binding.input_mapping_json,
+                        false,
+                    ),
+            );
+            let keys = frozen_lifetime::PreparedFrozenRoot::cli(&binding.input_mapping_json, false)
+                .ok()
+                .map(|root| {
+                    root.locator()
+                        .into_iter()
+                        .map(|id| format!("m:{id}"))
+                        .collect::<Vec<_>>()
+                });
+            frozen_lifetime::complete_keys(frozen_change, &keys, *inserted);
             for change in changes {
                 change.completed(*inserted);
             }
@@ -8103,15 +8338,18 @@ impl CrudStore {
         execution_owner_id: &str,
         event_timestamp_secs: i64,
     ) -> Result<bool> {
+        let receipt_keys = vec![notification.turn.id.clone()];
+        let receipt_change = self
+            .connection
+            .work_signal("maintenance.receipts")
+            .changing();
         let changes = [
             "gateway.control",
             "gateway.cli",
             "projection",
             "compaction",
             "maintenance.zstd",
-            "maintenance.receipts",
             "maintenance.native",
-            "maintenance.frozen",
             "maintenance.html",
             "tasks.lifecycle",
         ]
@@ -8295,6 +8533,7 @@ impl CrudStore {
         }
         .await;
         if let Ok(changed) = &result {
+            receipt_change.completed_keys(if *changed { &receipt_keys } else { &[] });
             for change in changes {
                 change.completed(*changed);
             }
@@ -8335,7 +8574,6 @@ impl CrudStore {
             "gateway.control",
             "gateway.cli",
             "maintenance.native",
-            "maintenance.frozen",
             "maintenance.portable",
             "maintenance.html",
         ]
@@ -9040,13 +9278,13 @@ impl CrudStore {
         &self,
         event: NewCliRuntimeNativeEvent,
     ) -> Result<CliRuntimeNativeEventRecord> {
+        let cleanup_turns = event.turn_id.iter().cloned().collect::<Vec<_>>();
         let cli_changes = [
             self.connection.work_signal("gateway.control").changing(),
             self.connection.work_signal("gateway.cli").changing(),
         ];
         let cli_result = async {
-            let maintenance_changes =
-                [self.connection.work_signal("maintenance.native").changing()];
+            let cleanup_change = terminal_cleanup::Change::native(&self.connection);
             let maintenance_result = async {
                 self.run_serialized_write(|| async {
                     cli_runtime_binding::append_native_event(&self.connection, event.clone()).await
@@ -9056,9 +9294,9 @@ impl CrudStore {
             .await;
             let maintenance_changed = maintenance_result.is_ok();
             if maintenance_result.is_ok() {
-                for change in maintenance_changes {
-                    change.completed(maintenance_changed);
-                }
+                cleanup_change
+                    .complete(&self.connection, maintenance_changed, &cleanup_turns)
+                    .await;
             }
             maintenance_result
         }
@@ -9075,6 +9313,7 @@ impl CrudStore {
         &self,
         event: NewCliRuntimeNativeEvent,
     ) -> Result<CliRuntimeNativeEventRecord> {
+        let cleanup_turns = event.turn_id.iter().cloned().collect::<Vec<_>>();
         let cli_changes = [
             self.connection.work_signal("gateway.control").changing(),
             self.connection.work_signal("gateway.cli").changing(),
@@ -9084,8 +9323,7 @@ impl CrudStore {
             .await?
             .is_some();
         let cli_result = async {
-            let maintenance_changes =
-                [self.connection.work_signal("maintenance.native").changing()];
+            let cleanup_change = terminal_cleanup::Change::native(&self.connection);
             let maintenance_result = async {
                 self.run_serialized_write(|| async {
                     cli_runtime_binding::append_native_event_if_absent(
@@ -9097,11 +9335,14 @@ impl CrudStore {
                 .await
             }
             .await;
+            // The earlier existence probe is advisory: a concurrent cleanup
+            // can remove that row before this append commits. Preserve the
+            // terminal-turn wake even when the earlier reader saw a duplicate.
             let maintenance_changed = maintenance_result.is_ok();
             if maintenance_result.is_ok() {
-                for change in maintenance_changes {
-                    change.completed(maintenance_changed);
-                }
+                cleanup_change
+                    .complete(&self.connection, maintenance_changed, &cleanup_turns)
+                    .await;
             }
             maintenance_result
         }
@@ -9157,13 +9398,10 @@ impl CrudStore {
     ) -> Result<()> {
         // These events advance replay/delivery receipts and compressed raw
         // history; started/checkpointed/continued also update recovery liveness.
-        let changes = [
-            "gateway.control",
-            "projection",
-            "maintenance.zstd",
-            "maintenance.receipts",
-        ]
-        .map(|domain| self.connection.work_signal(domain).changing());
+        let cleanup_turns = vec![transition.event_payload().turn_id().to_owned()];
+        let cleanup_change = terminal_cleanup::Change::events(&self.connection);
+        let changes = ["gateway.control", "projection", "maintenance.zstd"]
+            .map(|domain| self.connection.work_signal(domain).changing());
         let result = async {
         let _release_wake = matches!(&transition, NativeExecutionWindowTransition::Blocked { .. })
             .then(|| execution_heartbeat::ReleaseWake(self.execution_heartbeats.clone()));
@@ -9737,6 +9975,9 @@ impl CrudStore {
         .await
         }.await;
         if let Ok(changed) = &result {
+            cleanup_change
+                .complete(&self.connection, *changed, &cleanup_turns)
+                .await;
             for change in changes {
                 change.completed(*changed);
             }
@@ -16184,13 +16425,10 @@ impl CrudStore {
         expected_task_finalization_revision: Option<&str>,
         event_timestamp_secs: i64,
     ) -> Result<PrepareTurnFinalizationOutcome> {
-        let changes = [
-            "projection",
-            "compaction",
-            "maintenance.native",
-            "maintenance.receipts",
-        ]
-        .map(|domain| self.connection.work_signal(domain).changing());
+        let cleanup_turns = vec![notification.turn_id.clone()];
+        let cleanup_change = terminal_cleanup::Change::events(&self.connection);
+        let changes = ["projection", "compaction"]
+            .map(|domain| self.connection.work_signal(domain).changing());
         let notification = notification.clone();
         let expected_task_finalization_revision =
             expected_task_finalization_revision.map(str::to_owned);
@@ -16301,6 +16539,9 @@ impl CrudStore {
         .await;
         if let Ok(value) = &result {
             let changed = matches!(value, PrepareTurnFinalizationOutcome::Prepared);
+            cleanup_change
+                .complete(&self.connection, changed, &cleanup_turns)
+                .await;
             for change in changes {
                 change.completed(changed);
             }
@@ -16393,15 +16634,18 @@ impl CrudStore {
         turn_id: &str,
         event_timestamp_secs: i64,
     ) -> Result<TurnFinalizationCommitOutcome> {
+        let receipt_keys = vec![turn_id.to_owned()];
+        let receipt_change = self
+            .connection
+            .work_signal("maintenance.receipts")
+            .changing();
         let changes = [
             "gateway.control",
             "gateway.cli",
             "projection",
             "compaction",
             "maintenance.zstd",
-            "maintenance.receipts",
             "maintenance.native",
-            "maintenance.frozen",
             "maintenance.html",
         ]
         .map(|domain| self.connection.work_signal(domain).changing());
@@ -16682,6 +16926,7 @@ impl CrudStore {
         }
         .await;
         if let Ok((_, changed)) = &result {
+            receipt_change.completed_keys(if *changed { &receipt_keys } else { &[] });
             for change in changes {
                 change.completed(*changed);
             }
@@ -17112,7 +17357,10 @@ impl CrudStore {
         event: TaskEventPayload,
         event_timestamp_secs: i64,
     ) -> Result<AppendedTaskEvent> {
-        let change = crate::task_events::TaskWorkChange::new(&self.connection);
+        let change = crate::task_events::TaskWorkChange::for_tasks(
+            &self.connection,
+            [event.task_id().to_owned()],
+        );
         let result = async {
             self.run_serialized_write(|| {
                 self.append_task_event_once(event.clone(), event_timestamp_secs)
@@ -17131,7 +17379,10 @@ impl CrudStore {
         events: Vec<TaskEventPayload>,
         event_timestamp_secs: i64,
     ) -> Result<Vec<AppendedTaskEvent>> {
-        let change = crate::task_events::TaskWorkChange::new(&self.connection);
+        let change = crate::task_events::TaskWorkChange::for_tasks(
+            &self.connection,
+            events.iter().map(|event| event.task_id().to_owned()),
+        );
         let result = async {
             self.run_serialized_write(|| {
                 self.append_task_events_once(events.clone(), event_timestamp_secs)
@@ -17151,7 +17402,10 @@ impl CrudStore {
         event_timestamp_secs: i64,
         agent_action: AgentCommitInput,
     ) -> Result<Vec<AppendedTaskEvent>> {
-        let change = crate::task_events::TaskWorkChange::new(&self.connection);
+        let change = crate::task_events::TaskWorkChange::for_tasks(
+            &self.connection,
+            events.iter().map(|event| event.task_id().to_owned()),
+        );
         let result = async {
             self.run_serialized_write(|| {
                 self.append_task_events_with_agent_action_once(
@@ -17175,7 +17429,10 @@ impl CrudStore {
         event_timestamp_secs: i64,
         admission: NewTaskExecutionAdmission,
     ) -> Result<Vec<AppendedTaskEvent>> {
-        let change = crate::task_events::TaskWorkChange::new(&self.connection);
+        let change = crate::task_events::TaskWorkChange::for_tasks(
+            &self.connection,
+            events.iter().map(|event| event.task_id().to_owned()),
+        );
         let result = async {
             self.run_serialized_write(|| {
                 self.append_task_events_with_execution_admission_once(
@@ -17199,7 +17456,10 @@ impl CrudStore {
         event_timestamp_secs: i64,
         admission: NewTaskExecutionAdmission,
     ) -> Result<Vec<AppendedTaskEvent>> {
-        let change = crate::task_events::TaskWorkChange::new(&self.connection);
+        let change = crate::task_events::TaskWorkChange::for_tasks(
+            &self.connection,
+            events.iter().map(|event| event.task_id().to_owned()),
+        );
         let result = async {
             self.run_serialized_write(|| {
                 self.append_task_events_with_execution_readmission_once(
@@ -17224,7 +17484,10 @@ impl CrudStore {
         admission: NewTaskExecutionAdmission,
         agent_action: AgentCommitInput,
     ) -> Result<Vec<AppendedTaskEvent>> {
-        let change = crate::task_events::TaskWorkChange::new(&self.connection);
+        let change = crate::task_events::TaskWorkChange::for_tasks(
+            &self.connection,
+            events.iter().map(|event| event.task_id().to_owned()),
+        );
         let result = async {
             self.run_serialized_write(|| {
                 self.append_task_events_with_execution_readmission_and_agent_action_once(
@@ -17252,7 +17515,10 @@ impl CrudStore {
         &self,
         input: TaskCreationCommitInput,
     ) -> Result<Vec<AppendedTaskEvent>> {
-        let change = crate::task_events::TaskWorkChange::new(&self.connection);
+        let change = crate::task_events::TaskWorkChange::for_tasks(
+            &self.connection,
+            input.events.iter().map(|event| event.task_id().to_owned()),
+        );
         let result = async {
             let root = input
                 .conversation_snapshot
@@ -17305,7 +17571,10 @@ impl CrudStore {
         occurrence_contracts: Vec<pioneer_protocol::TaskOccurrenceContract>,
         reserve_executions: Vec<(String, TaskExecutorKind)>,
     ) -> Result<Vec<AppendedTaskEvent>> {
-        let change = crate::task_events::TaskWorkChange::new(&self.connection);
+        let change = crate::task_events::TaskWorkChange::for_tasks(
+            &self.connection,
+            events.iter().map(|event| event.task_id().to_owned()),
+        );
         let result = async {
             if trigger.status != TaskTriggerStatus::Active {
                 return Ok(Vec::new());
@@ -17348,7 +17617,10 @@ impl CrudStore {
         error: TaskError,
         now: i64,
     ) -> Result<Vec<AppendedTaskEvent>> {
-        let change = crate::task_events::TaskWorkChange::new(&self.connection);
+        let change = crate::task_events::TaskWorkChange::for_tasks(
+            &self.connection,
+            [trigger.task_id.clone()],
+        );
         let result = async {
             let Some(expected_next_fire_at) = trigger.next_fire_at else {
                 return Ok(Vec::new());
@@ -17389,7 +17661,8 @@ impl CrudStore {
         expected_next_fire_at: i64,
         now: i64,
     ) -> Result<Option<DueTaskTriggerReconciliation>> {
-        let change = crate::task_events::TaskWorkChange::new(&self.connection);
+        let change =
+            crate::task_events::TaskWorkChange::for_source(&self.connection, "g", trigger_id);
         let result = self
             .run_serialized_write(|| {
                 self.reconcile_due_trigger_for_nonexecuting_task_once(
@@ -17495,7 +17768,10 @@ impl CrudStore {
         contract: &pioneer_protocol::TaskActorContract,
         now: i64,
     ) -> Result<()> {
-        let change = crate::task_events::TaskWorkChange::new(&self.connection);
+        let change = crate::task_events::TaskWorkChange::for_tasks(
+            &self.connection,
+            [contract.task_id.clone()],
+        );
         let before = self.get_task_actor_contract(&contract.task_id).await?;
         let result = async {
             repositories::task_actor_contract::upsert_task_actor_contract(
@@ -17534,7 +17810,8 @@ impl CrudStore {
         status: &str,
         now: i64,
     ) -> Result<()> {
-        let change = crate::task_events::TaskWorkChange::new(&self.connection);
+        let change =
+            crate::task_events::TaskWorkChange::for_tasks(&self.connection, [task_id.to_owned()]);
         let mut before =
             pioneer_entity::task_delivery_authority::Entity::find_by_id(delivery_id.to_owned())
                 .one(&self.connection)
@@ -17576,7 +17853,10 @@ impl CrudStore {
         contract: &pioneer_protocol::TaskOccurrenceContract,
         now: i64,
     ) -> Result<()> {
-        let change = crate::task_events::TaskWorkChange::new(&self.connection);
+        let change = crate::task_events::TaskWorkChange::for_tasks(
+            &self.connection,
+            [contract.task_id.clone()],
+        );
         let before = self
             .get_task_occurrence_contract(&contract.occurrence_id)
             .await?;
@@ -17705,8 +17985,9 @@ impl CrudStore {
         .await?
         .is_some();
         let task_result = async {
+            let frozen_change = self.connection.work_signal("maintenance.frozen").changing();
+            let frozen_task_keys = vec![format!("t:{}", snapshot.task_id)];
             let maintenance_changes = [
-                self.connection.work_signal("maintenance.frozen").changing(),
                 self.connection
                     .work_signal("maintenance.portable")
                     .changing(),
@@ -17753,6 +18034,11 @@ impl CrudStore {
                 .as_ref()
                 .is_ok_and(|(_, inserted)| *inserted);
             if maintenance_result.is_ok() {
+                frozen_change.completed_keys(if maintenance_changed {
+                    &frozen_task_keys
+                } else {
+                    &[]
+                });
                 for change in maintenance_changes {
                     change.completed(maintenance_changed);
                 }
@@ -17830,8 +18116,8 @@ impl CrudStore {
     }
 
     pub async fn delete_task_run_conversation_snapshot(&self, run_id: &str) -> Result<u64> {
+        let frozen_change = self.connection.work_signal("maintenance.frozen").changing();
         let maintenance_changes = [
-            self.connection.work_signal("maintenance.frozen").changing(),
             self.connection
                 .work_signal("maintenance.portable")
                 .changing(),
@@ -17840,25 +18126,38 @@ impl CrudStore {
         let maintenance_result = async {
             self.run_serialized_write(|| async {
                 let tx = self.connection.begin().await?;
+                let old_root = pioneer_entity::task_run_conversation_snapshot::Entity::find_by_id(
+                    run_id.to_owned(),
+                )
+                .select_only()
+                .column(pioneer_entity::task_run_conversation_snapshot::Column::FrozenManifestId)
+                .into_tuple::<Option<String>>()
+                .one(&tx)
+                .await?
+                .flatten();
+
                 let deleted = task_run_conversation_snapshot::delete_by_run(&tx, run_id).await?;
                 if deleted > 0 {
                     repositories::task_child_producers::run(&tx, run_id).await?;
                 }
                 tx.commit().await?;
-                Ok(deleted)
+                Ok((deleted, frozen_lifetime::changed_root_keys(old_root, None)))
             })
             .await
         }
         .await;
         let maintenance_changed = maintenance_result
             .as_ref()
-            .is_ok_and(|changed| *changed > 0);
+            .is_ok_and(|(changed, _)| *changed > 0);
+        if let Ok((_, keys)) = &maintenance_result {
+            frozen_lifetime::complete_keys(frozen_change, keys, maintenance_changed);
+        }
         if maintenance_result.is_ok() {
             for change in maintenance_changes {
                 change.completed(maintenance_changed);
             }
         }
-        maintenance_result
+        maintenance_result.map(|(deleted, _)| deleted)
     }
 
     pub async fn list_tasks(&self, params: TaskListParams) -> Result<Vec<Task>> {
@@ -18308,7 +18607,7 @@ impl CrudStore {
         lease_until: i64,
         mode: TaskExecutionOccurrenceClaimMode,
     ) -> Result<Option<TaskRunExecution>> {
-        let change = crate::task_events::TaskWorkChange::new(&self.connection);
+        let change = crate::task_events::TaskWorkChange::for_source(&self.connection, "r", run_id);
         let result = async {
             let run_id = run_id.to_owned();
             let worker_id = worker_id.to_owned();
@@ -18923,7 +19222,8 @@ impl CrudStore {
         now: i64,
         lease_until: i64,
     ) -> Result<Option<TaskRunExecution>> {
-        let change = crate::task_events::TaskWorkChange::new(&self.connection);
+        let change =
+            crate::task_events::TaskWorkChange::for_source(&self.connection, "e", execution_id);
         let before = task_run_execution::find_execution_by_id(&self.connection, execution_id)
             .await?
             .map(task_run_execution_from_db_model)
@@ -18961,7 +19261,8 @@ impl CrudStore {
     ) -> Result<Option<TaskRunExecution>> {
         let control_change = self.connection.work_signal("gateway.control").changing();
         let control_result = async {
-            let change = crate::task_events::TaskWorkChange::new(&self.connection);
+            let change =
+                crate::task_events::TaskWorkChange::for_source(&self.connection, "e", execution_id);
             let before = task_run_execution::find_execution_by_id(&self.connection, execution_id)
                 .await?
                 .map(task_run_execution_from_db_model)
@@ -19006,7 +19307,8 @@ impl CrudStore {
     ) -> Result<Option<TaskRunExecution>> {
         let control_change = self.connection.work_signal("gateway.control").changing();
         let control_result = async {
-            let change = crate::task_events::TaskWorkChange::new(&self.connection);
+            let change =
+                crate::task_events::TaskWorkChange::for_source(&self.connection, "e", execution_id);
             let before = task_run_execution::find_execution_by_id(&self.connection, execution_id)
                 .await?
                 .map(task_run_execution_from_db_model)
@@ -19230,7 +19532,10 @@ impl CrudStore {
         &self,
         binding: TaskRunThreadBinding,
     ) -> Result<TaskRunThreadBinding> {
-        let change = crate::task_events::TaskWorkChange::new(&self.connection);
+        let change = crate::task_events::TaskWorkChange::for_tasks(
+            &self.connection,
+            [binding.task_id.clone()],
+        );
         let before = self.get_task_run_thread_binding(&binding.id).await?;
         let result = async {
             self.run_serialized_write(|| async {
@@ -19308,7 +19613,8 @@ impl CrudStore {
     }
 
     pub async fn upsert_task_run_turn(&self, turn: TaskRunTurn) -> Result<TaskRunTurn> {
-        let change = crate::task_events::TaskWorkChange::new(&self.connection);
+        let change =
+            crate::task_events::TaskWorkChange::for_tasks(&self.connection, [turn.task_id.clone()]);
         let before = self.get_task_run_turn(&turn.id).await?;
         let result = async {
             self.run_serialized_write(|| async {
@@ -19389,7 +19695,7 @@ impl CrudStore {
         status: TaskRunTurnStatus,
         completed_at: Option<i64>,
     ) -> Result<Option<TaskRunTurn>> {
-        let change = crate::task_events::TaskWorkChange::new(&self.connection);
+        let change = crate::task_events::TaskWorkChange::for_source(&self.connection, "v", id);
         let before = self.get_task_run_turn(id).await?;
         let result = async {
             self.run_serialized_write(|| async {
@@ -19415,7 +19721,10 @@ impl CrudStore {
         let control_change = self.connection.work_signal("gateway.control").changing();
         let control_result =
             async {
-                let change = crate::task_events::TaskWorkChange::new(&self.connection);
+                let change = crate::task_events::TaskWorkChange::for_tasks(
+                    &self.connection,
+                    [candidate.task_id.clone()],
+                );
                 let before = self.get_task_result_candidate(&candidate.id).await?;
                 let result =
                     async {
@@ -19645,7 +19954,10 @@ impl CrudStore {
         &self,
         review_event: TaskResultReviewEvent,
     ) -> Result<TaskResultReviewEvent> {
-        let change = crate::task_events::TaskWorkChange::new(&self.connection);
+        let change = crate::task_events::TaskWorkChange::for_tasks(
+            &self.connection,
+            [review_event.task_id.clone()],
+        );
         let before = self.get_task_result_review_event(&review_event.id).await?;
         let result = async {
             let prepared_review =
@@ -20048,7 +20360,7 @@ impl CrudStore {
         run_id: &str,
         claimed_at: i64,
     ) -> Result<Option<(TaskRun, AppendedTaskEvent)>> {
-        let change = crate::task_events::TaskWorkChange::new(&self.connection);
+        let change = crate::task_events::TaskWorkChange::for_source(&self.connection, "r", run_id);
         let result = async {
             self.run_serialized_write(|| {
                 self.claim_task_run_for_dispatch_once(run_id.to_owned(), claimed_at, None)
@@ -20075,7 +20387,7 @@ impl CrudStore {
         claimed_at: i64,
         occurrence: pioneer_protocol::TaskOccurrenceContract,
     ) -> Result<Option<(TaskRun, AppendedTaskEvent)>> {
-        let change = crate::task_events::TaskWorkChange::new(&self.connection);
+        let change = crate::task_events::TaskWorkChange::for_source(&self.connection, "r", run_id);
         let result = async {
             anyhow::ensure!(
                 occurrence.run_id == run_id,
@@ -20222,7 +20534,8 @@ impl CrudStore {
         run_id: String,
         started_at: i64,
     ) -> Result<Option<AppendedTaskEvent>> {
-        let change = crate::task_events::TaskWorkChange::new(&self.connection);
+        let change =
+            crate::task_events::TaskWorkChange::for_tasks(&self.connection, [task_id.clone()]);
         let result = async {
             self.run_serialized_write(|| {
                 self.append_task_run_started_once_inner(task_id.clone(), run_id.clone(), started_at)
@@ -20857,14 +21170,17 @@ impl CrudStore {
         &self,
         request: EditTurnMessageRequest,
     ) -> Result<TurnMessageEditedEvent> {
+        let receipt_keys = vec![request.turn_id.clone()];
+        let receipt_change = self
+            .connection
+            .work_signal("maintenance.receipts")
+            .changing();
         let maintenance_changes = [
             "projection",
             "compaction",
             "maintenance.zstd",
-            "maintenance.frozen",
             "maintenance.html",
             "maintenance.native",
-            "maintenance.receipts",
         ]
         .map(|domain| self.connection.work_signal(domain).changing());
         let maintenance_result = async {
@@ -21067,6 +21383,11 @@ impl CrudStore {
         .await;
         let maintenance_changed = maintenance_result.is_ok();
         if maintenance_result.is_ok() {
+            receipt_change.completed_keys(if maintenance_changed {
+                &receipt_keys
+            } else {
+                &[]
+            });
             for change in maintenance_changes {
                 change.completed(maintenance_changed);
             }
@@ -21089,15 +21410,18 @@ impl CrudStore {
         &self,
         request: DeleteTurnMessageRequest,
     ) -> Result<DeleteTurnMessageResult> {
+        let receipt_keys = vec![request.turn_id.clone()];
+        let receipt_change = self
+            .connection
+            .work_signal("maintenance.receipts")
+            .changing();
         let maintenance_changes = [
             "projection",
             "compaction",
             "maintenance.zstd",
-            "maintenance.frozen",
             "maintenance.html",
             "maintenance.portable",
             "maintenance.native",
-            "maintenance.receipts",
         ]
         .map(|domain| self.connection.work_signal(domain).changing());
         let maintenance_result = async {
@@ -21300,6 +21624,11 @@ impl CrudStore {
             .as_ref()
             .is_ok_and(|outcome| outcome.event.is_some());
         if maintenance_result.is_ok() {
+            receipt_change.completed_keys(if maintenance_changed {
+                &receipt_keys
+            } else {
+                &[]
+            });
             for change in maintenance_changes {
                 change.completed(maintenance_changed);
             }
@@ -21660,7 +21989,6 @@ impl CrudStore {
         let result = async {
             let maintenance_changes = [
                 self.connection.work_signal("maintenance.native").changing(),
-                self.connection.work_signal("maintenance.frozen").changing(),
                 self.connection.work_signal("maintenance.html").changing(),
             ];
             let maintenance_result = async {
@@ -32121,14 +32449,17 @@ impl CrudStore {
         cleanup_plan: RecoveryTerminalCleanupPlan,
         event_timestamp_secs: i64,
     ) -> Result<RecoveryTerminalizationApplyOutcome> {
+        let receipt_keys = vec![record.turn_id.clone()];
+        let receipt_change = self
+            .connection
+            .work_signal("maintenance.receipts")
+            .changing();
         let changes = [
             "gateway.control",
             "gateway.cli",
             "projection",
             "compaction",
             "maintenance.zstd",
-            "maintenance.receipts",
-            "maintenance.frozen",
             "maintenance.html",
             "tasks.lifecycle",
         ]
@@ -32411,6 +32742,7 @@ impl CrudStore {
         }.await;
         if let Ok(value) = &control_result {
             let published = matches!(value, RecoveryTerminalizationApplyOutcome::Applied(applied) if applied.newly_terminal_turn.is_some() || applied.final_item.is_some());
+            receipt_change.completed_keys(if published { &receipt_keys } else { &[] });
             for change in changes {
                 change.completed(published);
             }
@@ -32616,7 +32948,8 @@ impl CrudStore {
         execution_owner_id: &str,
         execution_lease_until_unix: i64,
     ) -> Result<Option<TaskOwnedTurnResumeOutcome>> {
-        let task_change = crate::task_events::TaskWorkChange::new(&self.connection);
+        let task_change =
+            crate::task_events::TaskWorkChange::for_source(&self.connection, "y", turn_id);
         let control_change = self.connection.work_signal("gateway.control").changing();
         let control_result = async {
             let _recovery_change = recovery_wake::RecoveryChange(self.recovery_work.clone());
@@ -34171,15 +34504,29 @@ impl CrudStore {
     ) -> Result<Option<AgentExecutionGraphCommitResult>> {
         // Optional graph/action receipts may change without a new event.
         let mut changed = false;
+        let cleanup_turns = events
+            .iter()
+            .map(|event| event.turn_id().to_owned())
+            .collect::<Vec<_>>();
+        // The entire write set below (events, admission and Agent receipts/graph)
+        // does not mutate frozen roots, operation bindings or checkpoint edges.
+        // Those owners publish their own committed identity deltas.
+        let html_turns = events
+            .iter()
+            .filter_map(terminal_cleanup::html_lifetime_turn)
+            .map(str::to_owned)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let html_change = (!html_turns.is_empty())
+            .then(|| self.connection.work_signal("maintenance.html").changing());
+        let mut html_changed = false;
+        let cleanup_change = terminal_cleanup::Change::events(&self.connection);
         let changes = [
             "gateway.control",
             "projection",
             "compaction",
             "maintenance.zstd",
-            "maintenance.native",
-            "maintenance.receipts",
-            "maintenance.frozen",
-            "maintenance.html",
         ]
         .map(|domain| self.connection.work_signal(domain).changing());
         let result = async {
@@ -34274,6 +34621,8 @@ impl CrudStore {
             .begin()
             .await
             .context("failed to begin turn event batch materialization transaction")?;
+
+        let html_before = terminal_cleanup::html_turn_lifetimes(&transaction, &html_turns).await?;
 
         if let Some(response) = agent_turn_response.as_ref() {
             let matching_start = events.iter().any(|event| {
@@ -34484,6 +34833,8 @@ impl CrudStore {
             }
         }
 
+        html_changed = html_before != terminal_cleanup::html_turn_lifetimes(&transaction, &html_turns).await?;
+
         transaction
             .commit()
             .await
@@ -34498,6 +34849,12 @@ impl CrudStore {
         result
         }.await;
         if result.is_ok() {
+            cleanup_change
+                .complete(&self.connection, changed, &cleanup_turns)
+                .await;
+            if let Some(change) = html_change {
+                change.completed(html_changed);
+            }
             for change in changes {
                 change.completed(changed);
             }
@@ -34732,14 +35089,14 @@ impl CrudStore {
         execution_owner_id: Option<&str>,
         operation_guard: Option<sea_orm::Statement>,
     ) -> Result<Option<crate::events::AppendedTurnEvent>> {
+        let cleanup_turns = vec![event.turn_id().to_owned()];
+        let cleanup_change = terminal_cleanup::Change::events(&self.connection);
         let changes = [
             "gateway.control",
             "gateway.cli",
             "projection",
             "compaction",
             "maintenance.zstd",
-            "maintenance.native",
-            "maintenance.receipts",
         ]
         .map(|domain| self.connection.work_signal(domain).changing());
         let result = async {
@@ -34996,6 +35353,9 @@ impl CrudStore {
         .await;
         if let Ok(appended) = &result {
             let changed = appended.as_ref().is_some_and(|event| event.was_inserted);
+            cleanup_change
+                .complete(&self.connection, changed, &cleanup_turns)
+                .await;
             for change in changes {
                 change.completed(changed);
             }
@@ -35010,16 +35370,21 @@ impl CrudStore {
         claim_token: String,
         projected_at: DateTimeWithTimeZone,
     ) -> Result<TurnEventProjectionOutcome> {
+        let cleanup_turns = vec![appended_event.turn_id.clone()];
+        let html_turns = terminal_cleanup::html_lifetime_turn(&appended_event.payload)
+            .map(str::to_owned)
+            .into_iter()
+            .collect::<Vec<_>>();
+        let html_change = (!html_turns.is_empty())
+            .then(|| self.connection.work_signal("maintenance.html").changing());
+        let mut html_changed = false;
+        let cleanup_change = terminal_cleanup::Change::events(&self.connection);
         let changes = [
             "gateway.control",
             "gateway.cli",
             "projection",
             "compaction",
             "maintenance.zstd",
-            "maintenance.native",
-            "maintenance.receipts",
-            "maintenance.frozen",
-            "maintenance.html",
         ]
         .map(|domain| self.connection.work_signal(domain).changing());
         let result = async {
@@ -35060,6 +35425,8 @@ impl CrudStore {
             .begin()
             .await
             .context("failed to begin turn event projection transaction")?;
+
+        let html_before = terminal_cleanup::html_turn_lifetimes(&transaction, &html_turns).await?;
 
         let is_next_projection_sequence =
             match turn_event_projection_state::is_next_projection_sequence(
@@ -35208,6 +35575,8 @@ impl CrudStore {
             );
         }
 
+        html_changed = html_before != terminal_cleanup::html_turn_lifetimes(&transaction, &html_turns).await?;
+
         transaction
             .commit()
             .await
@@ -35225,6 +35594,12 @@ impl CrudStore {
         .await;
         if let Ok(outcome) = &result {
             let changed = matches!(outcome, TurnEventProjectionOutcome::Projected);
+            cleanup_change
+                .complete(&self.connection, changed, &cleanup_turns)
+                .await;
+            if let Some(change) = html_change {
+                change.completed(html_changed);
+            }
             for change in changes {
                 change.completed(changed);
             }
@@ -35672,13 +36047,13 @@ impl CrudStore {
         expected_blocking_event_id: &str,
         restored_at_unix: i64,
     ) -> Result<RestoreTurnProjectionStreamOutcome> {
-        let changes = [
-            "projection",
-            "compaction",
-            "maintenance.receipts",
-            "maintenance.native",
-        ]
-        .map(|domain| self.connection.work_signal(domain).changing());
+        let receipt_keys = vec![turn_id.to_owned()];
+        let receipt_change = self
+            .connection
+            .work_signal("maintenance.receipts")
+            .changing();
+        let changes = ["projection", "compaction", "maintenance.native"]
+            .map(|domain| self.connection.work_signal(domain).changing());
         let task_change = crate::task_events::TaskWorkChange::new(&self.connection);
         let result = async {
         self.run_serialized_write(|| async {
@@ -35792,6 +36167,7 @@ impl CrudStore {
         if let Ok(outcome) = &result {
             let changed = matches!(outcome, RestoreTurnProjectionStreamOutcome::Restored);
             task_change.completed(changed);
+            receipt_change.completed_keys(if changed { &receipt_keys } else { &[] });
             for change in changes {
                 change.completed(changed);
             }
@@ -46278,13 +46654,8 @@ mod tests {
         .await;
         use futures_util::FutureExt;
         let database = store.database_connection();
-        let mut consumers = [
-            "gateway.control",
-            "projection",
-            "maintenance.zstd",
-            "maintenance.receipts",
-        ]
-        .map(|domain| database.work_signal(domain).subscribe());
+        let mut consumers = ["gateway.control", "projection", "maintenance.zstd"]
+            .map(|domain| database.work_signal(domain).subscribe());
         for consumer in &mut consumers {
             consumer.begin_pass(&database).await.unwrap();
         }
@@ -48004,13 +48375,12 @@ mod tests {
         use futures_util::FutureExt;
         let store = test_store_with_workspace("ws_cli_bind").await;
         let database = store.database_connection();
-        let mut consumers = [
-            "gateway.control",
-            "gateway.cli",
-            "maintenance.frozen",
-            "maintenance.html",
-        ]
-        .map(|domain| database.work_signal(domain).subscribe());
+        let mut frozen = database.work_signal("maintenance.frozen").subscribe();
+        frozen.begin_pass(&database).await.unwrap();
+        let mut html = database.work_signal("maintenance.html").subscribe();
+        html.begin_pass(&database).await.unwrap();
+        let mut consumers = ["gateway.control", "gateway.cli"]
+            .map(|domain| database.work_signal(domain).subscribe());
         for consumer in &mut consumers {
             consumer.begin_pass(&database).await.unwrap();
         }
@@ -48049,6 +48419,14 @@ mod tests {
             );
             consumer.begin_pass(&database).await.unwrap();
         }
+        assert!(
+            frozen.wait(None).now_or_never().is_none(),
+            "a binding with no frozen descriptor cannot release frozen data"
+        );
+        assert!(
+            html.wait(None).now_or_never().is_none(),
+            "a CLI receipt without history is not an HTML retention root"
+        );
         let repeated_thread = store
             .upsert_cli_runtime_thread_binding(thread_binding.clone())
             .await
@@ -55465,6 +55843,19 @@ mod tests {
             )
             .await
             .unwrap();
+        let mut completed = turn.clone();
+        completed.status = TurnStatus::Completed;
+        store
+            .materialize_turn_completed(
+                pioneer_protocol::TurnCompletedNotification {
+                    workspace_id: thread.workspace_id.clone(),
+                    thread_id: thread.id.clone(),
+                    turn: completed,
+                },
+                timestamp + 1,
+            )
+            .await
+            .unwrap();
         let now = chrono::Utc::now().fixed_offset();
         crate::upsert_projection_meta(
             &store.connection,
@@ -55492,7 +55883,7 @@ mod tests {
                 .await
                 .unwrap()
                 .rows_deleted,
-            1
+            2
         );
         let before = store
             .get_turn_event_projection_stream_state(&turn.id)
@@ -62899,18 +63290,23 @@ mod tests {
         let database = store.database_connection();
         // Independent store wrappers and consumers share the runtime signals.
         let writer = CrudStore::new(database.clone());
+        let mut frozen = database.work_signal("maintenance.frozen").subscribe();
+        frozen.begin_pass(&database).await.unwrap();
+        let mut html = database.work_signal("maintenance.html").subscribe();
+        html.begin_pass(&database).await.unwrap();
         let mut consumers = [
             "gateway.control",
             "maintenance.zstd",
-            "maintenance.native",
-            "maintenance.receipts",
-            "maintenance.frozen",
-            "maintenance.html",
             "projection",
             "compaction",
         ]
         .map(|domain| database.work_signal(domain).subscribe());
         for consumer in &mut consumers {
+            consumer.begin_pass(&database).await.unwrap();
+        }
+        let mut cleanup = ["maintenance.native", "maintenance.receipts"]
+            .map(|domain| database.work_signal(domain).subscribe());
+        for consumer in &mut cleanup {
             consumer.begin_pass(&database).await.unwrap();
         }
         let event = TurnEventPayload::ItemCompleted(ItemCompletedNotification {
@@ -62937,7 +63333,7 @@ mod tests {
             consumer.begin_pass(&database).await.unwrap();
         }
         writer
-            .materialize_turn_events_atomically(vec![event], 1_700_000_100)
+            .materialize_turn_events_atomically(vec![event.clone()], 1_700_000_100)
             .await
             .unwrap();
         for consumer in &mut consumers {
@@ -62946,6 +63342,69 @@ mod tests {
                 "an already projected duplicate must let consumers remain parked"
             );
         }
+        for consumer in &mut cleanup {
+            assert!(
+                futures_util::FutureExt::now_or_never(consumer.wait(None)).is_none(),
+                "running item writes and duplicate ACKs must leave cleanup parked"
+            );
+        }
+        assert!(
+            futures_util::FutureExt::now_or_never(frozen.wait(None)).is_none(),
+            "ordinary item projection does not mutate a frozen root or operation"
+        );
+        assert!(
+            futures_util::FutureExt::now_or_never(html.wait(None)).is_none(),
+            "item writes do not change HTML ownership"
+        );
+        let (_, mut terminal) = writer
+            .get_turn("thr_atomic_wake", "turn_atomic_wake")
+            .await
+            .unwrap()
+            .unwrap();
+        terminal.status = TurnStatus::Completed;
+        writer
+            .materialize_turn_completed(
+                pioneer_protocol::TurnCompletedNotification {
+                    workspace_id: "ws_atomic_wake".into(),
+                    thread_id: "thr_atomic_wake".into(),
+                    turn: terminal,
+                },
+                1_700_000_101,
+            )
+            .await
+            .unwrap();
+        for consumer in &mut cleanup {
+            assert!(
+                futures_util::FutureExt::now_or_never(consumer.wait(None)).is_some(),
+                "terminal commit makes the accumulated receipts eligible"
+            );
+            consumer.begin_pass(&database).await.unwrap();
+        }
+        assert!(
+            futures_util::FutureExt::now_or_never(html.wait(None)).is_some(),
+            "terminal lifecycle transition wakes HTML retirement"
+        );
+        html.begin_pass(&database).await.unwrap();
+        let mut late = event;
+        if let TurnEventPayload::ItemCompleted(notification) = &mut late {
+            if let TurnItem::AgentMessage { id, .. } = &mut notification.item {
+                *id = "late_independent_message".into();
+            }
+        }
+        writer
+            .materialize_turn_events_atomically(vec![late], 1_700_000_102)
+            .await
+            .unwrap();
+        for consumer in &mut cleanup {
+            assert!(
+                futures_util::FutureExt::now_or_never(consumer.wait(None)).is_some(),
+                "late terminal-turn projection must not be stranded behind a completed pass"
+            );
+        }
+        assert!(
+            futures_util::FutureExt::now_or_never(html.wait(None)).is_none(),
+            "a late item does not reopen HTML cleanup for an already terminal Turn"
+        );
     }
 
     #[tokio::test]

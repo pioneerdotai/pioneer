@@ -62,15 +62,14 @@ impl CrudStore {
         identity: CliMcpCallIdentity,
         event_timestamp_secs: i64,
     ) -> Result<()> {
+        let cleanup_turns = vec![notification.turn_id.clone()];
+        let cleanup_change = crate::terminal_cleanup::Change::events(&self.connection);
         let changes = [
             "gateway.control",
             "gateway.cli",
             "projection",
             "compaction",
             "maintenance.zstd",
-            "maintenance.receipts",
-            "maintenance.native",
-            "maintenance.html",
             "tasks.lifecycle",
         ]
         .map(|domain| self.connection.work_signal(domain).changing());
@@ -281,6 +280,9 @@ impl CrudStore {
         }
         .await;
         if let Ok(changed) = &result {
+            cleanup_change
+                .complete(&self.connection, *changed, &cleanup_turns)
+                .await;
             for change in changes {
                 change.completed(*changed);
             }

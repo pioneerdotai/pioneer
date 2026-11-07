@@ -61,7 +61,10 @@ impl CrudStore {
         transition: TaskDeliveryTransition,
         at: i64,
     ) -> Result<TaskDeliveryTransitionOutcome<AppendedTaskEvent>> {
-        let change = crate::task_events::TaskWorkChange::new(&self.connection);
+        let change = crate::task_events::TaskWorkChange::for_tasks(
+            &self.connection,
+            [event.task_id().to_owned()],
+        );
         let result = async {
             self.run_serialized_write(|| {
                 self.transition_task_delivery_once(event.clone(), transition, at, None)
@@ -84,7 +87,10 @@ impl CrudStore {
         cutoff: i64,
         at: i64,
     ) -> Result<TaskDeliveryTransitionOutcome<AppendedTaskEvent>> {
-        let change = crate::task_events::TaskWorkChange::new(&self.connection);
+        let change = crate::task_events::TaskWorkChange::for_tasks(
+            &self.connection,
+            [event.task_id().to_owned()],
+        );
         let result = async {
             self.transition_task_delivery_once(
                 event,
@@ -329,7 +335,10 @@ impl CrudStore {
         action: Option<crate::AgentCommitInput>,
         actor_id: Option<String>,
     ) -> Result<Vec<AppendedTaskEvent>> {
-        let change = crate::task_events::TaskWorkChange::new(&self.connection);
+        let change = crate::task_events::TaskWorkChange::for_tasks(
+            &self.connection,
+            events.iter().map(|event| event.task_id().to_owned()),
+        );
         let result = async {
             let mut appended = Vec::new();
             if action.is_some() {

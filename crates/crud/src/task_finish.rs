@@ -121,7 +121,8 @@ impl CrudStore {
         at: i64,
         action: Option<crate::AgentCommitInput>,
     ) -> Result<(bool, Vec<AppendedTaskEvent>)> {
-        let change = crate::task_events::TaskWorkChange::new(&self.connection);
+        let change =
+            crate::task_events::TaskWorkChange::for_tasks(&self.connection, [task_id.to_owned()]);
         let result = async {
             self.run_serialized_write(|| {
                 self.request_task_finish_once(task_id, reason.clone(), at, action.clone())
@@ -287,7 +288,8 @@ impl CrudStore {
         task_id: &str,
         at: i64,
     ) -> Result<Vec<AppendedTaskEvent>> {
-        let change = crate::task_events::TaskWorkChange::new(&self.connection);
+        let change =
+            crate::task_events::TaskWorkChange::for_tasks(&self.connection, [task_id.to_owned()]);
         let result = async {
             self.run_serialized_write(|| self.discard_finished_task_queue_once(task_id, at))
                 .await

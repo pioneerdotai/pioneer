@@ -31,7 +31,12 @@ struct PreparedRead {
 }
 
 impl PreparedRead {
-    fn new(backend: DbBackend, mut query: SelectStatement, input_count: usize) -> Self {
+    fn new(
+        backend: DbBackend,
+        mut query: SelectStatement,
+        input_count: usize,
+        fixed_limit: u64,
+    ) -> Self {
         if backend == DbBackend::Sqlite {
             let mut args = Query::select();
             for input in &INPUTS[..input_count] {
@@ -42,13 +47,21 @@ impl PreparedRead {
                 .columns(INPUTS[..input_count].iter().map(|name| Alias::new(*name)))
                 .materialized(true)
                 .query(args.to_owned());
-            // One input row preserves the physical page's cardinality. Keeping
-            // parameters out of indexed predicates avoids SQLite's STAT4/LIKE
-            // parameter-sensitive reprepare. Schema changes still invalidate
-            // SQLite's prepared statements normally.
-            query.with_cte(cte).from(Alias::new(INPUT_TABLE));
+            // Scalar reads of the single materialized argument row keep bound
+            // values out of STAT4-sensitive indexed predicates, without a join
+            // that makes SQLite sort the already index-ordered physical page.
+            query.with_cte(cte);
+        } else {
+            query.limit(fixed_limit);
         }
-        let statement = backend.build(&query);
+        let mut statement = backend.build(&query);
+        if backend == DbBackend::Sqlite {
+            // SeaQuery 1.0's LIMIT accepts only a Value, so build() always binds
+            // it. Even a constant bound LIMIT triggers STAT4 reprepare. All four
+            // callers below supply code-owned limits; no input enters this SQL.
+            // Do not inline any cursor/ID or replace SQLx's prepared cache.
+            statement.sql.push_str(&format!(" LIMIT {fixed_limit}"));
+        }
         let slots: Vec<_> = statement
             .values
             .iter()
@@ -82,7 +95,11 @@ impl PreparedRead {
 
 fn input(backend: DbBackend, index: usize) -> SimpleExpr {
     if backend == DbBackend::Sqlite {
-        Expr::col((Alias::new(INPUT_TABLE), Alias::new(INPUTS[index])))
+        Query::select()
+            .column(Alias::new(INPUTS[index]))
+            .from(Alias::new(INPUT_TABLE))
+            .to_owned()
+            .into()
     } else {
         Expr::val(INPUTS[index])
     }
@@ -135,7 +152,6 @@ impl FrozenReads {
             .filter(Expr::col((checkpoint::Entity, checkpoint::Column::Id)).gt(input(backend, 0)))
             .filter(Expr::col((checkpoint::Entity, checkpoint::Column::Id)).lte(input(backend, 1)))
             .order_by_asc(checkpoint::Column::Id)
-            .limit(META_ROWS)
             .into_query();
 
         let id = input(backend, 0);
@@ -160,7 +176,6 @@ impl FrozenReads {
             .filter(discard_candidate_filter())
             .filter(Expr::exists(previous).not())
             .filter(Expr::exists(incoming).not())
-            .limit(1)
             .into_query();
 
         let held: SimpleExpr = Expr::case(
@@ -180,13 +195,12 @@ impl FrozenReads {
             .filter(Expr::col((history::Entity, history::Column::Id)).gt(input(backend, 0)))
             .filter(Expr::col((history::Entity, history::Column::Id)).lte(input(backend, 1)))
             .order_by_asc(history::Column::Id)
-            .limit(16)
             .into_query();
         Self {
-            discard_page: PreparedRead::new(backend, discard_page, 2),
-            discard_preflight: PreparedRead::new(backend, discard_preflight, 1),
-            expiry_page: PreparedRead::new(backend, expiry_page, 2),
-            directly_held: PreparedRead::new(backend, direct_roots(backend), 1),
+            discard_page: PreparedRead::new(backend, discard_page, 2, META_ROWS),
+            discard_preflight: PreparedRead::new(backend, discard_preflight, 1, 1),
+            expiry_page: PreparedRead::new(backend, expiry_page, 2, 16),
+            directly_held: PreparedRead::new(backend, direct_roots(backend), 1, 1),
         }
     }
 }
@@ -195,7 +209,6 @@ fn direct_roots(backend: DbBackend) -> SelectStatement {
     Query::select()
         .expr_as(Expr::Constant(1.into()), Alias::new("held"))
         .cond_where(direct_root_filter(input(backend, 0)))
-        .limit(1)
         .to_owned()
 }
 

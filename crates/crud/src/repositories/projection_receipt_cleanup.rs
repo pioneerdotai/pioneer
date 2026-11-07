@@ -1,11 +1,11 @@
 use anyhow::{Context, Result, ensure};
 use pioneer_entity::{
-    turn_event_projection_state as receipt, turn_event_projection_stream_state as stream,
+    turn, turn_event_projection_state as receipt, turn_event_projection_stream_state as stream,
 };
 use sea_orm::sea_query::Expr;
 use sea_orm::{
     ColumnTrait, ConnectionTrait, DatabaseTransaction, EntityTrait, FromQueryResult, QueryFilter,
-    QuerySelect, Statement,
+    QuerySelect, QueryTrait, Statement,
 };
 
 #[cfg(test)]
@@ -19,6 +19,8 @@ pub const RECEIPT_CLEANUP_MAX_SOURCE_BYTES: i64 = 256 * 1024;
 pub struct ProjectionReceiptCleanupOutcome {
     pub backfill_ready: bool,
     pub last_turn_id: Option<String>,
+    /// Captured once for an addressed finite pass; late suffixes need a new wake.
+    pub through_sequence: Option<i64>,
     pub rows_deleted: u64,
     pub source_bytes: u64,
     pub deferred: bool,
@@ -120,6 +122,9 @@ fn discovery_statement(
              INDEXED BY idx_turn_event_projection_stream_cleanup_work \
              WHERE status = 'healthy' AND receipts_compacted_through_sequence >= 0 \
              AND projected_through_sequence > receipts_compacted_through_sequence{seek}{bound} \
+             AND EXISTS (SELECT 1 FROM \"turn\" AS owner \
+                 WHERE owner.id = turn_event_projection_stream_state.turn_id \
+                 AND owner.status IN ('completed', 'failed', 'interrupted')) \
              ORDER BY turn_id{direction} LIMIT 1"
         ),
         values,
@@ -134,6 +139,40 @@ fn stream_query() -> sea_orm::Select<stream::Entity> {
         stream::Column::ProjectedThroughSequence,
         stream::Column::ReceiptsCompactedThroughSequence,
     ])
+}
+
+pub(crate) async fn addressed_stream<C: ConnectionTrait>(
+    db: &C,
+    turn_id: &str,
+    through: Option<i64>,
+) -> Result<Option<CleanupStream>> {
+    let terminal = turn::Entity::find()
+        .select_only()
+        .column(turn::Column::Id)
+        .filter(turn::Column::Id.eq(turn_id))
+        .filter(turn::Column::Status.is_in(["completed", "failed", "interrupted"]))
+        .into_query();
+    let current = stream_query()
+        .filter(stream::Column::TurnId.eq(turn_id))
+        .filter(stream::Column::TurnId.in_subquery(terminal))
+        .filter(stream::Column::Status.eq("healthy"))
+        .into_model::<CleanupStream>()
+        .one(db)
+        .await?;
+    Ok(current.and_then(|mut row| {
+        if let Some(through) = through {
+            row.projected_through_sequence = row.projected_through_sequence.min(through);
+        }
+        (row.receipts_compacted_through_sequence >= 0
+            && row.projected_through_sequence > row.receipts_compacted_through_sequence)
+            .then_some(row)
+    }))
+}
+
+impl CleanupStream {
+    pub(crate) fn through_sequence(&self) -> i64 {
+        self.projected_through_sequence
+    }
 }
 
 async fn load_rows<C: ConnectionTrait>(
@@ -218,6 +257,19 @@ pub(crate) async fn apply(db: &DatabaseTransaction, prepared: &PreparedCleanup) 
         return Ok(0);
     };
     if !backfill_ready(db).await? {
+        return Ok(0);
+    }
+    // Advisory discovery can race a resume. Check authoritative terminal state
+    // again in the same serialized transaction as deletion and boundary advance.
+    if turn::Entity::find_by_id(prepared.stream.turn_id.clone())
+        .select_only()
+        .column(turn::Column::Id)
+        .filter(turn::Column::Status.is_in(["completed", "failed", "interrupted"]))
+        .into_tuple::<String>()
+        .one(db)
+        .await?
+        .is_none()
+    {
         return Ok(0);
     }
     let current = stream_query()

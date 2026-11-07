@@ -93,19 +93,32 @@ async fn episodic_pending_delivery_survives_real_receipt_cleanup_and_reopen() {
     )
     .await
     .unwrap();
+    let mut completed = turn.clone();
+    completed.status = TurnStatus::Completed;
+    store
+        .materialize_turn_completed(
+            pioneer_protocol::TurnCompletedNotification {
+                workspace_id: thread.workspace_id.clone(),
+                thread_id: thread.id.clone(),
+                turn: completed,
+            },
+            NOW,
+        )
+        .await
+        .unwrap();
     // Use the actual cleanup quantum, including its atomic durable boundary.
     let cleanup = store
         .cleanup_projection_receipts_quantum(None, None)
         .await
         .unwrap();
-    assert_eq!(cleanup.rows_deleted, 4); // Turn start and three completed items.
+    assert_eq!(cleanup.rows_deleted, 5); // Start, three items, terminal event.
     let state = stream::Entity::find_by_id(turn.id.clone())
         .one(&store.connection)
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(state.projected_through_sequence, 4);
-    assert_eq!(state.receipts_compacted_through_sequence, 4);
+    assert_eq!(state.projected_through_sequence, 5);
+    assert_eq!(state.receipts_compacted_through_sequence, 5);
     assert_eq!(
         receipt::Entity::find()
             .count(&store.connection)
@@ -127,7 +140,7 @@ async fn episodic_pending_delivery_survives_real_receipt_cleanup_and_reopen() {
             .count(&store.connection)
             .await
             .unwrap(),
-        4
+        5
     );
     store.database_connection().close().await.unwrap();
     drop(store);

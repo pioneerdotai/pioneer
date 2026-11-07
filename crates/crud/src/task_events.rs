@@ -93,27 +93,55 @@ pub(crate) fn materialize_task_events(
 
 /// Covers only Task mutations that can create runnable/dependent work. The
 /// guard starts outside DB admission so cancellation retains uncertainty.
-pub(crate) struct TaskWorkChange(Vec<pioneer_sqlite::WorkChange>);
+pub(crate) struct TaskWorkChange {
+    changes: Vec<pioneer_sqlite::WorkChange>,
+    frozen: pioneer_sqlite::WorkChange,
+    frozen_keys: Option<Vec<String>>,
+}
 impl TaskWorkChange {
     pub(crate) fn new(database: &pioneer_sqlite::SqliteDatabase) -> Self {
-        Self(
-            [
+        Self {
+            frozen: database.work_signal("maintenance.frozen").changing(),
+            frozen_keys: None,
+            changes: [
                 "tasks.scheduler",
                 "tasks.lifecycle",
                 "tasks.fanout",
                 "tasks.review",
                 "compaction",
-                "maintenance.frozen",
                 "maintenance.portable",
                 "maintenance.html",
             ]
             .into_iter()
             .map(|domain| database.work_signal(domain).changing())
             .collect(),
-        )
+        }
+    }
+    pub(crate) fn for_tasks(
+        database: &pioneer_sqlite::SqliteDatabase,
+        tasks: impl IntoIterator<Item = String>,
+    ) -> Self {
+        let mut change = Self::new(database);
+        let keys = tasks
+            .into_iter()
+            .take(257)
+            .map(|id| format!("t:{id}"))
+            .collect::<Vec<_>>();
+        change.frozen_keys = (!keys.is_empty()).then_some(keys);
+        change
+    }
+    pub(crate) fn for_source(
+        database: &pioneer_sqlite::SqliteDatabase,
+        kind: &str,
+        id: &str,
+    ) -> Self {
+        let mut change = Self::new(database);
+        change.frozen_keys = Some(vec![format!("{kind}:{id}")]);
+        change
     }
     pub(crate) fn completed(self, changed: bool) {
-        for change in self.0 {
+        crate::frozen_lifetime::complete_keys(self.frozen, &self.frozen_keys, changed);
+        for change in self.changes {
             change.completed(changed);
         }
     }

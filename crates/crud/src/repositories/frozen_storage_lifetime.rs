@@ -45,6 +45,12 @@ const SCOPE_PAGE_KEY_BYTES: i64 = FRAGMENT_BYTES;
 #[derive(Default)]
 pub struct FrozenStorageLifetimeProgress {
     phase: usize,
+    // None is the recovery inventory; Some is a bounded, acknowledged set of
+    // changed identities. It never substitutes for final writer authority.
+    target_manifests: Option<Vec<String>>,
+    target_checkpoints: Option<Vec<String>>,
+    target_backings: Option<Vec<String>>,
+    retries_only: bool,
     release_only: bool,
     pass_done: [bool; 6],
     // Reconciliation/sealing can release holds discovered earlier this pass.
@@ -1755,6 +1761,257 @@ impl FrozenStorageLifetimeProgress {
         };
     }
 
+    /// Expand only addressed operation/checkpoint metadata. A missing scope,
+    /// oversized set or legacy key deliberately requests the original resync.
+    pub async fn restart_for_changes(
+        &mut self,
+        store: &CrudStore,
+        keys: Option<Vec<String>>,
+    ) -> Result<bool> {
+        let Some(keys) = keys else {
+            self.restart_discovery();
+            return Ok(true);
+        };
+        if !self.scope.done {
+            self.restart_discovery();
+            return Ok(true);
+        }
+        let retries_only = keys.is_empty();
+        let mut manifests = BTreeSet::new();
+        let mut checkpoints = BTreeSet::new();
+        let mut operations = BTreeSet::new();
+        let mut tasks = BTreeSet::new();
+        let mut task_sources = Vec::new();
+        for key in keys {
+            match key.split_once(':') {
+                Some(("m", id)) => {
+                    manifests.insert(id.to_owned());
+                }
+                Some(("c", id)) => {
+                    checkpoints.insert(id.to_owned());
+                }
+                Some(("o", id)) => {
+                    operations.insert(id.to_owned());
+                }
+                Some(("t", id)) => {
+                    tasks.insert(id.to_owned());
+                }
+                Some((kind @ ("r" | "e" | "v" | "g" | "y"), id)) => {
+                    task_sources.push((kind.to_owned(), id.to_owned()));
+                }
+                _ => {
+                    self.restart_discovery();
+                    return Ok(true);
+                }
+            }
+        }
+        for (kind, id) in task_sources {
+            let task_id = match kind.as_str() {
+                "r" => {
+                    pioneer_entity::task_run::Entity::find_by_id(id)
+                        .select_only()
+                        .column(pioneer_entity::task_run::Column::TaskId)
+                        .into_tuple::<String>()
+                        .one(&store.connection)
+                        .await?
+                }
+                "e" => {
+                    pioneer_entity::task_run_execution::Entity::find_by_id(id)
+                        .select_only()
+                        .column(pioneer_entity::task_run_execution::Column::TaskId)
+                        .into_tuple::<String>()
+                        .one(&store.connection)
+                        .await?
+                }
+                "v" => {
+                    pioneer_entity::task_run_turn::Entity::find_by_id(id)
+                        .select_only()
+                        .column(pioneer_entity::task_run_turn::Column::TaskId)
+                        .into_tuple::<String>()
+                        .one(&store.connection)
+                        .await?
+                }
+                "g" => {
+                    pioneer_entity::task_trigger::Entity::find_by_id(id)
+                        .select_only()
+                        .column(pioneer_entity::task_trigger::Column::TaskId)
+                        .into_tuple::<String>()
+                        .one(&store.connection)
+                        .await?
+                }
+                _ => {
+                    pioneer_entity::task_run_turn::Entity::find()
+                        .select_only()
+                        .column(pioneer_entity::task_run_turn::Column::TaskId)
+                        .filter(pioneer_entity::task_run_turn::Column::TurnId.eq(id))
+                        .into_tuple::<String>()
+                        .one(&store.connection)
+                        .await?
+                }
+            };
+            let Some(task_id) = task_id else {
+                self.restart_discovery();
+                return Ok(true);
+            };
+            tasks.insert(task_id);
+        }
+        for task_id in tasks {
+            // Run/lease/receipt changes inside a live Task cannot release its
+            // immutable input roots. Capsule/root deletion has its own m: delta.
+            let terminal_task = task::Entity::find_by_id(&task_id)
+                .select_only()
+                .column(task::Column::Id)
+                .filter(task::Column::Status.is_in(["completed", "failed", "cancelled"]))
+                .into_tuple::<String>()
+                .one(&store.connection)
+                .await?;
+            if terminal_task.is_none() {
+                continue;
+            }
+            let roots = task_input::Entity::find()
+                .select_only()
+                .column(task_input::Column::FrozenManifestId)
+                .filter(task_input::Column::TaskId.eq(&task_id))
+                .limit(257)
+                .into_tuple::<Option<String>>()
+                .all(&store.connection)
+                .await?;
+            if roots.len() > 256 || roots.iter().any(|id| id.as_deref() == Some("")) {
+                self.restart_discovery();
+                return Ok(true);
+            }
+            manifests.extend(roots.into_iter().flatten());
+            let outputs = pioneer_entity::compaction_task_output::Entity::find()
+                .select_only()
+                .column(pioneer_entity::compaction_task_output::Column::ManifestId)
+                .filter(pioneer_entity::compaction_task_output::Column::TaskId.eq(&task_id))
+                .limit(257)
+                .into_tuple::<String>()
+                .all(&store.connection)
+                .await?;
+            manifests.extend(outputs);
+            if manifests.len() > 256 {
+                self.restart_discovery();
+                return Ok(true);
+            }
+        }
+        if !manifests.is_empty() {
+            let related = projection::Entity::find()
+                .select_only()
+                .column(projection::Column::OperationId)
+                .filter(projection::Column::ManifestId.is_in(manifests.iter().cloned()))
+                .limit(257)
+                .into_tuple::<String>()
+                .all(&store.connection)
+                .await?;
+            if related.len() > 256 {
+                self.restart_discovery();
+                return Ok(true);
+            }
+            operations.extend(related);
+        }
+        for id in checkpoints.clone() {
+            if let Some(op) = checkpoint::Entity::find_by_id(id)
+                .select_only()
+                .column(checkpoint::Column::OperationId)
+                .into_tuple::<String>()
+                .one(&store.connection)
+                .await?
+            {
+                operations.insert(op);
+            }
+        }
+        for op in operations {
+            let bound = projection::Entity::find_by_id(&op)
+                .select_only()
+                .column(projection::Column::ManifestId)
+                .into_tuple::<String>()
+                .one(&store.connection)
+                .await?;
+            let Some(id) = bound.filter(|id| !id.is_empty()) else {
+                // Unbound legacy operations conservatively hold an entire
+                // workspace. Exact IDs cannot represent their released scope.
+                self.restart_discovery();
+                return Ok(true);
+            };
+            manifests.insert(id);
+            let ids = checkpoint::Entity::find()
+                .select_only()
+                .column(checkpoint::Column::Id)
+                .filter(checkpoint::Column::OperationId.eq(&op))
+                .limit(257)
+                .into_tuple::<String>()
+                .all(&store.connection)
+                .await?;
+            checkpoints.extend(ids);
+            if checkpoints.len() + manifests.len() > 256 {
+                self.restart_discovery();
+                return Ok(true);
+            }
+        }
+        let mut backings = manifests.clone();
+        if !manifests.is_empty() {
+            let sources = span::Entity::find()
+                .select_only()
+                .column(span::Column::SourceManifest)
+                .filter(span::Column::ManifestId.is_in(manifests.iter().cloned()))
+                .distinct()
+                .limit(257)
+                .into_tuple::<String>()
+                .all(&store.connection)
+                .await?;
+            backings.extend(sources);
+            let candidates = layout::Entity::find()
+                .select_only()
+                .column(layout::Column::Candidate)
+                .filter(layout::Column::ManifestId.is_in(manifests.iter().cloned()))
+                .distinct()
+                .limit(257)
+                .into_tuple::<Option<String>>()
+                .all(&store.connection)
+                .await?;
+            backings.extend(candidates.into_iter().flatten());
+            if backings.len() > 256 {
+                self.restart_discovery();
+                return Ok(true);
+            }
+        }
+        let scope = std::mem::take(&mut self.scope);
+        *self = Self {
+            scope,
+            target_manifests: Some(manifests.into_iter().collect()),
+            target_checkpoints: Some(checkpoints.into_iter().collect()),
+            target_backings: if retries_only {
+                None
+            } else {
+                Some(backings.into_iter().collect())
+            },
+            retries_only,
+            ..Self::default()
+        };
+        self.pass_done = self.discovery_phases();
+        Ok(!self.target_manifests.as_ref().unwrap().is_empty())
+    }
+
+    fn discovery_phases(&self) -> [bool; 6] {
+        match (&self.target_manifests, &self.target_checkpoints) {
+            (Some(manifests), Some(checkpoints)) => [
+                true,
+                checkpoints.is_empty(),
+                manifests.is_empty(),
+                false,
+                checkpoints.is_empty(),
+                true,
+            ],
+            _ if self.release_only => [true, true, false, false, false, true],
+            _ => [false; 6],
+        }
+    }
+
+    pub(super) fn target_manifests(&self) -> Option<&[String]> {
+        self.target_manifests.as_deref()
+    }
+
     /// Called only after worker EOF. A hold release changes cleanup eligibility,
     /// not legacy proof/locator validity. Keep scope and conversion knowledge.
     pub fn recheck_released_holds(&mut self) {
@@ -1847,11 +2104,7 @@ impl FrozenStorageLifetimeProgress {
             self.pass_done[phase] = true;
         }
         if self.pass_done.iter().all(|done| *done) {
-            self.pass_done = if self.release_only {
-                [true, true, false, false, false, true]
-            } else {
-                [false; 6]
-            };
+            self.pass_done = self.discovery_phases();
             self.locator_done = [false; 4];
             self.sweep_round = Default::default();
             tracing::debug!(
@@ -2036,6 +2289,13 @@ impl FrozenStorageLifetimeProgress {
             }
             let query = Query::select()
                 .from(checkpoint::Entity)
+                .cond_where(match &self.target_checkpoints {
+                    Some(ids) => Condition::all().add(
+                        Expr::col((checkpoint::Entity, checkpoint::Column::Id))
+                            .is_in(ids.iter().cloned()),
+                    ),
+                    None => Condition::all(),
+                })
                 .columns(
                     [
                         checkpoint::Column::Id,
@@ -2175,8 +2435,31 @@ impl FrozenStorageLifetimeProgress {
 
     async fn expiry_quantum(&mut self, store: &CrudStore) -> Result<bool> {
         if let Some(expiry) = self.expiry.as_mut() {
+            let expired_before = self.accounting.expired;
             if expiry.step(store, &mut self.accounting).await? {
                 self.expiry = None;
+            }
+            if self.accounting.expired > expired_before {
+                self.pass_changed = true;
+                self.pass_done[3] = false;
+                self.pass_done[4] = self.target_checkpoints.as_ref().is_some_and(Vec::is_empty);
+            }
+            return Ok(true);
+        }
+        if let Some(ids) = &self.target_manifests {
+            let Some(id) = ids.iter().find(|id| *id > &self.expiry_after).cloned() else {
+                self.expiry_after.clear();
+                return Ok(false);
+            };
+            let header = history::Entity::find_by_id(&id)
+                .filter(history::Column::Ready.eq(1))
+                .filter(history::Column::Expired.eq(0))
+                .one(&store.connection)
+                .await?;
+            self.expiry_after = id;
+            if let Some(header) = header {
+                ensure!(counter_health(&header), "corrupt expiry counters");
+                self.expiry = Some(ExpiryPreparation::new(header));
             }
             return Ok(true);
         }
@@ -2291,7 +2574,9 @@ impl FrozenStorageLifetimeProgress {
         let fanout_checked = self.sweep_fanout;
         if fanout_checked {
             self.sweep_fanout = false;
-            if frozen_sweep_work::fanout_step(store).await? {
+            if !self.retries_only
+                && frozen_sweep_work::fanout_step(store, self.target_manifests.as_deref()).await?
+            {
                 self.invalidate_sweep();
                 return Ok(true);
             }
@@ -2310,6 +2595,8 @@ impl FrozenStorageLifetimeProgress {
             &active_keys,
             kind,
             &mut self.sweep_round[kind as usize],
+            self.target_backings.as_deref(),
+            self.retries_only,
         )
         .await?;
         let selected = match selected {
@@ -2319,6 +2606,8 @@ impl FrozenStorageLifetimeProgress {
                     &active_keys,
                     1 - kind,
                     &mut self.sweep_round[(1 - kind) as usize],
+                    self.target_backings.as_deref(),
+                    self.retries_only,
                 )
                 .await?
             }
@@ -2329,7 +2618,10 @@ impl FrozenStorageLifetimeProgress {
             frozen_sweep_work::Admission::Continue => return Ok(true),
             frozen_sweep_work::Admission::Idle => {
                 // Empty physical admission is not EOF while propagation continues.
-                let propagated = !fanout_checked && frozen_sweep_work::fanout_step(store).await?;
+                let propagated = !fanout_checked
+                    && (!self.retries_only
+                        && frozen_sweep_work::fanout_step(store, self.target_manifests.as_deref())
+                            .await?);
                 if propagated {
                     self.invalidate_sweep();
                 }
@@ -2406,9 +2698,25 @@ impl FrozenStorageLifetimeProgress {
                 self.discard = None;
                 return Ok(true);
             }
-            discard.cleanup(store).await?;
+            self.pass_changed |= discard.cleanup(store).await?;
             self.discard = None;
             return Ok(true);
+        }
+        if self.discard_pending.is_empty() {
+            if let Some(ids) = &self.target_checkpoints {
+                let page = ids
+                    .iter()
+                    .filter(|id| *id > &self.discard_after)
+                    .take(META_ROWS as usize)
+                    .cloned()
+                    .map(|id| (Some(id), true))
+                    .collect::<VecDeque<_>>();
+                if page.is_empty() {
+                    self.discard_after.clear();
+                    return Ok(false);
+                }
+                self.discard_pending = page;
+            }
         }
         if self.discard_pending.is_empty() {
             if self.discard_upper.is_none() {
@@ -2653,7 +2961,7 @@ struct DiscardPreparation {
     thread: String,
 }
 impl DiscardPreparation {
-    async fn cleanup(&self, store: &CrudStore) -> Result<()> {
+    async fn cleanup(&self, store: &CrudStore) -> Result<bool> {
         // Sizes first, no payload decoding or large comparisons in the writer.
         // At most three exact keys and 1 MiB of logical row bytes per quantum.
         let mut keys = Vec::new();
@@ -2697,7 +3005,11 @@ impl DiscardPreparation {
                 }
             }
         }
-        store
+        let change = store
+            .connection
+            .work_signal("maintenance.frozen")
+            .changing();
+        let changed = store
             .run_serialized_write(|| async {
                 let tx = store.connection.begin().await?;
                 if crate::frozen_lifetime::cleanup_blocked(
@@ -2706,7 +3018,7 @@ impl DiscardPreparation {
                     &store.connection.work_signal("maintenance.frozen.release"),
                 ) {
                     tx.commit().await?;
-                    return Ok(());
+                    return Ok(false);
                 }
                 let incoming_previous = checkpoint::Entity::find()
                     .select_only()
@@ -2831,10 +3143,13 @@ impl DiscardPreparation {
                     }
                 }
                 tx.commit().await?;
-                Ok(())
+                Ok(eligible.is_some() && !keys.is_empty())
             })
             .await?;
-        Ok(())
+        // Deleting legacy import/proof rows can release opaque outgoing roots.
+        // Recover their complete dependency set rather than guessing an ID.
+        change.completed(changed);
+        Ok(changed)
     }
 }
 
