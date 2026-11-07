@@ -10,7 +10,7 @@ use pioneer_entity::{
 use pioneer_observability::portable_payload as observe;
 use sea_orm::sea_query::{Alias, Expr, ExprTrait, Func, OnConflict};
 use sea_orm::{
-    ActiveValue::Set, ColumnTrait, ConnectionTrait, DbBackend, EntityTrait, QueryFilter,
+    ActiveValue::Set, ColumnTrait, Condition, ConnectionTrait, DbBackend, EntityTrait, QueryFilter,
     QueryOrder, QuerySelect, QueryTrait, TransactionTrait,
 };
 use sha2::{Digest, Sha256};
@@ -292,6 +292,25 @@ struct PendingKey {
     owner: String,
 }
 
+// NULL is a verified inline history; the empty-string legacy sentinel must
+// still be resolved by frozen-locator recovery. A known Task frozen descriptor
+// already points to its stored history and has no work for this codec.
+// Use the same admission for the finite ceiling and every pending page.
+fn pending_locator_condition(family: Family) -> Condition {
+    match family {
+        Family::TaskHistory => Condition::all().add(
+            pioneer_entity::task_run_conversation_snapshot::Column::FrozenManifestId.is_null(),
+        ),
+        Family::CliMapping => {
+            use pioneer_entity::turn_cli_runtime_binding::Column;
+            Condition::any()
+                .add(Column::FrozenManifestId.is_null())
+                .add(Column::FrozenManifestId.ne(""))
+        }
+        _ => Condition::all(),
+    }
+}
+
 async fn pending_upper(store: &CrudStore, family: Family) -> Result<Option<PendingKey>> {
     let _phase = observe::stage(observe::Stage::SourceRead);
     store
@@ -301,14 +320,8 @@ async fn pending_upper(store: &CrudStore, family: Family) -> Result<Option<Pendi
                     .select_only()
                     .column_as(key, "owner")
                     .filter(reference.is_null())
-                    .filter(field.is_not_null());
-                if matches!(family, Family::CliMapping | Family::TaskHistory) {
-                    query = query.filter(
-                        Expr::col(Alias::new("frozen_manifest_id"))
-                            .is_null()
-                            .or(Expr::col(Alias::new("frozen_manifest_id")).ne("")),
-                    );
-                }
+                    .filter(field.is_not_null())
+                    .filter(pending_locator_condition(family));
                 query = query.order_by_desc(key);
                 Ok(query
                     .limit(1)
@@ -343,14 +356,8 @@ async fn pending_sources(
                         "bytes",
                     )
                     .filter(reference.is_null())
-                    .filter(field.is_not_null());
-                if matches!(family, Family::CliMapping | Family::TaskHistory) {
-                    query = query.filter(
-                        Expr::col(Alias::new("frozen_manifest_id"))
-                            .is_null()
-                            .or(Expr::col(Alias::new("frozen_manifest_id")).ne("")),
-                    );
-                }
+                    .filter(field.is_not_null())
+                    .filter(pending_locator_condition(family));
                 if let Some(after) = after {
                     query = query.filter(key.gt(after));
                 }
@@ -1648,7 +1655,11 @@ fn eligibility_sql(family: Family) -> String {
         }
         Family::TaskEvent => " AND EXISTS(SELECT 1 FROM task t WHERE t.id=task_event.task_id)",
     };
-    let root_guard = if matches!(family, Family::CliMapping | Family::TaskHistory) {
+    let root_guard = if family == Family::TaskHistory {
+        // Publication can race a logical replacement of inline history with a
+        // frozen descriptor. Revalidate admission as well as the existing CAS.
+        " AND frozen_manifest_id IS NULL".into()
+    } else if family == Family::CliMapping {
         format!(
             " AND (frozen_manifest_id IS NULL OR (frozen_manifest_id<>'' AND EXISTS(SELECT 1 FROM compaction_frozen_history h WHERE h.id={table}.frozen_manifest_id AND h.workspace_id={table}.workspace_id AND h.expired=0 AND h.ready=1 AND h.message_count>=0 AND h.import_count>=0 AND h.next_ordinal=h.message_count AND h.next_import=h.import_count)))"
         )
@@ -2097,7 +2108,7 @@ mod tests {
     #[tokio::test]
     async fn publication_refusals_preserve_source_and_cleanup_but_sql_errors_propagate() {
         for mutation in [
-            "UPDATE compaction_frozen_history SET expired=1 WHERE id='root'",
+            "replace_with_frozen",
             "DELETE FROM task_run WHERE id='run'",
             "UPDATE task_run SET task_id='another-task' WHERE id='run'",
             "UPDATE task SET workspace_id='another-workspace',status='completed' WHERE id='task'",
@@ -2114,14 +2125,16 @@ mod tests {
             ] {
                 store.connection.execute_unprepared(sql).await.unwrap();
             }
+            let descriptor = serde_json::to_string(&pioneer_compaction::frozen::FrozenHistoryRef {
+                format: 1,
+                manifest_id: "root".into(),
+                messages: 0,
+                identity_sha256: "a".repeat(64),
+            })
+            .unwrap();
             let mut history =
-                serde_json::to_string(&pioneer_compaction::frozen::FrozenHistoryRef {
-                    format: 1,
-                    manifest_id: "root".into(),
-                    messages: 0,
-                    identity_sha256: "a".repeat(64),
-                })
-                .unwrap();
+                serde_json::json!([{ "role": "user", "content": "inline publication fixture" }])
+                    .to_string();
             // Preserve exact JSON bytes while ensuring real staged blocks for
             // refusal/hold/cleanup coverage, including a final-publication race.
             history.push_str(&" ".repeat(200_000));
@@ -2179,7 +2192,15 @@ mod tests {
                     .is_some()
             );
             let id = prepared.prepared.header.id.clone();
-            store.connection.execute_unprepared(mutation).await.unwrap();
+            if mutation == "replace_with_frozen" {
+                store.connection.execute_raw(sea_orm::Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    "UPDATE task_run_conversation_snapshot SET history_json=?,frozen_manifest_id='root' WHERE run_id='run'",
+                    [descriptor.clone().into()],
+                )).await.unwrap();
+            } else {
+                store.connection.execute_unprepared(mutation).await.unwrap();
+            }
             let expected_error = mutation.starts_with("CREATE TRIGGER");
             progress.pending = Some(prepared);
             let result = progress.quantum(&store).await;
@@ -2203,7 +2224,9 @@ mod tests {
             assert!(source.history_json_payload_id.is_none());
             assert_eq!(
                 source.history_json,
-                if mutation.contains("history_json='[]'") {
+                if mutation == "replace_with_frozen" {
+                    &descriptor
+                } else if mutation.contains("history_json='[]'") {
                     "[]"
                 } else {
                     &history
@@ -2277,7 +2300,222 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn discovery_skip_before_corruption_records_quantum_error() {
+    async fn frozen_task_descriptors_stay_out_of_codec_while_inline_and_old_payloads_work() {
+        use pioneer_entity::task_run_conversation_snapshot as snapshot;
+        use sea_orm::{PaginatorTrait, Statement};
+        let reads = Arc::new(ReadCount::default());
+        let (_dir, store) = reservation_fixture_observed(reads.clone()).await;
+        for sql in [
+            "INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,created_by_turn_id,executor_kind,status,title,goal) VALUES('task','ws','thread','thread','thread','turn','agent','running','fixture','fixture')",
+            "INSERT INTO compaction_frozen_history(id,workspace_id,owner_thread,identity_sha256,message_count,next_ordinal,import_count,next_import,imports_sha256,ready) VALUES('root','ws','thread','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',0,0,0,0,'',1)",
+            "WITH RECURSIVE n(i) AS (VALUES(0) UNION ALL SELECT i+1 FROM n WHERE i<2047) INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) SELECT printf('z-%04d',i),'task',printf('z-%04d',i),1,i+1,'succeeded','agent' FROM n",
+        ] {
+            store.connection.execute_unprepared(sql).await.unwrap();
+        }
+        let descriptor = serde_json::to_string(&pioneer_compaction::frozen::FrozenHistoryRef {
+            format: 1,
+            manifest_id: "root".into(),
+            messages: 0,
+            identity_sha256: "a".repeat(64),
+        })
+        .unwrap();
+        store.connection.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,history_json,frozen_manifest_id,created_at) SELECT id,'task','ws','thread',?,'root',CURRENT_TIMESTAMP FROM task_run",
+            [descriptor.clone().into()],
+        )).await.unwrap();
+
+        // Persist legacy physical formats directly: the current worker must
+        // continue reading them even though it no longer creates these values.
+        let original = format!("{descriptor}{}", " ".repeat(4096));
+        let dict = codec::Dictionary::from_bytes(original.as_bytes().to_vec()).unwrap();
+        let dict_id = dictionary_key(Family::TaskHistory.name(), dict.digest());
+        dictionary::Entity::insert(dictionary::ActiveModel {
+            id: Set(dict_id.clone()),
+            family: Set(Family::TaskHistory.name().into()),
+            version: Set(1),
+            data: Set(dict.bytes().to_vec()),
+        })
+        .exec(&store.connection)
+        .await
+        .unwrap();
+        let encoded = codec::encode(original.as_bytes(), &dict).unwrap();
+        assert!(codec::is_compressed(&encoded).unwrap());
+        for (run, id, raw) in [
+            ("z-0000", "legacyraw001", true),
+            ("z-0001", "legacyzip001", false),
+        ] {
+            value::Entity::insert(value::ActiveModel {
+                id: Set(id.into()),
+                family: Set(Family::TaskHistory.name().into()),
+                original_bytes: Set(original.len() as i64),
+                original_chars: Set(original.chars().count() as i64),
+                sha256: Set(Sha256::digest(original.as_bytes()).to_vec()),
+                raw: Set(i32::from(raw)),
+                retired: Set(0),
+                dictionary_id: Set((!raw).then(|| dict_id.clone())),
+            })
+            .exec(&store.connection)
+            .await
+            .unwrap();
+            if !raw {
+                block::Entity::insert(block::ActiveModel {
+                    payload_id: Set(id.into()),
+                    ordinal: Set(0),
+                    byte_offset: Set(0),
+                    char_offset: Set(0),
+                    original_bytes: Set(original.len() as i64),
+                    original_chars: Set(original.chars().count() as i64),
+                    data: Set(encoded.clone()),
+                })
+                .exec(&store.connection)
+                .await
+                .unwrap();
+            }
+            snapshot::Entity::update_many()
+                .col_expr(
+                    snapshot::Column::HistoryJson,
+                    Expr::value(if raw { original.clone() } else { "{}".into() }),
+                )
+                .col_expr(snapshot::Column::HistoryJsonPayloadId, Expr::value(id))
+                .filter(snapshot::Column::RunId.eq(run))
+                .exec(&store.connection)
+                .await
+                .unwrap();
+        }
+        store
+            .connection
+            .execute_unprepared("UPDATE compaction_frozen_history SET expired=1")
+            .await
+            .unwrap();
+        let before = reads.0.load(std::sync::atomic::Ordering::SeqCst);
+        let mut progress = PortablePayloadProgress::default();
+        let mut eof = false;
+        for _ in 0..12 {
+            if !progress.quantum(&store).await.unwrap() {
+                eof = true;
+                break;
+            }
+        }
+        assert!(
+            eof,
+            "known descriptors must not form a pending compression tail"
+        );
+        assert!(
+            reads.0.load(std::sync::atomic::Ordering::SeqCst) - before <= 6,
+            "an excluded descriptor catalog must reach EOF without walking its rows"
+        );
+        assert_eq!(
+            value::Entity::find()
+                .count(&store.connection)
+                .await
+                .unwrap(),
+            2
+        );
+
+        // An inline key beyond the frozen catalog forces pending pages to skip
+        // the known descriptor prefix as well as applying the ceiling filter.
+        store.connection.execute_unprepared("INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES('zz-inline','task','zz-inline',1,2049,'succeeded','agent')").await.unwrap();
+        let inline =
+            serde_json::json!([{"role":"user", "content":"actual inline history ".repeat(1000)}])
+                .to_string();
+        store
+            .insert_task_run_conversation_snapshot_if_absent(
+                crate::NewTaskRunConversationSnapshot {
+                    run_id: "zz-inline".into(),
+                    task_id: "task".into(),
+                    workspace_id: "ws".into(),
+                    conversation_thread_id: "thread".into(),
+                    source_turn_id: None,
+                    history_json: inline.clone(),
+                    created_at: chrono::Utc::now().fixed_offset(),
+                },
+            )
+            .await
+            .unwrap();
+        let before_inline = reads.0.load(std::sync::atomic::Ordering::SeqCst);
+        eof = false;
+        for _ in 0..100 {
+            if !progress.quantum(&store).await.unwrap() {
+                eof = true;
+                break;
+            }
+        }
+        assert!(eof);
+        assert!(
+            reads.0.load(std::sync::atomic::Ordering::SeqCst) - before_inline < 90,
+            "the inline page must not walk the frozen descriptor prefix"
+        );
+        let source = snapshot::Entity::find_by_id("zz-inline")
+            .one(&store.connection)
+            .await
+            .unwrap()
+            .unwrap();
+        let payload = value::Entity::find_by_id(source.history_json_payload_id.unwrap())
+            .one(&store.connection)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            payload.raw, 0,
+            "actual inline history must still be compressed"
+        );
+        assert_eq!(
+            value::Entity::find()
+                .count(&store.connection)
+                .await
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            store
+                .get_task_run_conversation_snapshot("zz-inline")
+                .await
+                .unwrap()
+                .unwrap()
+                .history_json,
+            inline
+        );
+        assert_eq!(
+            store
+                .get_task_run_conversation_snapshot("z-0000")
+                .await
+                .unwrap()
+                .unwrap()
+                .history_json,
+            original
+        );
+        assert_eq!(
+            store
+                .get_task_run_conversation_snapshot("z-0001")
+                .await
+                .unwrap()
+                .unwrap()
+                .history_json,
+            original
+        );
+        assert_eq!(
+            store
+                .get_task_run_conversation_snapshot("z-2047")
+                .await
+                .unwrap()
+                .unwrap()
+                .history_json,
+            descriptor
+        );
+        assert!(
+            snapshot::Entity::find_by_id("z-2047")
+                .one(&store.connection)
+                .await
+                .unwrap()
+                .unwrap()
+                .history_json_payload_id
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn cli_discovery_skip_before_corruption_records_quantum_error() {
         use sea_orm::Statement;
         let _telemetry_lock = TELEMETRY_TEST_LOCK.lock().await;
         let (_dir, store) = reservation_fixture().await;
@@ -2298,20 +2536,14 @@ mod tests {
                 identity_sha256: "a".repeat(64),
             })
             .unwrap();
-            store
-                .insert_task_run_conversation_snapshot_if_absent(
-                    crate::NewTaskRunConversationSnapshot {
-                        run_id: id.into(),
-                        task_id: "task".into(),
-                        workspace_id: "ws".into(),
-                        conversation_thread_id: "thread".into(),
-                        source_turn_id: None,
-                        history_json: history,
-                        created_at: chrono::Utc::now().fixed_offset(),
-                    },
-                )
-                .await
-                .unwrap();
+            store.connection.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+                "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES(?,'thread','completed','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+                [id.into()],
+            )).await.unwrap();
+            store.connection.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+                "INSERT INTO turn_cli_runtime_binding(turn_id,thread_id,continuation_thread_id,workspace_id,runtime_id,runtime_kind,native_thread_id,status,input_mapping_json,frozen_manifest_id,created_at,updated_at) VALUES(?,'thread','thread','ws','codex','codex',?,'completed',?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+                [id.into(), id.into(), serde_json::json!({"pioneerContextBasis":{"historyJson":history}}).to_string().into(), id.into()],
+            )).await.unwrap();
         }
         store
             .connection
@@ -2343,7 +2575,7 @@ mod tests {
             }
             let mut progress = PortablePayloadProgress::default();
             let mut observed = false;
-            // Find the Task history quantum by its public observation, without
+            // Find the CLI mapping quantum by its public observation, without
             // coupling the assertion to the order of families in the round.
             for _ in 0..10 {
                 let owner = caller();
@@ -2366,7 +2598,7 @@ mod tests {
                     .collect();
                 assert_eq!(terminals.len(), 1);
                 let operation = terminals[0].portable_payload.unwrap();
-                if operation.family != observe::Family::TaskHistory {
+                if operation.family != observe::Family::CliMapping {
                     assert!(result.unwrap());
                     continue;
                 }
@@ -2378,7 +2610,7 @@ mod tests {
                 } else {
                     assert!(result.unwrap());
                 }
-                assert_eq!(operation.family, observe::Family::TaskHistory);
+                assert_eq!(operation.family, observe::Family::CliMapping);
                 assert_eq!(operation.mode, observe::Mode::Background);
                 assert_eq!(
                     operation.outcome,
@@ -2399,7 +2631,7 @@ mod tests {
                 observed = true;
                 break;
             }
-            assert!(observed, "Task history discovery must receive service");
+            assert!(observed, "CLI mapping discovery must receive service");
         }
     }
 
