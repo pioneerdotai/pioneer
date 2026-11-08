@@ -1787,6 +1787,10 @@ pub use crate::repositories::turn_llm_context::{
     NewTurnLlmContextEntry, TurnLlmContextAppendOutcome, TurnLlmContextEntry,
 };
 
+pub use crate::repositories::turn_event_delivery::{
+    DeliveryOutcome as TurnEventDeliveryOutcome, DeliverySettlement as TurnEventDeliverySettlement,
+};
+
 #[derive(Debug, Clone)]
 pub struct ClaimedTurnEventDeliveryRecord {
     pub id: String,
@@ -5655,6 +5659,7 @@ impl CrudStore {
                     next_eligible_at_unix,
                 });
             }
+            let candidates = turn_event_delivery::prepare_claims(candidates);
             let consumer = consumer.to_owned();
             let claimed = self
                 .run_serialized_write(|| {
@@ -5663,12 +5668,12 @@ impl CrudStore {
                     async move {
                         let now = unix_to_datetime(now_unix);
                         let claim_expires_at = unix_to_datetime(now_unix.saturating_add(120));
-                        turn_event_delivery::claim_candidates(
+                        turn_event_delivery::claim_prepared(
                             &self.connection,
                             &consumer,
                             now,
                             claim_expires_at,
-                            candidates.clone(),
+                            &candidates,
                         )
                         .await
                     }
@@ -5676,24 +5681,60 @@ impl CrudStore {
                 .await?;
             // Claim writes are committed before event reads/JSON decoding. A read
             // error leaves the durable lease recoverable and dispatches no claim.
+            let ids = claimed
+                .iter()
+                .map(|c| c.row.event_id.clone())
+                .collect::<Vec<_>>();
+            let events = turn_event::find_event_models_by_ids(&self.connection, &ids)
+                .await?
+                .into_iter()
+                .map(|e| (e.id.clone(), e))
+                .collect::<std::collections::HashMap<_, _>>();
             let mut records = Vec::with_capacity(claimed.len());
+            let mut invalid = Vec::new();
             for claim in claimed {
-                let event =
-                    turn_event::find_event_by_id(&self.connection, claim.row.event_id.as_str())
-                        .await?
-                        .with_context(|| {
-                            format!(
-                                "turn event `{}` is missing for delivery `{}`",
-                                claim.row.event_id, claim.row.id
-                            )
-                        })?;
-                records.push(ClaimedTurnEventDeliveryRecord {
-                    id: claim.row.id,
-                    consumer: claim.row.consumer,
-                    attempt_count: claim.row.attempt_count,
-                    claim_token: claim.claim_token,
-                    event,
-                });
+                let event = events
+                    .get(&claim.row.event_id)
+                    .cloned()
+                    .with_context(|| {
+                        format!(
+                            "turn event `{}` is missing for delivery `{}`",
+                            claim.row.event_id, claim.row.id
+                        )
+                    })
+                    .and_then(turn_event::appended_event_from_model)
+                    .and_then(|event| {
+                        anyhow::ensure!(
+                            event.turn_id == claim.row.turn_id
+                                && event.thread_id == claim.row.thread_id
+                                && event.sequence == claim.row.sequence
+                                && event.payload.thread_id() == claim.row.thread_id
+                                && event.payload.turn_id() == claim.row.turn_id,
+                            "delivery event owner/sequence changed"
+                        );
+                        Ok(event)
+                    });
+                match event {
+                    Ok(event) => records.push(ClaimedTurnEventDeliveryRecord {
+                        id: claim.row.id,
+                        consumer: claim.row.consumer,
+                        attempt_count: claim.row.attempt_count,
+                        claim_token: claim.claim_token,
+                        event,
+                    }),
+                    Err(error) => invalid.push(TurnEventDeliverySettlement {
+                        id: claim.row.id,
+                        claim_token: claim.claim_token,
+                        at_unix: now_unix,
+                        outcome: TurnEventDeliveryOutcome::Failed {
+                            attempt_count: claim.row.attempt_count,
+                            error: format!("{error:#}"),
+                        },
+                    }),
+                }
+            }
+            if !invalid.is_empty() {
+                self.settle_turn_event_deliveries(&invalid).await?;
             }
             Ok(TurnEventDeliveryClaimBatch {
                 deliveries: records,
@@ -5704,6 +5745,33 @@ impl CrudStore {
         if result.is_ok() {
             for change in changes {
                 change.completed(false);
+            }
+        }
+        result
+    }
+
+    /// Ready outcomes only: no batching delay, no writer held during delivery.
+    pub async fn settle_turn_event_deliveries(
+        &self,
+        settlements: &[TurnEventDeliverySettlement],
+    ) -> Result<u64> {
+        anyhow::ensure!(
+            settlements.len() <= turn_event_delivery::DELIVERY_BATCH_LIMIT,
+            "delivery settlement batch exceeds bound"
+        );
+        if settlements.is_empty() {
+            return Ok(0);
+        }
+        let changes = ["projection", "compaction"]
+            .map(|domain| self.connection.work_signal(domain).changing());
+        let result = self
+            .run_serialized_write(|| {
+                turn_event_delivery::settle_batch(&self.connection, settlements)
+            })
+            .await;
+        if let Ok(changed) = &result {
+            for change in changes {
+                change.completed(*changed != 0);
             }
         }
         result
@@ -40132,6 +40200,7 @@ async fn enqueue_recovery_terminalization_if_required<C: ConnectionTrait>(
 
 #[cfg(test)]
 mod tests {
+    use crate::{TurnEventDeliveryOutcome, TurnEventDeliverySettlement};
     mod authorization_reads;
     mod saved_history_read;
     mod task_child_discovery;
@@ -42046,14 +42115,24 @@ mod tests {
                     .collect::<Vec<_>>(),
                 healthy_turns
             );
-            for claim in ready {
-                assert!(
-                    store
-                        .complete_turn_event_delivery(&claim.id, &claim.claim_token, now)
-                        .await
-                        .unwrap()
-                );
-            }
+            let outcomes = ready
+                .iter()
+                .map(|claim| TurnEventDeliverySettlement {
+                    id: claim.id.clone(),
+                    claim_token: claim.claim_token.clone(),
+                    at_unix: now,
+                    outcome: TurnEventDeliveryOutcome::Delivered,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                store.settle_turn_event_deliveries(&outcomes).await.unwrap(),
+                2
+            );
+            assert_eq!(
+                store.settle_turn_event_deliveries(&outcomes).await.unwrap(),
+                0,
+                "replayed batch cannot settle a claim twice"
+            );
             assert!(
                 store
                     .claim_due_turn_event_deliveries(consumer, now, 2)
@@ -42135,10 +42214,16 @@ mod tests {
         assert_eq!(recovered[0].id, first[0].id);
         assert_ne!(recovered[0].claim_token, first[0].claim_token);
         assert!(
-            !restored
-                .complete_turn_event_delivery(&first[0].id, &first[0].claim_token, now + 120)
+            restored
+                .settle_turn_event_deliveries(&[TurnEventDeliverySettlement {
+                    id: first[0].id.clone(),
+                    claim_token: first[0].claim_token.clone(),
+                    at_unix: now + 120,
+                    outcome: TurnEventDeliveryOutcome::Delivered,
+                }])
                 .await
-                .unwrap(),
+                .unwrap()
+                == 0,
             "expired owner cannot complete a reclaimed head"
         );
         assert!(

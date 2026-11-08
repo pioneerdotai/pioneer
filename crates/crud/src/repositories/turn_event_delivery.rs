@@ -19,6 +19,42 @@ pub const DELIVERY_STATUS_DELIVERED: &str = "delivered";
 pub const DELIVERY_STATUS_EXHAUSTED: &str = "exhausted";
 
 const DB_ID_LEN: usize = 21;
+/// One finite quantum; also bounds UPDATE bind counts and payload row reads.
+pub const DELIVERY_BATCH_LIMIT: usize = 64;
+
+#[derive(Debug, Clone)]
+pub struct PreparedDeliveryClaim {
+    pub id: String,
+    pub token: String,
+}
+
+pub fn prepare_claims(candidates: Vec<String>) -> Vec<PreparedDeliveryClaim> {
+    let mut seen = std::collections::HashSet::new();
+    candidates
+        .into_iter()
+        .filter(|id| seen.insert(id.clone()))
+        .take(DELIVERY_BATCH_LIMIT)
+        .map(|id| PreparedDeliveryClaim {
+            id,
+            token: generate_id(DB_ID_LEN),
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone)]
+pub enum DeliveryOutcome {
+    Delivered,
+    ForegroundDeferred,
+    Failed { attempt_count: i64, error: String },
+}
+
+#[derive(Debug, Clone)]
+pub struct DeliverySettlement {
+    pub id: String,
+    pub claim_token: String,
+    pub at_unix: i64,
+    pub outcome: DeliveryOutcome,
+}
 
 #[derive(Debug, Clone)]
 pub struct ClaimedTurnEventDelivery {
@@ -187,7 +223,7 @@ pub async fn discover<C: ConnectionTrait>(
         .order_by_asc(eligible_clock())
         .order_by_asc(turn_event_delivery::Column::TurnId)
         .order_by_asc(turn_event_delivery::Column::Sequence)
-        .limit(limit)
+        .limit(limit.min(DELIVERY_BATCH_LIMIT as u64))
         .into_tuple::<(String, DateTimeWithTimeZone)>()
         .all(db)
         .await
@@ -206,6 +242,7 @@ pub async fn claim_due<C: ConnectionTrait>(
     claim_candidates(db, consumer, now, claim_expires_at, candidates).await
 }
 
+#[cfg(test)]
 pub async fn claim_candidates<C: ConnectionTrait>(
     db: &C,
     consumer: &str,
@@ -213,51 +250,207 @@ pub async fn claim_candidates<C: ConnectionTrait>(
     claim_expires_at: DateTimeWithTimeZone,
     candidates: Vec<String>,
 ) -> Result<Vec<ClaimedTurnEventDelivery>> {
-    let due = due_at(consumer, now);
-    let no_pending_predecessor = no_pending_predecessor();
-    let projection_ready = projection_ready(consumer);
-    let mut claimed = Vec::new();
-    for candidate in candidates {
-        let claim_token = generate_id(DB_ID_LEN);
-        let affected = turn_event_delivery::Entity::update_many()
-            .col_expr(
-                turn_event_delivery::Column::Status,
-                sea_orm::sea_query::Expr::value(DELIVERY_STATUS_DELIVERING.to_owned()),
-            )
-            .col_expr(
-                turn_event_delivery::Column::ClaimToken,
-                sea_orm::sea_query::Expr::value(Some(claim_token.clone())),
-            )
-            .col_expr(
-                turn_event_delivery::Column::ClaimExpiresAt,
-                sea_orm::sea_query::Expr::value(Some(claim_expires_at)),
-            )
-            .col_expr(
-                turn_event_delivery::Column::UpdatedAt,
-                sea_orm::sea_query::Expr::value(now),
-            )
-            .filter(turn_event_delivery::Column::Id.eq(candidate.clone()))
-            .filter(due.clone())
-            // Candidate discovery does not replace the claim's state guard.
-            // Revalidate causal eligibility in the same UPDATE as its lease.
-            .filter(no_pending_predecessor.clone())
-            .filter(projection_ready.clone())
-            .exec(db)
-            .await
-            .context("failed to claim turn event delivery")?
-            .rows_affected;
-        if affected == 0 {
-            continue;
-        }
-        if let Some(row) = turn_event_delivery::Entity::find_by_id(candidate)
-            .one(db)
-            .await
-            .context("failed to reload claimed turn event delivery")?
-        {
-            claimed.push(ClaimedTurnEventDelivery { row, claim_token });
-        }
+    claim_prepared(
+        db,
+        consumer,
+        now,
+        claim_expires_at,
+        &prepare_claims(candidates),
+    )
+    .await
+}
+
+/// Discovery is advisory. The one UPDATE rechecks due time, projection and
+/// predecessors atomically. Claiming never makes a predecessor terminal, so
+/// the causal predicate remains valid while SQLite visits this statement's rows.
+/// RETURNING replaces per-row reloads; every ID still has its own fresh token.
+pub async fn claim_prepared<C: ConnectionTrait>(
+    db: &C,
+    consumer: &str,
+    now: DateTimeWithTimeZone,
+    claim_expires_at: DateTimeWithTimeZone,
+    candidates: &[PreparedDeliveryClaim],
+) -> Result<Vec<ClaimedTurnEventDelivery>> {
+    anyhow::ensure!(
+        candidates.len() <= DELIVERY_BATCH_LIMIT,
+        "delivery claim batch exceeds bound"
+    );
+    if candidates.is_empty() {
+        return Ok(Vec::new());
     }
-    Ok(claimed)
+    let mut tokens = sea_orm::sea_query::CaseStatement::new();
+    for candidate in candidates {
+        tokens = tokens.case(
+            turn_event_delivery::Column::Id.eq(candidate.id.clone()),
+            candidate.token.clone(),
+        );
+    }
+    let rows = turn_event_delivery::Entity::update_many()
+        .col_expr(
+            turn_event_delivery::Column::Status,
+            Expr::value(DELIVERY_STATUS_DELIVERING),
+        )
+        .col_expr(
+            turn_event_delivery::Column::ClaimToken,
+            tokens.finally(Option::<String>::None).into(),
+        )
+        .col_expr(
+            turn_event_delivery::Column::ClaimExpiresAt,
+            Expr::value(Some(claim_expires_at)),
+        )
+        .col_expr(turn_event_delivery::Column::UpdatedAt, Expr::value(now))
+        .filter(turn_event_delivery::Column::Id.is_in(candidates.iter().map(|c| c.id.clone())))
+        .filter(due_at(consumer, now))
+        .filter(no_pending_predecessor())
+        .filter(projection_ready(consumer))
+        .exec_with_returning(db)
+        .await
+        .context("failed to claim turn event delivery batch")?;
+    // SQLite RETURNING order is unspecified. Restore discovery order.
+    let mut rows = rows
+        .into_iter()
+        .map(|r| (r.id.clone(), r))
+        .collect::<std::collections::HashMap<_, _>>();
+    Ok(candidates
+        .iter()
+        .filter_map(|c| {
+            rows.remove(&c.id).map(|row| ClaimedTurnEventDelivery {
+                row,
+                claim_token: c.token.clone(),
+            })
+        })
+        .collect())
+}
+
+/// Settle independent claims in one statement, retaining each exact ID/token
+/// fence. No external effects occur under the writer. A cancelled/unknown write
+/// retains the ordinary WorkChange/lease recovery contract at the CrudStore.
+pub async fn settle_batch<C: ConnectionTrait>(
+    db: &C,
+    settlements: &[DeliverySettlement],
+) -> Result<u64> {
+    use sea_orm::sea_query::CaseStatement;
+    use turn_event_delivery::Column as Col;
+    anyhow::ensure!(
+        settlements.len() <= DELIVERY_BATCH_LIMIT,
+        "delivery settlement batch exceeds bound"
+    );
+    if settlements.is_empty() {
+        return Ok(0);
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut guard = Condition::any();
+    let mut status = CaseStatement::new();
+    let mut errors = CaseStatement::new();
+    let mut attempts = CaseStatement::new();
+    let mut next = CaseStatement::new();
+    let mut delivered = CaseStatement::new();
+    let mut updated = CaseStatement::new();
+    for settlement in settlements {
+        anyhow::ensure!(seen.insert(&settlement.id), "duplicate delivery settlement");
+        let id = Col::Id.eq(settlement.id.clone());
+        let mut owned = Condition::all()
+            .add(id.clone())
+            .add(Col::ClaimToken.eq(settlement.claim_token.clone()));
+        let at = crate::util::unix_to_datetime(settlement.at_unix);
+        let (state, error, increment, next_at, delivered_at) = match &settlement.outcome {
+            DeliveryOutcome::Delivered => (DELIVERY_STATUS_DELIVERED, None, false, None, Some(at)),
+            DeliveryOutcome::ForegroundDeferred => {
+                owned = owned.add(Col::Consumer.eq(CONSUMER_LIVE_NOTIFICATION));
+                (
+                    DELIVERY_STATUS_PENDING,
+                    None,
+                    false,
+                    Some(at + chrono::Duration::seconds(1)),
+                    None,
+                )
+            }
+            DeliveryOutcome::Failed {
+                attempt_count,
+                error,
+            } => {
+                let exhausted = attempt_count.saturating_add(1) >= 10;
+                let delay = 2_i64
+                    .saturating_pow(u32::try_from((*attempt_count).clamp(0, 8)).unwrap_or(8))
+                    .min(300);
+                (
+                    if exhausted {
+                        DELIVERY_STATUS_EXHAUSTED
+                    } else {
+                        DELIVERY_STATUS_FAILED
+                    },
+                    Some(error.clone()),
+                    true,
+                    Some(at + chrono::Duration::seconds(delay)),
+                    None,
+                )
+            }
+        };
+        guard = guard.add(owned);
+        status = status.case(id.clone(), state);
+        // Deferral preserves the preceding attempt/error budget exactly.
+        let error_expr: SimpleExpr =
+            if matches!(&settlement.outcome, DeliveryOutcome::ForegroundDeferred) {
+                Expr::col(Col::LastError).into()
+            } else {
+                Expr::val(error).into()
+            };
+        errors = errors.case(id.clone(), error_expr);
+        attempts = attempts.case(
+            id.clone(),
+            if increment {
+                Expr::col(Col::AttemptCount).add(1)
+            } else {
+                Expr::col(Col::AttemptCount).into()
+            },
+        );
+        next = next.case(
+            id.clone(),
+            next_at
+                .map(|at| -> SimpleExpr { Expr::val(at).into() })
+                .unwrap_or_else(|| Expr::col(Col::NextRunAt).into()),
+        );
+        delivered = delivered.case(
+            id.clone(),
+            delivered_at
+                .map(|at| -> SimpleExpr { Expr::val(at).into() })
+                .unwrap_or_else(|| Expr::col(Col::DeliveredAt).into()),
+        );
+        updated = updated.case(id, at);
+    }
+    Ok(turn_event_delivery::Entity::update_many()
+        .col_expr(Col::Status, status.finally(Expr::col(Col::Status)).into())
+        .col_expr(
+            Col::LastError,
+            errors.finally(Expr::col(Col::LastError)).into(),
+        )
+        .col_expr(
+            Col::AttemptCount,
+            attempts.finally(Expr::col(Col::AttemptCount)).into(),
+        )
+        .col_expr(
+            Col::NextRunAt,
+            next.finally(Expr::col(Col::NextRunAt)).into(),
+        )
+        .col_expr(
+            Col::DeliveredAt,
+            delivered.finally(Expr::col(Col::DeliveredAt)).into(),
+        )
+        .col_expr(
+            Col::UpdatedAt,
+            updated.finally(Expr::col(Col::UpdatedAt)).into(),
+        )
+        .col_expr(Col::ClaimToken, Expr::value(Option::<String>::None))
+        .col_expr(
+            Col::ClaimExpiresAt,
+            Expr::value(Option::<DateTimeWithTimeZone>::None),
+        )
+        .filter(Col::Status.eq(DELIVERY_STATUS_DELIVERING))
+        .filter(guard)
+        .exec(db)
+        .await
+        .context("failed to settle turn event delivery batch")?
+        .rows_affected)
 }
 
 fn projection_ready(consumer: &str) -> SimpleExpr {

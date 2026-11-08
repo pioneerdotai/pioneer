@@ -3291,6 +3291,14 @@ impl MessageProcessor {
             .claim_due_turn_event_deliveries_with_deadline(consumer, now_unix, limit)
             .await?;
         let processed = batch.deliveries.len() as u64;
+        if processed == 1 {
+            self.process_claimed_native_turn_event_delivery(
+                batch.deliveries.into_iter().next().expect("one delivery"),
+            )
+            .await?;
+            return Ok((processed, batch.next_eligible_at_unix));
+        }
+
         let mut by_turn = std::collections::BTreeMap::<
             String,
             Vec<pioneer_crud::ClaimedTurnEventDeliveryRecord>,
@@ -3301,20 +3309,51 @@ impl MessageProcessor {
                 .or_default()
                 .push(delivery);
         }
+        // Claim discovery admits only causal heads, so each turn has one
+        // outstanding delivery. Keep per-turn sequencing explicit if that
+        // representation changes; other turns remain independent.
+        let deliveries = futures_util::stream::iter(by_turn.into_values())
+            .map(|deliveries| async move {
+                let mut outcomes = Vec::with_capacity(deliveries.len());
+                for delivery in deliveries {
+                    outcomes.push(
+                        self.prepare_native_turn_event_delivery_settlement(delivery)
+                            .await,
+                    );
+                }
+                outcomes
+            })
+            .buffer_unordered(16)
+            .ready_chunks(64);
         let storage_failed = AtomicBool::new(false);
-        futures_util::stream::iter(by_turn.into_values())
-            .for_each_concurrent(Some(16), |deliveries| {
+        deliveries
+            .for_each_concurrent(Some(16), |ready| {
                 let storage_failed = &storage_failed;
                 async move {
-                    for delivery in deliveries {
-                        if self
-                            .process_claimed_native_turn_event_delivery(delivery)
-                            .await
-                            .is_err()
-                        {
-                            storage_failed.store(true, Ordering::Relaxed);
+                    let ready = ready.into_iter().flatten().collect::<Vec<_>>();
+                    // ready_chunks never waits to fill a batch. Settlement futures
+                    // are polled alongside delivery, so waiting for the writer
+                    // cannot suspend the other turns' notification futures.
+                    if self
+                        .crud_store
+                        .settle_turn_event_deliveries(&ready)
+                        .await
+                        .is_err()
+                    {
+                        // Isolate a poison row. Exact tokens also fence a replay
+                        // following an unknown but actually committed batch write.
+                        for outcome in ready {
+                            if self
+                                .crud_store
+                                .settle_turn_event_deliveries(&[outcome])
+                                .await
+                                .is_err()
+                            {
+                                storage_failed.store(true, Ordering::Relaxed);
+                            }
                         }
                     }
+                    tokio::task::yield_now().await;
                 }
             })
             .await;
@@ -4819,72 +4858,48 @@ impl MessageProcessor {
         &self,
         delivery: pioneer_crud::ClaimedTurnEventDeliveryRecord,
     ) -> Result<()> {
-        if delivery.consumer == pioneer_crud::NATIVE_TURN_EVENT_LIVE_CONSUMER
+        let settlement = self
+            .prepare_native_turn_event_delivery_settlement(delivery)
+            .await;
+        self.crud_store
+            .settle_turn_event_deliveries(&[settlement])
+            .await?;
+        Ok(())
+    }
+
+    async fn prepare_native_turn_event_delivery_settlement(
+        &self,
+        delivery: pioneer_crud::ClaimedTurnEventDeliveryRecord,
+    ) -> pioneer_crud::TurnEventDeliverySettlement {
+        use pioneer_crud::{TurnEventDeliveryOutcome as Outcome, TurnEventDeliverySettlement};
+        let outcome = if delivery.consumer == pioneer_crud::NATIVE_TURN_EVENT_LIVE_CONSUMER
             && self.foreground_starts.pending(
                 delivery.event.payload.thread_id(),
                 delivery.event.payload.turn_id(),
+            ) {
+            Outcome::ForegroundDeferred
+        } else {
+            match tokio::time::timeout(
+                Duration::from_secs(5),
+                self.deliver_native_turn_event(&delivery),
             )
-        {
-            self.crud_store
-                .defer_turn_event_delivery_for_foreground_start(
-                    &delivery.id,
-                    &delivery.claim_token,
-                    now_timestamp_secs(),
-                )
-                .await?;
-            return Ok(());
-        }
-        let result = tokio::time::timeout(
-            Duration::from_secs(5),
-            self.deliver_native_turn_event(&delivery),
-        )
-        .await
-        .map_err(|_| anyhow::anyhow!("optional turn-event delivery timed out"))
-        .and_then(|result| result);
-        let completed_at = now_timestamp_secs();
-        match result {
-            Ok(()) => {
-                if let Err(error) = self
-                    .crud_store
-                    .complete_turn_event_delivery(
-                        delivery.id.as_str(),
-                        delivery.claim_token.as_str(),
-                        completed_at,
-                    )
-                    .await
-                {
-                    warn!(
-                        delivery_id = delivery.id,
-                        consumer = delivery.consumer,
-                        error = %format!("{error:#}"),
-                        "failed to acknowledge optional turn-event delivery"
-                    );
-                    return Err(error);
-                }
+            .await
+            .map_err(|_| anyhow::anyhow!("optional turn-event delivery timed out"))
+            .and_then(|result| result)
+            {
+                Ok(()) => Outcome::Delivered,
+                Err(error) => Outcome::Failed {
+                    attempt_count: delivery.attempt_count,
+                    error: format!("{error:#}"),
+                },
             }
-            Err(error) => {
-                if let Err(mark_error) = self
-                    .crud_store
-                    .fail_turn_event_delivery(
-                        delivery.id.as_str(),
-                        delivery.claim_token.as_str(),
-                        delivery.attempt_count,
-                        format!("{error:#}"),
-                        completed_at,
-                    )
-                    .await
-                {
-                    warn!(
-                        delivery_id = delivery.id,
-                        consumer = delivery.consumer,
-                        error = %format!("{mark_error:#}"),
-                        "failed to record optional turn-event delivery failure"
-                    );
-                    return Err(mark_error);
-                }
-            }
+        };
+        TurnEventDeliverySettlement {
+            id: delivery.id,
+            claim_token: delivery.claim_token,
+            at_unix: now_timestamp_secs(),
+            outcome,
         }
-        Ok(())
     }
 
     async fn deliver_native_turn_event(
