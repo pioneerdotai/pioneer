@@ -5431,7 +5431,7 @@ async fn control_activity_is_addressed_for_cli_and_api_without_repairing_foreign
             .await
             .unwrap()
             .map_or(at.timestamp(), |activity| {
-                activity.last_activity_at_unix.max(at.timestamp())
+                std::cmp::max(activity.last_activity_at_unix, at.timestamp())
             })
             + 1;
         assert!(
