@@ -157,6 +157,10 @@ async fn control_owner_keeps_deadline_that_matures_between_portions() {
         // Persist invalid detached envelopes: dispatch rejects them locally,
         // with no provider or runtime needed. Twelve raw claim quanta keep the
         // real outbox runnable throughout the observations below.
+        let change = database
+            .work_signal("gateway.control")
+            .changing()
+            .with_keys(&[pioneer_crud::GatewayControlWake::Actions.key()]);
         for batch in 0..12 {
             agent_action::Entity::insert_many((0..32).map(|row| {
                 let id = format!("A{:020}", batch * 32 + row);
@@ -191,6 +195,9 @@ async fn control_owner_keeps_deadline_that_matures_between_portions() {
             .await
             .unwrap();
         }
+        // These fixture SQL writes stand in for the normal producer, whose
+        // commit invalidates the addressed outbox family.
+        change.completed(true);
         while now_timestamp_secs() <= due {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
@@ -1173,7 +1180,15 @@ async fn cli_active_scan_defers_busy_session_without_waiting_or_refetching_pages
     )
     .await
     .expect("a busy gate must not hold the resilience worker");
-    assert_eq!((result.selected, result.processed), (128, 128));
+    assert_eq!(result.selected, 128);
+    assert_eq!(result.processed, 126);
+    let mut deferred = result
+        .deferred_transitions
+        .iter()
+        .map(|(turn, _)| turn.as_str())
+        .collect::<Vec<_>>();
+    deferred.sort_unstable();
+    assert_eq!(deferred, ["busy_running_gate", GUARDED_TURN]);
     assert!(has_recovery(&store, "busy_starting_stale").await);
     assert!(has_recovery(&store, "busy_running_stale").await);
     assert!(!has_recovery(&store, "busy_running_gate").await);
@@ -5281,10 +5296,7 @@ async fn control_owner_reaches_later_supervision_page_after_persistent_row_failu
         .await
         .unwrap();
     let processor = Arc::new(processor);
-    processor.arm_completed_history_preparation_barrier("__control_after_timeout_phase__");
-    processor.start_resilience_workers().await.unwrap();
     let outcome = tokio::time::timeout(Duration::from_secs(30), async {
-        processor.wait_for_completed_history_preparation_barrier().await;
         let now = now_timestamp_secs();
         let coordinator = &processor.recovery_coordinator;
         let mut jobs = Vec::new();
@@ -5339,6 +5351,11 @@ async fn control_owner_reaches_later_supervision_page_after_persistent_row_failu
             poison.id.replace('\'', "''"),
         )).await.unwrap();
 
+        // Activate every fixture before starting the independent recovery-due
+        // owner; it must not consume the claims while they are being seeded.
+        processor.arm_completed_history_preparation_barrier("__control_after_timeout_phase__");
+        processor.start_resilience_workers().await.unwrap();
+        processor.wait_for_completed_history_preparation_barrier().await;
         for _ in 0..3 {
             processor.arm_completed_history_preparation_barrier("__control_after_timeout_phase__");
             processor.release_completed_history_preparation_barrier();
@@ -5407,10 +5424,22 @@ async fn control_activity_is_addressed_for_cli_and_api_without_repairing_foreign
     let mut changes = signal.subscribe();
     changes.begin_keyed_pass(&database).await.unwrap();
     for turn_id in ["codex-turn-command", "api-control-turn"] {
-        store
-            .observe_turn_runtime_activity(turn_id, "provider/delta", at.timestamp())
+        // Runtime activity timestamps have second precision. Advance past the
+        // fixture's materialized activity rather than submitting a stale CAS.
+        let observed_at = store
+            .get_turn_liveness(turn_id)
             .await
-            .unwrap();
+            .unwrap()
+            .map_or(at.timestamp(), |activity| {
+                activity.last_activity_at_unix.max(at.timestamp())
+            })
+            + 1;
+        assert!(
+            store
+                .observe_turn_runtime_activity(turn_id, "provider/delta", observed_at)
+                .await
+                .unwrap()
+        );
         let keys = changes.begin_keyed_pass(&database).await.unwrap().unwrap();
         assert_eq!(keys, [Wake::Activity(turn_id.into()).key()]);
         let mut work = ControlWork::default();
@@ -5428,7 +5457,7 @@ async fn control_activity_is_addressed_for_cli_and_api_without_repairing_foreign
             "healthy progress only refreshes this Turn's deadline"
         );
         let (done, _) = processor
-            .process_control_turn(turn_id, &mut pass, at.timestamp())
+            .process_control_turn(turn_id, &mut pass, observed_at)
             .await
             .unwrap();
         assert!(done);

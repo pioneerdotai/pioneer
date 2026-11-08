@@ -888,6 +888,18 @@ async fn portable_cli_mapping_preserves_sent_bytes_control_updates_and_upsert() 
         .unwrap();
     binding.status = "running".into();
     binding.native_turn_id = Some("native-control-1".into());
+    // Archival is post-Turn work. Keep the mapping binding active to exercise
+    // control reads, but seal its owning Turn before staging the payload.
+    store
+        .update_turn_status(
+            "thread",
+            "turn",
+            pioneer_protocol::TurnStatus::Completed,
+            None,
+            at.timestamp(),
+        )
+        .await
+        .unwrap();
     let mut progress = pioneer_crud::PortablePayloadProgress::default();
     let mut staged = false;
     for _ in 0..100 {
@@ -1630,16 +1642,12 @@ async fn portable_unavailable_history_pages_yield_and_revisit_without_blocking_o
         )
         .await
         .unwrap();
-    let mut errors = 0;
+    // Frozen descriptors are handled by frozen-storage maintenance, never by
+    // portable payload archival, even when their backing root is malformed.
     for _ in 0..30 {
-        if progress.quantum(&store).await.is_err() {
-            errors += 1;
-        }
+        progress.quantum(&store).await.unwrap();
     }
-    assert!(
-        errors > 0,
-        "malformed frozen counters must not become idle skips"
-    );
+    assert_eq!(scalar(&store, "SELECT count(*) n FROM task_run_conversation_snapshot WHERE frozen_manifest_id='unavailable' AND history_json_payload_id IS NOT NULL").await, 0);
     store
         .database_connection()
         .execute_unprepared(

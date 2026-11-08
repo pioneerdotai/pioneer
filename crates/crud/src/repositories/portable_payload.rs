@@ -3335,10 +3335,10 @@ mod tests {
                 .await
                 .unwrap();
             for sql in [
-                "INSERT INTO turn_cli_runtime_binding(turn_id,thread_id,continuation_thread_id,workspace_id,runtime_id,runtime_kind,native_thread_id,status,input_mapping_json,created_at,updated_at) VALUES('turn','thread','thread','ws','codex','codex','native','running','{}',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+                "INSERT INTO turn_cli_runtime_binding(turn_id,thread_id,continuation_thread_id,workspace_id,runtime_id,runtime_kind,native_thread_id,status,input_mapping_json,frozen_manifest_id,created_at,updated_at) VALUES('turn','thread','thread','ws','codex','codex','native','running','{}',NULL,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
                 "INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,created_by_turn_id,executor_kind,status,title,goal) VALUES('active-task','ws','thread','thread','thread','turn','agent','running','fixture','fixture')",
                 "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES('active-run','active-task','active-run',1,1,'running','agent')",
-                "INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at) VALUES('active-run','active-task','ws','thread','turn','[]',CURRENT_TIMESTAMP)",
+                "INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,frozen_manifest_id,created_at) VALUES('active-run','active-task','ws','thread','turn','[]',NULL,CURRENT_TIMESTAMP)",
                 "INSERT INTO task_event(id,task_id,run_id,thread_id,turn_id,sequence,event_type,payload_json,created_at) VALUES('run-event','active-task','active-run','thread','turn',1,'fixture','{}',CURRENT_TIMESTAMP)",
                 "INSERT INTO task_event(id,task_id,sequence,event_type,payload_json,created_at) VALUES('task-event','active-task',2,'fixture','{}',CURRENT_TIMESTAMP)",
             ] {
@@ -3445,6 +3445,9 @@ mod tests {
                 .execute_unprepared("UPDATE turn SET status='interrupted' WHERE id='turn'")
                 .await
                 .unwrap();
+            // The abandoned source is behind this pass's captured cursor.
+            // Finish that finite pass before rediscovering the old key.
+            finish_archive_pass(&mut progress, &store).await;
             finish_archive_pass(&mut progress, &store).await;
             let row = chunk::Entity::find()
                 .filter(chunk::Column::Id.eq("resume-output"))

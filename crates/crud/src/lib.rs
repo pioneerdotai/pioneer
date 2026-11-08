@@ -41405,7 +41405,11 @@ mod tests {
             assert!(html.changed().now_or_never().is_none());
             assert!(tasks.changed().now_or_never().is_none());
 
-            store.insert_turn_llm_context(entry).await.unwrap();
+            // The direct insert is a distinct context entry, not another
+            // write to the sequence already allocated by the append API.
+            let mut direct = entry;
+            direct.sequence = first.entry.sequence + 1;
+            store.insert_turn_llm_context(direct).await.unwrap();
             assert!(frozen.changed().now_or_never().is_none());
             assert_eq!(html.changed().now_or_never().is_some(), relevant);
             assert!(tasks.changed().now_or_never().is_some());
@@ -56928,6 +56932,15 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        let events_before = pioneer_entity::turn_event::Entity::find()
+            .filter(pioneer_entity::turn_event::Column::TurnId.eq(turn.id.clone()))
+            .count(&store.connection)
+            .await
+            .unwrap();
+        assert_eq!(
+            events_before, 2,
+            "TurnStarted and TurnCompleted remain durable"
+        );
         store
             .materialize_turn_start(
                 &thread,
@@ -56963,7 +56976,7 @@ mod tests {
                 .count(&store.connection)
                 .await
                 .unwrap(),
-            1
+            events_before
         );
     }
 
