@@ -2,6 +2,15 @@
 //! claims and leases remain authoritative; overflow always restores discovery.
 use pioneer_crud::{GatewayControlWake as Wake, TimeoutCandidateCursor};
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+use tokio::task::{Id, JoinError, JoinSet};
+
+pub(super) enum CliTurnReadiness {
+    Ready(Option<i64>),
+    Waiting(Arc<tokio::sync::Mutex<()>>),
+}
+
+const CLI_TRANSITION_WAIT_LIMIT: usize = 256;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum Family {
@@ -83,6 +92,9 @@ pub(super) struct ControlWork {
     cli_overflow: bool,
     turn_after: Option<String>,
     retry_turns: BTreeMap<String, (TurnPass, i64)>,
+    cli_transition_turns: BTreeMap<String, Id>,
+    cli_transition_waits: JoinSet<String>,
+    cli_transition_overflow_retry: Option<i64>,
     pub rebuild_commands: bool,
 }
 impl ControlWork {
@@ -96,6 +108,8 @@ impl ControlWork {
         self.cli_deadlines.clear();
         self.cli_overflow = false;
         self.turn_after = None;
+        // Gate waits are live obligations, not discovery cursors. Retain them
+        // across UNKNOWN/full hints until release, cancellation or shutdown.
     }
     pub(super) fn turn(&mut self, id: String, commands: bool) {
         let prior = self.retry_turns.remove(&id).map(|(pass, _)| pass);
@@ -177,6 +191,13 @@ impl ControlWork {
         }
     }
     pub(super) fn due(&mut self, now: i64) {
+        if self
+            .cli_transition_overflow_retry
+            .is_some_and(|at| at <= now)
+        {
+            self.cli_transition_overflow_retry = None;
+            self.ready.insert(Family::Cli);
+        }
         let retry_ids = self
             .retry_turns
             .iter()
@@ -240,6 +261,12 @@ impl ControlWork {
         self.cli_deadlines = deadlines;
         self.cli_overflow = overflow;
         self.finish(Family::Cli, head);
+        if !overflow {
+            for id in self.cli_transition_turns.keys() {
+                self.cli_deadlines.remove(id);
+            }
+            self.refresh_cli_head();
+        }
     }
     pub(super) fn cli_turn(&mut self, id: String, deadline: Option<i64>) {
         if self.cli_overflow {
@@ -285,14 +312,193 @@ impl ControlWork {
     pub(super) fn retry_turn(&mut self, id: String, pass: TurnPass, at: i64) {
         self.retry_turns.insert(id, (pass, at));
     }
+    /// One-shot waits run independently of the control owner's dispatch awaits:
+    /// dispatch may itself need this gate. A waiter releases the acquired guard
+    /// immediately, without DB work or effects, then reports readiness. JoinSet
+    /// owns every task and aborts outstanding waits when this owner is dropped.
+    pub(super) fn defer_cli_transition(
+        &mut self,
+        id: String,
+        transition: Arc<tokio::sync::Mutex<()>>,
+        now: i64,
+    ) {
+        self.cli_deadlines.remove(&id);
+        self.refresh_cli_head();
+        if self.cli_transition_turns.contains_key(&id) {
+            return;
+        }
+        if self.cli_transition_turns.len() >= CLI_TRANSITION_WAIT_LIMIT {
+            // Bounded overload fallback, serving a known deferred obligation.
+            // Do not silently discard it or substitute the healthy stale TTL.
+            let retry = now.saturating_add(2);
+            self.cli_transition_overflow_retry = Some(
+                self.cli_transition_overflow_retry
+                    .map_or(retry, |at| at.min(retry)),
+            );
+            return;
+        }
+        let turn_id = id.clone();
+        let task = self.cli_transition_waits.spawn(async move {
+            drop(transition.lock_owned().await);
+            turn_id
+        });
+        self.cli_transition_turns.insert(id, task.id());
+    }
+    fn cli_transition_released(&mut self, id: String) {
+        self.cli_transition_turns.remove(&id);
+        // Re-read current authority instead of applying a captured terminal
+        // snapshot: resume/new execution may have won while the gate was held.
+        self.turn(id, false);
+    }
+    fn cli_transition_joined(&mut self, result: Result<(Id, String), JoinError>) {
+        let id = match result {
+            Ok((_, id)) => id,
+            Err(error) => {
+                // An unexpected waiter cancellation/panic cannot consume the
+                // owed retry or permanently occupy the bounded admission set.
+                let Some(id) = self
+                    .cli_transition_turns
+                    .iter()
+                    .find(|(_, task)| **task == error.id())
+                    .map(|(id, _)| id.clone())
+                else {
+                    return;
+                };
+                id
+            }
+        };
+        self.cli_transition_released(id);
+    }
+    pub(super) fn drain_cli_transition_retries(&mut self) {
+        while let Some(result) = self.cli_transition_waits.try_join_next_with_id() {
+            self.cli_transition_joined(result);
+        }
+    }
+    pub(super) async fn wait_cli_transition_retry(&mut self) {
+        if self.cli_transition_waits.is_empty() {
+            std::future::pending::<()>().await;
+        } else if let Some(result) = self.cli_transition_waits.join_next_with_id().await {
+            self.cli_transition_joined(result);
+        }
+    }
     pub(super) fn deadline(&self) -> Option<i64> {
         self.deadlines
             .values()
             .copied()
             .chain(self.retry_turns.values().map(|(_, at)| *at))
+            .chain(self.cli_transition_overflow_retry)
             .min()
     }
     pub(super) fn has_work(&self) -> bool {
         !self.ready.is_empty() || !self.turns.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures_util::FutureExt;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn cli_transition_wait_survives_select_cancellation_and_full_hints_without_blocking_peers()
+     {
+        let busy = Arc::new(tokio::sync::Mutex::new(()));
+        let held = busy.clone().lock_owned().await;
+        let free = Arc::new(tokio::sync::Mutex::new(()));
+        let mut work = ControlWork::default();
+        work.defer_cli_transition("busy".into(), busy.clone(), 100);
+        assert!(work.wait_cli_transition_retry().now_or_never().is_none());
+        work.full();
+        work.defer_cli_transition("busy".into(), busy.clone(), 100);
+        work.defer_cli_transition("peer".into(), free.clone(), 100);
+        tokio::time::timeout(Duration::from_secs(1), work.wait_cli_transition_retry())
+            .await
+            .expect("free peer must progress independently of a busy gate");
+        assert_eq!(work.take_turn_ids(16), ["peer"]);
+        assert!(
+            free.try_lock().is_ok(),
+            "a completed waiter must release its acquired gate"
+        );
+        work.turns.clear();
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(1), work.wait_cli_transition_retry())
+            .await
+            .expect("the retained gate release must reach its owner");
+        assert_eq!(work.take_turn_ids(16), ["busy"]);
+        assert!(
+            work.turns["busy"].check_state,
+            "release must revalidate authority"
+        );
+        work.turns.clear();
+        assert!(
+            work.wait_cli_transition_retry().now_or_never().is_none(),
+            "no duplicate or empty wake"
+        );
+        assert!(busy.try_lock().is_ok());
+    }
+
+    #[tokio::test]
+    async fn cli_transition_wait_overflow_retains_bounded_due_work_and_shutdown_releases_waiters() {
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        let held = gate.clone().lock_owned().await;
+        let mut work = ControlWork::default();
+        for n in 0..=CLI_TRANSITION_WAIT_LIMIT {
+            work.defer_cli_transition(format!("turn-{n}"), gate.clone(), 100);
+        }
+        assert!(!work.has_work());
+        assert_eq!(work.deadline(), Some(102));
+        work.due(101);
+        assert!(!work.ready(Family::Cli));
+        work.due(102);
+        assert!(
+            work.ready(Family::Cli),
+            "overflow must rediscover its deferred obligation"
+        );
+        assert!(work.wait_cli_transition_retry().now_or_never().is_none());
+        drop(work);
+        drop(held);
+        let _guard = tokio::time::timeout(Duration::from_secs(1), gate.lock_owned())
+            .await
+            .expect("shutdown must cancel owned waiters and release lock reservations");
+    }
+
+    // The owner stops polling retry completions while synchronously dispatching
+    // the next CLI launch, whose preparation awaits the same transition gate.
+    #[tokio::test]
+    async fn cli_transition_waiter_releases_gate_while_control_owner_awaits_next_launch() {
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        let previous_launch = gate.clone().lock_owned().await;
+        let mut work = ControlWork::default();
+        work.defer_cli_transition("previous-turn".into(), gate.clone(), 100);
+        assert!(work.wait_cli_transition_retry().now_or_never().is_none());
+        drop(previous_launch);
+
+        // Do not poll ControlWork here. The previous FuturesUnordered waiter
+        // reserved the permit but could not release it during this await.
+        tokio::time::timeout(Duration::from_secs(1), async {
+            let _next_launch = gate.clone().lock_owned().await;
+        })
+        .await
+        .expect("CLI dispatch must not depend on its own caller polling a gate waiter");
+
+        tokio::time::timeout(Duration::from_secs(1), work.wait_cli_transition_retry())
+            .await
+            .expect("the previous Turn must still be scheduled for reconciliation");
+        assert_eq!(work.take_turn_ids(16), ["previous-turn"]);
+    }
+
+    #[tokio::test]
+    async fn cancelled_cli_transition_waiter_retains_its_original_turn_retry() {
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        let _held = gate.clone().lock_owned().await;
+        let mut work = ControlWork::default();
+        work.defer_cli_transition("cancelled-turn".into(), gate, 100);
+        work.cli_transition_waits.abort_all();
+        tokio::time::timeout(Duration::from_secs(1), work.wait_cli_transition_retry())
+            .await
+            .expect("unexpected cancellation cannot silently consume owed reconciliation");
+        assert_eq!(work.take_turn_ids(16), ["cancelled-turn"]);
+        assert!(work.turns["cancelled-turn"].check_state);
     }
 }

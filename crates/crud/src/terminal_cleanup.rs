@@ -97,6 +97,15 @@ impl Change {
         Self(vec![db.work_signal("maintenance.zstd").changing()])
     }
 
+    /// The caller's atomic write already proves a committed completed/failed/
+    /// interrupted Turn. Publish directly, before any post-commit reads. A later
+    /// resume is harmless: cleanup revalidates current eligibility itself.
+    pub(crate) fn completed_terminal(self, changed: bool, turns: &[String]) {
+        for change in self.0 {
+            change.completed_keys(if changed { turns } else { &[] });
+        }
+    }
+
     pub(crate) async fn complete(self, db: &SqliteDatabase, changed: bool, turns: &[String]) {
         let relevant = if changed && !turns.is_empty() {
             // A bounded primary-key metadata probe after releasing the writer.

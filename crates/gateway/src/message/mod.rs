@@ -3176,6 +3176,9 @@ impl MessageProcessor {
                 let this = this.for_background_reconciliation();
                 let maintenance = this.with_database_class(SqliteWriteClass::Maintenance);
                 let now = now_timestamp_secs();
+                // Poll release obligations even while other families have more
+                // portions; a busy outbox must not starve terminal cleanup.
+                work.drain_cli_transition_retries();
                 let mut transient_storage_poll_failed = false;
                 let mut more = false;
                 let mut finished = std::collections::BTreeSet::new();
@@ -3315,8 +3318,14 @@ impl MessageProcessor {
                     let result = this.process_control_turn(&turn_id, &mut pass, now).await;
                     match result {
                         Ok((done, cli_deadline)) => {
-                            if let Some(next) = cli_deadline {
-                                work.cli_turn(turn_id.clone(), next);
+                            match cli_deadline {
+                                Some(control_work::CliTurnReadiness::Ready(next)) => {
+                                    work.cli_turn(turn_id.clone(), next);
+                                }
+                                Some(control_work::CliTurnReadiness::Waiting(transition)) => {
+                                    work.defer_cli_transition(turn_id.clone(), transition, now);
+                                }
+                                None => {}
                             }
                             point_timeouts_changed = true;
                             if commands_requested {
@@ -3795,6 +3804,9 @@ impl MessageProcessor {
                         ),
                     )
                     .await;
+                    for (turn_id, transition) in stale.deferred_transitions {
+                        work.defer_cli_transition(turn_id, transition, now);
+                    }
                     cli_stale_complete = !stale.has_more && !stale.failed;
                     if cli_stale_complete {
                         finished.insert(Family::Cli);
@@ -3928,6 +3940,7 @@ impl MessageProcessor {
                 tokio::select! {
                     _ = control_changes.wait(deadline) => {},
                     _ = cli_changes.changed() => {},
+                    _ = work.wait_cli_transition_retry() => {},
                     _ = native_retry_changes.changed() => {
                         next_native_terminal_effect_recovery = Some(0);
                     },
@@ -4055,7 +4068,7 @@ impl MessageProcessor {
         turn_id: &str,
         pass: &mut control_work::TurnPass,
         now: i64,
-    ) -> anyhow::Result<(bool, Option<Option<i64>>)> {
+    ) -> anyhow::Result<(bool, Option<control_work::CliTurnReadiness>)> {
         if pass.commands {
             if pass.command_upper.is_none() {
                 pass.command_upper = Some(

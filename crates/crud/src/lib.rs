@@ -17445,14 +17445,23 @@ impl CrudStore {
             .await
         }
         .await;
-        if let Ok((_, changed)) = &result {
-            payload_change
-                .complete(&self.connection, *changed, &receipt_keys)
-                .await;
+        if let Ok((outcome, changed)) = &result {
+            // Terminal status and its projection were committed atomically.
+            // Mandatory consumers must observe that commit before any further
+            // reads; payload eligibility needs no advisory post-commit SELECT.
             receipt_change.completed_keys(if *changed { &receipt_keys } else { &[] });
             for change in changes {
                 change.completed(*changed);
             }
+            let payload_changed = *changed
+                && matches!(
+                    outcome,
+                    TurnFinalizationCommitOutcome::Committed(_)
+                        | TurnFinalizationCommitOutcome::SupersededByTerminalStatus(
+                            TurnStatus::Failed | TurnStatus::Interrupted
+                        )
+                );
+            payload_change.completed_terminal(payload_changed, &receipt_keys);
             task_change.completed(&self.connection).await?;
         }
         result.map(|(outcome, _)| outcome)
@@ -40227,6 +40236,8 @@ mod tests {
     mod cli_runtime_active_bindings;
     #[path = "task_event_fanout.rs"]
     mod fanout;
+    #[path = "finalization_wakes.rs"]
+    mod finalization_wakes;
     #[path = "task_run_occurrence.rs"]
     mod occurrence_tracker;
     #[path = "task_occurrence_reconcile.rs"]

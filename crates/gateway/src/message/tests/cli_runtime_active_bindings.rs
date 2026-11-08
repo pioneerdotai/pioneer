@@ -5471,3 +5471,310 @@ async fn control_activity_is_addressed_for_cli_and_api_without_repairing_foreign
     assert!(unknown.ready(Family::Skills));
     assert!(unknown.ready(Family::Ledger));
 }
+
+// A failed content read must not leave an accepted native completion unACKed,
+// its attempt running, or its retained admission lease occupied.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_completion_finishes_and_acks_when_optional_mapping_cannot_be_hydrated() {
+    use pioneer_entity::portable_payload;
+    use sea_orm::Set;
+
+    let temp = tempfile::tempdir().unwrap();
+    let (processor, store, _, workspace) = blocked_observation_fixture_with_receipt(
+        &temp.path().join("optional-mapping.sqlite"),
+        "codex",
+        true,
+        true,
+    )
+    .await;
+    let key = CLIAgentRuntimeSessionKey::new(&workspace, "codex", BLOCKED_THREAD).unwrap();
+    let handle = processor
+        .cli_runtime_manager
+        .as_ref()
+        .unwrap()
+        .existing_session(&key)
+        .await
+        .unwrap();
+    let lease = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
+    processor
+        .cli_runtime_session_turn_leases
+        .lock()
+        .await
+        .insert(BLOCKED_TURN.into(), (lease, handle.clone()));
+
+    // Deliberately damaged content, with valid control/attempt authority. The
+    // invalid length/digest fail the real hydration path, not an unrelated
+    // owner fence or a test replacement for the completion handler.
+    portable_payload::Entity::insert(portable_payload::ActiveModel {
+        id: Set("damaged-cli-mapping".into()),
+        family: Set("cli.mapping".into()),
+        original_bytes: Set(2),
+        original_chars: Set(2),
+        sha256: Set(vec![0; 32]),
+        raw: Set(1),
+        retired: Set(0),
+        dictionary_id: Set(None),
+    })
+    .exec(&store.database_connection())
+    .await
+    .unwrap();
+    binding::Entity::update_many()
+        .col_expr(
+            binding::Column::InputMappingJsonPayloadId,
+            Expr::value(Some("damaged-cli-mapping".to_owned())),
+        )
+        .col_expr(
+            binding::Column::InputMappingJson,
+            Expr::value(String::new()),
+        )
+        .filter(binding::Column::TurnId.eq(BLOCKED_TURN))
+        .exec(&store.database_connection())
+        .await
+        .unwrap();
+    let control = store
+        .get_cli_runtime_turn_binding_control(BLOCKED_TURN)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        store
+            .load_cli_runtime_control_mapping(&control)
+            .await
+            .is_err()
+    );
+
+    timeout(
+        Duration::from_secs(10),
+        processor.handle_cli_runtime_timeline_event(
+            handle.instance(),
+            RuntimeEvent::TurnCompleted(RuntimeTurnCompleted {
+                native_thread_id: Some(BLOCKED_NATIVE_THREAD.into()),
+                native_turn_id: BLOCKED_TURN.into(),
+                status: "completed".into(),
+                native: None,
+            }),
+        ),
+    )
+    .await
+    .expect("optional mapping failure must not interrupt terminal delivery");
+    assert_eq!(
+        store
+            .get_turn(BLOCKED_THREAD, BLOCKED_TURN)
+            .await
+            .unwrap()
+            .unwrap()
+            .1
+            .status,
+        TurnStatus::Completed
+    );
+    assert_eq!(
+        store
+            .latest_cli_runtime_turn_attempt(BLOCKED_TURN)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        pioneer_crud::CliRuntimeTurnAttemptStatus::Completed
+    );
+    assert!(
+        !store
+            .has_pending_cli_runtime_terminal_event(BLOCKED_TURN)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !processor
+            .cli_runtime_session_turn_leases
+            .lock()
+            .await
+            .contains_key(BLOCKED_TURN)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_cached_activity_waiting_for_database_does_not_block_other_session_cache_access() {
+    use futures_util::FutureExt;
+    let temp = tempfile::tempdir().unwrap();
+    let (processor, store, _, workspace) = blocked_observation_fixture_with_receipt(
+        &temp.path().join("cache-reader-wait.sqlite"),
+        "codex",
+        true,
+        true,
+    )
+    .await;
+    let key = CLIAgentRuntimeSessionKey::new(&workspace, "codex", BLOCKED_THREAD).unwrap();
+    let handle = processor
+        .cli_runtime_manager
+        .as_ref()
+        .unwrap()
+        .existing_session(&key)
+        .await
+        .unwrap();
+    let binding = store
+        .get_cli_runtime_turn_binding_control(BLOCKED_TURN)
+        .await
+        .unwrap()
+        .unwrap();
+    processor
+        .cli_runtime_turn_binding_cache
+        .lock()
+        .await
+        .insert(
+            CLIRuntimeNativeTurnKey {
+                workspace_id: workspace,
+                runtime_id: "codex".into(),
+                thread_id: BLOCKED_THREAD.into(),
+                session_generation: handle.instance().generation(),
+                native_thread_id: BLOCKED_NATIVE_THREAD.into(),
+                native_turn_id: BLOCKED_TURN.into(),
+            },
+            binding,
+        );
+
+    // Exhaust the existing Maintenance reader capacity. The scoped processor's
+    // next native activity validation must wait, without retaining the cache.
+    let maintenance = store.database_connection().maintenance();
+    let reader = maintenance.begin_read().await.unwrap();
+    let mut event = Box::pin(processor.handle_cli_runtime_timeline_event(
+        handle.instance(),
+        ordinary_native_failure(BLOCKED_NATIVE_THREAD, BLOCKED_TURN),
+    ));
+    assert!(event.as_mut().now_or_never().is_none());
+    let cache = processor
+        .cli_runtime_turn_binding_cache
+        .try_lock()
+        .expect("another session's terminal invalidation must not wait for this DB read");
+    assert_eq!(cache.len(), 1);
+    drop(cache);
+    drop(event);
+    reader.rollback().await.unwrap();
+    assert!(processor.cli_runtime_turn_binding_cache.try_lock().is_ok());
+    assert!(
+        store
+            .latest_cli_runtime_turn_attempt(BLOCKED_TURN)
+            .await
+            .unwrap()
+            .unwrap()
+            .status
+            .is_active()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_control_owner_retries_terminal_cleanup_on_gate_release_without_another_event() {
+    let temp = tempfile::tempdir().unwrap();
+    let (processor, store, _, workspace) = blocked_observation_fixture_with_receipt(
+        &temp.path().join("terminal-gate-release.sqlite"),
+        "codex",
+        true,
+        true,
+    )
+    .await;
+    let processor = Arc::new(processor);
+    let key = CLIAgentRuntimeSessionKey::new(&workspace, "codex", BLOCKED_THREAD).unwrap();
+    let handle = processor
+        .cli_runtime_manager
+        .as_ref()
+        .unwrap()
+        .existing_session(&key)
+        .await
+        .unwrap();
+    let lease = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
+    processor
+        .cli_runtime_session_turn_leases
+        .lock()
+        .await
+        .insert(BLOCKED_TURN.into(), (lease, handle));
+    processor.arm_completed_history_preparation_barrier("__control_before_wait__");
+    processor.start_resilience_workers().await.unwrap();
+    let result = timeout(Duration::from_secs(10), async {
+        // Finish startup on a consistent active Turn, then exercise an addressed
+        // terminal mutation after initial discovery has reached EOF.
+        processor
+            .wait_for_completed_history_preparation_barrier()
+            .await;
+        let gate = processor
+            .cli_runtime_session_transition_mutex(&key)
+            .await
+            .lock_owned()
+            .await;
+        store
+            .update_turn_status(
+                BLOCKED_THREAD,
+                BLOCKED_TURN,
+                TurnStatus::Completed,
+                None,
+                chrono::Utc::now().timestamp(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                processor
+                    .refresh_cli_control_turn(BLOCKED_TURN, chrono::Utc::now().timestamp(), true)
+                    .await
+                    .unwrap(),
+                crate::message::control_work::CliTurnReadiness::Waiting(_)
+            ),
+            "contention is owed work, not a healthy liveness deadline"
+        );
+        processor.arm_completed_history_preparation_barrier("__control_before_wait__");
+        processor.release_completed_history_preparation_barrier();
+        processor
+            .wait_for_completed_history_preparation_barrier()
+            .await;
+        assert!(
+            store
+                .latest_cli_runtime_turn_attempt(BLOCKED_TURN)
+                .await
+                .unwrap()
+                .unwrap()
+                .status
+                .is_active()
+        );
+        assert!(
+            processor
+                .cli_runtime_session_turn_leases
+                .lock()
+                .await
+                .contains_key(BLOCKED_TURN)
+        );
+        // Release before the owner enters select: no producer or DB mutation
+        // follows this. Gate availability alone must retain the owed retry.
+        drop(gate);
+        processor.release_completed_history_preparation_barrier();
+        loop {
+            if !processor
+                .cli_runtime_session_turn_leases
+                .lock()
+                .await
+                .contains_key(BLOCKED_TURN)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            store
+                .latest_cli_runtime_turn_attempt(BLOCKED_TURN)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            pioneer_crud::CliRuntimeTurnAttemptStatus::Completed
+        );
+        assert_eq!(
+            store
+                .get_cli_runtime_turn_binding_control(BLOCKED_TURN)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "completed"
+        );
+    })
+    .await;
+    processor.release_completed_history_preparation_barrier();
+    processor.shutdown_resilience_workers().await;
+    result.expect("gate release must wake terminal cleanup without waiting for the stale deadline");
+}
