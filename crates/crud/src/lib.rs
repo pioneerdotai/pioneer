@@ -2178,7 +2178,7 @@ pub struct TurnItemAttemptDeadlines {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TurnProjectionReplaySummary {
     /// Earliest eligible clock from this replay's last bounded discovery.
-    /// Advisory only: foreign changes are still discovered on every poll.
+    /// Advisory only; invalidation and durable claims remain authoritative.
     pub next_eligible_at_unix: Option<i64>,
     pub claimed: usize,
     pub projected: usize,
@@ -5640,7 +5640,11 @@ impl CrudStore {
         now_unix: i64,
         limit: u64,
     ) -> Result<TurnEventDeliveryClaimBatch> {
-        let changes = [self.connection.work_signal("projection").changing()];
+        let changes = [self
+            .connection
+            .work_signal("projection")
+            .changing()
+            .with_keys(&["delivery".into()])];
         let result = async {
             // One compact reader discovery supplies both due IDs and an eligible
             // timer. Empty polls need no second query, writer or payload load.
@@ -5762,8 +5766,14 @@ impl CrudStore {
         if settlements.is_empty() {
             return Ok(0);
         }
-        let changes = ["projection", "compaction"]
-            .map(|domain| self.connection.work_signal(domain).changing());
+        let changes = ["projection", "compaction"].map(|domain| {
+            let change = self.connection.work_signal(domain).changing();
+            if domain == "projection" {
+                change.with_keys(&["delivery".into()])
+            } else {
+                change
+            }
+        });
         let result = self
             .run_serialized_write(|| {
                 turn_event_delivery::settle_batch(&self.connection, settlements)
@@ -5783,8 +5793,14 @@ impl CrudStore {
         claim_token: &str,
         now_unix: i64,
     ) -> Result<bool> {
-        let changes = ["projection", "compaction"]
-            .map(|domain| self.connection.work_signal(domain).changing());
+        let changes = ["projection", "compaction"].map(|domain| {
+            let change = self.connection.work_signal(domain).changing();
+            if domain == "projection" {
+                change.with_keys(&["delivery".into()])
+            } else {
+                change
+            }
+        });
         let id = id.to_owned();
         let claim_token = claim_token.to_owned();
         let result = self
@@ -5832,7 +5848,10 @@ impl CrudStore {
         now_unix: i64,
     ) -> Result<bool> {
         let projection_changes = [
-            self.connection.work_signal("projection").changing(),
+            self.connection
+                .work_signal("projection")
+                .changing()
+                .with_keys(&["delivery".into()]),
             self.connection.work_signal("compaction").changing(),
         ];
         let projection_result = async {
@@ -5866,7 +5885,10 @@ impl CrudStore {
         now_unix: i64,
     ) -> Result<bool> {
         let projection_changes = [
-            self.connection.work_signal("projection").changing(),
+            self.connection
+                .work_signal("projection")
+                .changing()
+                .with_keys(&["delivery".into()]),
             self.connection.work_signal("compaction").changing(),
         ];
         let projection_result = async {
@@ -16939,8 +16961,19 @@ impl CrudStore {
     ) -> Result<PrepareTurnFinalizationOutcome> {
         let cleanup_turns = vec![notification.turn_id.clone()];
         let cleanup_change = terminal_cleanup::Change::events(&self.connection);
-        let changes = ["projection", "compaction"]
-            .map(|domain| self.connection.work_signal(domain).changing());
+        let changes = ["projection", "compaction"].map(|domain| {
+            let change = self.connection.work_signal(domain).changing();
+            if domain == "projection" {
+                change.with_keys(
+                    &cleanup_turns
+                        .iter()
+                        .map(|id| format!("turn:{id}"))
+                        .collect::<Vec<_>>(),
+                )
+            } else {
+                change
+            }
+        });
         let notification = notification.clone();
         let expected_task_finalization_revision =
             expected_task_finalization_revision.map(str::to_owned);
@@ -17106,6 +17139,47 @@ impl CrudStore {
         .context(NativeFinalizationPhase::Scan)?;
         let complete = (page.len() as u64) < limit;
         let last = page.last().cloned();
+        let mut summary = self
+            .reconcile_finalization_candidates(page, event_timestamp_secs)
+            .await;
+        pass.failed |= !summary.failures.is_empty();
+        summary.pass_complete = complete;
+        summary.pass_failed = pass.failed;
+        if complete {
+            *pass = turn_finalization::PreparedPass::default();
+        } else {
+            pass.after = last;
+        }
+        Ok(summary)
+    }
+
+    /// No global cursor is moved by a keyed wake. Eligibility is advisory;
+    /// commit revalidates intent, Turn state and predecessor in its transaction.
+    pub async fn reconcile_prepared_turn_finalizations_for_turns(
+        &self,
+        turn_ids: &[String],
+        event_timestamp_secs: i64,
+    ) -> Result<TurnFinalizationReconciliationSummary> {
+        anyhow::ensure!(
+            turn_ids.len() <= 64,
+            "finalization frontier exceeds 64 Turns"
+        );
+        let page = turn_finalization::list_eligible_prepared_for_turns(&self.connection, turn_ids)
+            .await
+            .context(NativeFinalizationPhase::Scan)?;
+        let mut summary = self
+            .reconcile_finalization_candidates(page, event_timestamp_secs)
+            .await;
+        summary.pass_complete = true;
+        summary.pass_failed = !summary.failures.is_empty();
+        Ok(summary)
+    }
+
+    async fn reconcile_finalization_candidates(
+        &self,
+        page: Vec<turn_finalization::PreparedCursor>,
+        event_timestamp_secs: i64,
+    ) -> TurnFinalizationReconciliationSummary {
         let mut summary = TurnFinalizationReconciliationSummary::default();
         for candidate in page {
             summary.scanned = summary.scanned.saturating_add(1);
@@ -17127,15 +17201,7 @@ impl CrudStore {
                 Err(error) => summary.failures.push(std::sync::Arc::new(error)),
             }
         }
-        pass.failed |= !summary.failures.is_empty();
-        summary.pass_complete = complete;
-        summary.pass_failed = pass.failed;
-        if complete {
-            *pass = turn_finalization::PreparedPass::default();
-        } else {
-            pass.after = last;
-        }
-        Ok(summary)
+        summary
     }
 
     /// Atomically publishes the prepared final AgentMessage and immutable
@@ -21813,7 +21879,9 @@ impl CrudStore {
             "maintenance.html",
             "maintenance.native",
         ]
-        .map(|domain| self.connection.work_signal(domain).changing());
+        .map(|domain| {
+            self.control_work_change(domain, &[GatewayControlWake::Turn(request.turn_id.clone())])
+        });
         let maintenance_result = async {
             validate_turn_message_edit_shape(
                 request.input.as_slice(),
@@ -22057,7 +22125,9 @@ impl CrudStore {
             "maintenance.portable",
             "maintenance.native",
         ]
-        .map(|domain| self.connection.work_signal(domain).changing());
+        .map(|domain| {
+            self.control_work_change(domain, &[GatewayControlWake::Turn(request.turn_id.clone())])
+        });
         let maintenance_result = async {
             let changed_at = unix_to_datetime(request.changed_at_unix);
             let prepared_thread =
@@ -22662,7 +22732,7 @@ impl CrudStore {
         }
         let changes = [
             self.control_work_change("gateway.control", &control_wakes),
-            self.connection.work_signal("projection").changing(),
+            self.control_work_change("projection", &control_wakes),
             self.connection.work_signal("compaction").changing(),
         ];
         let result = async {
@@ -35200,6 +35270,7 @@ impl CrudStore {
                     || {
                         self.mark_turn_event_projection_pending_once(
                             appended_event.id.clone(),
+                            appended_event.turn_id.clone(),
                             claim_token.clone(),
                             event_timestamp_secs,
                         )
@@ -36503,11 +36574,15 @@ impl CrudStore {
     async fn mark_turn_event_projection_pending_once(
         &self,
         event_id: String,
+        turn_id: String,
         claim_token: String,
         deferred_at_unix: i64,
     ) -> Result<bool> {
         let projection_changes = [
-            self.connection.work_signal("projection").changing(),
+            self.connection
+                .work_signal("projection")
+                .changing()
+                .with_keys(&[format!("turn:{turn_id}")]),
             self.connection.work_signal("compaction").changing(),
         ];
         let projection_result = async {
@@ -36565,7 +36640,10 @@ impl CrudStore {
         force_exhausted: bool,
     ) -> Result<TurnEventProjectionFailureOutcome> {
         let projection_changes = [
-            self.connection.work_signal("projection").changing(),
+            self.connection
+                .work_signal("projection")
+                .changing()
+                .with_keys(&[format!("turn:{turn_id}")]),
             self.connection.work_signal("compaction").changing(),
         ];
         let projection_result = async {
@@ -36945,8 +37023,14 @@ impl CrudStore {
             .connection
             .work_signal("maintenance.receipts")
             .changing();
-        let changes = ["projection", "compaction", "maintenance.native"]
-            .map(|domain| self.connection.work_signal(domain).changing());
+        let changes = ["projection", "compaction", "maintenance.native"].map(|domain| {
+            let change = self.connection.work_signal(domain).changing();
+            if domain == "projection" {
+                change.with_keys(&[format!("turn:{turn_id}")])
+            } else {
+                change
+            }
+        });
         let task_change = crate::task_events::TaskWorkChange::new(&self.connection);
         let result = async {
         self.run_serialized_write(|| async {
@@ -37073,6 +37157,26 @@ impl CrudStore {
         now_unix: i64,
         limit: u64,
     ) -> Result<TurnProjectionReplaySummary> {
+        self.replay_turn_event_projection_frontier(now_unix, limit, None, now_unix)
+            .await
+    }
+
+    /// Advisory discovery is restricted to the captured invalidation frontier.
+    /// Claims, leases and publication use the current operation clock; only
+    /// candidate eligibility uses the fixed pass cutoff. Transactional guards
+    /// still revalidate ownership, stream health and predecessor ordering.
+    pub async fn replay_turn_event_projection_frontier(
+        &self,
+        now_unix: i64,
+        limit: u64,
+        turn_ids: Option<&[String]>,
+        eligible_before_unix: i64,
+    ) -> Result<TurnProjectionReplaySummary> {
+        anyhow::ensure!(
+            turn_ids.is_none_or(|ids| ids.len() <= 64),
+            "projection recovery frontier exceeds 64 Turns"
+        );
+        let eligible_before = unix_to_datetime(eligible_before_unix.min(now_unix));
         let now = unix_to_datetime(now_unix);
         let claim_expires_at =
             unix_to_datetime(now_unix.saturating_add(TURN_EVENT_PROJECTION_LEASE_SECS));
@@ -37083,13 +37187,18 @@ impl CrudStore {
         // each Turn. Refill after projecting those events so one healthy stream
         // can still use the replay budget without monopolizing the first batch.
         while remaining > 0 {
-            let page = turn_event_projection_state::discover(&self.connection, remaining).await?;
+            let page = turn_event_projection_state::discover_for_turns(
+                &self.connection,
+                remaining,
+                turn_ids,
+            )
+            .await?;
             summary.next_eligible_at_unix = page
                 .first()
                 .map(|(_, at)| crate::util::deadline_unix_seconds(*at));
             let candidates = page
                 .into_iter()
-                .filter(|(_, at)| *at <= now)
+                .filter(|(_, at)| *at <= eligible_before)
                 .map(|(id, _)| id)
                 .collect::<Vec<_>>();
             if candidates.is_empty() {
@@ -37233,6 +37342,7 @@ impl CrudStore {
                             .run_serialized_write(|| {
                                 self.mark_turn_event_projection_pending_once(
                                     event_id.clone(),
+                                    turn_id.clone(),
                                     claim_token.clone(),
                                     now_unix,
                                 )
@@ -37291,6 +37401,15 @@ impl CrudStore {
             remaining = remaining.saturating_sub(claimed_count);
         }
 
+        // A consumed budget is not EOF. Refresh the advisory head so completed
+        // events do not manufacture an immediate timer/full discovery.
+        if summary.claimed > 0 {
+            summary.next_eligible_at_unix =
+                turn_event_projection_state::discover_for_turns(&self.connection, 1, turn_ids)
+                    .await?
+                    .first()
+                    .map(|(_, at)| crate::util::deadline_unix_seconds(*at));
+        }
         Ok(summary)
     }
 
@@ -40240,6 +40359,8 @@ mod tests {
     mod finalization_wakes;
     #[path = "task_run_occurrence.rs"]
     mod occurrence_tracker;
+    #[path = "projection_recovery.rs"]
+    mod projection_recovery;
     #[path = "task_occurrence_reconcile.rs"]
     mod task_occurrence_tracker;
     use super::{

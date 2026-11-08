@@ -195,6 +195,23 @@ impl CrudStore {
         let change = self.connection.work_signal(domain).changing();
         if matches!(domain, "gateway.control" | "gateway.cli") {
             change.with_keys(&work.iter().map(GatewayControlWake::key).collect::<Vec<_>>())
+        } else if domain == "projection" {
+            let turns = work
+                .iter()
+                .filter_map(|wake| match wake {
+                    GatewayControlWake::Turn(id)
+                    | GatewayControlWake::Activity(id)
+                    | GatewayControlWake::CommandTurn(id) => Some(format!("turn:{id}")),
+                    _ => None,
+                })
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            if turns.is_empty() {
+                change
+            } else {
+                change.with_keys(&turns)
+            }
         } else {
             change
         }

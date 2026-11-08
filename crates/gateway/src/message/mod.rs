@@ -27,6 +27,7 @@ mod native_health;
 mod notifications;
 mod patch_history_handlers;
 mod permission_handlers;
+mod projection_work;
 mod provider_handlers;
 mod provider_readiness;
 mod reconciliation_diagnostics;
@@ -2638,34 +2639,52 @@ impl MessageProcessor {
         let database = owner.crud_store.database_connection().maintenance();
         let mut changes = database.work_signal("projection").subscribe();
         drop(owner);
-        let mut begin = true;
+        let mut work = projection_work::ProjectionWork::default();
         loop {
             let Some(this) = processor.upgrade() else {
                 break;
             };
             let this = this.for_background_reconciliation();
             let mut failed = false;
-            let mut deadline = None;
+            let mut replay_deadline = None;
             let cycle = AssertUnwindSafe(async {
-                if begin {
-                    if let Err(error) = changes.begin_pass(&database).await {
-                        error!(error = %error, "projection invalidation failed");
-                        failed = true;
-                        return;
+                if work.is_complete() {
+                    match changes.begin_keyed_pass(&database).await {
+                        Ok(keys) => work.begin(keys, now_timestamp_secs()),
+                        Err(error) => {
+                            error!(error = %error, "projection invalidation failed");
+                            failed = true;
+                            return;
+                        }
                     }
-                    begin = false;
                 }
+                let Some(scope) = work.current() else {
+                    // Delivery ACK/claim changes still wake the existing delivery
+                    // owners, without re-running projection/finalization discovery.
+                    this.kick_native_turn_event_deliveries();
+                    return;
+                };
                 let now = now_timestamp_secs();
-                let replay = crate::database::attribution::scope_database_workload_result(
-                    pioneer_observability::DatabaseWorkload::ProjectionRecovery,
-                    pioneer_observability::DatabaseOperationSite::ProjectionReplay,
-                    retry_transient_storage_access(|| {
-                        this.crud_store.replay_due_turn_event_projections(now, 64)
-                    }),
-                )
-                .await;
+                let cutoff = work.cutoff;
+                let replay = if scope.replay {
+                    crate::database::attribution::scope_database_workload_result(
+                        pioneer_observability::DatabaseWorkload::ProjectionRecovery,
+                        pioneer_observability::DatabaseOperationSite::ProjectionReplay,
+                        retry_transient_storage_access(|| {
+                            this.crud_store.replay_turn_event_projection_frontier(
+                                now,
+                                64,
+                                scope.turns.as_deref(),
+                                cutoff,
+                            )
+                        }),
+                    )
+                    .await
+                } else {
+                    Ok(pioneer_crud::TurnProjectionReplaySummary::default())
+                };
                 match &replay {
-                    Ok(summary) => deadline = summary.next_eligible_at_unix,
+                    Ok(summary) => replay_deadline = summary.next_eligible_at_unix,
                     Err(_) => failed = true,
                 }
                 match replay {
@@ -2689,25 +2708,34 @@ impl MessageProcessor {
                     ),
                 }
 
-                let result = crate::database::attribution::scope_database_workload_result(
-                    pioneer_observability::DatabaseWorkload::FinalizationRecovery,
-                    pioneer_observability::DatabaseOperationSite::PreparedFinalizationReconcile,
-                    retry_transient_storage_access(|| {
-                        this.reconcile_prepared_native_turn_finalizations(now, 64)
-                    }),
-                )
-                .await;
+                let result = if scope.finalization {
+                    crate::database::attribution::scope_database_workload_result(
+                        pioneer_observability::DatabaseWorkload::FinalizationRecovery,
+                        pioneer_observability::DatabaseOperationSite::PreparedFinalizationReconcile,
+                        retry_transient_storage_access(|| {
+                            this.reconcile_prepared_native_turn_finalizations_scoped(
+                                now,
+                                64,
+                                scope.turns.as_deref(),
+                            )
+                        }),
+                    )
+                    .await
+                } else {
+                    Ok(pioneer_crud::TurnFinalizationReconciliationSummary {
+                        pass_complete: true,
+                        ..Default::default()
+                    })
+                };
                 finalization_reporting.observe_finalizations(&result, Instant::now());
                 match result {
                     Ok(summary) => {
                         failed |= summary.pass_failed || !summary.failures.is_empty();
-                        // Retain source invalidations across the whole finite
-                        // cursor pass. Only EOF starts a new acknowledgement;
-                        // a commit behind the cursor then causes a fresh pass.
-                        if !summary.pass_complete {
-                            deadline = Some(0);
+                        // A full page is continuation, not EOF. Keep the same
+                        // invalidation frontier until both domain passes finish.
+                        if !failed {
+                            work.advance(replay_deadline, summary.pass_complete);
                         }
-                        begin = summary.pass_complete;
                         let committed = summary.committed_count();
                         if committed > 0 {
                             info!(
@@ -2752,9 +2780,10 @@ impl MessageProcessor {
             }
             drop(this);
             if failed || cycle.is_err() {
+                work.retry();
                 sleep(Duration::from_secs(RESILIENCE_WORKER_POLL_INTERVAL_SECONDS)).await;
             } else {
-                changes.wait(deadline).await;
+                work.wait(&mut changes).await;
             }
             tokio::task::yield_now().await;
         }

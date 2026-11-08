@@ -1242,6 +1242,8 @@ async fn apply_prepared_payload_rows(
 /// capture and replay, including tiny fixtures below dictionary-training size.
 #[cfg(test)]
 pub(crate) async fn compress_history_payloads_for_test(store: &CrudStore) -> Result<u64> {
+    use sea_orm::DbBackend;
+
     let db = store.with_maintenance_access().database_connection();
     let mut total = 0;
     for &config in ZSTD_PAYLOAD_COLUMNS {

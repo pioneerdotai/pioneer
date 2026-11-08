@@ -8330,10 +8330,28 @@ impl MessageProcessor {
         now_unix: i64,
         limit: u64,
     ) -> Result<TurnFinalizationReconciliationSummary> {
-        let mut summary = self
-            .crud_store
-            .reconcile_prepared_turn_finalizations(limit, now_unix)
-            .await?;
+        self.reconcile_prepared_native_turn_finalizations_scoped(now_unix, limit, None)
+            .await
+    }
+
+    pub(super) async fn reconcile_prepared_native_turn_finalizations_scoped(
+        &self,
+        now_unix: i64,
+        limit: u64,
+        turns: Option<&[String]>,
+    ) -> Result<TurnFinalizationReconciliationSummary> {
+        let mut summary = match turns {
+            Some(turns) => {
+                self.crud_store
+                    .reconcile_prepared_turn_finalizations_for_turns(turns, now_unix)
+                    .await?
+            }
+            None => {
+                self.crud_store
+                    .reconcile_prepared_turn_finalizations(limit, now_unix)
+                    .await?
+            }
+        };
         for committed in &summary.committed {
             if !committed.already_committed {
                 self.recover_completed_turn_title(
