@@ -181,6 +181,7 @@ impl crate::CrudStore {
 /// repeated finalization or an item-only event.
 pub(crate) struct TaskTurnChange {
     change: pioneer_sqlite::WorkChange,
+    portable: pioneer_sqlite::WorkChange,
     before: Vec<(String, TurnDependencyFacts)>,
 }
 impl TaskTurnChange {
@@ -189,6 +190,7 @@ impl TaskTurnChange {
         ids: Vec<String>,
     ) -> anyhow::Result<Self> {
         let change = database.work_signal("tasks.lifecycle").changing();
+        let portable = database.work_signal("maintenance.portable").changing();
         let mut ids = ids;
         ids.sort();
         ids.dedup();
@@ -196,17 +198,34 @@ impl TaskTurnChange {
         for id in ids {
             before.push((id.clone(), turn_dependency_facts(database, &id).await?));
         }
-        Ok(Self { change, before })
+        Ok(Self {
+            change,
+            portable,
+            before,
+        })
     }
     pub(crate) async fn completed(
         self,
         database: &pioneer_sqlite::SqliteDatabase,
     ) -> anyhow::Result<()> {
         let mut changed = false;
+        let mut terminal_turns = Vec::new();
         for (id, before) in self.before {
-            changed |= before != turn_dependency_facts(database, &id).await?;
+            let after = turn_dependency_facts(database, &id).await?;
+            if before.turn != after.turn
+                && after.turn.as_ref().is_some_and(|(_, status, _)| {
+                    matches!(
+                        status.as_str(),
+                        "completed" | "failed" | "interrupted" | "blocked"
+                    )
+                })
+            {
+                terminal_turns.push(id);
+            }
+            changed |= before != after;
         }
         self.change.completed(changed);
+        self.portable.completed_keys(&terminal_turns);
         Ok(())
     }
 }

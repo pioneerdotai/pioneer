@@ -223,7 +223,7 @@ pub async fn discover<C: ConnectionTrait>(
         .order_by_asc(eligible_clock())
         .order_by_asc(turn_event_delivery::Column::TurnId)
         .order_by_asc(turn_event_delivery::Column::Sequence)
-        .limit(limit.min(DELIVERY_BATCH_LIMIT as u64))
+        .limit(std::cmp::min(limit, DELIVERY_BATCH_LIMIT as u64))
         .into_tuple::<(String, DateTimeWithTimeZone)>()
         .all(db)
         .await
@@ -370,9 +370,10 @@ pub async fn settle_batch<C: ConnectionTrait>(
                 error,
             } => {
                 let exhausted = attempt_count.saturating_add(1) >= 10;
-                let delay = 2_i64
-                    .saturating_pow(u32::try_from((*attempt_count).clamp(0, 8)).unwrap_or(8))
-                    .min(300);
+                let delay = std::cmp::min(
+                    2_i64.saturating_pow(u32::try_from((*attempt_count).clamp(0, 8)).unwrap_or(8)),
+                    300,
+                );
                 (
                     if exhausted {
                         DELIVERY_STATUS_EXHAUSTED

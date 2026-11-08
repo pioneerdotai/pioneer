@@ -321,7 +321,8 @@ async fn pending_upper(store: &CrudStore, family: Family) -> Result<Option<Pendi
                     .column_as(key, "owner")
                     .filter(reference.is_null())
                     .filter(field.is_not_null())
-                    .filter(pending_locator_condition(family));
+                    .filter(pending_locator_condition(family))
+                    .filter(Expr::cust(terminal_admission_sql(family)));
                 query = query.order_by_desc(key);
                 Ok(query
                     .limit(1)
@@ -357,7 +358,8 @@ async fn pending_sources(
                     )
                     .filter(reference.is_null())
                     .filter(field.is_not_null())
-                    .filter(pending_locator_condition(family));
+                    .filter(pending_locator_condition(family))
+                    .filter(Expr::cust(terminal_admission_sql(family)));
                 if let Some(after) = after {
                     query = query.filter(key.gt(after));
                 }
@@ -594,7 +596,42 @@ impl PortablePayloadProgress {
 }
 impl Preparation {
     async fn step(&mut self, store: &CrudStore) -> Result<bool> {
+        let owner = &self.owner;
+        let revision = self.revision;
+        let identity = &self.identity;
+        let stamp = &self.owner_stamp;
         let prepared = &mut self.prepared;
+        // Source reads carry this guard themselves. Staging/finalization steps
+        // also revalidate before work: a resumed Turn/Run must not keep paying
+        // for a preparation admitted while it was terminal. No DB lease spans
+        // codec work; publication independently repeats the full predicate.
+        if !prepared.installed || !prepared.blocks.is_empty() || self.offset >= self.size {
+            let family = self.family;
+            let current = store
+                .run_background_database_quantum(|| async {
+                    target!(family, |Target, Col, key, _field, reference| {
+                        Ok(Target::find()
+                            .select_only()
+                            .column(key)
+                            .filter(key.eq(owner))
+                            .filter(Col::PortableRevision.eq(revision))
+                            .filter(Col::PortableIdentity.eq(identity))
+                            .filter(reference.is_null())
+                            .filter(Expr::cust(owner_stamp_sql(family)).eq(stamp))
+                            .filter(Expr::cust(eligibility_sql(family)))
+                            .into_tuple::<String>()
+                            .one(&store.connection)
+                            .await?
+                            .is_some())
+                    })
+                })
+                .await?;
+            if !current {
+                observe::outcome(observe::Outcome::Stale);
+                return Ok(true);
+            }
+        }
+
         if !prepared.installed {
             ensure!(
                 prepared._read_hold.is_some(),
@@ -697,6 +734,7 @@ impl Preparation {
                     )
                     .filter(Col::PortableIdentity.eq(source_identity))
                     .filter(Expr::cust(owner_stamp_sql(family)).eq(source_stamp))
+                    .filter(Expr::cust(eligibility_sql(family)))
                     .limit(1)
                     .build(DbBackend::Sqlite)
             });
@@ -1638,6 +1676,26 @@ fn invalid_root_sql(family: Family) -> String {
     )
 }
 
+// Optional archival work is tied to the concrete execution, never to whether
+// a reusable CLI process or recurring Task happens to remain alive. These
+// indexed relational guards are shared by discovery, source reads and publish.
+fn terminal_admission_sql(family: Family) -> &'static str {
+    match family {
+        Family::ToolText | Family::ToolMetadata => {
+            "EXISTS(SELECT 1 FROM turn t WHERE t.id=tool_output_chunk.turn_id AND t.status IN ('completed','failed','interrupted','blocked'))"
+        }
+        Family::CliMapping => {
+            "EXISTS(SELECT 1 FROM turn t WHERE t.id=turn_cli_runtime_binding.turn_id AND t.status IN ('completed','failed','interrupted','blocked'))"
+        }
+        Family::TaskHistory => {
+            "EXISTS(SELECT 1 FROM task_run r WHERE r.id=task_run_conversation_snapshot.run_id AND r.task_id=task_run_conversation_snapshot.task_id AND r.status IN ('succeeded','failed','blocked','cancelled','timed_out')) AND (source_turn_id IS NULL OR EXISTS(SELECT 1 FROM turn t WHERE t.id=task_run_conversation_snapshot.source_turn_id AND t.status IN ('completed','failed','interrupted','blocked')))"
+        }
+        Family::TaskEvent => {
+            "(turn_id IS NULL OR EXISTS(SELECT 1 FROM turn et WHERE et.id=task_event.turn_id AND et.status IN ('completed','failed','interrupted','blocked'))) AND ((run_id IS NOT NULL AND EXISTS(SELECT 1 FROM task_run r WHERE r.id=task_event.run_id AND r.task_id=task_event.task_id AND r.status IN ('succeeded','failed','blocked','cancelled','timed_out'))) OR (run_id IS NULL AND NOT EXISTS(SELECT 1 FROM task_run r WHERE r.task_id=task_event.task_id AND r.status NOT IN ('succeeded','failed','blocked','cancelled','timed_out')) AND NOT EXISTS(SELECT 1 FROM task owner JOIN turn creator ON creator.id=owner.created_by_turn_id WHERE owner.id=task_event.task_id AND creator.status NOT IN ('completed','failed','interrupted','blocked'))))"
+        }
+    }
+}
+
 // Correlated ownership/root predicates are shared by bounded discovery and
 // atomic publication. SeaORM has no typed relation for all these heterogeneous
 // owners; keep the existing correlated SQL expressions on the Entity path.
@@ -1667,9 +1725,10 @@ fn eligibility_sql(family: Family) -> String {
         String::new()
     };
     format!(
-        "({}){}",
+        "({}){} AND ({})",
         owner_guard.trim_start_matches(" AND "),
-        root_guard
+        root_guard,
+        terminal_admission_sql(family)
     )
 }
 
@@ -1802,10 +1861,10 @@ async fn clear_blocks(store: &CrudStore, id: &str) -> Result<bool> {
 fn owner_stamp_sql(family: Family) -> &'static str {
     match family {
         Family::ToolText | Family::ToolMetadata => {
-            "coalesce((SELECT json_array(th.workspace_id,t.thread_id) FROM turn t JOIN thread th ON th.id=t.thread_id WHERE t.id=tool_output_chunk.turn_id),'')"
+            "coalesce((SELECT json_array(th.workspace_id,t.thread_id,t.status) FROM turn t JOIN thread th ON th.id=t.thread_id WHERE t.id=tool_output_chunk.turn_id),'')"
         }
         Family::CliMapping => {
-            "coalesce((SELECT json_array(th.workspace_id,t.thread_id,(SELECT json_array(h.workspace_id,h.owner_thread,h.identity_sha256,h.message_count,h.import_count,h.imports_sha256,h.expired,h.ready,h.next_ordinal,h.next_import) FROM compaction_frozen_history h WHERE h.id=turn_cli_runtime_binding.frozen_manifest_id)) FROM turn t JOIN thread th ON th.id=t.thread_id WHERE t.id=turn_cli_runtime_binding.turn_id),'')"
+            "coalesce((SELECT json_array(th.workspace_id,t.thread_id,t.status,(SELECT json_array(h.workspace_id,h.owner_thread,h.identity_sha256,h.message_count,h.import_count,h.imports_sha256,h.expired,h.ready,h.next_ordinal,h.next_import) FROM compaction_frozen_history h WHERE h.id=turn_cli_runtime_binding.frozen_manifest_id)) FROM turn t JOIN thread th ON th.id=t.thread_id WHERE t.id=turn_cli_runtime_binding.turn_id),'')"
         }
         Family::TaskHistory => {
             "coalesce((SELECT json_array(t.workspace_id,t.owner_kind,t.owner_id,t.status,t.updated_at,(SELECT json_array(h.workspace_id,h.owner_thread,h.identity_sha256,h.message_count,h.import_count,h.imports_sha256,h.expired,h.ready,h.next_ordinal,h.next_import) FROM compaction_frozen_history h WHERE h.id=task_run_conversation_snapshot.frozen_manifest_id)) FROM task t WHERE t.id=task_run_conversation_snapshot.task_id),'')"
@@ -3191,5 +3250,270 @@ mod tests {
             foreign_block
         );
         drop(foreign_hold);
+    }
+    async fn finish_archive_pass(progress: &mut PortablePayloadProgress, store: &CrudStore) {
+        for _ in 0..500 {
+            if !progress.quantum(store).await.unwrap() {
+                return;
+            }
+        }
+        panic!("bounded archival pass did not reach EOF");
+    }
+
+    async fn archive_family_refs(store: &CrudStore) -> Vec<Option<String>> {
+        use pioneer_entity::{
+            task_event as event, task_run_conversation_snapshot as snapshot,
+            tool_output_chunk as chunk, turn_cli_runtime_binding as mapping,
+        };
+        let tool = chunk::Entity::find()
+            .filter(chunk::Column::Id.eq("active-output"))
+            .one(&store.connection)
+            .await
+            .unwrap()
+            .unwrap();
+        let cli = mapping::Entity::find_by_id("turn")
+            .one(&store.connection)
+            .await
+            .unwrap()
+            .unwrap();
+        let history = snapshot::Entity::find_by_id("active-run")
+            .one(&store.connection)
+            .await
+            .unwrap()
+            .unwrap();
+        let events = event::Entity::find()
+            .filter(event::Column::TaskId.eq("active-task"))
+            .order_by_asc(event::Column::Sequence)
+            .all(&store.connection)
+            .await
+            .unwrap();
+        let mut refs = vec![
+            tool.text_payload_id,
+            tool.metadata_payload_id,
+            cli.input_mapping_json_payload_id,
+            history.history_json_payload_id,
+        ];
+        refs.extend(
+            events
+                .into_iter()
+                .map(|event| event.payload_json_payload_id),
+        );
+        refs
+    }
+
+    #[tokio::test]
+    async fn every_archive_family_waits_for_its_turn_and_run_then_revisits_old_keys() {
+        use sea_orm::{PaginatorTrait, Statement};
+        for (turn_status, run_status) in [
+            ("completed", "succeeded"),
+            ("failed", "failed"),
+            ("interrupted", "cancelled"),
+            ("blocked", "blocked"),
+            ("failed", "timed_out"),
+        ] {
+            let (_dir, store) = reservation_fixture().await;
+            store
+                .connection
+                .execute_unprepared("UPDATE turn SET status='in_progress' WHERE id='turn'")
+                .await
+                .unwrap();
+            store
+                .record_tool_output(
+                    "active-output",
+                    &pioneer_protocol::ItemDeltaNotification {
+                        workspace_id: "ws".into(),
+                        thread_id: "thread".into(),
+                        turn_id: "turn".into(),
+                        item_id: "item".into(),
+                        delta: "live output ".repeat(400),
+                        stream: None,
+                        payload: Some(serde_json::json!({"live":true})),
+                        markdown: None,
+                        markdown_version: None,
+                    },
+                )
+                .await
+                .unwrap();
+            for sql in [
+                "INSERT INTO turn_cli_runtime_binding(turn_id,thread_id,continuation_thread_id,workspace_id,runtime_id,runtime_kind,native_thread_id,status,input_mapping_json,created_at,updated_at) VALUES('turn','thread','thread','ws','codex','codex','native','running','{}',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+                "INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,created_by_turn_id,executor_kind,status,title,goal) VALUES('active-task','ws','thread','thread','thread','turn','agent','running','fixture','fixture')",
+                "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES('active-run','active-task','active-run',1,1,'running','agent')",
+                "INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at) VALUES('active-run','active-task','ws','thread','turn','[]',CURRENT_TIMESTAMP)",
+                "INSERT INTO task_event(id,task_id,run_id,thread_id,turn_id,sequence,event_type,payload_json,created_at) VALUES('run-event','active-task','active-run','thread','turn',1,'fixture','{}',CURRENT_TIMESTAMP)",
+                "INSERT INTO task_event(id,task_id,sequence,event_type,payload_json,created_at) VALUES('task-event','active-task',2,'fixture','{}',CURRENT_TIMESTAMP)",
+            ] {
+                store.connection.execute_unprepared(sql).await.unwrap();
+            }
+            let mut progress = PortablePayloadProgress::default();
+            finish_archive_pass(&mut progress, &store).await;
+            assert_eq!(archive_family_refs(&store).await, vec![None; 6]);
+            assert_eq!(
+                value::Entity::find()
+                    .count(&store.connection)
+                    .await
+                    .unwrap(),
+                0,
+                "active work must not even stage an archival header"
+            );
+            store
+                .connection
+                .execute_raw(Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    "UPDATE turn SET status=? WHERE id='turn'",
+                    [turn_status.into()],
+                ))
+                .await
+                .unwrap();
+            // Tool text/metadata and CLI mapping are now independently eligible;
+            // the Run and task-level events still have an active execution.
+            finish_archive_pass(&mut progress, &store).await;
+            let refs = archive_family_refs(&store).await;
+            assert!(refs[..3].iter().all(Option::is_some));
+            assert!(refs[3..].iter().all(Option::is_none));
+            store
+                .connection
+                .execute_raw(Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    "UPDATE task_run SET status=? WHERE id='active-run'",
+                    [run_status.into()],
+                ))
+                .await
+                .unwrap();
+            // The reusable Task remains running, as for a recurring Task.
+            finish_archive_pass(&mut progress, &store).await;
+            assert!(
+                archive_family_refs(&store)
+                    .await
+                    .iter()
+                    .all(Option::is_some)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn resumed_turn_discards_preparation_before_reading_and_before_publish() {
+        use pioneer_entity::tool_output_chunk as chunk;
+        for finalized in [false, true] {
+            let (_dir, store) = reservation_fixture().await;
+            let text = "archive only after completion ".repeat(4000);
+            store
+                .record_tool_output(
+                    "resume-output",
+                    &pioneer_protocol::ItemDeltaNotification {
+                        workspace_id: "ws".into(),
+                        thread_id: "thread".into(),
+                        turn_id: "turn".into(),
+                        item_id: "item".into(),
+                        delta: text.clone(),
+                        stream: None,
+                        payload: None,
+                        markdown: None,
+                        markdown_version: None,
+                    },
+                )
+                .await
+                .unwrap();
+            let mut progress = PortablePayloadProgress::default();
+            pending_preparation(&mut progress, &store).await;
+            let mut pending = progress.pending.take().unwrap();
+            if finalized {
+                for _ in 0..50 {
+                    if pending.prepared.finalized {
+                        break;
+                    }
+                    assert!(!pending.step(&store).await.unwrap());
+                }
+                assert!(pending.prepared.finalized);
+            }
+            store
+                .connection
+                .execute_unprepared("UPDATE turn SET status='in_progress' WHERE id='turn'")
+                .await
+                .unwrap();
+            assert!(pending.step(&store).await.unwrap());
+            drop(pending);
+            let row = chunk::Entity::find()
+                .filter(chunk::Column::Id.eq("resume-output"))
+                .one(&store.connection)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(row.text_payload_id.is_none());
+            assert_eq!(row.text, text);
+            store
+                .connection
+                .execute_unprepared("UPDATE turn SET status='interrupted' WHERE id='turn'")
+                .await
+                .unwrap();
+            finish_archive_pass(&mut progress, &store).await;
+            let row = chunk::Entity::find()
+                .filter(chunk::Column::Id.eq("resume-output"))
+                .one(&store.connection)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(row.text_payload_id.is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn active_output_is_quiet_and_terminal_commit_wakes_archive_without_new_payload() {
+        use futures_util::FutureExt;
+        let (_dir, store) = reservation_fixture().await;
+        store
+            .connection
+            .execute_unprepared("UPDATE turn SET status='in_progress' WHERE id='turn'")
+            .await
+            .unwrap();
+        let database = store.database_connection();
+        let mut wake = database.work_signal("maintenance.portable").subscribe();
+        wake.begin_pass(&database).await.unwrap();
+        store
+            .record_tool_output(
+                "wake-output",
+                &pioneer_protocol::ItemDeltaNotification {
+                    workspace_id: "ws".into(),
+                    thread_id: "thread".into(),
+                    turn_id: "turn".into(),
+                    item_id: "item".into(),
+                    delta: "source remains readable".into(),
+                    stream: None,
+                    payload: None,
+                    markdown: None,
+                    markdown_version: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            wake.wait(None).now_or_never().is_none(),
+            "active output must not wake the archive worker"
+        );
+        let (_, mut turn) = store.get_turn("thread", "turn").await.unwrap().unwrap();
+        turn.status = pioneer_protocol::TurnStatus::Completed;
+        store
+            .materialize_turn_completed(
+                pioneer_protocol::TurnCompletedNotification {
+                    workspace_id: "ws".into(),
+                    thread_id: "thread".into(),
+                    turn,
+                },
+                1_700_000_100,
+            )
+            .await
+            .unwrap();
+        assert!(
+            wake.wait(None).now_or_never().is_some(),
+            "canonical terminal commit must release deferred archival work"
+        );
+        let mut progress = PortablePayloadProgress::default();
+        finish_archive_pass(&mut progress, &store).await;
+        let row = pioneer_entity::tool_output_chunk::Entity::find()
+            .filter(pioneer_entity::tool_output_chunk::Column::Id.eq("wake-output"))
+            .one(&store.connection)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(row.text_payload_id.is_some());
     }
 }
