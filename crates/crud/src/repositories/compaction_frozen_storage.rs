@@ -503,7 +503,17 @@ async fn publish(
     .await;
     if result.is_ok() {
         // Only activation without remaining cleanup releases lifetime protection.
-        frozen_change.completed(published && (h.ready == 0 || l.copy_to.unwrap_or(prefix) == 0));
+        let keys = Some(
+            std::iter::once(h.id.clone())
+                .chain(l.candidate.iter().cloned())
+                .map(|id| format!("m:{id}"))
+                .collect::<Vec<_>>(),
+        );
+        crate::frozen_lifetime::complete_keys(
+            frozen_change,
+            &keys,
+            published && (h.ready == 0 || l.copy_to.unwrap_or(prefix) == 0),
+        );
         for change in changes {
             change.completed(published);
         }
@@ -730,6 +740,11 @@ pub(crate) async fn maintain(
     use sea_orm::QueryTrait;
     for kind in [0, 1] {
         let pending = layout::Entity::find()
+            .filter(match progress.target_manifests() {
+                Some(ids) => sea_orm::Condition::all()
+                    .add(layout::Column::ManifestId.is_in(ids.iter().cloned())),
+                None => sea_orm::Condition::all(),
+            })
             .filter(layout::Column::ManifestId.gte(&progress.conversion_after[kind as usize]))
             .filter(
                 layout::Column::ManifestId
@@ -795,6 +810,12 @@ pub(crate) async fn maintain(
         }
     }
     let h = history::Entity::find()
+        .filter(match progress.target_manifests() {
+            Some(ids) => {
+                sea_orm::Condition::all().add(history::Column::Id.is_in(ids.iter().cloned()))
+            }
+            None => sea_orm::Condition::all(),
+        })
         .filter(history::Column::Id.gt(&progress.conversion_register_after))
         .filter(history::Column::Id.lte(progress.conversion_upper.as_deref().unwrap_or_default()))
         .filter(history::Column::Ready.eq(1))
@@ -1000,8 +1021,17 @@ async fn maintain_layout(
             .exec(&tx)
             .await?;
         tx.commit().await?;
-        frozen_change
-            .completed(changed.rows_affected > 0 && current.pending != 0 && end >= l.cleanup_to);
+        let keys = Some(
+            std::iter::once(h.id.clone())
+                .chain(l.candidate.iter().cloned())
+                .map(|id| format!("m:{id}"))
+                .collect::<Vec<_>>(),
+        );
+        crate::frozen_lifetime::complete_keys(
+            frozen_change,
+            &keys,
+            changed.rows_affected > 0 && current.pending != 0 && end >= l.cleanup_to,
+        );
         return Ok(deleted);
     }
     Ok(None)

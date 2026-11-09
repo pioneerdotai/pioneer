@@ -20,11 +20,12 @@ use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-const HOST_BUNDLE_ID: &str = if cfg!(debug_assertions) {
-    pioneer_config::DEV_GATEWAY_BUNDLE_ID
-} else {
-    "ai.pioneer.gateway"
-};
+fn host_bundle_id() -> &'static str {
+    match pioneer_config::RuntimeEnvironment::current() {
+        pioneer_config::RuntimeEnvironment::Development => pioneer_config::DEV_GATEWAY_BUNDLE_ID,
+        pioneer_config::RuntimeEnvironment::Production => "ai.pioneer.gateway",
+    }
+}
 const MAX_OWNERS: usize = 32;
 const QUEUE_CAPACITY: usize = 16;
 const CALL_DEADLINE: Duration = Duration::from_secs(120);
@@ -482,7 +483,7 @@ impl Worker {
             .map_err(|_| unavailable("cannot create owned daemon client"))?;
         let host = EmbeddedCuaDriverHost::with_options(EmbeddedDriverHostOptions {
             binary_path: binary.to_string_lossy().into_owned(),
-            host_bundle_id: HOST_BUNDLE_ID.to_owned(),
+            host_bundle_id: host_bundle_id().to_owned(),
             socket_path: Some(endpoint),
             startup_timeout_ms: Some(10_000),
             shutdown_timeout_ms: Some(2_000),
@@ -681,7 +682,7 @@ fn verify_packaged_driver(executable_dir: &Path, binary: &Path) -> Result<(), To
         || manifest["target"].as_str() != Some(packaged_target()?)
         || manifest["daemon"].as_str() != Some(relative.as_str())
         || (cfg!(debug_assertions)
-            && manifest["gateway_bundle_identifier"].as_str() != Some(HOST_BUNDLE_ID))
+            && manifest["gateway_bundle_identifier"].as_str() != Some(host_bundle_id()))
     {
         return Err(unavailable(
             "Gateway CUA payload identity or layout is invalid",
@@ -768,7 +769,7 @@ async fn verify_identity(driver: &Arc<CuaDriver>) -> Result<(), ToolError> {
                     checks.iter().any(|check| {
                         check["name"] == "bundle_identity"
                             && check["status"] == "pass"
-                            && check["data"]["bundle_identifier"] == HOST_BUNDLE_ID
+                            && check["data"]["bundle_identifier"] == host_bundle_id()
                             && check["data"]["identity_source"] == "parent_application"
                             && check["data"]["parent_process_id"].as_u64()
                                 == Some(u64::from(std::process::id()))

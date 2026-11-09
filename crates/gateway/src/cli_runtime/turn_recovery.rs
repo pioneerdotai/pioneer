@@ -102,7 +102,7 @@ pub(crate) async fn scan_cli_runtime_turn_recovery(
     limit: u64,
 ) -> Result<Vec<CLIAgentRuntimeTurnRecoveryPlan>> {
     let bindings = store
-        .list_cli_runtime_turn_bindings(CliRuntimeTurnBindingListFilter {
+        .list_cli_runtime_turn_binding_controls(CliRuntimeTurnBindingListFilter {
             statuses: vec![
                 CLI_RUNTIME_TURN_STATUS_STARTING.to_owned(),
                 CLI_RUNTIME_TURN_STATUS_RUNNING.to_owned(),

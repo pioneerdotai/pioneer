@@ -904,7 +904,7 @@ async fn generated_sweep_entities_preserve_defaults_conflicts_and_null_cursor_de
     let revision = work(&store, "source", 0).await.revision;
     let mut finished = false;
     for _ in 0..32 {
-        frozen_sweep_work::fanout_step(&store).await.unwrap();
+        frozen_sweep_work::fanout_step(&store, None).await.unwrap();
         let cursor = consumer::Entity::find_by_id(initial.consumer_row)
             .one(&store.connection)
             .await
@@ -1045,7 +1045,7 @@ async fn fanout_ack_reopens_blocked_visit_without_another_work_revision() {
         // final one; the remaining consumer ACK only removes its fence.
         while frozen_sweep_work::bootstrap_step(&store).await.unwrap() {}
         for _ in 0..100 {
-            assert!(frozen_sweep_work::fanout_step(&store).await.unwrap());
+            assert!(frozen_sweep_work::fanout_step(&store, None).await.unwrap());
             if query(&store, "SELECT count(*) AS n FROM compaction_frozen_sweep_consumer WHERE manifest_id='ack-consumer' AND pending=1 AND after_source='batch-physical'").await == 1 { break; }
         }
         assert_eq!(query(&store, "SELECT count(*) AS n FROM compaction_frozen_sweep_consumer WHERE manifest_id='ack-consumer' AND pending=1 AND after_source='batch-physical'").await, 1);

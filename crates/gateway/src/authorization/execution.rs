@@ -1893,6 +1893,62 @@ impl ExecutionAuthorizationContext {
         })
     }
 
+    /// Validate a finite page's authority envelopes without reparsing or
+    /// revalidating shared ancestors for each card. The existing durable
+    /// verifier remains authoritative; missing ancestors and cycles still fail.
+    pub(crate) fn load_for_turns<'a>(
+        store: &'a CrudStore,
+        initial: std::collections::HashMap<String, String>,
+    ) -> BoxFuture<'a, Result<std::collections::HashMap<String, Self>>> {
+        Box::pin(async move {
+            let requested = initial.keys().cloned().collect::<BTreeSet<_>>();
+            let mut pending = initial;
+            let mut contexts = std::collections::HashMap::new();
+            let mut parents = std::collections::HashMap::new();
+            while !pending.is_empty() {
+                let mut next = BTreeSet::new();
+                for (id, encoded) in pending {
+                    let context = Self::from_persisted_json(&encoded).with_context(|| {
+                        format!("turn `{id}` has an invalid authority envelope")
+                    })?;
+                    let parent = context.verify_durable_turn_binding(store, &id).await?;
+                    if let Some(parent) = &parent {
+                        next.insert(parent.clone());
+                    }
+                    contexts.insert(id.clone(), context);
+                    parents.insert(id, parent);
+                }
+                let next = next
+                    .into_iter()
+                    .filter(|id| !contexts.contains_key(id))
+                    .collect::<Vec<_>>();
+                pending = store
+                    .get_turn_execution_authorization_contexts(&next)
+                    .await?;
+                anyhow::ensure!(
+                    pending.len() == next.len(),
+                    "execution Turn ancestor has no durable authority envelope"
+                );
+            }
+            for id in &requested {
+                let mut visited = BTreeSet::new();
+                let mut current = id.as_str();
+                loop {
+                    anyhow::ensure!(
+                        visited.insert(current),
+                        "execution Turn lineage contains a cycle"
+                    );
+                    match &parents[current] {
+                        Some(parent) => current = parent,
+                        None => break,
+                    }
+                }
+            }
+            contexts.retain(|id, _| requested.contains(id));
+            Ok(contexts)
+        })
+    }
+
     async fn verify_durable_turn_binding(
         &self,
         store: &CrudStore,

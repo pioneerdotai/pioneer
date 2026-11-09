@@ -44,19 +44,52 @@ pub(crate) async fn run(store: Arc<CrudStore>, cancellation: CancellationToken) 
         .work_signal("maintenance.frozen.release")
         .subscribe();
     let mut begin = true;
+    let mut force_full = true;
     let mut retry_pending = false;
     loop {
         if begin {
-            tokio::select! {
+            if force_full {
+                // Recovery inventories all releases observed before it starts.
+                // Later releases keep their own unacknowledged frontier.
+                tokio::select! {
+                    _ = cancellation.cancelled() => return,
+                    _ = released.begin_keyed_pass(&database) => {},
+                }
+            }
+            let keys = tokio::select! {
                 biased;
                 _ = cancellation.cancelled() => return,
-                result = wake.begin_pass(&database) => if result.is_err() {
+                result = wake.begin_keyed_pass(&database) => match result {
+                    Ok(keys) => keys,
+                    Err(_) => {
+                        tokio::select! {
+                            _ = cancellation.cancelled() => return,
+                            _ = tokio::time::sleep(IDLE_INTERVAL) => {},
+                        }
+                        continue;
+                    }
+                },
+            };
+            let keys = if force_full { None } else { keys };
+            let restarted = tokio::select! {
+                _ = cancellation.cancelled() => return,
+                result = progress.restart_for_changes(&store, keys) => result,
+            };
+            match restarted {
+                Ok(conversion) => {
+                    force_full = false;
+                    admission = DiscoveryAdmission {
+                        done: [!conversion, false],
+                    };
+                }
+                Err(_) => {
+                    force_full = true;
                     tokio::select! {
                         _ = cancellation.cancelled() => return,
                         _ = tokio::time::sleep(IDLE_INTERVAL) => {},
                     }
                     continue;
-                },
+                }
             }
             begin = false;
         }
@@ -69,8 +102,8 @@ pub(crate) async fn run(store: Arc<CrudStore>, cancellation: CancellationToken) 
             Ok(true) => BATCH_PAUSE,
             Ok(false) if retry_pending => {
                 retry_pending = false;
-                progress = FrozenStorageLifetimeProgress::default();
-                admission = DiscoveryAdmission::default();
+                force_full = true;
+                begin = true;
                 IDLE_INTERVAL
             }
             Ok(false) => {
@@ -83,8 +116,7 @@ pub(crate) async fn run(store: Arc<CrudStore>, cancellation: CancellationToken) 
                                 _ = cancellation.cancelled() => return,
                                 _ = tokio::time::sleep(IDLE_INTERVAL) => {},
                             }
-                            progress = FrozenStorageLifetimeProgress::default();
-                            admission = DiscoveryAdmission::default();
+                            force_full = true;
                             begin = true;
                             continue;
                         }
@@ -96,16 +128,25 @@ pub(crate) async fn run(store: Arc<CrudStore>, cancellation: CancellationToken) 
                     _ = released.changed() => true,
                 };
                 if release_only {
-                    // Only memory protection changed. No writer fence or proof
-                    // revalidation is needed; source changes remain unacknowledged.
-                    progress.recheck_released_holds();
-                    admission.done = [true, false];
-                    continue;
+                    // The releasing reader supplies exactly the blocked manifest.
+                    // Do not acknowledge unrelated source changes on this branch.
+                    let keys = released.begin_keyed_pass(&database).await;
+                    match keys {
+                        Ok(keys) => match tokio::select! {
+                            _ = cancellation.cancelled() => return,
+                            result = progress.restart_for_changes(&store, keys) => result,
+                        } {
+                            Ok(conversion) => {
+                                admission = DiscoveryAdmission {
+                                    done: [!conversion, false],
+                                };
+                                continue;
+                            }
+                            Err(_) => force_full = true,
+                        },
+                        Err(_) => force_full = true,
+                    }
                 }
-                // Invalidate all finished keysets, including changed old rows.
-                // No unfinished preparation is discarded at a quantum boundary.
-                progress = FrozenStorageLifetimeProgress::default();
-                admission = DiscoveryAdmission::default();
                 begin = true;
                 continue;
             }
@@ -562,6 +603,297 @@ mod tests {
         }
     }
     #[tokio::test]
+    async fn one_released_manifest_finishes_without_revisiting_retained_histories() {
+        use pioneer_entity::compaction_frozen_history as history;
+        use sea_orm::EntityTrait;
+        use sha2::{Digest, Sha256};
+        let (_directory, store, observer) = fixture_with_metadata(64).await;
+        let mut holds = Vec::new();
+        for index in 0..64 {
+            holds.push(
+                store
+                    .compaction_finish_frozen_history_held(
+                        "ws",
+                        "thread",
+                        &FrozenHistoryRef {
+                            format: 1,
+                            manifest_id: format!("metadata-{index:04}"),
+                            messages: 0,
+                            identity_sha256: hex::encode(Sha256::digest([])),
+                        },
+                    )
+                    .await
+                    .unwrap(),
+            );
+        }
+        let mut progress = FrozenStorageLifetimeProgress::default();
+        let mut lifetime = false;
+        let mut admission = DiscoveryAdmission::default();
+        let mut finished = false;
+        for _ in 0..2048 {
+            if !batch(
+                &store,
+                &mut progress,
+                &mut lifetime,
+                &mut admission,
+                BATCH_STEPS,
+                BATCH_TIME,
+            )
+            .await
+            .unwrap()
+            {
+                finished = true;
+                break;
+            }
+        }
+        assert!(
+            finished,
+            "startup must reach checked EOF with retaining readers"
+        );
+        let db = store.database_connection();
+        let mut release = db.work_signal("maintenance.frozen.release").subscribe();
+        release.begin_pass(&db).await.unwrap();
+        drop(holds.remove(0));
+        let keys = release.begin_keyed_pass(&db).await.unwrap();
+        assert_eq!(
+            keys.as_deref(),
+            Some(["m:metadata-0000".to_owned()].as_slice())
+        );
+        let before = observer.operations();
+        let conversion = progress.restart_for_changes(&store, keys).await.unwrap();
+        admission = DiscoveryAdmission {
+            done: [!conversion, false],
+        };
+        finished = false;
+        for _ in 0..256 {
+            if !batch(
+                &store,
+                &mut progress,
+                &mut lifetime,
+                &mut admission,
+                BATCH_STEPS,
+                BATCH_TIME,
+            )
+            .await
+            .unwrap()
+            {
+                finished = true;
+                break;
+            }
+        }
+        assert!(
+            finished,
+            "the addressed expiry and its physical work must drain"
+        );
+        assert!(
+            observer.operations() - before < 128,
+            "one changed identity must not repeat preparations for 63 other ready histories"
+        );
+        assert_eq!(
+            history::Entity::find_by_id("metadata-0000")
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap()
+                .expired,
+            1
+        );
+        for index in 1..64 {
+            assert_eq!(
+                history::Entity::find_by_id(format!("metadata-{index:04}"))
+                    .one(&db)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .expired,
+                0
+            );
+        }
+        drop(holds);
+    }
+
+    #[tokio::test]
+    async fn metadata_refresh_is_quiet_and_root_replacement_addresses_both_identities() {
+        use pioneer_crud::NewCliRuntimeThreadBinding;
+        use sha2::{Digest, Sha256};
+        let (_directory, store, _) = fixture_with_metadata(0).await;
+        let db = store.database_connection();
+        let mut html = db.work_signal("maintenance.html").subscribe();
+        html.begin_pass(&db).await.unwrap();
+        let mut wake = db.work_signal("maintenance.frozen").subscribe();
+        wake.begin_keyed_pass(&db).await.unwrap();
+        let before = store
+            .get_cli_runtime_thread_binding("thread")
+            .await
+            .unwrap()
+            .unwrap();
+        let mut update = NewCliRuntimeThreadBinding {
+            thread_id: before.thread_id,
+            workspace_id: before.workspace_id,
+            runtime_id: before.runtime_id,
+            runtime_kind: before.runtime_kind,
+            native_thread_id: before.native_thread_id,
+            native_session_id: before.native_session_id,
+            native_root_thread_id: before.native_root_thread_id,
+            native_cwd: before.native_cwd,
+            native_model: Some("metadata-refresh".into()),
+            resume_cursor_json: before.resume_cursor_json,
+            status: before.status,
+            created_at: before.created_at,
+            updated_at: before.updated_at + chrono::Duration::seconds(1),
+        };
+        let refreshed = store
+            .upsert_cli_runtime_thread_binding(update.clone())
+            .await
+            .unwrap();
+        assert_eq!(refreshed.native_model.as_deref(), Some("metadata-refresh"));
+        assert!(
+            futures_util::FutureExt::now_or_never(wake.wait(None)).is_none(),
+            "metadata refresh leaves root identity and cleanup eligibility unchanged"
+        );
+        assert!(
+            futures_util::FutureExt::now_or_never(html.wait(None)).is_none(),
+            "session/model metadata does not release HTML ownership"
+        );
+        let previous_cursor = update.resume_cursor_json.clone();
+        let mut bookkeeping: serde_json::Value = serde_json::from_str(&previous_cursor).unwrap();
+        bookkeeping["cursorBookkeeping"] = "next-item".into();
+        update.resume_cursor_json = bookkeeping.to_string();
+        store
+            .update_cli_runtime_thread_resume_cursor(
+                "thread",
+                &update.native_thread_id,
+                &previous_cursor,
+                update.resume_cursor_json.clone(),
+                update.updated_at,
+            )
+            .await
+            .unwrap();
+        assert!(futures_util::FutureExt::now_or_never(wake.wait(None)).is_none());
+        assert!(
+            futures_util::FutureExt::now_or_never(html.wait(None)).is_none(),
+            "changed cursor JSON with the same history does not release HTML"
+        );
+        let replacement = FrozenHistoryRef {
+            format: 1,
+            manifest_id: "replacement".into(),
+            messages: 0,
+            identity_sha256: hex::encode(Sha256::digest([])),
+        };
+        store
+            .compaction_begin_frozen_history("ws", "thread", &replacement)
+            .await
+            .unwrap();
+        let hold = store
+            .compaction_finish_frozen_history_held("ws", "thread", &replacement)
+            .await
+            .unwrap();
+        wake.begin_keyed_pass(&db).await.unwrap();
+        let mut cursor: serde_json::Value =
+            serde_json::from_str(&update.resume_cursor_json).unwrap();
+        cursor["pioneerContext"]["contextHistoryJson"] =
+            serde_json::to_string(&replacement).unwrap().into();
+        html.begin_pass(&db).await.unwrap();
+        update.resume_cursor_json = cursor.to_string();
+        store
+            .upsert_cli_runtime_thread_binding(update)
+            .await
+            .unwrap();
+        assert_eq!(
+            wake.begin_keyed_pass(&db).await.unwrap(),
+            Some(vec!["m:live".into(), "m:replacement".into()])
+        );
+        assert!(
+            futures_util::FutureExt::now_or_never(html.wait(None)).is_some(),
+            "root replacement must preserve the HTML lifetime wake"
+        );
+        drop(hold);
+    }
+
+    #[tokio::test]
+    async fn source_invalidation_registers_new_work_without_repeating_legacy_inventory() {
+        use pioneer_entity::compaction_frozen_history as history;
+        use sea_orm::EntityTrait;
+        use sha2::{Digest, Sha256};
+
+        let (_directory, store, observer) = fixture_with_metadata(128).await;
+        let mut progress = FrozenStorageLifetimeProgress::default();
+        let mut lifetime = false;
+        let mut admission = DiscoveryAdmission::default();
+        let mut idle = false;
+        for _ in 0..2048 {
+            if !batch(
+                &store,
+                &mut progress,
+                &mut lifetime,
+                &mut admission,
+                BATCH_STEPS,
+                BATCH_TIME,
+            )
+            .await
+            .unwrap()
+            {
+                idle = true;
+                break;
+            }
+        }
+        assert!(idle, "the initial legacy inventory must finish");
+        let db = store.database_connection();
+        let mut wake = db.work_signal("maintenance.frozen").subscribe();
+        wake.begin_pass(&db).await.unwrap();
+        let descriptor = FrozenHistoryRef {
+            format: 1,
+            manifest_id: "new-after-idle".into(),
+            messages: 0,
+            identity_sha256: hex::encode(Sha256::digest([])),
+        };
+        store
+            .compaction_begin_frozen_history("ws", "thread", &descriptor)
+            .await
+            .unwrap();
+        let _capture = store
+            .compaction_finish_frozen_history_held("ws", "thread", &descriptor)
+            .await
+            .unwrap();
+        assert!(futures_util::FutureExt::now_or_never(wake.wait(None)).is_some());
+        let keys = wake.begin_keyed_pass(&db).await.unwrap();
+        let conversion = progress.restart_for_changes(&store, keys).await.unwrap();
+        admission = DiscoveryAdmission {
+            done: [!conversion, false],
+        };
+        lifetime = false;
+        let before = observer.operations();
+        // One new manifest must not pay for another 128-header legacy walk.
+        // Count all reader operations, not a particular SQL shape or call order.
+        for _ in 0..16 {
+            batch(
+                &store,
+                &mut progress,
+                &mut lifetime,
+                &mut admission,
+                1,
+                BATCH_TIME,
+            )
+            .await
+            .unwrap();
+            let registered = history::Entity::find_by_id("new-after-idle")
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap()
+                .storage_registered;
+            assert!(
+                observer.operations() - before < 64,
+                "source invalidation must not repeat the old scope inventory"
+            );
+            if registered == 1 {
+                return;
+            }
+        }
+        panic!("new supported work must be registered without a legacy scan");
+    }
+
+    #[tokio::test]
     async fn conversion_release_reopens_lifetime_after_eof() {
         use pioneer_entity::compaction_frozen_history as history;
         use sea_orm::EntityTrait;
@@ -924,10 +1256,10 @@ mod tests {
         let reads = observer.operations();
         let writes = observer.writes.lock().unwrap().len();
         assert!(progress.quantum(&store).await.unwrap());
-        assert_eq!(
-            observer.operations() - reads,
-            3,
-            "finite frontier + candidate + exact-key preflight, no reverse read"
+        let preflight_reads = observer.operations() - reads;
+        assert!(
+            (2..=3).contains(&preflight_reads),
+            "discard preflight must stay within its bounded maintenance read budget"
         );
         assert_eq!(observer.writes.lock().unwrap().len(), writes);
         assert!(

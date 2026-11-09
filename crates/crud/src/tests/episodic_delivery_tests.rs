@@ -93,19 +93,32 @@ async fn episodic_pending_delivery_survives_real_receipt_cleanup_and_reopen() {
     )
     .await
     .unwrap();
+    let mut completed = turn.clone();
+    completed.status = TurnStatus::Completed;
+    store
+        .materialize_turn_completed(
+            pioneer_protocol::TurnCompletedNotification {
+                workspace_id: thread.workspace_id.clone(),
+                thread_id: thread.id.clone(),
+                turn: completed,
+            },
+            NOW,
+        )
+        .await
+        .unwrap();
     // Use the actual cleanup quantum, including its atomic durable boundary.
     let cleanup = store
         .cleanup_projection_receipts_quantum(None, None)
         .await
         .unwrap();
-    assert_eq!(cleanup.rows_deleted, 4); // Turn start and three completed items.
+    assert_eq!(cleanup.rows_deleted, 5); // Start, three items, terminal event.
     let state = stream::Entity::find_by_id(turn.id.clone())
         .one(&store.connection)
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(state.projected_through_sequence, 4);
-    assert_eq!(state.receipts_compacted_through_sequence, 4);
+    assert_eq!(state.projected_through_sequence, 5);
+    assert_eq!(state.receipts_compacted_through_sequence, 5);
     assert_eq!(
         receipt::Entity::find()
             .count(&store.connection)
@@ -127,7 +140,7 @@ async fn episodic_pending_delivery_survives_real_receipt_cleanup_and_reopen() {
             .count(&store.connection)
             .await
             .unwrap(),
-        4
+        5
     );
     store.database_connection().close().await.unwrap();
     drop(store);
@@ -365,6 +378,12 @@ impl ConnectionTrait for ClaimConnection {
 
     async fn query_all_raw(&self, statement: Statement) -> Result<Vec<QueryResult>, DbErr> {
         self.statements.lock().unwrap().push(statement.clone());
+        if statement.sql.starts_with("UPDATE ") {
+            let mutation = self.before_update.lock().unwrap().take();
+            if let Some(mutation) = mutation {
+                self.db.execute_raw(mutation).await?;
+            }
+        }
         self.db.query_all_raw(statement).await
     }
 }
@@ -533,8 +552,8 @@ async fn episodic_claim_production_sql_uses_unfinished_index_with_large_terminal
     }
     assert_eq!(
         (selects, updates),
-        (1, 2),
-        "cover discovery and every guarded claim"
+        (1, 1),
+        "one discovery and one guarded batch claim; both use the causal index"
     );
     for claim in claims {
         assert!(
@@ -596,5 +615,191 @@ async fn episodic_claim_production_sql_uses_unfinished_index_with_large_terminal
     assert_eq!(
         live[0].row.sequence, 20_001,
         "consumers retain separate causal heads"
+    );
+}
+
+#[tokio::test]
+async fn mixed_delivery_batch_preserves_individual_retry_deferral_and_ack_state() {
+    let (store, thread, turn) =
+        test_store_with_started_turn("ws_batch", "thr_batch", "batch_a").await;
+    let turns = ["batch_a", "batch_b", "batch_c", "batch_d"];
+    for (index, id) in turns.iter().enumerate() {
+        if index != 0 {
+            let mut next = turn.clone();
+            next.id = (*id).into();
+            store
+                .materialize_turn_start(
+                    &thread,
+                    SandboxMode::FullAccess,
+                    &next,
+                    &[],
+                    pioneer_protocol::PersistedActorRef::System,
+                )
+                .await
+                .unwrap();
+        }
+        append_optional_delivery_test_items(&store, &thread, id, 2).await;
+    }
+    // Existing retry history is real persisted state, read back into each claim.
+    for (id, count, error) in [
+        ("batch_b", 2, "earlier error"),
+        ("batch_d", 9, "last retry"),
+    ] {
+        delivery::Entity::update_many()
+            .col_expr(delivery::Column::AttemptCount, Expr::value(count))
+            .col_expr(delivery::Column::LastError, Expr::value(error))
+            .filter(delivery::Column::TurnId.eq(id))
+            .filter(delivery::Column::Consumer.eq(LIVE))
+            .exec(&store.connection)
+            .await
+            .unwrap();
+    }
+    let claims = store
+        .with_maintenance_access()
+        .claim_due_turn_event_deliveries(LIVE, NOW, 64)
+        .await
+        .unwrap();
+    assert_eq!(
+        claims
+            .iter()
+            .map(|c| c.event.turn_id.as_str())
+            .collect::<Vec<_>>(),
+        turns
+    );
+    let outcomes = claims
+        .iter()
+        .enumerate()
+        .map(|(i, c)| crate::TurnEventDeliverySettlement {
+            id: c.id.clone(),
+            claim_token: c.claim_token.clone(),
+            at_unix: NOW,
+            outcome: match i {
+                0 => crate::TurnEventDeliveryOutcome::Delivered,
+                1 => crate::TurnEventDeliveryOutcome::ForegroundDeferred,
+                _ => crate::TurnEventDeliveryOutcome::Failed {
+                    attempt_count: c.attempt_count,
+                    error: format!("failure-{i}"),
+                },
+            },
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        store
+            .with_maintenance_access()
+            .settle_turn_event_deliveries(&outcomes)
+            .await
+            .unwrap(),
+        4
+    );
+    assert_eq!(
+        store.settle_turn_event_deliveries(&outcomes).await.unwrap(),
+        0
+    );
+    for (i, claim) in claims.iter().enumerate() {
+        let row = delivery::Entity::find_by_id(claim.id.clone())
+            .one(&store.connection)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(row.claim_token.is_none() && row.claim_expires_at.is_none());
+        match i {
+            0 => {
+                assert_eq!(row.status, "delivered");
+                assert_eq!(row.delivered_at, Some(unix_to_datetime(NOW)));
+                assert_eq!(row.attempt_count, 0);
+            }
+            1 => {
+                assert_eq!(row.status, "pending");
+                assert_eq!(row.next_run_at, unix_to_datetime(NOW + 1));
+                assert_eq!(row.attempt_count, 2);
+                assert_eq!(row.last_error.as_deref(), Some("earlier error"));
+            }
+            2 => {
+                assert_eq!(row.status, "failed");
+                assert_eq!(row.next_run_at, unix_to_datetime(NOW + 1));
+                assert_eq!(row.attempt_count, 1);
+                assert_eq!(row.last_error.as_deref(), Some("failure-2"));
+            }
+            _ => {
+                assert_eq!(row.status, "exhausted");
+                assert_eq!(row.attempt_count, 10);
+                assert_eq!(row.last_error.as_deref(), Some("failure-3"));
+            }
+        }
+    }
+    let next = store
+        .claim_due_turn_event_deliveries(LIVE, NOW, 64)
+        .await
+        .unwrap();
+    assert_eq!(
+        next.iter()
+            .map(|c| c.event.turn_id.as_str())
+            .collect::<Vec<_>>(),
+        ["batch_a", "batch_d"],
+        "only delivered/exhausted heads unblock their own successors"
+    );
+}
+
+#[tokio::test]
+async fn corrupt_body_in_claim_batch_does_not_suppress_healthy_turn() {
+    let (store, thread, turn) =
+        test_store_with_started_turn("ws_corrupt_batch", "thr_corrupt_batch", "a_corrupt_batch")
+            .await;
+    append_optional_delivery_test_items(&store, &thread, &turn.id, 1).await;
+    let mut other = turn.clone();
+    other.id = "z_healthy_batch".into();
+    store
+        .materialize_turn_start(
+            &thread,
+            SandboxMode::FullAccess,
+            &other,
+            &[],
+            pioneer_protocol::PersistedActorRef::System,
+        )
+        .await
+        .unwrap();
+    append_optional_delivery_test_items(&store, &thread, &other.id, 1).await;
+    let bad = delivery::Entity::find()
+        .filter(delivery::Column::TurnId.eq(turn.id.clone()))
+        .filter(delivery::Column::Consumer.eq(LIVE))
+        .one(&store.connection)
+        .await
+        .unwrap()
+        .unwrap();
+    pioneer_entity::turn_event::Entity::update_many()
+        .col_expr(
+            pioneer_entity::turn_event::Column::Payload,
+            Expr::value("{invalid-json"),
+        )
+        .filter(pioneer_entity::turn_event::Column::Id.eq(bad.event_id))
+        .exec(&store.connection)
+        .await
+        .unwrap();
+    let claims = store
+        .claim_due_turn_event_deliveries(LIVE, NOW, 64)
+        .await
+        .unwrap();
+    assert_eq!(claims.len(), 1);
+    assert_eq!(claims[0].event.turn_id, other.id);
+    let bad = delivery::Entity::find_by_id(bad.id)
+        .one(&store.connection)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(bad.status, "failed");
+    assert_eq!(bad.attempt_count, 1);
+    assert!(bad.claim_token.is_none());
+    assert_eq!(bad.next_run_at, unix_to_datetime(NOW + 1));
+    assert_eq!(
+        store
+            .settle_turn_event_deliveries(&[crate::TurnEventDeliverySettlement {
+                id: claims[0].id.clone(),
+                claim_token: claims[0].claim_token.clone(),
+                at_unix: NOW,
+                outcome: crate::TurnEventDeliveryOutcome::Delivered,
+            }])
+            .await
+            .unwrap(),
+        1
     );
 }

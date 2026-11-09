@@ -12,34 +12,58 @@ use std::{
 mod stream;
 pub(crate) use stream::FrozenRootStream;
 
-pub(crate) type ReaderCounts = Arc<Mutex<BTreeMap<String, usize>>>;
+pub(crate) type ReaderCounts = Arc<Mutex<BTreeMap<String, Readers>>>;
+
+#[derive(Debug, Default)]
+pub(crate) struct Readers {
+    count: usize,
+    blocked_cleanup: Vec<pioneer_sqlite::WorkSignal>,
+}
+impl Readers {
+    pub(crate) fn block_cleanup(&mut self, released: &pioneer_sqlite::WorkSignal) {
+        if !self
+            .blocked_cleanup
+            .iter()
+            .any(|signal| signal.same_channel(released))
+        {
+            self.blocked_cleanup.push(released.clone());
+        }
+    }
+}
+
+/// Record only cleanup actually refused by this hold. Registration and the
+/// last-reader release share the lock, so a release cannot lose its wake.
+pub(crate) fn cleanup_blocked(
+    readers: &ReaderCounts,
+    manifest: &str,
+    released: &pioneer_sqlite::WorkSignal,
+) -> bool {
+    let mut readers = readers
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(held) = readers.get_mut(manifest) else {
+        return false;
+    };
+    held.block_cleanup(released);
+    true
+}
 
 #[derive(Debug)]
 pub struct FrozenReadHold {
     readers: ReaderCounts,
     manifest: String,
-    released: Option<pioneer_sqlite::WorkSignal>,
 }
 impl FrozenReadHold {
-    pub(crate) fn register_on(
-        readers: &ReaderCounts,
-        manifest: &str,
-        database: &pioneer_sqlite::SqliteDatabase,
-    ) -> Self {
-        let mut hold = Self::register(readers, manifest);
-        hold.released = Some(database.work_signal("maintenance.frozen.release"));
-        hold
-    }
     pub(crate) fn register(readers: &ReaderCounts, manifest: &str) -> Self {
-        *readers
+        readers
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .entry(manifest.to_owned())
-            .or_default() += 1;
+            .or_default()
+            .count += 1;
         Self {
             readers: readers.clone(),
             manifest: manifest.to_owned(),
-            released: None,
         }
     }
 }
@@ -49,13 +73,13 @@ impl Drop for FrozenReadHold {
             .readers
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(count) = readers.get_mut(&self.manifest) {
-            *count -= 1;
-            if *count == 0 {
-                readers.remove(&self.manifest);
+        if let Some(held) = readers.get_mut(&self.manifest) {
+            held.count -= 1;
+            if held.count == 0 {
+                let held = readers.remove(&self.manifest).expect("last frozen reader");
                 drop(readers);
-                if let Some(signal) = &self.released {
-                    signal.notify();
+                for signal in held.blocked_cleanup {
+                    signal.notify_keys(&[format!("m:{}", self.manifest)]);
                 }
             }
         }
@@ -340,11 +364,7 @@ impl crate::CrudStore {
         self.run_serialized_write(|| async {
             let tx = self.connection.begin().await?;
             let header = exact_header(&tx, workspace, descriptor).await?;
-            let hold = FrozenReadHold::register_on(
-                &self.frozen_readers,
-                &descriptor.manifest_id,
-                &self.connection,
-            );
+            let hold = FrozenReadHold::register(&self.frozen_readers, &descriptor.manifest_id);
             tx.commit().await?;
             Ok((header, hold))
         })
@@ -478,11 +498,45 @@ mod tests {
         let scoped = readers.clone();
         let first = FrozenReadHold::register(&readers, "m");
         let second = FrozenReadHold::register(&scoped, "m");
-        assert_eq!(readers.lock().unwrap().get("m"), Some(&2));
+        assert_eq!(
+            readers.lock().unwrap().get("m").map(|held| held.count),
+            Some(2)
+        );
         drop(first);
-        assert_eq!(scoped.lock().unwrap().get("m"), Some(&1));
+        assert_eq!(
+            scoped.lock().unwrap().get("m").map(|held| held.count),
+            Some(1)
+        );
         drop(second);
         assert!(readers.lock().unwrap().is_empty());
+    }
+
+    // The expiry/HTML owner tests cover useful wakeups. This race protects the
+    // shared handoff: refusal must either observe no hold or retain its release.
+    #[test]
+    fn cleanup_registration_racing_last_reader_cannot_lose_release() {
+        use futures_util::FutureExt;
+        for _ in 0..32 {
+            let readers: ReaderCounts = Default::default();
+            let hold = FrozenReadHold::register(&readers, "m");
+            let signal = pioneer_sqlite::WorkSignal::default();
+            let mut wake = signal.subscribe();
+            let start = std::sync::Barrier::new(2);
+            let blocked = std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    start.wait();
+                    drop(hold);
+                });
+                start.wait();
+                cleanup_blocked(&readers, "m", &signal)
+            });
+            assert_eq!(wake.changed().now_or_never().is_some(), blocked);
+            assert!(readers.lock().unwrap().is_empty());
+            assert!(!cleanup_blocked(&readers, "m", &signal));
+            // No pending waiter leaks into a later unrelated read of this key.
+            drop(FrozenReadHold::register(&readers, "m"));
+            assert!(wake.changed().now_or_never().is_none());
+        }
     }
     #[test]
     fn root_shapes_distinguish_no_basis_from_malformed_new_basis() {
@@ -511,5 +565,94 @@ mod tests {
                 .locator(),
             Some("m".into())
         );
+    }
+}
+
+/// Exact root delta prepared by the authoritative writer. An opaque legacy
+/// locator cannot identify released dependencies and requests recovery instead.
+pub(crate) fn changed_root_keys(
+    before: Option<String>,
+    after: Option<String>,
+) -> Option<Vec<String>> {
+    if before == after {
+        return Some(Vec::new());
+    }
+    if before.as_deref() == Some("") || after.as_deref() == Some("") {
+        return None;
+    }
+    Some(
+        before
+            .into_iter()
+            .chain(after)
+            .map(|id| format!("m:{id}"))
+            .collect(),
+    )
+}
+
+pub(crate) fn complete_keys(
+    change: pioneer_sqlite::WorkChange,
+    keys: &Option<Vec<String>>,
+    changed: bool,
+) {
+    if !changed {
+        change.completed(false);
+        return;
+    }
+    match keys {
+        Some(keys) => change.completed_keys(keys),
+        None => change.completed(true),
+    }
+}
+
+/// Compare only the CLI facts consulted by HTML retention, after releasing the
+/// writer. Model/session/timestamp and cursor bookkeeping are not dependencies.
+/// `before` is captured by the same transaction that stores `after`.
+pub(crate) fn html_cli_root_changed(
+    before: Option<&(String, String)>,
+    workspace: &str,
+    json: &str,
+    thread: bool,
+) -> bool {
+    fn root(json: &str, thread: bool) -> Option<(Option<String>, bool)> {
+        let value: serde_json::Value = serde_json::from_str(json).ok()?;
+        let basis = value.get(if thread {
+            "pioneerContext"
+        } else {
+            "pioneerContextBasis"
+        });
+        let history = basis.and_then(|basis| {
+            basis.get(if thread {
+                "contextHistoryJson"
+            } else {
+                "historyJson"
+            })
+        });
+        let text = match history {
+            None | Some(serde_json::Value::Null) => "[]",
+            Some(value) => value.as_str()?,
+        };
+        let history: serde_json::Value = serde_json::from_str(text).ok()?;
+        if history.is_array() {
+            // Match the existing conservative opaque-history predicate exactly.
+            Some((None, text != "[]"))
+        } else {
+            let descriptor: FrozenHistoryRef = serde_json::from_value(history).ok()?;
+            Some((Some(descriptor.manifest_id), false))
+        }
+    }
+    if let Some((old_workspace, old_json)) = before {
+        if old_workspace == workspace && old_json == json {
+            return false;
+        }
+        match (root(old_json, thread), root(json, thread)) {
+            (Some(before), Some(after)) => {
+                before != after
+                    || (old_workspace != workspace
+                        && (before.0.is_some() || before.1 || after.0.is_some() || after.1))
+            }
+            _ => true,
+        }
+    } else {
+        root(json, thread).is_none_or(|(manifest, opaque)| manifest.is_some() || opaque)
     }
 }
