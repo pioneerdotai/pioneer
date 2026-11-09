@@ -888,6 +888,9 @@ impl CompiledPromptPayload {
 
 #[derive(Debug, Clone)]
 pub struct ChatRequest {
+    /// Host-owned positional proposal. Never an execution grant or delivery ACK.
+    /// Not part of canonical messages or public protocol contracts.
+    pub tool_declarations: Option<crate::tool_declarations::ToolDeclarations>,
     pub model: String,
     pub messages: Vec<ChatMessage>,
     pub temperature: Option<f32>,
@@ -1865,6 +1868,7 @@ mod tests {
     #[test]
     fn rendered_messages_with_compiled_prompt_uses_canonical_full_text() {
         let request = ChatRequest {
+            tool_declarations: None,
             model: "test-model".to_owned(),
             messages: vec![
                 ChatMessage::system("legacy prompt"),

@@ -3011,6 +3011,7 @@ mod tests {
         .unwrap();
         let response = provider
             .chat(ChatRequest {
+                tool_declarations: None,
                 model: "fixture".into(),
                 messages: vec![ChatMessage::user("hello")],
                 temperature: None,

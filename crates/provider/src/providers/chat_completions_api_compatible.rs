@@ -2794,6 +2794,7 @@ mod tests {
             Some("artifact-file")
         );
         let request = ChatRequest {
+            tool_declarations: None,
             model: "fixture-media".into(),
             messages: messages.clone(),
             temperature: None,
@@ -3230,6 +3231,7 @@ mod tests {
             Some(replay_state),
         );
         let request = ChatRequest {
+            tool_declarations: None,
             model: "compatible-model".to_owned(),
             messages: vec![
                 message,
@@ -3292,6 +3294,7 @@ mod tests {
         );
         assert!(replay.model.is_none());
         let request = ChatRequest {
+            tool_declarations: None,
             model: "compatible-model".to_owned(),
             messages: vec![ChatMessage::assistant_tool_calls_with_provider_state(
                 None::<String>,
@@ -3501,6 +3504,7 @@ mod tests {
     fn merge_mode_uses_compiled_prompt_full_text() {
         let provider = test_provider().with_merge_system_into_user(true);
         let request = ChatRequest {
+            tool_declarations: None,
             model: "test-model".to_owned(),
             messages: vec![
                 ChatMessage::system("legacy system prompt should be ignored"),
@@ -3582,6 +3586,7 @@ mod tests {
     fn unknown_compatible_model_rejects_explicit_unverified_reasoning() {
         let provider = test_provider();
         let request = ChatRequest {
+            tool_declarations: None,
             model: "custom-compatible-model".to_owned(),
             messages: vec![ChatMessage::user("Hello")],
             temperature: None,

@@ -404,6 +404,7 @@ pub(crate) async fn prepare_completed_history_owned(
             None
         };
         let request = ChatRequest {
+            tool_declarations: None,
             model: current.model.clone(),
             messages,
             temperature: None,
@@ -418,6 +419,7 @@ pub(crate) async fn prepare_completed_history_owned(
             pioneer_provider::history::project_request_for_provider(&catalog, request)?
         } else {
             ChatRequest {
+                tool_declarations: None,
                 messages: request
                     .messages
                     .iter()

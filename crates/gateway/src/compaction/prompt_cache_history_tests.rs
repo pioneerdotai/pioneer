@@ -220,6 +220,7 @@ async fn retry_resolution_between_call_and_result_survives_cold_accepted_and_res
         .await
         .unwrap();
         let request = |messages| ChatRequest {
+            tool_declarations: None,
             model: "gpt-5.1".into(),
             messages,
             temperature: None,

@@ -69,6 +69,7 @@ impl NativeSummarizer {
             })
             .transpose()?;
         Ok(ChatRequest {
+            tool_declarations: None,
             model: request.selection.model.clone(),
             messages: vec![
                 ChatMessage::system(INSTRUCTIONS),

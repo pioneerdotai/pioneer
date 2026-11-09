@@ -684,6 +684,7 @@ mod tests {
 
     fn replay_request(model: &str, reasoning_content: Option<&str>) -> ChatRequest {
         ChatRequest {
+            tool_declarations: None,
             model: model.to_owned(),
             messages: vec![ChatMessage::assistant_tool_calls_with_reasoning(
                 None::<String>,
@@ -726,6 +727,7 @@ mod tests {
     // this field instead of deriving a default from the model name.
     fn request_with(messages: Vec<ChatMessage>) -> ChatRequest {
         ChatRequest {
+            tool_declarations: None,
             model: "deepseek-reasoner".into(),
             messages,
             temperature: None,
@@ -949,6 +951,7 @@ mod tests {
         );
         state.model = Some("deepseek-v4-flash".into());
         let request = ChatRequest {
+            tool_declarations: None,
             model: "deepseek-v4-flash".to_owned(),
             messages: vec![
                 ChatMessage::assistant_tool_calls_with_provider_state(

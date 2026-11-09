@@ -4,6 +4,7 @@ use crate::types::{AttachmentDataSource, ChatMessage, MessageAttachment, Message
 
 fn request(messages: Vec<ChatMessage>) -> ChatRequest {
     ChatRequest {
+        tool_declarations: None,
         model: "gemini-2.5-flash".into(),
         messages,
         temperature: None,

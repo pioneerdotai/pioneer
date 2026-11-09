@@ -2611,6 +2611,7 @@ mod tests {
     #[test]
     fn compiled_prompt_payload_overrides_raw_system_messages() {
         let request = ChatRequest {
+            tool_declarations: None,
             model: "claude-sonnet-4-20250514".into(),
             messages: vec![
                 ChatMessage::system("legacy system prompt should be ignored"),
@@ -2692,6 +2693,7 @@ mod tests {
     async fn chat_fails_without_valid_key() {
         let provider = AnthropicProvider::new("sk-ant-invalid-key");
         let request = ChatRequest {
+            tool_declarations: None,
             model: "claude-sonnet-4-20250514".into(),
             messages: vec![ChatMessage::user("Hello")],
             temperature: None,

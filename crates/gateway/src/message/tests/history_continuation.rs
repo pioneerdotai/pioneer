@@ -80,6 +80,7 @@ async fn prepare_history_for_provider(
     assert!(adapter.authority_fingerprint().is_some());
     adapter
         .prepare_input_budget(ChatRequest {
+            tool_declarations: None,
             model: model.into(),
             messages: messages.to_vec(),
             temperature: None,

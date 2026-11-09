@@ -1993,6 +1993,7 @@ mod tests {
             }
         }
         let request = || ChatRequest {
+            tool_declarations: None,
             model: "fixture".into(),
             messages: vec![],
             temperature: None,
@@ -2168,6 +2169,7 @@ mod tests {
                     .unwrap();
                 let provider = registry.get_or_create("openrouter").unwrap();
                 let request = ChatRequest {
+                    tool_declarations: None,
                     model: "fixture".into(),
                     messages: vec![],
                     temperature: None,
@@ -2616,6 +2618,7 @@ mod tests {
             .unwrap()
         };
         let request = ChatRequest {
+            tool_declarations: None,
             model: model.into(),
             messages: vec![pioneer_provider::ChatMessage::user("hello")],
             temperature: None,
@@ -2805,6 +2808,7 @@ mod tests {
                                 }
                             });
                             let request = ChatRequest {
+                                tool_declarations: None,
                                 model: model.to_owned(),
                                 messages: vec![pioneer_provider::ChatMessage::user("hello")],
                                 temperature: None,
@@ -3500,6 +3504,7 @@ mod tests {
         let provider = registry.get_or_create_for_workspace("a", "vllm").unwrap();
         let mut chunks = provider
             .stream_chat(ChatRequest {
+                tool_declarations: None,
                 model: "fixture".into(),
                 messages: vec![pioneer_provider::ChatMessage::user("hello")],
                 temperature: None,
@@ -3553,6 +3558,7 @@ mod tests {
         let provider = registry.get_or_create_for_workspace("a", "openai").unwrap();
         let error = provider
             .chat(ChatRequest {
+                tool_declarations: None,
                 model: "fixture".into(),
                 messages: vec![pioneer_provider::ChatMessage::user("hello")],
                 temperature: None,
@@ -3925,6 +3931,7 @@ mod partial_observation_tests {
             let hub = AgentEventHub::new();
             let mut events = hub.take_durable_receiver().await.unwrap();
             let request = ChatRequest {
+                tool_declarations: None,
                 model: "fixture".into(),
                 messages: vec![pioneer_provider::ChatMessage::user("request")],
                 temperature: None,
@@ -4327,6 +4334,7 @@ mod terminal_boundary_tests {
     }
     fn request() -> ChatRequest {
         ChatRequest {
+            tool_declarations: None,
             model: "fixture".into(),
             messages: vec![pioneer_provider::ChatMessage::user("fixture")],
             temperature: None,
@@ -4610,6 +4618,7 @@ mod native_decoder_gate_tests {
                 }
             });
             let request = ChatRequest {
+                tool_declarations: None,
                 model: "fixture".into(), messages: vec![pioneer_provider::ChatMessage::user("fixture")],
                 temperature: None, max_tokens: None, tools: None, tool_choice: None,
                 parallel_tool_calls: None, reasoning: None, compiled_prompt: None,
@@ -4774,6 +4783,7 @@ mod phased_message_tests {
     }
     fn request() -> ChatRequest {
         ChatRequest {
+            tool_declarations: None,
             model: "fixture".into(),
             messages: vec![],
             temperature: None,
@@ -5388,6 +5398,7 @@ mod control_deadline_tests {
         policy.first_chunk_timeout = std::time::Duration::from_millis(20);
         policy.inter_chunk_idle_timeout = std::time::Duration::from_millis(20);
         let request = ChatRequest {
+            tool_declarations: None,
             model: "fixture".into(),
             messages: vec![],
             temperature: None,

@@ -670,7 +670,10 @@ impl Provider for ResponsesApiCompatibleProvider {
     ) -> Result<crate::attachments::PreparedInputBudget> {
         let request = crate::tools::policy::prepare_responses_request(&self.name, request)?;
         crate::generation::responses_fields(&self.name, &request)?;
-        let request = self.project(request)?;
+        let mut request = self.project(request)?;
+        // Budget exactly the selected wire projection; unsupported routes retain
+        // the established full-list representation and calibration identity.
+        request.tool_declarations = self.declarations_for_request(&request);
         crate::attachments::input_estimate::prepare_responses(
             &self.name,
             &self.capabilities(),

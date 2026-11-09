@@ -64,6 +64,7 @@ fn canonical_chat_rounds_keep_nested_arguments_and_ids_for_each_profile() {
             ));
             history.push(ChatMessage::tool_result(&calls[0].id, &calls[0].name, "ok"));
             let request = ChatRequest {
+                tool_declarations: None,
                 model: "fixture-model".into(),
                 messages: history.clone(),
                 temperature: None,

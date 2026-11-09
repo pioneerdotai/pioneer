@@ -1530,6 +1530,7 @@ mod tests {
 
     fn chat_request() -> ChatRequest {
         ChatRequest {
+            tool_declarations: None,
             model: "test-model".to_owned(),
             messages: vec![crate::ChatMessage::user("hello")],
             temperature: None,

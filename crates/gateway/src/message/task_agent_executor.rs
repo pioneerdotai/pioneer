@@ -8904,6 +8904,7 @@ mod prepared_snapshot_tests {
         let request = |messages| {
             pioneer_agent::compaction::request::NativeRequestProjection::full(
                 pioneer_provider::ChatRequest {
+                    tool_declarations: None,
                     model: "gpt-4".into(),
                     messages,
                     temperature: None,

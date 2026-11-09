@@ -51,12 +51,18 @@ impl NativeInputReceipt {
                 .filter_map(|message| message.provider_replay_state.as_ref())
                 .find_map(|state| state.payload.get("prefix_context")),
         }))?;
-        let tools_hash = digest(&serde_json::json!({
+        let mut tools_identity = serde_json::json!({
             "tools": request.tools, "tool_choice": request.tool_choice,
             "parallel_tool_calls": request.parallel_tool_calls,
             "reasoning": request.reasoning.map(|v|format!("{v:?}")),
             "output_cap": request.max_tokens, "temperature": request.temperature,
-        }))?;
+        });
+        if let Some(declarations) =
+            pioneer_provider::tool_declarations::ToolDeclarations::for_request(request)
+        {
+            tools_identity["tool_declarations"] = declarations.projection_identity();
+        }
+        let tools_hash = digest(&tools_identity)?;
         let messages = request
             .messages
             .iter()
@@ -288,6 +294,7 @@ mod tests {
     use pioneer_provider::{ChatMessage, ReasoningConfig, ReasoningEffort, ToolDefinition};
     fn request() -> ChatRequest {
         ChatRequest {
+            tool_declarations: None,
             model: "m".into(),
             messages: vec![ChatMessage::user("a")],
             temperature: None,
