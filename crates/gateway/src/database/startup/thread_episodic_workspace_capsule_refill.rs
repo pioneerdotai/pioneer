@@ -864,6 +864,7 @@ pub(crate) async fn refill_once_with_projection_resolver_and_config(
     let preflight = async {
         if projection_target.requires_embedding_provider() {
             let provider = resolve_refill_embedding_provider_for_target(
+                crud_store.as_ref(),
                 workspace_id,
                 &projection_target,
                 embedding_provider_resolver.as_ref(),
@@ -879,6 +880,7 @@ pub(crate) async fn refill_once_with_projection_resolver_and_config(
                 as Arc<dyn ThreadEpisodicIndexEmbeddingProviderResolver>);
         }
         preflight_refill_embedding_resolver(
+            crud_store.as_ref(),
             workspace_id,
             &projection_target,
             embedding_provider_resolver.as_ref(),
@@ -1071,6 +1073,7 @@ pub(crate) async fn refill_once_with_projection_resolver_and_config(
 }
 
 async fn resolve_refill_embedding_provider_for_target(
+    usage_store: &CrudStore,
     workspace_id: &str,
     projection_target: &ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget,
     embedding_provider_resolver: Option<&Arc<dyn ThreadEpisodicIndexEmbeddingProviderResolver>>,
@@ -1080,7 +1083,7 @@ async fn resolve_refill_embedding_provider_for_target(
     };
 
     let provider = embedding_provider_resolver
-        .resolve_active_embedding_provider(workspace_id)
+        .resolve_active_embedding_provider_with_usage(workspace_id, usage_store)
         .await
         .map_err(|error| {
             anyhow!(
@@ -1585,6 +1588,7 @@ async fn populate_refill_source_counts(
 }
 
 async fn preflight_refill_embedding_resolver(
+    usage_store: &CrudStore,
     workspace_id: &str,
     projection_target: &ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget,
     embedding_provider_resolver: Option<&Arc<dyn ThreadEpisodicIndexEmbeddingProviderResolver>>,
@@ -1597,7 +1601,7 @@ async fn preflight_refill_embedding_resolver(
     };
 
     let provider = embedding_provider_resolver
-        .resolve_active_embedding_provider(workspace_id)
+        .resolve_active_embedding_provider_with_usage(workspace_id, usage_store)
         .await
         .map_err(|error| {
             anyhow!(

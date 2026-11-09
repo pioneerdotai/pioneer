@@ -150,3 +150,5 @@ pub(crate) mod task_child_producers;
 pub mod task_child_work;
 
 pub(crate) mod task_occurrence_producers;
+
+pub mod execution_observability;

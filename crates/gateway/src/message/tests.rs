@@ -13,6 +13,9 @@ impl super::MessageProcessor {
     }
 }
 
+#[path = "tests/execution_observability.rs"]
+mod execution_observability;
+
 #[path = "tests/control_rpc.rs"]
 mod control_rpc;
 
@@ -89530,6 +89533,13 @@ async fn auxiliary_terminal_stream_accepts_late_usage_without_reopening_the_atte
     assert_eq!(started[0].status, "started");
     let metadata: serde_json::Value = serde_json::from_str(&started[0].usage_json).unwrap();
     assert_eq!(metadata["_pioneer_journal"]["connection_id"], "authority-a");
+    let prepared_attempt = metadata["physical_attempt_id"].as_str().unwrap().to_owned();
+    assert!(metadata["accounting"].is_object());
+    assert_eq!(
+        metadata["_pioneer_observation"]["context_manifest"]["layer"],
+        "application_canonical"
+    );
+    assert!(metadata["_pioneer_observation"]["timing"]["dispatch_at"].is_null());
     assert!(stream.next().await.unwrap().unwrap().is_final);
     assert_eq!(
         stream
@@ -89550,6 +89560,10 @@ async fn auxiliary_terminal_stream_accepts_late_usage_without_reopening_the_atte
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].status, "completed");
     let retained: pioneer_provider::TokenUsage = serde_json::from_str(&rows[0].usage_json).unwrap();
+    assert_eq!(
+        retained.physical_attempt_id.as_deref(),
+        Some(prepared_attempt.as_str())
+    );
     assert_eq!(retained.input_tokens, Some(10));
     assert_eq!(retained.output_tokens, Some(2));
     assert_eq!(

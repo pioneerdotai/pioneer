@@ -58,8 +58,29 @@ thread_local! {
 pub(crate) fn non_stream_request(
     builder: RequestBuilder,
     policy: ProviderTimeoutPolicy,
-) -> RequestBuilder {
-    builder.timeout(policy.non_stream_request_timeout)
+) -> ObservedRequestBuilder {
+    ObservedRequestBuilder(builder.timeout(policy.non_stream_request_timeout))
+}
+#[derive(Clone)]
+struct ObservedBody {
+    dispatch: crate::usage::transport::DispatchObservation,
+    started: std::time::Instant,
+}
+pub(crate) struct ObservedRequestBuilder(RequestBuilder);
+impl ObservedRequestBuilder {
+    pub(crate) async fn send(self) -> Result<Response> {
+        let observed = crate::usage::transport::before_send(&self.0).await?;
+        let dispatch_point = crate::usage::observation_point();
+        let started = std::time::Instant::now();
+        let mut response = self.0.send().await?;
+        if let Some(dispatch) = observed {
+            crate::usage::transport::headers_received(&dispatch, started.elapsed(), dispatch_point);
+            response
+                .extensions_mut()
+                .insert(ObservedBody { dispatch, started });
+        }
+        Ok(response)
+    }
 }
 
 pub(crate) fn stream_request(
@@ -77,8 +98,12 @@ pub(crate) async fn send_stream_request(
     builder: RequestBuilder,
     policy: ProviderTimeoutPolicy,
 ) -> Result<Response> {
-    let send = stream_request(builder, policy).send();
-    tokio::time::timeout(policy.first_chunk_timeout, send)
+    let builder = stream_request(builder, policy);
+    let observed = crate::usage::transport::before_send(&builder).await?;
+    let dispatch_point = crate::usage::observation_point();
+    let started = std::time::Instant::now();
+    let send = builder.send();
+    let mut response = tokio::time::timeout(policy.first_chunk_timeout, send)
         .await
         .map_err(|_| {
             anyhow!(
@@ -86,7 +111,14 @@ pub(crate) async fn send_stream_request(
                 policy.first_chunk_timeout
             )
         })?
-        .map_err(Into::into)
+        .map_err(anyhow::Error::from)?;
+    if let Some(dispatch) = observed {
+        crate::usage::transport::headers_received(&dispatch, started.elapsed(), dispatch_point);
+        response
+            .extensions_mut()
+            .insert(ObservedBody { dispatch, started });
+    }
+    Ok(response)
 }
 
 pub(crate) async fn read_response_bytes_bounded(
@@ -118,6 +150,7 @@ pub(crate) async fn read_response_bytes_bounded(
         .unwrap_or_default()
         .min(limit);
     let mut body = Vec::with_capacity(capacity);
+    let observation = response.extensions().get::<ObservedBody>().cloned();
     let mut byte_stream = response.bytes_stream();
     while let Some(chunk) = byte_stream.next().await {
         let chunk = chunk?;
@@ -136,6 +169,12 @@ pub(crate) async fn read_response_bytes_bounded(
         }
         body.extend_from_slice(chunk.as_ref());
     }
+    if let Some(observation) = observation {
+        crate::usage::transport::body_finished(
+            &observation.dispatch,
+            observation.started.elapsed(),
+        );
+    }
     Ok(body)
 }
 
@@ -152,6 +191,25 @@ pub(crate) async fn read_response_text_bounded(
 /// legacy text adapters use this boundary; successful responses never enter it.
 pub(crate) async fn provider_api_error(response: Response, provider: &str) -> anyhow::Error {
     let status = response.status();
+    let path = response.url().path();
+    let api = if path.ends_with("/messages") {
+        "messages"
+    } else if path.ends_with("/responses") {
+        "responses"
+    } else if path.ends_with("/converse") {
+        "bedrock_converse"
+    } else if path.ends_with(":generateContent") || path.ends_with(":streamGenerateContent") {
+        "generate_content"
+    } else if path.ends_with("/chat/completions") {
+        "chat_completions"
+    } else {
+        "unclassified"
+    };
+    let request_id = ["x-request-id", "request-id", "x-amzn-requestid"]
+        .into_iter()
+        .find_map(|key| {
+            crate::usage::native_id(response.headers().get(key).and_then(|v| v.to_str().ok()))
+        });
     let retry_after_ms = response
         .headers()
         .get(reqwest::header::RETRY_AFTER)
@@ -159,6 +217,16 @@ pub(crate) async fn provider_api_error(response: Response, provider: &str) -> an
         .and_then(|value| value.trim().parse::<u64>().ok())
         .map(|seconds| seconds.saturating_mul(1000));
     let result = read_response_text_bounded(response, 16 * 1024, "provider_error_body").await;
+    let observed = result
+        .as_ref()
+        .ok()
+        .and_then(|body| crate::usage::http_error_usage(body, api, request_id.as_deref()))
+        .or_else(|| {
+            request_id.map(|request_id| crate::TokenUsage {
+                request_id: Some(request_id),
+                ..Default::default()
+            })
+        });
     let (source, mut classification) = match result {
         Ok(body) => {
             let lower = body.to_ascii_lowercase();
@@ -199,11 +267,16 @@ pub(crate) async fn provider_api_error(response: Response, provider: &str) -> an
     };
     classification.http_status = Some(status.as_u16());
     classification.retry_after_ms = retry_after_ms.or(classification.retry_after_ms);
-    crate::failure::ProviderHttpFailure {
+    let error = crate::failure::ProviderHttpFailure {
         classification,
         source,
     }
-    .into()
+    .into();
+    if let Some(usage) = observed {
+        crate::usage::with_error_usage(error, &usage)
+    } else {
+        error
+    }
 }
 
 pub(crate) async fn read_response_json_bounded<T: DeserializeOwned>(
@@ -224,11 +297,12 @@ pub(crate) fn bounded_response_stream(
     component: &'static str,
 ) -> BoxStream<'static, Result<Bytes>> {
     let content_length = response.content_length();
+    let observation = response.extensions().get::<ObservedBody>().cloned();
     let byte_stream = response.bytes_stream();
     Box::pin(stream::unfold(
-        Some((byte_stream, 0usize)),
+        Some((byte_stream, 0usize, observation)),
         move |state| async move {
-            let Some((mut byte_stream, total)) = state else {
+            let Some((mut byte_stream, total, observation)) = state else {
                 return None;
             };
 
@@ -255,11 +329,21 @@ pub(crate) fn bounded_response_stream(
                             None,
                         ))
                     } else {
-                        Some((Ok(chunk), Some((byte_stream, observed))))
+                        Some((Ok(chunk), Some((byte_stream, observed, observation))))
                     }
                 }
                 Some(Err(error)) => Some((Err(error.into()), None)),
-                None => None,
+                None => {
+                    if let Some(observation) = observation {
+                        // The binding travels with the actual body into spawned
+                        // decoders. Recording cannot turn EOF into a retry.
+                        crate::usage::transport::body_finished(
+                            &observation.dispatch,
+                            observation.started.elapsed(),
+                        );
+                    }
+                    None
+                }
             }
         },
     ))

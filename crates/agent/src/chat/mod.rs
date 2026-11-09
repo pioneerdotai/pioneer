@@ -196,6 +196,7 @@ struct TurnCapabilityResolutionSummary {
 
 #[derive(Debug)]
 struct AgentRoundResponse {
+    observed_attempt_operation_id: Option<String>,
     round_id: String,
     messages: Vec<pioneer_provider::ProviderMessage>,
     ui_copies: Vec<pioneer_provider::ProviderRoundUiCopy>,
@@ -2394,11 +2395,69 @@ fn compiled_prompt_payload_from_delivery_plan(
     plan: &CompiledInstructionDeliveryPlan,
 ) -> CompiledPromptPayload {
     let bundle = &plan.bundle;
+    use sha2::{Digest, Sha256};
+    let sections=bundle.sections.iter().enumerate().take(64).map(|(ordinal,section)| {
+        let category=match section.id {
+            pioneer_promt::PromptSectionId::AgentsMd=>"instruction_files",
+            pioneer_promt::PromptSectionId::SelectedSkills|pioneer_promt::PromptSectionId::SkillsRuntimePrompt=>"skills",
+            pioneer_promt::PromptSectionId::MemoryRecall=>"memory_recall",
+            pioneer_promt::PromptSectionId::ThreadContext=>"thread_context",
+            pioneer_promt::PromptSectionId::Dynamic(_)=>"unclassified",
+            _=>"base_system",
+        };
+        let id=section.id.manifest_id();
+        let rendered=section.as_rendered_text();
+        let version=hex::encode(Sha256::digest(rendered.as_bytes()));
+        serde_json::json!({"source_id":id,"source_version":version,
+            "ordinal":ordinal,"category":category,"rendered_bytes":rendered.len(),"characters":rendered.chars().count(),
+            "estimated_text_tokens":pioneer_compaction::text_tokens(&rendered),"estimator_version":"pioneer_utf16_heuristic_v1",
+            "source_occurrences":section.sources.iter().take(16).map(|source|serde_json::json!({
+                "source_id_fingerprint":hex::encode(Sha256::digest(source.as_bytes())),
+                "source_version_fingerprint":version,"version_scope":"rendered_section_aggregate",
+                "compiler_source":bundle.source_manifest.iter().find(|entry|entry.path==*source).map(|entry|serde_json::json!({"status":entry.status,"characters":entry.chars})),
+                "source_reconstruction":"existing_source_policy_not_archived_here"})).collect::<Vec<_>>(),
+            "omitted_source_occurrences":section.sources.len().saturating_sub(16),
+            "included_in_provider_instructions":plan.provider_instructions.section_ids.contains(&id),
+            "footprint_inclusion":if plan.provider_instructions.section_ids.contains(&id){"provider_instruction_occurrence"}else{"nonadditive_bundle_reference"},
+            "footprint_basis":if plan.provider_instructions.section_ids.contains(&id){"actual_provider_instruction_delivery"}else{"turn_context_delivery_is_measured_in_message_occurrences_not_current_bundle"},
+            "delivery_policy":plan.sections.iter().find(|s|s.section_id==id),"source_reconstruction":"not_duplicated_in_manifest"})
+    }).collect::<Vec<_>>();
     CompiledPromptPayload {
+        observation_manifest: Some(
+            serde_json::json!({"version":1,"compiler_version":bundle.compiler_version,
+            "sections":sections,"omitted_sections":bundle.sections.len().saturating_sub(64),
+            "source_manifest_ref":bundle.fingerprint_full}),
+        ),
         stable_system_text: plan.provider_instructions.text.clone(),
         dynamic_system_text: String::new(),
         boundary_marker: bundle.boundary_marker.to_owned(),
         full_system_text: plan.provider_instructions.text.clone(),
+    }
+}
+
+// This metadata is serde-skipped by CompiledPromptPayload: it cannot change
+// replay fingerprints, disclosure order or the actual provider instructions.
+fn annotate_request_tool_observation(
+    request: &mut ChatRequest,
+    router: &pioneer_tools::ToolRouter,
+    reason: &str,
+) {
+    use sha2::{Digest, Sha256};
+    let origins=request.tools.iter().flatten().take(64).map(|tool| {
+        let configured=router.find_spec(&tool.name);
+        let skill=configured.and_then(|spec|spec.spec.permission_metadata.dynamic_skill.as_ref());
+        let kind=if skill.is_some(){"skill"}else if configured.is_some_and(|spec|matches!(&spec.payload_binding,pioneer_tools::ToolPayloadBinding::Mcp{..})){"mcp"}else if configured.is_some_and(|spec|matches!(&spec.output_projection,pioneer_tools::ToolOutputProjectionKind::Builtin)){"builtin"}else{"unclassified"};
+        let source=skill.map(|s|serde_json::json!({"id_fingerprint":hex::encode(Sha256::digest(s.skill_id.to_string().as_bytes())),"version":s.skill_fingerprint})).or_else(||configured.and_then(|spec|match &spec.payload_binding {
+            pioneer_tools::ToolPayloadBinding::Mcp{server_id,catalog_version,snapshot_version,..}=>Some(serde_json::json!({"id_fingerprint":hex::encode(Sha256::digest(server_id.as_bytes())),"version_fingerprint":hex::encode(Sha256::digest(catalog_version.as_bytes())),"snapshot_version":snapshot_version})),_=>None,
+        }));
+        (tool.name.clone(),serde_json::json!({"kind":kind,"source":source,"disclosure":"actual_selected_definition","plugin_origin":"unobserved"}))
+    }).collect::<serde_json::Map<_,_>>();
+    if let Some(prompt) = &mut request.compiled_prompt {
+        let observation = prompt
+            .observation_manifest
+            .get_or_insert_with(|| serde_json::json!({}));
+        observation["tool_origins"] = origins.into();
+        observation["definition_change_reason"] = reason.into();
     }
 }
 
@@ -4986,6 +5045,11 @@ async fn execute_agent_provider_response(
         },
     };
 
+    let mut observation_change_reason = if execution_checkpoint_context.is_some() {
+        "restore"
+    } else {
+        "initial_runtime_selection"
+    };
     let mut requested_tool_names = restored_requested_tool_names(
         execution_checkpoint_context.as_ref(),
         workspace_id,
@@ -5722,13 +5786,15 @@ async fn execute_agent_provider_response(
                     reasoning,
                     compiled_prompt: round_compiled_prompt,
                             };
-            let (request, receipt, restoration) = prepare_request_with_inventory(
+            let (mut request, receipt, restoration) = prepare_request_with_inventory(
                 context_session, request, event_tx.as_ref(), workspace_id, thread_id, turn_id,
             ).await.map_err(|error| (error, current_thinking_id.clone()))?;
             if let Some(message) = restoration {
                 retain_provider_history_message(&mut continuation_provider_history,
                     &mut next_provider_history_sequence, &message);
             }
+            annotate_request_tool_observation(&mut request,router.as_ref(),observation_change_reason);
+            observation_change_reason="runtime_selection_cause_unobserved";
             messages = request.messages.clone();
             if last_provider_reasoning_id.as_deref() == Some(current_thinking_id.as_str()) {
                 current_thinking_id = start_reasoning_item(
@@ -6593,6 +6659,7 @@ async fn execute_agent_provider_response(
             );
             messages.push(assistant_round);
 
+            let observed_attempt_parent=round.observed_attempt_operation_id.clone().unwrap_or_else(||format!("turn:{turn_id}"));
             let guarded_tool_calls = resolved_tool_calls
                 .into_iter()
                 .map(|(model_tool_call, item_id, ordinal)| {
@@ -6611,6 +6678,7 @@ async fn execute_agent_provider_response(
             let tool_tasks = guarded_tool_calls
                 .into_iter()
                 .map(|(model_tool_call, item_id, ordinal, no_progress_decision)| {
+                    let observation_parent=observed_attempt_parent.clone();
                     let router = router.clone();
                     let runtime = runtime.clone();
                     let turn_control = turn_control.clone();
@@ -6914,11 +6982,11 @@ async fn execute_agent_provider_response(
                             }
                         }
 
-                        let tool_call = match tool_parent.scope(router.build_model_tool_call(RawToolCall {
+                        let tool_call = match pioneer_provider::usage::scope_causal_parent(observation_parent.clone(),tool_parent.scope(router.build_model_tool_call(RawToolCall {
                             call_id: item_id.clone(),
                             tool_name: tool_name.clone(),
                             arguments: arguments.clone(),
-                        })).await {
+                        }))).await {
                             Ok(tool_call) => tool_call,
                             Err(error) => {
                                 let suppress_partial_unknown_tool_ui =
@@ -7037,11 +7105,13 @@ async fn execute_agent_provider_response(
 
                         let tool_correlation = tool_call.observation.correlation();
                         let tool_attempt_started = Instant::now();
-                        let dispatch_result = if runtime.router().computer_use_leaf(&tool_name).is_some() {
-                            runtime.execute_tool_call_with_deferred_delivery(tool_call, attempt_token.clone()).await
-                        } else {
-                            runtime.execute_tool_call_with_cancellation(tool_call, attempt_token.clone()).await
-                        };
+                        let dispatch_result = pioneer_provider::usage::scope_causal_parent(observation_parent,async {
+                            if runtime.router().computer_use_leaf(&tool_name).is_some() {
+                                runtime.execute_tool_call_with_deferred_delivery(tool_call, attempt_token.clone()).await
+                            } else {
+                                runtime.execute_tool_call_with_cancellation(tool_call, attempt_token.clone()).await
+                            }
+                        }).await;
                         let delivery = dispatch_result.as_ref().ok()
                             .and_then(|result| result.output.delivery_receipt())
                             .map(|receipt| NativeToolDelivery {
@@ -7335,11 +7405,12 @@ async fn execute_agent_provider_response(
             }
             window_stats.record_executed_tools(&executed_results);
 
-            apply_request_tools_results_to_visible_tools(
+            let disclosed=apply_request_tools_results_to_visible_tools(
                 &mut visible_tool_names,
                 &executed_results,
                 router.as_ref(),
             );
+            if !disclosed.is_empty(){observation_change_reason="request_tools";}
             record_requested_tool_names(&mut requested_tool_names, &executed_results);
 
             for result in &executed_results {
@@ -10472,6 +10543,7 @@ mod tests {
     #[test]
     fn exact_saved_system_snapshot_is_recovered_without_a_model_facing_user_event() {
         let prompt = pioneer_provider::CompiledPromptPayload {
+            observation_manifest: None,
             stable_system_text: "saved system bytes \n".to_owned(),
             dynamic_system_text: String::new(),
             boundary_marker: "saved boundary".to_owned(),

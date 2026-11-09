@@ -218,9 +218,19 @@ impl NativeContextSession {
             .lock()
             .map_err(|_| anyhow::anyhow!("native usage state unavailable"))?
             .clone();
-        let prepare = self
-            .controller
-            .prepare(&self.context, request, measurement, recovery);
+        let operation = pioneer_protocol::generate_id(21);
+        let started = chrono::Utc::now();
+        let mono = std::time::Instant::now();
+        let start_clock = pioneer_observability::work::clock_ms().checked_mul(1_000_000);
+        let prepare = async {
+            publish_preparation(&self.context, &operation, started, start_clock, None).await?;
+            pioneer_provider::usage::scope_causal_parent(
+                format!("item:{}:{operation}", self.context.turn_id),
+                self.controller
+                    .prepare(&self.context, request, measurement, recovery),
+            )
+            .await
+        };
         let work = async {
             if recovery {
                 let deadline = self.recovery_deadline.expect("validated recovery deadline");
@@ -240,8 +250,25 @@ impl NativeContextSession {
         let prepared = tokio::select! { biased;
             _ = self.context.cancellation.cancelled() => anyhow::bail!("native context preparation cancelled"),
             result = work => result,
-        }?;
-        Ok(prepared)
+        };
+        // A diagnostic terminal failure cannot repair the operation by running
+        // a paid compaction again. Its acknowledged start remains unconfirmed.
+        let settlement = publish_preparation(
+            &self.context,
+            &operation,
+            started,
+            start_clock,
+            Some((prepared.is_ok(), mono.elapsed())),
+        );
+        tokio::select! { biased;
+            _ = self.context.cancellation.cancelled() => {},
+            _ = async {
+                if recovery {
+                    let _ = tokio::time::timeout_at(self.recovery_deadline.expect("validated recovery deadline"), settlement).await;
+                } else { let _ = settlement.await; }
+            } => {},
+        }
+        prepared
     }
     pub fn provider_deadline(&self) -> Option<tokio::time::Instant> {
         self.recovery_active
@@ -273,6 +300,59 @@ impl NativeContextSession {
         self.context.cancellation.cancel();
         result
     }
+}
+
+async fn publish_preparation(
+    context: &NativeContext,
+    id: &str,
+    started: chrono::DateTime<chrono::Utc>,
+    start_clock: Option<u64>,
+    finished: Option<(bool, std::time::Duration)>,
+) -> Result<()> {
+    use pioneer_protocol::{
+        AgentDurableEvent, ItemCompletedNotification, ItemStartedNotification, SystemEventLevel,
+        TurnItem,
+    };
+    let item = TurnItem::SystemEvent {
+        id: id.into(),
+        level: SystemEventLevel::Info,
+        message: "Native context preparation".into(),
+        code: Some("runtime_operation".into()),
+        details: Some(
+            serde_json::json!({"operation_kind":"context_preparation","status":finished.map(|(ok,_)|if ok{"completed"}else{"failed"}).unwrap_or("started"),
+            "source_observation":pioneer_provider::usage::observation_point(),
+            "timing":{"prepared_at":started,"prepared_mono_ns":start_clock,"process_run_id":pioneer_observability::identity::run_identity().run_id,
+                "clock_domain":"observability_work_clock_v1","clock_resolution_ns":1_000_000,
+                "observation_finished_at":finished.map(|_|chrono::Utc::now()),
+                "observation_finished_mono_ns":finished.and_then(|_|pioneer_observability::work::clock_ms().checked_mul(1_000_000)),
+                "elapsed_ns":finished.map(|(_,duration)|duration.as_nanos().min(i64::MAX as u128) as i64),
+                "basis":"context_preparation_scope_including_initial_durable_ack"}}),
+        ),
+    };
+    let event = if finished.is_some() {
+        AgentDurableEvent::ItemCompleted {
+            notification: ItemCompletedNotification {
+                workspace_id: context.workspace_id.clone(),
+                thread_id: context.thread_id.clone(),
+                turn_id: context.turn_id.clone(),
+                item,
+            },
+        }
+    } else {
+        AgentDurableEvent::ItemStarted {
+            notification: ItemStartedNotification {
+                workspace_id: context.workspace_id.clone(),
+                thread_id: context.thread_id.clone(),
+                turn_id: context.turn_id.clone(),
+                item,
+            },
+        }
+    };
+    context
+        .events
+        .publish_durable_and_wait(event)
+        .await
+        .map_err(|_| anyhow::anyhow!("context preparation observation commit unconfirmed"))
 }
 
 impl std::fmt::Debug for NativeContextSession {

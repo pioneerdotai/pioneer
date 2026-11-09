@@ -57,7 +57,7 @@ pub(super) async fn make_summarizer(
         instance,
         selection,
         crate::cli_runtime::config::proxy_env(proxy.as_deref()),
-        Some((store.clone(), workspace.into())),
+        Some((store.clone(), workspace.into(), thread.into())),
         opencode_data_home,
     )
 }
@@ -66,7 +66,7 @@ fn make_cli_summarizer(
     instance: pioneer_config::EffectiveGatewayCliAgentRuntimeInstanceConfig,
     selection: ModelSelection,
     environment: pioneer_cli_agent_runtime::process::SensitiveEnvironment,
-    usage_scope: Option<(pioneer_crud::CrudStore, String)>,
+    usage_scope: Option<(pioneer_crud::CrudStore, String, String)>,
     opencode_data_home: Option<std::path::PathBuf>,
 ) -> Result<Arc<dyn Summarizer>> {
     ensure!(
@@ -144,7 +144,7 @@ enum CliService {
     OpenCode(crate::cli_runtime::opencode_session::OpenCodeSummaryService),
 }
 struct CliSummarizer {
-    usage_scope: Option<(pioneer_crud::CrudStore, String)>,
+    usage_scope: Option<(pioneer_crud::CrudStore, String, String)>,
     selection: ModelSelection,
     budget: ModelBudget,
     service: CliService,
@@ -375,13 +375,11 @@ impl Summarizer for CliSummarizer {
             ),
             ..Default::default()
         };
-        let call = if let Some((store, workspace)) = &self.usage_scope {
+        let call = if let Some((store, workspace, thread)) = &self.usage_scope {
             Some(
-                crate::usage_journal::Call::start(
-                    store, workspace, "summary", workspace, &observed,
-                )
-                .await
-                .map_err(failure)?,
+                crate::usage_journal::Call::start(store, workspace, "summary", thread, &observed)
+                    .await
+                    .map_err(failure)?,
             )
         } else {
             None
@@ -433,16 +431,20 @@ impl Summarizer for CliSummarizer {
         Ok(finish_cli_summary(&mut observed, text, input_tokens, output_tokens, &raw))
         }.await;
         if let Some(call) = call {
-            call.record(
-                if completion.is_ok() {
-                    "completed"
-                } else {
-                    "failed"
-                },
-                &observed,
-            )
-            .await
-            .map_err(failure)?;
+            if call
+                .record(
+                    if completion.is_ok() {
+                        "completed"
+                    } else {
+                        "failed"
+                    },
+                    &observed,
+                )
+                .await
+                .is_err()
+            {
+                tracing::warn!("external summary usage settlement commit unconfirmed");
+            }
         }
         completion
     }

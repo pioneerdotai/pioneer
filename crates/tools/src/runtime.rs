@@ -506,6 +506,7 @@ impl ToolCallRuntime {
                     Phase::Output,
                     &pioneer_observability::scenario::Correlation::capture(),
                 );
+                trace.emit_stage(1, "output.projection.started", None, None);
                 let raw_output_text = output.raw_output_text();
                 let raw_output_json = output.raw_output_json();
                 let arguments = payload_arguments_json(&call.payload);
@@ -525,6 +526,23 @@ impl ToolCallRuntime {
                 } else {
                     project_tool_result(projection_input)
                 };
+                let prepared_source_bytes = match &raw_output_json {
+                    serde_json::Value::String(text) => text.len(),
+                    serde_json::Value::Null => raw_output_text.len(),
+                    value => serialized_size(value, false),
+                };
+                trace.record_output_sizes(
+                    raw_output_text.len(),
+                    prepared_source_bytes,
+                    match &projection.llm_view {
+                        crate::output_policy::ToolResultView::Text { text, .. } => text.len(),
+                        crate::output_policy::ToolResultView::Json { value, .. } => {
+                            serialized_size(value, true)
+                        }
+                        crate::output_policy::ToolResultView::Empty => 0,
+                    },
+                );
+                trace.emit_stage(1, "output.projection.completed", None, None);
                 crate::observation::output_completeness(&mut output_observation, &projection);
                 output_observation.units(
                     pioneer_observability::tool_call::Unit::OutputBytes,
@@ -1572,4 +1590,25 @@ mod tests {
             tokio_runtime.block_on(body);
         }
     }
+}
+
+// Count already prepared representations without allocating another full output.
+fn serialized_size(value: &serde_json::Value, pretty: bool) -> usize {
+    struct Counter(usize);
+    impl std::io::Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.saturating_add(bytes.len());
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut count = Counter(0);
+    let result = if pretty {
+        serde_json::to_writer_pretty(&mut count, value)
+    } else {
+        serde_json::to_writer(&mut count, value)
+    };
+    if result.is_ok() { count.0 } else { 0 } // Value serialization is infallible for this writer.
 }

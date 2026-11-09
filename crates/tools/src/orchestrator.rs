@@ -285,6 +285,7 @@ impl ToolOrchestrator {
         intent: &PermissionIntent,
         key: &crate::PermissionRequestKey,
         reason: PermissionDecisionReason,
+        trace: &ToolEventTrace,
     ) -> PermissionApprovalResolution {
         use pioneer_observability::{
             scenario::Correlation,
@@ -294,6 +295,7 @@ impl ToolOrchestrator {
         let wait = pioneer_observability::live::WaitGuard::new(
             pioneer_observability::live::WaitKind::UserOrProvider,
         );
+        trace.emit_stage(invocation.attempt_id, "approval.wait.started", None, None);
         let resolution = tokio::select! {
             biased;
             _ = invocation.cancellation.cancelled() => {
@@ -307,6 +309,7 @@ impl ToolOrchestrator {
                 reason,
             ) => resolution,
         };
+        trace.emit_stage(invocation.attempt_id, "approval.wait.completed", None, None);
         drop(wait);
         observation.finish(match &resolution {
             PermissionApprovalResolution::Cancelled => Fact::Cancelled,
@@ -427,9 +430,15 @@ impl ToolOrchestrator {
         trace: &ToolEventTrace,
         permission_context: &PermissionEvaluationContext,
     ) -> Result<AnyToolResult, ToolError> {
-        crate::observation::measure(
-            pioneer_observability::tool_call::Phase::Attempt,
-            self.run_observed_attempt(registry, invocation, trace, permission_context),
+        pioneer_provider::usage::scope_causal_parent(
+            format!("tool:{}:{}:1", trace.turn_id(), trace.tool_call_id()),
+            crate::observation::scope_trace(
+                trace.clone(),
+                crate::observation::measure(
+                    pioneer_observability::tool_call::Phase::Attempt,
+                    self.run_observed_attempt(registry, invocation, trace, permission_context),
+                ),
+            ),
         )
         .await
     }
@@ -992,6 +1001,7 @@ impl ToolOrchestrator {
                         &intent,
                         &key,
                         reason,
+                        trace,
                     )
                     .await;
                 match resolution {
@@ -1178,6 +1188,7 @@ impl ToolOrchestrator {
                 &intent,
                 &key,
                 PermissionDecisionReason::SandboxDenied,
+                trace,
             )
             .await;
 
@@ -1366,6 +1377,7 @@ impl ToolOrchestrator {
                 &intent,
                 &key,
                 PermissionDecisionReason::SandboxDenied,
+                trace,
             )
             .await;
 

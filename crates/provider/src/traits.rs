@@ -74,6 +74,15 @@ pub trait Provider: Send + Sync {
         Ok(crate::catalog::model_catalog()?.limits(self.name(), model))
     }
 
+    /// Exact embeddings adapter route; absence never inherits a chat endpoint.
+    fn embedding_usage_profile(&self) -> crate::ProviderUsageProfile {
+        crate::ProviderUsageProfile {
+            api: "embeddings".into(),
+            api_version: None,
+            route: None,
+        }
+    }
+
     /// Optional authority-owned model facts, including usage accounting evidence.
     /// When present, the owning provider also decides `model_tool_calling`;
     /// wrappers must not substitute public facts for that model decision.

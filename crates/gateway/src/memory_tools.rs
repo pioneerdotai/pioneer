@@ -884,9 +884,11 @@ impl AgentMemoryPostTurnExtractorProvider for GatewayMemoryProvider {
         // existing providers reject optional output parameters). Known limits
         // use the supported ChatRequest field, capped to remaining context.
         let max_output_tokens = limits.max_output.and(output_budget);
-        let raw_json =
-            request_post_turn_extractor_json(provider.as_ref(), model, prompt, max_output_tokens)
-                .await?;
+        let raw_json = pioneer_provider::usage::scope_causal_parent(
+            format!("turn:{}", context.turn_id),
+            request_post_turn_extractor_json(provider.as_ref(), model, prompt, max_output_tokens),
+        )
+        .await?;
         if raw_json.len() > MAX_POST_TURN_EXTRACTOR_FRESH_RAW_BYTES {
             return Err(memory_extractor_hook_error(
                 "memory.post_turn_extractor.response_too_large",

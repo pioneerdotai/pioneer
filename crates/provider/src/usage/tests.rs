@@ -50,6 +50,10 @@ fn gemini_candidates_and_thoughts_are_separate_from_inclusive_total() {
     assert_eq!(u.reported_total_tokens, Some(159));
     assert_eq!(
         decode::<3>(json!({"candidatesTokenCount":0})).output_tokens,
+        None
+    );
+    assert_eq!(
+        decode::<3>(json!({"candidatesTokenCount":0,"thoughtsTokenCount":0})).output_tokens,
         Some(0)
     );
     assert_eq!(decode::<3>(json!({})).output_tokens, None);
@@ -147,13 +151,18 @@ fn tariff_absence_cache_units_tiers_and_non_token_charges_are_not_free() {
 }
 #[test]
 fn provider_cost_is_not_overwritten_by_estimate_or_unknown_tariff() {
-    let u = decode::<0>(
+    let mut u = decode::<0>(
         json!({"prompt_tokens":100,"completion_tokens":10,"cost":0.4,
         "cost_details":{"upstream_inference_cost":0.3}}),
     );
     let result = accounting(&u, "openrouter", "unknown", None);
     assert_eq!(result["reported_cost"]["amount"], 0.4);
-    assert_eq!(result["reported_cost"]["currency"], "credits");
+    assert!(result["reported_cost"]["currency"].is_null());
+    u.route = route(crate::providers::openrouter::BASE_URL, "/chat/completions");
+    assert_eq!(
+        accounting(&u, "openrouter", "unknown", None)["reported_cost"]["currency"],
+        "credits"
+    );
     assert!(result["estimated_cost"].is_null());
     assert_eq!(result["price_status"], "unknown_tariff");
     let catalog = crate::catalog::ModelCatalog::parse(
@@ -368,8 +377,15 @@ fn billing_context(
     model: &str,
     catalog: std::sync::Arc<crate::catalog::ModelCatalog>,
 ) -> UsageContext {
+    let diagnostic_losses = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     UsageContext {
         provider: provider.into(),
+        captured_at: chrono::Utc::now(),
+        transport_observations: transport::BodyObservations::new(diagnostic_losses.clone()),
+        diagnostic_losses,
+        requested_modalities: Vec::new(),
+        adapter_conditions: std::sync::Arc::new(std::sync::Mutex::new(json!({}))),
+        authority: None,
         model: model.into(),
         api: "chat_completions".into(),
         api_version: None,
@@ -438,7 +454,7 @@ fn documented_auto_selected_model_and_captured_snapshot_determine_estimate() {
     context.enrich(&mut usage);
     let a = usage.accounting.as_ref().unwrap();
     assert_eq!(a["pricing_eligibility"]["billing_model"], "B");
-    assert_eq!(a["pricing"]["cost"]["input"], 20.);
+    assert_eq!(a["pricing"]["cost"]["input"], "20");
     assert_eq!(a["catalog_snapshot"], original.snapshot_id());
     assert_ne!(a["catalog_snapshot"], replacement.snapshot_id());
     assert!((a["estimated_cost"]["amount"].as_f64().unwrap() - 0.0022).abs() < 1e-10);
@@ -654,6 +670,8 @@ fn vercel_responses_fixed_tariff_is_estimated_but_conditional_tariffs_are_not() 
     let base = "https://ai-gateway.vercel.sh/v1";
     for pricing in [
         json!({"input":"0.000002","output":"0.000006"}),
+        json!({"input":"0.000002","output":"0.000006","varies_by_provider":false}),
+        json!({"input":"0.000002","output":"0.000006","input_cache_read":"0.0000002","input_cache_write":"0.0000025"}),
         json!({"input":"0.000002","output":"0.000006","varies_by_provider":true}),
         json!({"input":"0.000002","output":"0.000006","input_tiers":[{"threshold":1000,"price":"0.000004"}]}),
     ] {
@@ -682,10 +700,24 @@ fn vercel_responses_fixed_tariff_is_estimated_but_conditional_tariffs_are_not() 
             Some(&catalog),
         );
         assert_eq!(evidence["pricing"]["source"]["raw"], pricing);
-        if pricing.as_object().unwrap().len() == 2 {
+        if pricing.get("input_tiers").is_none() && pricing["varies_by_provider"] != true {
             assert!(
                 (evidence["estimated_cost"]["amount"].as_f64().unwrap() - 0.00032).abs() < 1e-10
             );
+            if pricing.get("input_cache_read").is_some() {
+                let mut cached = usage.clone();
+                cached.cache_read_input_tokens = Some(50);
+                cached.cache_write_input_tokens = Some(20);
+                assert_eq!(
+                    accounting(
+                        &cached,
+                        "vercel-ai-gateway",
+                        "fixture/priced",
+                        Some(&catalog)
+                    )["estimated_cost"]["amount_decimal"],
+                    "0.00024"
+                );
+            }
             let mut partial = usage.clone();
             partial.output_tokens = None;
             assert!(
@@ -809,8 +841,15 @@ fn chat_cached_aliases_preserve_inclusive_input_and_explicit_zero() {
 }
 
 fn native_chat_context(provider: &str, base: &str) -> UsageContext {
+    let diagnostic_losses = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     UsageContext {
         provider: provider.into(),
+        captured_at: chrono::Utc::now(),
+        transport_observations: transport::BodyObservations::new(diagnostic_losses.clone()),
+        diagnostic_losses,
+        requested_modalities: Vec::new(),
+        adapter_conditions: std::sync::Arc::new(std::sync::Mutex::new(json!({}))),
+        authority: None,
         model: "fixture".into(),
         api: "chat_completions".into(),
         api_version: None,
@@ -1225,4 +1264,351 @@ fn cli_evidence_is_bounded_through_update_without_widening_api_usage() {
             .get("cli_statistics")
             .is_none()
     );
+}
+
+#[test]
+fn structured_historical_tariff_boundary_and_legacy_alias_use_explicit_threshold() {
+    // Catalog evidence uses a misleading legacy name alongside a 272000 tier.
+    let mut rates = json!({"input":2,"output":10,"cache_read":0.1,"cache_write":2.5,
+        "tiers":[{"tier":{"type":"context","size":272000},
+            "input":4,"output":15,"cache_read":0.2,"cache_write":5}],
+        "context_over_200k":{"input":4,"output":15,"cache_read":0.2,"cache_write":5}});
+    for (input, expected, threshold) in [
+        (272000, "0.544", Value::Null),
+        (272001, "1.088004", json!(272000)),
+    ] {
+        let usage = TokenUsage {
+            input_tokens: Some(input),
+            output_tokens: Some(0),
+            cache_read_input_tokens: Some(0),
+            cache_write_input_tokens: Some(0),
+            ..Default::default()
+        };
+        let result = estimate(&usage, &rates, &metadata()).unwrap();
+        assert_eq!(result["amount_decimal"], expected);
+        assert_eq!(result["input_tokens_above"], threshold);
+    }
+    rates["tiers"][0]["inputTokensAbove"] = json!(200000);
+    let result = guarded_resolution(
+        &TokenUsage {
+            input_tokens: Some(300000),
+            ..Default::default()
+        },
+        &rates,
+        &metadata(),
+    )
+    .unwrap();
+    assert_eq!(result["status"], "unresolved");
+    assert_eq!(result["reasons"][0], "conflicting_tier_thresholds");
+}
+
+#[test]
+fn partial_cost_keeps_known_subtotal_and_decimal_lines_without_reasoning_double_charge() {
+    let usage = TokenUsage {
+        input_tokens: Some(130),
+        output_tokens: Some(20),
+        reasoning_tokens: Some(10),
+        cache_read_input_tokens: Some(100),
+        cache_write_input_tokens: Some(20),
+        ..Default::default()
+    };
+    let rates = json!({"input":2,"output":10,"cache_read":0.1});
+    let result = guarded_resolution(&usage, &rates, &metadata()).unwrap();
+    assert_eq!(result["status"], "partial");
+    assert_eq!(result["known_subtotal_decimal"], "0.00023");
+    assert_eq!(result["reasons"][0]["meter"], "cacheWrite");
+    assert!(estimate(&usage, &rates, &metadata()).is_none());
+    let inconsistent = TokenUsage {
+        reasoning_tokens: Some(21),
+        ..usage
+    };
+    assert_eq!(
+        guarded_resolution(&inconsistent, &rates, &metadata()).unwrap()["reasons"][0],
+        "inconsistent_usage"
+    );
+}
+
+#[test]
+fn explicit_zero_rates_are_known_but_conflicting_aliases_and_missing_usage_are_not() {
+    let usage = TokenUsage {
+        input_tokens: Some(1),
+        output_tokens: Some(1),
+        cache_read_input_tokens: Some(0),
+        cache_write_input_tokens: Some(0),
+        ..Default::default()
+    };
+    assert_eq!(
+        estimate(&usage, &json!({"input":0,"output":0}), &metadata()).unwrap()["amount_decimal"],
+        "0"
+    );
+    let conflict = guarded_resolution(
+        &usage,
+        &json!({"input":1,"output":1,"cacheRead":0.1,"cache_read":0.2}),
+        &metadata(),
+    )
+    .unwrap();
+    assert_ne!(conflict["status"], "complete");
+    assert!(
+        estimate(
+            &TokenUsage::default(),
+            &json!({"input":0,"output":0}),
+            &metadata()
+        )
+        .is_none()
+    );
+    for invalid in [json!(-1), json!(1.5), json!(true)] {
+        let usage = decode::<0>(json!({"prompt_tokens":invalid,"completion_tokens":0}));
+        assert_eq!(usage_coverage(&usage)["status"], "inconsistent");
+        assert_eq!(
+            guarded_resolution(&usage, &json!({"input":1,"output":1}), &metadata()).unwrap()["reasons"]
+                [0],
+            "inconsistent_usage"
+        );
+    }
+}
+
+#[test]
+fn application_manifest_is_order_sensitive_and_contains_no_source_payload() {
+    let mut request = crate::ChatRequest {
+        model: "fixture".into(),
+        messages: vec![crate::ChatMessage::user("PRIVATE USER CONTENT")],
+        temperature: None,
+        max_tokens: Some(100),
+        tools: Some(vec![
+            crate::ToolDefinition {
+                name: "first".into(),
+                description: "PRIVATE TOOL DESCRIPTION".into(),
+                parameters: json!({}),
+            },
+            crate::ToolDefinition {
+                name: "second".into(),
+                description: String::new(),
+                parameters: json!({}),
+            },
+        ]),
+        tool_choice: None,
+        parallel_tool_calls: None,
+        reasoning: None,
+        compiled_prompt: None,
+    };
+    request.messages[0]
+        .content_parts
+        .push(crate::MessageContentPart::image(
+            crate::MessageAttachment::from_url(
+                "https://PRIVATE.invalid/image?secret=PRIVATE",
+                "image/png",
+            ),
+        ));
+    request.messages[0].provider_replay_state = Some(crate::ProviderReplayState::for_model(
+        "fixture",
+        "fixture",
+        json!({"opaque":"PRIVATE_OPAQUE_DATA"}),
+    ));
+    let before = request_manifest(&request).unwrap();
+    assert_eq!(before["layer"], "application_canonical");
+    assert!(before["rendered_definitions_hash"].is_null());
+    assert!(
+        before["entries"][0]["estimated_text_tokens"]
+            .as_u64()
+            .is_some()
+    );
+    assert!(before["entries"][0]["media_estimated_tokens"].is_null());
+    assert_eq!(before["entries"][0]["opaque_replay_present"], true);
+    assert_eq!(before["entries"][0]["content_parts_count"], 1);
+    assert!(!before.to_string().contains("PRIVATE"));
+    request.tools.as_mut().unwrap().reverse();
+    let after = request_manifest(&request).unwrap();
+    assert_ne!(
+        before["ordered_canonical_definitions_hash"],
+        after["ordered_canonical_definitions_hash"]
+    );
+    request.messages = vec![crate::ChatMessage::user("x"); 1000];
+    let bounded = request_manifest(&request).unwrap();
+    assert_eq!(
+        bounded["omitted_message_entries"].as_u64().unwrap()
+            + bounded["entries"].as_array().unwrap().len() as u64,
+        1000
+    );
+    assert!(bounded.to_string().len() <= 12 * 1024);
+    assert_eq!(bounded["coverage"], "partial");
+}
+
+#[test]
+fn openrouter_historical_overrides_use_strict_threshold_order_and_inherited_rates() {
+    let mut meta = metadata();
+    meta.insert(
+        "pricingSource".into(),
+        json!({"url":"https://openrouter.ai/api/v1/models","units":"USD_per_token",
+        "raw":{"prompt":"0.000002","completion":"0.00001","overrides":[
+            {"min_prompt_tokens":272000,"prompt":"0.000004"},
+            {"min_prompt_tokens":272000,"completion":"0.000015"}]}}),
+    );
+    for (input, expected) in [(272000, "0.54401"), (272001, "1.088019")] {
+        let usage = TokenUsage {
+            input_tokens: Some(input),
+            output_tokens: Some(1),
+            cache_read_input_tokens: Some(0),
+            cache_write_input_tokens: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(
+            estimate(&usage, &json!({}), &meta).unwrap()["amount_decimal"],
+            expected
+        );
+    }
+    meta.get_mut("pricingSource").unwrap()["raw"]["overrides"][0]["utc_start"] = json!(1200);
+    assert!(
+        estimate(
+            &TokenUsage {
+                input_tokens: Some(300000),
+                ..Default::default()
+            },
+            &json!({}),
+            &meta
+        )
+        .is_none()
+    );
+}
+
+#[test]
+fn retained_decimal_amounts_handle_small_reported_values_without_float_summation() {
+    assert_eq!(
+        add_decimal_amounts("1e-9", "0.000000002").as_deref(),
+        Some("0.000000003")
+    );
+    assert_eq!(add_decimal_amounts("0", "0").as_deref(), Some("0"));
+    assert!(add_decimal_amounts("-1", "2").is_none());
+    assert!(add_decimal_amounts("1e-30", "0").is_none());
+    let tiny: Value = serde_json::from_str("1e-999").unwrap();
+    let usage = decode::<0>(json!({"cost":tiny,"currency":"USD"}));
+    let accounting = accounting(&usage, "fixture", "fixture", None);
+    assert!(accounting["reported_cost"]["amount"].is_number());
+    assert!(accounting["reported_cost"]["amount_decimal"].is_null());
+    assert_eq!(
+        accounting["reported_cost"]["unresolved_reason"],
+        "unsupported_reported_decimal_precision_or_range"
+    );
+    assert_eq!(accounting["selected_cost"]["basis"], "provider_reported");
+}
+
+#[test]
+fn started_only_has_no_known_subtotal_and_retention_does_not_poison_known_output() {
+    let rates = json!({"input":2,"output":10,"cacheRead":0.1,"cacheWrite":2.5});
+    let absent = guarded_resolution(&TokenUsage::default(), &rates, &metadata()).unwrap();
+    assert_eq!(absent["status"], "unresolved");
+    assert!(absent["known_subtotal_decimal"].is_null());
+    let mut usage = TokenUsage {
+        input_tokens: Some(100),
+        uncached_input_tokens: Some(20),
+        cache_read_input_tokens: Some(30),
+        cache_write_input_tokens: Some(50),
+        output_tokens: Some(10),
+        raw_usage: Some(
+            json!({"cache_creation":{"ephemeral_5m_input_tokens":10,"ephemeral_1h_input_tokens":40}}),
+        ),
+        ..Default::default()
+    };
+    let partial = guarded_resolution(&usage, &rates, &metadata()).unwrap();
+    assert_eq!(partial["status"], "partial");
+    assert_eq!(partial["known_subtotal_decimal"], "0.000143");
+    assert!(
+        partial["lines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|line| line["meter"] != "cacheWrite")
+    );
+    usage.cache_write_input_tokens = Some(49);
+    let inconsistent = guarded_resolution(&usage, &rates, &metadata()).unwrap();
+    assert_eq!(inconsistent["status"], "unresolved");
+    assert_eq!(inconsistent["reasons"][0], "inconsistent_usage");
+}
+
+#[test]
+fn retained_decimal_evidence_and_unknown_conditions_cannot_be_flattened_to_base_total() {
+    let raw =
+        r#"{"cost":{"input":0.123456789012,"output":1},"source":{"raw":{"input":0.123456789012}}}"#;
+    let retained = tariff::lossless_evidence(raw).unwrap();
+    assert_eq!(retained["cost"]["input"], "0.123456789012");
+    let usage = TokenUsage {
+        input_tokens: Some(1),
+        uncached_input_tokens: Some(1),
+        output_tokens: Some(0),
+        cache_read_input_tokens: Some(0),
+        cache_write_input_tokens: Some(0),
+        ..Default::default()
+    };
+    let estimate = tariff::resolve(&usage, &retained["cost"]);
+    assert_eq!(estimate["known_subtotal_decimal"], "0.000000123456789012");
+    let mut meta = metadata();
+    meta.insert(
+        "pricingSource".into(),
+        json!({"raw":{"input":2,"region_adjustment":{"factor":3}}}),
+    );
+    let unresolved = guarded_resolution(&usage, &json!({"input":2,"output":1}), &meta).unwrap();
+    assert_eq!(unresolved["status"], "unresolved");
+    assert!(unresolved["known_subtotal_decimal"].is_null());
+}
+
+#[test]
+fn retained_contract_recalculates_old_attempt_after_replacement_and_preserves_conditions() {
+    let old = billing_context("openai", "A", billing_catalog("openai", 2.));
+    let initial = old.initial_usage();
+    let evidence = initial.accounting.as_ref().unwrap()["pricing"].clone();
+    let replacement = billing_context("openai", "A", billing_catalog("openai", 9.));
+    let mut partial = billing_usage();
+    old.enrich(&mut partial);
+    let mut next = billing_usage();
+    replacement.enrich(&mut next);
+    assert_eq!(
+        partial.accounting.as_ref().unwrap()["cost_resolution"]["known_subtotal_decimal"],
+        "0.00022"
+    );
+    assert_eq!(
+        next.accounting.as_ref().unwrap()["cost_resolution"]["known_subtotal_decimal"],
+        "0.00099"
+    );
+    let reopened: Value = serde_json::from_str(&serde_json::to_string(&evidence).unwrap()).unwrap();
+    assert_eq!(
+        resolve_retained_tariff(&partial, &reopened)["known_subtotal_decimal"],
+        "0.00022"
+    );
+    partial.accounting.as_mut().unwrap()["adapter_conditions"] =
+        json!({"requested_service_tier":"priority"});
+    assert_eq!(
+        resolve_retained_tariff(&partial, &reopened)["reasons"][0],
+        "effective_service_tier_unconfirmed"
+    );
+    partial.service_tier = Some("priority".into());
+    assert_eq!(
+        resolve_retained_tariff(&partial, &reopened)["reasons"][0],
+        "unsupported_effective_service_tier"
+    );
+    partial.service_tier = None;
+    partial.accounting.as_mut().unwrap()["adapter_conditions"] =
+        json!({"prompt_cache_retention":"24h"});
+    assert_eq!(
+        resolve_retained_tariff(&partial, &reopened)["reasons"][0],
+        "unsupported_requested_cache_retention_contract"
+    );
+}
+
+#[test]
+fn embedding_manifest_preserves_order_occurrences_and_bounded_content_free_sizes() {
+    let request =
+        crate::EmbeddingRequest::new("fixture", vec!["PRIVATE_ONE".into(), "PRIVATE_TWO".into()]);
+    let first = embedding_request_manifest(&request).unwrap();
+    let reversed =
+        crate::EmbeddingRequest::new("fixture", vec!["PRIVATE_TWO".into(), "PRIVATE_ONE".into()]);
+    let second = embedding_request_manifest(&reversed).unwrap();
+    assert_ne!(
+        first["ordered_inputs_fingerprint"],
+        second["ordered_inputs_fingerprint"]
+    );
+    assert_eq!(first["entries"][0]["text_bytes"], 11);
+    assert!(!first.to_string().contains("PRIVATE"));
+    let repeated = crate::EmbeddingRequest::new("fixture", vec!["same source".into(); 1024]);
+    let bounded = embedding_request_manifest(&repeated).unwrap();
+    assert!(bounded["omitted_component_entries"].as_u64().unwrap() > 0);
+    assert!(serde_json::to_vec(&bounded).unwrap().len() <= 12 * 1024);
 }

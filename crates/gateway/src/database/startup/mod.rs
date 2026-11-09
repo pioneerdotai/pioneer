@@ -1,5 +1,6 @@
 mod authorization_integrity_audit;
 mod execution_authority_integrity;
+mod execution_observability;
 mod html_preview_io;
 mod task_child_work_seed;
 pub(crate) mod thread_episodic_workspace_capsule_refill;
@@ -460,6 +461,13 @@ async fn run_inner(
         }
         failed = true;
         tracing::warn!("HTML preview IO seed deferred; compatibility discovery retained");
+    }
+    if let Err(error) = execution_observability::run(crud_store.as_ref()).await {
+        if is_maintenance_cancelled(&error) {
+            return Err(error);
+        }
+        failed = true;
+        tracing::warn!("execution observation legacy backfill incomplete");
     }
     run_stage!(
         pioneer_observability::GatewayOperationStage::DatabaseTurnEventProjectionBackfill,

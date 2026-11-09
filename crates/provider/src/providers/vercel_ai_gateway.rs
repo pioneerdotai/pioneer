@@ -51,6 +51,15 @@ impl std::fmt::Display for SafeFailure {
 }
 impl std::error::Error for SafeFailure {}
 fn safe_decode(error: anyhow::Error) -> anyhow::Error {
+    let usage = crate::usage::error_usage(&error).cloned();
+    let error = safe_decode_cause(error);
+    if let Some(usage) = usage {
+        crate::usage::with_error_usage(error, &usage)
+    } else {
+        error
+    }
+}
+fn safe_decode_cause(error: anyhow::Error) -> anyhow::Error {
     if error
         .downcast_ref::<crate::ProviderResponseTooLarge>()
         .is_some()
@@ -253,16 +262,25 @@ impl VercelAiGatewayProvider {
             .send()
             .await
             .map_err(|error| {
+                let Some(transport) = error.downcast_ref::<reqwest::Error>() else {
+                    return error;
+                };
                 let mut facts = ProviderFailureClassification::new(
                     pioneer_protocol::ProviderFailureClass::NetworkTransient,
                 );
                 facts.is_network_error = true;
-                facts.http_status = error.status().map(|s| s.as_u16());
-                SafeFailure(facts)
+                facts.http_status = transport.status().map(|s| s.as_u16());
+                anyhow::Error::from(SafeFailure(facts))
             })?;
         if response.status().is_success() {
             return Ok(response);
         }
+        let request_id = crate::usage::native_id(
+            response
+                .headers()
+                .get("x-request-id")
+                .and_then(|v| v.to_str().ok()),
+        );
         let status = response.status().as_u16();
         let retry = response
             .headers()
@@ -289,7 +307,15 @@ impl VercelAiGatewayProvider {
         let mut facts = ProviderFailureClassification::new(class);
         facts.http_status = Some(status);
         facts.retry_after_ms = retry;
-        Err(SafeFailure(facts).into())
+        let usage = embedding
+            .then(|| crate::usage::http_error_usage(&body, "embeddings", request_id.as_deref()))
+            .flatten();
+        let error = SafeFailure(facts).into();
+        Err(if let Some(usage) = usage {
+            crate::usage::with_error_usage(error, &usage)
+        } else {
+            error
+        })
     }
     async fn discovery(&self) -> Result<Value> {
         let response = self
@@ -617,6 +643,14 @@ fn model_info(raw: &Value, model: &crate::catalog::CatalogModel) -> ProviderMode
 
 #[async_trait]
 impl Provider for VercelAiGatewayProvider {
+    fn embedding_usage_profile(&self) -> crate::ProviderUsageProfile {
+        crate::ProviderUsageProfile {
+            api: "embeddings".into(),
+            api_version: None,
+            route: crate::usage::route(&self.root, "/embeddings"),
+        }
+    }
+
     fn name(&self) -> &str {
         NAME
     }
@@ -773,19 +807,32 @@ impl Provider for VercelAiGatewayProvider {
         )
         .await
         .map_err(safe_decode)?;
+        // Preserve the lexical JSON amount, including values outside the
+        // calculator's supported range. Float underflow must never create zero.
         let reported_cost = parsed.provider_metadata["gateway"]["cost"]
             .as_str()
-            .and_then(|value| value.parse::<f64>().ok())
-            .or_else(|| parsed.provider_metadata["gateway"]["cost"].as_f64())
-            .filter(|value| value.is_finite() && *value >= 0.0);
-        let mut result = parsed.indexed.into_response(count).map_err(safe_decode)?;
-        if reported_cost.is_some() && result.usage.is_none() {
-            result.usage = Some(crate::TokenUsage {
+            .and_then(|value| serde_json::from_str::<Value>(value).ok())
+            .or_else(|| {
+                parsed.provider_metadata["gateway"]["cost"]
+                    .as_number()
+                    .map(|number| Value::Number(number.clone()))
+            })
+            .filter(|value| value.is_number() && !value.to_string().starts_with('-'));
+        let reported_decimal = reported_cost
+            .as_ref()
+            .and_then(|value| crate::usage::add_decimal_amounts("0", &value.to_string()));
+        let result = parsed.indexed.into_response(count).map_err(safe_decode);
+        let mut usage = match &result {
+            Ok(response) => response.usage.clone(),
+            Err(error) => crate::usage::error_usage(error).cloned(),
+        };
+        if reported_cost.is_some() && usage.is_none() {
+            usage = Some(crate::TokenUsage {
                 output_tokens: Some(0),
                 ..Default::default()
             });
         }
-        if let Some(usage) = &mut result.usage {
+        if let Some(usage) = &mut usage {
             *usage = usage.clone().with_reported_model(parsed.model.as_deref());
             usage.request_id = request_id;
             usage.api = Some("embeddings".into());
@@ -793,11 +840,21 @@ impl Provider for VercelAiGatewayProvider {
             let mut accounting =
                 crate::usage::accounting_with_entry(usage, NAME, &model_id, None, entry.as_ref());
             if let Some(amount) = reported_cost {
-                accounting["reported_cost"] = json!({"amount":amount,"currency":"USD","provenance":"provider_metadata.gateway.cost"});
+                accounting["reported_cost"] = json!({"amount":amount,"amount_lexical":amount.to_string(),"amount_decimal":reported_decimal,"unresolved_reason":reported_decimal.is_none().then_some("unsupported_reported_decimal_precision_or_range"),"currency":(self.root==BASE_URL).then_some("USD"),"provenance":"provider_metadata.gateway.cost"});
             }
             usage.accounting = Some(accounting);
         }
-        Ok(result)
+        match result {
+            Ok(mut result) => {
+                result.usage = usage;
+                Ok(result)
+            }
+            Err(error) => Err(if let Some(usage) = usage {
+                crate::usage::with_error_usage(error, &usage)
+            } else {
+                error
+            }),
+        }
     }
 }
 
@@ -1292,7 +1349,11 @@ mod tests {
         assert_eq!(usage.reported_total_tokens, Some(7));
         let accounting = usage.accounting.unwrap();
         assert_eq!(accounting["pricing"]["cost"]["input"], 2.0);
-        assert_eq!(accounting["pricing_eligibility"]["eligible"], true);
+        assert_eq!(accounting["pricing_eligibility"]["eligible"], false);
+        assert_eq!(
+            accounting["pricing_eligibility"]["reason"],
+            "nonpublic_tariff_applicability_unconfirmed"
+        );
         assert_eq!(accounting["reported_cost"]["amount"], 0.000014);
         assert_eq!(
             accounting["reported_cost"]["provenance"],

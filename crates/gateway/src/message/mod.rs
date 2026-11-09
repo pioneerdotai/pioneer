@@ -14,6 +14,7 @@ mod cli_runtime;
 mod compaction_background;
 mod control_work;
 mod dispatch;
+mod execution_observability;
 pub(crate) mod html_tools;
 mod invitation_handlers;
 mod invitation_lifecycle;

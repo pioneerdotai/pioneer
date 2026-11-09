@@ -111,11 +111,43 @@ pub(super) async fn forward_tool_event_to_agent(
             }
         }
         ToolEventPayload::PermissionAudit(audit_event) => {
+            let phase = audit_event.event_kind;
+            let permission_boundary = matches!(
+                phase,
+                pioneer_protocol::TurnPermissionAuditEventKind::ApprovalRequested
+                    | pioneer_protocol::TurnPermissionAuditEventKind::ApprovalResolved
+            );
+            let boundary=permission_boundary.then(||serde_json::json!({
+                "phase":phase,"parent_operation_id":format!("tool:{turn_id}:{}:{}",event.call_id,event.observation.attempt_id),
+                "ts_unix_ms":event.observation.ts_unix_ms,"mono_ns":event.observation.mono_ns,
+                "process_run_id":event.observation.process_run_id,"local_sequence":event.observation.event_seq,
+                "timing_basis":"source_permission_event_point","duration_basis":"paired_typed_approval_wait_in_terminal_tool_observation"}));
             event_tx
                 .publish_durable_and_wait(AgentDurableEvent::TurnPermissionAudit {
                     event: audit_event,
                 })
                 .await?;
+            if let Some(boundary) = boundary {
+                event_tx
+                    .publish_durable_and_wait(AgentDurableEvent::ItemCompleted {
+                        notification: ItemCompletedNotification {
+                            workspace_id: workspace_id.into(),
+                            thread_id: thread_id.into(),
+                            turn_id: turn_id.into(),
+                            item: TurnItem::SystemEvent {
+                                id: format!(
+                                    "permission-phase:{}:{}",
+                                    event.observation.trace_id, event.observation.event_seq
+                                ),
+                                level: pioneer_protocol::SystemEventLevel::Info,
+                                message: "Permission timing boundary".into(),
+                                code: Some("runtime_phase".into()),
+                                details: Some(boundary),
+                            },
+                        },
+                    })
+                    .await?;
+            }
         }
         ToolEventPayload::OutputDelta(delta_event) => {
             let should_forward = {
@@ -378,6 +410,11 @@ fn protocol_observation(
     observation: pioneer_tools::ObservationContext,
 ) -> pioneer_protocol::ToolObservation {
     pioneer_protocol::ToolObservation {
+        parent_operation_id: observation.parent_operation_id,
+        phase_boundaries: observation.phase_boundaries,
+        omitted_phase_boundaries: observation.omitted_phase_boundaries,
+        output_sizes: observation.output_sizes,
+        process_run_id: observation.process_run_id,
         trace_id: observation.trace_id,
         turn_id: observation.turn_id,
         tool_call_id: observation.tool_call_id,
@@ -1768,6 +1805,11 @@ mod tests {
             tool_name: "exec_command".to_owned(),
             ts_unix_ms: 1,
             observation: ObservationContext {
+                parent_operation_id: None,
+                phase_boundaries: Vec::new(),
+                omitted_phase_boundaries: 0,
+                output_sizes: None,
+                process_run_id: None,
                 trace_id: "trace_late_delta".to_owned(),
                 turn_id: "turn_1".to_owned(),
                 tool_call_id: "call_late_delta".to_owned(),
@@ -1853,6 +1895,11 @@ mod tests {
             tool_name: "read_file".to_owned(),
             ts_unix_ms: 1,
             observation: ObservationContext {
+                parent_operation_id: None,
+                phase_boundaries: Vec::new(),
+                omitted_phase_boundaries: 0,
+                output_sizes: None,
+                process_run_id: None,
                 trace_id: "trace_read".to_owned(),
                 turn_id: "turn_1".to_owned(),
                 tool_call_id: "call_read".to_owned(),

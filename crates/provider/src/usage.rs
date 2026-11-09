@@ -3,6 +3,11 @@
 use crate::types::TokenUsage;
 use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
+mod manifest;
+mod tariff;
+pub(crate) mod transport;
+pub use manifest::{embedding_request_manifest, request_manifest};
+pub use tariff::add_amounts as add_decimal_amounts;
 
 pub(crate) type ChatUsage = WireUsage<0>;
 pub(crate) type AnthropicUsage = WireUsage<1>;
@@ -11,6 +16,41 @@ pub(crate) type GeminiUsage = WireUsage<3>;
 pub(crate) fn normalize_responses(value: &Value) -> anyhow::Result<TokenUsage> {
     anyhow::ensure!(value.is_object(), "invalid Responses usage");
     Ok(WireUsage::<4>(bounded_usage(value)).normalized())
+}
+
+/// The same API-specific counters can accompany an HTTP failure. Decode only
+/// the allowlisted usage object, never retain the error text/body/headers.
+pub(crate) fn http_error_usage(
+    body: &str,
+    api: &str,
+    request_id: Option<&str>,
+) -> Option<TokenUsage> {
+    let value: Value = serde_json::from_str(body).ok()?;
+    let raw = if api == "generate_content" {
+        value.get("usageMetadata")
+    } else {
+        value.get("usage")
+    }?;
+    if !raw.is_object() {
+        return None;
+    }
+    let raw = bounded_usage(raw);
+    let mut usage = match api {
+        "messages" => WireUsage::<1>(raw).normalized(),
+        "bedrock_converse" => WireUsage::<2>(raw).normalized(),
+        "generate_content" => WireUsage::<3>(raw).normalized(),
+        "responses" => WireUsage::<4>(raw).normalized(),
+        "chat_completions" | "embeddings" => WireUsage::<0>(raw).normalized(),
+        _ => return None,
+    }
+    .with_reported_model(value["model"].as_str())
+    .with_service_tier(value["service_tier"].as_str());
+    if api == "embeddings" {
+        usage.output_tokens = Some(0);
+        usage.reasoning_tokens = None;
+    }
+    usage.request_id = native_id(request_id);
+    Some(usage)
 }
 
 #[derive(Debug)]
@@ -397,7 +437,11 @@ impl<const API: u8> WireUsage<API> {
                 n("input_tokens"),
                 n("output_tokens"),
                 n("cache_read_input_tokens"),
-                n("cache_creation_input_tokens"),
+                n("cache_creation_input_tokens").or_else(|| {
+                    raw["cache_creation"]["ephemeral_5m_input_tokens"]
+                        .as_u64()?
+                        .checked_add(raw["cache_creation"]["ephemeral_1h_input_tokens"].as_u64()?)
+                }),
                 None,
                 "exclusive_cache",
             ),
@@ -447,10 +491,10 @@ impl<const API: u8> WireUsage<API> {
             input
         };
         let total_output = if API == 3 {
-            match (output, reasoning) {
-                (None, None) => None,
-                (o, r) => o.unwrap_or(0).checked_add(r.unwrap_or(0)),
-            }
+            // A partial snapshot cannot establish the omitted category as zero.
+            output
+                .zip(reasoning)
+                .and_then(|(visible, thoughts)| visible.checked_add(thoughts))
         } else {
             output
         };
@@ -580,22 +624,23 @@ pub(crate) fn accounting_with_entry(
     let raw = usage.raw_usage.as_ref();
     let reported = raw
         .and_then(|r| {
-            r["cost"].as_f64().or_else(|| {
+            r.get("cost").filter(|v| v.is_number()).or_else(|| {
                 (provider == "perplexity")
-                    .then(|| r["cost"]["total_cost"].as_f64())
+                    .then(|| r["cost"].get("total_cost"))
                     .flatten()
             })
         })
-        .filter(|v| v.is_finite() && *v >= 0.);
+        .filter(|value| value.is_number() && !value.to_string().starts_with('-'));
     let reported_cost = reported.map(|amount|json!({
-        "amount":amount,
-        "currency":if provider == "openrouter" {Some("credits")} else {raw.and_then(|r|r["currency"].as_str())},
+        "amount":amount,"amount_lexical":amount.to_string(),"amount_decimal":tariff::add_amounts("0",&amount.to_string()),
+        "unresolved_reason":tariff::add_amounts("0",&amount.to_string()).is_none().then_some("unsupported_reported_decimal_precision_or_range"),
+        "currency":if provider == "openrouter" && ["/chat/completions","/embeddings"].into_iter().any(|path|usage.route==route(crate::providers::openrouter::BASE_URL,path)) {Some("credits")} else {raw.and_then(|r|r["currency"].as_str())},
         "provenance":"provider_response_usage.cost",
         "details":raw.map(|r|r["cost_details"].clone()),
     }));
     let requested_entry = native
         .filter(|entry| entry.id == model)
-        .or_else(|| catalog.and_then(|c| c.model(provider, model)));
+        .or_else(|| catalog.and_then(|c| c.billing_model(provider, model)));
     let dynamic_router =
         provider == "openrouter" && matches!(model, "openrouter/auto" | "openrouter/auto-beta");
     let billing_model = match usage.reported_model.as_deref() {
@@ -610,7 +655,7 @@ pub(crate) fn accounting_with_entry(
     let entry = billing_model.and_then(|id| {
         native
             .filter(|entry| entry.id == id)
-            .or_else(|| catalog.and_then(|c| c.model(provider, id)))
+            .or_else(|| catalog.and_then(|c| c.billing_model(provider, id)))
     });
     let eligibility = if dynamic_router && billing_model.is_none() {
         Err("missing_selected_billing_model")
@@ -620,29 +665,80 @@ pub(crate) fn accounting_with_entry(
     // A requested-model snapshot is reference evidence only when billing identity
     // is unresolved. It must never be presented as an actual-attempt estimate.
     let snapshot_entry = entry.or(requested_entry);
-    let mut pricing = snapshot_entry.map(|e| {
+    let pricing = snapshot_entry.map(|e| {
+        let retained = catalog.and_then(|c|c.retained_pricing_json(provider,&e.id))
+            .and_then(tariff::lossless_evidence);
+        let retained_cost = retained.as_ref().and_then(|v|v.get("cost")).filter(|v|!v.is_null()).unwrap_or(&e.cost);
+        let mut source = retained.as_ref().and_then(|v|v.get("source")).filter(|v|!v.is_null()).cloned()
+            .or_else(||e.metadata.get("pricingSource").cloned());
+        if let Some(object) = source.as_mut().and_then(Value::as_object_mut) {
+            if object
+                .get("url")
+                .and_then(Value::as_str)
+                .is_some_and(|url| {
+                    !matches!(
+                        url,
+                        "https://models.dev/api.json"
+                            | "https://openrouter.ai/api/v1/models"
+                            | "https://ai-gateway.vercel.sh/v1/models"
+                    )
+                })
+            {
+                object.insert("url".into(), json!("redacted_nonpublic_tariff_source"));
+                object.remove("raw");object.insert("raw_coverage".into(),json!("nonpublic_source_not_retained"));
+            }
+        }
         json!({"catalog_snapshot":catalog.map(|c|c.snapshot_id()),
         "provider":e.provider,"model":e.id,"catalog_api":e.api,
         "basis":if eligibility.is_ok(){"observed_billing_identity"}else{"reference_tariff_only"},
-        "cost":e.cost,"source":e.metadata.get("pricingSource"),
+        "cost":retained_cost,"source":source,
+        "raw_catalog_pricing_json":source.as_ref().filter(|s|s["url"]!="redacted_nonpublic_tariff_source")
+            .and_then(|_|catalog.and_then(|c|c.retained_pricing_json(provider,&e.id))),
+        "source_captured_at":e.metadata.get("pricingCapturedAt"),"source_effective_from":e.metadata.get("pricingEffectiveFrom"),
+        "normalizer_version":1,"resolver_version":1,
         "captured_at":e.metadata.get("pricingCapturedAt"),
         "units":e.metadata.get("pricingUnits"),
         "version":e.metadata.get("pricingEvidenceVersion")})
     });
-    let oversized = pricing
-        .as_ref()
-        .is_some_and(|p| p.to_string().len() > 8 * 1024);
-    if oversized {
-        pricing = Some(
-            json!({"catalog_snapshot":catalog.map(|c|c.snapshot_id()),"metadata_omitted":"exceeds_8192_bytes"}),
-        );
-    }
-    let estimate = if oversized || eligibility.is_err() {
+    // Durable stores enforce the independent evidence bound before dispatch.
+    let estimate = if eligibility.is_err() {
         None
     } else {
-        entry.and_then(|e| estimate(usage, &e.cost, &e.metadata))
+        entry.and_then(|e| {
+            let mut metadata = e.metadata.clone();
+            if let Some(source) = pricing.as_ref().and_then(|v| v.get("source")) {
+                metadata.insert("pricingSource".into(), source.clone());
+            }
+            estimate(
+                usage,
+                pricing
+                    .as_ref()
+                    .and_then(|v| v.get("cost"))
+                    .unwrap_or(&e.cost),
+                &metadata,
+            )
+        })
     };
-    json!({"reported_cost":reported_cost,"estimated_cost":estimate,
+    let resolution = if eligibility.is_err() {
+        None
+    } else {
+        entry.and_then(|e| {
+            let mut metadata = e.metadata.clone();
+            if let Some(source) = pricing.as_ref().and_then(|v| v.get("source")) {
+                metadata.insert("pricingSource".into(), source.clone());
+            }
+            guarded_resolution(
+                usage,
+                pricing
+                    .as_ref()
+                    .and_then(|v| v.get("cost"))
+                    .unwrap_or(&e.cost),
+                &metadata,
+            )
+        })
+    };
+    let selected = select_cost_basis(reported_cost.as_ref(), estimate.as_ref());
+    json!({"reported_cost":reported_cost,"estimated_cost":estimate,"selected_cost":selected,"cost_resolution":resolution,
         "catalog_snapshot":catalog.map(|c|c.snapshot_id()),
         "pricing":pricing,"pricing_eligibility":{
             "eligible":eligibility.is_ok(),"reason":eligibility.err(),
@@ -653,6 +749,9 @@ pub(crate) fn accounting_with_entry(
             } else if provider == "openai" && entry.is_some_and(|e| e.api == "openai-responses") {
                 "https://developers.openai.com/api/docs/pricing"
             } else {"captured_catalog_api_and_endpoint"}},
+        "unresolved_reasons":if let Err(reason) = eligibility {json!([reason])}
+            else if estimate.is_none() {resolution.as_ref().and_then(|v|v.get("reasons")).cloned().unwrap_or_else(||json!(["unsupported_conditions_or_incomplete_usage"]))} else {json!([])},
+        "calculator_version":1,"usage_coverage":usage_coverage(usage),
         "price_status":if snapshot_entry.is_none(){"unknown_tariff"}else if estimate.is_none(){"unknown_or_conditional_price"}else{"catalog_estimate"}})
 }
 
@@ -672,6 +771,12 @@ fn pricing_eligibility(
         return Err("deployment_private_or_subscription_billing_contract");
     }
     let entry = entry.ok_or("unknown_billing_tariff")?;
+    if provider == "vercel-ai-gateway"
+        && entry.base_url != crate::providers::vercel_ai_gateway::BASE_URL
+    {
+        return Err("nonpublic_tariff_applicability_unconfirmed");
+    }
+
     // OpenAI documents shared model token tariffs for Chat and Responses:
     // https://developers.openai.com/api/docs/pricing (APIs not priced separately).
     // This narrow API equivalence does not confer endpoint/model equivalence.
@@ -680,6 +785,9 @@ fn pricing_eligibility(
             (usage.api.as_deref(), entry.api.as_str()),
             (Some("responses"), "openai-responses") | (Some("embeddings"), "openai-embeddings")
         ))
+        || (matches!(provider, "openai" | "openrouter")
+            && usage.api.as_deref() == Some("embeddings")
+            && entry.api == "openai-embeddings")
         || (provider == "openai"
             && ((usage.api.as_deref() == Some("chat_completions")
                 && entry.api == "openai-responses")
@@ -765,32 +873,60 @@ pub fn classification_source(error: &anyhow::Error) -> &(dyn std::error::Error +
     error.chain().nth(skip).unwrap_or_else(|| error.as_ref())
 }
 
-fn estimate(
+fn guarded_resolution(
     usage: &TokenUsage,
     cost: &Value,
     metadata: &std::collections::BTreeMap<String, Value>,
 ) -> Option<Value> {
+    let unresolved = |reason: &str| {
+        Some(json!({"version":1,"status":"unresolved","reasons":[reason],"lines":[]}))
+    };
+    if usage.accounting.as_ref().is_some_and(|a| {
+        a["requested_modalities"]
+            .as_array()
+            .is_some_and(|v| !v.is_empty())
+    }) {
+        return unresolved("unsupported_application_modality_pricing_contract");
+    }
+    if let Some(conditions) = usage
+        .accounting
+        .as_ref()
+        .and_then(|a| a.get("adapter_conditions"))
+    {
+        if conditions["coverage"] == "uninspectable_adapter_body" {
+            return unresolved("adapter_pricing_conditions_uninspected");
+        }
+        let requested = conditions["requested_service_tier"].as_str();
+        if requested.is_some_and(|s| !matches!(s, "default" | "standard"))
+            && usage.service_tier.is_none()
+        {
+            return unresolved("effective_service_tier_unconfirmed");
+        }
+        if conditions["requested_region_present"] == true {
+            return unresolved("requested_region_pricing_contract_unconfirmed");
+        }
+        if conditions["prompt_cache_retention"]
+            .as_str()
+            .is_some_and(|s| s != "in-memory")
+        {
+            return unresolved("unsupported_requested_cache_retention_contract");
+        }
+        if conditions["cache_control_ttls"]
+            .as_array()
+            .is_some_and(|v| v.iter().any(|s| s == "unrecognized"))
+        {
+            return unresolved("unsupported_requested_cache_ttl");
+        }
+    }
     // Do not apply the standard text/default-retention tariff to a reported
     // modality or TTL whose pricing contract is not represented here.
     fn conditional_usage(value: &Value, key: &str) -> bool {
         match value {
             Value::Object(map) => map.iter().any(|(k, v)| conditional_usage(v, k)),
             Value::Array(values) => values.iter().any(|v| conditional_usage(v, key)),
-            Value::Number(n)
-                if matches!(
-                    key,
-                    "ephemeral_1h_input_tokens"
-                        | "audio_tokens"
-                        | "image_tokens"
-                        | "video_tokens"
-                        | "web_search_requests"
-                        | "web_fetch_requests"
-                ) =>
-            {
+            Value::Number(n) if matches!(key, "audio_tokens" | "image_tokens" | "video_tokens") => {
                 n.as_f64().is_some_and(|n| n > 0.)
             }
-            Value::String(s) if key == "ttl" => s != "5m",
-            Value::Number(n) if key == "ttl" => n.as_u64() != Some(300),
             Value::String(s) if key == "modality" => s != "TEXT",
             Value::String(s) if key == "inference_geo" => s != "global",
             _ => false,
@@ -801,102 +937,222 @@ fn estimate(
         .as_ref()
         .is_some_and(|r| conditional_usage(r, ""))
     {
-        return None;
+        return unresolved("unsupported_modality_or_region_contract");
     }
     if usage
         .service_tier
         .as_deref()
         .is_some_and(|tier| !matches!(tier, "default" | "standard" | "STANDARD"))
     {
-        return None;
+        return unresolved("unsupported_effective_service_tier");
     }
-    if metadata.get("pricingEvidenceVersion")?.as_u64() != Some(1)
-        || metadata.get("pricingUnits")?.as_str() != Some("USD_per_million_tokens")
+    if metadata
+        .get("pricingEvidenceVersion")
+        .and_then(Value::as_u64)
+        != Some(1)
+        || metadata.get("pricingUnits").and_then(Value::as_str) != Some("USD_per_million_tokens")
     {
-        return None;
+        return unresolved("unsupported_tariff_evidence_version_or_units");
     }
     // TTL, modality, non-token fees and opaque tier conditions need a separate
     // pricing contract. Preserve them, never flatten them into a zero charge.
     let source = metadata.get("pricingSource");
     if source.is_some_and(|s| s.get("unknownRateContract").is_some_and(|v| !v.is_null())) {
-        return None;
+        return unresolved("unconfirmed_source_rate_contract");
     }
-    if source
-        .and_then(|s| s.get("raw"))
-        .and_then(Value::as_object)
-        .is_some_and(|r| {
-            r.keys().any(|k| {
-                !matches!(
-                    k.as_str(),
-                    "input"
-                        | "output"
-                        | "cache_read"
-                        | "cache_write"
-                        | "prompt"
-                        | "completion"
-                        | "input_cache_read"
-                        | "input_cache_write"
-                ) && !r[k].is_null()
-                    && r[k].as_f64() != Some(0.)
-                    && r[k].as_str() != Some("0")
-            })
-        })
+    let mut normalized = cost.clone();
+    let mut unresolved = Vec::new();
+    if let Some(raw) = source.and_then(|s| s.get("raw")).and_then(Value::as_object) {
+        let router = source.is_some_and(|s| {
+            s["url"] == "https://openrouter.ai/api/v1/models" && s["units"] == "USD_per_token"
+        });
+        let vercel = source.is_some_and(|s| {
+            s["url"] == "https://ai-gateway.vercel.sh/v1/models" && s["units"] == "USD_per_token"
+        });
+        if vercel {
+            normalized = match tariff::vercel_rates(&Value::Object(raw.clone())) {
+                Ok(rates) => rates,
+                Err(reason) => {
+                    return Some(
+                        json!({"version":1,"status":"unresolved","reasons":[reason],"lines":[]}),
+                    );
+                }
+            };
+        }
+        if router {
+            normalized = match tariff::openrouter_rates(
+                &Value::Object(raw.clone()),
+                usage.input_tokens,
+            ) {
+                Ok(rates) => rates,
+                Err(reason) => {
+                    return Some(
+                        json!({"version":1,"status":"unresolved","reasons":[reason],"lines":[]}),
+                    );
+                }
+            };
+        }
+        for (key, value) in raw {
+            if !matches!(
+                key.as_str(),
+                "input"
+                    | "output"
+                    | "cache_read"
+                    | "cache_write"
+                    | "prompt"
+                    | "completion"
+                    | "input_cache_read"
+                    | "input_cache_write"
+                    | "tiers"
+                    | "context_over_200k"
+            ) && !(router && key == "overrides")
+                && !(vercel && key == "varies_by_provider" && value == false)
+                && !value.is_null()
+            {
+                if matches!(
+                    key.as_str(),
+                    "request"
+                        | "image"
+                        | "audio"
+                        | "web_search"
+                        | "internal_reasoning"
+                        | "input_audio_cache"
+                        | "input_audio"
+                        | "output_audio"
+                ) {
+                    let zero = value
+                        .as_str()
+                        .map(str::to_owned)
+                        .or_else(|| value.as_number().map(ToString::to_string))
+                        .and_then(|v| tariff::add_amounts("0", &v))
+                        .as_deref()
+                        == Some("0");
+                    if !zero {
+                        unresolved
+                            .push(json!({"meter":key,"reason":"unsupported_additional_meter"}));
+                    }
+                } else {
+                    // An unknown condition can change every base rate. Such a
+                    // base is not a known subtotal, even if it looks numeric.
+                    return Some(json!({"version":1,"status":"unresolved","reasons":[{
+                        "condition":key,"reason":"unsupported_tariff_condition"}],"lines":[]}));
+                }
+            }
+        }
+        if !router {
+            for field in ["tiers", "context_over_200k"] {
+                if raw
+                    .get(field)
+                    .is_some_and(|v| !v.is_null() && cost.get(field) != Some(v))
+                {
+                    return Some(
+                        json!({"version":1,"status":"unresolved","reasons":["conflicting_source_tiers"],"lines":[]}),
+                    );
+                }
+            }
+        }
+    }
+    fn long_retention(value: &Value, key: &str) -> bool {
+        match value {
+            Value::Object(fields) => fields.iter().any(|(key, value)| long_retention(value, key)),
+            Value::Array(values) => values.iter().any(|v| long_retention(v, key)),
+            Value::Number(n) if key == "ephemeral_1h_input_tokens" => {
+                n.as_u64().is_some_and(|n| n > 0)
+            }
+            Value::String(s) if key == "ttl" => s != "5m",
+            Value::Number(n) if key == "ttl" => n.as_u64() != Some(300),
+            _ => false,
+        }
+    }
+    if usage
+        .raw_usage
+        .as_ref()
+        .is_some_and(|raw| long_retention(raw, ""))
+        || (usage.cache_write_input_tokens != Some(0)
+            && usage.accounting.as_ref().is_some_and(|a| {
+                a["adapter_conditions"]["cache_control_ttls"]
+                    .as_array()
+                    .is_some_and(|ttls| ttls.iter().any(|ttl| ttl == "1h"))
+            }))
     {
+        // TTL changes only the write meter under the captured text contract.
+        // Preserve other known components; never borrow a multiplier from
+        // another API or silently apply the default cache-write price.
+        fn suppress_write_rates(value: &mut Value) {
+            match value {
+                Value::Object(fields) => {
+                    for key in ["cacheWrite", "cache_write"] {
+                        fields.remove(key);
+                    }
+                    for child in fields.values_mut() {
+                        suppress_write_rates(child);
+                    }
+                }
+                Value::Array(values) => {
+                    for child in values {
+                        suppress_write_rates(child);
+                    }
+                }
+                _ => {}
+            }
+        }
+        suppress_write_rates(&mut normalized);
+        unresolved
+            .push(json!({"meter":"cacheWrite","reason":"unsupported_cache_retention_contract"}));
+    }
+    fn server_units(value: &Value, key: &str) -> bool {
+        match value {
+            Value::Object(fields) => fields.iter().any(|(k, v)| server_units(v, k)),
+            Value::Array(values) => values.iter().any(|v| server_units(v, key)),
+            Value::Number(n)
+                if matches!(
+                    key,
+                    "web_search_requests"
+                        | "web_fetch_requests"
+                        | "num_search_queries"
+                        | "toolUsePromptTokenCount"
+                ) =>
+            {
+                n.as_u64().is_some_and(|n| n > 0)
+            }
+            _ => false,
+        }
+    }
+    if usage
+        .raw_usage
+        .as_ref()
+        .is_some_and(|raw| server_units(raw, ""))
+    {
+        unresolved.push(json!({"meter":"provider_server_tools","reason":"known_service_units_without_applicable_tariff"}));
+    }
+    let mut resolution = tariff::resolve(usage, &normalized);
+    if !unresolved.is_empty() {
+        if let Some(reasons) = resolution["reasons"].as_array_mut() {
+            reasons.extend(unresolved);
+        }
+        if resolution["status"] == "complete" {
+            resolution["status"] = "partial".into();
+        }
+    }
+    Some(resolution)
+}
+
+fn estimate(
+    usage: &TokenUsage,
+    cost: &Value,
+    metadata: &std::collections::BTreeMap<String, Value>,
+) -> Option<Value> {
+    let resolution = guarded_resolution(usage, cost, metadata)?;
+    if resolution["status"] != "complete" {
         return None;
     }
-    if cost.as_object()?.keys().any(|k| {
-        !matches!(
-            k.as_str(),
-            "input"
-                | "output"
-                | "cacheRead"
-                | "cacheWrite"
-                | "cache_read"
-                | "cache_write"
-                | "tiers"
-        )
-    }) {
-        return None;
-    }
-    let input = usage.input_tokens?;
-    let output = usage.output_tokens?;
-    let read = usage.cache_read_input_tokens?;
-    let write = usage.cache_write_input_tokens?;
-    let uncached = input.checked_sub(read)?.checked_sub(write)?;
-    let mut selected = cost.clone();
-    let mut threshold = None;
-    for tier in cost["tiers"].as_array().into_iter().flatten() {
-        let above = tier["inputTokensAbove"].as_u64()?;
-        if tier.as_object()?.keys().any(|k| {
-            !matches!(
-                k.as_str(),
-                "inputTokensAbove" | "input" | "output" | "cacheRead" | "cacheWrite"
-            )
-        }) {
-            return None;
-        }
-        if input > above && threshold.is_none_or(|t| above > t) {
-            selected = tier.clone();
-            threshold = Some(above);
-        }
-    }
-    let priced = |count: u64, key: &str| -> Option<f64> {
-        if count == 0 {
-            return Some(0.);
-        }
-        let rate = selected[key]
-            .as_f64()
-            .filter(|v| v.is_finite() && *v >= 0.)?;
-        Some(count as f64 * rate / 1_000_000.)
-    };
-    let amount = priced(uncached, "input")?
-        + priced(read, "cacheRead")?
-        + priced(write, "cacheWrite")?
-        + priced(output, "output")?;
-    amount.is_finite().then(|| {
-        json!({"amount":amount,"currency":"USD","provenance":"catalog_estimate",
-        "units":"USD_per_million_tokens","input_tokens_above":threshold})
-    })
+    let exact = resolution["known_subtotal_decimal"].as_str()?;
+    let numeric: Value = serde_json::from_str(exact).ok()?;
+    Some(
+        json!({"amount":numeric,"amount_decimal":exact,"currency":"USD",
+        "provenance":"catalog_estimate","units":"USD_per_million_tokens",
+        "input_tokens_above":resolution["input_tokens_above"],"resolution":resolution}),
+    )
 }
 
 /// Authority-native facts precede permitted public-catalog facts per field.
@@ -992,8 +1248,15 @@ pub(crate) fn route(base: &str, template: &str) -> Option<String> {
     ))
 }
 
-pub(crate) struct UsageContext {
+#[derive(Clone)]
+pub struct UsageContext {
     provider: String,
+    captured_at: chrono::DateTime<chrono::Utc>,
+    diagnostic_losses: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    transport_observations: std::sync::Arc<transport::BodyObservations>,
+    requested_modalities: Vec<String>,
+    adapter_conditions: std::sync::Arc<std::sync::Mutex<Value>>,
+    authority: Option<String>,
     model: String,
     api: String,
     api_version: Option<String>,
@@ -1002,10 +1265,118 @@ pub(crate) struct UsageContext {
     catalog: Option<std::sync::Arc<crate::catalog::ModelCatalog>>,
     native: Option<crate::catalog::CatalogModel>,
 }
+tokio::task_local! {
+    static PREPARED_USAGE: std::cell::RefCell<Option<UsageContext>>;
+    static ADAPTER_CONDITIONS: std::sync::Arc<std::sync::Mutex<Value>>;
+}
+
 impl UsageContext {
+    /// Scope a single physical call after its initial evidence has committed.
+    /// The reservation is consumed once; subsequent calls capture new evidence.
+    pub async fn scope<F: std::future::Future>(&self, future: F) -> F::Output {
+        transport::attempt_scope(
+            self.attempt.clone(),
+            ADAPTER_CONDITIONS.scope(
+                self.adapter_conditions.clone(),
+                PREPARED_USAGE.scope(std::cell::RefCell::new(Some(self.clone())), future),
+            ),
+        )
+        .await
+    }
+    pub async fn scope_with_observations<F, H, HF>(
+        &self,
+        future: F,
+        handler: H,
+    ) -> anyhow::Result<F::Output>
+    where
+        F: std::future::Future,
+        H: FnMut(Value) -> HF,
+        HF: std::future::Future<Output = anyhow::Result<()>>,
+    {
+        transport::observe_scope(
+            self.scope(future),
+            handler,
+            self.transport_observations.clone(),
+        )
+        .await
+    }
+    pub async fn observe_transport<F, H, HF>(
+        &self,
+        future: F,
+        handler: H,
+    ) -> anyhow::Result<F::Output>
+    where
+        F: std::future::Future,
+        H: FnMut(Value) -> HF,
+        HF: std::future::Future<Output = anyhow::Result<()>>,
+    {
+        transport::observe_scope(
+            transport::attempt_scope(
+                self.attempt.clone(),
+                ADAPTER_CONDITIONS.scope(self.adapter_conditions.clone(), future),
+            ),
+            handler,
+            self.transport_observations.clone(),
+        )
+        .await
+    }
+    pub fn prepare_operation(provider: &dyn crate::Provider, model: &str, api: &str) -> Self {
+        let mut context = Self::capture(provider, model);
+        let profile = provider.embedding_usage_profile();
+        context.api = api.into();
+        context.api_version = profile.api_version;
+        context.route = profile.route;
+        context
+    }
+    pub fn finalize_usage(&self, usage: &mut TokenUsage) {
+        self.enrich(usage);
+    }
+    pub fn record_diagnostic_loss(&self) {
+        self.diagnostic_losses
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    pub fn initial_usage(&self) -> TokenUsage {
+        let mut usage = TokenUsage::default();
+        self.enrich(&mut usage);
+        usage
+    }
+    pub fn prepare_request(
+        provider: &dyn crate::Provider,
+        request: &crate::ChatRequest,
+    ) -> anyhow::Result<Self> {
+        let profile = provider.request_usage_profile(request)?;
+        let mut context = Self::capture(provider, &request.model);
+        context.api = profile.api;
+        context.api_version = profile.api_version;
+        context.route = profile.route;
+        context.requested_modalities = request
+            .messages
+            .iter()
+            .flat_map(|m| &m.content_parts)
+            .filter_map(|part| match part {
+                crate::MessageContentPart::Text { .. } => None,
+                crate::MessageContentPart::File { .. } => Some("file"),
+                crate::MessageContentPart::Image { .. } => Some("image"),
+                crate::MessageContentPart::Audio { .. } => Some("audio"),
+                crate::MessageContentPart::Video { .. } => Some("video"),
+            })
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        Ok(context)
+    }
+
     pub(crate) fn capture(provider: &dyn crate::Provider, model: &str) -> Self {
+        let diagnostic_losses = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         Self {
             provider: provider.name().into(),
+            captured_at: chrono::Utc::now(),
+            transport_observations: transport::BodyObservations::new(diagnostic_losses.clone()),
+            diagnostic_losses,
+            requested_modalities: Vec::new(),
+            adapter_conditions: std::sync::Arc::new(std::sync::Mutex::new(json!({}))),
+            authority: provider.authority_fingerprint().map(str::to_owned),
             model: model.into(),
             api: provider.usage_api().into(),
             api_version: provider.usage_api_version(),
@@ -1022,12 +1393,27 @@ impl UsageContext {
         request: &crate::ChatRequest,
     ) -> anyhow::Result<Self> {
         let profile = provider.request_usage_profile(request)?;
-        let mut context = Self::capture(provider, &request.model);
-        context.api = profile.api;
-        context.api_version = profile.api_version;
-        context.route = profile.route;
-        Ok(context)
+        if let Ok(context) = PREPARED_USAGE.try_with(|slot| -> anyhow::Result<Self> {
+            let context = slot
+                .borrow_mut()
+                .take()
+                .ok_or_else(|| anyhow::anyhow!("request attempt reservation already consumed"))?;
+            anyhow::ensure!(
+                context.provider == provider.name()
+                    && context.authority.as_deref() == provider.authority_fingerprint()
+                    && context.model == request.model
+                    && context.api == profile.api
+                    && context.route == profile.route
+                    && context.api_version == profile.api_version,
+                "prepared request profile changed before dispatch"
+            );
+            Ok(context)
+        }) {
+            return context;
+        }
+        Self::prepare_request(provider, request)
     }
+
     pub(crate) fn enrich_error(&self, error: anyhow::Error) -> anyhow::Error {
         if let Some(mut usage) = error_usage(&error).cloned() {
             self.enrich(&mut usage);
@@ -1043,9 +1429,40 @@ impl UsageContext {
         usage.api_version = self.api_version.clone();
         usage.route = self.route.clone();
         usage.physical_attempt_id = Some(self.attempt.clone());
+        if self.provider == "openai"
+            && self.api == "embeddings"
+            && self.route == route(crate::providers::openai::BASE_URL, "/embeddings")
+        {
+            // The actual Embeddings schema bills input only and exposes no
+            // cache/output meters. Do not apply this to arbitrary proxies.
+            // https://developers.openai.com/api/reference/resources/embeddings/methods/create
+            usage.cache_read_input_tokens = Some(0);
+            usage.cache_write_input_tokens = Some(0);
+            usage.uncached_input_tokens = usage.input_tokens;
+            usage.output_tokens = Some(0);
+            usage.semantics = Some("openai_embeddings_input_only_cache_not_applicable_v1".into());
+        }
         if self.api == "chat_completions" {
             apply_chat_usage_policy(usage, &self.provider, self.route.as_deref());
         }
+        let native_reported_cost = usage
+            .accounting
+            .as_ref()
+            .and_then(|a| a.get("reported_cost"))
+            .filter(|v| v.is_object())
+            .cloned();
+        if !usage.accounting.as_ref().is_some_and(Value::is_object) {
+            usage.accounting = Some(json!({}));
+        }
+        usage.accounting.as_mut().expect("accounting object")["requested_modalities"] =
+            json!(self.requested_modalities);
+        let adapter_conditions = self
+            .adapter_conditions
+            .lock()
+            .expect("adapter conditions")
+            .clone();
+        usage.accounting.as_mut().expect("accounting object")["adapter_conditions"] =
+            adapter_conditions.clone();
         usage.accounting = Some(accounting_with_entry(
             usage,
             &self.provider,
@@ -1053,6 +1470,31 @@ impl UsageContext {
             self.catalog.as_deref(),
             self.native.as_ref(),
         ));
+        if let Some(accounting) = &mut usage.accounting {
+            accounting["attempt_tariff_captured_at"] = json!(self.captured_at);
+            accounting["requested_modalities"] = json!(self.requested_modalities);
+            accounting["adapter_conditions"] = adapter_conditions;
+            accounting["request_conditions_basis"] =
+                "captured_application_request_before_adapter_transforms".into();
+
+            accounting["transport_observation_coverage"] = self.transport_observations.coverage();
+            accounting["diagnostic_losses"] = self
+                .diagnostic_losses
+                .load(std::sync::atomic::Ordering::Acquire)
+                .into();
+        }
+        if let (Some(accounting), Some(reported)) = (&mut usage.accounting, native_reported_cost) {
+            if accounting["reported_cost"].is_null() {
+                accounting["reported_cost"] = reported;
+            }
+        }
+        if let Some(accounting) = &mut usage.accounting {
+            let selected = select_cost_basis(
+                accounting.get("reported_cost"),
+                accounting.get("estimated_cost"),
+            );
+            accounting["selected_cost"] = json!(selected);
+        }
     }
 }
 
@@ -1149,4 +1591,129 @@ impl TokenUsage {
         });
         self
     }
+}
+
+/// Reproduce a resolution from retained historical evidence only. Never consult
+/// the live catalog, and never turn a reference tariff into a billing contract.
+pub fn resolve_retained_tariff(usage: &TokenUsage, evidence: &Value) -> Value {
+    if evidence["basis"] != "observed_billing_identity" {
+        return json!({"version":1,"status":"unresolved","reasons":["unconfirmed_historical_applicability"],"lines":[]});
+    }
+    let metadata = std::collections::BTreeMap::from([
+        ("pricingEvidenceVersion".into(), evidence["version"].clone()),
+        ("pricingUnits".into(), evidence["units"].clone()),
+        ("pricingSource".into(), evidence["source"].clone()),
+    ]);
+    guarded_resolution(usage,&evidence["cost"],&metadata).unwrap_or_else(||json!({"version":1,"status":"unresolved","reasons":["unsupported_historical_conditions"],"lines":[]}))
+}
+
+/// A selection is a view of one charge, never reported + estimated spend.
+pub fn select_cost_basis(reported: Option<&Value>, estimated: Option<&Value>) -> Option<Value> {
+    if let Some(reported) =
+        reported.filter(|v| v.is_object() && v.get("amount").is_some_and(Value::is_number))
+    {
+        return Some(
+            json!({"basis":"provider_reported","amount":reported["amount"],"amount_lexical":reported["amount_lexical"],"amount_decimal":reported["amount_decimal"],"unresolved_reason":reported["unresolved_reason"],"currency":reported["currency"],"provenance":reported["provenance"]}),
+        );
+    }
+    estimated.filter(|v|v.is_object()).map(|v|json!({"basis":"catalog_estimate","amount_decimal":v["amount_decimal"],"currency":v["currency"]}))
+}
+
+tokio::task_local! { static CAUSAL_PARENT: String; }
+/// Runtime-only causal link. Never populated from provider/model JSON.
+pub async fn scope_causal_parent<F: std::future::Future>(parent: String, future: F) -> F::Output {
+    CAUSAL_PARENT.scope(parent, future).await
+}
+pub fn current_causal_parent() -> Option<String> {
+    CAUSAL_PARENT.try_with(Clone::clone).ok()
+}
+
+/// Content-free local point on the existing observability process clock. The
+/// clock's actual resolution is milliseconds; conversion does not add precision.
+pub fn observation_point() -> Value {
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    json!({"process_run_id":pioneer_observability::identity::run_identity().run_id,
+        "ts_unix_ms":chrono::Utc::now().timestamp_millis(),
+        "mono_ns":pioneer_observability::work::clock_ms().checked_mul(1_000_000),
+        "clock_domain":"observability_work_clock_v1","clock_resolution_ns":1_000_000,
+        "local_sequence":SEQUENCE.fetch_add(1,std::sync::atomic::Ordering::Relaxed)})
+}
+
+fn usage_coverage(usage: &TokenUsage) -> Value {
+    let missing = [
+        ("input", usage.input_tokens),
+        ("output", usage.output_tokens),
+        ("uncached_input", usage.uncached_input_tokens),
+        ("cache_read", usage.cache_read_input_tokens),
+        ("cache_write", usage.cache_write_input_tokens),
+    ]
+    .into_iter()
+    .filter_map(|(meter, value)| value.is_none().then_some(meter))
+    .collect::<Vec<_>>();
+    let inconsistent = inconsistent_quantities(usage);
+    let missing_all = usage.input_tokens.is_none()
+        && usage.output_tokens.is_none()
+        && usage.uncached_input_tokens.is_none()
+        && usage.cache_read_input_tokens.is_none()
+        && usage.cache_write_input_tokens.is_none();
+    json!({"status":if inconsistent{"inconsistent"}else if missing_all{"missing"}else if missing.is_empty(){"complete"}else{"partial"},
+        "missing_meters":missing,"input_semantics":"inclusive_uncached_plus_cache_read_plus_cache_write","reasoning_semantics":"subset_of_inclusive_output",
+        "cache_applicability":if usage.semantics.as_deref()==Some("openai_embeddings_input_only_cache_not_applicable_v1"){"not_applicable"}else{"unknown_without_meter_evidence"}})
+}
+
+// Optional categories constrain known totals without filling omitted meters.
+fn inconsistent_quantities(usage: &TokenUsage) -> bool {
+    let categories = [
+        usage.uncached_input_tokens,
+        usage.cache_read_input_tokens,
+        usage.cache_write_input_tokens,
+    ];
+    let sum = categories
+        .into_iter()
+        .flatten()
+        .try_fold(0u64, u64::checked_add);
+    let input_bad = sum.is_none()
+        || usage.input_tokens.is_some_and(|input| {
+            sum.is_none_or(|known| known > input)
+                || (categories.iter().all(Option::is_some) && sum != Some(input))
+        });
+    let output_bad = usage
+        .output_tokens
+        .zip(usage.reasoning_tokens)
+        .is_some_and(|(output, reasoning)| reasoning > output);
+    let split_bad = usage.raw_usage.as_ref().is_some_and(|raw| {
+        let split = raw["cache_creation"]["ephemeral_5m_input_tokens"]
+            .as_u64()
+            .zip(raw["cache_creation"]["ephemeral_1h_input_tokens"].as_u64());
+        split.is_some_and(|(short, long)| {
+            short.checked_add(long).is_none_or(|sum| {
+                usage
+                    .cache_write_input_tokens
+                    .is_some_and(|known| known != sum)
+            })
+        })
+    });
+    fn invalid_counter(value: &Value, key: &str) -> bool {
+        let quantity = key.ends_with("_tokens")
+            || key.ends_with("Tokens")
+            || key.ends_with("TokenCount")
+            || key == "tokenCount";
+        if quantity && !value.is_null() && value.as_u64().is_none() {
+            return true;
+        }
+        match value {
+            Value::Object(fields) => fields
+                .iter()
+                .any(|(key, value)| invalid_counter(value, key)),
+            Value::Array(values) => values.iter().any(|value| invalid_counter(value, key)),
+            _ => false,
+        }
+    }
+    input_bad
+        || output_bad
+        || split_bad
+        || usage
+            .raw_usage
+            .as_ref()
+            .is_some_and(|raw| invalid_counter(raw, ""))
 }

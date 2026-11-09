@@ -236,6 +236,23 @@ impl NativeRequestProjection {
         }
         request.messages = messages;
         let estimated_input_tokens = tokens_from_utf16(units).saturating_add(media_tokens);
+        if let Some(prompt) = &mut request.compiled_prompt {
+            let diagnostics = prompt
+                .observation_manifest
+                .get_or_insert_with(|| serde_json::json!({}));
+            let reserve = if self.recovery {
+                self.output_reserve.max(self.budget.compaction_reserve())
+            } else {
+                self.output_reserve
+            };
+            diagnostics["effective_budget"] = serde_json::json!({"context_window_tokens":self.budget.context,
+                "input_limit_tokens":self.budget.input_limit,"max_output_tokens":self.budget.max_output,
+                "output_reserve_tokens":reserve,"separate_reasoning_reserve_tokens":self.budget.separate_reasoning,
+                "estimated_input_tokens":estimated_input_tokens,"media_estimate_tokens":media_tokens,
+                "estimated_unpadded_free_tokens":estimated_input_tokens.checked_add(reserve).and_then(|v|v.checked_add(self.budget.separate_reasoning)).and_then(|used|self.budget.context.checked_sub(used)),
+                "basis":"existing_materialized_native_request_budget_not_billed_input","limits_provenance":"effective_selected_model_budget_source_or_fallback_not_reinferred",
+                "estimator_version":"native_request_utf16_and_admitted_media_v1"});
+        }
         Ok(EvaluatedRequest {
             request,
             estimated_input_tokens,
@@ -545,6 +562,7 @@ mod tests {
         let mut full = request();
         full.max_tokens = Some(3000);
         full.compiled_prompt = Some(CompiledPromptPayload {
+            observation_manifest: None,
             stable_system_text: "instructions ".repeat(500),
             dynamic_system_text: "dynamic".into(),
             boundary_marker: "boundary".into(),

@@ -5273,10 +5273,23 @@ impl CrudStore {
         // Prepare outside writer admission. An invalid/unknown preview remains
         // unchanged unless the commit finds an authoritative release marker.
         let delivery_key = delivery_key.to_owned();
+        let source_observation = self
+            .prepare_retained_tool_source(&entry, &delivery_key)
+            .await?;
+        let archived_observation = if let Some(Some(payload)) = &preview_archive {
+            let mut archived = entry.clone();
+            archived.payload = payload.clone();
+            self.prepare_retained_tool_source(&archived, &delivery_key)
+                .await?
+        } else {
+            None
+        };
         let result = self
             .run_serialized_write(|| {
                 let mut entry = entry.clone();
                 let preview_archive = preview_archive.clone();
+                let mut source_observation = source_observation.clone();
+                let archived_observation = archived_observation.clone();
                 let delivery_key = delivery_key.clone();
                 async move {
                     let transaction = self
@@ -5292,6 +5305,7 @@ impl CrudStore {
                         )
                         .await?
                         {
+                            source_observation = archived_observation;
                             entry.payload = prepared.ok_or_else(|| {
                                 anyhow::anyhow!(
                                     "released HTML preview result cannot be reintroduced"
@@ -5307,6 +5321,15 @@ impl CrudStore {
                     .await;
                     match outcome {
                         Ok(outcome) => {
+                            if !outcome.already_committed {
+                                if let Some(prepared) = &source_observation {
+                                    repositories::execution_observability::commit(
+                                        &transaction,
+                                        prepared,
+                                    )
+                                    .await?;
+                                }
+                            }
                             transaction
                                 .commit()
                                 .await
@@ -40328,6 +40351,7 @@ async fn enqueue_recovery_terminalization_if_required<C: ConnectionTrait>(
 
 #[cfg(test)]
 mod tests {
+    mod execution_observability;
     use crate::{TurnEventDeliveryOutcome, TurnEventDeliverySettlement};
     mod authorization_reads;
     mod saved_history_read;
@@ -68679,4 +68703,8 @@ impl CrudStore {
 pub use repositories::html_preview_io_work::{
     HtmlPreviewIoClaim, HtmlPreviewIoErrorClass, HtmlPreviewIoFamily, HtmlPreviewIoLocator,
     HtmlPreviewIoOutcome, HtmlPreviewIoSource, HtmlPreviewIoState,
+};
+
+pub use repositories::execution_observability::{
+    ExecutionObservationInput, PreparedExecutionObservation,
 };

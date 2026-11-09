@@ -485,6 +485,7 @@ async fn request_agent_round_observed(
                 provider,
                 model_name.as_str(),
                 provider_timeout_policy,
+                event_tx,
                 observation,
             )
             .await?
@@ -631,6 +632,7 @@ async fn request_agent_round_observed(
         };
         lifecycle_metric.finish(pioneer_observability::NativeLifecycleOutcome::Succeeded);
         return Ok(AgentRoundResponse {
+            observed_attempt_operation_id: None,
             round_id: super::generate_id(super::TURN_ITEM_ID_LEN),
             messages: message_collector.into_messages(),
             ui_copies: commentary_ui.copies,
@@ -750,6 +752,7 @@ async fn request_agent_round_observed(
     };
     lifecycle_metric.finish(pioneer_observability::NativeLifecycleOutcome::Succeeded);
     Ok(AgentRoundResponse {
+        observed_attempt_operation_id: None,
         round_id: super::generate_id(super::TURN_ITEM_ID_LEN),
         messages: response.messages,
         ui_copies: commentary_ui.copies,
@@ -834,6 +837,7 @@ async fn stream_provider_response_observed(
             provider,
             model_name.as_str(),
             provider_timeout_policy,
+            event_tx,
             observation,
         )
         .await?
@@ -1669,6 +1673,7 @@ async fn read_next_stream_chunk<S>(
     provider: &Arc<dyn Provider>,
     model_name: &str,
     provider_timeout_policy: ProviderTimeoutPolicy,
+    event_tx: &AgentEventHub,
     observation: &ProviderAttemptObservation,
 ) -> Result<Option<StreamChunk>, ChatTurnError>
 where
@@ -1691,6 +1696,7 @@ where
         loop {
             let next = stream.next().await;
             if let Some(Ok(chunk)) = &next {
+                observation.capture_chunk_boundary(Some(chunk));
                 let identity_only = !chunk.is_final
                     && chunk.message.is_none()
                     && chunk.delta.is_empty()
@@ -1714,6 +1720,9 @@ where
                     continue;
                 }
             }
+            if next.is_none() {
+                observation.capture_chunk_boundary(None);
+            }
             break next;
         }
     })
@@ -1732,8 +1741,11 @@ where
             "stream stall: chunk timeout exceeded".to_owned(),
             Some(classification),
         )
-    })?;
-
+    });
+    // Recording waits are outside the provider's stream-stall timer. A failed
+    // commit is terminal observation failure, never a retryable network stall.
+    observation.flush_milestones(event_tx).await?;
+    let next_chunk = next_chunk?;
     let Some(chunk_result) = next_chunk else {
         return Ok(None);
     };
@@ -4055,6 +4067,18 @@ fn observe_startup_chunk(turn_id: &str, chunk: &pioneer_provider::StreamChunk) {
 /// survive error; no usage is invented for a failed connect or missing terminal.
 pub(super) struct ProviderAttemptObservation {
     id: String,
+    owner: Option<(String, String, String)>,
+    logical_request_id: Option<String>,
+    milestones: std::sync::Mutex<(bool, bool, bool)>,
+    pending_milestones: std::sync::Mutex<Vec<serde_json::Value>>,
+    tool_milestones: std::sync::Mutex<std::collections::BTreeMap<String, bool>>,
+    usage_dirty: std::sync::atomic::AtomicBool,
+    usage_revision: std::sync::atomic::AtomicI64,
+    manifest: Option<serde_json::Value>,
+    prepared_at: chrono::DateTime<chrono::Utc>,
+    prepared_mono: std::time::Instant,
+    prepared_clock_ns: Option<u64>,
+    prepared_point: serde_json::Value,
     purpose: &'static str,
     connection: Option<String>,
     provider: String,
@@ -4062,11 +4086,24 @@ pub(super) struct ProviderAttemptObservation {
     api: String,
     route: Option<String>,
     usage: std::sync::Mutex<TokenUsage>,
+    context: Option<pioneer_provider::usage::UsageContext>,
 }
 impl ProviderAttemptObservation {
     pub(super) fn new(provider: &dyn Provider, model: &str) -> Self {
         Self {
             id: super::generate_id(super::TURN_ITEM_ID_LEN),
+            owner: None,
+            logical_request_id: None,
+            milestones: std::sync::Mutex::new((false, false, false)),
+            pending_milestones: std::sync::Mutex::new(Vec::new()),
+            tool_milestones: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+            usage_dirty: std::sync::atomic::AtomicBool::new(false),
+            usage_revision: std::sync::atomic::AtomicI64::new(0),
+            manifest: None,
+            prepared_at: chrono::Utc::now(),
+            prepared_mono: std::time::Instant::now(),
+            prepared_clock_ns: pioneer_observability::work::clock_ms().checked_mul(1_000_000),
+            prepared_point: pioneer_provider::usage::observation_point(),
             purpose: "main",
             connection: provider.authority_fingerprint().map(str::to_owned),
             provider: provider.name().to_owned(),
@@ -4074,6 +4111,7 @@ impl ProviderAttemptObservation {
             api: provider.usage_api().to_owned(),
             route: provider.usage_route(),
             usage: std::sync::Mutex::new(TokenUsage::default()),
+            context: None,
         }
     }
     pub(super) fn for_request(
@@ -4086,13 +4124,197 @@ impl ProviderAttemptObservation {
         let mut observation = Self::new(provider, &request.model);
         observation.api = profile.api;
         observation.route = profile.route;
+        let context = pioneer_provider::usage::UsageContext::prepare_request(provider, request)
+            .map_err(|_| {
+                ChatTurnError::Terminal("provider accounting preparation failed".into())
+            })?;
+        *observation.usage.lock().expect("usage observation") = context.initial_usage();
+        observation.context = Some(context);
+        observation.manifest = Some(
+            pioneer_provider::usage::request_manifest(request).map_err(|_| {
+                ChatTurnError::Terminal("context manifest preparation failed".into())
+            })?,
+        );
         Ok(observation)
     }
-    pub(super) fn observe(&self, snapshot: &TokenUsage) {
-        self.usage
+    async fn publish_phase(
+        &self,
+        events: &AgentEventHub,
+        workspace: &str,
+        thread: &str,
+        turn: &str,
+        mut fact: serde_json::Value,
+    ) -> anyhow::Result<()> {
+        if let (Some(fact), Some(point)) = (
+            fact.as_object_mut(),
+            pioneer_provider::usage::observation_point().as_object(),
+        ) {
+            for (key, value) in point {
+                fact.entry(key.clone()).or_insert_with(|| value.clone());
+            }
+        }
+        fact["parent_operation_id"] = serde_json::json!(format!("provider:{turn}:{}", self.id));
+        fact["provider"] = self.provider.clone().into();
+        fact["model"] = self.model.clone().into();
+        fact["purpose"] = self.purpose.into();
+        let item = TurnItem::SystemEvent {
+            id: super::generate_id(super::TURN_ITEM_ID_LEN),
+            level: pioneer_protocol::SystemEventLevel::Info,
+            message: "Provider request boundary".into(),
+            code: Some("provider_phase".into()),
+            details: Some(fact),
+        };
+        events
+            .publish_durable_and_wait(AgentDurableEvent::ItemCompleted {
+                notification: ItemCompletedNotification {
+                    workspace_id: workspace.into(),
+                    thread_id: thread.into(),
+                    turn_id: turn.into(),
+                    item,
+                },
+            })
+            .await?;
+        Ok(())
+    }
+    fn capture_chunk_boundary(&self, chunk: Option<&StreamChunk>) {
+        if let Some(usage) = chunk.and_then(|c| c.usage.as_ref()) {
+            self.observe(usage);
+        }
+        let (first, semantic, body) = {
+            let mut state = self.milestones.lock().expect("provider milestones");
+            let first = chunk.is_some() && !state.0;
+            let semantic = chunk
+                .and_then(|c| {
+                    if !c.delta.is_empty() {
+                        Some("text")
+                    } else if c.reasoning_delta.as_ref().is_some_and(|s| !s.is_empty()) {
+                        Some("reasoning")
+                    } else if c.tool_calls.iter().any(|call| !call.arguments.is_empty()) {
+                        Some("tool_arguments")
+                    } else if !c.tool_calls.is_empty() {
+                        Some("tool_declaration")
+                    } else {
+                        None
+                    }
+                })
+                .filter(|_| !state.1);
+            let body = chunk.is_none() && !state.2;
+            state.0 |= first;
+            state.1 |= semantic.is_some();
+            state.2 |= body;
+            (first, semantic, body)
+        };
+        let mut pending = self
+            .pending_milestones
             .lock()
-            .expect("usage observation")
-            .update(snapshot);
+            .expect("pending provider milestones");
+        for (enabled, phase, kind) in [
+            (first, "first_normalized_chunk", None),
+            (semantic.is_some(), "first_semantic_content", semantic),
+            (body, "normalized_stream_finished", None),
+        ] {
+            if enabled {
+                let mut fact = pioneer_provider::usage::observation_point();
+                let boundary = serde_json::json!({"phase":phase,"semantic_kind":kind,
+                "ts_unix_ms":chrono::Utc::now().timestamp_millis(),
+                "process_run_id":pioneer_observability::identity::run_identity().run_id,
+                "elapsed_ms":self.prepared_mono.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                "timing_basis":"since_observation_preparation_monotonic_not_prefill"});
+                fact.as_object_mut()
+                    .expect("point object")
+                    .extend(boundary.as_object().expect("boundary object").clone());
+                pending.push(fact);
+            }
+        }
+        if let Some(chunk) = chunk {
+            let mut tools = self
+                .tool_milestones
+                .lock()
+                .expect("provider tool milestones");
+            for call in &chunk.tool_calls {
+                let id = pioneer_provider::usage::native_id(Some(&call.id)).unwrap_or_else(|| {
+                    use sha2::{Digest, Sha256};
+                    hex::encode(Sha256::digest(call.id.as_bytes()))
+                });
+                let new = !tools.contains_key(&id);
+                if new && tools.len() >= 64 {
+                    if let Some(context) = &self.context {
+                        context.record_diagnostic_loss();
+                    }
+                    continue;
+                }
+                let arguments = tools.entry(id.clone()).or_default();
+                let first_arguments = !call.arguments.is_empty() && !*arguments;
+                *arguments |= first_arguments;
+                for (enabled, phase) in [
+                    (new, "tool_call_declared"),
+                    (first_arguments, "tool_arguments_first_observed"),
+                ] {
+                    if enabled {
+                        let mut fact = pioneer_provider::usage::observation_point();
+                        fact["phase"] = phase.into();
+                        fact["provider_call_id"] = id.clone().into();
+                        fact["argument_bytes_at_boundary"] = call.arguments.len().into();
+                        fact["timing_basis"] =
+                            "normalized_call_boundary_internal_generation_unobserved".into();
+                        pending.push(fact);
+                    }
+                }
+            }
+        }
+    }
+    async fn flush_milestones(&self, events: &AgentEventHub) -> Result<(), ChatTurnError> {
+        let facts = std::mem::take(
+            &mut *self
+                .pending_milestones
+                .lock()
+                .expect("pending provider milestones"),
+        );
+        let Some((workspace, thread, turn)) = &self.owner else {
+            return Ok(());
+        };
+        if self
+            .usage_dirty
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            let usage = self.usage.lock().expect("usage observation").clone();
+            let value = serde_json::to_value(&usage)
+                .map_err(|_| ChatTurnError::Terminal("usage serialization failed".into()))?;
+            events
+                .publish_durable_and_wait(AgentDurableEvent::ProviderUsageSnapshot {
+                    workspace_id: workspace.clone(),
+                    thread_id: thread.clone(),
+                    turn_id: turn.clone(),
+                    item_id: self.id.clone(),
+                    revision: self
+                        .usage_revision
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                    usage: value,
+                })
+                .await
+                .map_err(|_| ChatTurnError::Terminal("usage snapshot commit unconfirmed".into()))?;
+        }
+        for fact in facts {
+            if self
+                .publish_phase(events, workspace, thread, turn, fact)
+                .await
+                .is_err()
+            {
+                if let Some(context) = &self.context {
+                    context.record_diagnostic_loss();
+                }
+            }
+        }
+        Ok(())
+    }
+    pub(super) fn observe(&self, snapshot: &TokenUsage) {
+        let mut usage = self.usage.lock().expect("usage observation");
+        let previous = usage.clone();
+        usage.update(snapshot);
+        if *usage != previous {
+            self.usage_dirty
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
     }
     pub(super) fn observe_error(&self, error: &anyhow::Error) {
         if let Some(snapshot) = pioneer_provider::usage::error_usage(error) {
@@ -4107,7 +4329,13 @@ impl ProviderAttemptObservation {
         turn: &str,
         completed: Option<bool>,
     ) -> Result<(), ChatTurnError> {
+        if completed.is_some() {
+            self.flush_milestones(events).await?;
+        }
         let mut usage = self.usage.lock().expect("usage observation").clone();
+        if let Some(context) = &self.context {
+            context.finalize_usage(&mut usage);
+        }
         if let Some(raw) = &usage.raw_usage {
             usage.raw_usage = Some(pioneer_provider::usage::bounded_usage(raw));
         }
@@ -4121,10 +4349,24 @@ impl ProviderAttemptObservation {
                 "physical_attempt_id":usage.physical_attempt_id,
                 "request_sent":serde_json::Value::Null,
                 "provider":self.provider,"model":self.model,"api":self.api,"route":self.route,
-                "purpose":self.purpose,
+                "purpose":self.purpose,"logical_request_id":self.logical_request_id,
                 "connection_id":self.connection,
+                "prepared_observation":self.prepared_point,
+                "source_observation":pioneer_provider::usage::observation_point(),
                 "status":match completed {None=>"started",Some(true)=>"completed",Some(false)=>"failed"},
-                "complete":completed == Some(true),"usage":usage})),
+                "complete":completed == Some(true),"usage":usage,
+                "usage_snapshot_revision":self.usage_revision.load(std::sync::atomic::Ordering::Acquire).checked_sub(1),
+                "context_manifest":self.manifest,
+                "timing":{"process_run_id":pioneer_observability::identity::run_identity().run_id,
+                    "prepared_at":self.prepared_at,"prepared_mono_ns":self.prepared_clock_ns,
+                    "clock_domain":"observability_work_clock_v1","clock_resolution_ns":1_000_000,
+                    "observation_finished_mono_ns":completed.and_then(|_|pioneer_observability::work::clock_ms().checked_mul(1_000_000)),
+                    "elapsed_ns":completed.map(|_|self.prepared_mono.elapsed().as_nanos().min(i64::MAX as u128) as i64),
+                    "observation_finished_at":completed.map(|_|chrono::Utc::now()),
+                    "elapsed_ms":completed.map(|_|self.prepared_mono.elapsed().as_millis().min(u64::MAX as u128) as u64),
+                    "basis":"observation_lifetime_monotonic",
+                    "dispatch_at":null,"provider_body_finished_at":null,
+                    "coverage":"preparation_and_observation_only"}})),
         };
         let event = if completed.is_none() {
             AgentDurableEvent::ItemStarted {
@@ -4145,7 +4387,18 @@ impl ProviderAttemptObservation {
                 },
             }
         };
-        super::emit_durable_event(events, event).await
+        super::emit_durable_event(events, event).await?;
+        if completed.is_some() {
+            self.publish_phase(events,workspace,thread,turn,serde_json::json!({
+                "phase":"settlement_completed","ts_unix_ms":chrono::Utc::now().timestamp_millis(),
+                "process_run_id":pioneer_observability::identity::run_identity().run_id,
+                "elapsed_ms":self.prepared_mono.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                "timing_basis":"observation_preparation_to_durable_terminal_ack",
+            })).await.unwrap_or_else(|_| {
+                if let Some(context) = &self.context { context.record_diagnostic_loss(); }
+            });
+        }
+        Ok(())
     }
 }
 
@@ -4160,28 +4413,38 @@ pub(super) async fn request_agent_round(
     provider_timeout_policy: ProviderTimeoutPolicy,
     event_tx: &AgentEventHub,
 ) -> Result<AgentRoundResponse, ChatTurnError> {
-    let observation = ProviderAttemptObservation::for_request(provider.as_ref(), &request)?;
+    let mut observation = ProviderAttemptObservation::for_request(provider.as_ref(), &request)?;
+    observation.owner = Some((workspace_id.into(), thread_id.into(), turn_id.into()));
+    observation.logical_request_id = Some(thinking_item_id.into());
     observation
         .publish(event_tx, workspace_id, thread_id, turn_id, None)
         .await?;
-    let result = pioneer_provider::prompt_cache::scope(
-        workspace_id,
-        thread_id,
-        "main",
-        request_agent_round_observed(
-            provider,
-            request,
-            workspace_id,
-            thread_id,
-            turn_id,
-            thinking_item_id,
-            force_non_stream,
-            provider_timeout_policy,
-            event_tx,
-            &observation,
-        ),
-    )
-    .await;
+    let result = observation
+        .context
+        .as_ref()
+        .expect("prepared observation")
+        .scope_with_observations(
+            pioneer_provider::prompt_cache::scope(
+                workspace_id,
+                thread_id,
+                "main",
+                request_agent_round_observed(
+                    provider,
+                    request,
+                    workspace_id,
+                    thread_id,
+                    turn_id,
+                    thinking_item_id,
+                    force_non_stream,
+                    provider_timeout_policy,
+                    event_tx,
+                    &observation,
+                ),
+            ),
+            |fact| observation.publish_phase(event_tx, workspace_id, thread_id, turn_id, fact),
+        )
+        .await
+        .map_err(|_| ChatTurnError::Terminal("request observation commit unconfirmed".into()))?;
     observation
         .publish(
             event_tx,
@@ -4191,7 +4454,11 @@ pub(super) async fn request_agent_round(
             Some(result.is_ok()),
         )
         .await?;
-    result
+    result.map(|mut round| {
+        round.observed_attempt_operation_id =
+            Some(format!("provider:{turn_id}:{}", observation.id));
+        round
+    })
 }
 
 pub(super) async fn stream_provider_response(
@@ -4205,28 +4472,38 @@ pub(super) async fn stream_provider_response(
     provider_timeout_policy: ProviderTimeoutPolicy,
     event_tx: &AgentEventHub,
 ) -> Result<(String, Option<pioneer_provider::TokenUsage>), ChatTurnError> {
-    let observation = ProviderAttemptObservation::for_request(provider.as_ref(), &request)?;
+    let mut observation = ProviderAttemptObservation::for_request(provider.as_ref(), &request)?;
+    observation.owner = Some((workspace_id.into(), thread_id.into(), turn_id.into()));
+    observation.logical_request_id = Some(thinking_item_id.into());
     observation
         .publish(event_tx, workspace_id, thread_id, turn_id, None)
         .await?;
-    let result = pioneer_provider::prompt_cache::scope(
-        workspace_id,
-        thread_id,
-        "main",
-        stream_provider_response_observed(
-            provider,
-            request,
-            workspace_id,
-            thread_id,
-            turn_id,
-            thinking_item_id,
-            message_item_id,
-            provider_timeout_policy,
-            event_tx,
-            &observation,
-        ),
-    )
-    .await;
+    let result = observation
+        .context
+        .as_ref()
+        .expect("prepared observation")
+        .scope_with_observations(
+            pioneer_provider::prompt_cache::scope(
+                workspace_id,
+                thread_id,
+                "main",
+                stream_provider_response_observed(
+                    provider,
+                    request,
+                    workspace_id,
+                    thread_id,
+                    turn_id,
+                    thinking_item_id,
+                    message_item_id,
+                    provider_timeout_policy,
+                    event_tx,
+                    &observation,
+                ),
+            ),
+            |fact| observation.publish_phase(event_tx, workspace_id, thread_id, turn_id, fact),
+        )
+        .await
+        .map_err(|_| ChatTurnError::Terminal("request observation commit unconfirmed".into()))?;
     observation
         .publish(
             event_tx,
@@ -4249,27 +4526,37 @@ pub(super) async fn non_stream_provider_response(
     message_item_id: &str,
     event_tx: &AgentEventHub,
 ) -> Result<(String, Option<pioneer_provider::TokenUsage>), ChatTurnError> {
-    let observation = ProviderAttemptObservation::for_request(provider.as_ref(), &request)?;
+    let mut observation = ProviderAttemptObservation::for_request(provider.as_ref(), &request)?;
+    observation.owner = Some((workspace_id.into(), thread_id.into(), turn_id.into()));
+    observation.logical_request_id = Some(thinking_item_id.into());
     observation
         .publish(event_tx, workspace_id, thread_id, turn_id, None)
         .await?;
-    let result = pioneer_provider::prompt_cache::scope(
-        workspace_id,
-        thread_id,
-        "main",
-        non_stream_provider_response_observed(
-            provider,
-            request,
-            workspace_id,
-            thread_id,
-            turn_id,
-            thinking_item_id,
-            message_item_id,
-            event_tx,
-            &observation,
-        ),
-    )
-    .await;
+    let result = observation
+        .context
+        .as_ref()
+        .expect("prepared observation")
+        .scope_with_observations(
+            pioneer_provider::prompt_cache::scope(
+                workspace_id,
+                thread_id,
+                "main",
+                non_stream_provider_response_observed(
+                    provider,
+                    request,
+                    workspace_id,
+                    thread_id,
+                    turn_id,
+                    thinking_item_id,
+                    message_item_id,
+                    event_tx,
+                    &observation,
+                ),
+            ),
+            |fact| observation.publish_phase(event_tx, workspace_id, thread_id, turn_id, fact),
+        )
+        .await
+        .map_err(|_| ChatTurnError::Terminal("request observation commit unconfirmed".into()))?;
     observation
         .publish(
             event_tx,
