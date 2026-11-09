@@ -60394,7 +60394,7 @@ mod tests {
         )
         .await;
         for turn_id in [&failed.id, &aborted.id] {
-            repositories::turn_execution::insert_immutable(
+            turn_execution::insert_immutable(
                 &store.connection,
                 NewTurnExecution {
                     turn_id: turn_id.clone(),
@@ -60622,7 +60622,7 @@ mod tests {
                     "turn_shell_abort_pending",
                 )
                 .await;
-                repositories::turn_execution::insert_immutable(
+                turn_execution::insert_immutable(
                     &store.connection,
                     NewTurnExecution {
                         turn_id: blocked.id.clone(),
@@ -60765,7 +60765,7 @@ mod tests {
                     .iter()
                     .any(|row| row.source == "tool_result_v2")
             );
-            let execution = repositories::turn_execution::find(&store.connection, &blocked.id)
+            let execution = turn_execution::find(&store.connection, &blocked.id)
                 .await
                 .unwrap()
                 .unwrap();
