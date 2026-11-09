@@ -1713,6 +1713,7 @@ mod session_tests {
                 core.finish_current_auth(0, None, auth_me()).unwrap();
                 let thread = pioneer_protocol::Thread {
                     context_window: None,
+                    service_mode: None,
                     context_authority: None,
                     id: "thread".into(),
                     workspace_id: "workspace".into(),

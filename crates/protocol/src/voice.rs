@@ -397,6 +397,8 @@ fn validate_voice_chunk_header_common(
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
 pub struct VoiceTurnContext {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_mode: Option<crate::NativeServiceModeSelection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_authority: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u64>,
@@ -451,6 +453,7 @@ impl VoiceTurnContext {
         input.extend(self.prepared_input);
 
         TurnStartParams {
+            service_mode: self.service_mode,
             context_authority: self.context_authority,
             context_window: self.context_window,
             agent_delegation_routes: Vec::new(),
@@ -707,6 +710,7 @@ mod tests {
     #[test]
     fn voice_control_dtos_round_trip_through_serde() {
         let context = VoiceTurnContext {
+            service_mode: None,
             context_authority: None,
             context_window: None,
             workspace_id: "workspace_1".to_owned(),
@@ -808,6 +812,7 @@ mod tests {
     #[test]
     fn voice_context_prepends_transcript_without_embedding_it_in_frozen_context() {
         let context = VoiceTurnContext {
+            service_mode: None,
             context_authority: None,
             context_window: None,
             workspace_id: "workspace_1".to_owned(),

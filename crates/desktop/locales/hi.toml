@@ -54,6 +54,9 @@ remove = "उल्लेख हटाएँ"
 cancel = "जवाब रद्द करें"
 
 [chat.composer.model]
+service_label = "सेवा स्तर"
+service_standard = "मानक"
+service_invalid = "सहेजा गया सेवा स्तर उपलब्ध नहीं है। मानक या दूसरा मोड चुनें।"
 context_label = "संदर्भ विंडो"
 context_auto = "ऑटो — %{tokens} टोकन तक"
 context_up_to = "%{tokens} टोकन तक"

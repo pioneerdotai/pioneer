@@ -269,6 +269,7 @@ impl ThreadManager {
         Ok((
             Thread {
                 context_window: None,
+                service_mode: None,
                 context_authority: None,
                 id: thread_id.to_owned(),
                 workspace_id: workspace_id.to_owned(),
@@ -675,6 +676,7 @@ impl ThreadManager {
                 } else {
                     Thread {
                         context_window: None,
+                        service_mode: None,
                         context_authority: None,
                         id: thread_id.clone(),
                         workspace_id,
@@ -2330,6 +2332,7 @@ mod tests {
             .turn_start(
                 10,
                 TurnStartParams {
+                    service_mode: None,
                     context_authority: None,
                     context_window: None,
                     agent_delegation_routes: Vec::new(),
@@ -2361,6 +2364,7 @@ mod tests {
             .prepare_completed_message_turn(
                 10,
                 &TurnStartParams {
+                    service_mode: None,
                     context_authority: None,
                     context_window: None,
                     agent_delegation_routes: Vec::new(),
@@ -2466,6 +2470,7 @@ mod tests {
             .await
             .expect("thread should start");
         let params = TurnStartParams {
+            service_mode: None,
             context_authority: None,
             context_window: None,
             agent_delegation_routes: Vec::new(),
@@ -2525,6 +2530,7 @@ mod tests {
             ("interrupted", TurnStatus::Interrupted),
         ] {
             let params = TurnStartParams {
+                service_mode: None,
                 context_authority: None,
                 context_window: None,
                 agent_delegation_routes: Vec::new(),
@@ -2597,6 +2603,7 @@ mod tests {
             agent: None,
         };
         let params = |turn_id: &str, text: &str| TurnStartParams {
+            service_mode: None,
             context_authority: None,
             context_window: None,
             agent_delegation_routes: Vec::new(),
@@ -2695,6 +2702,7 @@ mod tests {
         let seed_updated_at = 1_700_000_000_i64;
         let seed_thread = Thread {
             context_window: None,
+            service_mode: None,
             context_authority: None,
             workspace_id: "ws_000000000000000001".to_owned(),
             id: "thr_000000000000000099".to_owned(),
@@ -2786,6 +2794,7 @@ mod tests {
         let turn_id = "turn_000000000000000121";
         let thread = Thread {
             context_window: None,
+            service_mode: None,
             context_authority: None,
             workspace_id: "ws_000000000000000001".to_owned(),
             id: thread_id.to_owned(),
@@ -2910,6 +2919,7 @@ mod tests {
         let task_turn_id = "run_0000000000000000122";
         let thread = Thread {
             context_window: None,
+            service_mode: None,
             context_authority: None,
             workspace_id: workspace_id.to_owned(),
             id: thread_id.to_owned(),
@@ -2974,6 +2984,7 @@ mod tests {
             .turn_start(
                 10,
                 TurnStartParams {
+                    service_mode: None,
                     context_authority: None,
                     context_window: None,
                     agent_delegation_routes: Vec::new(),
@@ -3147,6 +3158,7 @@ mod tests {
             .turn_start(
                 10,
                 TurnStartParams {
+                    service_mode: None,
                     context_authority: None,
                     context_window: None,
                     agent_delegation_routes: Vec::new(),
@@ -3205,6 +3217,7 @@ mod tests {
             .turn_start(
                 10,
                 TurnStartParams {
+                    service_mode: None,
                     context_authority: None,
                     context_window: None,
                     agent_delegation_routes: Vec::new(),
@@ -3235,6 +3248,7 @@ mod tests {
         let child = manager
             .concurrent_agent_turn_start_with_permission_profile(
                 TurnStartParams {
+                    service_mode: None,
                     context_authority: None,
                     context_window: None,
                     agent_delegation_routes: Vec::new(),
@@ -3405,6 +3419,7 @@ mod tests {
             .turn_start(
                 10,
                 TurnStartParams {
+                    service_mode: None,
                     context_authority: None,
                     context_window: None,
                     agent_delegation_routes: Vec::new(),
@@ -3464,6 +3479,7 @@ mod tests {
             .turn_start(
                 10,
                 TurnStartParams {
+                    service_mode: None,
                     context_authority: None,
                     context_window: None,
                     agent_delegation_routes: Vec::new(),
@@ -3517,6 +3533,7 @@ mod tests {
             .turn_start(
                 10,
                 TurnStartParams {
+                    service_mode: None,
                     context_authority: None,
                     context_window: None,
                     agent_delegation_routes: Vec::new(),
@@ -3562,6 +3579,7 @@ mod tests {
             .turn_start(
                 10,
                 TurnStartParams {
+                    service_mode: None,
                     context_authority: None,
                     context_window: None,
                     agent_delegation_routes: Vec::new(),
@@ -3612,6 +3630,7 @@ mod tests {
             .turn_start(
                 10,
                 TurnStartParams {
+                    service_mode: None,
                     context_authority: None,
                     context_window: None,
                     agent_delegation_routes: Vec::new(),

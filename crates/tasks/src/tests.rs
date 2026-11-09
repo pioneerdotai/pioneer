@@ -746,6 +746,7 @@ async fn persist_test_agent_turn(
         pioneer_protocol::PersistedActorRef::AgentExecution(snapshot.agent_execution_id.clone());
     let thread = pioneer_protocol::Thread {
         context_window: None,
+        service_mode: None,
         context_authority: None,
         workspace_id: TEST_WORKSPACE_ID.to_owned(),
         id: thread_id.to_owned(),
@@ -1341,6 +1342,7 @@ fn composer_work_create_params(
         composer_work: Some(pioneer_protocol::TaskComposerWork {
             version: payload_version,
             launch: pioneer_protocol::TurnStartParams {
+                service_mode: None,
                 context_authority: None,
                 context_window: None,
                 agent_delegation_routes: Vec::new(),

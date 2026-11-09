@@ -355,6 +355,9 @@ reason_cancelled = "The run was cancelled."
 reason_unknown = "The operation did not complete as expected. Check the gateway logs."
 
 [chat.composer.model]
+service_label = "Service tier"
+service_standard = "Standard"
+service_invalid = "Saved service tier is unavailable. Choose Standard or reselect a mode."
 context_label = "Context window"
 context_auto = "Auto — up to %{tokens} tokens"
 context_up_to = "Up to %{tokens} tokens"

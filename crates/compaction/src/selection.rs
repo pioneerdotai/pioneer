@@ -12,6 +12,8 @@ pub enum Transport {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ModelSelection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_mode: Option<pioneer_protocol::NativeServiceModeSelection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_authority: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u64>,
@@ -71,6 +73,7 @@ mod tests {
     use super::*;
     fn model(transport: Transport, name: &str) -> ModelSelection {
         ModelSelection {
+            service_mode: None,
             context_authority: None,
             context_window: None,
             transport,

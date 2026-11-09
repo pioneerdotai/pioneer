@@ -320,6 +320,8 @@ fn sha256_hex(bytes: &[u8]) -> String {
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
 pub struct TurnStartParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_mode: Option<crate::NativeServiceModeSelection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_authority: Option<String>,
     /// User-owned model choice; absent means Auto, not inheritance of a wider override.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -6864,6 +6866,7 @@ mod tests {
     #[test]
     fn turn_start_params_encode_user_input_tagged_enum() {
         let params = TurnStartParams {
+            service_mode: None,
             context_authority: None,
             context_window: None,
             agent_delegation_routes: Vec::new(),
@@ -6933,6 +6936,7 @@ mod tests {
     #[test]
     fn turn_start_params_encode_extended_attachment_input_variants() {
         let params = TurnStartParams {
+            service_mode: None,
             context_authority: None,
             context_window: None,
             agent_delegation_routes: Vec::new(),

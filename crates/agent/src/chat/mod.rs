@@ -3619,6 +3619,7 @@ async fn execute_standard_provider_response(
     }
 
     let request = ChatRequest {
+        service_mode: None,
         model,
         messages,
         temperature: None,
@@ -5712,6 +5713,7 @@ async fn execute_agent_provider_response(
             }
             let post_turn_assistant_text_len_before_round = post_turn_assistant_text.len();
             let request = ChatRequest {
+                service_mode: None,
                     model: model.clone(),
                     messages: messages.clone(),
                     temperature: None,
@@ -7994,6 +7996,7 @@ mod tests {
                 session
                     .prepare(
                         ChatRequest {
+                            service_mode: None,
                             model: "private/model".into(),
                             messages: vec![],
                             temperature: None,

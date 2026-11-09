@@ -309,6 +309,7 @@ mod tests {
         let core = Arc::new(ClientCore::new());
         core.upsert_thread(Thread {
             context_window: None,
+            service_mode: None,
             context_authority: None,
             workspace_id: "ws".into(),
             id: "a".into(),

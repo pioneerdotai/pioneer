@@ -2186,6 +2186,7 @@ mod tests {
     fn source_thread_for_workspace(workspace_id: &str, thread_id: &str, created_at: i64) -> Thread {
         Thread {
             context_window: None,
+            service_mode: None,
             context_authority: None,
             workspace_id: workspace_id.to_owned(),
             id: thread_id.to_owned(),

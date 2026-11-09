@@ -36,9 +36,15 @@ pub struct ComposerModelPickerPublication {
     pub selector: ProviderModelSelectorState,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub context_rows: Vec<presentation::ContextWindowRow>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub service_rows: Vec<presentation::ServiceModeRow>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub default_reasoning_only: bool,
     pub selected_reasoning_effort: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected_context_window: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_service_mode: Option<pioneer_protocol::NativeServiceModeSelection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected_context_authority: Option<String>,
     pub deferred: bool,
@@ -54,6 +60,7 @@ impl ComposerModelPickerPublication {
             model,
             selected_reasoning_effort: self.selected_reasoning_effort.clone(),
             selected_context_window: self.selected_context_window.clone(),
+            selected_service_mode: self.selected_service_mode.clone(),
             selected_context_authority: self.selected_context_authority.clone(),
         }
     }
@@ -99,6 +106,10 @@ pub enum ComposerModelPickerIntent {
     SelectModel {
         identity: ComposerOperationIdentity,
         model: String,
+    },
+    SelectServiceMode {
+        identity: ComposerOperationIdentity,
+        id: String,
     },
     SelectContextWindow {
         identity: ComposerOperationIdentity,
@@ -256,11 +267,29 @@ impl ClientCore {
                 }
             })
             .collect();
+        next.service_rows = next
+            .selector
+            .service_rows(next.selected_service_mode.as_ref());
+        next.default_reasoning_only = next
+            .selector
+            .service_default_reasoning_only(next.selected_service_mode.as_ref());
         next.context_rows = next.selector.context_rows(
             next.selected_context_window,
             next.selected_context_authority.as_deref(),
         );
-        next.reasoning_rows = next.reasoning_rows();
+        next.reasoning_rows = if next.default_reasoning_only {
+            vec![]
+        } else {
+            next.reasoning_rows()
+        };
+        if next
+            .selected_service_mode
+            .as_ref()
+            .is_some_and(|mode| mode.id == "pro")
+        {
+            next.reasoning_rows
+                .retain(|row| !matches!(row.effort.as_str(), "none" | "off"));
+        }
         next.selected_provider_ready = list::provider_ready_for_model_selector(
             next.selector.selected_provider(),
             next.selector.cli_runtimes(),
@@ -344,6 +373,8 @@ impl ClientCore {
             };
             let next = ComposerModelPickerPublication {
                 context_rows: vec![],
+                service_rows: vec![],
+                default_reasoning_only: false,
                 provider_rows: vec![],
                 reasoning_rows: vec![],
                 selected_provider_ready: false,
@@ -355,6 +386,7 @@ impl ClientCore {
                 ),
                 selected_reasoning_effort: draft.domain().selected_reasoning_effort.clone(),
                 selected_context_window: draft.domain().selected_context_window,
+                selected_service_mode: draft.domain().selected_service_mode.clone(),
                 selected_context_authority: draft.domain().selected_context_authority.clone(),
                 deferred,
                 closed: false,
@@ -370,6 +402,7 @@ impl ClientCore {
         let identity = match &intent {
             ComposerModelPickerIntent::SelectProvider { identity, .. }
             | ComposerModelPickerIntent::SelectModel { identity, .. }
+            | ComposerModelPickerIntent::SelectServiceMode { identity, .. }
             | ComposerModelPickerIntent::SelectContextWindow { identity, .. }
             | ComposerModelPickerIntent::SelectReasoningEffort { identity, .. }
             | ComposerModelPickerIntent::RetryProviders { identity }
@@ -434,6 +467,7 @@ impl ClientCore {
                 next.selector.select_provider(provider.clone());
                 next.selected_reasoning_effort = None;
                 next.selected_context_window = None;
+                next.selected_service_mode = None;
                 next.selected_context_authority = None;
                 next.models_request = Default::default();
                 request = Some(RequestKind::Models(provider));
@@ -448,7 +482,30 @@ impl ClientCore {
                 next.selector.set_selected_model(model);
                 next.selected_reasoning_effort = None;
                 next.selected_context_window = None;
+                next.selected_service_mode = None;
                 next.selected_context_authority = None;
+            }
+            ComposerModelPickerIntent::SelectServiceMode { id, .. } => {
+                let Some(model) = next
+                    .selector
+                    .models()
+                    .iter()
+                    .find(|model| Some(model.id.as_str()) == next.selector.selected_model())
+                else {
+                    return self.reject_intent();
+                };
+                if !next
+                    .selector
+                    .service_rows(next.selected_service_mode.as_ref())
+                    .iter()
+                    .any(|row| row.id == id && row.available)
+                {
+                    return self.reject_intent();
+                }
+                let Some(choice) = presentation::service_mode_choice(model, &id) else {
+                    return self.reject_intent();
+                };
+                next.selected_service_mode = choice;
             }
             ComposerModelPickerIntent::SelectContextWindow { window, .. } => {
                 let rows = next.selector.context_rows(
@@ -468,12 +525,29 @@ impl ClientCore {
                 next.selected_context_window = window;
             }
             ComposerModelPickerIntent::SelectReasoningEffort { effort, .. } => {
+                if effort.is_some()
+                    && next
+                        .selector
+                        .service_default_reasoning_only(next.selected_service_mode.as_ref())
+                {
+                    return self.reject_intent();
+                }
                 if next.selected_reasoning_effort == effort {
                     return self.model_picker_noop();
                 }
                 if effort.as_ref().is_some_and(|effort| {
                     !next.reasoning_rows().iter().any(|r| &r.effort == effort)
                 }) {
+                    return self.reject_intent();
+                }
+                if next
+                    .selected_service_mode
+                    .as_ref()
+                    .is_some_and(|mode| mode.id == "pro")
+                    && effort
+                        .as_deref()
+                        .is_some_and(|effort| matches!(effort, "none" | "off"))
+                {
                     return self.reject_intent();
                 }
                 next.selected_reasoning_effort = effort;
@@ -718,6 +792,7 @@ impl ClientCore {
             next.selector = ProviderModelSelectorState::new(None, None);
             next.selected_reasoning_effort = None;
             next.selected_context_window = None;
+            next.selected_service_mode = None;
             next.selected_context_authority = None;
             next.providers_request.state = ComposerCatalogRequestState::Cancelled;
             next.models_request.state = ComposerCatalogRequestState::Cancelled;
@@ -1988,6 +2063,7 @@ mod tests {
                 RequestKind::Providers => providers(),
                 RequestKind::Models(provider) => ModelPickerResult::Models(Ok(serde_json::from_value(serde_json::json!({"provider":provider,"models":["one","two"].iter().map(|id| serde_json::json!({
                     "id":id,"provider":provider,"limits":{"context_window":1050000},"capabilities":{},
+                    "service_modes":{"status":"known","modes":{"pro":{"status":"parsed","descriptor":{"id":"pro","label":"Pro","parameters":{"kind":"open_ai_pro"},"source_provider":"openai","source_model":id,"source_api":"openai-responses"}}}},
                     "context_authority":"account-a", "context_tiers":{"status":"tiered","windows":[272000,1050000],"price_order_confirmed":true}
                 })).collect::<Vec<_>>()})).unwrap())),
             };
@@ -2001,6 +2077,10 @@ mod tests {
             identity: identity.clone(),
             window: Some(1050000),
         });
+        core.composer_model_picker_intent(ComposerModelPickerIntent::SelectServiceMode {
+            identity: identity.clone(),
+            id: "pro".into(),
+        });
         let selected = core.composer_snapshot("a").unwrap();
         assert_eq!(selected.domain().selected_context_window, Some(1050000));
         assert_eq!(
@@ -2010,6 +2090,13 @@ mod tests {
         let restored: super::super::state_machine::ComposerDomainState =
             serde_json::from_str(&serde_json::to_string(selected.domain()).unwrap()).unwrap();
         assert_eq!(restored.selected_context_window, Some(1050000));
+        assert_eq!(
+            restored
+                .selected_service_mode
+                .as_ref()
+                .map(|mode| mode.id.as_str()),
+            Some("pro")
+        );
         core.composer_model_picker_intent(ComposerModelPickerIntent::Close { identity });
         let identity = open(&core, false);
         assert_eq!(
@@ -2018,6 +2105,14 @@ mod tests {
                 .selected_context_window,
             Some(1050000)
         );
+        assert_eq!(
+            core.composer_model_picker_snapshot("a")
+                .unwrap()
+                .selected_service_mode
+                .as_ref()
+                .map(|mode| mode.id.as_str()),
+            Some("pro")
+        );
         // Reopening already preserves the choice before discovery arrives.
         // Complete the new snapshot using the existing metadata owner.
         while let Ok(work) = rx.try_recv() {
@@ -2025,11 +2120,23 @@ mod tests {
                 RequestKind::Providers => providers(),
                 RequestKind::Models(provider) => ModelPickerResult::Models(Ok(serde_json::from_value(serde_json::json!({"provider":provider,"models":["one","two"].iter().map(|id| serde_json::json!({
                     "id":id,"provider":provider,"limits":{"context_window":1050000},"capabilities":{},
+                    "service_modes":{"status":"known","modes":{"pro":{"status":"parsed","descriptor":{"id":"pro","label":"Pro","parameters":{"kind":"open_ai_pro"},"source_provider":"openai","source_model":id,"source_api":"openai-responses"}}}},
                     "context_authority":"account-a", "context_tiers":{"status":"tiered","windows":[272000,1050000],"price_order_confirmed":true}
                 })).collect::<Vec<_>>()})).unwrap())),
             };
             core.complete_composer_model_picker(work, result);
         }
+        core.composer_model_picker_intent(ComposerModelPickerIntent::SelectServiceMode {
+            identity: identity.clone(),
+            id: "standard".into(),
+        });
+        let standard = core.composer_snapshot("a").unwrap();
+        assert!(standard.domain().selected_service_mode.is_none());
+        assert_eq!(standard.domain().selected_context_window, Some(1050000));
+        core.composer_model_picker_intent(ComposerModelPickerIntent::SelectServiceMode {
+            identity: identity.clone(),
+            id: "pro".into(),
+        });
         core.composer_model_picker_intent(ComposerModelPickerIntent::SelectContextWindow {
             identity: identity.clone(),
             window: None,
@@ -2056,6 +2163,13 @@ mod tests {
             identity,
             model: "two".into(),
         });
+        assert!(
+            core.composer_snapshot("a")
+                .unwrap()
+                .domain()
+                .selected_service_mode
+                .is_none()
+        );
         assert_eq!(
             core.composer_snapshot("a")
                 .unwrap()

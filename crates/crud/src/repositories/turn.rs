@@ -1116,7 +1116,21 @@ pub(crate) async fn pin_turn_native_context<C: ConnectionTrait>(
             Expr::cust_with_values("json_set(execution_security_snapshot_json,'$.native_context',json(?),'$.native_summary',json(?))",
                 [budget_json.to_owned(), summary_json.to_owned()]))
         .exec(db).await?;
-    Ok(result.rows_affected > 0)
+    // Legacy context-tier snapshots already have a pinned cap. Fill only the
+    // missing service plan; never replace that cap or any authorization fields.
+    // Values were serialized before writer acquisition by CrudStore.
+    let mode_result = turn::Entity::update_many()
+        .filter(turn::Column::Id.eq(turn_id))
+        .filter(turn::Column::ThreadId.in_subquery(
+            pioneer_entity::thread::Entity::find().select_only().column(pioneer_entity::thread::Column::Id)
+                .filter(pioneer_entity::thread::Column::WorkspaceId.eq(workspace)).into_query(),
+        ))
+        .filter(Expr::cust("json_valid(execution_security_snapshot_json) AND json_extract(execution_security_snapshot_json,'$.backend.execution_backend')='native' AND json_extract(execution_security_snapshot_json,'$.native_context') IS NOT NULL AND json_extract(execution_security_snapshot_json,'$.native_context.service_mode') IS NULL"))
+        .filter(Expr::cust_with_values("json_extract(?,'$.service_mode') IS NOT NULL AND json_extract(execution_security_snapshot_json,'$.native_context.instance')=json_extract(?,'$.instance') AND json_extract(execution_security_snapshot_json,'$.native_context.model')=json_extract(?,'$.model') AND json_extract(execution_security_snapshot_json,'$.native_context.authority') IS json_extract(?,'$.authority')", [budget_json.to_owned(),budget_json.to_owned(),budget_json.to_owned(),budget_json.to_owned()]))
+        .col_expr(turn::Column::ExecutionSecuritySnapshotJson,
+            Expr::cust_with_values("CASE WHEN json_extract(execution_security_snapshot_json,'$.native_summary') IS NOT NULL AND json_extract(execution_security_snapshot_json,'$.native_summary.budget.service_mode') IS NULL THEN json_set(execution_security_snapshot_json,'$.native_context.service_mode',json_extract(?,'$.service_mode'),'$.native_summary.budget.service_mode',json_extract(?,'$.budget.service_mode')) ELSE json_set(execution_security_snapshot_json,'$.native_context.service_mode',json_extract(?,'$.service_mode')) END", [budget_json.to_owned(),summary_json.to_owned(),budget_json.to_owned()]))
+        .exec(db).await?;
+    Ok(result.rows_affected > 0 || mode_result.rows_affected > 0)
 }
 
 pub async fn find_turn_execution_security_snapshot<C: ConnectionTrait>(

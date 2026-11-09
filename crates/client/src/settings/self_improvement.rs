@@ -256,6 +256,7 @@ mod tests {
                 model: Some(" gpt-5.4 ".to_owned()),
                 selected_reasoning_effort: None,
                 selected_context_window: None,
+                selected_service_mode: None,
                 selected_context_authority: None,
             }),
             Some(selection("openai", "gpt-5.4"))
@@ -266,6 +267,7 @@ mod tests {
                 model: Some(" ".to_owned()),
                 selected_reasoning_effort: None,
                 selected_context_window: None,
+                selected_service_mode: None,
                 selected_context_authority: None,
             })
             .is_none()
@@ -279,6 +281,7 @@ mod tests {
                 model: Some("model".to_owned()),
                 selected_reasoning_effort: effort.map(str::to_owned),
                 selected_context_window: None,
+                selected_service_mode: None,
                 selected_context_authority: None,
             })
             .unwrap();

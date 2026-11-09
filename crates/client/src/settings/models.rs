@@ -31,6 +31,7 @@ pub fn from_selector(
             (ModelSelectionTransport::Api, provider)
         };
     GatewayModelSelection::Explicit {
+        service_mode: selection.selected_service_mode,
         context_authority: selection.selected_context_authority,
         context_window: selection.selected_context_window,
         transport,
@@ -45,6 +46,7 @@ pub fn to_selector(selection: &GatewayModelSelection) -> ModelSelectorSelection 
     match selection {
         GatewayModelSelection::Inherit => ModelSelectorSelection::default(),
         GatewayModelSelection::Explicit {
+            service_mode,
             context_authority,
             context_window,
             transport,
@@ -60,6 +62,7 @@ pub fn to_selector(selection: &GatewayModelSelection) -> ModelSelectorSelection 
             model: Some(model.clone()),
             selected_reasoning_effort: reasoning_effort.clone(),
             selected_context_window: *context_window,
+            selected_service_mode: service_mode.clone(),
             selected_context_authority: context_authority.clone(),
         },
     }
@@ -71,6 +74,7 @@ mod tests {
     fn selector_roundtrip_retains_cli_kind_and_effort_and_rejects_missing_instance() {
         let runtime = GatewayCliRuntimeInstanceSettings::default_claude();
         let selection = GatewayModelSelection::Explicit {
+            service_mode: None,
             context_authority: None,
             context_window: None,
             transport: ModelSelectionTransport::Claude,

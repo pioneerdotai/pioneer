@@ -23,9 +23,15 @@ pub struct SettingsModelPickerPublication {
     pub selector: ProviderModelSelectorState,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub context_rows: Vec<presentation::ContextWindowRow>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub service_rows: Vec<presentation::ServiceModeRow>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub default_reasoning_only: bool,
     pub selected_reasoning_effort: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected_context_window: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_service_mode: Option<pioneer_protocol::NativeServiceModeSelection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected_context_authority: Option<String>,
     pub closed: bool,
@@ -49,6 +55,11 @@ pub enum SettingsModelPickerIntent {
         picker_id: String,
         expected_owner: u64,
         model: String,
+    },
+    SelectServiceMode {
+        picker_id: String,
+        expected_owner: u64,
+        id: String,
     },
     SelectContextWindow {
         picker_id: String,
@@ -79,6 +90,7 @@ impl SettingsModelPickerIntent {
             Self::Open { picker_id, .. }
             | Self::SelectProvider { picker_id, .. }
             | Self::SelectModel { picker_id, .. }
+            | Self::SelectServiceMode { picker_id, .. }
             | Self::SelectContextWindow { picker_id, .. }
             | Self::SelectReasoningEffort { picker_id, .. }
             | Self::RetryProviders { picker_id, .. }
@@ -91,6 +103,7 @@ impl SettingsModelPickerIntent {
             Self::Open { .. } => None,
             Self::SelectProvider { expected_owner, .. }
             | Self::SelectModel { expected_owner, .. }
+            | Self::SelectServiceMode { expected_owner, .. }
             | Self::SelectContextWindow { expected_owner, .. }
             | Self::SelectReasoningEffort { expected_owner, .. }
             | Self::RetryProviders { expected_owner, .. }
@@ -190,6 +203,7 @@ impl ClientCore {
             model,
             selected_reasoning_effort: value.selected_reasoning_effort.clone(),
             selected_context_window: value.selected_context_window.clone(),
+            selected_service_mode: value.selected_service_mode.clone(),
             selected_context_authority: value.selected_context_authority.clone(),
         })
     }
@@ -276,12 +290,15 @@ impl ClientCore {
             let selected = selector.preload_selected_provider_models();
             let value = SettingsModelPickerPublication {
                 context_rows: vec![],
+                service_rows: vec![],
+                default_reasoning_only: false,
                 picker_id: id.clone(),
                 owner_generation: store.generation,
                 workspace_id: workspace_id.clone(),
                 selector,
                 selected_reasoning_effort: selection.selected_reasoning_effort.clone(),
                 selected_context_window: selection.selected_context_window.clone(),
+                selected_service_mode: selection.selected_service_mode.clone(),
                 selected_context_authority: selection.selected_context_authority.clone(),
                 closed: false,
             };
@@ -339,6 +356,7 @@ impl ClientCore {
                     let provider = next.selector.select_provider(provider);
                     next.selected_reasoning_effort = None;
                     next.selected_context_window = None;
+                    next.selected_service_mode = None;
                     next.selected_context_authority = None;
                     session.model_generation += 1;
                     session.model_pending = true;
@@ -352,8 +370,30 @@ impl ClientCore {
                         next.selector.set_selected_model(model);
                         next.selected_reasoning_effort = None;
                         next.selected_context_window = None;
+                        next.selected_service_mode = None;
                         next.selected_context_authority = None;
                     }
+                }
+                SettingsModelPickerIntent::SelectServiceMode { id, .. } => {
+                    let Some(model) =
+                        next.selector.models().iter().find(|model| {
+                            Some(model.id.as_str()) == next.selector.selected_model()
+                        })
+                    else {
+                        return self.reject_intent();
+                    };
+                    if !next
+                        .selector
+                        .service_rows(next.selected_service_mode.as_ref())
+                        .iter()
+                        .any(|row| row.id == id && row.available)
+                    {
+                        return self.reject_intent();
+                    }
+                    let Some(choice) = presentation::service_mode_choice(model, &id) else {
+                        return self.reject_intent();
+                    };
+                    next.selected_service_mode = choice;
                 }
                 SettingsModelPickerIntent::SelectContextWindow { window, .. } => {
                     let rows = next.selector.context_rows(
@@ -373,6 +413,13 @@ impl ClientCore {
                     next.selected_context_window = window;
                 }
                 SettingsModelPickerIntent::SelectReasoningEffort { effort, .. } => {
+                    if effort.is_some()
+                        && next
+                            .selector
+                            .service_default_reasoning_only(next.selected_service_mode.as_ref())
+                    {
+                        return self.reject_intent();
+                    }
                     let rows = next
                         .selector
                         .models()
@@ -383,6 +430,16 @@ impl ClientCore {
                         })
                         .unwrap_or_default();
                     if effort.is_some() && !rows.iter().any(|row| row.selected) {
+                        return self.reject_intent();
+                    }
+                    if next
+                        .selected_service_mode
+                        .as_ref()
+                        .is_some_and(|mode| mode.id == "pro")
+                        && effort
+                            .as_deref()
+                            .is_some_and(|effort| matches!(effort, "none" | "off"))
+                    {
                         return self.reject_intent();
                     }
                     next.selected_reasoning_effort = effort;
@@ -432,6 +489,7 @@ impl ClientCore {
                     next.selector = ProviderModelSelectorState::new(None, None);
                     next.selected_reasoning_effort = None;
                     next.selected_context_window = None;
+                    next.selected_service_mode = None;
                     next.selected_context_authority = None;
                     if session.runtime_demand {
                         released = Some(next.workspace_id.clone());
@@ -440,6 +498,12 @@ impl ClientCore {
                 }
                 SettingsModelPickerIntent::Open { .. } => unreachable!(),
             }
+            next.service_rows = next
+                .selector
+                .service_rows(next.selected_service_mode.as_ref());
+            next.default_reasoning_only = next
+                .selector
+                .service_default_reasoning_only(next.selected_service_mode.as_ref());
             next.context_rows = next.selector.context_rows(
                 next.selected_context_window,
                 next.selected_context_authority.as_deref(),
@@ -656,6 +720,12 @@ impl ClientCore {
                 Err(error) => next.selector.apply_provider_list_error(error),
             }
         }
+        next.service_rows = next
+            .selector
+            .service_rows(next.selected_service_mode.as_ref());
+        next.default_reasoning_only = next
+            .selector
+            .service_default_reasoning_only(next.selected_service_mode.as_ref());
         next.context_rows = next.selector.context_rows(
             next.selected_context_window,
             next.selected_context_authority.as_deref(),
@@ -753,6 +823,12 @@ impl ClientCore {
                             work
                         });
                     }
+                    next.service_rows = next
+                        .selector
+                        .service_rows(next.selected_service_mode.as_ref());
+                    next.default_reasoning_only = next
+                        .selector
+                        .service_default_reasoning_only(next.selected_service_mode.as_ref());
                     next.context_rows = next.selector.context_rows(
                         next.selected_context_window,
                         next.selected_context_authority.as_deref(),
@@ -844,6 +920,7 @@ mod tests {
                 model: Some("baseline".into()),
                 selected_reasoning_effort: None,
                 selected_context_window: None,
+                selected_service_mode: None,
                 selected_context_authority: None,
             },
         });
@@ -882,6 +959,7 @@ mod tests {
                     model: Some("baseline".into()),
                     selected_reasoning_effort: Some("high".into()),
                     selected_context_window: None,
+                    selected_service_mode: None,
                     selected_context_authority: None,
                 },
             });
@@ -1163,6 +1241,7 @@ mod tests {
                 model: Some("model".into()),
                 selected_reasoning_effort: None,
                 selected_context_window: None,
+                selected_service_mode: None,
                 selected_context_authority: None,
             },
         });
@@ -1281,6 +1360,7 @@ mod tests {
                 model: None,
                 selected_reasoning_effort: None,
                 selected_context_window: None,
+                selected_service_mode: None,
                 selected_context_authority: None,
             },
         });

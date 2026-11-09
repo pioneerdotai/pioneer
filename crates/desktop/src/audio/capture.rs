@@ -1598,6 +1598,7 @@ mod tests {
 
     fn voice_context() -> VoiceTurnContext {
         VoiceTurnContext {
+            service_mode: None,
             context_authority: None,
             context_window: None,
             workspace_id: "workspace_1".to_owned(),

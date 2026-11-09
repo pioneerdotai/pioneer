@@ -962,6 +962,7 @@ impl crate::traits::Provider for GlmProvider {
             .data
             .into_iter()
             .map(|m| ProviderModelInfo {
+                service_modes: None,
                 context_authority: None,
                 context_tiers: None,
                 id: m.id.clone(),

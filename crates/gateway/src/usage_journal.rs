@@ -155,6 +155,15 @@ impl Provider for JournalProvider {
     ) -> Result<Option<pioneer_protocol::ProviderContextTiers>> {
         self.inner.model_context_tiers(model).await
     }
+    async fn model_service_modes(
+        &self,
+        model: &str,
+    ) -> Result<Option<pioneer_protocol::SourceServiceModes>> {
+        self.inner.model_service_modes(model).await
+    }
+    fn standard_service_mode(&self, model: &str) -> pioneer_protocol::ServiceModeParameters {
+        self.inner.standard_service_mode(model)
+    }
     async fn model_limits(&self, model: &str) -> Result<pioneer_provider::catalog::CatalogLimits> {
         self.inner.model_limits(model).await
     }

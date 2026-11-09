@@ -144,6 +144,7 @@ pub(crate) fn reconcile_composer_policy(
     if domain.selected_provider.is_none() || domain.selected_model.is_none() {
         domain.selected_reasoning_effort = None;
         domain.selected_context_window = None;
+        domain.selected_service_mode = None;
         domain.selected_context_authority = None;
     }
     *fingerprint = reconciliation.draft.policy_fingerprint.clone();

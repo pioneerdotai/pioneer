@@ -1743,6 +1743,11 @@ async fn cli_parent_selects_only_unambiguous_api_choices_for_threads_and_tasks()
                 "a model-authored API switch cannot inherit CLI financial choices"
             );
             assert!(budget.context_window > 0);
+            assert_eq!(
+                budget.service_mode.as_ref().map(|mode| mode.id.as_str()),
+                Some("standard"),
+                "CLI-to-API model-authored launch has no paid Native consent"
+            );
             if let Some(summary) = native_summary.filter(|summary| summary.inherits_working) {
                 assert_eq!(summary.budget, budget);
             }
@@ -2061,6 +2066,65 @@ async fn large_later_catalog_stays_out_of_task_and_execution_grants_and_replay()
         bundles: task_tools.bundles,
         ..Default::default()
     };
+    // Trusted persisted fixture represents an earlier user-admitted Pro turn.
+    // The tool cannot supply these fields; inheritance must use the bound turn.
+    let provider = processor
+        .provider_registry
+        .get_or_create_for_workspace(&context.workspace_id, "openai")
+        .unwrap();
+    let mut parent_snapshot = processor
+        .crud_store
+        .get_turn_execution_security_snapshot(&context.turn_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .snapshot;
+    let admitted = pioneer_protocol::NativeContextBudget {
+        instance: "openai".into(),
+        authority: provider.authority_fingerprint().map(str::to_owned),
+        model: "gpt-5.4".into(),
+        manual_window: None,
+        context_window: 272000,
+        max_input: None,
+        max_output: Some(16000),
+        service_mode: Some(pioneer_protocol::NativeServiceModePlan {
+            id: "pro".into(),
+            parameters: pioneer_protocol::ServiceModeParameters::OpenAiPro,
+        }),
+    };
+    parent_snapshot.native_context = Some(admitted.clone());
+    parent_snapshot.native_summary = Some(pioneer_protocol::NativeSummaryContext {
+        budget: admitted.clone(),
+        effort: Some("high".into()),
+        inherits_working: false,
+    });
+    processor
+        .crud_store
+        .set_turn_execution_security_snapshot(&context.turn_id, &parent_snapshot)
+        .await
+        .unwrap();
+    let same = call(
+        &task_tools,
+        "task_create",
+        "same-service-scope",
+        json!({"title":"Same scope", "goal":"Use the admitted model"}),
+    )
+    .await;
+    let same_actor = processor
+        .crud_store
+        .get_task_actor_contract(same["taskId"].as_str().unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    let same_grant: serde_json::Value = serde_json::from_str(
+        same_actor
+            .derived_child_launch_grant_json
+            .as_deref()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(same_grant["native_context"]["service_mode"]["id"], "pro");
+    assert_eq!(same_grant["native_context"]["context_window"], 272000);
     let launch = json!({"profile":{"kind":"model","providerId":"openai","modelId":"gpt-5.4-later-4096"},"useDefaultReasoning":true});
     let task = call(
         &task_tools,
@@ -2082,6 +2146,17 @@ async fn large_later_catalog_stays_out_of_task_and_execution_grants_and_replay()
     assert!(saved_task_grant.len() < 131_072);
     let saved_task: serde_json::Value = serde_json::from_str(saved_task_grant).unwrap();
     assert_eq!(saved_task["profile"]["modelId"], "gpt-5.4-later-4096");
+    assert_eq!(
+        saved_task["native_context"]["service_mode"]["id"],
+        "standard"
+    );
+    assert_eq!(saved_task["native_summary"]["budget"]["model"], "gpt-5.4");
+    assert_eq!(
+        saved_task["native_summary"]["budget"]["service_mode"]["id"],
+        "pro"
+    );
+    assert_eq!(saved_task["native_summary"]["inherits_working"], false);
+
     assert!(saved_task["child_launch_grant"].get("profiles").is_none());
     assert!(
         saved_task["child_launch_grant"]

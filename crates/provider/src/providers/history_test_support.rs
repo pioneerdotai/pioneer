@@ -4,6 +4,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 pub(super) fn request(messages: Vec<ChatMessage>) -> ChatRequest {
     ChatRequest {
+        service_mode: None,
         model: "fixture".into(),
         messages,
         temperature: None,

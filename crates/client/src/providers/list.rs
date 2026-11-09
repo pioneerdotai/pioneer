@@ -173,6 +173,70 @@ pub enum ProviderModelSelectorMode {
 }
 
 impl ProviderModelSelectorState {
+    /// Adapter limitation, not a rewrite of the user's saved effort preference.
+    pub fn service_default_reasoning_only(
+        &self,
+        selected: Option<&pioneer_protocol::NativeServiceModeSelection>,
+    ) -> bool {
+        if !matches!(self.mode, ProviderModelSelectorMode::Chat)
+            || self
+                .selected_provider()
+                .and_then(runtime_id_from_cli_runtime_provider_key)
+                .is_some()
+        {
+            return false;
+        }
+        use pioneer_protocol::{ServiceModeParameters, SourceServiceMode, SourceServiceModes};
+        let Some(choice) = selected else {
+            return false;
+        };
+        let Some(model) = self.models().iter().find(|model| {
+            Some(model.id.as_str()) == self.selected_model()
+                && model.context_authority.as_deref() == Some(choice.authority.as_str())
+        }) else {
+            return false;
+        };
+        let Some(SourceServiceModes::Known(modes)) = &model.service_modes else {
+            return false;
+        };
+        modes.values().any(|mode| {
+            matches!(mode, SourceServiceMode::Parsed { descriptor }
+                if descriptor.id == choice.id
+                    && matches!(descriptor.parameters, ServiceModeParameters::BedrockNestedUltrafast))
+        })
+    }
+
+    pub fn service_rows(
+        &self,
+        selected: Option<&pioneer_protocol::NativeServiceModeSelection>,
+    ) -> Vec<super::presentation::ServiceModeRow> {
+        if !matches!(self.mode, ProviderModelSelectorMode::Chat)
+            || self
+                .selected_provider()
+                .and_then(runtime_id_from_cli_runtime_provider_key)
+                .is_some()
+        {
+            return vec![];
+        }
+        match self
+            .models()
+            .iter()
+            .find(|model| Some(model.id.as_str()) == self.selected_model())
+        {
+            Some(model) => super::presentation::service_mode_rows(model, selected),
+            None => selected
+                .map(|choice| {
+                    vec![super::presentation::ServiceModeRow {
+                        id: choice.id.clone(),
+                        label: choice.id.clone(),
+                        selected: true,
+                        available: false,
+                    }]
+                })
+                .unwrap_or_default(),
+        }
+    }
+
     pub fn context_rows(
         &self,
         manual: Option<u64>,
@@ -586,6 +650,7 @@ fn provider_model_from_runtime_model(
     });
 
     ProviderModelInfo {
+        service_modes: None,
         context_authority: None,
         context_tiers: None,
         id: model.id,
@@ -668,6 +733,60 @@ pub fn provider_list_transcription_models_params(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn service_rows_are_native_chat_only_and_surface_default_reasoning_limit() {
+        let model: ProviderModelInfo = serde_json::from_value(serde_json::json!({
+            "id":"fixture","provider":"bedrock","limits":{},"capabilities":{},"context_authority":"scope-a",
+            "service_modes":{"status":"known","modes":{"ultrafast":{"status":"parsed","descriptor":{"id":"ultrafast","label":"Ultrafast","parameters":{"kind":"bedrock_nested_ultrafast"},"source_provider":"amazon-bedrock","source_model":"fixture","source_api":"bedrock-converse-stream"}}}}
+        })).unwrap();
+        let choice = pioneer_protocol::NativeServiceModeSelection {
+            id: "ultrafast".into(),
+            authority: "scope-a".into(),
+        };
+        for mode in [
+            ProviderModelSelectorMode::Chat,
+            ProviderModelSelectorMode::AuxiliaryChat,
+            ProviderModelSelectorMode::Embeddings,
+            ProviderModelSelectorMode::Transcription,
+        ] {
+            let mut selector = ProviderModelSelectorState::new_with_mode(
+                Some("bedrock".into()),
+                Some("fixture".into()),
+                mode,
+            );
+            selector.apply_provider_models_success(ProviderListModelsResponse {
+                provider: "bedrock".into(),
+                models: vec![model.clone()],
+            });
+            assert_eq!(
+                !selector.service_rows(Some(&choice)).is_empty(),
+                mode == ProviderModelSelectorMode::Chat
+            );
+            if mode == ProviderModelSelectorMode::Chat {
+                assert!(selector.service_default_reasoning_only(Some(&choice)));
+                let stale = pioneer_protocol::NativeServiceModeSelection {
+                    authority: "scope-b".into(),
+                    ..choice.clone()
+                };
+                let stale_rows = selector.service_rows(Some(&stale));
+                assert!(!selector.service_default_reasoning_only(Some(&stale)));
+                assert!(!stale_rows.iter().any(|row| row.selected));
+                assert_eq!(
+                    stale_rows
+                        .iter()
+                        .filter(|row| row.id == "ultrafast")
+                        .count(),
+                    1
+                );
+                assert!(
+                    stale_rows
+                        .iter()
+                        .any(|row| row.id == "ultrafast" && row.available)
+                );
+            }
+        }
+    }
     use super::*;
     use pioneer_protocol::CLIRuntimeListResponse;
 
@@ -896,6 +1015,7 @@ mod tests {
         let applied = state.apply_provider_models_success(ProviderListModelsResponse {
             provider: "openai".to_owned(),
             models: vec![ProviderModelInfo {
+                service_modes: None,
                 context_authority: None,
                 context_tiers: None,
                 id: "gpt-5.4".to_owned(),
@@ -1157,6 +1277,7 @@ mod tests {
         let applied = state.apply_provider_models_success(ProviderListModelsResponse {
             provider: "openai".to_owned(),
             models: vec![ProviderModelInfo {
+                service_modes: None,
                 context_authority: None,
                 context_tiers: None,
                 id: "text-embedding-3-small".to_owned(),
@@ -1263,6 +1384,7 @@ mod tests {
         );
         let models = (0..16)
             .map(|index| ProviderModelInfo {
+                service_modes: None,
                 context_authority: None,
                 context_tiers: None,
                 id: format!("model-{index:02}"),

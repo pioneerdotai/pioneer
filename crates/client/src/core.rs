@@ -4065,6 +4065,7 @@ mod tests {
             JournalPayload::Work(w) if w.context.parent == Some(connecting_context.token) && w.context.kind == WorkKind::ClientPublication)));
         let mut fixture_thread = pioneer_protocol::Thread {
             context_window: None,
+            service_mode: None,
             context_authority: None,
             workspace_id: "ws".into(),
             id: "thread".into(),

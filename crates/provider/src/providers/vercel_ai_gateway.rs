@@ -594,6 +594,7 @@ fn model_info(raw: &Value, model: &crate::catalog::CatalogModel) -> ProviderMode
         crate::catalog::InputCapabilityState::Unknown => None,
     };
     ProviderModelInfo {
+        service_modes: None,
         context_authority: None,
         context_tiers: Some(crate::catalog::context_tiers_for_model(model)),
         id: model.id.clone(),
@@ -1406,6 +1407,7 @@ mod tests {
         let response = crate::attachments::runtime::with_async_authority_scope(
             provider.authority_fingerprint().unwrap().to_owned(),
             provider.chat(ChatRequest {
+                service_mode: None,
                 model: "private/agent".into(),
                 messages: vec![crate::ChatMessage::user("hello")],
                 temperature: Some(0.5),
@@ -1466,6 +1468,7 @@ mod tests {
                 .await
                 .unwrap();
             let request = ChatRequest {
+                service_mode: None,
                 model: if index == 1 {
                     "private/other"
                 } else {
@@ -1644,6 +1647,7 @@ mod tests {
         for id in ["private/embed", "private/language-batch"] {
             let error = provider
                 .prepare_input_budget(ChatRequest {
+                    service_mode: None,
                     model: id.into(),
                     messages: vec![crate::ChatMessage::user("hello")],
                     temperature: None,

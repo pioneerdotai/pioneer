@@ -25,6 +25,7 @@ pub struct TextTurnPreparation {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct TurnStartParamsPlan {
+    pub service_mode: Option<pioneer_protocol::NativeServiceModeSelection>,
     pub context_authority: Option<String>,
     pub context_window: Option<u64>,
     pub thread_id: String,
@@ -90,6 +91,15 @@ pub fn text_user_input(text: &str) -> Option<UserInput> {
 pub fn turn_start_params_from_plan(plan: TurnStartParamsPlan) -> TurnStartParams {
     let is_message = plan.mode == Some(ThreadMode::Message);
     TurnStartParams {
+        service_mode: if is_message
+            || matches!(
+                &plan.execution_backend,
+                Some(AgentExecutionBackend::CLIAgentRuntime { .. })
+            ) {
+            None
+        } else {
+            plan.service_mode
+        },
         context_authority: if is_message
             || matches!(
                 &plan.execution_backend,
@@ -336,6 +346,7 @@ mod tests {
     #[test]
     fn turn_start_params_from_plan_preserves_capabilities_model_and_mode() {
         let params = turn_start_params_from_plan(TurnStartParamsPlan {
+            service_mode: None,
             context_authority: None,
             context_window: None,
             thread_id: "thread".to_owned(),
@@ -376,6 +387,7 @@ mod tests {
         let mentioned_principal_id =
             PrincipalId::new("P00000000000000000001").expect("principal id");
         let params = turn_start_params_from_plan(TurnStartParamsPlan {
+            service_mode: None,
             context_authority: None,
             context_window: None,
             thread_id: "thread".to_owned(),
@@ -409,6 +421,7 @@ mod tests {
     #[test]
     fn turn_start_params_from_plan_preserves_reasoning_selection() {
         let params = turn_start_params_from_plan(TurnStartParamsPlan {
+            service_mode: None,
             context_authority: None,
             context_window: None,
             thread_id: "thread".to_owned(),
@@ -439,6 +452,7 @@ mod tests {
     #[test]
     fn turn_start_params_from_plan_preserves_permission_profile_selection() {
         let params = turn_start_params_from_plan(TurnStartParamsPlan {
+            service_mode: None,
             context_authority: None,
             context_window: None,
             thread_id: "thread".to_owned(),
@@ -467,6 +481,7 @@ mod tests {
     fn message_snapshot_update_preserves_execution_selection() {
         let mut thread = Thread {
             context_window: None,
+            service_mode: None,
             context_authority: None,
             workspace_id: "ws_1".to_owned(),
             id: "thr_1".to_owned(),
@@ -729,6 +744,7 @@ mod tests {
                 expected;
             let mut thread = Thread {
                 context_window: None,
+                service_mode: None,
                 context_authority: None,
                 workspace_id: "ws_1".to_owned(),
                 id: "thr_1".to_owned(),

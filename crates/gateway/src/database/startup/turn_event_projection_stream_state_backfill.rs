@@ -784,6 +784,7 @@ INSERT INTO turn_event_projection_state (
         let store = CrudStore::new(db.clone());
         let thread = Thread {
             context_window: None,
+            service_mode: None,
             context_authority: None,
             workspace_id: workspace_id.to_owned(),
             id: canonical_thread_id.to_owned(),

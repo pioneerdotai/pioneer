@@ -644,6 +644,7 @@ impl ClientCore {
         )
         .state;
         next.draft.domain.selected_context_window = selection.selected_context_window;
+        next.draft.domain.selected_service_mode = selection.selected_service_mode;
         next.draft.domain.selected_context_authority = selection.selected_context_authority;
         next.execution_capabilities_removed = reduction.execution_capabilities_removed;
         if let Some(policy) = store.policies.get(&identity.thread_id) {

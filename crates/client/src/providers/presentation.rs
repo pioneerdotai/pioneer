@@ -417,6 +417,7 @@ mod tests {
 
     fn model(id: &str, name: Option<&str>) -> ProviderModelInfo {
         ProviderModelInfo {
+            service_modes: None,
             context_authority: None,
             context_tiers: None,
             id: id.to_owned(),
@@ -872,4 +873,83 @@ pub fn context_window_rows(
         }));
     }
     rows
+}
+
+/// Shell-neutral rows; prices remain evidence rather than invented flat amounts.
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct ServiceModeRow {
+    pub id: String,
+    pub label: String,
+    pub selected: bool,
+    pub available: bool,
+}
+
+pub fn service_mode_rows(
+    model: &ProviderModelInfo,
+    choice: Option<&pioneer_protocol::NativeServiceModeSelection>,
+) -> Vec<ServiceModeRow> {
+    use pioneer_protocol::{SourceServiceMode, SourceServiceModes};
+    let mut rows = vec![ServiceModeRow {
+        id: "standard".into(),
+        label: "Standard".into(),
+        selected: choice.is_none(),
+        available: true,
+    }];
+    if let Some(SourceServiceModes::Known(modes)) = &model.service_modes {
+        for state in modes.values() {
+            if let SourceServiceMode::Parsed { descriptor } = state {
+                if rows.iter().any(|row| row.id == descriptor.id) {
+                    continue;
+                }
+                rows.push(ServiceModeRow {
+                    id: descriptor.id.clone(),
+                    label: descriptor.label.clone(),
+                    selected: false,
+                    available: model.context_authority.is_some(),
+                });
+            }
+        }
+    }
+    if let Some(choice) = choice {
+        if let Some(row) = rows.iter_mut().find(|row| {
+            row.id == choice.id
+                && model.context_authority.as_deref() == Some(choice.authority.as_str())
+        }) {
+            row.selected = true;
+        } else if !rows.iter().any(|row| row.id == choice.id) {
+            rows.push(ServiceModeRow {
+                id: choice.id.clone(),
+                label: choice.id.clone(),
+                selected: true,
+                available: false,
+            });
+        }
+    }
+    if rows.len() == 1 && choice.is_none() {
+        vec![]
+    } else {
+        rows
+    }
+}
+
+pub fn service_mode_choice(
+    model: &ProviderModelInfo,
+    id: &str,
+) -> Option<Option<pioneer_protocol::NativeServiceModeSelection>> {
+    if id == "standard" {
+        return Some(None);
+    }
+    let rows = service_mode_rows(model, None);
+    rows.iter()
+        .any(|row| row.id == id && row.available)
+        .then(|| {
+            Some(pioneer_protocol::NativeServiceModeSelection {
+                id: id.into(),
+                authority: model
+                    .context_authority
+                    .clone()
+                    .expect("available mode has authority"),
+            })
+        })
 }

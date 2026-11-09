@@ -27345,6 +27345,19 @@ impl CrudStore {
                     .map(|turn| thread_native_context_from_turn(turn, thread))
                     .transpose()?
                     .flatten();
+                thread.service_mode = native.as_ref().and_then(|budget| {
+                    let plan = budget
+                        .service_mode
+                        .as_ref()
+                        .filter(|plan| plan.id != "standard")?;
+                    Some(pioneer_protocol::NativeServiceModeSelection {
+                        id: plan.id.clone(),
+                        authority: pioneer_protocol::native_context_choice_authority(
+                            budget.authority.as_deref()?,
+                            &budget.model,
+                        ),
+                    })
+                });
                 thread.context_window = native.as_ref().and_then(|budget| budget.manual_window);
                 thread.context_authority = native
                     .filter(|budget| budget.manual_window.is_some())
@@ -27398,6 +27411,19 @@ impl CrudStore {
             .map(|turn| thread_native_context_from_turn(turn, thread))
             .transpose()?
             .flatten();
+        thread.service_mode = native.as_ref().and_then(|budget| {
+            let plan = budget
+                .service_mode
+                .as_ref()
+                .filter(|plan| plan.id != "standard")?;
+            Some(pioneer_protocol::NativeServiceModeSelection {
+                id: plan.id.clone(),
+                authority: pioneer_protocol::native_context_choice_authority(
+                    budget.authority.as_deref()?,
+                    &budget.model,
+                ),
+            })
+        });
         thread.context_window = native.as_ref().and_then(|budget| budget.manual_window);
         thread.context_authority = native
             .filter(|budget| budget.manual_window.is_some())
@@ -40153,6 +40179,7 @@ fn thread_from_db_model(model: pioneer_entity::thread::Model) -> Result<Option<T
 
     Ok(Some(Thread {
         context_window: None,
+        service_mode: None,
         context_authority: None,
         workspace_id: model.workspace_id,
         id: model.id,
@@ -41248,6 +41275,7 @@ mod tests {
         let timestamp = 1_700_000_000;
         let thread = Thread {
             context_window: None,
+            service_mode: None,
             context_authority: None,
             workspace_id: workspace_id.to_owned(),
             id: thread_id.to_owned(),
@@ -41312,6 +41340,7 @@ mod tests {
         let timestamp = 1_700_000_000;
         let thread = Thread {
             context_window: None,
+            service_mode: None,
             context_authority: None,
             workspace_id: workspace_id.to_owned(),
             id: thread_id.to_owned(),
@@ -47379,6 +47408,7 @@ mod tests {
             let turn_id = format!("turn_recovery_batch_{index}");
             let thread = Thread {
                 context_window: None,
+                service_mode: None,
                 context_authority: None,
                 workspace_id: workspace_id.to_owned(),
                 id: thread_id.clone(),
@@ -47555,6 +47585,7 @@ mod tests {
         .await;
         let second_thread = Thread {
             context_window: None,
+            service_mode: None,
             context_authority: None,
             workspace_id: "ws_recovery_poison".to_owned(),
             id: "thr_recovery_valid".to_owned(),
@@ -49067,6 +49098,7 @@ mod tests {
     fn sample_thread(workspace_id: &str, thread_id: &str, timestamp: i64) -> Thread {
         Thread {
             context_window: None,
+            service_mode: None,
             context_authority: None,
             workspace_id: workspace_id.to_owned(),
             id: thread_id.to_owned(),
@@ -50923,6 +50955,7 @@ mod tests {
         let store = test_store_with_workspace(workspace_id).await;
         let thread = Thread {
             context_window: None,
+            service_mode: None,
             context_authority: None,
             workspace_id: workspace_id.to_owned(),
             id: thread_id.to_owned(),
@@ -53358,6 +53391,7 @@ mod tests {
         let timestamp = 1_700_000_000;
         let thread = Thread {
             context_window: None,
+            service_mode: None,
             context_authority: None,
             workspace_id: "ws_task".to_owned(),
             id: "thr_task".to_owned(),
@@ -55558,6 +55592,7 @@ mod tests {
         let store = test_store_with_workspace(workspace_id).await;
         let thread = Thread {
             context_window: None,
+            service_mode: None,
             context_authority: None,
             workspace_id: workspace_id.to_owned(),
             id: thread_id.to_owned(),
@@ -56391,6 +56426,7 @@ mod tests {
 
         let thread = Thread {
             context_window: None,
+            service_mode: None,
             context_authority: None,
             workspace_id: workspace_id.to_owned(),
             id: thread_id.to_owned(),
@@ -60438,6 +60474,7 @@ mod tests {
         let terminal_turn_id = "turn_llm_terminal";
         let thread = Thread {
             context_window: None,
+            service_mode: None,
             context_authority: None,
             workspace_id: workspace_id.to_owned(),
             id: thread_id.to_owned(),
@@ -60663,6 +60700,7 @@ mod tests {
 
         let thread = Thread {
             context_window: None,
+            service_mode: None,
             context_authority: None,
             workspace_id: workspace_id.to_owned(),
             id: thread_id.to_owned(),
@@ -60927,6 +60965,7 @@ mod tests {
 
         let thread = Thread {
             context_window: None,
+            service_mode: None,
             context_authority: None,
             workspace_id: workspace_id.to_owned(),
             id: thread_id.to_owned(),
@@ -63091,6 +63130,7 @@ mod tests {
         let timestamp = 1_700_000_000;
         let thread = Thread {
             context_window: None,
+            service_mode: None,
             context_authority: None,
             workspace_id: "ws_000000000000000001".to_owned(),
             id: "thr_000000000000000001".to_owned(),
@@ -63296,6 +63336,7 @@ mod tests {
         let timestamp = 1_700_000_000;
         let thread = Thread {
             context_window: None,
+            service_mode: None,
             context_authority: None,
             workspace_id: "ws_legacy_actor".to_owned(),
             id: "thr_legacy_actor".to_owned(),
@@ -63683,6 +63724,7 @@ mod tests {
         let timestamp = 1_700_000_000;
         let thread = Thread {
             context_window: None,
+            service_mode: None,
             context_authority: None,
             workspace_id: "ws_permission_profile".to_owned(),
             id: "thr_permission_profile".to_owned(),
@@ -63878,6 +63920,7 @@ mod tests {
         let timestamp = 1_700_000_000;
         let thread = Thread {
             context_window: None,
+            service_mode: None,
             context_authority: None,
             workspace_id: "ws_atomic_profile".to_owned(),
             id: "thr_atomic_profile".to_owned(),
@@ -64206,6 +64249,7 @@ mod tests {
         let timestamp = 1_700_000_000;
         let thread = Thread {
             context_window: None,
+            service_mode: None,
             context_authority: None,
             workspace_id: "ws_atomic_admission_fault".to_owned(),
             id: "thr_atomic_admission_fault".to_owned(),
@@ -64740,6 +64784,7 @@ mod tests {
         .expect("author principal should persist");
         let authoritative_thread = Thread {
             context_window: None,
+            service_mode: None,
             context_authority: None,
             workspace_id: "ws_atomic_message".to_owned(),
             id: "thr_atomic_message".to_owned(),
@@ -65421,6 +65466,7 @@ mod tests {
 
         let thread = Thread {
             context_window: None,
+            service_mode: None,
             context_authority: None,
             workspace_id: workspace_id.to_owned(),
             id: thread_id.to_owned(),
@@ -65538,6 +65584,7 @@ mod tests {
         let timestamp = 1_700_000_000;
         let thread = Thread {
             context_window: None,
+            service_mode: None,
             context_authority: None,
             workspace_id: "ws_old_permission_profile".to_owned(),
             id: "thr_old_permission_profile".to_owned(),
@@ -65603,6 +65650,7 @@ mod tests {
         let timestamp = 1_700_000_000;
         let thread = Thread {
             context_window: None,
+            service_mode: None,
             context_authority: None,
             workspace_id: "ws_unknown_permission_profile".to_owned(),
             id: "thr_unknown_permission_profile".to_owned(),
@@ -66126,6 +66174,7 @@ mod tests {
         );
         assert_eq!(persisted_snapshot, snapshot);
         let budget = pioneer_protocol::NativeContextBudget {
+            service_mode: None,
             instance: thread.model_provider.clone(),
             authority: Some("account-a".into()),
             model: thread.model.clone(),
@@ -66162,8 +66211,41 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(pinned.snapshot, expected);
+        let mut legacy_plan = wider.clone();
+        legacy_plan.service_mode = Some(pioneer_protocol::NativeServiceModePlan {
+            id: "standard".into(),
+            parameters: pioneer_protocol::ServiceModeParameters::OpenAiStandard,
+        });
+        assert!(
+            store
+                .pin_turn_native_context("ws_security_unrestricted", &turn.id, &legacy_plan, None)
+                .await
+                .unwrap()
+        );
+        let pinned_mode = store
+            .get_turn_execution_security_snapshot(&turn.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .snapshot;
+        assert_eq!(
+            pinned_mode.native_context.as_ref().unwrap().context_window,
+            272000
+        );
+        expected.native_context.as_mut().unwrap().service_mode = legacy_plan.service_mode.clone();
+        assert_eq!(pinned_mode, expected);
+        legacy_plan.service_mode.as_mut().unwrap().id = "pro".into();
+        legacy_plan.service_mode.as_mut().unwrap().parameters =
+            pioneer_protocol::ServiceModeParameters::OpenAiPro;
+        assert!(
+            !store
+                .pin_turn_native_context("ws_security_unrestricted", &turn.id, &legacy_plan, None)
+                .await
+                .unwrap()
+        );
         // A saved user choice projects through the normal thread read on restart.
         let manual = expected.native_context.as_mut().unwrap();
+        manual.service_mode = legacy_plan.service_mode.clone();
         manual.manual_window = Some(1050000);
         manual.context_window = 1050000;
         store
@@ -66172,6 +66254,10 @@ mod tests {
             .unwrap();
         let restored = store.get_thread_model(&thread.id).await.unwrap().unwrap();
         assert_eq!(restored.context_window, Some(1050000));
+        assert_eq!(
+            restored.service_mode.as_ref().map(|mode| mode.id.as_str()),
+            Some("pro")
+        );
         assert_eq!(
             restored.context_authority,
             Some(pioneer_protocol::native_context_choice_authority(
@@ -66185,6 +66271,10 @@ mod tests {
             .await
             .unwrap();
         let reset = store.get_thread_model(&thread.id).await.unwrap().unwrap();
+        assert_eq!(
+            reset.service_mode.as_ref().map(|mode| mode.id.as_str()),
+            Some("pro")
+        );
         assert_eq!(
             (reset.context_window, reset.context_authority),
             (None, None)
@@ -66376,6 +66466,7 @@ mod tests {
         let timestamp = 1_700_000_000;
         let thread = Thread {
             context_window: None,
+            service_mode: None,
             context_authority: None,
             workspace_id: "ws_reasoning_effort".to_owned(),
             id: "thr_reasoning_effort".to_owned(),
@@ -66439,6 +66530,7 @@ mod tests {
         let timestamp = 1_700_000_000;
         let thread = Thread {
             context_window: None,
+            service_mode: None,
             context_authority: None,
             workspace_id: "ws_000000000000000001".to_owned(),
             id: "thr_000000000000000001".to_owned(),
@@ -66684,6 +66776,7 @@ mod tests {
 
         let first_thread = Thread {
             context_window: None,
+            service_mode: None,
             context_authority: None,
             workspace_id: workspace_id.to_owned(),
             id: thread_id.to_owned(),
@@ -67612,6 +67705,7 @@ mod tests {
         let timestamp = 1_700_000_000;
         let thread = Thread {
             context_window: None,
+            service_mode: None,
             context_authority: None,
             workspace_id: "ws_000000000000000001".to_owned(),
             id: "thr_000000000000000002".to_owned(),
@@ -67738,6 +67832,7 @@ mod tests {
         .expect("reader principal should persist");
         let thread = Thread {
             context_window: None,
+            service_mode: None,
             context_authority: None,
             workspace_id: workspace_id.to_owned(),
             id: thread_id.to_owned(),
@@ -68611,6 +68706,7 @@ mod tests {
         .expect("reader principal should persist");
         let thread = Thread {
             context_window: None,
+            service_mode: None,
             context_authority: None,
             workspace_id: workspace_id.to_owned(),
             id: thread_id.to_owned(),

@@ -54,6 +54,9 @@ remove = "Remove mention"
 cancel = "Cancel reply"
 
 [chat.composer.model]
+service_label = "Service tier"
+service_standard = "Standard"
+service_invalid = "Saved service tier is unavailable. Choose Standard or reselect a mode."
 context_label = "Context window"
 context_auto = "Auto — up to %{tokens} tokens"
 context_up_to = "Up to %{tokens} tokens"

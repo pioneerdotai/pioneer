@@ -547,6 +547,7 @@ mod tests {
                     selected_model: Some("model".into()),
                     selected_reasoning_effort: Some("high".into()),
                     selected_context_window: None,
+                    selected_service_mode: None,
                     selected_context_authority: None,
                     ..Default::default()
                 },

@@ -778,6 +778,15 @@ fn backend_kind(backend: AgentExecutionProfileBackend) -> AgentToolBackendKind {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn model_authored_launch_cannot_request_a_financial_service_preset() {
+        for field in ["service_mode", "serviceMode", "service_tier", "serviceTier"] {
+            let mut input = serde_json::json!({});
+            input[field] = serde_json::json!({"id":"pro","authority":"copied-public-proof"});
+            assert!(serde_json::from_value::<AgentToolLaunchSelection>(input).is_err());
+        }
+    }
     use super::*;
     use crate::{
         AgentExecutionProfileBackend, AgentExecutionProfileId, AgentExecutionProfileProjection,
