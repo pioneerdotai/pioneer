@@ -5080,7 +5080,10 @@ async fn restored_discovery_rejects_failed_incomplete_and_unowned_results() {
                         None,
                     )
                 } else {
-                    pioneer_tools::ToolOutcome::partial("incomplete retained result", None)
+                    pioneer_tools::ToolOutcome::partial(
+                        "incomplete retained result",
+                        "read the complete retained result",
+                    )
                 })
                 .unwrap();
                 result.message.content = value.to_string();
