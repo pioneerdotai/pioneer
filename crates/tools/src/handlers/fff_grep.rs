@@ -405,7 +405,11 @@ fn search_fff(
             break;
         }
     }
-    if matches.len() > request.max_results || result.next_file_offset != 0 {
+    // A literal fallback is attempted only after the constrained search reached
+    // EOF without matches. Its pagination does not describe the requested glob.
+    if !result.literal_fallback
+        && (matches.len() > request.max_results || result.next_file_offset != 0)
+    {
         output.truncated = true;
     }
     let skipped_large_files = picker

@@ -83151,9 +83151,13 @@ async fn compaction_result_reader_pages_exact_source_and_rejects_cross_scope() {
     let mut small = params.clone();
     small.max_tokens = Some(100);
     small.max_bytes = Some(200);
-    let small_page = processor.read_thread_tool_result(small).await.unwrap();
-    assert!(!small_page.text.is_empty());
-    assert!(serde_json::to_string(&small_page).unwrap().len() <= 200);
+    let error = processor.read_thread_tool_result(small).await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("cannot make progress within budget"),
+        "a budget smaller than the delivery envelope must be rejected"
+    );
     let mut restored = String::new();
     loop {
         let page: ThreadToolResultReadResponse = processor
