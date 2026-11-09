@@ -311,7 +311,8 @@ fn search_fff(
         newline_escape
     });
     let mut output = BoundedOutput::new(request.max_results, request.max_output_bytes);
-    output.truncated = result.literal_fallback;
+    // FFF only falls back after the constrained search found no matches.
+    // Discarding the unconstrained retry does not truncate that original search.
     for matched in matches {
         if cancelled.load(Ordering::Acquire) {
             return Err(ToolError::cancelled("grep_files was cancelled"));

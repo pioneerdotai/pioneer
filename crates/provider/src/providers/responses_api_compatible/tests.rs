@@ -3116,7 +3116,17 @@ async fn compact_shell_result_remains_one_output_part_on_responses_wire() {
                 AuthStyle::Bearer,
             );
             let mut req = request();
-            req.messages = vec![ChatMessage::tool_result("call", "exec_command", compact)];
+            req.messages = vec![
+                ChatMessage::assistant_tool_calls(
+                    None::<String>,
+                    vec![crate::ProviderToolCall {
+                        id: "call".into(),
+                        name: "exec_command".into(),
+                        arguments: "{}".into(),
+                    }],
+                ),
+                ChatMessage::tool_result("call", "exec_command", compact),
+            ];
             let prepared = provider
                 .prepare(req, &provider.capabilities())
                 .await
@@ -3124,9 +3134,14 @@ async fn compact_shell_result_remains_one_output_part_on_responses_wire() {
             for stream in [false, true] {
                 let body = provider.render(&prepared, stream).unwrap();
                 assert_eq!(
-                    body["input"],
-                    json!([{"type":"function_call_output", "call_id":"call",
-                    "output":[{"type":"input_text", "text":compact}]}])
+                    body["input"].as_array().unwrap().len(),
+                    2,
+                    "one function call followed by one compact result"
+                );
+                assert_eq!(
+                    body["input"][1],
+                    json!({"type":"function_call_output", "call_id":"call",
+                    "output":[{"type":"input_text", "text":compact}]})
                 );
             }
         }
