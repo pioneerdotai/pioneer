@@ -4144,59 +4144,70 @@ async fn connection_owned_model_preparation_precedes_agent_tool_inventory() {
     assert!(tools.iter().any(|tool| tool.name == "read_file"));
 }
 
-#[tokio::test]
-async fn agent_dispatch_starts_with_main_prompt() {
-    let provider = Arc::new(CaptureAgentProvider::default());
-    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
-    let manager = AgentManager::new(registry, test_tool_loop_config());
+#[test]
+fn agent_dispatch_starts_with_main_prompt() {
+    // Poll through a trait object to avoid duplicating the large composed
+    // startup future in Tokio block_on stack frames. Keep the normal stack.
+    let body = async {
+        let provider = Arc::new(CaptureAgentProvider::default());
+        let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
+        let manager = AgentManager::new(registry, test_tool_loop_config());
 
-    let memory = Arc::new(RecordingMemoryProvider::new(Ok(
-        MemoryToolMaterialization {
-            bundles: vec![fake_standard_memory_tool_bundle()],
-            diagnostics: Vec::new(),
-        },
-    )));
-    manager.set_memory_provider(Some(memory.clone())).await;
-    install_configured_memory_hooks_for_test(&manager).await;
+        let memory = Arc::new(RecordingMemoryProvider::new(Ok(
+            MemoryToolMaterialization {
+                bundles: vec![fake_standard_memory_tool_bundle()],
+                diagnostics: Vec::new(),
+            },
+        )));
+        manager.set_memory_provider(Some(memory.clone())).await;
+        install_configured_memory_hooks_for_test(&manager).await;
 
-    let observed = start_simple_turn(
-        &manager,
-        "main_agent_loop_thread",
-        "workspace",
-        "main_agent_loop_turn",
-        ThreadMode::Agent,
-        "capture",
-        "hello",
-    )
-    .await;
-    assert_turn_completed(&observed);
+        let observed = start_simple_turn(
+            &manager,
+            "main_agent_loop_thread",
+            "workspace",
+            "main_agent_loop_turn",
+            ThreadMode::Agent,
+            "capture",
+            "hello",
+        )
+        .await;
+        assert_turn_completed(&observed);
 
-    let requests = provider.snapshot_all_requests();
-    assert_eq!(
-        requests.len(),
-        1,
-        "one main dispatch without a preliminary request"
-    );
-    let main_request = &requests[0];
-    assert!(main_request.compiled_prompt.is_some());
-    assert!(main_request.tools.is_some());
-    assert_eq!(memory.tool_contexts().len(), 1);
-    assert!(
-        main_request
-            .tools
-            .as_ref()
-            .unwrap()
-            .iter()
-            .all(|tool| !tool.name.starts_with("memory_"))
-    );
-    assert!(
-        !main_request
-            .compiled_prompt
-            .as_ref()
-            .unwrap()
-            .full_system_text
-            .contains("### Memory Recall")
-    );
+        let requests = provider.snapshot_all_requests();
+        assert_eq!(
+            requests.len(),
+            1,
+            "one main dispatch without a preliminary request"
+        );
+        let main_request = &requests[0];
+        assert!(main_request.compiled_prompt.is_some());
+        assert!(main_request.tools.is_some());
+        assert_eq!(memory.tool_contexts().len(), 1);
+        assert!(
+            main_request
+                .tools
+                .as_ref()
+                .unwrap()
+                .iter()
+                .all(|tool| !tool.name.starts_with("memory_"))
+        );
+        assert!(
+            !main_request
+                .compiled_prompt
+                .as_ref()
+                .unwrap()
+                .full_system_text
+                .contains("### Memory Recall")
+        );
+    };
+    tokio::pin!(body);
+    let body: std::pin::Pin<&mut dyn std::future::Future<Output = ()>> = body;
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("Failed building the Runtime")
+        .block_on(body);
 }
 
 fn agent_skill_delivery_fixture() -> AgentSkillRuntimeEntry {
@@ -8542,79 +8553,101 @@ async fn phase_11_repeated_review_observation_does_not_spam_or_complete() {
     assert!(completed_agent_message_text(&observed).is_none());
 }
 
-#[tokio::test]
-async fn computer_use_text_only_model_does_not_gate_computer_use() {
-    let provider = Arc::new(TextOnlyAgentProvider::with_requested_tools(
-        requested_tool_names(&["cua_get_window_state"]),
-    ));
-    let registry = Arc::new(ProviderRegistry::with_provider(
-        "text-only",
-        provider.clone(),
-    ));
-    let manager = AgentManager::new(registry, test_tool_loop_config_with_computer_use());
+#[test]
+fn computer_use_text_only_model_does_not_gate_computer_use() {
+    // Poll through a trait object to avoid duplicating the large composed
+    // startup future in Tokio block_on stack frames. Keep the normal stack.
+    let body = async {
+        let provider = Arc::new(TextOnlyAgentProvider::with_requested_tools(
+            requested_tool_names(&["cua_get_window_state"]),
+        ));
+        let registry = Arc::new(ProviderRegistry::with_provider(
+            "text-only",
+            provider.clone(),
+        ));
+        let manager = AgentManager::new(registry, test_tool_loop_config_with_computer_use());
 
-    let observed = start_simple_turn(
-        &manager,
-        "thr_computer_use_text_only_no_gate",
-        "ws_computer_use_text_only_no_gate",
-        "turn_computer_use_text_only_no_gate",
-        ThreadMode::Agent,
-        "text-only",
-        "Open the requested desktop location.",
-    )
-    .await;
-    assert_turn_completed(&observed);
+        let observed = start_simple_turn(
+            &manager,
+            "thr_computer_use_text_only_no_gate",
+            "ws_computer_use_text_only_no_gate",
+            "turn_computer_use_text_only_no_gate",
+            ThreadMode::Agent,
+            "text-only",
+            "Open the requested desktop location.",
+        )
+        .await;
+        assert_turn_completed(&observed);
 
-    let requests = provider.snapshot_requests();
-    assert_eq!(requests.len(), 2);
-    let request_tool_names = requests[1]
-        .tools
-        .as_ref()
-        .expect("main request should still include available provider tools")
-        .iter()
-        .map(|tool| tool.name.as_str())
-        .collect::<Vec<_>>();
-    assert_eq!(
-        request_tool_names.contains(&"cua_get_window_state"),
-        !pioneer_tools::computer_use_tool_specs().is_empty(),
-        "computer_use must not be provider-gated by image capability"
-    );
+        let requests = provider.snapshot_requests();
+        assert_eq!(requests.len(), 2);
+        let request_tool_names = requests[1]
+            .tools
+            .as_ref()
+            .expect("main request should still include available provider tools")
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            request_tool_names.contains(&"cua_get_window_state"),
+            !pioneer_tools::computer_use_tool_specs().is_empty(),
+            "computer_use must not be provider-gated by image capability"
+        );
+    };
+    tokio::pin!(body);
+    let body: std::pin::Pin<&mut dyn std::future::Future<Output = ()>> = body;
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("Failed building the Runtime")
+        .block_on(body);
 }
 
-#[tokio::test]
-async fn computer_use_registered_tool_exposes_after_request_tools() {
-    let provider = Arc::new(CaptureAgentProvider::with_requested_tools(
-        requested_tool_names(&["cua_get_window_state"]),
-    ));
-    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
-    let manager = AgentManager::new(registry, test_tool_loop_config_with_computer_use());
+#[test]
+fn computer_use_registered_tool_exposes_after_request_tools() {
+    // Poll through a trait object to avoid duplicating the large composed
+    // startup future in Tokio block_on stack frames. Keep the normal stack.
+    let body = async {
+        let provider = Arc::new(CaptureAgentProvider::with_requested_tools(
+            requested_tool_names(&["cua_get_window_state"]),
+        ));
+        let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
+        let manager = AgentManager::new(registry, test_tool_loop_config_with_computer_use());
 
-    let observed = start_simple_turn(
-        &manager,
-        "thr_computer_use_registered_tool",
-        "ws_computer_use_registered_tool",
-        "turn_computer_use_registered_tool",
-        ThreadMode::Agent,
-        "capture",
-        "Open the requested desktop location.",
-    )
-    .await;
-    assert_turn_completed(&observed);
+        let observed = start_simple_turn(
+            &manager,
+            "thr_computer_use_registered_tool",
+            "ws_computer_use_registered_tool",
+            "turn_computer_use_registered_tool",
+            ThreadMode::Agent,
+            "capture",
+            "Open the requested desktop location.",
+        )
+        .await;
+        assert_turn_completed(&observed);
 
-    let requests = provider.snapshot_requests();
-    assert_eq!(requests.len(), 2);
-    let request_tool_names = requests[1]
-        .tools
-        .as_ref()
-        .expect("main request should include provider tools")
-        .iter()
-        .map(|tool| tool.name.as_str())
-        .collect::<Vec<_>>();
-    assert_eq!(
-        request_tool_names.contains(&"cua_get_window_state"),
-        !pioneer_tools::computer_use_tool_specs().is_empty(),
-        "image-capable providers may expose computer_use after request_tools"
-    );
+        let requests = provider.snapshot_requests();
+        assert_eq!(requests.len(), 2);
+        let request_tool_names = requests[1]
+            .tools
+            .as_ref()
+            .expect("main request should include provider tools")
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            request_tool_names.contains(&"cua_get_window_state"),
+            !pioneer_tools::computer_use_tool_specs().is_empty(),
+            "image-capable providers may expose computer_use after request_tools"
+        );
+    };
+    tokio::pin!(body);
+    let body: std::pin::Pin<&mut dyn std::future::Future<Output = ()>> = body;
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("Failed building the Runtime")
+        .block_on(body);
 }
 
 #[tokio::test]
