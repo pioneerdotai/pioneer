@@ -1140,7 +1140,7 @@ async fn run_one_shot(
     if trace
         .emit_progress_delta(
             1,
-            "retained_output_log".into(),
+            "retained_output_log",
             Some(serde_json::json!({
                 "full_output_available": output_stats.full_output_available,
                 "incomplete": !output_stats.full_output_available,
@@ -1747,7 +1747,7 @@ async fn save_session_output(
             }),
         )
     };
-    if trace.emit_progress_delta(1, "retained_output_log_delta".into(), Some(serde_json::json!({
+    if trace.emit_progress_delta(1, "retained_output_log_delta", Some(serde_json::json!({
         "full_output_available":complete,
         "scope":"delta since the preceding poll; statistics are cumulative session counters",
         "stream_order":"observed decoded-chunk capture order; independent pipes have no process total order",
