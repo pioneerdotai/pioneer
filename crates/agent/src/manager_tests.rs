@@ -4937,7 +4937,9 @@ async fn discovery_history_before_next_snapshot(
                 Some(message)
             }
             AgentDurableEvent::TurnExecutionWindowCheckpointed { .. } => {
-                panic!("no updated checkpoint at this boundary")
+                // Rejecting the next proposal can checkpoint the aborted attempt.
+                // It must never checkpoint before the captured crash boundary.
+                assert!(rejected, "no updated checkpoint before proposal rejection");
             }
             AgentDurableEvent::TurnFailed { .. }
             | AgentDurableEvent::TurnBlocked { .. }
