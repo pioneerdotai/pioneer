@@ -60411,19 +60411,22 @@ mod tests {
             .await
             .unwrap();
         }
-        for (turn_id, item, expiry) in [
+        for (index, (turn_id, item, expiry)) in [
             (&failed.id, "abandoned", None),
             (&failed.id, "expired", Some(unix_to_datetime(now - 1))),
             (&failed.id, "successful", None),
             (&aborted.id, "abandoned", None),
             (&foreign.id, "abandoned", None),
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
             store
                 .insert_turn_llm_context(NewTurnLlmContextEntry {
                     turn_id: turn_id.clone(),
                     item_id: Some(item.into()),
                     attempt_id: None,
-                    sequence: 1,
+                    sequence: index as i64 + 1,
                     source: "shell_control_v1".into(),
                     tool_name: Some("write_stdin".into()),
                     payload: r#"{"kind":"json","value":{"session_id":27},"truncated":false}"#
