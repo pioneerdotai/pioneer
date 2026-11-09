@@ -1327,6 +1327,29 @@ fn canonical_gemini_thinking_level(level: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn disclosed_tools_keep_prefix_in_serialized_payload() {
+        let render = |request: ChatRequest| {
+            serde_json::to_value(GeminiProvider::build_request_result(&request).unwrap()).unwrap()
+        };
+        let mut request = crate::tools::policy::test_request();
+        let before = render(request.clone());
+        let mut added = request.tools.as_ref().unwrap()[0].clone();
+        added.name = "alpha".into();
+        request.tools.as_mut().unwrap().push(added);
+        let body = render(request);
+        assert_eq!(
+            body["tools"][0]["functionDeclarations"][0],
+            before["tools"][0]["functionDeclarations"][0],
+            "entire previously serialized definition must survive expansion"
+        );
+        assert_eq!(
+            body["tools"][0]["functionDeclarations"][0]["name"],
+            "lookup"
+        );
+        assert_eq!(body["tools"][0]["functionDeclarations"][1]["name"], "alpha");
+    }
+
     #[tokio::test]
     async fn native_closed_levels_and_boolean_control_arbitrary_generate_content_model() {
         let id = "quartz-custom-787";

@@ -1930,6 +1930,31 @@ impl crate::traits::Provider for ChatCompletionsApiCompatibleProvider {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn disclosed_tools_keep_prefix_in_serialized_payload() {
+        let render = |request: ChatRequest| {
+            let provider = ChatCompletionsApiCompatibleProvider::new(
+                "openai",
+                "https://fixture.invalid",
+                "unused",
+                AuthStyle::Bearer,
+            );
+            provider.render_chat_request_for_test(request).unwrap()
+        };
+        let mut request = crate::tools::policy::test_request();
+        let before = render(request.clone());
+        let mut added = request.tools.as_ref().unwrap()[0].clone();
+        added.name = "alpha".into();
+        request.tools.as_mut().unwrap().push(added);
+        let body = render(request);
+        assert_eq!(
+            body["tools"][0], before["tools"][0],
+            "entire previously serialized definition must survive expansion"
+        );
+        assert_eq!(body["tools"][0]["function"]["name"], "lookup");
+        assert_eq!(body["tools"][1]["function"]["name"], "alpha");
+    }
+
+    #[test]
     fn stock_chat_discovery_accepts_equivalent_completion_urls_only() {
         use super::*;
         use crate::traits::Provider;

@@ -125,11 +125,9 @@ fn prepare_request_for_api(
         .try_with(|(owner, public, _)| owner != provider || *public)
         .unwrap_or(true);
     let catalog = catalog.filter(|_| use_public_catalog);
-    // Capability discovery can materialize the same authorized set in a different
-    // order. Canonicalize only the wire ordering; never retain revoked schemas.
-    if let Some(tools) = request.tools.as_mut() {
-        tools.sort_by(|left, right| left.name.cmp(&right.name));
-    }
+    // The producer owns disclosure order. Sorting here would insert newly
+    // disclosed tools into the previously sent prefix. Validate without changing
+    // that order; this policy never retains definitions from an earlier request.
     let tools = request.tools.as_deref().unwrap_or_default();
     let mut names = BTreeSet::new();
     for tool in tools {
@@ -497,19 +495,19 @@ mod tests {
         second.name = "alpha".into();
         second.description = "Another authorized tool".into();
         request.tools.as_mut().unwrap().push(second);
-        let mut reversed = request.clone();
-        reversed.tools.as_mut().unwrap().reverse();
-        // Both API policies converge before the adapter serializes native tools.
         for responses in [false, true] {
             let first =
                 prepare_request_for_api("openai", request.clone(), None, responses).unwrap();
-            let other =
-                prepare_request_for_api("openai", reversed.clone(), None, responses).unwrap();
             assert_eq!(
-                serde_json::to_value(&first.tools).unwrap(),
-                serde_json::to_value(&other.tools).unwrap()
+                first
+                    .tools
+                    .as_ref()
+                    .unwrap()
+                    .iter()
+                    .map(|tool| tool.name.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["lookup", "alpha"]
             );
-            assert_eq!(first.tools.as_ref().unwrap()[0].name, "alpha");
             let mut revoked = request.clone();
             revoked
                 .tools
