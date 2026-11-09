@@ -1986,10 +1986,10 @@ mod tests {
         while let Ok(work) = rx.try_recv() {
             let result = match &work.kind {
                 RequestKind::Providers => providers(),
-                RequestKind::Models(provider) => ModelPickerResult::Models(Ok(serde_json::from_value(serde_json::json!({"provider":provider,"models":["one","two"].iter().map(|id| serde_json::json!({
+                RequestKind::Models(provider) => ModelPickerResult::Models(Ok(serde_json::from_value(serde_json::json!({"provider":provider,"models":(["one","two"].iter().map(|id| serde_json::json!({
                     "id":id,"provider":provider,"limits":{"context_window":1050000},"capabilities":{},
                     "context_authority":"account-a", "context_tiers":{"status":"tiered","windows":[272000,1050000],"price_order_confirmed":true}
-                })).collect::<Vec<_>>()})).unwrap())),
+                })).collect::<Vec<_>>())})).unwrap())),
             };
             core.complete_composer_model_picker(work, result);
         }
@@ -2023,10 +2023,10 @@ mod tests {
         while let Ok(work) = rx.try_recv() {
             let result = match &work.kind {
                 RequestKind::Providers => providers(),
-                RequestKind::Models(provider) => ModelPickerResult::Models(Ok(serde_json::from_value(serde_json::json!({"provider":provider,"models":["one","two"].iter().map(|id| serde_json::json!({
+                RequestKind::Models(provider) => ModelPickerResult::Models(Ok(serde_json::from_value(serde_json::json!({"provider":provider,"models":(["one","two"].iter().map(|id| serde_json::json!({
                     "id":id,"provider":provider,"limits":{"context_window":1050000},"capabilities":{},
                     "context_authority":"account-a", "context_tiers":{"status":"tiered","windows":[272000,1050000],"price_order_confirmed":true}
-                })).collect::<Vec<_>>()})).unwrap())),
+                })).collect::<Vec<_>>())})).unwrap())),
             };
             core.complete_composer_model_picker(work, result);
         }
