@@ -1218,6 +1218,8 @@ fn provider_model_from_gemini_model_entry(m: GeminiModelEntry) -> ProviderModelI
     let reasoning = gemini_reasoning_capabilities_for_model_entry(&m);
 
     ProviderModelInfo {
+        context_authority: None,
+        context_tiers: None,
         id: id.clone(),
         name: m.display_name,
         description: m.description,

@@ -20,6 +20,7 @@ pub(crate) use history::load_exact_line_history;
 pub(crate) use history::pause_selected_turn_load;
 pub(crate) use history::provider_round_aliases;
 mod native;
+pub(crate) mod native_budget;
 mod origins;
 #[cfg(test)]
 pub(crate) use origins::resolve_message_origins;

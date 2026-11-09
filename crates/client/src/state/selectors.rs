@@ -418,6 +418,8 @@ mod tests {
 
     fn thread(thread_id: &str, workspace_id: &str, updated_at: i64) -> Thread {
         Thread {
+            context_window: None,
+            context_authority: None,
             workspace_id: workspace_id.to_owned(),
             id: thread_id.to_owned(),
             name: None,
@@ -608,6 +610,8 @@ mod tests {
                 provider: "openai".to_owned(),
                 model: "gpt-5.4".to_owned(),
                 selected_reasoning_effort: None,
+                selected_context_window: None,
+                selected_context_authority: None,
             })
         );
     }

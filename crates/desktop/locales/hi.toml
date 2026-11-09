@@ -54,6 +54,10 @@ remove = "उल्लेख हटाएँ"
 cancel = "जवाब रद्द करें"
 
 [chat.composer.model]
+context_label = "संदर्भ विंडो"
+context_auto = "ऑटो — %{tokens} टोकन तक"
+context_up_to = "%{tokens} टोकन तक"
+context_invalid = "सहेजा गया विकल्प उपलब्ध नहीं है। ऑटो या दूसरी विंडो चुनें।"
 select_label = "मॉडल चुनें"
 dialog_title = "मॉडल चुनें"
 provider_label = "प्रदाता"

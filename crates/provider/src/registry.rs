@@ -391,6 +391,14 @@ impl AuthorityBoundProvider {
         {
             catalog.enrich_for_tool_scope(self.inner.name(), &mut models, self.use_public_catalog);
         }
+        if purpose == ModelPurpose::Chat {
+            for model in &mut models {
+                model.context_authority = Some(crate::catalog::context_choice_authority(
+                    self.authority_fingerprint.as_str(),
+                    &model.id,
+                ));
+            }
+        }
         models
     }
 
@@ -678,6 +686,41 @@ impl Provider for AuthorityBoundProvider {
         self.public_result(self.inner.prepare_model(model).await)
     }
 
+    async fn model_context_tiers(
+        &self,
+        model: &str,
+    ) -> Result<Option<pioneer_protocol::ProviderContextTiers>> {
+        self.ensure_not_revoked()?;
+        if crate::catalog::catalog_provider(self.inner.name()) == "azure-openai-responses" {
+            return Ok(Some(pioneer_protocol::ProviderContextTiers::Excluded));
+        }
+
+        // Native owners can refresh independently of the chat admission DTO
+        // (embedding discovery or on-demand model preparation, for example).
+        if self.inner.name() == "vercel-ai-gateway" {
+            return self.public_result(self.inner.model_context_tiers(model).await);
+        }
+        if let Some(entry) = self.inner.model_catalog_entry(model) {
+            return Ok(Some(crate::catalog::context_tiers_for_model(&entry)));
+        }
+        if let Some(metadata) = self
+            .input_admission
+            .model(model)
+            .and_then(|m| m.context_tiers)
+        {
+            return Ok(Some(metadata));
+        }
+        if !self.use_public_catalog {
+            return Ok(None);
+        }
+        let metadata = self.public_result(self.inner.model_context_tiers(model).await)?;
+        anyhow::ensure!(
+            metadata.is_some(),
+            "Context pricing metadata is unavailable for this public provider/model"
+        );
+        Ok(metadata)
+    }
+
     async fn model_limits(&self, model: &str) -> Result<crate::catalog::CatalogLimits> {
         self.ensure_not_revoked()?;
         let discovery = self.input_admission.model(model);
@@ -727,6 +770,12 @@ impl Provider for AuthorityBoundProvider {
             // Native discovery is usable before bootstrap and during catalog
             // outages. Keep authority-local evidence even without enrichment.
             self.remember_discovery(&models);
+        }
+        for model in &mut models {
+            model.context_authority = Some(crate::catalog::context_choice_authority(
+                self.authority_fingerprint.as_str(),
+                &model.id,
+            ));
         }
         Ok(models)
     }

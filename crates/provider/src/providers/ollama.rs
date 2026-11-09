@@ -1003,6 +1003,8 @@ impl crate::traits::Provider for OllamaProvider {
                 });
 
                 ProviderModelInfo {
+                    context_authority: None,
+                    context_tiers: None,
                     id: id.clone(),
                     name: m.name,
                     description,

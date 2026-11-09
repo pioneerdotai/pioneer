@@ -2256,6 +2256,20 @@
     "TurnStartParams": {
       "type": "object",
       "properties": {
+        "context_authority": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "context_window": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
         "agent_delegation_routes": {
           "description": "Explicit, bounded cross-capsule delegations requested for this root\nAgent execution. These are authorization inputs, never prompt content.",
           "type": "array",

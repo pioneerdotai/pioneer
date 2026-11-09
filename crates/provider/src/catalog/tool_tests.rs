@@ -69,6 +69,8 @@ pub(crate) fn generated_catalog() -> ModelCatalog {
 
 pub(crate) fn discovered(id: &str, support: Option<bool>) -> ProviderModelInfo {
     ProviderModelInfo {
+        context_authority: None,
+        context_tiers: None,
         id: id.into(),
         provider: "openai".into(),
         name: None,

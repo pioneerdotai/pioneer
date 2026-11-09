@@ -29,6 +29,26 @@
           "type": "string",
           "const": "resolved_task_launch"
         },
+        "native_context": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NativeContextBudget"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "native_summary": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NativeSummaryContext"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "profile": {
           "$ref": "#/$defs/AgentExecutionProfileProjection"
         },
@@ -287,6 +307,78 @@
         "allowInheritParentProfile",
         "maxPermissionProfile",
         "fingerprint"
+      ]
+    },
+    "NativeContextBudget": {
+      "type": "object",
+      "properties": {
+        "instance": {
+          "type": "string"
+        },
+        "authority": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "model": {
+          "type": "string"
+        },
+        "manual_window": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "context_window": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max_input": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max_output": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "instance",
+        "model",
+        "context_window"
+      ]
+    },
+    "NativeSummaryContext": {
+      "type": "object",
+      "properties": {
+        "budget": {
+          "$ref": "#/$defs/NativeContextBudget"
+        },
+        "effort": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "inherits_working": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "budget",
+        "inherits_working"
       ]
     },
     "PermissionBehavior": {

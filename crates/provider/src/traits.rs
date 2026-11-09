@@ -74,6 +74,19 @@ pub trait Provider: Send + Sync {
         Ok(crate::catalog::model_catalog()?.limits(self.name(), model))
     }
 
+    /// Context pricing metadata for the selected authority; never technical limits.
+    async fn model_context_tiers(
+        &self,
+        model: &str,
+    ) -> Result<Option<pioneer_protocol::ProviderContextTiers>> {
+        if let Some(entry) = self.model_catalog_entry(model) {
+            return Ok(Some(crate::catalog::context_tiers_for_model(&entry)));
+        }
+        Ok(crate::catalog::model_catalog()?
+            .context_tiers(self.name(), model)
+            .cloned())
+    }
+
     /// Optional authority-owned model facts, including usage accounting evidence.
     /// When present, the owning provider also decides `model_tool_calling`;
     /// wrappers must not substitute public facts for that model decision.

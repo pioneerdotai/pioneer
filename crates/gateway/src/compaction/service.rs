@@ -26,21 +26,42 @@ pub(super) async fn make_summarizer(
     workspace: &str,
     thread: &str,
     selection: ModelSelection,
+    native_context: bool,
+    saved: Option<&pioneer_protocol::NativeContextBudget>,
 ) -> Result<Arc<dyn Summarizer>> {
     if selection.transport == Transport::Api {
         let provider = providers.get_or_create_for_workspace(workspace, &selection.instance)?;
         let provider = crate::usage_journal::observe(provider, store, workspace, "summary", thread);
-        let limits = provider.model_limits(&selection.model).await?;
-        return Ok(Arc::new(NativeSummarizer::new(
-            provider,
-            selection,
+        let budget = if native_context {
+            if saved.is_none() {
+                super::native_budget::validate_manual_authority(
+                    provider.as_ref(),
+                    &selection.model,
+                    selection.context_window,
+                    selection.context_authority.as_deref(),
+                )?;
+            }
+            super::native_budget::effective(
+                provider.as_ref(),
+                &selection.instance,
+                &selection.model,
+                saved,
+                selection.context_window,
+            )
+            .await?
+        } else {
+            let limits = provider.model_limits(&selection.model).await?;
             ModelBudget::new(
                 Some(limits.context_window),
                 limits.max_input,
                 limits.max_output,
-            ),
+            )
+        };
+        return Ok(Arc::new(NativeSummarizer::new(
+            provider, selection, budget,
         )?));
     }
+
     let processor =
         processor.ok_or_else(|| anyhow::anyhow!("CLI service instance catalog is unavailable"))?;
     let instance = processor
@@ -844,6 +865,8 @@ mod tests {
     #[test]
     fn cli_summary_input_keeps_projected_command_output_once() {
         let selection = ModelSelection {
+            context_authority: None,
+            context_window: None,
             transport: Transport::Claude,
             instance: "fixture".into(),
             model: "fixture-model".into(),
@@ -942,6 +965,8 @@ print(json.dumps([{'type':'system','subtype':'init','model':'claude-sonnet-4-6'}
             debug_native_events: false,
         };
         let selection = ModelSelection {
+            context_authority: None,
+            context_window: None,
             transport: Transport::Claude,
             instance: "selected-cli".into(),
             model: "claude-sonnet-4-6".into(),

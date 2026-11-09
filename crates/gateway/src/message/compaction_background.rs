@@ -112,6 +112,15 @@ impl MessageProcessor {
     ) -> anyhow::Result<()> {
         let clock = SystemCompactionClock::default();
         let current = ModelSelection {
+            context_authority: context.context_budget.as_ref().and_then(|saved| {
+                saved.authority.as_deref().map(|authority| {
+                    pioneer_provider::catalog::context_choice_authority(authority, &saved.model)
+                })
+            }),
+            context_window: context
+                .context_budget
+                .as_ref()
+                .map(|saved| saved.context_window),
             transport: Transport::Api,
             instance: context.provider_instance.clone(),
             model: prepared.request.model.clone(),
@@ -730,6 +739,8 @@ impl MessageProcessor {
             };
             CapturedCheck {
                 current: ModelSelection {
+                    context_authority: None,
+                    context_window: None,
                     transport,
                     instance: row
                         .runtime_id

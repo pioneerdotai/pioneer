@@ -1651,6 +1651,8 @@ fn provider_model_from_openai_model_entry(m: ApiModelEntry) -> ProviderModelInfo
     let capabilities = ProviderModelCapabilities::default();
 
     ProviderModelInfo {
+        context_authority: None,
+        context_tiers: None,
         id: m.id.clone(),
         name: None,
         description: None,
@@ -1669,6 +1671,8 @@ fn provider_model_from_openai_model_entry(m: ApiModelEntry) -> ProviderModelInfo
 
 fn openai_embedding_model_info(model: &OpenAiEmbeddingModelDefinition) -> ProviderModelInfo {
     ProviderModelInfo {
+        context_authority: None,
+        context_tiers: None,
         id: model.id.to_owned(),
         name: Some(model.name.to_owned()),
         description: Some(model.description.to_owned()),

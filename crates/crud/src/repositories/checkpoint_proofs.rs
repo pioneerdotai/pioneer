@@ -2924,6 +2924,8 @@ mod tests {
             admission: CompactionSettings::default()
                 .admit(
                     &ModelSelection {
+                        context_authority: None,
+                        context_window: None,
                         transport: Transport::Api,
                         instance: "fixture".into(),
                         model: "model".into(),

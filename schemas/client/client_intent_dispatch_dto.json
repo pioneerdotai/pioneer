@@ -3704,6 +3704,20 @@
             }
           ]
         },
+        "selected_context_authority": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "selected_context_window": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
         "selected_mentions": {
           "type": "array",
           "items": {
@@ -4328,6 +4342,30 @@
         {
           "type": "object",
           "properties": {
+            "identity": {
+              "$ref": "#/$defs/ComposerOperationIdentity"
+            },
+            "kind": {
+              "type": "string",
+              "const": "select_context_window"
+            },
+            "window": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint64",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "kind",
+            "identity"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
             "effort": {
               "type": [
                 "string",
@@ -4421,6 +4459,20 @@
         },
         "provider": {
           "type": "string"
+        },
+        "selected_context_authority": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "selected_context_window": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
         },
         "selected_reasoning_effort": {
           "type": [
@@ -4801,6 +4853,20 @@
         {
           "type": "object",
           "properties": {
+            "context_authority": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "context_window": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint64",
+              "minimum": 0
+            },
             "instance": {
               "type": "string"
             },
@@ -6026,6 +6092,20 @@
             "string",
             "null"
           ]
+        },
+        "selected_context_authority": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "selected_context_window": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
         },
         "selected_reasoning_effort": {
           "type": [
@@ -7278,6 +7358,7 @@
       "type": "string",
       "enum": [
         "Chat",
+        "AuxiliaryChat",
         "SelfImprovement",
         "Embeddings",
         "Transcription"
@@ -8248,6 +8329,36 @@
             "picker_id",
             "expected_owner",
             "model"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "expected_owner": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "kind": {
+              "type": "string",
+              "const": "select_context_window"
+            },
+            "picker_id": {
+              "type": "string"
+            },
+            "window": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint64",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "kind",
+            "picker_id",
+            "expected_owner"
           ]
         },
         {
@@ -9494,6 +9605,20 @@
               "type": "null"
             }
           ]
+        },
+        "context_authority": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "context_window": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
         },
         "execution_backend": {
           "anyOf": [

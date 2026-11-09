@@ -2972,6 +2972,8 @@ mod tests {
         let context = context();
         let timestamp = 1_700_030_000;
         let thread = Thread {
+            context_window: None,
+            context_authority: None,
             workspace_id: context.workspace_id.clone(),
             id: context.thread_id.clone(),
             name: None,

@@ -1324,6 +1324,8 @@ mod tests {
         let thread_id = generate_id(AUTH_DOMAIN_ID_LEN);
         let timestamp = chrono::Utc::now().timestamp();
         let new_thread = Thread {
+            context_window: None,
+            context_authority: None,
             id: thread_id.clone(),
             workspace_id: fixture.red_workspace_id.clone(),
             name: Some("Atomic private thread".to_owned()),
@@ -1414,6 +1416,8 @@ mod tests {
         let thread_id = generate_id(AUTH_DOMAIN_ID_LEN);
         let turn_id = generate_id(AUTH_DOMAIN_ID_LEN);
         let thread = Thread {
+            context_window: None,
+            context_authority: None,
             id: thread_id.clone(),
             workspace_id: fixture.red_workspace_id.clone(),
             name: None,
@@ -1579,6 +1583,8 @@ mod tests {
         let workspace_thread_id = generate_id(AUTH_DOMAIN_ID_LEN);
         let workspace_turn_id = generate_id(AUTH_DOMAIN_ID_LEN);
         let workspace_thread = Thread {
+            context_window: None,
+            context_authority: None,
             id: workspace_thread_id.clone(),
             visibility: Some(ThreadVisibility::Workspace),
             ..thread.clone()
@@ -1643,6 +1649,8 @@ mod tests {
         let thread_id = generate_id(AUTH_DOMAIN_ID_LEN);
         let timestamp = chrono::Utc::now().timestamp();
         let new_thread = Thread {
+            context_window: None,
+            context_authority: None,
             id: thread_id.clone(),
             workspace_id: fixture.red_workspace_id,
             name: None,
@@ -1760,6 +1768,8 @@ mod tests {
         let thread_id = generate_id(AUTH_DOMAIN_ID_LEN);
         let timestamp = now.timestamp();
         let new_thread = Thread {
+            context_window: None,
+            context_authority: None,
             id: thread_id.clone(),
             workspace_id: fixture.red_workspace_id.clone(),
             name: Some("Managed".to_owned()),
@@ -1956,6 +1966,8 @@ mod tests {
 
         let thread_id = generate_id(AUTH_DOMAIN_ID_LEN);
         let new_thread = Thread {
+            context_window: None,
+            context_authority: None,
             id: thread_id.clone(),
             workspace_id: fixture.red_workspace_id.clone(),
             name: None,

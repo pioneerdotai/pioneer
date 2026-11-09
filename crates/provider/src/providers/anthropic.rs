@@ -1672,6 +1672,8 @@ fn provider_model_from_anthropic_model_entry(m: AnthropicModelEntry) -> Provider
     }
 
     ProviderModelInfo {
+        context_authority: None,
+        context_tiers: None,
         id: m.id.clone(),
         name: m.display_name,
         description: None,

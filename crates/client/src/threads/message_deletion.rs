@@ -500,6 +500,8 @@ mod tests {
     fn fixture() -> (Arc<ClientCore>, ClientSubscription) {
         let core = Arc::new(ClientCore::new());
         core.upsert_thread(Thread {
+            context_window: None,
+            context_authority: None,
             workspace_id: "ws".into(),
             id: "a".into(),
             name: None,

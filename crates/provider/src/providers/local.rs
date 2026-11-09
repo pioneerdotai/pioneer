@@ -539,6 +539,8 @@ impl Provider for LocalProvider {
 
 fn local_embedding_model_to_provider_model(model: &LocalEmbeddingModelInfo) -> ProviderModelInfo {
     ProviderModelInfo {
+        context_authority: None,
+        context_tiers: None,
         id: model.id.to_owned(),
         name: Some(model.display_name.to_owned()),
         description: Some(model.description.to_owned()),
@@ -568,6 +570,8 @@ fn local_transcription_model_to_provider_model(
     let engine = local_transcription_engine_id(model.engine);
 
     ProviderModelInfo {
+        context_authority: None,
+        context_tiers: None,
         id: model.id.to_owned(),
         name: Some(model.display_name.to_owned()),
         description: Some(model.description.to_owned()),

@@ -276,6 +276,8 @@ mod tests {
 
     fn thread(origin_kind: ThreadOriginKind, visibility: Option<ThreadVisibility>) -> Thread {
         Thread {
+            context_window: None,
+            context_authority: None,
             workspace_id: "workspace_1".into(),
             id: "thread_1".into(),
             name: None,

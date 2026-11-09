@@ -1060,6 +1060,8 @@ mod tests {
 
     fn transcription_model(id: &str, recommended: bool) -> ProviderModelInfo {
         ProviderModelInfo {
+            context_authority: None,
+            context_tiers: None,
             id: id.to_owned(),
             name: Some(id.to_owned()),
             description: None,

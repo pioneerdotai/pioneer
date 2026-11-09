@@ -565,6 +565,20 @@
       "description": "Frozen non-audio composer context for voice turn materialization.\n\n`prepared_input` is for existing prepared `UserInput` references such as\nartifacts/local attachment references. It must not contain the future voice\ntranscript; the gateway prepends the transcript as `UserInput::Text` after\nsuccessful transcription.",
       "type": "object",
       "properties": {
+        "context_authority": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "context_window": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
         "capabilities": {
           "description": "Selected skills, MCP tools/servers and related turn capabilities.",
           "type": "array",

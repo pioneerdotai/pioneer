@@ -61,6 +61,10 @@ pub enum TaskReviewerIntent {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum TaskDerivedChildLaunchGrant {
     ResolvedTaskLaunch {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        native_context: Option<crate::NativeContextBudget>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        native_summary: Option<crate::NativeSummaryContext>,
         identity: AgentIdentityProjection,
         profile: AgentExecutionProfileProjection,
         role_key: String,
@@ -124,6 +128,8 @@ impl TaskDerivedChildLaunchGrant {
             allowed_actions,
             agent_authorization_fingerprint,
             child_launch_grant,
+            native_context,
+            native_summary: _,
         } = self;
         if role_key.trim().is_empty()
             || *agent_policy_generation == 0
@@ -134,6 +140,14 @@ impl TaskDerivedChildLaunchGrant {
                 .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
         {
             return Err(TaskActorContractError::InvalidResolvedLaunchGrant);
+        }
+        if native_context.as_ref().is_some_and(|budget| {
+            profile.backend != crate::AgentExecutionProfileBackend::ApiProvider
+                || budget.instance != profile.provider_id
+                || budget.model != profile.model_id
+                || budget.context_window == 0
+        }) {
+            return Err(TaskActorContractError::ResolvedLaunchGrantMismatch);
         }
         child_launch_grant
             .validate()

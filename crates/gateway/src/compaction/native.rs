@@ -503,12 +503,14 @@ async fn prepare_native_projection_with_prepared(
         if matches!(&accepted_projection, Some(AcceptedProjection::Prepared(_))) {
             observe_reused_projection(store, workspace, thread);
         }
-        let limits = context.provider.model_limits(&request.model).await?;
-        let budget = ModelBudget::new(
-            Some(limits.context_window),
-            limits.max_input,
-            limits.max_output,
-        );
+        let budget = super::native_budget::effective(
+            context.provider.as_ref(),
+            &context.provider_instance,
+            &request.model,
+            context.context_budget.as_ref(),
+            None,
+        )
+        .await?;
         // Resolve and pin media under the selected provider authority before
         // evaluating either the full request or any compaction candidate.
         let materialized = context.provider.prepare_input_budget(request).await?;
@@ -579,14 +581,50 @@ async fn prepare_native_projection_with_prepared(
             None => None,
         };
         let current = ModelSelection {
+            context_authority: context.context_budget.as_ref().and_then(|saved| {
+                saved.authority.as_deref().map(|authority| {
+                    pioneer_provider::catalog::context_choice_authority(authority, &saved.model)
+                })
+            }),
+            context_window: context
+                .context_budget
+                .as_ref()
+                .map(|saved| saved.context_window),
             transport: Transport::Api,
             instance: context.provider_instance.clone(),
             model: full.request.model.clone(),
             effort,
         };
-        let selection = effective_selection(&current, settings.selection.as_ref(), None).clone();
+        let selection = context
+            .summary_context
+            .as_ref()
+            .map(|saved| super::native_budget::summary_selection(saved, current.effort.clone()))
+            .unwrap_or_else(|| {
+                effective_selection(&current, settings.selection.as_ref(), None).clone()
+            });
+        // Admission and the service must consume the same durable choice.
+        let summary_settings = CompactionSettings {
+            selection: Some(selection.clone()),
+        };
         let summarizer = super::service::make_summarizer(
-            providers, store, processor, workspace, thread, selection,
+            providers,
+            store,
+            processor,
+            workspace,
+            thread,
+            selection,
+            true,
+            context
+                .summary_context
+                .as_ref()
+                .map(|saved| &saved.budget)
+                .or_else(|| {
+                    if settings.selection.is_none() {
+                        context.context_budget.as_ref()
+                    } else {
+                        None
+                    }
+                }),
         )
         .await?;
         let layout = NativeHistoryLayout::from_messages(
@@ -683,7 +721,7 @@ async fn prepare_native_projection_with_prepared(
             &store,
             workspace,
             thread,
-            settings,
+            &summary_settings,
             &current,
             None,
             summarizer.as_ref(),
@@ -949,6 +987,50 @@ impl pioneer_agent::compaction::controller::NativeContextController
             result = refresh => result?,
         };
         let mut context = context.clone();
+        if context.context_budget.is_none() {
+            let saved = processor
+                .crud_store
+                .get_turn_execution_security_snapshot(&context.turn_id)
+                .await?;
+            if let Some(record) = saved {
+                if record.snapshot.native_context.is_none() {
+                    let budget = super::native_budget::capture(
+                        context.provider.as_ref(),
+                        &context.provider_instance,
+                        &request.model,
+                        None,
+                    )
+                    .await?;
+                    let summary = super::native_budget::capture_summary(
+                        &processor,
+                        &context.workspace_id,
+                        &budget,
+                    )
+                    .await?;
+                    processor
+                        .crud_store
+                        .pin_turn_native_context(
+                            &context.workspace_id,
+                            &context.turn_id,
+                            &budget,
+                            summary.as_ref(),
+                        )
+                        .await?;
+                }
+                let saved = processor
+                    .crud_store
+                    .get_turn_execution_security_snapshot(&context.turn_id)
+                    .await?
+                    .context("Native execution context snapshot disappeared")?
+                    .snapshot;
+                context.context_budget = saved.native_context;
+                context.summary_context = saved.native_summary;
+                ensure!(
+                    context.context_budget.is_some(),
+                    "Native execution context could not be pinned"
+                );
+            }
+        }
         context.recovery_deadline_ms = Some(deadline);
         context.cancellation = lease.cancellation();
         let settings = processor.compaction_settings_for_workspace(&context.workspace_id)?;

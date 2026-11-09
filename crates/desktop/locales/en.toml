@@ -54,6 +54,10 @@ remove = "Remove mention"
 cancel = "Cancel reply"
 
 [chat.composer.model]
+context_label = "Context window"
+context_auto = "Auto — up to %{tokens} tokens"
+context_up_to = "Up to %{tokens} tokens"
+context_invalid = "Saved context choice is unavailable. Choose Auto or another window."
 select_label = "Select model"
 dialog_title = "Select Model"
 provider_label = "Provider"

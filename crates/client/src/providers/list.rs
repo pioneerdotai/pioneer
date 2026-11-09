@@ -165,12 +165,44 @@ pub struct ProviderModelSelectorState {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ProviderModelSelectorMode {
     Chat,
+    /// Chat models used outside the Native turn/compaction execution pipeline.
+    AuxiliaryChat,
     SelfImprovement,
     Embeddings,
     Transcription,
 }
 
 impl ProviderModelSelectorState {
+    pub fn context_rows(
+        &self,
+        manual: Option<u64>,
+        authority: Option<&str>,
+    ) -> Vec<super::presentation::ContextWindowRow> {
+        if !matches!(self.mode, ProviderModelSelectorMode::Chat)
+            || self
+                .selected_provider()
+                .and_then(runtime_id_from_cli_runtime_provider_key)
+                .is_some()
+        {
+            return vec![];
+        }
+        self.models()
+            .iter()
+            .find(|model| Some(model.id.as_str()) == self.selected_model())
+            .map(|model| {
+                let mut rows = super::presentation::context_window_rows(model, manual);
+                if manual.is_some()
+                    && (authority.is_none() || authority != model.context_authority.as_deref())
+                {
+                    for row in &mut rows {
+                        row.selected = false;
+                    }
+                }
+                rows
+            })
+            .unwrap_or_default()
+    }
+
     pub fn cli_runtimes(&self) -> &[RuntimeSummary] {
         &self.cli_runtimes
     }
@@ -211,7 +243,9 @@ impl ProviderModelSelectorState {
             .iter()
             .filter(|provider| provider_is_selectable(provider))
             .filter(|provider| match self.mode {
-                ProviderModelSelectorMode::Chat => provider.name != "local",
+                ProviderModelSelectorMode::Chat | ProviderModelSelectorMode::AuxiliaryChat => {
+                    provider.name != "local"
+                }
                 ProviderModelSelectorMode::SelfImprovement => {
                     provider.capabilities.self_improvement
                 }
@@ -229,7 +263,10 @@ impl ProviderModelSelectorState {
             })
             .collect::<Vec<_>>();
 
-        if self.mode == ProviderModelSelectorMode::Chat {
+        if matches!(
+            self.mode,
+            ProviderModelSelectorMode::Chat | ProviderModelSelectorMode::AuxiliaryChat
+        ) {
             rows.extend(
                 self.cli_runtimes
                     .iter()
@@ -281,7 +318,10 @@ impl ProviderModelSelectorState {
 
     pub fn mark_providers_loading(&mut self) {
         self.loading_providers = true;
-        self.loading_cli_runtimes = self.mode == ProviderModelSelectorMode::Chat;
+        self.loading_cli_runtimes = matches!(
+            self.mode,
+            ProviderModelSelectorMode::Chat | ProviderModelSelectorMode::AuxiliaryChat
+        );
         self.error = None;
     }
 
@@ -546,6 +586,8 @@ fn provider_model_from_runtime_model(
     });
 
     ProviderModelInfo {
+        context_authority: None,
+        context_tiers: None,
         id: model.id,
         name: model.name,
         description: model.description,
@@ -854,6 +896,8 @@ mod tests {
         let applied = state.apply_provider_models_success(ProviderListModelsResponse {
             provider: "openai".to_owned(),
             models: vec![ProviderModelInfo {
+                context_authority: None,
+                context_tiers: None,
                 id: "gpt-5.4".to_owned(),
                 name: Some("GPT 5.4".to_owned()),
                 description: None,
@@ -1113,6 +1157,8 @@ mod tests {
         let applied = state.apply_provider_models_success(ProviderListModelsResponse {
             provider: "openai".to_owned(),
             models: vec![ProviderModelInfo {
+                context_authority: None,
+                context_tiers: None,
                 id: "text-embedding-3-small".to_owned(),
                 name: None,
                 description: None,
@@ -1217,6 +1263,8 @@ mod tests {
         );
         let models = (0..16)
             .map(|index| ProviderModelInfo {
+                context_authority: None,
+                context_tiers: None,
                 id: format!("model-{index:02}"),
                 name: Some(format!("Model {index:02}")),
                 description: Some("Client-safe transcription model".to_owned()),

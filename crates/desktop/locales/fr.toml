@@ -54,6 +54,10 @@ remove = "Supprimer la mention"
 cancel = "Annuler la réponse"
 
 [chat.composer.model]
+context_label = "Fenêtre de contexte"
+context_auto = "Auto — jusqu’à %{tokens} tokens"
+context_up_to = "Jusqu’à %{tokens} tokens"
+context_invalid = "Le choix enregistré est indisponible. Choisissez Auto ou une autre fenêtre."
 select_label = "Sélectionner le modèle"
 dialog_title = "Sélectionner le modèle"
 provider_label = "Fournisseur"

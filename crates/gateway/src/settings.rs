@@ -5323,6 +5323,8 @@ fn compaction_selection(
     value: &pioneer_protocol::GatewayModelSelection,
 ) -> Option<pioneer_compaction::ModelSelection> {
     let pioneer_protocol::GatewayModelSelection::Explicit {
+        context_authority,
+        context_window,
         transport,
         instance,
         model,
@@ -5332,6 +5334,8 @@ fn compaction_selection(
         return None;
     };
     Some(pioneer_compaction::ModelSelection {
+        context_authority: context_authority.clone(),
+        context_window: *context_window,
         transport: match transport {
             pioneer_protocol::ModelSelectionTransport::Api => pioneer_compaction::Transport::Api,
             pioneer_protocol::ModelSelectionTransport::Codex => {
@@ -5377,6 +5381,8 @@ fn legacy_model_selection(
         return pioneer_protocol::GatewayModelSelection::Inherit;
     }
     pioneer_protocol::GatewayModelSelection::Explicit {
+        context_authority: None,
+        context_window: None,
         transport: pioneer_protocol::ModelSelectionTransport::Api,
         instance: provider.unwrap_or_default().to_owned(),
         model: model.unwrap_or_default().to_owned(),

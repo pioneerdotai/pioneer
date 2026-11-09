@@ -3422,6 +3422,8 @@ mod tests {
 
     fn voice_turn_context() -> VoiceTurnContext {
         VoiceTurnContext {
+            context_authority: None,
+            context_window: None,
             workspace_id: "ws_1".to_owned(),
             thread_id: "thread_1".to_owned(),
             turn_id: "turn_1".to_owned(),
@@ -3742,6 +3744,8 @@ mod tests {
                 turn_start(
                     &PanicTransport,
                     TurnStartParams {
+                        context_authority: None,
+                        context_window: None,
                         agent_delegation_routes: Vec::new(),
                         thread_id: " ".to_owned(),
                         turn_id: "turn_1".to_owned(),
@@ -3770,6 +3774,8 @@ mod tests {
                 turn_start(
                     &PanicTransport,
                     TurnStartParams {
+                        context_authority: None,
+                        context_window: None,
                         agent_delegation_routes: Vec::new(),
                         thread_id: "thread_1".to_owned(),
                         turn_id: " ".to_owned(),
@@ -3797,6 +3803,8 @@ mod tests {
         let error = turn_start(
             &ExactSkillTurnTransport,
             TurnStartParams {
+                context_authority: None,
+                context_window: None,
                 agent_delegation_routes: Vec::new(),
                 thread_id: "thread_1".to_owned(),
                 turn_id: "turn_1".to_owned(),

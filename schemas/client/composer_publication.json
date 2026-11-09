@@ -836,6 +836,20 @@
             }
           ]
         },
+        "selected_context_authority": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "selected_context_window": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
         "selected_mentions": {
           "type": "array",
           "items": {
@@ -3000,6 +3014,20 @@
               "type": "null"
             }
           ]
+        },
+        "context_authority": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "context_window": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
         },
         "execution_backend": {
           "anyOf": [

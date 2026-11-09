@@ -897,6 +897,8 @@ pub(super) struct DetachedAgentThreadAdmission {
 // The final serialized request is prepared and budget-checked before the parent
 // is durable. Only the separate authorization context is built after admission.
 struct ComposerDetachedTaskPlan {
+    native_context: Option<pioneer_protocol::NativeContextBudget>,
+    native_summary: Option<pioneer_protocol::NativeSummaryContext>,
     prepared: pioneer_tasks::PreparedComposerTask,
     resolved_launch: Option<(
         pioneer_protocol::AgentIdentityProjection,
@@ -1913,7 +1915,47 @@ impl MessageProcessor {
                         "invalid Composer Task request: {error:#}"
                     ))
                 })?;
+            let native_context = if security_snapshot.backend.execution_backend
+                == pioneer_protocol::TurnSecurityExecutionBackendKind::Native
+            {
+                let provider = self
+                    .provider_registry
+                    .get_or_create_for_workspace(&thread.workspace_id, &task_model_provider)
+                    .map_err(|e| TurnStartFailure::unavailable(e.to_string()))?;
+                crate::compaction::native_budget::validate_manual_authority(
+                    provider.as_ref(),
+                    &outcome.materialization.thread.model,
+                    launch.context_window,
+                    launch.context_authority.as_deref(),
+                )
+                .map_err(|error| TurnStartFailure::policy_denied(error.to_string()))?;
+                Some(
+                    crate::compaction::native_budget::capture(
+                        provider.as_ref(),
+                        &task_model_provider,
+                        &outcome.materialization.thread.model,
+                        launch.context_window,
+                    )
+                    .await
+                    .map_err(|e| TurnStartFailure::policy_denied(e.to_string()))?,
+                )
+            } else {
+                None
+            };
+            let native_summary = if let Some(budget) = &native_context {
+                crate::compaction::native_budget::capture_summary(
+                    self,
+                    &thread.workspace_id,
+                    budget,
+                )
+                .await
+                .map_err(|e| TurnStartFailure::unavailable(e.to_string()))?
+            } else {
+                None
+            };
             Ok(ComposerDetachedTaskPlan {
+                native_context,
+                native_summary,
                 prepared,
                 resolved_launch,
             })
@@ -2352,6 +2394,8 @@ impl MessageProcessor {
             .await;
         let task_created = message_future(async {
             let ComposerDetachedTaskPlan {
+                native_context,
+                native_summary,
                 prepared,
                 resolved_launch,
             } = task_plan;
@@ -2445,6 +2489,8 @@ impl MessageProcessor {
                     ..Default::default()
                 }
             };
+            create_context.native_context = native_context;
+            create_context.native_summary = native_summary;
             create_context.execution_admission = Some(pioneer_tasks::TaskExecutionAdmissionSeed {
                 workspace_id: task_execution_context.workspace_id().to_owned(),
                 root_thread_id: task_execution_context.root_thread_id().to_owned(),
@@ -9912,6 +9958,53 @@ impl MessageProcessor {
                     },
                 )?
             };
+            if outcome.materialization.turn.mode != pioneer_protocol::ThreadMode::Message
+                && snapshot.backend.execution_backend
+                    == pioneer_protocol::TurnSecurityExecutionBackendKind::Native
+                && snapshot.native_context.is_none()
+            {
+                let thread = &outcome.materialization.thread;
+                let provider = self
+                    .provider_registry
+                    .get_or_create_for_workspace(&thread.workspace_id, &thread.model_provider)
+                    .map_err(|e| {
+                        TurnStartFailure::unavailable(format!(
+                            "Native context provider unavailable: {e:#}"
+                        ))
+                    })?;
+                crate::compaction::native_budget::validate_manual_authority(
+                    provider.as_ref(),
+                    &thread.model,
+                    params.context_window,
+                    params.context_authority.as_deref(),
+                )
+                .map_err(|error| TurnStartFailure::policy_denied(error.to_string()))?;
+                snapshot.native_context = Some(
+                    crate::compaction::native_budget::capture(
+                        provider.as_ref(),
+                        &thread.model_provider,
+                        &thread.model,
+                        params.context_window,
+                    )
+                    .await
+                    .map_err(|e| {
+                        TurnStartFailure::policy_denied(format!("Native context selection: {e:#}"))
+                    })?,
+                );
+            }
+            if let Some(working) = &snapshot.native_context {
+                if snapshot.native_summary.is_none() {
+                    snapshot.native_summary = crate::compaction::native_budget::capture_summary(
+                        self,
+                        &outcome.materialization.thread.workspace_id,
+                        working,
+                    )
+                    .await
+                    .map_err(|e| {
+                        TurnStartFailure::unavailable(format!("Native summary context: {e:#}"))
+                    })?;
+                }
+            }
             snapshot.authority_cap.resource_binding_revision =
                 execution_authority.policy_revision();
             self.add_native_turn_runtime_sandbox_roots(
@@ -10337,6 +10430,8 @@ impl MessageProcessor {
                 CLIAgentRuntimeKind::OpenCode => pioneer_compaction::Transport::OpenCode,
             };
             let current = pioneer_compaction::ModelSelection {
+                context_window: None,
+                context_authority: None,
                 transport,
                 instance: runtime_id.to_owned(),
                 model: model.to_owned(),
@@ -12870,6 +12965,8 @@ pub(super) fn provider_model_from_runtime_model_for_reasoning_lookup(
     });
 
     ProviderModelInfo {
+        context_authority: None,
+        context_tiers: None,
         id: model.id,
         name: model.name,
         description: model.description,
@@ -13446,6 +13543,8 @@ mod tests {
             mode: pioneer_protocol::TurnPermissionMode::Supervised,
         };
         TurnStartParams {
+            context_authority: None,
+            context_window: None,
             agent_delegation_routes: Vec::new(),
             thread_id: "thread-root".to_owned(),
             turn_id: "turn-root".to_owned(),
@@ -13566,6 +13665,8 @@ mod tests {
         reasoning: Option<ProviderModelReasoningCapabilities>,
     ) -> ProviderModelInfo {
         ProviderModelInfo {
+            context_authority: None,
+            context_tiers: None,
             id: "model-a".to_owned(),
             name: None,
             description: None,

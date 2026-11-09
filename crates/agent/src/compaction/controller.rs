@@ -11,6 +11,8 @@ use tokio_util::sync::CancellationToken;
 
 #[derive(Clone)]
 pub struct NativeContext {
+    pub context_budget: Option<pioneer_protocol::NativeContextBudget>,
+    pub summary_context: Option<pioneer_protocol::NativeSummaryContext>,
     pub overflow_recovery: bool,
     pub recovery_deadline_ms: Option<u64>,
     pub workspace_id: String,
@@ -338,6 +340,8 @@ mod tests {
     fn recorded_normalized_usage_does_not_add_cache_output_or_reasoning_and_unknown_clears_anchor()
     {
         let context = NativeContext {
+            context_budget: None,
+            summary_context: None,
             overflow_recovery: false,
             recovery_deadline_ms: None,
             workspace_id: "ws".into(),

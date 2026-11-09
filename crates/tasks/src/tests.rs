@@ -745,6 +745,8 @@ async fn persist_test_agent_turn(
     let actor =
         pioneer_protocol::PersistedActorRef::AgentExecution(snapshot.agent_execution_id.clone());
     let thread = pioneer_protocol::Thread {
+        context_window: None,
+        context_authority: None,
         workspace_id: TEST_WORKSPACE_ID.to_owned(),
         id: thread_id.to_owned(),
         name: None,
@@ -935,6 +937,8 @@ fn task_create_context_for(params: &TaskCreateParams) -> TaskCreateContext {
     let (launch, identity, profile, authorization) = test_agent_launch_facts();
     assert_eq!(params.launch.as_ref(), Some(&launch));
     TaskCreateContext {
+        native_context: None,
+        native_summary: None,
         webhook_secret_ref: None,
         conversation_frozen_hold: None,
         actor_id: Some(TEST_PRINCIPAL_ID.to_owned()),
@@ -1337,6 +1341,8 @@ fn composer_work_create_params(
         composer_work: Some(pioneer_protocol::TaskComposerWork {
             version: payload_version,
             launch: pioneer_protocol::TurnStartParams {
+                context_authority: None,
+                context_window: None,
                 agent_delegation_routes: Vec::new(),
                 thread_id: parent_thread_id.to_owned(),
                 turn_id: format!("planned_{parent_thread_id}"),
