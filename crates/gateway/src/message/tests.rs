@@ -9574,8 +9574,10 @@ async fn detach_task_for_test(
 
 pub(crate) fn test_summary_config() -> super::summary::SummaryConfig {
     super::summary::SummaryConfig {
-        summary_model: Some("test-model".to_owned()),
-        summary_model_provider: Some("echo".to_owned()),
+        // General fixtures inherit the working provider's context budget.
+        // Tests of a separate summarizer configure their own registered provider.
+        summary_model: None,
+        summary_model_provider: None,
         title_model: Some("test-model".to_owned()),
         title_model_provider: Some("echo".to_owned()),
     }
