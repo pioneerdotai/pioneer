@@ -389,7 +389,9 @@ impl AgentManager {
         history: Vec<ChatMessage>,
     ) -> Result<(), AgentStartError> {
         let runtime_snapshot = self.runtime_dependencies.snapshot().await;
-        self.start_turn_with_resolved_artifacts_environment_reasoning_permission_profile_and_security_snapshot(
+        // Box at the fixture boundary so outer async helpers do not embed the
+        // composed production startup future and copy it through their frames.
+        Box::pin(self.start_turn_with_resolved_artifacts_environment_reasoning_permission_profile_and_security_snapshot(
             thread_id,
             turn_id,
             mode,
@@ -405,7 +407,7 @@ impl AgentManager {
             None,
             pioneer_protocol::default_turn_permission_profile_snapshot(),
             test_full_access_security_snapshot(),
-        )
+        ))
         .await
     }
 
