@@ -5085,6 +5085,7 @@ stderr_ring_lines = 73
             instance: "claude".into(),
             model: "claude-selected".into(),
             reasoning_effort: Some("high".into()),
+            service_mode: None,
             context_window: None,
             context_authority: None,
         };
@@ -5150,6 +5151,7 @@ stderr_ring_lines = 73
             instance: "codex".into(),
             model: "codex-selected".into(),
             reasoning_effort: Some("high".into()),
+            service_mode: None,
             context_window: None,
             context_authority: None,
         };
@@ -5168,6 +5170,7 @@ stderr_ring_lines = 73
             instance: "claude".into(),
             model: "other".into(),
             reasoning_effort: None,
+            service_mode: None,
             context_window: None,
             context_authority: None,
         });

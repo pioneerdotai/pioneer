@@ -11002,6 +11002,7 @@ dependencies = [
  "gpui-kit",
  "pioneer-client",
  "pioneer-desktop-foundation",
+ "pioneer-protocol",
  "rust-i18n",
  "serde",
  "serde_json",
