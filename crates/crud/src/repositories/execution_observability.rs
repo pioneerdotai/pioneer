@@ -1235,11 +1235,13 @@ impl CrudStore {
                 source::Column::CreatedAt,
             ])
             .column_as(
-                Expr::case(
-                    Expr::expr(length).lte(2 * 1024 * 1024),
-                    Expr::col(source::Column::Payload),
-                )
-                .finally(Option::<String>::None),
+                Expr::expr(
+                    Expr::case(
+                        Expr::expr(length).lte(2 * 1024 * 1024),
+                        Expr::col(source::Column::Payload),
+                    )
+                    .finally(Option::<String>::None),
+                ),
                 "payload",
             )
             .filter(source::Column::Id.gt(&before.after))
@@ -1812,11 +1814,13 @@ impl CrudStore {
                 source::Column::StartedAt,
             ])
             .column_as(
-                Expr::case(
-                    Expr::expr(length).lte(32 * 1024),
-                    Expr::col(source::Column::UsageJson),
-                )
-                .finally(Option::<String>::None),
+                Expr::expr(
+                    Expr::case(
+                        Expr::expr(length).lte(32 * 1024),
+                        Expr::col(source::Column::UsageJson),
+                    )
+                    .finally(Option::<String>::None),
+                ),
                 "usage_json",
             )
             .filter(source::Column::Id.gt(&before.after))
