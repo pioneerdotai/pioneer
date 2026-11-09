@@ -3106,27 +3106,30 @@ fn vercel_routing_outcomes_survive_json_and_sse_without_session_identifiers() {
 
 #[tokio::test]
 async fn compact_shell_result_remains_one_output_part_on_responses_wire() {
-    let compact = crate::providers::history_test_support::COMPACT_SHELL_RESULT;
-    for name in ["openai", "vercel-ai-gateway"] {
-        let provider = ResponsesApiCompatibleProvider::new(
-            name,
-            "https://example.invalid/v1",
-            "fixture",
-            AuthStyle::Bearer,
-        );
-        let mut req = request();
-        req.messages = vec![ChatMessage::tool_result("call", "exec_command", compact)];
-        let prepared = provider
-            .prepare(req, &provider.capabilities())
-            .await
-            .unwrap();
-        for stream in [false, true] {
-            let body = provider.render(&prepared, stream).unwrap();
-            assert_eq!(
-                body["input"],
-                json!([{"type":"function_call_output", "call_id":"call",
-                "output":[{"type":"input_text", "text":compact}]}])
+    crate::attachments::runtime::with_async_authority_scope("fixture-authority".into(), async {
+        let compact = crate::providers::history_test_support::COMPACT_SHELL_RESULT;
+        for name in ["openai", "vercel-ai-gateway"] {
+            let provider = ResponsesApiCompatibleProvider::new(
+                name,
+                "https://example.invalid/v1",
+                "fixture",
+                AuthStyle::Bearer,
             );
+            let mut req = request();
+            req.messages = vec![ChatMessage::tool_result("call", "exec_command", compact)];
+            let prepared = provider
+                .prepare(req, &provider.capabilities())
+                .await
+                .unwrap();
+            for stream in [false, true] {
+                let body = provider.render(&prepared, stream).unwrap();
+                assert_eq!(
+                    body["input"],
+                    json!([{"type":"function_call_output", "call_id":"call",
+                    "output":[{"type":"input_text", "text":compact}]}])
+                );
+            }
         }
-    }
+    })
+    .await;
 }
