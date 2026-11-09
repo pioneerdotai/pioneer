@@ -3879,8 +3879,9 @@ async fn start_simple_turn(
         .await
         .expect("thread should be created");
     let mut events = subscribe_agent_events(manager, thread_id).await;
-    manager
-        .start_test_turn_with_default_profile_and_capabilities(
+    // Keep the composed turn-start future out of the test harness stack.
+    Box::pin(
+        manager.start_test_turn_with_default_profile_and_capabilities(
             thread_id,
             turn_id,
             mode,
@@ -3893,9 +3894,10 @@ async fn start_simple_turn(
             }],
             Vec::new(),
             Vec::new(),
-        )
-        .await
-        .expect("turn should start");
+        ),
+    )
+    .await
+    .expect("turn should start");
 
     recv_events_until_terminal(&mut events).await
 }
