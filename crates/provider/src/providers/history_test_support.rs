@@ -52,3 +52,6 @@ pub(super) async fn serve_sse(body: &'static str) -> (String, tokio::task::JoinH
     });
     (url, task)
 }
+
+// Contract input for serializers: two independent streams, no redundant aggregate.
+pub(super) const COMPACT_SHELL_RESULT: &str = r#"{"stdout":"唯一\nline\nline","stderr":"warning","session_id":7,"truncated":{"stdout":false,"stderr":false}}"#;

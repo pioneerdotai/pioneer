@@ -519,6 +519,83 @@ impl CrudStore {
         )
         .await
     }
+    pub async fn shell_control_receipt(
+        &self,
+        workspace: &str,
+        thread: &str,
+        turn: &str,
+        item: &str,
+    ) -> Result<Option<String>> {
+        repositories::turn_llm_context::shell_control_receipt(
+            &self.connection,
+            workspace,
+            thread,
+            turn,
+            item,
+        )
+        .await
+    }
+
+    /// Prepare the model payload before admission. Its terminal source revision
+    /// and absence of a canonical result are revalidated atomically with append.
+    pub async fn commit_recovered_shell_result(
+        &self,
+        workspace: &str,
+        thread: &str,
+        turn: &str,
+        item: &str,
+        terminal_source: &SourceRef,
+        entry: crate::NewTurnLlmContextEntry,
+    ) -> Result<crate::TurnLlmContextEntry> {
+        use sea_orm::TransactionTrait;
+        anyhow::ensure!(
+            entry.turn_id == turn && entry.item_id.as_deref() == Some(item),
+            "recovery result scope mismatch"
+        );
+        let delivery_key = format!("shell-recovery-v1:{item}");
+        let changes = [
+            self.connection.work_signal("tasks.lifecycle").changing(),
+            self.connection.work_signal("maintenance.frozen").changing(),
+            self.connection.work_signal("maintenance.html").changing(),
+        ];
+        let outcome = self
+            .run_scoped_database_quantum(|| {
+                let entry = entry.clone();
+                let delivery_key = delivery_key.clone();
+                async move {
+                    let transaction = self.connection.begin().await?;
+                    anyhow::ensure!(
+                        repositories::compaction::compaction_tool_item_reference(
+                            &transaction,
+                            workspace,
+                            thread,
+                            turn,
+                            item
+                        )
+                        .await?
+                        .as_ref()
+                            == Some(terminal_source),
+                        "terminal shell source changed before recovery commit"
+                    );
+                    let outcome = repositories::turn_llm_context::append_recovered_shell_result(
+                        &transaction,
+                        entry,
+                        &delivery_key,
+                    )
+                    .await?;
+                    transaction.commit().await?;
+                    Ok(outcome)
+                }
+            })
+            .await;
+        if let Ok(outcome) = &outcome {
+            for change in changes {
+                change.completed(!outcome.already_committed);
+            }
+        }
+        outcome.map(|outcome| outcome.entry)
+    }
+
     /// Prefer an already retained full shell source. Other tools use their canonical result.
     /// Both lookups and fragments retain the same workspace/thread/turn scope.
     pub async fn compaction_tool_result_fragment(

@@ -129,7 +129,9 @@ pub use sandbox_backend::{
     NativeSandboxRequest, NonoBackendSupport, NonoCapabilityPlan, NonoSandboxBackend,
     build_nono_capability_plan, configure_nono_command, prepare_native_sandbox_backend,
 };
-pub use shell_format::{ExecModelPayload, ExecPayloadInput, ExecTruncation, render_exec_ui_text};
+pub use shell_format::{
+    ExecModelPayload, ExecPayloadInput, ExecTruncation, bound_shell_output, render_exec_ui_text,
+};
 pub use spec::{
     ConfiguredToolSpec, DynamicSkillPermissionKind, DynamicSkillPermissionMetadata, ExecutionClass,
     PayloadKind, REQUEST_TOOLS_TOOL_NAME, ToolIdempotencyMode, ToolPayloadBinding,

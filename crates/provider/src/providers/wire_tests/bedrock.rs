@@ -58,7 +58,7 @@ fn canonical_tool_rounds_parse_and_replay_native_unions() {
         history.push(ChatMessage::tool_result(
             &call.id,
             &call.name,
-            "{\"ok\":true}",
+            crate::providers::history_test_support::COMPACT_SHELL_RESULT,
         ));
         let request = request(history.clone());
         let prepared = prepare_messages_for_provider_model(
@@ -88,7 +88,7 @@ fn canonical_tool_rounds_parse_and_replay_native_unions() {
             assert!(assistant["content"][1]["toolUse"]["input"].is_object());
             assert_eq!(
                 result["content"][0]["toolResult"]["content"][0]["text"],
-                "{\"ok\":true}"
+                crate::providers::history_test_support::COMPACT_SHELL_RESULT
             );
             let reasoning = &assistant["content"][0]["reasoningContent"];
             if previous == 0 {

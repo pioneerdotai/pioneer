@@ -1027,3 +1027,302 @@ async fn parked_taskrun_child_wakes_after_parent_thread_workspace_repair() {
 
 #[path = "task_child_owner_repair.rs"]
 mod owner_repair;
+
+#[tokio::test]
+async fn shell_control_cleanup_defers_to_the_existing_child_receipt_gate() {
+    let (store, task) = fixture().await;
+    let active_run = run(&store, &task, 80, TaskRunStatus::Running).await;
+    let pending = child(
+        &store,
+        &active_run,
+        "pending_shell_child",
+        TurnStatus::Failed,
+        TaskRunTurnStatus::InProgress,
+        AT,
+    )
+    .await;
+    terminal_child(
+        &store,
+        &task,
+        81,
+        "settled_shell_child",
+        TaskRunStatus::Succeeded,
+        AT,
+    )
+    .await;
+    for (turn_id, thread_id) in [
+        (&pending.turn_id, &pending.thread_id),
+        (
+            &"settled_shell_child".to_owned(),
+            &"th_settled_shell_child".to_owned(),
+        ),
+    ] {
+        crate::repositories::turn_execution::insert_immutable(
+            &store.connection,
+            crate::NewTurnExecution {
+                turn_id: turn_id.clone(),
+                thread_id: thread_id.clone(),
+                workspace_id: "ws_task".into(),
+                executor_kind: crate::TurnExecutorKind::NativeAgent,
+                executor_key: None,
+                status: crate::TurnExecutionStatus::Running,
+                owner_id: "owner".into(),
+                lease_until: unix_to_datetime(AT + 10),
+                created_at: unix_to_datetime(AT),
+            },
+        )
+        .await
+        .unwrap();
+        crate::repositories::turn_execution::mark_terminal(
+            &store.connection,
+            turn_id,
+            if turn_id == &pending.turn_id {
+                crate::TurnExecutionStatus::Failed
+            } else {
+                crate::TurnExecutionStatus::Completed
+            },
+            unix_to_datetime(AT + 1),
+        )
+        .await
+        .unwrap();
+        store
+            .insert_turn_llm_context(NewTurnLlmContextEntry {
+                turn_id: turn_id.clone(),
+                item_id: Some("shell".into()),
+                attempt_id: None,
+                sequence: 1,
+                source: "shell_control_v1".into(),
+                tool_name: Some("write_stdin".into()),
+                payload: "{}".into(),
+                output_policy_snapshot: "{}".into(),
+                created_at: unix_to_datetime(AT),
+                expires_at: None,
+            })
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        store
+            .release_settled_shell_controls(&pending.turn_id)
+            .await
+            .unwrap(),
+        0
+    );
+    store
+        .delete_turn_llm_context_for_turn(&pending.turn_id)
+        .await
+        .unwrap();
+    assert!(
+        store
+            .shell_control_receipt("ws_task", &pending.thread_id, &pending.turn_id, "shell")
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert_ne!(
+        store
+            .cleanup_terminal_task_child_capsule(&pending.thread_id, &pending.turn_id)
+            .await
+            .unwrap(),
+        Some(true)
+    );
+    let job = store
+        .enqueue_recovery_job(
+            "settled_shell_child".into(),
+            "shell".into(),
+            TurnItemType::CommandExecution,
+            None,
+            RecoveryTrigger::ProjectionFailure,
+            RecoveryAction::RetryWithBackoff,
+            None,
+            None,
+            None,
+            None,
+            1,
+            2,
+            serde_json::json!({}),
+            serde_json::json!({}),
+            AT,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .terminal_task_child_cleanup_ready("th_settled_shell_child", "settled_shell_child")
+            .await
+            .unwrap(),
+        Some(false)
+    );
+    assert_eq!(
+        store
+            .cleanup_terminal_task_child_capsule("th_settled_shell_child", "settled_shell_child")
+            .await
+            .unwrap(),
+        Some(false)
+    );
+    assert!(
+        store
+            .shell_control_receipt(
+                "ws_task",
+                "th_settled_shell_child",
+                "settled_shell_child",
+                "shell"
+            )
+            .await
+            .unwrap()
+            .is_some()
+    );
+    // The existing owner parks on this dependency. Its recovery settlement must
+    // publish a new durable revision, without waiting for another Turn mutation.
+    let parked = claimed_child(&store, "th_settled_shell_child", "settled_shell_child").await;
+    assert!(
+        store
+            .finish_child_point(&parked, None, false)
+            .await
+            .unwrap()
+    );
+    assert!(
+        store
+            .mark_recovery_job_terminal(
+                &job.id,
+                RecoveryJobStatus::Blocked,
+                Some("await resume".into()),
+                AT + 2
+            )
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        store
+            .terminal_task_child_cleanup_ready("th_settled_shell_child", "settled_shell_child")
+            .await
+            .unwrap(),
+        Some(false),
+        "unsettled blocked outbox still protects capsule"
+    );
+    let claims = store
+        .claim_due_recovery_terminalizations(AT + 3, 45, 10)
+        .await
+        .unwrap();
+    assert_eq!(claims.len(), 1);
+    assert_eq!(
+        store
+            .classify_claimed_recovery_terminalization(&claims[0], AT + 3)
+            .await
+            .unwrap(),
+        crate::RecoveryTerminalizationClaimDisposition::SupersededByTerminalStatus(
+            TurnStatus::Completed
+        )
+    );
+    let republished =
+        pioneer_entity::task_child_reconcile_pending::Entity::find_by_id("settled_shell_child")
+            .one(&store.connection)
+            .await
+            .unwrap()
+            .unwrap();
+    assert_ne!(republished.revision, parked.revision);
+    assert!(republished.next_attempt_at.is_some());
+    assert!(!store.cleanup_claimed_child_capsule(&parked).await.unwrap());
+    assert_eq!(
+        store
+            .get_recovery_job(&job.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        RecoveryJobStatus::Blocked
+    );
+    assert!(
+        !store
+            .get_recovery_job(&job.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .resolution_pending
+    );
+    // Settled audit history is insufficient without positive execution evidence.
+    pioneer_entity::turn_execution::Entity::update_many()
+        .filter(pioneer_entity::turn_execution::Column::TurnId.eq("settled_shell_child"))
+        .col_expr(
+            pioneer_entity::turn_execution::Column::CompletedAt,
+            Expr::value(Option::<sea_orm::entity::prelude::DateTimeWithTimeZone>::None),
+        )
+        .exec(&store.connection)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .terminal_task_child_cleanup_ready("th_settled_shell_child", "settled_shell_child")
+            .await
+            .unwrap(),
+        Some(false)
+    );
+    pioneer_entity::turn_execution::Entity::update_many()
+        .filter(pioneer_entity::turn_execution::Column::TurnId.eq("settled_shell_child"))
+        .col_expr(
+            pioneer_entity::turn_execution::Column::CompletedAt,
+            Expr::value(Some(unix_to_datetime(AT + 1))),
+        )
+        .exec(&store.connection)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .terminal_task_child_cleanup_ready("th_settled_shell_child", "settled_shell_child")
+            .await
+            .unwrap(),
+        Some(true)
+    );
+    assert_eq!(
+        store
+            .cleanup_terminal_task_child_capsule("th_settled_shell_child", "settled_shell_child")
+            .await
+            .unwrap(),
+        Some(true)
+    );
+    assert!(
+        store
+            .shell_control_receipt(
+                "ws_task",
+                "th_settled_shell_child",
+                "settled_shell_child",
+                "shell"
+            )
+            .await
+            .unwrap()
+            .is_none()
+    );
+    // The queued lifecycle owner must consume the same settled control capsule
+    // under its claim fence and READY proof, without inventing canonical output.
+    store
+        .insert_turn_llm_context(NewTurnLlmContextEntry {
+            turn_id: "settled_shell_child".into(),
+            item_id: Some("late-shell".into()),
+            attempt_id: None,
+            sequence: 2,
+            source: "shell_control_v1".into(),
+            tool_name: Some("write_stdin".into()),
+            payload: "{}".into(),
+            output_policy_snapshot: "{}".into(),
+            created_at: unix_to_datetime(AT),
+            expires_at: None,
+        })
+        .await
+        .unwrap();
+    let claim = claimed_child(&store, "th_settled_shell_child", "settled_shell_child").await;
+    assert!(store.cleanup_claimed_child_capsule(&claim).await.unwrap());
+    assert!(
+        store
+            .list_turn_llm_context("settled_shell_child")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store
+            .shell_control_receipt("ws_task", &pending.thread_id, &pending.turn_id, "shell")
+            .await
+            .unwrap()
+            .is_some()
+    );
+}

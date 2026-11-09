@@ -1134,7 +1134,9 @@ impl CrudStore {
                 tx.rollback().await?;
                 return Ok(false);
             }
-            match super::task_child_cleanup::ready(&tx, &claim.thread_id, &claim.turn_id).await? {
+            let cleanup_ready =
+                super::task_child_cleanup::ready(&tx, &claim.thread_id, &claim.turn_id).await?;
+            match cleanup_ready {
                 Some(false) => {
                     tx.rollback().await?;
                     return Ok(false);
@@ -1218,7 +1220,16 @@ impl CrudStore {
                     }
                 }
             }
-            super::turn_llm_context::delete_turn_llm_context_for_turn(&tx, &claim.turn_id).await?;
+            if cleanup_ready == Some(true) {
+                super::turn_llm_context::delete_turn_llm_context_for_settled_child(
+                    &tx,
+                    &claim.turn_id,
+                )
+                .await?;
+            } else {
+                super::turn_llm_context::delete_turn_llm_context_for_turn(&tx, &claim.turn_id)
+                    .await?;
+            }
             super::turn_runtime_snapshot::delete_turn_runtime_snapshot(&tx, &claim.turn_id).await?;
             if !(point::Entity::delete_many()
                 .filter(point_fence(claim))

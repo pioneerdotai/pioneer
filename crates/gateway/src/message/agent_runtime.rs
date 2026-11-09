@@ -5545,11 +5545,17 @@ impl MessageProcessor {
                         return false;
                     }
                 };
-                let delivery_key = turn_llm_context_delivery_key(&[
-                    "tool_result",
-                    item_id.as_str(),
-                    attempt_id.as_deref().unwrap_or(""),
-                ]);
+                // A control-only receipt and the final canonical result belong
+                // to the same item, but are distinct acknowledged deliveries.
+                let delivery_key = if source == "shell_control_v1" {
+                    turn_llm_context_delivery_key(&["shell_control_v1", item_id.as_str()])
+                } else {
+                    turn_llm_context_delivery_key(&[
+                        "tool_result",
+                        item_id.as_str(),
+                        attempt_id.as_deref().unwrap_or(""),
+                    ])
+                };
                 let entry = pioneer_crud::NewTurnLlmContextEntry {
                     turn_id: turn_id.clone(),
                     item_id: Some(item_id),
@@ -10118,6 +10124,24 @@ impl MessageProcessor {
             }
         }
 
+        // Recovery job settlement follows the first cleanup attempt. Retry the
+        // existing cleanup boundary now, so an aborted receipt needs no timer.
+        if task_reconciliation_succeeded {
+            let cleanup_store = self.crud_store.with_maintenance_access();
+            if let Err(_error) = cleanup_store
+                .release_settled_shell_controls(turn_id.as_str())
+                .await
+            {
+                warn!("failed to release settled shell controls");
+            }
+            if let Err(_error) = cleanup_store
+                .cleanup_terminal_task_child_capsule(thread_id.as_str(), turn_id.as_str())
+                .await
+            {
+                warn!("terminal child control cleanup remains pending");
+            }
+        }
+
         if task_reconciliation_succeeded
             && self
                 .thread_manager
@@ -11934,6 +11958,24 @@ impl MessageProcessor {
             }
         }
 
+        // Recovery job settlement follows the first cleanup attempt. Retry the
+        // existing cleanup boundary now, so an aborted receipt needs no timer.
+        if task_reconciliation_succeeded {
+            let cleanup_store = self.crud_store.with_maintenance_access();
+            if let Err(_error) = cleanup_store
+                .release_settled_shell_controls(turn_id.as_str())
+                .await
+            {
+                warn!("failed to release settled shell controls");
+            }
+            if let Err(_error) = cleanup_store
+                .cleanup_terminal_task_child_capsule(thread_id.as_str(), turn_id.as_str())
+                .await
+            {
+                warn!("terminal child control cleanup remains pending");
+            }
+        }
+
         if task_reconciliation_succeeded
             && self
                 .thread_manager
@@ -12169,6 +12211,24 @@ impl MessageProcessor {
                     error = %format!("{error:#}"),
                     "failed to mark active recovery jobs failed"
                 );
+            }
+        }
+
+        // Recovery job settlement follows the first cleanup attempt. Retry the
+        // existing cleanup boundary now, so an aborted receipt needs no timer.
+        if task_reconciliation_succeeded {
+            let cleanup_store = self.crud_store.with_maintenance_access();
+            if let Err(_error) = cleanup_store
+                .release_settled_shell_controls(turn_id.as_str())
+                .await
+            {
+                warn!("failed to release settled shell controls");
+            }
+            if let Err(_error) = cleanup_store
+                .cleanup_terminal_task_child_capsule(thread_id.as_str(), turn_id.as_str())
+                .await
+            {
+                warn!("terminal child control cleanup remains pending");
             }
         }
 
