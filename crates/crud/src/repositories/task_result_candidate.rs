@@ -424,3 +424,20 @@ pub(crate) async fn find_delivery_review_binding<C: ConnectionTrait>(
         .await
         .context("failed to read exact delivery final review binding")
 }
+
+pub(crate) async fn find_candidates_by_turns<C: ConnectionTrait>(
+    db: &C,
+    ids: &[String],
+) -> Result<Vec<task_result_candidate::Model>> {
+    let mut rows = Vec::new();
+    for ids in ids.chunks(64) {
+        rows.extend(
+            task_result_candidate::Entity::find()
+                .filter(task_result_candidate::Column::TaskRunTurnId.is_in(ids.to_vec()))
+                .all(db)
+                .await
+                .context("failed to load exact candidate batch")?,
+        );
+    }
+    Ok(rows)
+}

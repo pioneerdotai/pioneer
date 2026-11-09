@@ -536,6 +536,9 @@ async fn preserves_retained_rows_and_coalesces_waiting_active_events() -> Result
     let revision = f
         .scalar("SELECT revision FROM native_event_cleanup_job WHERE turn_id='active'")
         .await?;
+    use futures_util::FutureExt;
+    let mut wake = f.db.work_signal("maintenance.native").subscribe();
+    wake.begin_pass(&f.db).await?;
     for i in 0..10 {
         f.event(
             &format!("delta-{i}"),
@@ -551,6 +554,10 @@ async fn preserves_retained_rows_and_coalesces_waiting_active_events() -> Result
             .await?,
         revision
     );
+    assert!(
+        wake.wait(None).now_or_never().is_none(),
+        "active-turn deltas must not wake terminal cleanup"
+    );
     assert_eq!(run(&f.db, 10).await?.jobs_examined, 0);
     f.event(
         "current-runtime-late",
@@ -560,6 +567,10 @@ async fn preserves_retained_rows_and_coalesces_waiting_active_events() -> Result
         8,
     )
     .await?;
+    assert!(
+        wake.wait(None).now_or_never().is_some(),
+        "late raw events for terminal Turns must wake cleanup"
+    );
     assert_eq!(run(&f.db, 11).await?.events_deleted, 1);
     Ok(())
 }

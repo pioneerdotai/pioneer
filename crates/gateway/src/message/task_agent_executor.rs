@@ -4256,7 +4256,7 @@ impl TaskAgentExecutor {
                 let child_turn_id = child_runtime.task_run_turn.turn_id.as_str();
                 if let Some(binding) = processor
                     .crud_store
-                    .get_cli_runtime_turn_binding(child_turn_id)
+                    .get_cli_runtime_turn_binding_control(child_turn_id)
                     .await?
                 {
                     let parent = resolve_parent_context(processor, &task_response.task).await?;
@@ -5881,7 +5881,7 @@ impl TaskAgentExecutor {
                     .context("reviewer task continuation authorization is no longer active")?;
                     let cli_binding = processor
                         .crud_store
-                        .get_cli_runtime_turn_binding(task_run_turn.turn_id.as_str())
+                        .get_cli_runtime_turn_binding_control(task_run_turn.turn_id.as_str())
                         .await?;
                     match (turn_settings.cli_runtime.as_ref(), cli_binding.as_ref()) {
                         (Some((runtime_id, runtime_kind)), Some(binding))
@@ -13330,6 +13330,113 @@ mod tests {
                 )
                 .await
                 .unwrap()
+        );
+        // Read several response identities together, mixing the durable legacy
+        // fallback with explicit artifact pins and an uncommitted delivery.
+        let modern_id = "html-modern-delivery";
+        let mut modern: pioneer_entity::task_delivery::ActiveModel = delivered.clone().into();
+        modern.id = Set(modern_id.into());
+        modern.delivery_key = Set(modern_id.into());
+        let mut partial_result = normalized.clone();
+        partial_result.artifacts.truncate(1);
+        modern.result_snapshot_json = Set(Some(serde_json::to_string(&partial_result).unwrap()));
+        modern.insert(&db).await.unwrap();
+        let modern_item = pioneer_protocol::task_delivery_result_item_id(modern_id);
+        let legacy_id = "html-legacy-delivery";
+        let mut legacy: pioneer_entity::task_delivery::ActiveModel = delivered.clone().into();
+        legacy.id = Set(legacy_id.into());
+        legacy.delivery_key = Set(legacy_id.into());
+        legacy.result_snapshot_json = Set(Some(serde_json::to_string(&legacy_result).unwrap()));
+        legacy.insert(&db).await.unwrap();
+        let legacy_item = pioneer_protocol::task_delivery_result_item_id(legacy_id);
+        for id in [&modern_item, &legacy_item] {
+            processor
+                .crud_store
+                .materialize_item_completed(
+                    ItemCompletedNotification {
+                        workspace_id: task.workspace_id.clone(),
+                        thread_id: parent.into(),
+                        turn_id: execution.run_id.clone(),
+                        item: pioneer_protocol::TurnItem::AgentMessage {
+                            id: id.clone(),
+                            text: "Delivered".into(),
+                            markdown: None,
+                            markdown_version: None,
+                            phase: pioneer_protocol::AgentMessagePhase::FinalAnswer,
+                        },
+                    },
+                    now.timestamp() + 3,
+                )
+                .await
+                .unwrap();
+        }
+        let pending_id = "html-pending-delivery";
+        let mut pending: pioneer_entity::task_delivery::ActiveModel = delivered.clone().into();
+        pending.id = Set(pending_id.into());
+        pending.delivery_key = Set(pending_id.into());
+        pending.status = Set("pending".into());
+        pending.delivered_turn_id = Set(None);
+        pending.insert(&db).await.unwrap();
+        let pending_item = pioneer_protocol::task_delivery_result_item_id(pending_id);
+        // No final response was committed for this identity.
+        let batch = processor
+            .html_publications_for_agent_responses(
+                &task.workspace_id,
+                parent,
+                &[
+                    (execution.run_id.clone(), modern_item.clone(), true),
+                    (execution.run_id.clone(), legacy_item.clone(), true),
+                    (execution.run_id.clone(), pending_item.clone(), false),
+                ],
+            )
+            .await
+            .unwrap();
+        let modern_html = &batch[&(execution.run_id.clone(), modern_item.clone())];
+        assert_eq!(modern_html.len(), 1);
+        assert_eq!(modern_html[0].artifact, sources[0].artifact);
+        assert_eq!(
+            batch[&(execution.run_id.clone(), legacy_item.clone())],
+            restored
+        );
+        assert!(
+            batch
+                .get(&(execution.run_id.clone(), pending_item.clone()))
+                .is_none_or(Vec::is_empty)
+        );
+        assert!(
+            processor
+                .html_publications_for_agent_response(
+                    &task.workspace_id,
+                    parent,
+                    &execution.run_id,
+                    &pending_item
+                )
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        // A different immutable version must not be substituted for a delivered pin.
+        let mut wrong_pin = partial_result;
+        wrong_pin.artifacts[0].version_id = Some("another-version".into());
+        let modern = pioneer_entity::task_delivery::Entity::find_by_id(modern_id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut modern: pioneer_entity::task_delivery::ActiveModel = modern.into();
+        modern.result_snapshot_json = Set(Some(serde_json::to_string(&wrong_pin).unwrap()));
+        modern.update(&db).await.unwrap();
+        assert!(
+            processor
+                .html_publications_for_agent_response(
+                    &task.workspace_id,
+                    parent,
+                    &execution.run_id,
+                    &modern_item
+                )
+                .await
+                .unwrap()
+                .is_empty()
         );
         let mut failed: pioneer_entity::task_delivery::ActiveModel = delivered.into();
         failed.error_snapshot_json = Set(Some(

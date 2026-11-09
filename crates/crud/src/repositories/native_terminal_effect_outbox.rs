@@ -1951,7 +1951,10 @@ pub async fn mark_failed(
     now: DateTimeWithTimeZone,
 ) -> Result<bool> {
     let change = db.work_signal("control.native_retry").changing();
-    let control_change = db.work_signal("gateway.control").changing();
+    let control_change = db
+        .work_signal("gateway.control")
+        .changing()
+        .with_keys(&[crate::GatewayControlWake::NativeRetention.key()]);
     let result = async {
         let code = bounded_chars(error_code, MAX_ERROR_CODE_CHARS);
         let message = bounded_chars(error_message, MAX_ERROR_MESSAGE_CHARS);

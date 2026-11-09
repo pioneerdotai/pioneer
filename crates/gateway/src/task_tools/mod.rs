@@ -5133,7 +5133,7 @@ pub(crate) async fn observed_terminal_task_outcomes(
     // of this logical turn; do not restrict it to the latest session generation.
     let Some(cli_binding) = processor
         .crud_store
-        .get_cli_runtime_turn_binding(&context.turn_id)
+        .get_cli_runtime_turn_binding_control(&context.turn_id)
         .await?
     else {
         return Ok(outcomes);

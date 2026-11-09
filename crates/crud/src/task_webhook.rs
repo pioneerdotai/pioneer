@@ -115,7 +115,10 @@ impl CrudStore {
         events: Vec<TaskEventPayload>,
         action: Option<crate::AgentCommitInput>,
     ) -> Result<Option<(String, Vec<AppendedTaskEvent>)>> {
-        let change = crate::task_events::TaskWorkChange::new(&self.connection);
+        let change = crate::task_events::TaskWorkChange::for_tasks(
+            &self.connection,
+            [expected_task.id.clone()],
+        );
         let result = async {
             let manual = action.is_some();
             anyhow::ensure!(
