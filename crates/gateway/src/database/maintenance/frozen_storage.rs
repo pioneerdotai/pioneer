@@ -841,17 +841,18 @@ mod tests {
         let db = store.database_connection();
         let mut wake = db.work_signal("maintenance.frozen").subscribe();
         wake.begin_pass(&db).await.unwrap();
+        let descriptor = FrozenHistoryRef {
+            format: 1,
+            manifest_id: "new-after-idle".into(),
+            messages: 0,
+            identity_sha256: hex::encode(Sha256::digest([])),
+        };
         store
-            .compaction_begin_frozen_history(
-                "ws",
-                "thread",
-                &FrozenHistoryRef {
-                    format: 1,
-                    manifest_id: "new-after-idle".into(),
-                    messages: 0,
-                    identity_sha256: hex::encode(Sha256::digest([])),
-                },
-            )
+            .compaction_begin_frozen_history("ws", "thread", &descriptor)
+            .await
+            .unwrap();
+        let _capture = store
+            .compaction_finish_frozen_history_held("ws", "thread", &descriptor)
             .await
             .unwrap();
         assert!(futures_util::FutureExt::now_or_never(wake.wait(None)).is_some());

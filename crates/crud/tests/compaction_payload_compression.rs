@@ -886,6 +886,10 @@ async fn portable_cli_mapping_preserves_sent_bytes_control_updates_and_upsert() 
         .activate_cli_runtime_turn_attempt("turn", "mapping-attempt", "native-control-1", None, at)
         .await
         .unwrap();
+    store
+        .register_cli_runtime_control_execution_segment("turn", "native", "native-control-1", at)
+        .await
+        .unwrap();
     binding.status = "running".into();
     binding.native_turn_id = Some("native-control-1".into());
     // Archival is post-Turn work. Keep the mapping binding active to exercise
@@ -1061,40 +1065,30 @@ async fn portable_cli_mapping_preserves_sent_bytes_control_updates_and_upsert() 
         .await
         .unwrap()
         .unwrap();
-    let goal = store
-        .set_cli_runtime_turn_native_goal_control_state(
-            "turn",
-            Some("active".into()),
-            Some("native-control-2".into()),
-            at,
-            Some(selected),
-            "fixture-owner",
-        )
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(goal.native_goal_status.as_deref(), Some("active"));
-    assert!(goal.input_mapping_json.is_empty());
-    assert!(goal.input_mapping_read_hold.is_none());
-    let selected = store
-        .cli_runtime_turn_terminal_control_guard_by_id("turn")
-        .await
-        .unwrap()
-        .unwrap();
-    let cleared = store
-        .set_cli_runtime_turn_native_goal_control_state(
-            "turn",
-            None,
-            None,
-            at,
-            Some(selected),
-            "fixture-owner",
-        )
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(cleared.native_goal_status, None);
-    assert!(cleared.input_mapping_json.is_empty());
+    // Archival requires a terminal Turn. A late Goal event must therefore
+    // be fenced out, even though its corrupt mapping is not loaded by control.
+    assert!(
+        store
+            .set_cli_runtime_turn_native_goal_control_state(
+                "turn",
+                Some("active".into()),
+                Some("native-control-2".into()),
+                at,
+                Some(selected),
+                "fixture-owner",
+            )
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        store
+            .get_cli_runtime_turn_binding_control("turn")
+            .await
+            .unwrap()
+            .unwrap(),
+        next_segment.0
+    );
     let metadata = store
         .get_cli_runtime_turn_binding_control("turn")
         .await
@@ -1663,7 +1657,8 @@ async fn portable_unavailable_history_pages_yield_and_revisit_without_blocking_o
     for _ in 0..2200 {
         progress.quantum(&store).await.unwrap();
     }
-    assert_eq!(scalar(&store, "SELECT count(*) n FROM task_run_conversation_snapshot WHERE history_json_payload_id IS NOT NULL").await, 132);
+    assert_eq!(scalar(&store, "SELECT count(*) n FROM task_run_conversation_snapshot WHERE history_json_payload_id IS NOT NULL").await, 1);
+    assert_eq!(scalar(&store, "SELECT count(*) n FROM task_run_conversation_snapshot WHERE frozen_manifest_id='unavailable' AND history_json_payload_id IS NULL").await, 131);
     assert_eq!(
         store
             .get_task_run_conversation_snapshot("run")

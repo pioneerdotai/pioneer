@@ -122,6 +122,50 @@ async fn control_owner_keeps_deadline_that_matures_between_portions() {
     )
     .await
     .unwrap();
+    // Persist invalid detached envelopes: dispatch rejects them locally,
+    // with no provider or runtime needed. Twelve raw claim quanta keep the
+    // real outbox runnable throughout the observations below.
+    let change = database
+        .work_signal("gateway.control")
+        .changing()
+        .with_keys(&[pioneer_crud::GatewayControlWake::Actions.key()]);
+    for batch in 0..12 {
+        agent_action::Entity::insert_many((0..32).map(|row| {
+            let id = format!("A{:020}", batch * 32 + row);
+            agent_action::ActiveModel {
+                id: Set(id.clone()),
+                execution_id: Set(owner.into()),
+                action_kind: Set("send_message".into()),
+                idempotency_key: Set(id),
+                request_fingerprint: Set("fixture".into()),
+                status: Set("committed".into()),
+                created_at: Set(at),
+                committed_at: Set(Some(at)),
+                response_json: Set(Some("{}".into())),
+            }
+        }))
+        .exec(&database)
+        .await
+        .unwrap();
+        outbox::Entity::insert_many((0..32).map(|row| outbox::ActiveModel {
+            id: Set(format!("O{:020}", batch * 32 + row)),
+            action_id: Set(format!("A{:020}", batch * 32 + row)),
+            owner_execution_id: Set(owner.into()),
+            payload_json: Set(r#"{"execution_mode":"detached_task","kind":"invalid"}"#.into()),
+            status: Set("pending".into()),
+            attempts: Set(0),
+            next_attempt_at: Set(None),
+            delivered_at: Set(None),
+            last_error: Set(None),
+            created_at: Set(at),
+        }))
+        .exec(&database)
+        .await
+        .unwrap();
+    }
+    // These fixture SQL writes stand in for the normal producer, whose
+    // commit invalidates the addressed outbox family.
+    change.completed(true);
     let target = "cutoff_deadline_target";
     materialize_cli_runtime_turn_with_text(&store, &workspace, target, target, "timeout").await;
     let now = now_timestamp_secs();
@@ -154,54 +198,11 @@ async fn control_owner_keeps_deadline_that_matures_between_portions() {
             now_timestamp_secs() < due,
             "the first timeout phase must precede the deadline"
         );
-        // Persist invalid detached envelopes: dispatch rejects them locally,
-        // with no provider or runtime needed. Twelve raw claim quanta keep the
-        // real outbox runnable throughout the observations below.
-        let change = database
-            .work_signal("gateway.control")
-            .changing()
-            .with_keys(&[pioneer_crud::GatewayControlWake::Actions.key()]);
-        for batch in 0..12 {
-            agent_action::Entity::insert_many((0..32).map(|row| {
-                let id = format!("A{:020}", batch * 32 + row);
-                agent_action::ActiveModel {
-                    id: Set(id.clone()),
-                    execution_id: Set(owner.into()),
-                    action_kind: Set("send_message".into()),
-                    idempotency_key: Set(id),
-                    request_fingerprint: Set("fixture".into()),
-                    status: Set("committed".into()),
-                    created_at: Set(at),
-                    committed_at: Set(Some(at)),
-                    response_json: Set(Some("{}".into())),
-                }
-            }))
-            .exec(&database)
-            .await
-            .unwrap();
-            outbox::Entity::insert_many((0..32).map(|row| outbox::ActiveModel {
-                id: Set(format!("O{:020}", batch * 32 + row)),
-                action_id: Set(format!("A{:020}", batch * 32 + row)),
-                owner_execution_id: Set(owner.into()),
-                payload_json: Set(r#"{"execution_mode":"detached_task","kind":"invalid"}"#.into()),
-                status: Set("pending".into()),
-                attempts: Set(0),
-                next_attempt_at: Set(None),
-                delivered_at: Set(None),
-                last_error: Set(None),
-                created_at: Set(at),
-            }))
-            .exec(&database)
-            .await
-            .unwrap();
-        }
-        // These fixture SQL writes stand in for the normal producer, whose
-        // commit invalidates the addressed outbox family.
-        change.completed(true);
         while now_timestamp_secs() <= due {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        // No producer writes or signal injection after release. Observe up to
+        // The startup round already dispatched one action quantum. No producer
+        // writes or signal injection after release. Observe up to
         // eight real quanta, keeping the existing phase barrier armed so the
         // backlog cannot drain before we inspect durable recovery.
         for quantum in 0..8u64 {
@@ -225,7 +226,7 @@ async fn control_owner_keeps_deadline_that_matures_between_portions() {
                     .count(&database)
                     .await
                     .unwrap(),
-                32 * (quantum + 1),
+                32 * (quantum + 2),
                 "a full claim quantum must be rejected as InvalidBinding without retry"
             );
             assert!(
