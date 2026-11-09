@@ -5085,6 +5085,8 @@ stderr_ring_lines = 73
             instance: "claude".into(),
             model: "claude-selected".into(),
             reasoning_effort: Some("high".into()),
+            context_window: None,
+            context_authority: None,
         };
         let update = GatewaySettingsUpdate {
             general: Some(GatewayGeneralSettingsUpdate {
@@ -5148,6 +5150,8 @@ stderr_ring_lines = 73
             instance: "codex".into(),
             model: "codex-selected".into(),
             reasoning_effort: Some("high".into()),
+            context_window: None,
+            context_authority: None,
         };
         runtimes.instances[0].compaction_model = Some(selected.clone());
         let update = GatewaySettingsUpdate {
@@ -5164,6 +5168,8 @@ stderr_ring_lines = 73
             instance: "claude".into(),
             model: "other".into(),
             reasoning_effort: None,
+            context_window: None,
+            context_authority: None,
         });
         assert!(
             settings
