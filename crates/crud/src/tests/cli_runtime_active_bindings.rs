@@ -516,73 +516,184 @@ async fn commit_guard(
         .await
 }
 
+async fn commit_control_guard(
+    store: &CrudStore,
+    guard: &crate::CliRuntimeTurnTerminalGuard,
+) -> anyhow::Result<Option<crate::CliRuntimeTurnBindingRecord>> {
+    store
+        .terminalize_cli_runtime_turn_control_binding_guarded(
+            &guard.binding.turn_id,
+            "blocked",
+            CliRuntimeTurnAttemptStatus::Interrupted,
+            Some("old decision".into()),
+            unix_to_datetime(1_700_000_000),
+            Some(guard),
+        )
+        .await
+}
+
 #[tokio::test]
 async fn cli_terminal_guard_rejects_starting_activation_terminal_and_canonical_resume() {
-    for change in ["running", "terminal", "resume"] {
-        let (store, guard) = terminal_guard_fixture().await;
-        match change {
-            "running" => {
-                store
-                    .activate_cli_runtime_turn_attempt(
-                        &guard.binding.turn_id,
-                        &guard.attempt.as_ref().unwrap().id,
-                        "native_running",
-                        None,
-                        guard.binding.updated_at,
-                    )
-                    .await
-                    .unwrap();
-            }
-            "terminal" => {
-                store
-                    .terminalize_cli_runtime_turn_binding(
-                        &guard.binding.turn_id,
-                        "completed",
-                        CliRuntimeTurnAttemptStatus::Completed,
-                        None,
-                        guard.binding.updated_at,
-                    )
-                    .await
-                    .unwrap();
-            }
-            "resume" => {
-                store
-                    .update_turn_status(
-                        &guard.binding.thread_id,
-                        &guard.binding.turn_id,
-                        TurnStatus::InProgress,
-                        None,
-                        1_700_000_000,
-                    )
-                    .await
-                    .unwrap();
-            }
-            _ => unreachable!(),
-        }
-        let current = store
-            .get_cli_runtime_turn_binding(&guard.binding.turn_id)
-            .await
-            .unwrap();
-        let attempt = store
-            .latest_cli_runtime_turn_attempt(&guard.binding.turn_id)
-            .await
-            .unwrap();
-        assert!(commit_guard(&store, &guard).await.unwrap().is_none());
-        assert_eq!(
+    for control_only in [false, true] {
+        for change in ["running", "terminal", "resume"] {
+            let (store, logical_guard) = terminal_guard_fixture().await;
             store
+                .database_connection()
+                .execute_unprepared("PRAGMA foreign_keys=OFF")
+                .await
+                .unwrap();
+            let guard = if control_only {
+                store
+                    .cli_runtime_turn_terminal_control_guard(&logical_guard.binding)
+                    .await
+                    .unwrap()
+                    .unwrap()
+            } else {
+                logical_guard
+            };
+            match change {
+                "running" => {
+                    store
+                        .activate_cli_runtime_turn_attempt(
+                            &guard.binding.turn_id,
+                            &guard.attempt.as_ref().unwrap().id,
+                            "native_running",
+                            None,
+                            guard.binding.updated_at,
+                        )
+                        .await
+                        .unwrap();
+                }
+                "terminal" => {
+                    store
+                        .terminalize_cli_runtime_turn_binding(
+                            &guard.binding.turn_id,
+                            "completed",
+                            CliRuntimeTurnAttemptStatus::Completed,
+                            None,
+                            guard.binding.updated_at,
+                        )
+                        .await
+                        .unwrap();
+                }
+                "resume" => {
+                    store
+                        .update_turn_status(
+                            &guard.binding.thread_id,
+                            &guard.binding.turn_id,
+                            TurnStatus::InProgress,
+                            None,
+                            1_700_000_000,
+                        )
+                        .await
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let current = store
                 .get_cli_runtime_turn_binding(&guard.binding.turn_id)
                 .await
-                .unwrap(),
-            current
-        );
-        assert_eq!(
-            store
+                .unwrap();
+            let attempt = store
                 .latest_cli_runtime_turn_attempt(&guard.binding.turn_id)
                 .await
-                .unwrap(),
-            attempt
-        );
+                .unwrap();
+            let committed = if control_only {
+                commit_control_guard(&store, &guard).await.unwrap()
+            } else {
+                commit_guard(&store, &guard).await.unwrap()
+            };
+            assert!(committed.is_none());
+            assert_eq!(
+                store
+                    .get_cli_runtime_turn_binding(&guard.binding.turn_id)
+                    .await
+                    .unwrap(),
+                current
+            );
+            assert_eq!(
+                store
+                    .latest_cli_runtime_turn_attempt(&guard.binding.turn_id)
+                    .await
+                    .unwrap(),
+                attempt
+            );
+        }
     }
+}
+
+#[tokio::test]
+async fn cli_control_terminal_guard_fences_mapping_replacement_at_same_timestamp() {
+    let (store, logical_guard) = terminal_guard_fixture().await;
+    store
+        .database_connection()
+        .execute_unprepared("PRAGMA foreign_keys=OFF")
+        .await
+        .unwrap();
+    let selected = store
+        .cli_runtime_turn_terminal_control_guard(&logical_guard.binding)
+        .await
+        .unwrap()
+        .unwrap();
+    let replacement = r#"{"sent":"replacement context"}"#;
+    binding::Entity::update_many()
+        .col_expr(binding::Column::InputMappingJson, Expr::value(replacement))
+        .filter(binding::Column::TurnId.eq(&selected.binding.turn_id))
+        .exec(&store.database_connection())
+        .await
+        .unwrap();
+    let current = store
+        .cli_runtime_turn_terminal_control_guard_by_id(&selected.binding.turn_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.binding.updated_at, selected.binding.updated_at);
+    assert_ne!(current, selected);
+    assert!(
+        store
+            .cli_runtime_turn_terminal_control_guard(&selected.binding)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        commit_control_guard(&store, &selected)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        store
+            .latest_cli_runtime_turn_attempt(&selected.binding.turn_id)
+            .await
+            .unwrap(),
+        selected.attempt
+    );
+    let committed = commit_control_guard(&store, &current)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(committed.input_mapping_json.is_empty());
+    assert!(committed.input_mapping_read_hold.is_none());
+    assert_eq!(
+        store
+            .get_cli_runtime_turn_binding(&selected.binding.turn_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .input_mapping_json,
+        replacement
+    );
+    assert_eq!(committed.status, "blocked");
+    assert_eq!(
+        store
+            .latest_cli_runtime_turn_attempt(&selected.binding.turn_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        CliRuntimeTurnAttemptStatus::Interrupted
+    );
 }
 
 #[tokio::test]
@@ -1686,5 +1797,177 @@ async fn cli_stalled_task_blocked_commits_accepted_outcome_ack_atomically() {
             .has_pending_cli_runtime_terminal_event(&source.turn_id)
             .await
             .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn addressed_timeout_pages_keep_turn_scope_and_revisit_changes_behind_cursor() {
+    let store = test_store_with_zstd_turn_items().await;
+    store
+        .database_connection()
+        .execute_unprepared("PRAGMA foreign_keys=OFF")
+        .await
+        .unwrap();
+    let at = 1_700_000_000;
+    let thread = sample_thread("ws_addressed_control", "thread_addressed_control", at);
+    for turn_id in ["api_addressed", "other_addressed"] {
+        store
+            .materialize_turn_start(
+                &thread,
+                SandboxMode::FullAccess,
+                &sample_turn(turn_id),
+                &[],
+                pioneer_protocol::PersistedActorRef::System,
+            )
+            .await
+            .unwrap();
+    }
+    for (turn_id, item, started) in [
+        ("other_addressed", "foreign-first", at),
+        ("api_addressed", "a1", at + 1),
+        ("api_addressed", "a2", at + 2),
+        ("api_addressed", "a3", at + 3),
+    ] {
+        store
+            .materialize_item_started_with_attempt_deadlines(
+                ItemStartedNotification {
+                    workspace_id: thread.workspace_id.clone(),
+                    thread_id: thread.id.clone(),
+                    turn_id: turn_id.into(),
+                    item: safe_web_fetch_item(item),
+                },
+                started,
+                crate::TurnItemAttemptDeadlines {
+                    lease_expires_at_unix: Some(at + 4),
+                    idle_deadline_at_unix: Some(at + 4),
+                    hard_deadline_at_unix: Some(at + 4),
+                },
+            )
+            .await
+            .unwrap();
+    }
+    let database = store.database_connection();
+    let mut changes = database.work_signal("gateway.control").subscribe();
+    changes.begin_keyed_pass(&database).await.unwrap();
+    store
+        .observe_turn_runtime_activity("api_addressed", "provider/delta", at + 5)
+        .await
+        .unwrap();
+    assert_eq!(
+        changes.begin_keyed_pass(&database).await.unwrap(),
+        Some(vec![
+            crate::GatewayControlWake::Activity("api_addressed".into()).key()
+        ])
+    );
+    let (first, cursor) = store
+        .list_timeout_candidate_page_for_turn("api_addressed", at + 10, 2, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        first
+            .iter()
+            .map(|row| row.item_id.as_str())
+            .collect::<Vec<_>>(),
+        ["a1", "a2"]
+    );
+    assert!(first.iter().all(|row| row.turn_id == "api_addressed"));
+    let cursor = cursor.unwrap();
+    // A real committed event arrives behind the current page frontier.
+    store
+        .materialize_item_started_with_attempt_deadlines(
+            ItemStartedNotification {
+                workspace_id: thread.workspace_id.clone(),
+                thread_id: thread.id.clone(),
+                turn_id: "api_addressed".into(),
+                item: safe_web_fetch_item("behind"),
+            },
+            at - 1,
+            crate::TurnItemAttemptDeadlines {
+                lease_expires_at_unix: Some(at + 4),
+                idle_deadline_at_unix: Some(at + 4),
+                hard_deadline_at_unix: Some(at + 4),
+            },
+        )
+        .await
+        .unwrap();
+    let (tail, next) = store
+        .list_timeout_candidate_page_for_turn("api_addressed", at + 10, 2, Some(&cursor))
+        .await
+        .unwrap();
+    assert_eq!(
+        tail.iter()
+            .map(|row| row.item_id.as_str())
+            .collect::<Vec<_>>(),
+        ["a3"]
+    );
+    assert!(next.is_none());
+    assert_eq!(
+        changes.begin_keyed_pass(&database).await.unwrap(),
+        Some(vec![
+            crate::GatewayControlWake::Activity("api_addressed".into()).key()
+        ])
+    );
+    let (restarted, _) = store
+        .list_timeout_candidate_page_for_turn("api_addressed", at + 10, 2, None)
+        .await
+        .unwrap();
+    assert_eq!(restarted[0].item_id, "behind");
+    let upper = store
+        .running_turn_item_attempt_upper_id_by_type(TurnItemType::WebFetch)
+        .await
+        .unwrap()
+        .unwrap();
+    let (commands, _) = store
+        .list_running_turn_item_attempt_page_by_type_bounded_for_turn(
+            "api_addressed",
+            TurnItemType::WebFetch,
+            None,
+            &upper,
+            2,
+        )
+        .await
+        .unwrap();
+    assert_eq!(commands.len(), 2);
+    assert!(commands.iter().all(|row| row.turn_id == "api_addressed"));
+}
+
+#[tokio::test]
+async fn native_ack_replay_keeps_control_quiet_and_reinsert_wakes_its_turn() {
+    let (store, source, event) = native_delivery_fixture().await;
+    let database = store.database_connection();
+    let mut changes = database.work_signal("gateway.control").subscribe();
+    changes.begin_keyed_pass(&database).await.unwrap();
+    let first = store
+        .append_cli_runtime_native_event_if_absent(event.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        changes.begin_keyed_pass(&database).await.unwrap(),
+        Some(vec![
+            crate::GatewayControlWake::Activity(source.turn_id.clone()).key()
+        ])
+    );
+    let duplicate = store
+        .append_cli_runtime_native_event_if_absent(event.clone())
+        .await
+        .unwrap();
+    assert_eq!(duplicate, first);
+    assert_eq!(
+        changes.begin_keyed_pass(&database).await.unwrap(),
+        Some(Vec::new())
+    );
+    pioneer_entity::cli_runtime_native_event::Entity::delete_by_id(event.id.clone())
+        .exec(&database)
+        .await
+        .unwrap();
+    store
+        .append_cli_runtime_native_event_if_absent(event)
+        .await
+        .unwrap();
+    assert_eq!(
+        changes.begin_keyed_pass(&database).await.unwrap(),
+        Some(vec![
+            crate::GatewayControlWake::Activity(source.turn_id).key()
+        ])
     );
 }

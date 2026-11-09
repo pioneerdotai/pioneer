@@ -14,8 +14,8 @@ use sea_orm::sea_query::{
     Query, SelectStatement,
 };
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, DbBackend, EntityTrait, QueryFilter, QueryOrder, QuerySelect,
-    Statement, TransactionTrait,
+    ColumnTrait, Condition, ConnectionTrait, DbBackend, EntityTrait, QueryFilter, QueryOrder,
+    QuerySelect, Statement, TransactionTrait,
 };
 
 #[derive(Clone)]
@@ -205,7 +205,16 @@ fn scope_witness_guard(id: &str, row: &sea_orm::QueryResult) -> Result<SelectSta
 
 /// A consumer may reference arbitrarily many backing groups. The covering
 /// index seeks past the previous source, coalescing repeated spans per source.
-pub(super) async fn fanout_step(store: &CrudStore) -> Result<bool> {
+fn addressed_scope(targets: Option<&[String]>) -> Condition {
+    match targets {
+        Some(ids) => {
+            Condition::all().add(Expr::col(Alias::new("manifest_id")).is_in(ids.iter().cloned()))
+        }
+        None => Condition::all(),
+    }
+}
+
+pub(super) async fn fanout_step(store: &CrudStore, targets: Option<&[String]>) -> Result<bool> {
     // Explicit retained INTEGER PRIMARY KEY columns alias rowid, including
     // across VACUUM. Freeze an insertion frontier for each fair service round.
     let cursor = store
@@ -236,6 +245,7 @@ pub(super) async fn fanout_step(store: &CrudStore) -> Result<bool> {
             consumer::Column::AfterSource,
         ])
         .from(consumer::Entity)
+        .cond_where(addressed_scope(targets))
         .and_where(Expr::col(consumer::Column::Pending).eq(1))
         .and_where(Expr::col(consumer::Column::ConsumerRow).gt(after_row))
         .and_where(Expr::col(consumer::Column::ConsumerRow).lte(until_row))
@@ -255,6 +265,7 @@ pub(super) async fn fanout_step(store: &CrudStore) -> Result<bool> {
                         Alias::new("until_row"),
                     )
                     .from(consumer::Entity)
+                    .cond_where(addressed_scope(targets))
                     .to_owned(),
             )
             .await?
@@ -272,6 +283,7 @@ pub(super) async fn fanout_step(store: &CrudStore) -> Result<bool> {
                         consumer::Column::AfterSource,
                     ])
                     .from(consumer::Entity)
+                    .cond_where(addressed_scope(targets))
                     .and_where(Expr::col(consumer::Column::Pending).eq(1))
                     .and_where(Expr::col(consumer::Column::ConsumerRow).lte(until_row))
                     .order_by(consumer::Column::ConsumerRow, Order::Asc)
@@ -416,6 +428,8 @@ pub(super) async fn discover(
     active: &[(&str, i64)],
     kind: i64,
     round: &mut ServiceRound,
+    targets: Option<&[String]>,
+    retries_only: bool,
 ) -> Result<Admission> {
     if round.complete || (round.until_row > 0 && round.after_row >= round.until_row) {
         if !round.propagated {
@@ -430,6 +444,12 @@ pub(super) async fn discover(
     let mut due = Query::select();
     due.expr(Expr::val(1))
         .from(work::Entity)
+        .cond_where(addressed_scope(targets))
+        .cond_where(if retries_only {
+            Condition::all().add(work::Column::RetryAt.gt(0))
+        } else {
+            Condition::all()
+        })
         .and_where(Expr::col(work::Column::Pending).eq(1))
         .and_where(Expr::col(work::Column::Kind).eq(kind))
         .and_where(
@@ -455,11 +475,14 @@ pub(super) async fn discover(
             == 1,
         "unexpected sweep due table"
     );
-    due.sql = due.sql.replacen(
+    // Addressed IN seeks may use the existing manifest/kind unique key.
+    if targets.is_none() {
+        due.sql = due.sql.replacen(
         "FROM \"compaction_frozen_sweep_work\"",
         "FROM \"compaction_frozen_sweep_work\" INDEXED BY \"compaction_frozen_sweep_work_pending\"",
         1,
     );
+    }
     // No due non-active work means idle without walking future-retry pages.
     if store.connection.query_one_raw(due).await?.is_none() {
         round.complete = true;
@@ -476,6 +499,12 @@ pub(super) async fn discover(
                         Alias::new("until_row"),
                     )
                     .from(work::Entity)
+                    .cond_where(addressed_scope(targets))
+                    .cond_where(if retries_only {
+                        Condition::all().add(work::Column::RetryAt.gt(0))
+                    } else {
+                        Condition::all()
+                    })
                     .to_owned(),
             )
             .await?
@@ -499,6 +528,12 @@ pub(super) async fn discover(
             Alias::new("due"),
         )
         .from(work::Entity)
+        .cond_where(addressed_scope(targets))
+        .cond_where(if retries_only {
+            Condition::all().add(work::Column::RetryAt.gt(0))
+        } else {
+            Condition::all()
+        })
         .and_where(Expr::col(work::Column::Pending).eq(1))
         .and_where(Expr::col(work::Column::Kind).eq(kind))
         .and_where(Expr::col(work::Column::WorkRow).gt(round.after_row))
@@ -514,11 +549,14 @@ pub(super) async fn discover(
             == 1,
         "unexpected sweep service table"
     );
-    page.sql = page.sql.replacen(
+    // Addressed IN seeks may use the existing manifest/kind unique key.
+    if targets.is_none() {
+        page.sql = page.sql.replacen(
         "FROM \"compaction_frozen_sweep_work\"",
         "FROM \"compaction_frozen_sweep_work\" INDEXED BY \"compaction_frozen_sweep_work_service\"",
         1,
     );
+    }
     let rows = store.connection.query_all_raw(page).await?;
     if rows.is_empty() {
         round.after_row = round.until_row;

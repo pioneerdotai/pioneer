@@ -662,7 +662,7 @@ impl GatewayTurnMcpInvoker {
                 })?;
                 let turn_binding = self
                     .crud_store
-                    .get_cli_runtime_turn_binding(invocation.turn_id.as_str())
+                    .get_cli_runtime_turn_binding_control(invocation.turn_id.as_str())
                     .await
                     .map_err(|_| internal_error("failed to verify CLI MCP session binding"))?
                     .ok_or_else(|| {

@@ -3,14 +3,39 @@
 //! A subscription acknowledges changes *before* discovery, never after it.
 //! Consequently a commit during discovery remains visible to `wait`. This is
 //! only a scheduling hint; durable state and domain deadlines remain authoritative.
+use std::collections::BTreeMap;
 use tokio::sync::watch;
 
+const MAX_KEYS: usize = 256;
+const MAX_KEY_BYTES: usize = 1024;
+
+#[derive(Clone, Debug, Default)]
+struct Invalidation {
+    unknown: u64,
+    revision: u64,
+    full_revision: u64,
+    keys: BTreeMap<String, u64>,
+}
+impl Invalidation {
+    fn advance(&mut self) {
+        self.revision = self
+            .revision
+            .checked_add(1)
+            .expect("work revision exhausted");
+    }
+    fn full(&mut self) {
+        self.advance();
+        self.full_revision = self.revision;
+        self.keys.clear();
+    }
+}
+
 #[derive(Clone, Debug)]
-pub struct WorkSignal(watch::Sender<u64>);
+pub struct WorkSignal(watch::Sender<Invalidation>);
 
 impl Default for WorkSignal {
     fn default() -> Self {
-        Self(watch::channel(0).0)
+        Self(watch::channel(Invalidation::default()).0)
     }
 }
 
@@ -22,7 +47,28 @@ impl WorkSignal {
 
     /// Call after the relevant durable transition has released DB capacity.
     pub fn notify(&self) {
-        self.0.send_modify(|_| {});
+        self.0.send_modify(Invalidation::full);
+    }
+
+    /// Bounded hints, not work authority. Overflow requires finite rediscovery.
+    pub fn notify_keys(&self, keys: &[String]) {
+        if keys.is_empty() {
+            return;
+        }
+        self.0.send_modify(|state| {
+            state.advance();
+            for key in keys {
+                if key.len() > MAX_KEY_BYTES {
+                    state.full();
+                    return;
+                }
+                state.keys.insert(key.clone(), state.revision);
+                if state.keys.len() > MAX_KEYS {
+                    state.full();
+                    return;
+                }
+            }
+        });
     }
 
     /// Every independent consumer owns its own subscription.
@@ -30,26 +76,44 @@ impl WorkSignal {
         WorkSubscription {
             receiver: self.0.subscribe(),
             settled: 0,
+            observed: None,
         }
     }
 
     /// Create before dispatching a relevant mutation. Explicit completion is
     /// required even for a known rollback/no-change; cancellation is unknown.
     pub fn changing(&self) -> WorkChange {
-        WorkChange(Some(self.clone()))
+        WorkChange(Some(self.clone()), None)
     }
 }
 
-pub struct WorkChange(Option<WorkSignal>);
+pub struct WorkChange(Option<WorkSignal>, Option<Vec<String>>);
 
 impl WorkChange {
+    /// Retain exact domain hints before dispatch. An uncertain outcome still
+    /// publishes UNKNOWN and settles the writer; hints never replace authority.
+    pub fn with_keys(mut self, keys: &[String]) -> Self {
+        self.1 = Some(keys.to_vec());
+        self
+    }
+
     /// The operation has finished and released its DB resources. `changed`
     /// distinguishes useful invalidation from ACK/no-change self-wakes.
     pub fn completed(mut self, changed: bool) {
         if let Some(signal) = self.0.take() {
             if changed {
-                signal.notify();
+                if let Some(keys) = self.1.take() {
+                    signal.notify_keys(&keys);
+                } else {
+                    signal.notify();
+                }
             }
+        }
+    }
+    /// Known exact keys after the commit and release of database resources.
+    pub fn completed_keys(mut self, keys: &[String]) {
+        if let Some(signal) = self.0.take() {
+            signal.notify_keys(keys);
         }
     }
 }
@@ -57,18 +121,21 @@ impl WorkChange {
 impl Drop for WorkChange {
     fn drop(&mut self) {
         if let Some(signal) = self.0.take() {
-            signal.0.send_modify(|unknown| {
-                *unknown = unknown
+            signal.0.send_modify(|state| {
+                state.unknown = state
+                    .unknown
                     .checked_add(1)
                     .expect("work uncertainty epoch exhausted");
+                state.full();
             });
         }
     }
 }
 
 pub struct WorkSubscription {
-    receiver: watch::Receiver<u64>,
+    receiver: watch::Receiver<Invalidation>,
     settled: u64,
+    observed: Option<u64>,
 }
 
 impl WorkSubscription {
@@ -78,14 +145,42 @@ impl WorkSubscription {
         &mut self,
         database: &crate::SqliteDatabase,
     ) -> Result<(), sea_orm::DbErr> {
-        let unknown = *self.receiver.borrow_and_update();
+        let (unknown, revision) = {
+            let state = self.receiver.borrow_and_update();
+            (state.unknown, state.revision)
+        };
         if unknown != self.settled {
-            // Only ambiguous dispatches need a writer fence. Reader discovery
-            // could otherwise run before the cancelled SQLx command commits.
             database.settle_dispatched_writes().await?;
             self.settled = unknown;
         }
+        self.observed = Some(revision);
         Ok(())
+    }
+
+    /// None requires full discovery (startup, unknown outcome, unscoped change,
+    /// or bounded hint overflow). Each subscription has its own revision frontier.
+    pub async fn begin_keyed_pass(
+        &mut self,
+        database: &crate::SqliteDatabase,
+    ) -> Result<Option<Vec<String>>, sea_orm::DbErr> {
+        let state = self.receiver.borrow_and_update().clone();
+        if state.unknown != self.settled {
+            database.settle_dispatched_writes().await?;
+            self.settled = state.unknown;
+        }
+        let keys = self
+            .observed
+            .filter(|seen| state.full_revision <= *seen)
+            .map(|seen| {
+                state
+                    .keys
+                    .iter()
+                    .filter(|(_, revision)| **revision > seen)
+                    .map(|(key, _)| key.clone())
+                    .collect()
+            });
+        self.observed = Some(state.revision);
+        Ok(keys)
     }
 
     pub async fn changed(&mut self) {
@@ -132,6 +227,7 @@ pub async fn wait_for_unix_deadline(deadline: i64) {
 
 #[cfg(test)]
 mod tests {
+    use super::{MAX_KEY_BYTES, MAX_KEYS};
     use futures_util::FutureExt;
     use sea_orm::{ConnectionTrait, Database, DbBackend, Statement};
 
@@ -144,6 +240,61 @@ mod tests {
     // Existing heartbeat/recovery tests cover their own Notify protocols. They
     // do not protect independent subscriptions or a watch invalidation retained
     // across discovery, so this matrix belongs at the shared mechanism boundary.
+    #[tokio::test]
+    async fn keyed_frontiers_are_independent_bounded_and_keep_concurrent_changes() {
+        let database = database().await;
+        let signal = database.work_signal("test.keyed");
+        let mut first = signal.subscribe();
+        let mut second = signal.subscribe();
+        assert!(first.begin_keyed_pass(&database).await.unwrap().is_none());
+        assert!(second.begin_keyed_pass(&database).await.unwrap().is_none());
+        signal
+            .changing()
+            .with_keys(&["a".into(), "b".into()])
+            .completed(true);
+        assert_eq!(
+            first.begin_keyed_pass(&database).await.unwrap(),
+            Some(vec!["a".into(), "b".into()])
+        );
+        // The second subscriber has not acknowledged A/B. A reappears behind
+        // the first subscriber's cursor while it processes its finite batch.
+        signal.changing().completed_keys(&["a".into(), "c".into()]);
+        assert!(first.wait(None).now_or_never().is_some());
+        assert_eq!(
+            first.begin_keyed_pass(&database).await.unwrap(),
+            Some(vec!["a".into(), "c".into()])
+        );
+        assert_eq!(
+            second.begin_keyed_pass(&database).await.unwrap(),
+            Some(vec!["a".into(), "b".into(), "c".into()])
+        );
+        assert_eq!(
+            first.begin_keyed_pass(&database).await.unwrap(),
+            Some(vec![])
+        );
+        assert!(first.wait(None).now_or_never().is_none());
+        signal.notify_keys(
+            &(0..=MAX_KEYS)
+                .map(|n| format!("key-{n}"))
+                .collect::<Vec<_>>(),
+        );
+        assert!(first.begin_keyed_pass(&database).await.unwrap().is_none());
+        assert!(second.begin_keyed_pass(&database).await.unwrap().is_none());
+        signal.notify();
+        signal.notify_keys(&["after-full".into()]);
+        assert!(first.begin_keyed_pass(&database).await.unwrap().is_none());
+        signal
+            .changing()
+            .with_keys(&["quiet".into()])
+            .completed(false);
+        assert!(first.wait(None).now_or_never().is_none());
+        drop(signal.changing().with_keys(&["cancelled-source".into()]));
+        assert!(first.begin_keyed_pass(&database).await.unwrap().is_none());
+        signal.notify_keys(&["x".repeat(MAX_KEY_BYTES + 1)]);
+        assert!(first.begin_keyed_pass(&database).await.unwrap().is_none());
+        database.close().await.unwrap();
+    }
+
     #[tokio::test]
     async fn independent_consumers_retain_bursts_and_discovery_races() {
         let database = database().await;

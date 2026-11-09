@@ -2411,7 +2411,7 @@ async fn ensure_root_agent_action_binding(
     }
     let cli_binding = processor
         .crud_store
-        .get_cli_runtime_turn_binding(context.turn_id.as_str())
+        .get_cli_runtime_turn_binding_control(context.turn_id.as_str())
         .await?;
     let runtime = processor
         .crud_store

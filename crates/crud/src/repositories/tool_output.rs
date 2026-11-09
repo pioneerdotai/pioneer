@@ -68,17 +68,17 @@ pub(crate) async fn record_tool_output(
                         .is_some(),
                     "tool output workspace mismatch"
                 );
-                ensure!(
-                    turn::Entity::find_by_id(&n.turn_id)
-                        .filter(turn::Column::ThreadId.eq(&n.thread_id))
-                        .select_only()
-                        .column(turn::Column::Id)
-                        .into_tuple::<String>()
-                        .one(&tx)
-                        .await?
-                        .is_some(),
-                    "tool output turn mismatch"
-                );
+                let turn_status = turn::Entity::find_by_id(&n.turn_id)
+                    .filter(turn::Column::ThreadId.eq(&n.thread_id))
+                    .select_only()
+                    .column(turn::Column::Status)
+                    .into_tuple::<String>()
+                    .one(&tx)
+                    .await?;
+                ensure!(turn_status.is_some(), "tool output turn mismatch");
+                let terminal = turn_status.as_deref().is_some_and(|status| {
+                    matches!(status, "completed" | "failed" | "interrupted" | "blocked")
+                });
                 let inserted;
                 if let Some(actual) = tool_output_chunk::Entity::find()
                     .select_only()
@@ -100,12 +100,14 @@ pub(crate) async fn record_tool_output(
                     inserted = true;
                 }
                 tx.commit().await?;
-                Ok(inserted)
+                Ok((inserted, terminal))
             }
         })
         .await;
-    if let Ok(inserted) = &result {
-        change.completed(*inserted);
+    if let Ok((inserted, terminal)) = &result {
+        // Active output stays inline. Its Turn's terminal commit wakes the
+        // archive owner; late output for an already terminal Turn wakes here.
+        change.completed(*inserted && *terminal);
     }
     result.map(|_| ())
 }

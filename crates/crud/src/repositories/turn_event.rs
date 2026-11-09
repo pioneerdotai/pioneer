@@ -305,6 +305,26 @@ pub async fn find_event_by_id<C: ConnectionTrait>(
         .transpose()
 }
 
+/// Read finite rows after the claim commit. The caller decodes each body
+/// independently so one corrupt legacy body cannot suppress healthy deliveries.
+pub async fn find_event_models_by_ids<C: ConnectionTrait>(
+    db: &C,
+    ids: &[String],
+) -> Result<Vec<turn_event::Model>> {
+    anyhow::ensure!(
+        ids.len() <= super::turn_event_delivery::DELIVERY_BATCH_LIMIT,
+        "event body batch exceeds bound"
+    );
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    turn_event::Entity::find()
+        .filter(turn_event::Column::Id.is_in(ids.iter().cloned()))
+        .all(db)
+        .await
+        .context("failed to read delivery event batch")
+}
+
 /// Repairs a legacy final agent-diff snapshot whose denormalized thread owner
 /// came from the reusable CLI session instead of the Turn binding. The raw
 /// event column, canonical payload, and payload-derived idempotency key must

@@ -80,7 +80,7 @@ pub(crate) async fn persist_cli_runtime_turn_binding_before_native_start(
 ) -> Result<CliRuntimeTurnBindingRecord> {
     validate_start_request(&request)?;
     let existing = store
-        .get_cli_runtime_turn_binding(request.turn_id.as_str())
+        .get_cli_runtime_turn_binding_control(request.turn_id.as_str())
         .await
         .with_context(|| {
             format!(
@@ -155,7 +155,7 @@ async fn persist_cli_runtime_turn_binding_after_native_start_with_owner(
 ) -> Result<CliRuntimeTurnBindingRecord> {
     validate_native_turn_started(&native_turn)?;
     let Some(_existing) = store
-        .get_cli_runtime_turn_binding(native_turn.turn_id.as_str())
+        .get_cli_runtime_turn_binding_control(native_turn.turn_id.as_str())
         .await
         .with_context(|| {
             format!(

@@ -317,13 +317,11 @@ impl SqliteReadPool {
         let mut operation = SqliteReadOperation::start(self.observer.clone(), class);
         let result = async {
             let permit = self.acquire(class).await?;
-            let transaction = observe_control(
-                self.connection
-                    .begin_with_config(None, Some(AccessMode::ReadOnly)),
-                "begin",
-            )
-            .in_pool(reader_pool_context(class))
-            .await?;
+            // Read-only access belongs to the physical reader connection and
+            // this wrapper's guards. SQLite ignores transaction AccessMode.
+            let transaction = observe_control(self.connection.begin(), "begin")
+                .in_pool(reader_pool_context(class))
+                .await?;
             Ok((transaction, permit))
         }
         .await;

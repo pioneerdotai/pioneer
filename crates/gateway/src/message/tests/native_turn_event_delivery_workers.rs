@@ -881,3 +881,86 @@ async fn empty_delivery_owners_and_projection_cycles_do_not_repeat_deadline_quer
     let _ = worker.await;
     processor.shutdown_resilience_workers().await;
 }
+
+#[tokio::test]
+async fn ready_batch_settlement_does_not_wait_for_a_slow_sibling_turn() {
+    let (processor, store, workspace) = fixture().await;
+    let ingestor = Arc::new(BlockingIngestor::default());
+    processor
+        .set_thread_episodic_ingestor_for_test(ingestor.clone())
+        .await;
+    commit(&store, &workspace, "batch-original").await;
+    materialize_thread_episodic_ingest_turn(
+        &store,
+        &workspace,
+        "batch-other-thread",
+        "batch-other-turn",
+    )
+    .await;
+    store
+        .materialize_native_agent_turn_event(
+            pioneer_crud::CanonicalTurnEventPayload::ItemCompleted(ItemCompletedNotification {
+                workspace_id: workspace.clone(),
+                thread_id: "batch-other-thread".into(),
+                turn_id: "batch-other-turn".into(),
+                item: TurnItem::AgentMessage {
+                    id: "batch-other".into(),
+                    text: "other".into(),
+                    phase: pioneer_protocol::AgentMessagePhase::FinalAnswer,
+                    markdown: None,
+                    markdown_version: None,
+                },
+            }),
+            now_timestamp_secs(),
+            None,
+        )
+        .await
+        .unwrap();
+    processor.kick_native_turn_event_deliveries();
+    timeout(Duration::from_secs(2), ingestor.entered.notified())
+        .await
+        .unwrap();
+    // One effect is blocked on an explicit gate. The other turn's durable ACK
+    // must arrive before that gate opens, without a new commit or kick.
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let calls = ingestor.calls.lock().await.clone();
+            if calls.len() == 2 {
+                let turn = if calls[1] == "batch-original" {
+                    TURN
+                } else {
+                    "batch-other-turn"
+                };
+                let row = Entity::find()
+                    .filter(Column::Consumer.eq(EPISODIC))
+                    .filter(Column::TurnId.eq(turn))
+                    .one(&store.database_connection())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if row.status == "delivered" {
+                    break;
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let blocked_turn = if ingestor.calls.lock().await[0] == "batch-original" {
+        TURN
+    } else {
+        "batch-other-turn"
+    };
+    let blocked = Entity::find()
+        .filter(Column::Consumer.eq(EPISODIC))
+        .filter(Column::TurnId.eq(blocked_turn))
+        .one(&store.database_connection())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(blocked.status, "delivering");
+    ingestor.release.notify_one();
+    idle(&processor).await;
+    processor.shutdown_resilience_workers().await;
+}

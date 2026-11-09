@@ -172,3 +172,40 @@ fn active_model_from_new_turn(turn: NewTaskRunTurn) -> Result<task_run_turn::Act
         completed_at: Set(turn.completed_at.map(unix_to_datetime)),
     })
 }
+
+pub(crate) async fn find_turns_by_sources<C: ConnectionTrait>(
+    db: &C,
+    workspace: &str,
+    sources: &[(String, String)],
+) -> Result<Vec<task_run_turn::Model>> {
+    use pioneer_entity::thread;
+    use sea_orm::{Condition, QueryTrait};
+    let mut rows = Vec::new();
+    for sources in sources.chunks(64) {
+        let mut exact = Condition::any();
+        for (thread, turn) in sources {
+            exact = exact.add(
+                Condition::all()
+                    .add(task_run_turn::Column::ThreadId.eq(thread.clone()))
+                    .add(task_run_turn::Column::TurnId.eq(turn.clone())),
+            );
+        }
+        rows.extend(
+            task_run_turn::Entity::find()
+                .filter(exact)
+                .filter(
+                    task_run_turn::Column::ThreadId.in_subquery(
+                        thread::Entity::find()
+                            .select_only()
+                            .column(thread::Column::Id)
+                            .filter(thread::Column::WorkspaceId.eq(workspace))
+                            .into_query(),
+                    ),
+                )
+                .all(db)
+                .await
+                .context("failed to load exact execution sources")?,
+        );
+    }
+    Ok(rows)
+}
