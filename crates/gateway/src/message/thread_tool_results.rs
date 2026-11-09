@@ -52,38 +52,33 @@ fn result_delivery_page(
     let measure = |response| -> Result<_> {
         let (response, encoded) = result_delivery_encoding(response, protection)?;
         let value = serde_json::from_str(&encoded)?;
-        let projection = pioneer_tools::thread_read_page_bytes(&value);
-        Ok((
-            response,
-            TextSize::of(&encoded),
-            projection.saturating_sub(encoded.len()),
-        ))
+        Ok((response, pioneer_tools::thread_read_page_size(&value)))
     };
     let finish = |mut response: ThreadToolResultReadResponse, end: usize| -> Result<_> {
         response.text = text[..end].into();
-        let encoded = serde_json::to_string(&serde_json::to_value(&response)?)?;
+        let value = serde_json::to_value(&response)?;
+        let size = pioneer_tools::thread_read_page_size(&value);
         ensure!(
-            encoded.len() <= max_bytes
-                && pioneer_compaction::text_tokens(&encoded) <= max_tokens
-                && pioneer_tools::thread_read_page_fits(&serde_json::from_str(&encoded)?),
+            size.bytes <= max_bytes
+                && size.tokens() <= max_tokens
+                && pioneer_tools::thread_read_page_fits(&value),
             "result page does not fit its delivery budget"
         );
         Ok(response)
     };
     if text.len() <= max_bytes {
         let count = text.chars().count() as u64;
-        let (response, frame, overhead) = measure(make(count, true)?)?;
+        let (response, frame) = measure(make(count, true)?)?;
         let size = frame.saturating_add(json_string_content_size(text));
         if size.bytes <= max_bytes
             && size.tokens() <= max_tokens
-            && size.bytes.saturating_add(overhead) <= pioneer_protocol::TOOL_RESPONSE_MAX_BYTES
+            && size.bytes <= pioneer_protocol::TOOL_RESPONSE_MAX_BYTES
         {
             return finish(response, text.len());
         }
     }
-    let (_, frame, overhead) = measure(make(max_bytes as u64, false)?)?;
-    let byte_limit =
-        max_bytes.min(pioneer_protocol::TOOL_RESPONSE_MAX_BYTES.saturating_sub(overhead));
+    let (_, frame) = measure(make(max_bytes as u64, false)?)?;
+    let byte_limit = max_bytes.min(pioneer_protocol::TOOL_RESPONSE_MAX_BYTES);
     let mut content = TextSize::default();
     let mut count = 0u64;
     let mut end = 0;
@@ -102,7 +97,7 @@ fn result_delivery_page(
         end = next_end;
     }
     ensure!(end > 0, "result page cannot make progress within budget");
-    let (response, _, _) = measure(make(count, false)?)?;
+    let (response, _) = measure(make(count, false)?)?;
     finish(response, end)
 }
 
@@ -187,10 +182,10 @@ impl MessageProcessor {
         let mut text = fragment.text;
         let version = fragment.reference.version;
         let mut more = fragment.next_character;
-        let max_tokens = params.max_tokens.unwrap_or(u64::MAX);
+        let max_tokens = params.max_tokens.unwrap_or(pioneer_compaction::PAGE_TOKENS);
         let max_bytes = params
             .max_bytes
-            .unwrap_or(pioneer_protocol::TOOL_RESPONSE_MAX_BYTES as u64)
+            .unwrap_or(pioneer_compaction::PAGE_BYTES as u64)
             .min(pioneer_protocol::TOOL_RESPONSE_MAX_BYTES as u64) as usize;
         let mut text_size = pioneer_compaction::estimator::json_string_content_size(&text);
         while let Some(next_offset) = more {
@@ -203,13 +198,10 @@ impl MessageProcessor {
                 eof: false,
             };
             let (_, encoded) = result_delivery_encoding(probe, protection)?;
-            let frame = pioneer_compaction::estimator::TextSize::of(&encoded);
+            let frame = pioneer_tools::thread_read_page_size(&serde_json::from_str(&encoded)?);
             let size = frame.saturating_add(text_size);
-            let projection =
-                pioneer_tools::thread_read_page_bytes(&serde_json::from_str(&encoded)?);
             if size.bytes >= max_bytes
-                || projection.saturating_add(text_size.bytes)
-                    >= pioneer_protocol::TOOL_RESPONSE_MAX_BYTES
+                || size.bytes >= pioneer_protocol::TOOL_RESPONSE_MAX_BYTES
                 || size.tokens() >= max_tokens
             {
                 break;
@@ -232,10 +224,10 @@ impl MessageProcessor {
             text.push_str(&next.text);
             more = next.next_character;
         }
-        let max_tokens = params.max_tokens.unwrap_or(u64::MAX);
+        let max_tokens = params.max_tokens.unwrap_or(pioneer_compaction::PAGE_TOKENS);
         let max_bytes = params
             .max_bytes
-            .unwrap_or(pioneer_protocol::TOOL_RESPONSE_MAX_BYTES as u64)
+            .unwrap_or(pioneer_compaction::PAGE_BYTES as u64)
             .min(pioneer_protocol::TOOL_RESPONSE_MAX_BYTES as u64) as usize;
         result_delivery_page(
             &text,
@@ -325,8 +317,8 @@ impl MessageProcessor {
             }
             let mut source = target.clone();
             source.cursor = None;
-            source.max_bytes = Some(32768);
-            source.max_tokens = Some(4096);
+            source.max_bytes = Some(pioneer_compaction::PAGE_BYTES as u64);
+            source.max_tokens = Some(pioneer_compaction::PAGE_TOKENS);
             let mut encoded = String::new();
             loop {
                 let page = self.read_thread_tool_result(source.clone()).await?;
@@ -583,10 +575,10 @@ impl MessageProcessor {
             .nth(usize::try_from(offset)?)
             .map_or(text.len(), |(byte, _)| byte);
         let remaining = &text[start..];
-        let max_tokens = params.max_tokens.unwrap_or(u64::MAX);
+        let max_tokens = params.max_tokens.unwrap_or(pioneer_compaction::PAGE_TOKENS);
         let max_bytes = params
             .max_bytes
-            .unwrap_or(pioneer_protocol::TOOL_RESPONSE_MAX_BYTES as u64)
+            .unwrap_or(pioneer_compaction::PAGE_BYTES as u64)
             .min(pioneer_protocol::TOOL_RESPONSE_MAX_BYTES as u64) as usize;
         result_delivery_page(
             remaining,
@@ -659,10 +651,10 @@ impl MessageProcessor {
             .nth(usize::try_from(offset)?)
             .map_or(text.len(), |(byte, _)| byte);
         let remainder = &text[start..];
-        let max_tokens = params.max_tokens.unwrap_or(u64::MAX);
+        let max_tokens = params.max_tokens.unwrap_or(pioneer_compaction::PAGE_TOKENS);
         let max_bytes = params
             .max_bytes
-            .unwrap_or(pioneer_protocol::TOOL_RESPONSE_MAX_BYTES as u64)
+            .unwrap_or(pioneer_compaction::PAGE_BYTES as u64)
             .min(pioneer_protocol::TOOL_RESPONSE_MAX_BYTES as u64) as usize;
         result_delivery_page(
             remainder,
@@ -750,8 +742,10 @@ impl ToolHandler for ResultReadHandler {
             params.turn_id,
             params.item_id,
             params.output_log,
-            params.max_tokens,
-            params.max_bytes
+            params.max_tokens.unwrap_or(pioneer_compaction::PAGE_TOKENS),
+            params
+                .max_bytes
+                .unwrap_or(pioneer_compaction::PAGE_BYTES as u64)
         ])
         .to_string();
         if let Some(cursor) = &params.cursor {
@@ -878,7 +872,7 @@ pub(crate) fn thread_result_tool_specs() -> Vec<ConfiguredToolSpec> {
                 "workspace_id":{"type":"string"},"thread_id":{"type":"string"},"turn_id":{"type":"string"},"item_id":{"type":"string"},
                 "output_log":{"type":"boolean","default":false},
                 "cursor":{"type":"object","properties":{"version":{"type":"string"},"offset":{"type":"integer","minimum":0}},"required":["version","offset"]},
-                "max_tokens":{"type":"integer","minimum":1,"description":"Optional estimated token budget for the complete returned JSON, including the protected cursor; omitted means no token ceiling."},"max_bytes":{"type":"integer","minimum":1,"description":"Optional caller page budget; the complete page always fits Pioneer’s 2 MiB response projection."}},
+                "max_tokens":{"type":"integer","minimum":1,"default":pioneer_compaction::PAGE_TOKENS,"description":"Optional estimated token budget for the complete returned JSON, including the protected cursor; omitted defaults to 4096 estimated tokens."},"max_bytes":{"type":"integer","minimum":1,"default":pioneer_compaction::PAGE_BYTES,"description":"Optional caller page budget (default 32768 bytes), including JSON and protected cursor; the complete page always fits Pioneer’s 2 MiB response projection."}},
                 "required":["workspace_id","thread_id","turn_id","item_id"],"additionalProperties":false}),
         PayloadKind::Function,
     );
@@ -955,8 +949,8 @@ mod estimation_tests {
         for _ in 0..100 {
             let page = result_delivery_page(
                 remaining,
-                100,
-                400,
+                300,
+                1200,
                 Some(ResultCursorProtection {
                     codec: &codec,
                     scope: "fixture",
@@ -974,7 +968,7 @@ mod estimation_tests {
             )
             .unwrap();
             let encoded = serde_json::to_string(&serde_json::to_value(&page).unwrap()).unwrap();
-            assert!(encoded.len() <= 400 && pioneer_compaction::text_tokens(&encoded) <= 100);
+            assert!(encoded.len() <= 1200 && pioneer_compaction::text_tokens(&encoded) <= 300);
             rebuilt.push_str(&page.text);
             offset += page.text.chars().count() as u64;
             remaining = &remaining[page.text.len()..];

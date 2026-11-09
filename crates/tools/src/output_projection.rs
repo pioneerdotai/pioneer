@@ -621,19 +621,43 @@ fn project_read_file(input: ToolProjectionInput<'_>) -> ToolResultEnvelope {
 }
 
 fn read_file_llm_view(input: &ToolProjectionInput<'_>) -> ToolResultView {
-    let raw = input.raw_output_json;
     bounded_model_json(
         input,
-        serde_json::json!({
-            "path": raw.get("path").cloned().unwrap_or(JsonValue::Null),
-            "text": raw.get("text").or_else(|| raw.get("output")).cloned().unwrap_or_else(|| JsonValue::String(input.raw_output_text.to_owned())),
-            "start_line": raw.get("start_line").cloned().unwrap_or(JsonValue::Null),
-            "end_line": raw.get("end_line").cloned().unwrap_or(JsonValue::Null),
-            "truncated": raw.get("truncated").cloned().unwrap_or(JsonValue::Bool(false)),
-            "continuation": raw.get("continuation").cloned().unwrap_or(JsonValue::Null),
-            "next_line": raw.get("next_line").cloned().unwrap_or(JsonValue::Null),
-        }),
+        read_file_model_json(input.raw_output_json, input.raw_output_text),
     )
+}
+
+/// Shared by the producer budget check and model projection: pagination must
+/// account for precisely the JSON that enters the working tool message.
+pub(crate) fn read_file_model_json(raw: &JsonValue, fallback: &str) -> JsonValue {
+    let mut view = serde_json::Map::new();
+    for key in [
+        "path",
+        "start_line",
+        "end_line",
+        "start_byte",
+        "range",
+        "partial_line",
+        "truncated",
+        "continuation",
+        "next_line",
+    ] {
+        view.insert(key.into(), raw.get(key).cloned().unwrap_or(JsonValue::Null));
+    }
+    view.insert(
+        "truncated".into(),
+        raw.get("truncated")
+            .cloned()
+            .unwrap_or(JsonValue::Bool(false)),
+    );
+    view.insert(
+        "text".into(),
+        raw.get("text")
+            .or_else(|| raw.get("output"))
+            .cloned()
+            .unwrap_or_else(|| JsonValue::String(fallback.into())),
+    );
+    JsonValue::Object(view)
 }
 
 fn project_read_skill(input: ToolProjectionInput<'_>) -> ToolResultEnvelope {

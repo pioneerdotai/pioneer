@@ -226,6 +226,12 @@ pub(super) async fn forward_tool_event_to_agent(
                 && (value.get("session_id").is_some() || value.get("output_stats").is_some())
             {
                 let mut controls = serde_json::Map::new();
+                if completed.retained_output_log {
+                    controls.insert("retained_output_log".into(), true.into());
+                    if let Some(item) = &completed.retained_output_log_item {
+                        controls.insert("retained_output_log_item".into(), item.clone().into());
+                    }
+                }
                 for field in ["session_id", "output_stats", "command"] {
                     if let Some(value) = value.get(field) {
                         controls.insert(field.into(), value.clone());
@@ -329,6 +335,20 @@ pub(super) async fn forward_tool_event_to_agent(
                         },
                     })
                     .await?;
+            }
+
+            if failed.retained_output_log {
+                event_tx.publish_durable_and_wait(AgentDurableEvent::TurnLlmContextAppended {
+                    thread_id: thread_id.into(), turn_id: turn_id.into(),
+                    item_id: event.call_id.clone(), attempt_id: None, sequence: 0,
+                    source: "shell_control_v1".into(), tool_name: tool_name.clone(),
+                    payload: pioneer_protocol::ToolResultView::Json {
+                        value: serde_json::json!({"retained_output_log":true,
+                            "output_stats":{"full_output_available":false,"truncation_method":"retained_output_log"}}),
+                        truncated: false,
+                    },
+                    output_policy_snapshot: failed.output_policy.clone(),
+                }).await?;
             }
 
             let outcome = protocol_outcome_from_tool_outcome(&failed.outcome);
@@ -2048,81 +2068,109 @@ mod tests {
 
     #[tokio::test]
     async fn shell_control_receipt_is_acknowledged_before_terminal_item_without_output_bytes() {
-        let hub = Arc::new(AgentEventHub::with_capacity(8, 8));
-        let mut receiver = hub.take_durable_receiver().await.unwrap();
-        let event = ToolEvent {
-            schema_version: 1,
-            call_id: "shell-item".into(),
-            tool_name: "write_stdin".into(),
-            ts_unix_ms: 1,
-            observation: ObservationContext {
-                trace_id: "shell".into(),
-                turn_id: "turn".into(),
-                tool_call_id: "shell-item".into(),
-                attempt_id: 1,
-                pipeline_stage: "runtime.call.completed".into(),
+        for failure in [false, true] {
+            let hub = Arc::new(AgentEventHub::with_capacity(8, 8));
+            let mut receiver = hub.take_durable_receiver().await.unwrap();
+            let mut event = ToolEvent {
+                schema_version: 1,
+                call_id: "shell-item".into(),
+                tool_name: "write_stdin".into(),
                 ts_unix_ms: 1,
-                mono_ns: 1,
-                event_seq: 1,
-            },
-            payload: ToolEventPayload::CallCompleted(ToolCallCompletedEvent {
-                shell_output: true,
-                success: true,
-                outcome: ToolOutcome::partial("running", "continue"),
-                llm_view: ToolResultView::Json {
-                    value: serde_json::json!({"shell_model_output":1,"session_id":27,
-                    "stdout":"SECRET_OUTPUT_BYTES","output_stats":{"full_output_available":false}}),
-                    truncated: false,
+                observation: ObservationContext {
+                    trace_id: "shell".into(),
+                    turn_id: "turn".into(),
+                    tool_call_id: "shell-item".into(),
+                    attempt_id: 1,
+                    pipeline_stage: "runtime.call.completed".into(),
+                    ts_unix_ms: 1,
+                    mono_ns: 1,
+                    event_seq: 1,
                 },
-                display: ToolDisplayPayload::Hidden,
-                storage: ToolStoragePayload::None,
-                recovery: None,
-                output_policy: ToolOutputPolicySnapshot::for_tool_name("write_stdin"),
-            }),
-        };
-        let forwarder = {
-            let hub = hub.clone();
-            tokio::spawn(async move {
-                forward_tool_event_to_agent(
-                    event,
-                    &hub,
-                    Arc::new(Mutex::new(HashMap::new())),
-                    "ws",
-                    "thread",
-                    "turn",
-                )
-                .await
-            })
-        };
-        let first = receiver.recv().await.unwrap();
-        assert!(matches!(first, AgentDurableEvent::ItemStarted { .. }));
-        receiver.acknowledge_last(Ok(()));
-        let receipt = receiver.recv().await.unwrap();
-        let AgentDurableEvent::TurnLlmContextAppended {
-            source,
-            attempt_id,
-            payload,
-            ..
-        } = receipt
-        else {
-            panic!("control receipt must precede terminal");
-        };
-        assert_eq!(source, "shell_control_v1");
-        assert!(attempt_id.is_none());
-        let value = serde_json::to_value(payload).unwrap();
-        assert_eq!(value["value"]["session_id"], 27);
-        assert!(!value.to_string().contains("SECRET_OUTPUT_BYTES"));
-        assert!(
-            !forwarder.is_finished(),
-            "terminal publication waits for control receipt ACK"
-        );
-        receiver.acknowledge_last(Ok(()));
-        assert!(matches!(
-            receiver.recv().await.unwrap(),
-            AgentDurableEvent::ItemCompleted { .. }
-        ));
-        receiver.acknowledge_last(Ok(()));
-        forwarder.await.unwrap().unwrap();
+                payload: ToolEventPayload::CallCompleted(ToolCallCompletedEvent {
+                    shell_output: true,
+                    retained_output_log: true,
+                    retained_output_log_item: Some("nested-shell-item".into()),
+                    success: true,
+                    outcome: ToolOutcome::partial("running", "continue"),
+                    llm_view: ToolResultView::Json {
+                        value: serde_json::json!({"shell_model_output":1,"session_id":27,
+                        "stdout":"SECRET_OUTPUT_BYTES","output_stats":{"full_output_available":false}}),
+                        truncated: false,
+                    },
+                    display: ToolDisplayPayload::Hidden,
+                    storage: ToolStoragePayload::None,
+                    recovery: None,
+                    output_policy: ToolOutputPolicySnapshot::for_tool_name("write_stdin"),
+                }),
+            };
+            if failure {
+                event.payload = ToolEventPayload::CallFailed(pioneer_tools::ToolCallFailedEvent {
+                    retained_output_log: true,
+                    error: "cancelled after capture".into(),
+                    outcome: ToolOutcome::partial("cancelled", "inspect output"),
+                    llm_view: None,
+                    display: ToolDisplayPayload::Hidden,
+                    storage: ToolStoragePayload::None,
+                    recovery: None,
+                    output_policy: ToolOutputPolicySnapshot::for_tool_name("write_stdin"),
+                });
+            }
+            let forwarder = {
+                let hub = hub.clone();
+                tokio::spawn(async move {
+                    forward_tool_event_to_agent(
+                        event,
+                        &hub,
+                        Arc::new(Mutex::new(HashMap::new())),
+                        "ws",
+                        "thread",
+                        "turn",
+                    )
+                    .await
+                })
+            };
+            let first = receiver.recv().await.unwrap();
+            assert!(matches!(first, AgentDurableEvent::ItemStarted { .. }));
+            receiver.acknowledge_last(Ok(()));
+            let receipt = receiver.recv().await.unwrap();
+            let AgentDurableEvent::TurnLlmContextAppended {
+                source,
+                attempt_id,
+                payload,
+                ..
+            } = receipt
+            else {
+                panic!("control receipt must precede terminal");
+            };
+            assert_eq!(source, "shell_control_v1");
+            assert!(attempt_id.is_none());
+            let value = serde_json::to_value(payload).unwrap();
+            if failure {
+                assert_eq!(
+                    value["value"]["output_stats"]["full_output_available"],
+                    false
+                );
+            } else {
+                assert_eq!(value["value"]["session_id"], 27);
+                assert_eq!(
+                    value["value"]["retained_output_log_item"],
+                    "nested-shell-item"
+                );
+            }
+            assert_eq!(value["value"]["retained_output_log"], true);
+            assert!(!value.to_string().contains("SECRET_OUTPUT_BYTES"));
+            assert!(
+                !forwarder.is_finished(),
+                "terminal publication waits for control receipt ACK"
+            );
+            receiver.acknowledge_last(Ok(()));
+            assert!(matches!(
+                receiver.recv().await.unwrap(),
+                AgentDurableEvent::ItemCompleted { .. }
+            ));
+            receiver.acknowledge_last(Ok(()));
+            forwarder.await.unwrap().unwrap();
+        }
     }
 
     #[tokio::test]
@@ -2152,6 +2200,8 @@ mod tests {
             },
             payload: ToolEventPayload::CallCompleted(ToolCallCompletedEvent {
                 shell_output: false,
+                retained_output_log: false,
+                retained_output_log_item: None,
                 success: true,
                 outcome: ToolOutcome::ok(),
                 llm_view: ToolResultView::Json {
