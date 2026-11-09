@@ -4144,11 +4144,32 @@ async fn connection_owned_model_preparation_precedes_agent_tool_inventory() {
     assert!(tools.iter().any(|tool| tool.name == "read_file"));
 }
 
+fn run_composed_agent_startup_test<F, Fut>(name: &'static str, body: F)
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()>,
+{
+    // These fixtures compose startup, prompt capture and terminal-event assertions.
+    // Give their debug poll frames a bounded stack, as large Gateway fixtures do.
+    // Construct the future inside the thread so construction uses that stack too.
+    std::thread::Builder::new()
+        .name(name.to_owned())
+        .stack_size(32 * 1024 * 1024)
+        .spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("agent fixture runtime should build")
+                .block_on(Box::pin(body()));
+        })
+        .expect("agent fixture thread should start")
+        .join()
+        .unwrap_or_else(|error| std::panic::resume_unwind(error));
+}
+
 #[test]
 fn agent_dispatch_starts_with_main_prompt() {
-    // Heap-pin the composed startup future before polling through a trait
-    // object so its storage does not occupy the normal test thread stack.
-    let body = async {
+    run_composed_agent_startup_test("agent_dispatch_starts_with_main_prompt", || async {
         let provider = Arc::new(CaptureAgentProvider::default());
         let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
         let manager = AgentManager::new(registry, test_tool_loop_config());
@@ -4200,13 +4221,7 @@ fn agent_dispatch_starts_with_main_prompt() {
                 .full_system_text
                 .contains("### Memory Recall")
         );
-    };
-    let body: std::pin::Pin<Box<dyn std::future::Future<Output = ()>>> = Box::pin(body);
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("Failed building the Runtime")
-        .block_on(body);
+    });
 }
 
 fn agent_skill_delivery_fixture() -> AgentSkillRuntimeEntry {
@@ -8554,97 +8569,87 @@ async fn phase_11_repeated_review_observation_does_not_spam_or_complete() {
 
 #[test]
 fn computer_use_text_only_model_does_not_gate_computer_use() {
-    // Heap-pin the composed startup future before polling through a trait
-    // object so its storage does not occupy the normal test thread stack.
-    let body = async {
-        let provider = Arc::new(TextOnlyAgentProvider::with_requested_tools(
-            requested_tool_names(&["cua_get_window_state"]),
-        ));
-        let registry = Arc::new(ProviderRegistry::with_provider(
-            "text-only",
-            provider.clone(),
-        ));
-        let manager = AgentManager::new(registry, test_tool_loop_config_with_computer_use());
+    run_composed_agent_startup_test(
+        "computer_use_text_only_model_does_not_gate_computer_use",
+        || async {
+            let provider = Arc::new(TextOnlyAgentProvider::with_requested_tools(
+                requested_tool_names(&["cua_get_window_state"]),
+            ));
+            let registry = Arc::new(ProviderRegistry::with_provider(
+                "text-only",
+                provider.clone(),
+            ));
+            let manager = AgentManager::new(registry, test_tool_loop_config_with_computer_use());
 
-        let observed = start_simple_turn(
-            &manager,
-            "thr_computer_use_text_only_no_gate",
-            "ws_computer_use_text_only_no_gate",
-            "turn_computer_use_text_only_no_gate",
-            ThreadMode::Agent,
-            "text-only",
-            "Open the requested desktop location.",
-        )
-        .await;
-        assert_turn_completed(&observed);
+            let observed = start_simple_turn(
+                &manager,
+                "thr_computer_use_text_only_no_gate",
+                "ws_computer_use_text_only_no_gate",
+                "turn_computer_use_text_only_no_gate",
+                ThreadMode::Agent,
+                "text-only",
+                "Open the requested desktop location.",
+            )
+            .await;
+            assert_turn_completed(&observed);
 
-        let requests = provider.snapshot_requests();
-        assert_eq!(requests.len(), 2);
-        let request_tool_names = requests[1]
-            .tools
-            .as_ref()
-            .expect("main request should still include available provider tools")
-            .iter()
-            .map(|tool| tool.name.as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            request_tool_names.contains(&"cua_get_window_state"),
-            !pioneer_tools::computer_use_tool_specs().is_empty(),
-            "computer_use must not be provider-gated by image capability"
-        );
-    };
-    let body: std::pin::Pin<Box<dyn std::future::Future<Output = ()>>> = Box::pin(body);
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("Failed building the Runtime")
-        .block_on(body);
+            let requests = provider.snapshot_requests();
+            assert_eq!(requests.len(), 2);
+            let request_tool_names = requests[1]
+                .tools
+                .as_ref()
+                .expect("main request should still include available provider tools")
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                request_tool_names.contains(&"cua_get_window_state"),
+                !pioneer_tools::computer_use_tool_specs().is_empty(),
+                "computer_use must not be provider-gated by image capability"
+            );
+        },
+    );
 }
 
 #[test]
 fn computer_use_registered_tool_exposes_after_request_tools() {
-    // Heap-pin the composed startup future before polling through a trait
-    // object so its storage does not occupy the normal test thread stack.
-    let body = async {
-        let provider = Arc::new(CaptureAgentProvider::with_requested_tools(
-            requested_tool_names(&["cua_get_window_state"]),
-        ));
-        let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
-        let manager = AgentManager::new(registry, test_tool_loop_config_with_computer_use());
+    run_composed_agent_startup_test(
+        "computer_use_registered_tool_exposes_after_request_tools",
+        || async {
+            let provider = Arc::new(CaptureAgentProvider::with_requested_tools(
+                requested_tool_names(&["cua_get_window_state"]),
+            ));
+            let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
+            let manager = AgentManager::new(registry, test_tool_loop_config_with_computer_use());
 
-        let observed = start_simple_turn(
-            &manager,
-            "thr_computer_use_registered_tool",
-            "ws_computer_use_registered_tool",
-            "turn_computer_use_registered_tool",
-            ThreadMode::Agent,
-            "capture",
-            "Open the requested desktop location.",
-        )
-        .await;
-        assert_turn_completed(&observed);
+            let observed = start_simple_turn(
+                &manager,
+                "thr_computer_use_registered_tool",
+                "ws_computer_use_registered_tool",
+                "turn_computer_use_registered_tool",
+                ThreadMode::Agent,
+                "capture",
+                "Open the requested desktop location.",
+            )
+            .await;
+            assert_turn_completed(&observed);
 
-        let requests = provider.snapshot_requests();
-        assert_eq!(requests.len(), 2);
-        let request_tool_names = requests[1]
-            .tools
-            .as_ref()
-            .expect("main request should include provider tools")
-            .iter()
-            .map(|tool| tool.name.as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            request_tool_names.contains(&"cua_get_window_state"),
-            !pioneer_tools::computer_use_tool_specs().is_empty(),
-            "image-capable providers may expose computer_use after request_tools"
-        );
-    };
-    let body: std::pin::Pin<Box<dyn std::future::Future<Output = ()>>> = Box::pin(body);
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("Failed building the Runtime")
-        .block_on(body);
+            let requests = provider.snapshot_requests();
+            assert_eq!(requests.len(), 2);
+            let request_tool_names = requests[1]
+                .tools
+                .as_ref()
+                .expect("main request should include provider tools")
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                request_tool_names.contains(&"cua_get_window_state"),
+                !pioneer_tools::computer_use_tool_specs().is_empty(),
+                "image-capable providers may expose computer_use after request_tools"
+            );
+        },
+    );
 }
 
 #[tokio::test]
