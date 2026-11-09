@@ -4146,8 +4146,8 @@ async fn connection_owned_model_preparation_precedes_agent_tool_inventory() {
 
 #[test]
 fn agent_dispatch_starts_with_main_prompt() {
-    // Poll through a trait object to avoid duplicating the large composed
-    // startup future in Tokio block_on stack frames. Keep the normal stack.
+    // Heap-pin the composed startup future before polling through a trait
+    // object so its storage does not occupy the normal test thread stack.
     let body = async {
         let provider = Arc::new(CaptureAgentProvider::default());
         let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
@@ -4201,8 +4201,7 @@ fn agent_dispatch_starts_with_main_prompt() {
                 .contains("### Memory Recall")
         );
     };
-    tokio::pin!(body);
-    let body: std::pin::Pin<&mut dyn std::future::Future<Output = ()>> = body;
+    let body: std::pin::Pin<Box<dyn std::future::Future<Output = ()>>> = Box::pin(body);
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -8555,8 +8554,8 @@ async fn phase_11_repeated_review_observation_does_not_spam_or_complete() {
 
 #[test]
 fn computer_use_text_only_model_does_not_gate_computer_use() {
-    // Poll through a trait object to avoid duplicating the large composed
-    // startup future in Tokio block_on stack frames. Keep the normal stack.
+    // Heap-pin the composed startup future before polling through a trait
+    // object so its storage does not occupy the normal test thread stack.
     let body = async {
         let provider = Arc::new(TextOnlyAgentProvider::with_requested_tools(
             requested_tool_names(&["cua_get_window_state"]),
@@ -8594,8 +8593,7 @@ fn computer_use_text_only_model_does_not_gate_computer_use() {
             "computer_use must not be provider-gated by image capability"
         );
     };
-    tokio::pin!(body);
-    let body: std::pin::Pin<&mut dyn std::future::Future<Output = ()>> = body;
+    let body: std::pin::Pin<Box<dyn std::future::Future<Output = ()>>> = Box::pin(body);
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -8605,8 +8603,8 @@ fn computer_use_text_only_model_does_not_gate_computer_use() {
 
 #[test]
 fn computer_use_registered_tool_exposes_after_request_tools() {
-    // Poll through a trait object to avoid duplicating the large composed
-    // startup future in Tokio block_on stack frames. Keep the normal stack.
+    // Heap-pin the composed startup future before polling through a trait
+    // object so its storage does not occupy the normal test thread stack.
     let body = async {
         let provider = Arc::new(CaptureAgentProvider::with_requested_tools(
             requested_tool_names(&["cua_get_window_state"]),
@@ -8641,8 +8639,7 @@ fn computer_use_registered_tool_exposes_after_request_tools() {
             "image-capable providers may expose computer_use after request_tools"
         );
     };
-    tokio::pin!(body);
-    let body: std::pin::Pin<&mut dyn std::future::Future<Output = ()>> = body;
+    let body: std::pin::Pin<Box<dyn std::future::Future<Output = ()>>> = Box::pin(body);
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
