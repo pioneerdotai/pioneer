@@ -5441,10 +5441,16 @@ async fn provider_failure_checkpoints_window_and_recovery_continues_in_next_wind
 
     let mut saw_continued = false;
     for _ in 0..40 {
-        let event = timeout(Duration::from_secs(2), durable_events.recv())
-            .await
-            .expect("recovery window event should arrive")
-            .expect("durable receiver should stay open");
+        let event = match timeout(Duration::from_secs(2), durable_events.recv()).await {
+            Ok(event) => event.expect("durable receiver should stay open"),
+            Err(error) => {
+                if recovery_handle.is_finished() {
+                    let admission = recovery_handle.await;
+                    panic!("recovery window event timed out: {error}; admission: {admission:?}");
+                }
+                panic!("recovery window event timed out while admission is pending: {error}");
+            }
+        };
         durable_events.acknowledge_last(Ok(()));
         match event {
             AgentDurableEvent::TurnExecutionWindowContinued { notification } => {
