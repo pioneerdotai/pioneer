@@ -1004,3 +1004,24 @@ pub(crate) async fn next_work_deadline<C: ConnectionTrait>(
         .await?;
     Ok(pending.into_iter().chain(source).chain(retry).min())
 }
+
+pub(crate) async fn find_deliveries_by_ids<C: ConnectionTrait>(
+    db: &C,
+    workspace: &str,
+    thread: &str,
+    ids: &[String],
+) -> Result<Vec<task_delivery::Model>> {
+    let mut rows = Vec::new();
+    for ids in ids.chunks(64) {
+        rows.extend(
+            task_delivery::Entity::find()
+                .filter(task_delivery::Column::WorkspaceId.eq(workspace))
+                .filter(task_delivery::Column::TargetThreadId.eq(thread))
+                .filter(task_delivery::Column::Id.is_in(ids.to_vec()))
+                .all(db)
+                .await
+                .context("failed to load exact delivery batch")?,
+        );
+    }
+    Ok(rows)
+}

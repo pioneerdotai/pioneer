@@ -384,7 +384,8 @@ impl CrudStore {
         prepared: PreparedOccurrence,
         claim: Option<TaskRunOccurrenceReconcileClaim>,
     ) -> Result<TaskRunOccurrenceTerminalizationOutcome> {
-        let change = crate::task_events::TaskWorkChange::new(&self.connection);
+        let change =
+            crate::task_events::TaskWorkChange::for_source(&self.connection, "r", &prepared.run_id);
         let result = async {
             let PreparedOccurrence {
                 run_id,

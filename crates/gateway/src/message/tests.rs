@@ -43902,7 +43902,10 @@ async fn connection_closed_discards_unmaterialized_runtime_draft() {
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
     let agent_manager = Arc::new(AgentManager::new(test_provider(), test_tool_loop_config()));
-    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    // Disconnect cleanup and the persistence assertion can acquire different
+    // pool connections. Keep both on the same file-backed reader/writer fixture.
+    let (_database_dir, workspace_manager, crud_store, workspace_id) =
+        setup_pooled_file_workspace_manager().await;
     let processor = MessageProcessor::with_agent_manager(
         thread_manager.clone(),
         agent_manager.clone(),
@@ -67259,7 +67262,7 @@ async fn codex_retry_notice_is_durable_semantic_work_in_an_internal_execution_th
             "gpt-5",
             "retry notice presentation",
         );
-        let (run, child) = drain_test_notifications_while(&mut harness.rx, async {
+        let (run, child, binding) = drain_test_notifications_while(&mut harness.rx, async {
             let response = create_task_for_test(&processor, params).await.unwrap();
             let run = response.run.unwrap();
             let child = wait_for_child_lineage_for_run(store.clone(), &run.id).await;
@@ -67268,7 +67271,11 @@ async fn codex_retry_notice_is_durable_semantic_work_in_an_internal_execution_th
                 wait_for_run_status(store.clone(), &run.id, TaskRunStatus::Running).await,
                 TaskRunStatus::Running
             );
-            (run, child)
+            // The mock records start_turn before its response is durably applied.
+            // Wait for the exact child activation while draining startup fanout.
+            let binding = cli_task_tools::wait_for_task_cli_child(&processor, &run.id, None).await;
+            assert_eq!(binding.turn_id, child.child_turn_id);
+            (run, child, binding)
         })
         .await;
         assert!(
@@ -67285,11 +67292,6 @@ async fn codex_retry_notice_is_durable_semantic_work_in_an_internal_execution_th
             .unwrap();
         assert_eq!(source.access_class, "internal");
         assert_eq!(source.sidebar_visibility, "hidden");
-        let binding = store
-            .get_cli_runtime_turn_binding(&child.child_turn_id)
-            .await
-            .unwrap()
-            .unwrap();
         let key = CLIAgentRuntimeSessionKey::new(
             &harness.workspace_id,
             runtime_id,
@@ -67338,6 +67340,19 @@ async fn codex_retry_notice_is_durable_semantic_work_in_an_internal_execution_th
         )
         .await
         .unwrap();
+        // No notice exists yet for either backend. Mixed/duplicate page targets
+        // must not manufacture notices from the mere existence of CLI attempts.
+        assert!(
+            store
+                .codex_retry_notice_reads(&[
+                    child.child_turn_id.clone(),
+                    child.child_turn_id.clone(),
+                    "api-turn-with-no-cli-attempt".into(),
+                ])
+                .await
+                .unwrap()
+                .is_empty()
+        );
         let initial = request_live_thread_timeline_page(&mut harness, "retry-before").await;
         let core = ClientCore::new();
         core.upsert_thread(
@@ -67782,18 +67797,81 @@ async fn codex_retry_notice_is_durable_semantic_work_in_an_internal_execution_th
             .insert(&store.database_connection())
             .await
             .unwrap();
+        // Exercise both the page-target and attempt batch boundaries. A page
+        // may mix API cards, the same child twice, and a long retry history.
+        let mut page_sources = (0..65)
+            .map(|i| format!("api-page-turn-{i:03}"))
+            .collect::<Vec<_>>();
+        page_sources.extend([child.child_turn_id.clone(), child.child_turn_id.clone()]);
+        let reads = store.codex_retry_notice_reads(&page_sources).await.unwrap();
+        assert_eq!(reads.len(), 1);
+        let selected = reads.get(&child.child_turn_id).unwrap();
         let read = store
-            .codex_retry_notices_for_task(
+            .codex_retry_notices_for_task_read(
                 &target.workspace_id,
                 &target.thread_id,
                 &target.turn_id,
                 &target.task,
+                selected,
             )
             .await
             .unwrap();
         assert_eq!(read.len(), 2);
+        assert!(
+            store
+                .codex_retry_notices_for_task_read(
+                    "another-workspace",
+                    &target.thread_id,
+                    &target.turn_id,
+                    &target.task,
+                    selected,
+                )
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .codex_retry_notices_for_task_read(
+                    &target.workspace_id,
+                    &target.thread_id,
+                    &target.turn_id,
+                    &wrong_link,
+                    selected,
+                )
+                .await
+                .unwrap()
+                .is_empty()
+        );
         assert!(read.iter().any(|notice| notice.item_id == notice_id));
         assert!(read.iter().any(|notice| notice.item_id == history_id));
+        // Graph and notice payload batches must preserve per-card isolation and
+        // input positions, including continuation beyond the first group.
+        let mut cards = vec![target.clone(); 65];
+        cards[17].workspace_id = "another-workspace".into();
+        cards[33].task = wrong_link.clone();
+        cards[50].task.child_thread_id = Some("unrelated-child".into());
+        let batch = store
+            .codex_retry_notices_for_tasks(&cards, &reads)
+            .await
+            .unwrap();
+        assert_eq!(batch.len(), 65);
+        for (index, notices) in batch.iter().enumerate() {
+            if [17, 33, 50].contains(&index) {
+                assert!(notices.is_empty());
+            } else {
+                assert_eq!(notices.len(), 2);
+                assert!(
+                    notices
+                        .iter()
+                        .any(|n| n.item_id == notice_id && n.source_turn_id == child.child_turn_id)
+                );
+                assert!(notices.iter().any(
+                    |n| n.item_id == history_id && n.source_thread_id == child.child_thread_id
+                ));
+            }
+        }
+
         let original_payload = notice_row.payload.clone();
         let mut corrupt: pioneer_entity::turn_item::ActiveModel = notice_row.clone().into();
         corrupt.payload = Set("{corrupt requested retry notice".into());
@@ -68146,6 +68224,249 @@ async fn live_semantic_timeline_final_answer_collapses_work_without_work_flood()
             .iter()
             .all(|item| item.item_id != final_item_id),
         "final assistant message must not remain in turn work items"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn timeline_page_isolates_off_page_bodies_and_keeps_last_final_html() {
+    use pioneer_artifacts::{ArtifactBindingTarget, IngestArtifactBytesRequest};
+    use pioneer_protocol::{
+        ArtifactBindingDirection, ArtifactBindingKind, ArtifactCreatedByKind, ArtifactKind,
+        ArtifactRole,
+    };
+    use sea_orm::{ActiveModelTrait, Set};
+    let mut harness = setup_live_semantic_timeline_harness("exact_assistant_page").await;
+    let store = harness.processor.crud_store.clone();
+    crate::session::test_support::ensure_test_superuser_execution_authority(store.as_ref()).await;
+    let generation = pioneer_crud::current_policy_generation(&store.database_connection())
+        .await
+        .unwrap()
+        .get();
+    let publication=harness.processor.artifact_service.ingest_tool_bytes(IngestArtifactBytesRequest {
+        workspace_id:harness.workspace_id.clone(),primary_thread_id:Some(harness.thread_id.clone()),
+        bytes:b"<p>page publication</p>".to_vec(),display_name:"page publication".into(),
+        kind:ArtifactKind::File,mime_type:Some("text/html".into()),created_by_kind:ArtifactCreatedByKind::Tool,
+        created_by_actor_id:Some("html_render".into()),
+        binding:Some(ArtifactBindingTarget {
+            thread_id:Some(harness.thread_id.clone()),turn_id:Some(harness.turn_id.clone()),
+            message_id:None,turn_item_id:Some("exact_page_html".into()),tool_call_id:Some("exact_page_html".into()),
+            task_id:None,task_run_id:None,binding_kind:ArtifactBindingKind::ToolOutput,
+            direction:ArtifactBindingDirection::Output,role:Some(ArtifactRole::Tool),item_index:Some(0),
+        }),
+        metadata:std::collections::BTreeMap::from([("htmlTool".into(),json!({
+            "version":1,"publication":true,"turnId":harness.turn_id,"callId":"exact_page_html",
+            "index":"document","title":"page publication"
+        }))]),
+    },"exact-page-html".into(),generation,tokio_util::sync::CancellationToken::new()).await.unwrap();
+    let db = store.database_connection();
+    let original_version = pioneer_entity::artifact_version::Entity::find_by_id(
+        publication.artifact.version_id.clone().unwrap(),
+    )
+    .one(&db)
+    .await
+    .unwrap()
+    .unwrap();
+    // A broken newer, unbound version must not make the pinned response
+    // unreadable. This also catches loading the current summary before the pin.
+    let newer_id = "exact-page-unbound-version".to_owned();
+    let mut newer: pioneer_entity::artifact_version::ActiveModel = original_version.clone().into();
+    newer.id = Set(newer_id.clone());
+    newer.version_number = Set(original_version.version_number + 1);
+    newer.blob_id = Set("missing-unbound-blob".into());
+    newer.insert(&db).await.unwrap();
+    let artifact = pioneer_entity::artifact::Entity::find_by_id(&publication.artifact.artifact_id)
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut artifact: pioneer_entity::artifact::ActiveModel = artifact.into();
+    artifact.current_version_id = Set(Some(newer_id));
+    artifact.update(&db).await.unwrap();
+    let now = chrono::Utc::now().fixed_offset();
+    pioneer_entity::artifact_projection::ActiveModel {
+        id: Set("exact-page-pinned-preview".into()),
+        workspace_id: Set(harness.workspace_id.clone()),
+        artifact_id: Set(publication.artifact.artifact_id.clone()),
+        artifact_version_id: Set(original_version.id.clone()),
+        projection_kind: Set("plain_text".into()),
+        status: Set("ready".into()),
+        blob_id: Set(Some(original_version.blob_id.clone())),
+        text_content: Set(Some("preview text is not a publication body".into())),
+        metadata_json: Set("{}".into()),
+        created_at: Set(now),
+        updated_at: Set(now),
+    }
+    .insert(&db)
+    .await
+    .unwrap();
+    let mut expected_artifact = publication.artifact.clone();
+    expected_artifact.preview = Some(pioneer_protocol::ArtifactPreviewRef {
+        projection_kind: pioneer_protocol::ArtifactProjectionKind::PlainText,
+        status: pioneer_protocol::ArtifactProjectionStatus::Ready,
+        artifact_id: publication.artifact.artifact_id.clone(),
+        version_id: original_version.id,
+        blob_id: Some(original_version.blob_id),
+        mime_type: Some("text/html".into()),
+        size_bytes: publication.artifact.size_bytes,
+        sha256: publication.artifact.sha256.clone(),
+    });
+    let timestamp = now_timestamp_secs();
+    // Equal timestamps exercise the canonical item-ID tie-break, while a
+    // newer commentary message must never take the final-answer position.
+    for index in 0..66 {
+        store
+            .materialize_item_completed(
+                ItemCompletedNotification {
+                    workspace_id: harness.workspace_id.clone(),
+                    thread_id: harness.thread_id.clone(),
+                    turn_id: harness.turn_id.clone(),
+                    item: TurnItem::AgentMessage {
+                        id: format!("exact-page-{index:03}"),
+                        text: format!("page body {index}"),
+                        phase: if index == 65 {
+                            pioneer_protocol::AgentMessagePhase::Commentary
+                        } else {
+                            pioneer_protocol::AgentMessagePhase::FinalAnswer
+                        },
+                        markdown: None,
+                        markdown_version: None,
+                    },
+                },
+                timestamp,
+            )
+            .await
+            .unwrap();
+    }
+    let seed = request_live_thread_timeline_page(&mut harness, "exact-page-seed").await;
+    assert!(seed.page.has_more_before);
+    let off_page = pioneer_entity::turn_item::Entity::find()
+        .filter(pioneer_entity::turn_item::Column::TurnId.eq(&harness.turn_id))
+        .filter(pioneer_entity::turn_item::Column::ItemId.eq("exact-page-000"))
+        .one(&store.database_connection())
+        .await
+        .unwrap()
+        .unwrap();
+    let mut corrupt: pioneer_entity::turn_item::ActiveModel = off_page.into();
+    corrupt.payload = Set("{invalid off-page message".into());
+    corrupt.update(&store.database_connection()).await.unwrap();
+    let page = request_live_thread_timeline_page(&mut harness, "exact-page-newest").await;
+    let mut final_seen = false;
+    for block in &page.blocks {
+        if let pioneer_protocol::TimelineBlockKind::AssistantMessage {
+            item_id,
+            text,
+            html_publications,
+            ..
+        } = &block.kind
+        {
+            assert_ne!(item_id, "exact-page-000");
+            if item_id == "exact-page-064" {
+                final_seen = true;
+                assert_eq!(text, "page body 64");
+                assert_eq!(html_publications.len(), 1);
+                assert_eq!(html_publications[0].artifact, expected_artifact);
+            } else {
+                assert!(html_publications.is_empty());
+            }
+        }
+    }
+    assert!(final_seen);
+    let cursor = page
+        .page
+        .before_cursor
+        .expect("earlier page remains available");
+    let thread_id = harness.thread_id.clone();
+    let earlier = request_live_thread_timeline_page_for_thread_at_anchor(
+        &mut harness,
+        "exact-page-before",
+        &thread_id,
+        json!({"kind":"before","cursor":cursor}),
+    )
+    .await;
+    let mut earlier_seen = false;
+    for block in &earlier.blocks {
+        if let pioneer_protocol::TimelineBlockKind::AssistantMessage {
+            item_id,
+            html_publications,
+            ..
+        } = &block.kind
+        {
+            earlier_seen = true;
+            assert_ne!(item_id, "exact-page-064");
+            assert!(
+                html_publications.is_empty(),
+                "an off-page final must keep its HTML ownership"
+            );
+        }
+    }
+    assert!(earlier_seen);
+    // A multi-quantum request still reads only its exact targets. The corrupt
+    // first message is deliberately excluded; duplicate IDs cannot duplicate output.
+    let mut exact = (1..66)
+        .map(|i| (harness.turn_id.clone(), format!("exact-page-{i:03}")))
+        .collect::<Vec<_>>();
+    exact.push((harness.turn_id.clone(), "exact-page-064".into()));
+    let selected = store
+        .get_timeline_assistant_items(&harness.workspace_id, &harness.thread_id, &exact)
+        .await
+        .unwrap();
+    assert_eq!(selected.len(), 65);
+    for ((_, id), (item, status, is_final)) in &selected {
+        assert_eq!(item.item_id(), id);
+        assert_eq!(status.as_deref(), Some("completed"));
+        assert_eq!(*is_final, id == "exact-page-064");
+    }
+    let targets = [(harness.turn_id.clone(), "exact-page-064".to_owned())];
+    assert!(
+        store
+            .get_timeline_assistant_items("wrong-workspace", &harness.thread_id, &targets)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store
+            .get_timeline_assistant_items(&harness.workspace_id, "wrong-thread", &targets)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let artifact = pioneer_entity::artifact::Entity::find_by_id(&publication.artifact.artifact_id)
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut artifact: pioneer_entity::artifact::ActiveModel = artifact.into();
+    artifact.status = Set("deleted".into());
+    artifact.deleted_at = Set(Some(now));
+    artifact.update(&db).await.unwrap();
+    let deleted = request_live_thread_timeline_page(&mut harness, "exact-page-deleted-html").await;
+    let deleted_html = deleted
+        .blocks
+        .iter()
+        .find_map(|block| match &block.kind {
+            pioneer_protocol::TimelineBlockKind::AssistantMessage {
+                item_id,
+                html_publications,
+                ..
+            } if item_id == "exact-page-064" => Some(html_publications),
+            _ => None,
+        })
+        .unwrap();
+    expected_artifact.status = pioneer_protocol::ArtifactStatus::Deleted;
+    assert_eq!(deleted_html.len(), 1);
+    assert_eq!(deleted_html[0].artifact, expected_artifact);
+    assert!(
+        harness
+            .processor
+            .html_publications_for_response_turn(
+                "wrong-workspace",
+                &harness.thread_id,
+                &harness.turn_id,
+            )
+            .await
+            .unwrap()
+            .is_empty()
     );
 }
 

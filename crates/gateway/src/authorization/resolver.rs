@@ -862,6 +862,89 @@ impl AuthorizationResolver {
         )))
     }
 
+    /// Bounded page authorization through the same root ACL and durable actor
+    /// verifier as the single-child path. Facts/maps live only for this request.
+    pub(crate) async fn authorize_internal_thread_page(
+        &self,
+        principal: &AuthenticatedSessionPrincipal,
+        action_gate: &ActionGateDecision,
+        action: ResourceAction,
+        requested: &[(String, String)],
+    ) -> Result<HashSet<(String, String)>> {
+        let mut allowed = HashSet::new();
+        if self.preflight(action_gate, action).is_some() {
+            return Ok(allowed);
+        }
+        let Some(child_action) = super::execution_child_policy_action(action) else {
+            return Ok(allowed);
+        };
+        let child_gate = self.service.authorize_action(
+            principal.kind,
+            principal.role_key.as_ref(),
+            child_action,
+        );
+        if !child_gate.permits_resource_resolution() && !child_gate.is_final_allow() {
+            return Ok(allowed);
+        }
+        let requested = requested.iter().cloned().collect::<HashSet<_>>();
+        let child_ids = requested
+            .iter()
+            .map(|(_, id)| id.clone())
+            .collect::<Vec<_>>();
+        let facts = pioneer_crud::load_internal_thread_authorization_facts(
+            &self.store.database_connection(),
+            &child_ids,
+            &principal.principal_id,
+        )
+        .await?;
+        let eligible = facts
+            .into_iter()
+            .filter(|f| {
+                requested.contains(&(f.child.workspace_id.clone(), f.child.thread_id.clone()))
+                    && thread_resource(&f.child.workspace_id, &f.child.thread_id).is_some()
+                    && thread_resource(&f.root.workspace_id, &f.root.thread_id).is_some()
+                    && f.root_collaboration_thread_id
+                        .as_ref()
+                        .is_none_or(|id| resource_id(ThreadResourceId::new(id.clone())).is_some())
+                    && self
+                        .service
+                        .authorize_resource(
+                            action_gate,
+                            action,
+                            ResolvedResourceAccess::Thread(self.thread_facts_from_memberships(
+                                principal,
+                                &f.root,
+                                f.workspace_member,
+                                f.root_thread_member,
+                            )),
+                        )
+                        .is_allowed()
+            })
+            .collect::<Vec<_>>();
+        let parents = eligible
+            .iter()
+            .map(|f| f.parent_turn_id.clone())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let encoded = self
+            .store
+            .get_turn_execution_authorization_contexts(&parents)
+            .await?;
+        let contexts =
+            super::ExecutionAuthorizationContext::load_for_turns(&self.store, encoded).await?;
+        for f in eligible {
+            if contexts.get(&f.parent_turn_id).is_some_and(|context| {
+                context.workspace_id() == f.child.workspace_id
+                    && context.root_thread_id() == f.root.thread_id
+                    && context.grants_action(action)
+            }) {
+                allowed.insert((f.child.workspace_id, f.child.thread_id));
+            }
+        }
+        Ok(allowed)
+    }
+
     /// Resolves a turn in an internal child through the same persisted root
     /// lineage used for the child thread itself. The proof keeps the exact
     /// child and turn identity while inheriting only the root's current ACL.
@@ -2673,6 +2756,23 @@ mod tests {
             .into_authorized()
             .expect("authorized root permits indirect internal projection");
         assert_eq!(inherited.thread_id(), INTERNAL_THREAD_ID);
+        // Page authorization preserves the same ACL with mixed scopes and
+        // duplicate children, including a page beyond the metadata quantum.
+        let mut requested = (0..65)
+            .map(|i| (WORKSPACE_ID.to_owned(), format!("missing-child-{i}")))
+            .collect::<Vec<_>>();
+        requested.extend([
+            (WORKSPACE_ID.to_owned(), INTERNAL_THREAD_ID.to_owned()),
+            (WORKSPACE_ID.to_owned(), INTERNAL_THREAD_ID.to_owned()),
+            (WORKSPACE_ID.to_owned(), PRIVATE_THREAD_ID.to_owned()),
+            ("wrong-workspace".to_owned(), INTERNAL_THREAD_ID.to_owned()),
+        ]);
+        let batch = resolver
+            .authorize_internal_thread_page(&member, &gate, ResourceAction::ThreadRead, &requested)
+            .await
+            .expect("authorize bounded mixed page");
+        assert_eq!(batch.len(), 1);
+        assert!(batch.contains(&(WORKSPACE_ID.to_owned(), INTERNAL_THREAD_ID.to_owned())));
 
         let peer = principal(MEMBER_B_ID, PrincipalKind::User);
         let peer_gate = service.authorize_action(
@@ -2694,6 +2794,19 @@ mod tests {
                 .into_authorized()
                 .is_none(),
             "guessed child id must not bypass inaccessible root ACL"
+        );
+
+        assert!(
+            resolver
+                .authorize_internal_thread_page(
+                    &peer,
+                    &peer_gate,
+                    ResourceAction::ThreadRead,
+                    &requested
+                )
+                .await
+                .expect("peer must retain the root ACL denial")
+                .is_empty()
         );
 
         harness
@@ -2718,6 +2831,19 @@ mod tests {
                 .into_authorized()
                 .is_none(),
             "missing parent authority must never become unrestricted child access"
+        );
+        // No request-local result may survive across requests after revocation.
+        assert!(
+            resolver
+                .authorize_internal_thread_page(
+                    &member,
+                    &gate,
+                    ResourceAction::ThreadRead,
+                    &requested
+                )
+                .await
+                .expect("removed authority must deny a fresh page")
+                .is_empty()
         );
     }
 

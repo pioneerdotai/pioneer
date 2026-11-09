@@ -173,6 +173,26 @@ pub(crate) async fn list_eligible_prepared<C: ConnectionTrait>(
     upper: &PreparedCursor,
     limit: u64,
 ) -> Result<Vec<PreparedCursor>> {
+    eligible_prepared(db, after, Some(upper), limit, None).await
+}
+
+pub(crate) async fn list_eligible_prepared_for_turns<C: ConnectionTrait>(
+    db: &C,
+    turn_ids: &[String],
+) -> Result<Vec<PreparedCursor>> {
+    if turn_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    eligible_prepared(db, None, None, turn_ids.len() as u64, Some(turn_ids)).await
+}
+
+async fn eligible_prepared<C: ConnectionTrait>(
+    db: &C,
+    after: Option<&PreparedCursor>,
+    upper: Option<&PreparedCursor>,
+    limit: u64,
+    turn_ids: Option<&[String]>,
+) -> Result<Vec<PreparedCursor>> {
     let outer_id = || Expr::col((turn_finalization::Entity, turn_finalization::Column::TurnId));
     let active = Query::select()
         .expr(Expr::val(1))
@@ -219,15 +239,20 @@ pub(crate) async fn list_eligible_prepared<C: ConnectionTrait>(
                 .add(Expr::exists(stream_exists).not())
                 .add(Expr::exists(ready_stream)),
         );
-    query = query.filter(
-        Condition::any()
-            .add(turn_finalization::Column::PreparedAt.lt(upper.prepared_at))
-            .add(
-                Condition::all()
-                    .add(turn_finalization::Column::PreparedAt.eq(upper.prepared_at))
-                    .add(turn_finalization::Column::TurnId.lte(upper.turn_id.clone())),
-            ),
-    );
+    if let Some(turn_ids) = turn_ids {
+        query = query.filter(turn_finalization::Column::TurnId.is_in(turn_ids.to_vec()));
+    }
+    if let Some(upper) = upper {
+        query = query.filter(
+            Condition::any()
+                .add(turn_finalization::Column::PreparedAt.lt(upper.prepared_at))
+                .add(
+                    Condition::all()
+                        .add(turn_finalization::Column::PreparedAt.eq(upper.prepared_at))
+                        .add(turn_finalization::Column::TurnId.lte(upper.turn_id.clone())),
+                ),
+        );
+    }
     if let Some(after) = after {
         query = query.filter(
             Condition::any()

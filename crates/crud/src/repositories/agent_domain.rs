@@ -2833,7 +2833,7 @@ pub async fn enqueue_agent_execution<C: GatewayControlConnection>(
     db: &C,
     input: &AgentQueueEntryInput,
 ) -> Result<agent_work_queue::Model> {
-    let change = db.gateway_control_change();
+    let change = db.gateway_control_change_for(&[crate::GatewayControlWake::Resources]);
     let mut changed = false;
     let result = async {
         ensure_agent_branch_schedule(
@@ -5501,7 +5501,7 @@ pub async fn claim_agent_action_outbox<C: GatewayControlConnection + Transaction
     db: &C,
     limit: u64,
 ) -> Result<AgentActionOutboxClaimBatch> {
-    let change = db.gateway_control_change();
+    let change = db.gateway_control_change_for(&[crate::GatewayControlWake::Actions]);
     let result = claim_agent_action_outbox_with_clock(db, limit, &utc_now).await;
     if let Ok(batch) = &result {
         if batch.errors.is_empty() {
@@ -5771,7 +5771,7 @@ pub async fn mark_agent_action_outbox_delivered<C: GatewayControlConnection>(
     expected_attempts: i64,
     delivered_at: DateTimeWithTimeZone,
 ) -> Result<bool> {
-    let change = db.gateway_control_change();
+    let change = db.gateway_control_change_for(&[crate::GatewayControlWake::Actions]);
     let result = async {
         let result = agent_action_outbox::Entity::update_many()
             .col_expr(
@@ -5865,7 +5865,7 @@ pub async fn mark_agent_action_outbox_failed_with_cause<C: GatewayControlConnect
     failure: AgentActionOutboxFailure,
     terminal: bool,
 ) -> Result<bool> {
-    let change = db.gateway_control_change();
+    let change = db.gateway_control_change_for(&[crate::GatewayControlWake::Actions]);
     let result = async {
         let exhausted_start = if !terminal && expected_attempts == AGENT_ACTION_OUTBOX_MAX_ATTEMPTS
         {
@@ -5940,7 +5940,7 @@ pub async fn defer_agent_action_outbox_for_permit<C: GatewayControlConnection>(
     expected_attempts: i64,
     deferred_at: DateTimeWithTimeZone,
 ) -> Result<bool> {
-    let change = db.gateway_control_change();
+    let change = db.gateway_control_change_for(&[crate::GatewayControlWake::Actions]);
     let result = async {
         let restored_attempts = expected_attempts
             .checked_sub(1)
@@ -5994,7 +5994,7 @@ pub async fn defer_agent_action_outbox_for_runtime<C: GatewayControlConnection>(
     expected_attempts: i64,
     deferred_at: DateTimeWithTimeZone,
 ) -> Result<bool> {
-    let change = db.gateway_control_change();
+    let change = db.gateway_control_change_for(&[crate::GatewayControlWake::Actions]);
     let result = async {
         let restored_attempts = expected_attempts
             .checked_sub(1)
@@ -6044,7 +6044,7 @@ pub async fn wake_agent_action_outbox_for_execution<C: GatewayControlConnection>
     execution_id: &str,
     now: DateTimeWithTimeZone,
 ) -> Result<u64> {
-    let change = db.gateway_control_change();
+    let change = db.gateway_control_change_for(&[crate::GatewayControlWake::Actions]);
     let result = async {
         let execution = agent_execution::Entity::find_by_id(execution_id.to_owned())
             .one(db)
@@ -7875,7 +7875,7 @@ pub async fn record_agent_execution_progress<C: GatewayControlConnection>(
     progress_at: DateTimeWithTimeZone,
     idle_deadline: Option<DateTimeWithTimeZone>,
 ) -> Result<bool> {
-    let change = db.gateway_control_change();
+    let change = db.gateway_control_change_for(&[crate::GatewayControlWake::Resources]);
     let result = async {
         if progress_frontier_json.len() > 16 * 1024 {
             bail!("agent execution progress frontier is too large");

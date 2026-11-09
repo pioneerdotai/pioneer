@@ -789,8 +789,13 @@ async fn resolve_compression_dictionary(
         });
     }
     if sample_bytes < DICTIONARY_MIN_SOURCE_BYTES && sample_rows < DICTIONARY_SAMPLE_MAX_ROWS {
+        // Completed Turns may never supply more samples. Compress their finite
+        // batch without a dictionary rather than waiting for unrelated Turns.
         return Ok(DictionaryResolution {
-            dictionary: None,
+            dictionary: Some(CompressionDictionary {
+                id: -1,
+                bytes: None,
+            }),
             observed_rows: sample_rows as u64,
             source_bytes: sample_bytes as u64,
             more_pending: true,
@@ -980,6 +985,19 @@ fn prepare_payload_rows(
         .collect()
 }
 
+// These are extension-owned backing tables (no Entity). Reuse one owner
+// predicate for dictionary samples, source reads, backlog checks and commit CAS.
+// The projection watermark survives receipt cleanup; absence of receipts alone
+// is not evidence that the final event has been projected. A missing stream
+// only admits legacy Turns with no canonical events.
+fn compression_eligibility_sql() -> &'static str {
+    "EXISTS(SELECT 1 FROM turn AS owner WHERE owner.id=target.turn_id \
+     AND owner.status IN ('completed','failed','interrupted') \
+     AND NOT EXISTS(SELECT 1 FROM turn_event AS pending \
+       WHERE pending.turn_id=owner.id AND pending.sequence > COALESCE(\
+         (SELECT stream.projected_through_sequence FROM turn_event_projection_stream_state AS stream WHERE stream.turn_id=owner.id),-1)))"
+}
+
 async fn load_pending_payload_rows(
     db: &SqliteDatabase,
     config: ZstdColumnConfig,
@@ -997,11 +1015,12 @@ async fn load_pending_payload_rows(
             db.get_database_backend(),
             format!(
                 "SELECT rowid AS zstd_rowid, length(CAST({column} AS BLOB)) AS payload_bytes \
-                 FROM {table} WHERE {dict_column} IS NULL \
+                 FROM {table} AS target WHERE {dict_column} IS NULL AND {eligibility} \
                  ORDER BY rowid LIMIT ?",
                 column = config.column,
                 table = config.backing_table,
                 dict_column = config.dict_column,
+                eligibility = compression_eligibility_sql(),
             ),
             [(max_rows.saturating_add(1) as i64).into()],
         ))
@@ -1054,10 +1073,11 @@ async fn load_pending_payload_rows(
                  FROM {table} AS target \
                  JOIN selected ON selected.zstd_rowid = target.rowid \
                               AND selected.payload_bytes = length(CAST(target.{column} AS BLOB)) \
-                 WHERE target.{dict_column} IS NULL ORDER BY target.rowid",
+                 WHERE target.{dict_column} IS NULL AND {eligibility} ORDER BY target.rowid",
                 column = config.column,
                 table = config.backing_table,
                 dict_column = config.dict_column,
+                eligibility = compression_eligibility_sql(),
             ),
             values,
         ))
@@ -1184,12 +1204,13 @@ async fn apply_prepared_payload_rows(
             .execute_raw(Statement::from_sql_and_values(
                 transaction.get_database_backend(),
                 format!(
-                    "UPDATE {table} SET {column} = ?, {dict_column} = ? \
+                    "UPDATE {table} AS target SET {column} = ?, {dict_column} = ? \
                      WHERE rowid = ? AND id = ? AND {dict_column} IS NULL \
-                       AND {column} = ?",
+                       AND {column} = ? AND {eligibility}",
                     table = config.backing_table,
                     column = config.column,
                     dict_column = config.dict_column,
+                    eligibility = compression_eligibility_sql(),
                 ),
                 [
                     row.compressed_payload.clone().into(),
@@ -1221,6 +1242,8 @@ async fn apply_prepared_payload_rows(
 /// capture and replay, including tiny fixtures below dictionary-training size.
 #[cfg(test)]
 pub(crate) async fn compress_history_payloads_for_test(store: &CrudStore) -> Result<u64> {
+    use sea_orm::DbBackend;
+
     let db = store.with_maintenance_access().database_connection();
     let mut total = 0;
     for &config in ZSTD_PAYLOAD_COLUMNS {
@@ -1228,23 +1251,38 @@ pub(crate) async fn compress_history_payloads_for_test(store: &CrudStore) -> Res
             enable_transparent_compression(&db, config).await?;
         }
         for _ in 0..32 {
-            let rows = load_pending_payload_rows(
-                &db,
-                config,
-                COMPRESSION_BATCH_MAX_ROWS,
-                COMPRESSION_BATCH_MAX_SOURCE_BYTES,
-            )
-            .await?;
+            // Pre-policy physical-format fixture, including active history.
+            // Production admission is exercised by the actual worker tests.
+            let rows = db.query_all_raw(Statement::from_string(DbBackend::Sqlite, format!(
+                "SELECT rowid AS zstd_rowid,id,payload FROM {} WHERE {} IS NULL ORDER BY rowid LIMIT 32",
+                config.backing_table, config.dict_column,
+            ))).await?.into_iter().map(|row| Ok(PendingPayloadRow {
+                rowid: row.try_get("", "zstd_rowid")?, id: row.try_get("", "id")?, payload: row.try_get("", "payload")?,
+            })).collect::<Result<Vec<_>>>()?;
             if rows.is_empty() {
                 break;
             }
             let prepared = prepare_payload_rows(rows, 3, None)?;
-            let (applied, _) =
-                apply_prepared_payload_rows(&db, config, -1, &prepared, None).await?;
-            total += applied;
+            let tx = db.begin().await?;
+            for row in prepared {
+                total += tx.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite, format!(
+                    "UPDATE {} SET payload=?,{}=-1 WHERE rowid=? AND id=? AND {} IS NULL AND payload=?",
+                    config.backing_table, config.dict_column, config.dict_column,
+                ), [row.compressed_payload.into(),row.rowid.into(),row.id.into(),row.original_payload.into()])).await?.rows_affected();
+            }
+            tx.commit().await?;
         }
         anyhow::ensure!(
-            !has_pending_uncompressed_rows(&db, config).await?,
+            query_i64(
+                &db,
+                &format!(
+                    "SELECT COUNT(*) AS value FROM {} WHERE {} IS NULL",
+                    config.backing_table, config.dict_column
+                ),
+                "legacy physical fixture must drain"
+            )
+            .await?
+                == 0,
             "test compression exceeded its bounded fixture size"
         );
     }
@@ -1258,8 +1296,10 @@ async fn has_pending_uncompressed_rows(
     query_i64(
         db,
         format!(
-            "SELECT EXISTS(SELECT 1 FROM {} WHERE {} IS NULL LIMIT 1) AS value",
-            config.backing_table, config.dict_column
+            "SELECT EXISTS(SELECT 1 FROM {} AS target WHERE {} IS NULL AND {} LIMIT 1) AS value",
+            config.backing_table,
+            config.dict_column,
+            compression_eligibility_sql()
         )
         .as_str(),
         "failed to inspect pending sqlite-zstd rows",
@@ -1485,8 +1525,10 @@ async fn pending_uncompressed_rows(db: &SqliteDatabase, config: ZstdColumnConfig
     query_i64(
         db,
         format!(
-            "SELECT COUNT(*) AS value FROM {} WHERE {} IS NULL",
-            config.backing_table, config.dict_column
+            "SELECT COUNT(*) AS value FROM {} AS target WHERE {} IS NULL AND {}",
+            config.backing_table,
+            config.dict_column,
+            compression_eligibility_sql()
         )
         .as_str(),
         "failed to count pending sqlite-zstd rows",
@@ -1685,6 +1727,7 @@ mod tests {
         ConnectionTrait, Database, DatabaseConnection, DbBackend, Statement, TransactionTrait,
     };
     use std::sync::Arc;
+    use std::time::Duration;
     use tokio::sync::Notify;
 
     #[derive(Default)]
@@ -1860,7 +1903,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bounded_continuation_differs_from_payloads_awaiting_more_training_input() {
+    async fn bounded_continuation_drains_sealed_small_batches_without_waiting_for_more_samples() {
         let fixture = budget_fixture(&["tiny"; DICTIONARY_MIN_SAMPLE_ROWS]).await;
         let mut cache = PreparedDictionaryCache::new(&fixture.store);
         let cancellation = tokio_util::sync::CancellationToken::new();
@@ -1896,12 +1939,93 @@ mod tests {
             blocked
                 .summaries
                 .iter()
-                .all(|summary| summary.maintenance_more_pending
+                .all(|summary| !summary.maintenance_more_pending
                     && !summary.maintenance_runnable
-                    && summary.compressed_rows == 0
-                    && summary.pending_after > 0),
-            "unchanged insufficient training data waits for a source change"
+                    && summary.compressed_rows == DICTIONARY_MIN_SAMPLE_ROWS as u64
+                    && summary.pending_after == 0),
+            "a sealed small batch must compress without a dictionary, not wait for future Turns"
         );
+    }
+
+    #[tokio::test]
+    async fn worker_compresses_only_terminal_projected_turns_and_retains_late_writes() {
+        use pioneer_protocol::TurnStatus;
+        let fixture = budget_fixture(&["sealed small payload"; DICTIONARY_MIN_SAMPLE_ROWS]).await;
+        let db = fixture.store.database_connection();
+        // Capture real pending bytes, then resume both owners before their CAS.
+        // Payload equality alone must not allow compression of a resumed Turn.
+        let mut prepared = Vec::new();
+        for &config in ZSTD_PAYLOAD_COLUMNS {
+            let rows = load_pending_payload_rows(&db, config, 32, 1024 * 1024)
+                .await
+                .unwrap();
+            assert_eq!(rows.len(), DICTIONARY_MIN_SAMPLE_ROWS);
+            prepared.push((config, prepare_payload_rows(rows, 6, None).unwrap()));
+        }
+        db.execute_unprepared("UPDATE turn SET status='in_progress'")
+            .await
+            .unwrap();
+        for (config, rows) in prepared {
+            assert_eq!(
+                apply_prepared_payload_rows(&db, config, -1, &rows, None)
+                    .await
+                    .unwrap(),
+                (0, rows.len() as u64)
+            );
+        }
+        let completed_cycle = Arc::new(Notify::new());
+        let after_cycle = completed_cycle.clone();
+        let mut cache = PreparedDictionaryCache::new(&fixture.store);
+        cache.after_cycle = Some(Arc::new(move |_| after_cycle.notify_one()));
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let worker = tokio::spawn(crate::database::maintenance::run_zstd_worker_for_test(
+            Arc::new(fixture.store.clone()),
+            cancellation.clone(),
+            cache,
+        ));
+        let outcome = tokio::time::timeout(Duration::from_secs(20), async {
+            completed_cycle.notified().await;
+            for &config in ZSTD_PAYLOAD_COLUMNS {
+                assert!(!super::has_pending_uncompressed_rows(&db, config).await.unwrap(),
+                    "active raw rows must not keep the compression owner runnable");
+                assert_eq!(query_i64(&db, &format!("SELECT COUNT(*) AS value FROM {} WHERE {} IS NULL", config.backing_table, config.dict_column)).await, DICTIONARY_MIN_SAMPLE_ROWS as i64);
+            }
+            assert_eq!(query_i64(&db, "SELECT COUNT(*) AS value FROM _zstd_dicts WHERE id <> -1").await, 0,
+                "active data must not train a dictionary");
+            // A terminal status alone is insufficient while its watermark lags.
+            db.execute_unprepared("UPDATE turn_event_projection_stream_state SET projected_through_sequence=0 WHERE turn_id='turn_zstd'").await.unwrap();
+            fixture.store.update_turn_status("thread_zstd", "turn_zstd", TurnStatus::Completed, None, chrono::Utc::now().timestamp()).await.unwrap();
+            completed_cycle.notified().await;
+            assert_eq!(query_i64(&db, "SELECT COUNT(*) AS value FROM _turn_event_zstd WHERE _payload_dict IS NULL").await, DICTIONARY_MIN_SAMPLE_ROWS as i64);
+            // External writer fixture: advance the existing authoritative
+            // projection watermark and publish its existing commit signal.
+            let change = db.work_signal("maintenance.zstd").changing();
+            db.execute_unprepared("UPDATE turn_event_projection_stream_state SET projected_through_sequence=(SELECT MAX(sequence) FROM turn_event WHERE turn_id='turn_zstd') WHERE turn_id='turn_zstd'").await.unwrap();
+            change.completed(true);
+            completed_cycle.notified().await;
+            assert_eq!(query_i64(&db, "SELECT COUNT(*) AS value FROM _turn_event_zstd WHERE _payload_dict IS NULL").await, 0);
+            assert_eq!(query_i64(&db, "SELECT COUNT(*) AS value FROM _turn_item_zstd WHERE _payload_dict IS NULL").await, DICTIONARY_MIN_SAMPLE_ROWS as i64,
+                "finishing one Turn must not compress another active Turn");
+            fixture.store.update_turn_status("thread_zstd", "turn_item_zstd", TurnStatus::Interrupted, None, chrono::Utc::now().timestamp()).await.unwrap();
+            completed_cycle.notified().await;
+            assert_eq!(query_i64(&db, "SELECT COUNT(*) AS value FROM _turn_item_zstd WHERE _payload_dict IS NULL").await, 0);
+            // A late physical rewrite of a completed Turn must not be stranded
+            // after the owner reached EOF. No new item/event is needed.
+            let change = db.work_signal("maintenance.zstd").changing();
+            db.execute_unprepared("UPDATE turn_event SET payload=payload WHERE id='event_0'").await.unwrap();
+            change.completed(true);
+            completed_cycle.notified().await;
+            assert_eq!(query_i64(&db, "SELECT COUNT(*) AS value FROM _turn_event_zstd WHERE _payload_dict IS NULL").await, 0);
+            for (index, &config) in ZSTD_PAYLOAD_COLUMNS.iter().enumerate() {
+                let rows = db.query_all_raw(Statement::from_string(DbBackend::Sqlite, format!("SELECT payload FROM {} ORDER BY id", config.table))).await.unwrap();
+                let mut actual=rows.into_iter().map(|row| row.try_get::<String>("", "payload").unwrap()).collect::<Vec<_>>();
+                let mut expected=fixture.payloads[index].clone(); actual.sort(); expected.sort();
+                assert_eq!(actual,expected,"both raw and compressed views must preserve logical data");
+            }
+        }).await;
+        cancellation.cancel();
+        worker.await.unwrap();
+        outcome.unwrap();
     }
 
     // Observe actual CDict copies in the blocking miss path, rather than
@@ -3696,6 +3820,23 @@ mod tests {
         assert!(!outcome.summaries.is_empty());
     }
 
+    async fn ready_payload_owner(connection: &DatabaseConnection, turn: &str) {
+        for sql in [
+            "INSERT OR IGNORE INTO workspace(id,name,is_active,is_current) VALUES('ws_zstd','zstd fixture',1,1)",
+            "INSERT OR IGNORE INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES('thread_zstd','ws_zstd','','agent','m','p','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        ] {
+            connection.execute_unprepared(sql).await.unwrap();
+        }
+        connection.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+            "INSERT OR IGNORE INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES(?,'thread_zstd','completed','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+            [turn.into()],
+        )).await.unwrap();
+        connection.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+            "INSERT INTO turn_event_projection_stream_state(turn_id,thread_id,status,projected_through_sequence,created_at,updated_at) VALUES(?,'thread_zstd','active',COALESCE((SELECT MAX(sequence) FROM turn_event WHERE turn_id=?),0),CURRENT_TIMESTAMP,CURRENT_TIMESTAMP) ON CONFLICT(turn_id) DO UPDATE SET projected_through_sequence=excluded.projected_through_sequence",
+            [turn.into(),turn.into()],
+        )).await.unwrap();
+    }
+
     async fn insert_turn_events(connection: &DatabaseConnection, count: i64) {
         insert_turn_events_with_offset(connection, count, 0).await;
     }
@@ -3705,6 +3846,7 @@ mod tests {
         count: i64,
         offset: i64,
     ) {
+        ready_payload_owner(connection, "turn_zstd").await;
         for index in 0..count {
             let sequence = offset + index;
             let payload = large_payload(sequence);
@@ -3717,6 +3859,7 @@ mod tests {
                 .await
                 .expect("turn_event should insert");
         }
+        ready_payload_owner(connection, "turn_zstd").await;
     }
 
     fn large_payload(sequence: i64) -> String {
@@ -3735,6 +3878,7 @@ mod tests {
         count: i64,
         offset: i64,
     ) {
+        ready_payload_owner(connection, "turn_item_zstd").await;
         for index in 0..count {
             let sequence = offset + index;
             let item_id = format!("item_{sequence}");
@@ -3842,7 +3986,7 @@ mod tests {
         }
     }
 
-    async fn query_i64(connection: &DatabaseConnection, sql: &str) -> i64 {
+    async fn query_i64<C: ConnectionTrait>(connection: &C, sql: &str) -> i64 {
         let row = connection
             .query_one_raw(Statement::from_string(DbBackend::Sqlite, sql.to_owned()))
             .await

@@ -409,7 +409,22 @@ pub async fn discover<C: ConnectionTrait>(
     db: &C,
     limit: u64,
 ) -> Result<Vec<(String, DateTimeWithTimeZone)>> {
-    turn_event_projection_state::Entity::find()
+    discover_for_turns(db, limit, None).await
+}
+
+pub(crate) async fn discover_for_turns<C: ConnectionTrait>(
+    db: &C,
+    limit: u64,
+    turn_ids: Option<&[String]>,
+) -> Result<Vec<(String, DateTimeWithTimeZone)>> {
+    let mut query = turn_event_projection_state::Entity::find();
+    if let Some(turn_ids) = turn_ids {
+        if turn_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        query = query.filter(turn_event_projection_state::Column::TurnId.is_in(turn_ids.to_vec()));
+    }
+    query
         .select_only()
         .column(turn_event_projection_state::Column::EventId)
         .column_as(eligible_clock(), "eligible_at")

@@ -330,17 +330,23 @@ pub(super) fn local_capture() -> (
 
 #[tokio::test]
 async fn reconciliation_reporting_is_retained_in_both_real_worker_loops() {
-    let (processor, _, _, _, _, _) = setup_workspace_message_processor().await;
-    let processor = Arc::new(processor);
-    // Closed pools supply a real typed storage failure without fixture hooks.
-    processor
-        .crud_store
-        .database_connection()
-        .close()
+    let (mut processor, _, _, _, _, _) = setup_workspace_message_processor().await;
+    // Keep writer settlement available: closing both pools stops recovery at
+    // begin_pass after an uncertain write, before either domain reporter runs.
+    // A closed reader supplies the same real PoolClosed error on every pass.
+    let writer = sea_orm::Database::connect("sqlite::memory:").await.unwrap();
+    let reader = sea_orm::Database::connect("sqlite::memory:").await.unwrap();
+    reader
+        .execute_unprepared("PRAGMA query_only=ON")
         .await
         .unwrap();
+    reader.clone().close().await.unwrap();
+    processor.crud_store = Arc::new(CrudStore::new(pioneer_sqlite::SqliteDatabase::new(
+        reader, writer,
+    )));
+    let processor = Arc::new(processor);
     // SQLite pool setup uses a real worker thread. Pause only after the fixture
-    // is ready and closed, so Tokio cannot advance its acquisition timeout while
+    // is ready, so Tokio cannot advance its acquisition timeout while
     // that thread is still opening the connection.
     tokio::time::pause();
     let (hub, transport, dispatch) = local_capture();
@@ -355,7 +361,7 @@ async fn reconciliation_reporting_is_retained_in_both_real_worker_loops() {
             .bind_hub(hub),
     );
     let mut events = Vec::new();
-    // Existing replay/lifecycle errors mark successive real recovery passes.
+    // Existing replay/child errors mark successive real recovery passes.
     // Delivery now runs in the independent, coalesced consumer owners.
     for pass in 1..=3 {
         let mut completed = false;
@@ -370,7 +376,9 @@ async fn reconciliation_reporting_is_retained_in_both_real_worker_loops() {
                 .count();
             let lifecycle_passes = events
                 .iter()
-                .filter(|event| event.message.as_deref() == Some("task delivery worker failed"))
+                .filter(|event| {
+                    event.message.as_deref() == Some("task child terminal reconciler failed")
+                })
                 .count();
             if projection_passes >= pass && lifecycle_passes >= pass {
                 completed = true;

@@ -93,27 +93,55 @@ pub(crate) fn materialize_task_events(
 
 /// Covers only Task mutations that can create runnable/dependent work. The
 /// guard starts outside DB admission so cancellation retains uncertainty.
-pub(crate) struct TaskWorkChange(Vec<pioneer_sqlite::WorkChange>);
+pub(crate) struct TaskWorkChange {
+    changes: Vec<pioneer_sqlite::WorkChange>,
+    frozen: pioneer_sqlite::WorkChange,
+    frozen_keys: Option<Vec<String>>,
+}
 impl TaskWorkChange {
     pub(crate) fn new(database: &pioneer_sqlite::SqliteDatabase) -> Self {
-        Self(
-            [
+        Self {
+            frozen: database.work_signal("maintenance.frozen").changing(),
+            frozen_keys: None,
+            changes: [
                 "tasks.scheduler",
                 "tasks.lifecycle",
                 "tasks.fanout",
                 "tasks.review",
                 "compaction",
-                "maintenance.frozen",
                 "maintenance.portable",
                 "maintenance.html",
             ]
             .into_iter()
             .map(|domain| database.work_signal(domain).changing())
             .collect(),
-        )
+        }
+    }
+    pub(crate) fn for_tasks(
+        database: &pioneer_sqlite::SqliteDatabase,
+        tasks: impl IntoIterator<Item = String>,
+    ) -> Self {
+        let mut change = Self::new(database);
+        let keys = tasks
+            .into_iter()
+            .take(257)
+            .map(|id| format!("t:{id}"))
+            .collect::<Vec<_>>();
+        change.frozen_keys = (!keys.is_empty()).then_some(keys);
+        change
+    }
+    pub(crate) fn for_source(
+        database: &pioneer_sqlite::SqliteDatabase,
+        kind: &str,
+        id: &str,
+    ) -> Self {
+        let mut change = Self::new(database);
+        change.frozen_keys = Some(vec![format!("{kind}:{id}")]);
+        change
     }
     pub(crate) fn completed(self, changed: bool) {
-        for change in self.0 {
+        crate::frozen_lifetime::complete_keys(self.frozen, &self.frozen_keys, changed);
+        for change in self.changes {
             change.completed(changed);
         }
     }
@@ -153,6 +181,7 @@ impl crate::CrudStore {
 /// repeated finalization or an item-only event.
 pub(crate) struct TaskTurnChange {
     change: pioneer_sqlite::WorkChange,
+    portable: pioneer_sqlite::WorkChange,
     before: Vec<(String, TurnDependencyFacts)>,
 }
 impl TaskTurnChange {
@@ -161,6 +190,7 @@ impl TaskTurnChange {
         ids: Vec<String>,
     ) -> anyhow::Result<Self> {
         let change = database.work_signal("tasks.lifecycle").changing();
+        let portable = database.work_signal("maintenance.portable").changing();
         let mut ids = ids;
         ids.sort();
         ids.dedup();
@@ -168,17 +198,34 @@ impl TaskTurnChange {
         for id in ids {
             before.push((id.clone(), turn_dependency_facts(database, &id).await?));
         }
-        Ok(Self { change, before })
+        Ok(Self {
+            change,
+            portable,
+            before,
+        })
     }
     pub(crate) async fn completed(
         self,
         database: &pioneer_sqlite::SqliteDatabase,
     ) -> anyhow::Result<()> {
         let mut changed = false;
+        let mut terminal_turns = Vec::new();
         for (id, before) in self.before {
-            changed |= before != turn_dependency_facts(database, &id).await?;
+            let after = turn_dependency_facts(database, &id).await?;
+            if before.turn != after.turn
+                && after.turn.as_ref().is_some_and(|(_, status, _)| {
+                    matches!(
+                        status.as_str(),
+                        "completed" | "failed" | "interrupted" | "blocked"
+                    )
+                })
+            {
+                terminal_turns.push(id);
+            }
+            changed |= before != after;
         }
         self.change.completed(changed);
+        self.portable.completed_keys(&terminal_turns);
         Ok(())
     }
 }

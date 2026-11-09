@@ -41,6 +41,19 @@ async fn ready(store: &CrudStore) {
 async fn seed(store: &CrudStore, turn_id: &str, count: i64, watermark: i64) {
     let db = store.database_connection();
     let now = chrono::Utc::now().fixed_offset();
+    pioneer_entity::turn::Entity::insert(pioneer_entity::turn::ActiveModel {
+        id: sea_orm::Set(turn_id.into()),
+        thread_id: sea_orm::Set("thread".into()),
+        status: sea_orm::Set("completed".into()),
+        prompt_manifest_json: sea_orm::Set("{}".into()),
+        mentions_json: sea_orm::Set("[]".into()),
+        created_at: sea_orm::Set(now),
+        updated_at: sea_orm::Set(now),
+        ..Default::default()
+    })
+    .exec(&db)
+    .await
+    .unwrap();
     streams::ensure_healthy(&db, "thread", turn_id, now)
         .await
         .unwrap();
@@ -1149,4 +1162,120 @@ async fn discovery_uses_read_only_pool_and_cancelled_writer_wait_does_not_block_
     drop(store);
     database.close().await.unwrap();
     let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn running_turn_receipts_wait_for_terminal_and_resume_invalidates_preparation() {
+    let store = store().await;
+    seed(&store, "turn", 3, 3).await;
+    ready(&store).await;
+    let db = store.database_connection();
+    for status in ["in_progress", "completed", "failed", "interrupted"] {
+        turn::Entity::update_many()
+            .col_expr(turn::Column::Status, Expr::value(status))
+            .filter(turn::Column::Id.eq("turn"))
+            .exec(&db)
+            .await
+            .unwrap();
+        assert_eq!(
+            discovered_turn(&db, None).await.is_some(),
+            status != "in_progress"
+        );
+    }
+    let selected = next_stream(&db, None, None).await.unwrap().unwrap();
+    let prepared = prepare(&db, selected).await.unwrap();
+    // A genuine state change between reader preparation and writer apply.
+    turn::Entity::update_many()
+        .col_expr(turn::Column::Status, Expr::value("in_progress"))
+        .filter(turn::Column::Id.eq("turn"))
+        .exec(&db)
+        .await
+        .unwrap();
+    let tx = db.begin().await.unwrap();
+    assert_eq!(apply(&tx, &prepared).await.unwrap(), 0);
+    tx.commit().await.unwrap();
+    assert_eq!(boundary(&store, "turn").await, 0);
+    assert_eq!(receipt::Entity::find().count(&db).await.unwrap(), 3);
+    turn::Entity::update_many()
+        .col_expr(turn::Column::Status, Expr::value("completed"))
+        .filter(turn::Column::Id.eq("turn"))
+        .exec(&db)
+        .await
+        .unwrap();
+    let restarted = CrudStore::new(db.clone()).with_maintenance_access();
+    assert_eq!(
+        restarted
+            .cleanup_projection_receipts_quantum(None, None)
+            .await
+            .unwrap()
+            .rows_deleted,
+        3
+    );
+    assert_eq!(boundary(&restarted, "turn").await, 3);
+}
+
+#[tokio::test]
+async fn addressed_batches_freeze_the_frontier_preserve_other_turns_and_recover_on_restart() {
+    let store = store().await;
+    seed(&store, "a", 130, 130).await;
+    seed(&store, "b", 1, 1).await;
+    ready(&store).await;
+    let first = store
+        .cleanup_projection_receipts_for_turn("a", None)
+        .await
+        .unwrap();
+    assert_eq!(first.rows_deleted, 128);
+    assert_eq!(first.through_sequence, Some(130));
+    assert_eq!(boundary(&store, "b").await, 0);
+    insert_event(&store, "a", 131, "projected").await;
+    let db = store.database_connection();
+    assert!(
+        streams::advance_projected_through(&db, "a", 130, 131, chrono::Utc::now().fixed_offset())
+            .await
+            .unwrap()
+    );
+    let second = store
+        .cleanup_projection_receipts_for_turn("a", first.through_sequence)
+        .await
+        .unwrap();
+    assert_eq!(second.rows_deleted, 2);
+    assert_eq!(boundary(&store, "a").await, 130);
+    assert_eq!(
+        store
+            .cleanup_projection_receipts_for_turn("a", first.through_sequence)
+            .await
+            .unwrap()
+            .rows_deleted,
+        0
+    );
+    assert!(
+        receipt::Entity::find_by_id("a-131")
+            .one(&db)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    // A later notification opens a new frontier for the same ID, not an
+    // inventory of B or any other old stream.
+    assert_eq!(
+        store
+            .cleanup_projection_receipts_for_turn("a", None)
+            .await
+            .unwrap()
+            .rows_deleted,
+        1
+    );
+    assert_eq!(boundary(&store, "b").await, 0);
+    let restarted = CrudStore::new(db).with_maintenance_access();
+    // Process-local hints may disappear on restart; durable recovery is enough.
+    assert_eq!(
+        restarted
+            .cleanup_projection_receipts_quantum(None, None)
+            .await
+            .unwrap()
+            .last_turn_id
+            .as_deref(),
+        Some("b")
+    );
+    assert_eq!(boundary(&restarted, "b").await, 1);
 }

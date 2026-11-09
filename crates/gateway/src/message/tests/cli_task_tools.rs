@@ -560,7 +560,7 @@ fn threads_first_cli_outbox_dispatch_uses_committed_turn_once() {
 // Creation returns a durable TaskRun before its asynchronously admitted child
 // necessarily exists. Observe that run's authoritative binding, rather than
 // assuming nullable child ids in a creation response are already populated.
-async fn wait_for_task_cli_child(
+pub(super) async fn wait_for_task_cli_child(
     processor: &MessageProcessor,
     run_id: &str,
     previous_turn_id: Option<&str>,

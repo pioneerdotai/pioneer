@@ -458,7 +458,10 @@ impl CrudStore {
         &self,
         prepared: PreparedTaskTerminalTransition,
     ) -> Result<TaskTerminalCommitOutcome> {
-        let change = crate::task_events::TaskWorkChange::new(&self.connection);
+        let change = crate::task_events::TaskWorkChange::for_tasks(
+            &self.connection,
+            [prepared.state.task.id.clone()],
+        );
         // Keep the existing bounded terminal state machine off the worker stack.
         let result = Box::pin(self.commit_task_terminal_transition_inner(prepared)).await;
         if let Ok(outcome) = &result {

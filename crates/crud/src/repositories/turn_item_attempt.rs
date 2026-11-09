@@ -463,10 +463,27 @@ pub async fn list_expired_running_attempt_page<C: ConnectionTrait>(
     Vec<RunningAttemptSnapshot>,
     Option<crate::TimeoutCandidateCursor>,
 )> {
+    list_expired_running_attempt_page_scoped(db, now, limit, after, None).await
+}
+
+pub(crate) async fn list_expired_running_attempt_page_scoped<C: ConnectionTrait>(
+    db: &C,
+    now: DateTimeWithTimeZone,
+    limit: u64,
+    after: Option<&crate::TimeoutCandidateCursor>,
+    turn_id: Option<&str>,
+) -> Result<(
+    Vec<RunningAttemptSnapshot>,
+    Option<crate::TimeoutCandidateCursor>,
+)> {
+    let scope = turn_id
+        .map(|id| Condition::all().add(turn_item_attempt::Column::TurnId.eq(id)))
+        .unwrap_or_else(Condition::all);
     let (upper_started_at, upper_id) = if let Some(cursor) = after {
         (cursor.upper_started_at, cursor.upper_id.clone())
     } else {
         let Some(upper) = turn_item_attempt::Entity::find()
+            .filter(scope.clone())
             .select_only()
             .column(turn_item_attempt::Column::StartedAt)
             .column(turn_item_attempt::Column::Id)
@@ -499,6 +516,7 @@ pub async fn list_expired_running_attempt_page<C: ConnectionTrait>(
             )
     });
     let rows = turn_item_attempt::Entity::find()
+        .filter(scope.clone())
         .filter(after)
         .filter(upper)
         .filter(turn_item_attempt::Column::Status.eq(running))
@@ -1247,6 +1265,20 @@ pub async fn list_running_attempt_page_by_item_type_bounded<C: ConnectionTrait>(
     upper_id: &str,
     limit: u64,
 ) -> Result<(Vec<RunningAttemptSnapshot>, Option<String>)> {
+    list_running_attempt_page_by_item_type_bounded_scoped(
+        db, item_type, after_id, upper_id, limit, None,
+    )
+    .await
+}
+
+pub(crate) async fn list_running_attempt_page_by_item_type_bounded_scoped<C: ConnectionTrait>(
+    db: &C,
+    item_type: TurnItemType,
+    after_id: Option<&str>,
+    upper_id: &str,
+    limit: u64,
+    turn_id: Option<&str>,
+) -> Result<(Vec<RunningAttemptSnapshot>, Option<String>)> {
     let limit = limit.clamp(1, 1_024);
     let mut query = turn_item_attempt::Entity::find()
         .filter(turn_item_attempt::Column::Id.lte(upper_id))
@@ -1256,6 +1288,9 @@ pub async fn list_running_attempt_page_by_item_type_bounded<C: ConnectionTrait>(
             )),
         )
         .filter(turn_item_attempt::Column::ItemType.eq(turn_item_type_to_db(item_type)));
+    if let Some(turn_id) = turn_id {
+        query = query.filter(turn_item_attempt::Column::TurnId.eq(turn_id));
+    }
     if let Some(after_id) = after_id {
         query = query.filter(turn_item_attempt::Column::Id.gt(after_id));
     }
