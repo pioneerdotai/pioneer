@@ -9787,7 +9787,8 @@ mod tests {
 
     #[tokio::test]
     async fn declarations_snapshot_waits_for_ack_and_restores_committed_discovery() {
-        use pioneer_provider::tool_declarations::ToolDeclarations;
+        use super::{AgentDurableEvent, AgentEventHub};
+        use pioneer_provider::{ToolDefinition, tool_declarations::ToolDeclarations};
         let built = build_tools_with_extension_names(&["artifact_prepare", "artifact_register"]);
         let mut visible = vec!["request_tools".to_owned()];
         built.router.set_model_visible_tools(&visible).await;
