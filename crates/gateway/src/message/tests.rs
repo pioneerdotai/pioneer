@@ -89539,7 +89539,9 @@ async fn auxiliary_terminal_stream_accepts_late_usage_without_reopening_the_atte
         metadata["_pioneer_observation"]["context_manifest"]["layer"],
         "application_canonical"
     );
-    assert!(metadata["_pioneer_observation"]["timing"]["dispatch_at"].is_null());
+    assert!(serde_json::Value::is_null(
+        &metadata["_pioneer_observation"]["timing"]["dispatch_at"]
+    ));
     assert!(stream.next().await.unwrap().unwrap().is_final);
     assert_eq!(
         stream

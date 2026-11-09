@@ -574,7 +574,7 @@ async fn legacy_reconciliation_survives_read_overlay_redelivery_and_versioned_re
                 accounting["unresolved_reasons"][0],
                 "unconfirmed_historical_applicability"
             );
-            assert!(accounting["estimated_cost"].is_null());
+            assert!(serde_json::Value::is_null(&accounting["estimated_cost"]));
         }
         let repeat_id = generate_test_request_id("observe_reconcile", &format!("repeat{index}"));
         h.processor.process_request_for_connection(h.connection_id,&json!({"jsonrpc":"2.0","id":repeat_id,
