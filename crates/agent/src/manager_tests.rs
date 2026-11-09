@@ -4940,6 +4940,7 @@ async fn discovery_history_before_next_snapshot(
                 // Rejecting the next proposal can checkpoint the aborted attempt.
                 // It must never checkpoint before the captured crash boundary.
                 assert!(rejected, "no updated checkpoint before proposal rejection");
+                None
             }
             AgentDurableEvent::TurnFailed { .. }
             | AgentDurableEvent::TurnBlocked { .. }
