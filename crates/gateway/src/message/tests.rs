@@ -31337,6 +31337,7 @@ async fn cli_input_admission_impl(case: CliInputAdmissionCase) {
     processor
         .apply_compaction_settings(pioneer_compaction::CompactionSettings {
             selection: Some(pioneer_compaction::ModelSelection {
+                service_mode: None,
                 context_authority: None,
                 context_window: None,
                 transport: pioneer_compaction::Transport::Api,
@@ -33544,6 +33545,7 @@ async fn cancelling_cli_history_transfer_stops_before_provider_start_and_release
     processor
         .apply_compaction_settings(pioneer_compaction::CompactionSettings {
             selection: Some(pioneer_compaction::ModelSelection {
+                service_mode: None,
                 context_authority: None,
                 context_window: None,
                 transport: pioneer_compaction::Transport::Api,
