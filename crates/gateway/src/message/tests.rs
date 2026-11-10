@@ -7091,7 +7091,9 @@ impl Provider for SequencedToolProvider {
             .tool_call_rounds
             .as_ref()
             .and_then(|rounds| rounds.get(index))
-            .unwrap_or(&self.first_tool_calls);
+            .or_else(|| (index == 0).then_some(&self.first_tool_calls))
+            .map(Vec::as_slice)
+            .unwrap_or_default();
         let names = next_calls
             .iter()
             .map(|call| call.name.as_str())

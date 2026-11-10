@@ -7,6 +7,69 @@ struct CapsuleStepResult {
     outputs: Vec<(String, serde_json::Value)>,
 }
 
+#[tokio::test]
+async fn sequenced_task_provider_finishes_without_requesting_spent_tools() {
+    for multiple_rounds in [false, true] {
+        let mut provider =
+            SequencedToolProvider::new(vec![call(0, "task_result", json!({}))], "finished");
+        if multiple_rounds {
+            provider = provider.with_tool_call_rounds(vec![
+                vec![call(0, "task_result", json!({}))],
+                vec![call(1, "task_accept", json!({}))],
+            ]);
+        }
+        let mut request = ChatRequest {
+            model: "test-model".into(),
+            messages: Vec::new(),
+            temperature: None,
+            max_tokens: None,
+            tools: Some(vec![pioneer_provider::ToolDefinition {
+                name: "request_tools".into(),
+                description: String::new(),
+                parameters: json!({}),
+            }]),
+            tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning: None,
+            compiled_prompt: None,
+        };
+        assert_eq!(
+            provider.chat(request.clone()).await.unwrap().tool_calls[0].name,
+            "request_tools"
+        );
+        let unregistered_tools = request.tools.clone();
+        for name in ["task_result", "task_accept"] {
+            request
+                .tools
+                .as_mut()
+                .unwrap()
+                .push(pioneer_provider::ToolDefinition {
+                    name: name.into(),
+                    description: String::new(),
+                    parameters: json!({}),
+                });
+        }
+        assert_eq!(
+            provider.chat(request.clone()).await.unwrap().tool_calls[0].name,
+            "task_result"
+        );
+        if multiple_rounds {
+            assert_eq!(
+                provider.chat(request.clone()).await.unwrap().tool_calls[0].name,
+                "task_accept"
+            );
+        }
+        request.tools = unregistered_tools;
+        let response = provider.chat(request).await.unwrap();
+        assert!(response.tool_calls.is_empty());
+        assert_eq!(response.text, "finished");
+        assert_eq!(
+            response.termination,
+            pioneer_provider::ProviderTermination::Complete
+        );
+    }
+}
+
 // Each step constructs a new Gateway/AgentManager over the same durable store.
 // No requested-tool set, creator adapter or mutation cache survives the step.
 fn capsule_step(
