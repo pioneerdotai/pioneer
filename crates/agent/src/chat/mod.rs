@@ -478,6 +478,7 @@ fn apply_review_required_tools_to_visible_tools(
 fn sync_review_action_tools_to_observations(
     visible_tool_names: &mut Vec<String>,
     observations: &[ReviewRequiredTaskObservation],
+    requested_tool_names: &[String],
 ) -> Vec<String> {
     let allowed_review_actions = observations
         .iter()
@@ -488,6 +489,10 @@ fn sync_review_action_tools_to_observations(
     visible_tool_names.retain(|tool_name| {
         if matches!(tool_name.as_str(), "task_accept" | "task_revise")
             && !allowed_review_actions.contains(tool_name.as_str())
+            // Attached-task observations only govern automatic exposure. An
+            // explicit request also supports detached tasks and later turns;
+            // the task tool still authorizes each candidate operation.
+            && !requested_tool_names.contains(tool_name)
         {
             removed.push(tool_name.clone());
             false
@@ -5405,6 +5410,7 @@ async fn execute_agent_provider_response(
                 sync_review_action_tools_to_observations(
                     &mut visible_tool_names,
                     observation.observations.as_slice(),
+                    &requested_tool_names,
                 );
                 let has_new_signature = observation
                     .signatures
@@ -5440,7 +5446,11 @@ async fn execute_agent_provider_response(
                     messages.push(ChatMessage::user(observation.message));
                 }
             } else {
-                sync_review_action_tools_to_observations(&mut visible_tool_names, &[]);
+                sync_review_action_tools_to_observations(
+                    &mut visible_tool_names,
+                    &[],
+                    &requested_tool_names,
+                );
             }
 
             if let Some(observation) = task_gate_snapshot.as_ref().and_then(|snapshot| {
@@ -6133,6 +6143,7 @@ async fn execute_agent_provider_response(
                     sync_review_action_tools_to_observations(
                         &mut visible_tool_names,
                         observation.observations.as_slice(),
+                        &requested_tool_names,
                     );
                     apply_review_required_tools_to_visible_tools(
                         &mut visible_tool_names,
@@ -9630,7 +9641,7 @@ mod tests {
             "task_cancel".to_owned(),
         ];
         let removed_without_review =
-            sync_review_action_tools_to_observations(&mut no_review_visible, &[]);
+            sync_review_action_tools_to_observations(&mut no_review_visible, &[], &[]);
         assert_eq!(
             removed_without_review,
             vec!["task_accept".to_owned(), "task_revise".to_owned()]
@@ -9665,6 +9676,7 @@ mod tests {
         let removed = sync_review_action_tools_to_observations(
             &mut visible_tool_names,
             observations.as_slice(),
+            &[],
         );
         assert_eq!(removed, vec!["task_revise".to_owned()]);
         let added = apply_review_required_tools_to_visible_tools(
