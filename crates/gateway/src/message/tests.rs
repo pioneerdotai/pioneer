@@ -43903,7 +43903,10 @@ async fn connection_closed_discards_unmaterialized_runtime_draft() {
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
     let agent_manager = Arc::new(AgentManager::new(test_provider(), test_tool_loop_config()));
-    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    // Disconnect cleanup and the persistence assertion can acquire different
+    // pool connections. Keep both on the same file-backed reader/writer fixture.
+    let (_database_dir, workspace_manager, crud_store, workspace_id) =
+        setup_pooled_file_workspace_manager().await;
     let processor = MessageProcessor::with_agent_manager(
         thread_manager.clone(),
         agent_manager.clone(),
@@ -67254,7 +67257,7 @@ async fn codex_retry_notice_is_durable_semantic_work_in_an_internal_execution_th
             "gpt-5",
             "retry notice presentation",
         );
-        let (run, child) = drain_test_notifications_while(&mut harness.rx, async {
+        let (run, child, binding) = drain_test_notifications_while(&mut harness.rx, async {
             let response = create_task_for_test(&processor, params).await.unwrap();
             let run = response.run.unwrap();
             let child = wait_for_child_lineage_for_run(store.clone(), &run.id).await;
@@ -67263,7 +67266,11 @@ async fn codex_retry_notice_is_durable_semantic_work_in_an_internal_execution_th
                 wait_for_run_status(store.clone(), &run.id, TaskRunStatus::Running).await,
                 TaskRunStatus::Running
             );
-            (run, child)
+            // The mock records start_turn before its response is durably applied.
+            // Wait for the exact child activation while draining startup fanout.
+            let binding = cli_task_tools::wait_for_task_cli_child(&processor, &run.id, None).await;
+            assert_eq!(binding.turn_id, child.child_turn_id);
+            (run, child, binding)
         })
         .await;
         assert!(
@@ -67280,11 +67287,6 @@ async fn codex_retry_notice_is_durable_semantic_work_in_an_internal_execution_th
             .unwrap();
         assert_eq!(source.access_class, "internal");
         assert_eq!(source.sidebar_visibility, "hidden");
-        let binding = store
-            .get_cli_runtime_turn_binding(&child.child_turn_id)
-            .await
-            .unwrap()
-            .unwrap();
         let key = CLIAgentRuntimeSessionKey::new(
             &harness.workspace_id,
             runtime_id,

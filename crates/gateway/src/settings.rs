@@ -4937,7 +4937,10 @@ proactive_writes_model = { source = "custom", model_provider = "current", model 
             .expect("clock before unix epoch")
             .as_nanos();
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!("pioneer-settings-tests-{nanos}-{id}"))
+        std::env::temp_dir().join(format!(
+            "pioneer-settings-tests-{}-{nanos}-{id}",
+            std::process::id()
+        ))
     }
 
     #[test]
