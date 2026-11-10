@@ -31314,6 +31314,18 @@ async fn cli_input_admission_impl(case: CliInputAdmissionCase) {
         )),
     ));
     processor
+        .apply_compaction_settings(pioneer_compaction::CompactionSettings {
+            selection: Some(pioneer_compaction::ModelSelection {
+                context_authority: None,
+                context_window: None,
+                transport: pioneer_compaction::Transport::Api,
+                instance: "echo".into(),
+                model: "test-model".into(),
+                effort: None,
+            }),
+        })
+        .unwrap();
+    processor
         .mark_cli_runtimes_ready_for_tests(&workspace)
         .await
         .unwrap();
@@ -33507,6 +33519,18 @@ async fn cancelling_cli_history_transfer_stops_before_provider_start_and_release
             CLIAgentRuntimeKind::Codex,
         )),
     ));
+    processor
+        .apply_compaction_settings(pioneer_compaction::CompactionSettings {
+            selection: Some(pioneer_compaction::ModelSelection {
+                context_authority: None,
+                context_window: None,
+                transport: pioneer_compaction::Transport::Api,
+                instance: "echo".into(),
+                model: "test-model".into(),
+                effort: None,
+            }),
+        })
+        .unwrap();
     processor
         .mark_cli_runtimes_ready_for_tests(&workspace)
         .await
