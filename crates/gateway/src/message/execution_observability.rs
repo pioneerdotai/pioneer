@@ -394,14 +394,18 @@ impl Summary {
     }
 }
 impl MessageProcessor {
-    pub(super) async fn workspace_execution_observability(
-        &self,
-        context: &RequestContext,
-        proof: &crate::authorization::AuthorizedWorkspace,
+    // Return the heap boundary from the handler itself. Boxing an async fn at
+    // the dispatch call site still constructs and moves its full state machine
+    // in the shared dispatch poll frame, including for unrelated task RPCs.
+    pub(super) fn workspace_execution_observability<'a>(
+        &'a self,
+        context: &'a RequestContext,
+        proof: &'a crate::authorization::AuthorizedWorkspace,
         id: RequestId,
         p: pioneer_protocol::WorkspaceExecutionObservabilityParams,
-    ) {
-        let result:anyhow::Result<pioneer_protocol::WorkspaceExecutionObservabilityResponse>=async {
+    ) -> MessageFuture<'a, ()> {
+        message_future(async move {
+            let result:anyhow::Result<pioneer_protocol::WorkspaceExecutionObservabilityResponse>=async {
             anyhow::ensure!(p.workspace_id==proof.workspace_id(),"workspace scope mismatch");
             for value in [&p.operation_id,&p.parent_operation_id].into_iter().flatten() {
                 anyhow::ensure!(!value.is_empty() && value.len()<=256,"invalid scope filter");
@@ -448,8 +452,146 @@ impl MessageProcessor {
                     "query_scope":{"view":p.view,"operation_id":p.operation_id,"parent_operation_id":p.parent_operation_id},
                     "interpretation_versions":{"calculator":1,"normalizer":1,"resolver":1,"manifest":1}})})
         }.await;
-        match result {
-            Ok(value) => match JsonRpcResponse::from_result(id.clone(), &value) {
+            match result {
+                Ok(value) => match JsonRpcResponse::from_result(id.clone(), &value) {
+                    Ok(response) => {
+                        let _ = self.send_json(context.connection_id(), &response).await;
+                    }
+                    Err(_) => {
+                        self.send_error(
+                            context.connection_id(),
+                            JsonRpcErrorResponse::new(
+                                Some(id),
+                                INVALID_PARAMS_CODE,
+                                "workspace observation serialization unavailable",
+                            ),
+                        )
+                        .await
+                    }
+                },
+                Err(_) => {
+                    self.send_error(
+                        context.connection_id(),
+                        JsonRpcErrorResponse::new(
+                            Some(id),
+                            INVALID_PARAMS_CODE,
+                            "workspace observation unavailable",
+                        ),
+                    )
+                    .await
+                }
+            }
+        })
+    }
+    pub(super) fn execution_observability<'a>(
+        &'a self,
+        context: &'a RequestContext,
+        proof: &'a AuthorizedThread,
+        id: RequestId,
+        params: Params,
+    ) -> MessageFuture<'a, ()> {
+        message_future(async move {
+            if params.thread_id.trim() != proof.thread_id() {
+                self.send_error(
+                    context.connection_id(),
+                    crate::authorization::AuthorizationExternalError::NotFound.response(id),
+                )
+                .await;
+                return;
+            }
+            let result = self
+                .read_execution_observability(context, proof, &params)
+                .await;
+            match result.and_then(|value| {
+                JsonRpcResponse::from_result(id.clone(), &value).map_err(Into::into)
+            }) {
+                Ok(response) => {
+                    let _ = self.send_json(context.connection_id(), &response).await;
+                }
+                Err(_) => {
+                    self.send_error(
+                        context.connection_id(),
+                        crate::public_error::agent_rpc_error(
+                            Some(id),
+                            INVALID_PARAMS_CODE,
+                            pioneer_protocol::PublicErrorCode::InvalidInput,
+                            pioneer_protocol::PublicErrorStage::Observation,
+                            "execution observability read unavailable",
+                        ),
+                    )
+                    .await
+                }
+            }
+        })
+    }
+    pub(super) fn execution_reconcile<'a>(
+        &'a self,
+        context: &'a RequestContext,
+        proof: &'a AuthorizedThread,
+        id: RequestId,
+        p: pioneer_protocol::ExecutionReconcileParams,
+    ) -> MessageFuture<'a, ()> {
+        message_future(async move {
+            if p.thread_id.trim() != proof.thread_id() {
+                self.send_error(
+                    context.connection_id(),
+                    crate::authorization::AuthorizationExternalError::NotFound.response(id),
+                )
+                .await;
+                return;
+            }
+            let result = self
+                .historical_reconcile(
+                    proof.workspace_id(),
+                    Some(proof.thread_id()),
+                    &p.operation_id,
+                    p.expected_sequence,
+                )
+                .await;
+            match result
+                .and_then(|v| JsonRpcResponse::from_result(id.clone(), &v).map_err(Into::into))
+            {
+                Ok(response) => {
+                    let _ = self.send_json(context.connection_id(), &response).await;
+                }
+                Err(_) => {
+                    self.send_error(
+                        context.connection_id(),
+                        crate::public_error::agent_rpc_error(
+                            Some(id),
+                            INVALID_PARAMS_CODE,
+                            pioneer_protocol::PublicErrorCode::InvalidInput,
+                            pioneer_protocol::PublicErrorStage::Observation,
+                            "historical reconciliation unavailable or source changed",
+                        ),
+                    )
+                    .await
+                }
+            }
+        })
+    }
+    pub(super) fn workspace_execution_reconcile<'a>(
+        &'a self,
+        context: &'a RequestContext,
+        proof: &'a crate::authorization::AuthorizedWorkspace,
+        id: RequestId,
+        p: pioneer_protocol::WorkspaceExecutionReconcileParams,
+    ) -> MessageFuture<'a, ()> {
+        message_future(async move {
+            let result = if p.workspace_id == proof.workspace_id() {
+                self.historical_reconcile(
+                    proof.workspace_id(),
+                    None,
+                    &p.operation_id,
+                    p.expected_sequence,
+                )
+                .await
+            } else {
+                Err(anyhow::anyhow!("workspace scope mismatch"))
+            };
+            match result.and_then(|value| {
+                JsonRpcResponse::from_result(id.clone(), &value).map_err(Into::into)
+            }) {
                 Ok(response) => {
                     let _ = self.send_json(context.connection_id(), &response).await;
                 }
@@ -459,143 +601,13 @@ impl MessageProcessor {
                         JsonRpcErrorResponse::new(
                             Some(id),
                             INVALID_PARAMS_CODE,
-                            "workspace observation serialization unavailable",
+                            "workspace reconciliation unavailable or source changed",
                         ),
                     )
                     .await
                 }
-            },
-            Err(_) => {
-                self.send_error(
-                    context.connection_id(),
-                    JsonRpcErrorResponse::new(
-                        Some(id),
-                        INVALID_PARAMS_CODE,
-                        "workspace observation unavailable",
-                    ),
-                )
-                .await
             }
-        }
-    }
-    pub(super) async fn execution_observability(
-        &self,
-        context: &RequestContext,
-        proof: &AuthorizedThread,
-        id: RequestId,
-        params: Params,
-    ) {
-        if params.thread_id.trim() != proof.thread_id() {
-            self.send_error(
-                context.connection_id(),
-                crate::authorization::AuthorizationExternalError::NotFound.response(id),
-            )
-            .await;
-            return;
-        }
-        let result = self
-            .read_execution_observability(context, proof, &params)
-            .await;
-        match result
-            .and_then(|value| JsonRpcResponse::from_result(id.clone(), &value).map_err(Into::into))
-        {
-            Ok(response) => {
-                let _ = self.send_json(context.connection_id(), &response).await;
-            }
-            Err(_) => {
-                self.send_error(
-                    context.connection_id(),
-                    crate::public_error::agent_rpc_error(
-                        Some(id),
-                        INVALID_PARAMS_CODE,
-                        pioneer_protocol::PublicErrorCode::InvalidInput,
-                        pioneer_protocol::PublicErrorStage::Observation,
-                        "execution observability read unavailable",
-                    ),
-                )
-                .await
-            }
-        }
-    }
-    pub(super) async fn execution_reconcile(
-        &self,
-        context: &RequestContext,
-        proof: &AuthorizedThread,
-        id: RequestId,
-        p: pioneer_protocol::ExecutionReconcileParams,
-    ) {
-        if p.thread_id.trim() != proof.thread_id() {
-            self.send_error(
-                context.connection_id(),
-                crate::authorization::AuthorizationExternalError::NotFound.response(id),
-            )
-            .await;
-            return;
-        }
-        let result = self
-            .historical_reconcile(
-                proof.workspace_id(),
-                Some(proof.thread_id()),
-                &p.operation_id,
-                p.expected_sequence,
-            )
-            .await;
-        match result.and_then(|v| JsonRpcResponse::from_result(id.clone(), &v).map_err(Into::into))
-        {
-            Ok(response) => {
-                let _ = self.send_json(context.connection_id(), &response).await;
-            }
-            Err(_) => {
-                self.send_error(
-                    context.connection_id(),
-                    crate::public_error::agent_rpc_error(
-                        Some(id),
-                        INVALID_PARAMS_CODE,
-                        pioneer_protocol::PublicErrorCode::InvalidInput,
-                        pioneer_protocol::PublicErrorStage::Observation,
-                        "historical reconciliation unavailable or source changed",
-                    ),
-                )
-                .await
-            }
-        }
-    }
-    pub(super) async fn workspace_execution_reconcile(
-        &self,
-        context: &RequestContext,
-        proof: &crate::authorization::AuthorizedWorkspace,
-        id: RequestId,
-        p: pioneer_protocol::WorkspaceExecutionReconcileParams,
-    ) {
-        let result = if p.workspace_id == proof.workspace_id() {
-            self.historical_reconcile(
-                proof.workspace_id(),
-                None,
-                &p.operation_id,
-                p.expected_sequence,
-            )
-            .await
-        } else {
-            Err(anyhow::anyhow!("workspace scope mismatch"))
-        };
-        match result
-            .and_then(|value| JsonRpcResponse::from_result(id.clone(), &value).map_err(Into::into))
-        {
-            Ok(response) => {
-                let _ = self.send_json(context.connection_id(), &response).await;
-            }
-            Err(_) => {
-                self.send_error(
-                    context.connection_id(),
-                    JsonRpcErrorResponse::new(
-                        Some(id),
-                        INVALID_PARAMS_CODE,
-                        "workspace reconciliation unavailable or source changed",
-                    ),
-                )
-                .await
-            }
-        }
+        })
     }
     async fn historical_reconcile(
         &self,
