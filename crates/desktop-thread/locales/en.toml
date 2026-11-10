@@ -336,3 +336,8 @@
 "timeline.html.loading" = "Loading page…"
 "timeline.html.failed" = "Couldn’t display this page"
 "chat.composer.preparing_send" = "Preparing message"
+
+"chat.composer.model.context_label" = "Context window"
+"chat.composer.model.context_auto" = "Auto — up to %{tokens} tokens"
+"chat.composer.model.context_up_to" = "Up to %{tokens} tokens"
+"chat.composer.model.context_invalid" = "Saved context choice is unavailable. Choose Auto or another window."
