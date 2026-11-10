@@ -691,7 +691,7 @@ fn reviewed_background_survives_creator_and_is_reviewed_by_later_capsule_executi
                 "title":"Recurring capsule monitor", "goal":"Review saved workers", "requireReview":false,
                 "instructions":["Read saved worker task IDs and use task_get, task_result, task_revise and task_accept under current permissions."],
                 "outputInstructions":"Report confirmed review decisions.",
-                "trigger":{"kind":"interval","intervalSeconds":10,"intervalAnchorAt":4000000000},
+                "trigger":{"kind":"interval","intervalSeconds":10,"intervalAnchorAt":4_000_000_000_i64},
                 "concurrencyPolicy":{"maxParallelRuns":1,"onConflict":"queue"}
             }))],
         )
