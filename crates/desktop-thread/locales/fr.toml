@@ -340,3 +340,9 @@
 "chat.composer.model.context_auto" = "Auto — jusqu’à %{tokens} tokens"
 "chat.composer.model.context_up_to" = "Jusqu’à %{tokens} tokens"
 "chat.composer.model.context_invalid" = "Le choix enregistré est indisponible. Choisissez Auto ou une autre fenêtre."
+
+"chat.composer.model.service_label" = "Niveau de service"
+
+"chat.composer.model.service_standard" = "Standard"
+
+"chat.composer.model.service_invalid" = "Le niveau enregistré est indisponible. Choisissez Standard ou un autre mode."
