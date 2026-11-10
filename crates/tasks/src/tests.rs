@@ -2016,7 +2016,7 @@ async fn result_read_by_later_capsule_execution_does_not_require_final_review_po
     persist_test_agent_turn(&runtime, &execution, &reviewer_thread, turn, None).await;
     // A later independent execution has its own thread in the same capsule;
     // the original thread's persisted creator remains unchanged.
-    let at = now_timestamp_secs();
+    let at = chrono::Utc::now().timestamp();
     runtime
         .service()
         .store()
