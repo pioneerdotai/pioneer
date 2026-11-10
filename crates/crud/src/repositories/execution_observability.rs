@@ -167,7 +167,18 @@ pub async fn commit<C: ConnectionTrait>(
 ) -> Result<()> {
     commit_revision(db, prepared, prepared.input.revision).await
 }
-async fn commit_revision<C: ConnectionTrait>(
+// Every canonical event composes observation persistence with projection and
+// delivery. Keep its large state machine heap-pinned while retaining the same
+// borrowed transaction, cancellation and error propagation.
+fn commit_revision<'a, C: ConnectionTrait>(
+    db: &'a C,
+    prepared: &'a PreparedExecutionObservation,
+    revision: i64,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+    Box::pin(commit_revision_inner(db, prepared, revision))
+}
+
+async fn commit_revision_inner<C: ConnectionTrait>(
     db: &C,
     prepared: &PreparedExecutionObservation,
     revision: i64,
