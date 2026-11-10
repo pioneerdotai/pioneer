@@ -4411,62 +4411,71 @@ impl ProviderAttemptObservation {
     }
 }
 
-pub(super) async fn request_agent_round(
-    provider: &Arc<dyn Provider>,
+pub(super) fn request_agent_round<'a>(
+    provider: &'a Arc<dyn Provider>,
     request: ChatRequest,
-    workspace_id: &str,
-    thread_id: &str,
-    turn_id: &str,
-    thinking_item_id: &str,
+    workspace_id: &'a str,
+    thread_id: &'a str,
+    turn_id: &'a str,
+    thinking_item_id: &'a str,
     force_non_stream: bool,
     provider_timeout_policy: ProviderTimeoutPolicy,
-    event_tx: &AgentEventHub,
-) -> Result<AgentRoundResponse, ChatTurnError> {
-    let mut observation = ProviderAttemptObservation::for_request(provider.as_ref(), &request)?;
-    observation.owner = Some((workspace_id.into(), thread_id.into(), turn_id.into()));
-    observation.logical_request_id = Some(thinking_item_id.into());
-    observation
-        .publish(event_tx, workspace_id, thread_id, turn_id, None)
-        .await?;
-    let result = observation
-        .context
-        .as_ref()
-        .expect("prepared observation")
-        .scope_with_observations(
-            pioneer_provider::prompt_cache::scope(
-                workspace_id,
-                thread_id,
-                "main",
-                request_agent_round_observed(
-                    provider,
-                    request,
+    event_tx: &'a AgentEventHub,
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<AgentRoundResponse, ChatTurnError>> + Send + 'a>,
+> {
+    // Observation and transport state must not enlarge every native turn's
+    // inline future on the bounded Gateway worker stack. Keep the same owned
+    // request, borrowed event hub, ACK ordering and cancellation lifetime.
+    Box::pin(async move {
+        let mut observation = ProviderAttemptObservation::for_request(provider.as_ref(), &request)?;
+        observation.owner = Some((workspace_id.into(), thread_id.into(), turn_id.into()));
+        observation.logical_request_id = Some(thinking_item_id.into());
+        observation
+            .publish(event_tx, workspace_id, thread_id, turn_id, None)
+            .await?;
+        let result = observation
+            .context
+            .as_ref()
+            .expect("prepared observation")
+            .scope_with_observations(
+                pioneer_provider::prompt_cache::scope(
                     workspace_id,
                     thread_id,
-                    turn_id,
-                    thinking_item_id,
-                    force_non_stream,
-                    provider_timeout_policy,
-                    event_tx,
-                    &observation,
+                    "main",
+                    Box::pin(request_agent_round_observed(
+                        provider,
+                        request,
+                        workspace_id,
+                        thread_id,
+                        turn_id,
+                        thinking_item_id,
+                        force_non_stream,
+                        provider_timeout_policy,
+                        event_tx,
+                        &observation,
+                    )),
                 ),
-            ),
-            |fact| observation.publish_phase(event_tx, workspace_id, thread_id, turn_id, fact),
-        )
-        .await
-        .map_err(|_| ChatTurnError::Terminal("request observation commit unconfirmed".into()))?;
-    observation
-        .publish(
-            event_tx,
-            workspace_id,
-            thread_id,
-            turn_id,
-            Some(result.is_ok()),
-        )
-        .await?;
-    result.map(|mut round| {
-        round.observed_attempt_operation_id =
-            Some(format!("provider:{turn_id}:{}", observation.id));
-        round
+                |fact| observation.publish_phase(event_tx, workspace_id, thread_id, turn_id, fact),
+            )
+            .await
+            .map_err(|_| {
+                ChatTurnError::Terminal("request observation commit unconfirmed".into())
+            })?;
+        observation
+            .publish(
+                event_tx,
+                workspace_id,
+                thread_id,
+                turn_id,
+                Some(result.is_ok()),
+            )
+            .await?;
+        result.map(|mut round| {
+            round.observed_attempt_operation_id =
+                Some(format!("provider:{turn_id}:{}", observation.id));
+            round
+        })
     })
 }
 
