@@ -3,7 +3,7 @@ name: subagents
 slug: subagents
 owner: pioneer
 description: "Use this skill when Pioneer should delegate current-turn work to attached task-backed subagents, coordinate parallel child agents, wait for child results, review/revise/accept/cancel/detach attached work, or synthesize accepted child results into the parent answer."
-version: "0.2.2"
+version: "0.2.3"
 user-invocable: true
 disable-model-invocation: false
 implicit-invocation: required
@@ -16,7 +16,7 @@ Attached subagents are task-backed child agents created to help with the current
 
 A child result is evidence, not the final user answer, until the parent reviews it, accepts it, integrates it, or deliberately rejects/routes it elsewhere.
 
-The initiating thread is the original user-facing conversation. A subagent executes in an internal child thread; its parent may also be a child. Results pass through the assigned reviewer before becoming part of the user-facing answer.
+The initiating thread is the original user-facing conversation. A subagent executes in an internal child thread; its parent may also be a child. The parent inspects child results before using them in the user-facing answer. Formal Task acceptance is required only when requireReview:true was selected.
 
 ## Product Model
 
@@ -34,7 +34,7 @@ Do not use this skill for scheduled, recurring, future, or long-running backgrou
 
 Inter-agent chat is not currently supported. Do not use `thread_message_send`, `threads_turn_start`, or equivalent conversation writes to exchange instructions, progress, questions, blockers, or results between parent, child, or sibling agents.
 
-A child returns its result and any blockers in its final answer in its own execution thread; the runtime creates the review candidate. The parent uses `task_wait` / `task_result` to read it and `task_accept` / `task_revise` to respond. Do not send an additional message to announce or duplicate the result.
+A child returns its result and blockers in its own execution thread. With requireReview:false it completes automatically; the parent reads the terminal result through task_wait/task_get. With requireReview:true it submits a review candidate; the parent reads task_wait/task_result and uses task_accept/task_revise. Do not send an additional message to announce or duplicate the result.
 
 ## Quick Start
 
@@ -42,10 +42,10 @@ Before delegating, decide whether attached subagents improve the current answer.
 
 1. If the user needs one direct answer and the work is small, tightly coupled, or sequential, do it in the parent turn.
 2. If independent focused work improves speed, coverage, verification, or auditability, use `task_create` to create attached subagents.
-3. Create all independent child tasks with `task_create` first.
+3. Create independent child tasks first. Use requireReview:false normally; explicitly select true when the assignment needs formal acceptance and same-worker revisions.
 4. Call `task_wait` until the next child result is terminal or requires review.
-5. Review every returned terminal or review-required result immediately. Use the candidate's `reviewContent`; if it is truncated or no longer present in context, read the exact candidate again with `task_result`.
-6. Accept good candidates, revise close-but-incomplete candidates, cancel irrelevant or unsafe candidates, or detach work that should no longer block the parent.
+5. Inspect each returned terminal result. For review-required candidates, read complete reviewContent, paging through task_result when necessary.
+6. For review-required candidates, accept good work or request revisions. Automatically completed results need no task_accept and cannot be reopened with task_revise. Cancel or detach active work only when appropriate.
 7. Call `task_wait` again for the remaining active runs and repeat the review cycle until all child work is resolved.
 8. Synthesize the parent answer from accepted results and direct parent work.
 
@@ -105,7 +105,7 @@ Prefer parent-only work when:
 
 ## Create Good Attached Subagents
 
-For immediate attached subagents, omit `trigger`.
+For immediate attached subagents, omit `trigger` and normally set `requireReview:false`. Set true before launching work that requires formal acceptance or revisions.
 
 Good child tasks are narrow and auditable:
 
@@ -125,7 +125,7 @@ Read `references/tool-schemas.md` for exact payload examples.
 
 ## Wait And Review
 
-Task read/control access follows the authorized root-thread capsule and current action grants; a new turn does not by itself erase access. Review is stricter: reading the full review candidate, accepting it, or requesting revisions requires the task's designated reviewer. Capsule membership alone does not make another subagent the reviewer. Recovery of the same reviewer execution preserves that identity; an independent new execution does not inherit it.
+Task reading, control, and review follow the authorized root-thread capsule and current action grants/capabilities, including in later turns or independent executions. Reading full candidate content requires permitted result reading, not final-review authority. Accept/revise additionally enforce UserFinal, required advisory/quorum policy, authentic actor binding, and the prohibition on self-acceptance. Creator identity and execution graph do not grant exclusive review rights.
 
 An access or runtime error is not proof that a child stopped. Do not recreate work or claim cancellation on that basis; report the unresolved state and avoid duplicate work. See `system:pioneer/tasks` for durable task access and failure handling.
 
@@ -141,7 +141,7 @@ The parent may also keep working and check a child with `task_get`. A `running` 
 - evidence and artifact requirements;
 - safety, scope, and write constraints.
 
-For an authorized parent reviewer, `reviewRequired.reviewContent` contains the reviewer-safe child result for that exact candidate. Do not decide from `summary` alone; summary is only a preview and may be just the first heading. If `reviewContent.truncated` is true, call `task_result` with the candidate's `candidateId`, then continue with each returned `nextCursor` until the complete content has been inspected. Use the same `task_result(candidateId)` flow to re-read a candidate after recovery or context compaction.
+For an authorized result reader, `reviewRequired.reviewContent` contains the reviewer-safe child result for that exact candidate. Do not decide from `summary` alone; summary is only a preview and may be just the first heading. If `reviewContent.truncated` is true, call `task_result` with the candidate's `candidateId`, then continue with each returned `nextCursor` until the complete content has been inspected. Use the same `task_result(candidateId)` flow to re-read a candidate after recovery or context compaction.
 
 Always read by `candidateId`, not by `taskId`: a task may have several immutable revision rounds, and the review decision must apply to the exact content that was inspected.
 
@@ -187,3 +187,28 @@ Do not paste raw child outputs blindly. Combine duplicate findings, preserve imp
 - Do not quote rejected candidates as final results.
 - Do not finish while attached child work from this turn is unresolved.
 - Do not claim a child was created, accepted, revised, cancelled, or detached unless the relevant tool succeeded.
+
+## Review choice and later executions
+
+Use `requireReview:false` for ordinary task/subagent work; it is the default for
+all types and attachment modes, including scheduled, interval, cron and webhook.
+Set `requireReview:true` explicitly when each run result must wait for acceptance
+and may need same-worker revisions. The meaning does not depend on the trigger.
+Enabled review has no timeout acceptance. The saved policy supplies the revision
+budget (normally five); acceptance is final. Detaching a task or changing its
+schedule does not silently change its saved review choice.
+
+Later authorized executions in the same capsule can inspect and review saved
+workers under current grants, without creator/graph ownership or adoption.
+`task_get.reviewRequired` exposes current candidate references and available
+actions; read full content through `task_result(candidateId)` and all pages.
+For recurring/webhook work, decisions target the exact run and candidate, even
+when another run is queued or running. Read access does not require TaskReview;
+self-review, policy eligibility, finality and stale-candidate guards still apply.
+
+Background work without review defaults to origin_thread delivery. For
+`background:true` plus `requireReview:true`, omitted deliveryPolicy selects none;
+an explicit permitted policy wins. Results, errors and blocked/exhausted outcomes
+follow that same policy. None keeps results/history available without delivery.
+Scheduled work retains its existing delivery defaults and requires self-contained
+instructions and available Skills/MCP; capability inheritance is not promised.

@@ -1361,3 +1361,124 @@ async fn webhook_terminal_reconciles_started_sibling_but_rejects_unbacked_activi
         }
     }
 }
+
+#[tokio::test]
+async fn webhook_review_targets_one_run_while_later_requests_change_task_status() {
+    let runtime = runtime_with_review_config().await;
+    persist_test_agent_turn(
+        &runtime,
+        TEST_PARENT_EXECUTION_ID,
+        TEST_PARENT_THREAD_ID,
+        TEST_PARENT_TURN_ID,
+        None,
+    )
+    .await;
+    let mut params = webhook_params();
+    params.owner_id = Some(TEST_PARENT_THREAD_ID.into());
+    params.created_by_thread_id = params.owner_id.clone();
+    params.created_by_turn_id = Some(TEST_PARENT_TURN_ID.into());
+    params.agent_spec.as_mut().unwrap().review_policy =
+        Some(runtime.service().explicit_review_policy());
+    let mut context = task_create_context_for_parent_agent(&params);
+    context.webhook_secret_ref = Some("webhook-test-secret-reference".into());
+    let created = runtime
+        .service()
+        .create_task(context, params)
+        .await
+        .unwrap();
+    let first = post(&runtime, &created.trigger, "first reviewed body").await;
+    let candidate_id = submit_pending_review_for_run(
+        &runtime,
+        &first,
+        0,
+        TaskResultCandidateStatus::PendingReview,
+    )
+    .await;
+    let candidate = runtime
+        .service()
+        .store()
+        .get_task_result_candidate(&candidate_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let reviewer =
+        parent_accept_context_for_candidate(&runtime, &first.task_id, &candidate_id).await;
+    let second = post(&runtime, &created.trigger, "second independent body").await;
+    assert_eq!(
+        read(&runtime, &first.task_id).await.task.status,
+        TaskStatus::Queued
+    );
+    let revised = runtime
+        .service()
+        .revise_task_result_candidate(
+            reviewer.clone(),
+            revise_params(first.task_id.clone(), first.id.clone(), candidate_id),
+        )
+        .await
+        .unwrap();
+    assert_eq!(revised.task_run_turn.thread_id, candidate.thread_id);
+    let at = revised.task_run_turn.created_at + 1;
+    let mut turn = revised.task_run_turn.clone();
+    turn.status = TaskRunTurnStatus::CandidateCreated;
+    turn.completed_at = Some(at);
+    let mut replacement = candidate;
+    replacement.id = "webhook_revised_candidate".into();
+    replacement.task_run_turn_id = turn.id.clone();
+    replacement.turn_id = turn.turn_id.clone();
+    replacement.round = turn.round;
+    replacement.created_at = at;
+    replacement.updated_at = at;
+    let handle = TaskExecutionHandle::new(
+        runtime.service().store(),
+        runtime.event_bus(),
+        first.task_id.clone(),
+        first.id.clone(),
+    );
+    handle
+        .record_pending_review_result_candidate(turn, replacement.clone(), at)
+        .await
+        .unwrap();
+    let third = post(&runtime, &created.trigger, "third independent body").await;
+    assert_eq!(
+        read(&runtime, &first.task_id).await.task.status,
+        TaskStatus::Queued
+    );
+    let accepted = runtime
+        .service()
+        .accept_task_result_candidate(
+            reviewer,
+            accept_params(first.task_id.clone(), first.id.clone(), replacement.id),
+        )
+        .await
+        .unwrap();
+    assert_eq!(accepted.run.status, TaskRunStatus::Succeeded);
+    let after = read(&runtime, &first.task_id).await;
+    assert!(!after.task.status.is_terminal());
+    for queued in [&second, &third] {
+        let run = after.runs.iter().find(|run| run.id == queued.id).unwrap();
+        assert_eq!(run.status, TaskRunStatus::Queued);
+        assert_eq!(run.trigger_input, queued.trigger_input);
+    }
+    assert_eq!(
+        after
+            .runs
+            .iter()
+            .find(|run| run.id == first.id)
+            .unwrap()
+            .trigger_input,
+        first.trigger_input
+    );
+    let deliveries = runtime
+        .service()
+        .list_deliveries(TaskDeliveriesParams {
+            workspace_id: TEST_WORKSPACE_ID.into(),
+            task_id: Some(first.task_id),
+            run_id: None,
+            statuses: Vec::new(),
+            limit: Some(10),
+        })
+        .await
+        .unwrap();
+    assert_eq!(deliveries.deliveries.len(), 1);
+    assert_eq!(deliveries.deliveries[0].run_id, first.id);
+}

@@ -9475,7 +9475,6 @@ fn review_enabled_task_runtime_config() -> pioneer_tasks::TaskRuntimeConfig {
         review: pioneer_tasks::TaskReviewRuntimeConfig {
             enabled: true,
             allow_task_create_review_policy: true,
-            default_parent_review_for_immediate_attached_agent_tasks: false,
             default_max_revision_rounds: 2,
             auto_accept_after_seconds: 300,
         },
@@ -9487,6 +9486,22 @@ fn review_enabled_processor(
     session_manager: Arc<SessionManager>,
     workspace_manager: Arc<WorkspaceManager>,
     crud_store: Arc<CrudStore>,
+) -> Arc<MessageProcessor> {
+    processor_with_review_config(
+        provider_registry,
+        session_manager,
+        workspace_manager,
+        crud_store,
+        review_enabled_task_runtime_config(),
+    )
+}
+
+fn processor_with_review_config(
+    provider_registry: Arc<pioneer_provider::ProviderRegistry>,
+    session_manager: Arc<SessionManager>,
+    workspace_manager: Arc<WorkspaceManager>,
+    crud_store: Arc<CrudStore>,
+    task_runtime_config: pioneer_tasks::TaskRuntimeConfig,
 ) -> Arc<MessageProcessor> {
     let runtime_home = unique_temp_dir("message-review");
     let capsule_root = runtime_home.join("memory").join("capsules");
@@ -9505,7 +9520,7 @@ fn review_enabled_processor(
         runtime_home,
         capsule_root,
         pioneer_config::GatewayArtifactsConfig::default(),
-        review_enabled_task_runtime_config(),
+        task_runtime_config,
         crate::thread_episodic::ThreadEpisodicRuntimeConfig {
             enabled: false,
             indexing_enabled: false,
@@ -25333,6 +25348,7 @@ async fn task_accept_rpc_finalizes_review_candidate_and_queues_delivery_impl(
         mode: TaskAgentReviewMode::UserApproval,
         max_revision_rounds: 2,
         require_explicit_acceptance: true,
+        disable_timeout_acceptance: false,
         reviewers: Vec::new(),
         resolution_strategy: TaskResultReviewResolutionStrategy::UserFinal,
     });
@@ -25606,6 +25622,7 @@ async fn phase_11_task_tool_provider_review_required_observations_are_scoped_to_
         mode: TaskAgentReviewMode::UserApproval,
         max_revision_rounds: 2,
         require_explicit_acceptance: true,
+        disable_timeout_acceptance: false,
         reviewers: Vec::new(),
         resolution_strategy: TaskResultReviewResolutionStrategy::UserFinal,
     });
@@ -25638,6 +25655,7 @@ async fn phase_11_task_tool_provider_review_required_observations_are_scoped_to_
         mode: TaskAgentReviewMode::UserApproval,
         max_revision_rounds: 2,
         require_explicit_acceptance: true,
+        disable_timeout_acceptance: false,
         reviewers: Vec::new(),
         resolution_strategy: TaskResultReviewResolutionStrategy::UserFinal,
     });
@@ -25791,6 +25809,7 @@ async fn task_revise_rpc_rejects_candidate_and_dispatches_same_thread_revision_i
         mode: TaskAgentReviewMode::UserApproval,
         max_revision_rounds: 1,
         require_explicit_acceptance: true,
+        disable_timeout_acceptance: false,
         reviewers: Vec::new(),
         resolution_strategy: TaskResultReviewResolutionStrategy::UserFinal,
     });
@@ -25990,6 +26009,7 @@ async fn task_revise_dispatch_failure_blocks_revision_turn_and_run_impl() {
         mode: TaskAgentReviewMode::UserApproval,
         max_revision_rounds: 2,
         require_explicit_acceptance: true,
+        disable_timeout_acceptance: false,
         reviewers: Vec::new(),
         resolution_strategy: TaskResultReviewResolutionStrategy::UserFinal,
     });
@@ -26144,6 +26164,7 @@ async fn task_revise_restart_reuses_in_progress_revision_turn_impl() {
         mode: TaskAgentReviewMode::UserApproval,
         max_revision_rounds: 2,
         require_explicit_acceptance: true,
+        disable_timeout_acceptance: false,
         reviewers: Vec::new(),
         resolution_strategy: TaskResultReviewResolutionStrategy::UserFinal,
     });

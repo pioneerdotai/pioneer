@@ -44,6 +44,7 @@ Use `task_create` without `trigger` for immediate attached subagents.
 ```json
 {
   "title": "Inspect memory extraction",
+  "requireReview": false,
   "goal": "Find why explicit user identity facts are not being extracted into durable memory.",
   "agentRole": "researcher",
   "agentNickname": "Memory researcher",
@@ -102,7 +103,7 @@ Rules:
 - Do not use singular `taskId` or `runId`.
 - A timeout does not cancel child work.
 - `timedOut:true` means this wait window expired. Active `taskIds` or `runIds` can be waited on again even when no counts changed. A run timeout appears separately in its run status and error.
-- Authorized reviewers receive `reviewContent` for each `reviewRequired` candidate. `summary` alone is not the full result.
+- Authorized result readers receive `reviewContent` for each `reviewRequired` candidate. `summary` alone is not the full result.
 
 ## task_result
 
@@ -127,7 +128,7 @@ Do not substitute `taskId` or a different revision candidate. The review decisio
 
 ## task_accept
 
-Use after reviewing a candidate returned by `task_wait.reviewRequired`.
+Use after reviewing a pending candidate returned by `task_get.reviewRequired` or `task_wait.reviewRequired` for work created with requireReview:true.
 
 ```json
 {
@@ -201,3 +202,19 @@ Use `task_list` or `task_get` when attached work must be inspected, recovered, o
 ```
 
 Each `task_get.runs[]` includes `execution` with `status`, `heartbeatAt`, `lastActivityAt`, and `observedAt` (Unix seconds). `status:null` means no execution row was observed. `heartbeatAt` is periodic liveness, not proof of meaningful progress. `lastActivityAt` is present only when the runtime recorded task activity for the current execution attempt; `null` means activity is unknown. `updatedAt` on a task or run is not a substitute for either timestamp.
+
+### Review option
+
+`requireReview` defaults to false for every task type and attachment mode.
+Normally pass false. Set true explicitly when each run result requires acceptance
+or same-worker revision; this also applies to scheduled, interval, cron and
+webhook tasks. True has no timeout acceptance and uses the configured saved
+revision budget. The built-in choice requires review to be enabled; arbitrary
+advanced policies retain their existing admission gate.
+
+Read exact candidate references through task_get.reviewRequired or task_wait,
+then page task_result by candidateId. Accept/revise the exact run/candidate under
+current capsule permissions. False completes automatically; task_revise does not
+reopen a completed result. For reviewed background, omitted deliveryPolicy means
+none; explicit permitted policy overrides it for results and terminal errors.
+Background without review and scheduled tasks keep their existing delivery defaults.

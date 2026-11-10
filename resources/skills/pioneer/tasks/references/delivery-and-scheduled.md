@@ -92,7 +92,7 @@ Use when the result belongs in an external system.
 
 ### none
 
-Use for background state, task chains, or internal bookkeeping where no user-facing delivery is needed.
+Use for background state, task chains, or internal bookkeeping where no user-facing delivery is needed. This is the default for `background:true` plus `requireReview:true` when deliveryPolicy is omitted; an explicit permitted policy overrides it. Results and terminal errors follow the selected policy. Task status/history and result reading remain available. Background without review (requireReview:false by default) and scheduled tasks keep their existing delivery defaults.
 
 ## Choosing Summary Vs Full Result
 

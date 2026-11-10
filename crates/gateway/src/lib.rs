@@ -1336,9 +1336,6 @@ fn task_runtime_config_from_gateway_tasks_config(config: &GatewayTasksConfig) ->
         review: TaskReviewRuntimeConfig {
             enabled: config.review.enabled,
             allow_task_create_review_policy: config.review.allow_task_create_review_policy,
-            default_parent_review_for_immediate_attached_agent_tasks: config
-                .review
-                .default_parent_review_for_immediate_attached_agent_tasks,
             default_max_revision_rounds: config.review.default_max_revision_rounds,
             auto_accept_after_seconds: config.review.auto_accept_after_seconds,
         },
@@ -1836,11 +1833,6 @@ mod runtime_tests {
 
         assert!(runtime_config.review.enabled);
         assert!(!runtime_config.review.allow_task_create_review_policy);
-        assert!(
-            runtime_config
-                .review
-                .default_parent_review_for_immediate_attached_agent_tasks
-        );
         assert_eq!(runtime_config.review.default_max_revision_rounds, 5);
         assert_eq!(runtime_config.review.auto_accept_after_seconds, 300);
     }

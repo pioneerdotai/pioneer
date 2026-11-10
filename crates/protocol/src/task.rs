@@ -443,6 +443,9 @@ pub struct TaskAgentReviewPolicy {
     pub mode: TaskAgentReviewMode,
     pub max_revision_rounds: u32,
     pub require_explicit_acceptance: bool,
+    /// Mandatory-review marker: never resolve this policy through the legacy review timeout. Legacy records default to false.
+    #[serde(default)]
+    pub disable_timeout_acceptance: bool,
     #[serde(default)]
     pub reviewers: Vec<TaskResultReviewerSpec>,
     pub resolution_strategy: TaskResultReviewResolutionStrategy,
@@ -454,6 +457,7 @@ impl TaskAgentReviewPolicy {
             mode: TaskAgentReviewMode::ParentAgent,
             max_revision_rounds,
             require_explicit_acceptance: true,
+            disable_timeout_acceptance: false,
             reviewers: Vec::new(),
             resolution_strategy: TaskResultReviewResolutionStrategy::ParentFinal,
         }
@@ -2661,6 +2665,7 @@ pub enum TaskWaitReviewAction {
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskWaitRevisionBlockedReason {
+    ReviewNotAllowed,
     MaxRevisionRoundsReached,
     CandidateNotRevisable,
 }
@@ -3095,6 +3100,9 @@ pub struct PublicTaskGetResponse {
     pub webhook_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub webhook_scope: Option<TaskWebhookScope>,
+    /// Current review candidates only; full immutable content uses task_result.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub review_required: Vec<PublicTaskWaitReviewItem>,
     pub task: PublicTask,
     #[serde(default)]
     pub triggers: Vec<PublicTaskTrigger>,

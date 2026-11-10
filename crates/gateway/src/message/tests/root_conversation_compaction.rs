@@ -628,6 +628,7 @@ async fn reviewed_task_in(
         mode: TaskAgentReviewMode::UserApproval,
         max_revision_rounds: 2,
         require_explicit_acceptance: true,
+        disable_timeout_acceptance: false,
         reviewers: vec![],
         resolution_strategy: TaskResultReviewResolutionStrategy::UserFinal,
     });
