@@ -59554,6 +59554,17 @@ mod tests {
         let store = CrudStore::new(connection);
         let timestamp = 1_700_000_000;
         let workspace_id = "ws_history_llm_context";
+        pioneer_entity::workspace::Entity::insert(pioneer_entity::workspace::ActiveModel {
+            id: Set(workspace_id.to_owned()),
+            name: Set("History test".to_owned()),
+            is_active: Set(true),
+            is_current: Set(true),
+            created_at: Set(unix_to_datetime(timestamp)),
+            updated_at: Set(unix_to_datetime(timestamp)),
+        })
+        .exec(&store.connection)
+        .await
+        .expect("workspace required by item projections should exist");
         let thread_id = "thr_history_llm_context";
         let turn_id = "turn_history_llm_context";
         let item_id = "item_history_llm_context";
