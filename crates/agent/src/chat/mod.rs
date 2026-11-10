@@ -9996,17 +9996,23 @@ mod tests {
             fresh
                 .router
                 .set_blocked_tool_names([("artifact_prepare".to_owned(), "revoked".to_owned())]);
-            assert!(
-                fresh
-                    .router
-                    .build_model_tool_call(pioneer_tools::RawToolCall {
-                        call_id: "revoked".into(),
-                        tool_name: "artifact_prepare".into(),
-                        arguments: "{}".into(),
-                    })
-                    .await
-                    .is_err()
-            );
+            let selection = fresh
+                .router
+                .compute_final_visible_tools(&fresh.router.core_tool_names(), &order);
+            fresh
+                .router
+                .set_model_visible_tools(&selection.visible_tools)
+                .await;
+            let error = fresh
+                .router
+                .build_model_tool_call(pioneer_tools::RawToolCall {
+                    call_id: "revoked".into(),
+                    tool_name: "artifact_prepare".into(),
+                    arguments: "{}".into(),
+                })
+                .await
+                .expect_err("restored discovery must respect current tool revocation");
+            assert!(matches!(error, pioneer_tools::ToolError::NotVisible(_)));
         }
     }
 
