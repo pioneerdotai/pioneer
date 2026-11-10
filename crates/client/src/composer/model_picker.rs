@@ -2062,6 +2062,15 @@ mod tests {
     fn context_picker_commits_authority_reopens_resets_and_drops_override_on_model_change() {
         let (core, rx) = fixture();
         let identity = open(&core, false);
+        core.complete_composer_model_picker(rx.try_recv().unwrap(), providers());
+        assert_eq!(
+            core.composer_model_picker_intent(ComposerModelPickerIntent::SelectProvider {
+                identity: identity.clone(),
+                provider: "provider".into(),
+            })
+            .outcome(),
+            ClientTransitionOutcome::Changed
+        );
         while let Ok(work) = rx.try_recv() {
             let result = match &work.kind {
                 RequestKind::Providers => providers(),
