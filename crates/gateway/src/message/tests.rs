@@ -3923,6 +3923,7 @@ pub(super) fn test_provider() -> Arc<pioneer_provider::ProviderRegistry> {
 
 struct SequencedToolProvider {
     requests: std::sync::Mutex<Vec<ChatRequest>>,
+    last_request: std::sync::Mutex<Option<ChatRequest>>,
     first_tool_calls: Vec<ProviderToolCall>,
     tool_call_rounds: Option<Vec<Vec<ProviderToolCall>>>,
     second_text: String,
@@ -5959,6 +5960,7 @@ impl SequencedToolProvider {
     fn new(first_tool_calls: Vec<ProviderToolCall>, second_text: impl Into<String>) -> Self {
         Self {
             requests: std::sync::Mutex::new(Vec::new()),
+            last_request: std::sync::Mutex::new(None),
             first_tool_calls,
             tool_call_rounds: None,
             second_text: second_text.into(),
@@ -7086,6 +7088,12 @@ impl Provider for SequencedToolProvider {
     }
 
     async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
+        // Include discovery attempts in failure diagnostics without changing
+        // snapshot_requests(), which counts only consumed scripted rounds.
+        *self
+            .last_request
+            .lock()
+            .expect("last request lock poisoned") = Some(request.clone());
         let index = self.next_index.load(Ordering::SeqCst);
         let next_calls = self
             .tool_call_rounds

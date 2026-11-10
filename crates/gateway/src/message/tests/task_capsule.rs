@@ -142,7 +142,8 @@ fn capsule_run_with_rounds(
         let provider = Arc::new(provider);
         let processor = processor_with_review_config(
             Arc::new(pioneer_provider::ProviderRegistry::with_provider(
-                "openai", provider,
+                "openai",
+                provider.clone(),
             )),
             Arc::new(SessionManager::new()),
             workspace_manager,
@@ -211,11 +212,41 @@ fn capsule_run_with_rounds(
             )
             .await
             .expect("start independent root execution");
-            assert_eq!(
-                wait_for_task_status(store.clone(), &response.task.id, TaskStatus::Completed).await,
-                TaskStatus::Completed,
-                "capsule step {step} must finish"
-            );
+            let status =
+                wait_for_task_status(store.clone(), &response.task.id, TaskStatus::Completed).await;
+            if status != TaskStatus::Completed {
+                let request = provider.last_request.lock().unwrap().clone();
+                let tools = request
+                    .as_ref()
+                    .and_then(|request| request.tools.as_ref())
+                    .map(|tools| {
+                        tools
+                            .iter()
+                            .map(|tool| tool.name.as_str())
+                            .collect::<Vec<_>>()
+                    });
+                let messages = request.as_ref().map(|request| {
+                    request
+                        .messages
+                        .iter()
+                        .rev()
+                        .take(8)
+                        .map(|message| {
+                            (
+                                &message.role,
+                                &message.name,
+                                message.content.chars().take(4000).collect::<String>(),
+                                &message.tool_calls,
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                });
+                let state = store.get_task(&response.task.id).await.unwrap();
+                panic!(
+                    "capsule step {step} must finish: status={status:?}, scripted_round={}, tools={tools:?}, recent_messages={messages:?}, task={state:?}",
+                    provider.next_index.load(Ordering::SeqCst),
+                );
+            }
             (response.task.id, response.run.unwrap().id)
         };
         // Keep the reconstructed runtime alive until any background worker launched
