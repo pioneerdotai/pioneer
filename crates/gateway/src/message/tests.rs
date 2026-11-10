@@ -33177,6 +33177,18 @@ async fn pending_cli_heartbeat_writer_is_dropped_before_compaction_cleanup_impl(
                 ),
             ));
             restarted
+                .apply_compaction_settings(pioneer_compaction::CompactionSettings {
+                    selection: Some(pioneer_compaction::ModelSelection {
+                        context_authority: None,
+                        context_window: None,
+                        transport: pioneer_compaction::Transport::Api,
+                        instance: "echo".into(),
+                        model: "test-model".into(),
+                        effort: None,
+                    }),
+                })
+                .unwrap();
+            restarted
                 .mark_cli_runtimes_ready_for_tests(&workspace)
                 .await
                 .unwrap();
@@ -63380,7 +63392,7 @@ async fn turn_start_materializes_thread_and_turn_state() {
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let expected_principal_id = authenticated_test_superuser().principal_id.to_string();
-    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
     let workspace_manager = Arc::new(WorkspaceManager::new(connection.clone()));
     let workspace_id = workspace_manager
         .list_workspaces()

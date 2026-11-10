@@ -978,6 +978,10 @@ mod tests {
                         ..Default::default()
                     },
                     operational_resources: AuthorizationOperationalResourceProjection {
+                        providers: AuthorizationResourceSelector {
+                            all: true,
+                            ids: vec![],
+                        },
                         provider_models_all: true,
                         cli_models_all: true,
                         cli_runtimes: AuthorizationResourceSelector {
