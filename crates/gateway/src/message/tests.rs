@@ -32161,6 +32161,7 @@ async fn accepted_task_cli_transfer_compacts_without_later_parent_history_impl(
     processor
         .apply_compaction_settings(pioneer_compaction::CompactionSettings {
             selection: Some(pioneer_compaction::ModelSelection {
+                service_mode: None,
                 context_authority: None,
                 context_window: None,
                 transport: pioneer_compaction::Transport::Api,
@@ -32971,6 +32972,7 @@ async fn pending_cli_heartbeat_writer_is_dropped_before_compaction_cleanup_impl(
         processor
             .apply_compaction_settings(pioneer_compaction::CompactionSettings {
                 selection: Some(pioneer_compaction::ModelSelection {
+                    service_mode: None,
                     context_authority: None,
                     context_window: None,
                     transport: pioneer_compaction::Transport::Api,
