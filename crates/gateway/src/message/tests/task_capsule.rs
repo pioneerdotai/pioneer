@@ -913,7 +913,13 @@ fn reviewed_background_survives_creator_and_is_reviewed_by_later_capsule_executi
             4
         );
         assert_outcome(&accepted, "task_result", true);
-        assert_outcome(&accepted, "task_accept", false);
+        assert!(
+            accepted.items.iter().any(|item| matches!(item,
+                TurnItem::DynamicToolCall { tool_name, arguments, success: Some(false), .. }
+                if tool_name == "task_accept" && arguments["candidateId"] == candidate.id
+            )),
+            "stale candidate acceptance must be rejected"
+        );
         // The old round remains rejected; the final decision targets only the replacement.
         let final_state = store.get_task(&task.id).await.unwrap().unwrap();
         assert_eq!(final_state.task.status, TaskStatus::Completed);
@@ -1057,19 +1063,24 @@ fn background_creation_preserves_ordinary_completion_and_rejects_disabled_review
                     .iter()
                     .filter_map(|item| match item {
                         TurnItem::DynamicToolCall {
-                            tool_name, success, ..
-                        } if tool_name == "task_create" => Some(*success),
+                            tool_name,
+                            arguments,
+                            success,
+                            ..
+                        } if tool_name == "task_create" => {
+                            Some((arguments["title"].as_str().unwrap().to_owned(), *success))
+                        }
                         _ => None,
                     })
-                    .collect::<Vec<_>>();
-                assert_eq!(
-                    outcomes,
-                    if enabled {
-                        vec![Some(true)]
-                    } else {
-                        vec![Some(false), Some(true)]
-                    }
-                );
+                    .collect::<std::collections::BTreeMap<_, _>>();
+                let mut expected = std::collections::BTreeMap::from([(
+                    "Ordinary background".to_owned(),
+                    Some(true),
+                )]);
+                if !enabled {
+                    expected.insert("Disabled reviewed background".to_owned(), Some(false));
+                }
+                assert_eq!(outcomes, expected);
             }
         }
     });
