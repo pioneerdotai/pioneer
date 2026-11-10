@@ -40972,23 +40972,20 @@ async fn agent_mode_materializes_task_tools_and_chat_mode_does_not_impl() {
         "task_list",
         "task_reschedule",
         "task_pause",
+        "task_result",
+        "task_accept",
+        "task_revise",
     ] {
         assert!(
             tool_names.contains(&expected),
             "agent mode should expose {expected}"
         );
     }
-    for hidden_until_review in ["task_accept", "task_revise"] {
-        assert!(
-            !tool_names.contains(&hidden_until_review),
-            "agent mode should expose {hidden_until_review} only after a review-required candidate is observed"
-        );
-    }
     assert!(
         tool_names
             .iter()
             .all(|name| !name.contains("review") && !name.contains("approval")),
-        "review-disabled Phase 3 must not expose review/approval tools"
+        "the task domain must not expose a separate review/approval tool family"
     );
 
     // Start at the text response; Chat has no initial tool round to execute.
