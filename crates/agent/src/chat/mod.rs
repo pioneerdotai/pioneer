@@ -9790,6 +9790,10 @@ mod tests {
         use super::{AgentDurableEvent, AgentEventHub};
         use pioneer_provider::{ToolDefinition, tool_declarations::ToolDeclarations};
         let built = build_tools_with_extension_names(&["artifact_prepare", "artifact_register"]);
+        let mut built = built;
+        built.runtime = built
+            .runtime
+            .with_execution_security_snapshot(Some(test_full_access_security_snapshot()));
         let mut visible = vec!["request_tools".to_owned()];
         built.router.set_model_visible_tools(&visible).await;
         let definitions = |names: &[String]| {
