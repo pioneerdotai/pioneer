@@ -5328,7 +5328,7 @@ async fn provider_failure_checkpoints_window_and_recovery_continues_in_next_wind
         .await
         .expect("turn should start");
 
-    let mut retained_snapshots = Vec::new();
+    let mut retained_history = Vec::new();
     let mut exhausted_window_id = None;
     let mut checkpoint_context = None;
     let mut saw_provider_failure = false;
@@ -5341,18 +5341,23 @@ async fn provider_failure_checkpoints_window_and_recovery_continues_in_next_wind
         match event {
             AgentDurableEvent::TurnLlmContextAppended {
                 source, payload, ..
-            } if source == "system_snapshot_v1" => {
+            } if matches!(
+                source.as_str(),
+                "system_snapshot_v1" | "turn_input_projection_v1"
+            ) =>
+            {
                 let pioneer_protocol::ToolResultView::Json {
                     value,
                     truncated: false,
                 } = payload
                 else {
-                    panic!("system snapshot must be durable and complete")
+                    panic!("retained input and system snapshots must be durable and complete")
                 };
-                // Decode the actual acknowledged snapshot, including disclosure metadata.
+                // Recovery requires the acknowledged input projection (governing documents)
+                // alongside the system snapshot and its disclosure metadata.
                 let message = serde_json::from_value(value).unwrap();
-                retained_snapshots.push(crate::RetainedProviderHistoryMessage {
-                    sequence: retained_snapshots.len() as i64 + 1,
+                retained_history.push(crate::RetainedProviderHistoryMessage {
+                    sequence: retained_history.len() as i64 + 1,
                     message,
                 });
             }
@@ -5432,7 +5437,7 @@ async fn provider_failure_checkpoints_window_and_recovery_continues_in_next_wind
                     compact_history: false,
                     continue_generation: true,
                     model_override: None,
-                    retained_provider_history: retained_snapshots,
+                    retained_provider_history: retained_history,
                     execution_checkpoint_context: checkpoint_context,
                 },
             )
@@ -5535,6 +5540,9 @@ async fn provider_failure_checkpoints_window_and_recovery_continues_in_next_wind
                         .any(|tool| tool.name == "memory_remember")
                 );
                 return;
+            }
+            AgentDurableEvent::TurnFailed { error, .. } => {
+                panic!("recovery failed before starting execution window 2: {error}");
             }
             _ => {}
         }
