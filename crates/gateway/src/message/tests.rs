@@ -32136,6 +32136,18 @@ async fn accepted_task_cli_transfer_compacts_without_later_parent_history_impl(
         )),
     ));
     processor
+        .apply_compaction_settings(pioneer_compaction::CompactionSettings {
+            selection: Some(pioneer_compaction::ModelSelection {
+                context_authority: None,
+                context_window: None,
+                transport: pioneer_compaction::Transport::Api,
+                instance: "echo".into(),
+                model: "test-model".into(),
+                effort: None,
+            }),
+        })
+        .unwrap();
+    processor
         .mark_cli_runtimes_ready_for_tests(&workspace)
         .await
         .unwrap();
@@ -32933,6 +32945,18 @@ async fn pending_cli_heartbeat_writer_is_dropped_before_compaction_cleanup_impl(
                 supported_test_cli_mcp_readiness(CLIAgentRuntimeKind::Codex),
             ),
         ));
+        processor
+            .apply_compaction_settings(pioneer_compaction::CompactionSettings {
+                selection: Some(pioneer_compaction::ModelSelection {
+                    context_authority: None,
+                    context_window: None,
+                    transport: pioneer_compaction::Transport::Api,
+                    instance: "echo".into(),
+                    model: "test-model".into(),
+                    effort: None,
+                }),
+            })
+            .unwrap();
         processor
             .mark_cli_runtimes_ready_for_tests(&workspace)
             .await

@@ -83,6 +83,30 @@ pub(super) async fn assert_materialized_child_security(
     )
     .unwrap();
     if native {
+        // These fixtures use the default test-model provider (128k, no separate
+        // input/output caps). Native admission now freezes this budget even
+        // when the synthetic occurrence parent predates context snapshots.
+        let provider = processor
+            .provider_registry
+            .get_or_create_for_workspace(&response.task.workspace_id, "openai")
+            .unwrap();
+        let budget = parent_security.native_context.clone().unwrap_or_else(|| {
+            pioneer_protocol::NativeContextBudget {
+                instance: "openai".into(),
+                authority: provider.authority_fingerprint().map(str::to_owned),
+                model: "test-model".into(),
+                manual_window: None,
+                context_window: 128_000,
+                max_input: None,
+                max_output: None,
+            }
+        });
+        expected.native_context = Some(budget.clone());
+        expected.native_summary = Some(pioneer_protocol::NativeSummaryContext {
+            budget,
+            effort: None,
+            inherits_working: true,
+        });
         processor
             .add_native_turn_runtime_sandbox_roots(
                 &mut expected,
