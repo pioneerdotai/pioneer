@@ -48,6 +48,7 @@ fn technical_system_event(item: &TurnItem, service_filter: bool) -> bool {
             | "cli_runtime_turn_steer"
             | "task.finalization.snapshot"
             | "provider_usage"
+            | "provider_phase"
             | "runtime_operation",
         ) if service_filter => true,
         Some("agent_runtime_event") => {

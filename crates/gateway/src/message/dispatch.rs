@@ -4893,31 +4893,33 @@ impl MessageProcessor {
                         }
                     }
                 }
+                // Keep the observation/reconciliation state machines off the shared
+                // dispatcher future, which is also polled by ordinary turn RPCs.
                 methods::WORKSPACE_EXECUTION_OBSERVABILITY => {
                     let proof=admission.workspace().expect("central admission supplies workspace proof");
                     match serde_json::from_value::<pioneer_protocol::WorkspaceExecutionObservabilityParams>(request.params.unwrap_or_else(empty_object_value)) {
-                        Ok(params)=>self.workspace_execution_observability(&context,proof,request.id,params).await,
+                        Ok(params)=>message_future(self.workspace_execution_observability(&context,proof,request.id,params)).await,
                         Err(_)=>self.send_error(connection_id,JsonRpcErrorResponse::new(Some(request.id),INVALID_PARAMS_CODE,"invalid workspace execution observability params")).await,
                     }
                 }
                 methods::WORKSPACE_EXECUTION_RECONCILE => {
                     let proof=admission.workspace().expect("central admission supplies workspace proof");
                     match serde_json::from_value::<pioneer_protocol::WorkspaceExecutionReconcileParams>(request.params.unwrap_or_else(empty_object_value)) {
-                        Ok(params)=>self.workspace_execution_reconcile(&context,proof,request.id,params).await,
+                        Ok(params)=>message_future(self.workspace_execution_reconcile(&context,proof,request.id,params)).await,
                         Err(_)=>self.send_error(connection_id,JsonRpcErrorResponse::new(Some(request.id),INVALID_PARAMS_CODE,"invalid workspace reconciliation params")).await,
                     }
                 }
                 methods::THREAD_EXECUTION_RECONCILE => {
                     let proof=admission.thread().expect("central admission supplies thread proof");
                     match serde_json::from_value::<pioneer_protocol::ExecutionReconcileParams>(request.params.unwrap_or_else(empty_object_value)) {
-                        Ok(params)=>self.execution_reconcile(&context,proof,request.id,params).await,
+                        Ok(params)=>message_future(self.execution_reconcile(&context,proof,request.id,params)).await,
                         Err(_)=>self.send_error(connection_id,JsonRpcErrorResponse::new(Some(request.id),INVALID_PARAMS_CODE,"invalid execution reconciliation params")).await,
                     }
                 }
                 methods::THREAD_EXECUTION_OBSERVABILITY => {
                     let proof=admission.thread().expect("central admission supplies thread proof");
                     match serde_json::from_value::<pioneer_protocol::ExecutionObservabilityParams>(request.params.unwrap_or_else(empty_object_value)) {
-                        Ok(params)=>self.execution_observability(&context,proof,request.id,params).await,
+                        Ok(params)=>message_future(self.execution_observability(&context,proof,request.id,params)).await,
                         Err(_)=>self.send_error(connection_id,JsonRpcErrorResponse::new(Some(request.id),INVALID_PARAMS_CODE,"invalid execution observability params")).await,
                     }
                 }
