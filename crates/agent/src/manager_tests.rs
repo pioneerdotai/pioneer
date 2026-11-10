@@ -12775,8 +12775,8 @@ async fn continue_generation_recovery_reuses_saved_system_and_adds_context_at_ta
         .as_ref()
         .expect("recovery request should include compiled prompt payload");
     assert_eq!(
-        requests[0].compiled_prompt.as_ref().unwrap(),
-        continuation_prompt
+        serde_json::to_value(requests[0].compiled_prompt.as_ref().unwrap()).unwrap(),
+        serde_json::to_value(continuation_prompt).unwrap()
     );
     let initial_user = requests[0]
         .messages

@@ -56318,6 +56318,7 @@ mod tests {
         let store = CrudStore::new(connection);
         let timestamp = 1_700_000_000;
         let workspace_id = "ws_tool_policy";
+        seed_observation_workspace(&store, workspace_id).await;
         let thread_id = "thr_tool_policy";
         let turn_id = "turn_tool_policy";
         let item_id = "item_tool_policy";
@@ -57888,6 +57889,7 @@ mod tests {
         let store = CrudStore::new(connection);
         let timestamp = 1_700_000_000;
         let workspace_id = "ws_raw_payload";
+        seed_observation_workspace(&store, workspace_id).await;
         let thread_id = "thr_raw_payload";
         let turn_id = "turn_raw_payload";
         let thread = sample_thread(workspace_id, thread_id, timestamp);
@@ -58316,6 +58318,7 @@ mod tests {
         let store = test_store_with_zstd_turn_items().await;
         let timestamp = 1_700_000_000;
         let workspace_id = "ws_timeout_terminalize";
+        seed_observation_workspace(&store, workspace_id).await;
         let thread_id = "thr_timeout_terminalize";
         let turn_id = "turn_timeout_terminalize";
         let item_id = "item_timeout_terminalize";
@@ -58426,6 +58429,7 @@ mod tests {
         let store = CrudStore::new(connection);
         let timestamp = 1_700_000_000;
         let workspace_id = "ws_timeout_stale_candidate";
+        seed_observation_workspace(&store, workspace_id).await;
         let thread_id = "thr_timeout_stale_candidate";
         let turn_id = "turn_timeout_stale_candidate";
         let item_id = "item_timeout_stale_candidate";
@@ -58523,6 +58527,7 @@ mod tests {
         let store = CrudStore::new(connection);
         let timestamp = 1_700_000_000;
         let workspace_id = "ws_turn_liveness";
+        seed_observation_workspace(&store, workspace_id).await;
         let thread_id = "thr_turn_liveness";
         let turn_id = "turn_turn_liveness";
         let stale_item_id = "reasoning_stale_liveness";
@@ -60864,6 +60869,7 @@ mod tests {
         let store = CrudStore::new(connection.clone());
         let timestamp = 1_700_100_000;
         let workspace_id = "ws_000000000000000199";
+        seed_observation_workspace(&store, workspace_id).await;
         let thread_id = "thr_000000000000000199";
         let turn_id = "turn_000000000000000199";
         let item_id = "item_tool_retry";

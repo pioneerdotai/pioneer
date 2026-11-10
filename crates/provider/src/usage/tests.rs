@@ -454,7 +454,7 @@ fn documented_auto_selected_model_and_captured_snapshot_determine_estimate() {
     context.enrich(&mut usage);
     let a = usage.accounting.as_ref().unwrap();
     assert_eq!(a["pricing_eligibility"]["billing_model"], "B");
-    assert_eq!(a["pricing"]["cost"]["input"], "20");
+    assert_eq!(a["pricing"]["cost"]["input"], "20.0");
     assert_eq!(a["catalog_snapshot"], original.snapshot_id());
     assert_ne!(a["catalog_snapshot"], replacement.snapshot_id());
     assert!((a["estimated_cost"]["amount"].as_f64().unwrap() - 0.0022).abs() < 1e-10);

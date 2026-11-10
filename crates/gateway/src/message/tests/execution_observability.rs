@@ -742,10 +742,16 @@ async fn auxiliary_spawned_decoder_body_eof_reaches_the_drain_owner_and_journal(
         body_gate.await.unwrap();
         socket.write_all(b"0\r\n\r\n").await.unwrap();
     });
-    let provider = crate::usage_journal::observe(
+    let registry = pioneer_provider::ProviderRegistry::with_provider(
+        "openai",
         Arc::new(pioneer_provider::providers::OpenAiProvider::with_base_url(
             "fixture", base,
         )),
+    );
+    let provider = crate::usage_journal::observe(
+        registry
+            .get_or_create_for_workspace(&workspace, "openai")
+            .unwrap(),
         &store,
         &workspace,
         "summary",

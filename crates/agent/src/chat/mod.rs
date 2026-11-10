@@ -10818,9 +10818,24 @@ mod tests {
             hub.clone(),
         );
         tokio::pin!(work);
-        let event = tokio::select! {
-            result = &mut work => panic!("dispatch before restoration ACK: {result:?}"),
-            event = durable.recv() => event.unwrap(),
+        let event = loop {
+            let event = tokio::select! {
+                result = &mut work => panic!("dispatch before restoration ACK: {result:?}"),
+                event = durable.recv() => event.unwrap(),
+            };
+            let preparation_item = match &event {
+                AgentDurableEvent::ItemStarted { notification } => Some(&notification.item),
+                AgentDurableEvent::ItemCompleted { notification } => Some(&notification.item),
+                _ => None,
+            };
+            if matches!(preparation_item,
+                Some(pioneer_protocol::TurnItem::SystemEvent { code: Some(code), .. })
+                    if code == "runtime_operation")
+            {
+                durable.acknowledge_last(Ok(()));
+                continue;
+            }
+            break event;
         };
         let AgentDurableEvent::TurnLlmContextAppended {
             source,

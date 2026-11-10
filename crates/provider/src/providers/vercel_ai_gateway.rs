@@ -1336,6 +1336,7 @@ mod tests {
             (200, r#"{"data":[{"index":0,"embedding":[1.0]}],"model":"owner/private-model","usage":{"prompt_tokens":7,"total_tokens":7},"providerMetadata":{"gateway":{"cost":"0.000014","routing":{"private_host":"must not persist"}}}}"#)
         ]).await;
         let provider = VercelAiGatewayProvider::with_base_url("fixture-key", root);
+        provider.list_embedding_models().await.unwrap();
         let response = provider
             .embed(EmbeddingRequest::new(
                 "owner/private-model",

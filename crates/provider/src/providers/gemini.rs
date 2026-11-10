@@ -1610,7 +1610,7 @@ mod tests {
     fn usage_prompt_includes_cached_content_once() {
         let response: super::ApiGenerateResponse = serde_json::from_value(serde_json::json!({
             "candidates":[], "usageMetadata": {"promptTokenCount":140,
-                "cachedContentTokenCount":100,"candidatesTokenCount":9}
+                "cachedContentTokenCount":100,"candidatesTokenCount":9,"thoughtsTokenCount":0}
         }))
         .unwrap();
         let usage = super::GeminiProvider::extract_usage(&response).unwrap();
