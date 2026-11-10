@@ -2012,8 +2012,34 @@ async fn result_read_by_later_capsule_execution_does_not_require_final_review_po
     .await;
     let execution = "B".repeat(21);
     let turn = "later_review_turn";
-    persist_test_agent_turn(&runtime, &execution, TEST_PARENT_THREAD_ID, turn, None).await;
-    let mut context = TaskMutationContext::parent_agent(TEST_PARENT_THREAD_ID, turn);
+    let reviewer_thread = "L".repeat(21);
+    persist_test_agent_turn(&runtime, &execution, &reviewer_thread, turn, None).await;
+    // A later independent execution has its own thread in the same capsule;
+    // the original thread's persisted creator remains unchanged.
+    let at = now_timestamp_secs();
+    runtime
+        .service()
+        .store()
+        .append_task_event(
+            TaskEventPayload::TaskThreadLineageCreated {
+                task_id: task_id.clone(),
+                run_id: run_id.clone(),
+                lineage: TaskThreadLineage {
+                    child_thread_id: reviewer_thread.clone(),
+                    parent_thread_id: TEST_PARENT_THREAD_ID.into(),
+                    root_thread_id: TEST_PARENT_THREAD_ID.into(),
+                    depth: 1,
+                    origin_kind: Some("task_run".into()),
+                    created_by_thread_id: Some(TEST_PARENT_THREAD_ID.into()),
+                    created_by_turn_id: Some(TEST_PARENT_TURN_ID.into()),
+                    created_at: at,
+                },
+            },
+            at,
+        )
+        .await
+        .unwrap();
+    let mut context = TaskMutationContext::parent_agent(reviewer_thread, turn);
     context.actor_id = Some(execution);
     let denied = runtime
         .service()
@@ -2028,7 +2054,7 @@ async fn result_read_by_later_capsule_execution_does_not_require_final_review_po
         .service()
         .get_task_result_candidate_for_reviewer(context, candidate_id.as_str())
         .await
-        .expect("exact parent reviewer should read its immutable candidate");
+        .expect("later capsule execution should read the immutable candidate");
 
     assert_eq!(candidate.id, candidate_id);
     assert_eq!(candidate.round, 0);

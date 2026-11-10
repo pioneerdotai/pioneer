@@ -1,6 +1,12 @@
 use super::*;
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 
+#[derive(Debug)]
+struct CapsuleStepResult {
+    items: Vec<TurnItem>,
+    outputs: Vec<(String, serde_json::Value)>,
+}
+
 // Each step constructs a new Gateway/AgentManager over the same durable store.
 // No requested-tool set, creator adapter or mutation cache survives the step.
 fn capsule_step(
@@ -10,7 +16,7 @@ fn capsule_step(
     thread: &str,
     step: usize,
     calls: Vec<ProviderToolCall>,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<TurnItem>> + Send>> {
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = CapsuleStepResult> + Send>> {
     capsule_step_with_rounds(
         workspace_manager,
         store,
@@ -36,7 +42,7 @@ fn capsule_step_with_rounds(
     step: usize,
     rounds: Vec<Vec<ProviderToolCall>>,
     review_config: pioneer_tasks::TaskRuntimeConfig,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<TurnItem>> + Send>> {
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = CapsuleStepResult> + Send>> {
     capsule_run_with_rounds(
         workspace_manager,
         store,
@@ -58,7 +64,7 @@ fn capsule_run_with_rounds(
     rounds: Vec<Vec<ProviderToolCall>>,
     review_config: pioneer_tasks::TaskRuntimeConfig,
     monitor: Option<(String, i64)>,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<TurnItem>> + Send>> {
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = CapsuleStepResult> + Send>> {
     let workspace = workspace.to_owned();
     let thread = thread.to_owned();
     let calls = rounds.iter().flatten().cloned().collect::<Vec<_>>();
@@ -231,7 +237,25 @@ fn capsule_run_with_rounds(
                 assert_eq!(action.status, "committed");
             }
         }
-        items
+        // UI metadata deliberately hashes strings. Assert against the canonical
+        // retained result that the model received, without changing UI storage.
+        let mut outputs = Vec::new();
+        for entry in store
+            .list_turn_llm_context(&lineage.child_turn_id)
+            .await
+            .unwrap()
+        {
+            if entry.source != "tool_result_v2" {
+                continue;
+            }
+            let name = entry.tool_name.expect("retained tool result has a name");
+            let view: pioneer_protocol::ToolResultView =
+                serde_json::from_str(&entry.payload).unwrap();
+            if let pioneer_protocol::ToolResultView::Json { value, .. } = view {
+                outputs.push((name, value));
+            }
+        }
+        CapsuleStepResult { items, outputs }
     })
 }
 
@@ -243,15 +267,16 @@ fn call(step: usize, name: &str, args: serde_json::Value) -> ProviderToolCall {
     }
 }
 
-fn assert_outcome(items: &[TurnItem], name: &str, expected_success: bool) {
-    let item = items
+fn assert_outcome(step: &CapsuleStepResult, name: &str, expected_success: bool) {
+    let item = step
+        .items
         .iter()
         .find(|item| {
             matches!(item,
                 TurnItem::DynamicToolCall { tool_name, .. } if tool_name == name
             )
         })
-        .unwrap_or_else(|| panic!("missing {name}: {items:?}"));
+        .unwrap_or_else(|| panic!("missing {name}: {step:?}"));
     let TurnItem::DynamicToolCall {
         success, status, ..
     } = item
@@ -264,23 +289,11 @@ fn assert_outcome(items: &[TurnItem], name: &str, expected_success: bool) {
     }
 }
 
-fn tool_outputs(items: &[TurnItem], name: &str) -> Vec<serde_json::Value> {
-    items
+fn tool_outputs(step: &CapsuleStepResult, name: &str) -> Vec<serde_json::Value> {
+    step.outputs
         .iter()
-        .filter_map(|item| match item {
-            TurnItem::DynamicToolCall {
-                tool_name, storage, ..
-            } if tool_name == name => match storage {
-                ToolStoragePayload::Metadata { metadata } => {
-                    metadata.to_json().get("sanitizedResult").cloned()
-                }
-                ToolStoragePayload::Summary(summary) => {
-                    summary.metadata.to_json().get("sanitizedResult").cloned()
-                }
-                _ => None,
-            },
-            _ => None,
-        })
+        .filter(|(tool, _)| tool == name)
+        .map(|(_, value)| value.clone())
         .collect()
 }
 
@@ -979,7 +992,6 @@ fn background_creation_preserves_ordinary_completion_and_rejects_disabled_review
                     config,
                 )
                 .await;
-                assert_outcome(&items, "task_create", enabled);
                 let tasks = store
                     .list_tasks(pioneer_protocol::TaskListParams {
                         workspace_id: workspace,
@@ -1036,6 +1048,7 @@ fn background_creation_preserves_ordinary_completion_and_rejects_disabled_review
                     pioneer_protocol::TaskResultCandidateStatus::Accepted
                 );
                 let outcomes = items
+                    .items
                     .iter()
                     .filter_map(|item| match item {
                         TurnItem::DynamicToolCall {
