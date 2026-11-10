@@ -1,6 +1,6 @@
 //! Shared source and embedding preparation for indexed conversation retrieval.
 use super::*;
-use pioneer_memory::ThreadEpisodicMemvidSearchHit;
+use pioneer_memory::ThreadEpisodicSearchHit;
 
 impl ThreadEpisodicRecallService {
     /// Use the indexing resolver and its checked query embedding exactly once per search call.
@@ -8,24 +8,24 @@ impl ThreadEpisodicRecallService {
         &self,
         workspace_id: &str,
         query: &str,
-    ) -> Result<Option<ThreadEpisodicMemvidIndexEmbedding>> {
+    ) -> Result<Option<ThreadEpisodicIndexEmbedding>> {
         let config = self.config.read().map(|c| c.clone()).unwrap_or_default();
         let vector = self.vector_search_config_for_workspace(workspace_id, &config.vector_search);
         if !vector.has_selected_embedding_model() {
             return Ok(None);
         }
-        let embedder = self
-            .resolve_hybrid_recall_embedder(workspace_id)
+        let embedding_provider = self
+            .resolve_recall_embedding_provider(workspace_id)
             .await
             .map_err(anyhow::Error::msg)?;
         let query = query.to_owned();
         tokio::task::spawn_blocking(move || {
-            let identity = embedder.identity();
-            let embedding = embedder.provider().embed_query_checked(query.as_str());
+            let identity = embedding_provider.identity();
+            let embedding = embedding_provider.embed_query_checked(query.as_str());
             embedding
                 .map_err(|e| anyhow::anyhow!("{e}"))
                 .and_then(|vector| {
-                    ThreadEpisodicMemvidIndexEmbedding::new(identity, vector)
+                    ThreadEpisodicIndexEmbedding::new(identity, vector)
                         .map_err(|e| anyhow::anyhow!("{}", e.message))
                 })
                 .map(Some)
@@ -38,7 +38,7 @@ impl ThreadEpisodicRecallService {
     pub(crate) async fn resolve_thread_search_sources(
         &self,
         workspace_id: &str,
-        hits: &[ThreadEpisodicMemvidSearchHit],
+        hits: &[ThreadEpisodicSearchHit],
     ) -> Result<BTreeMap<String, (ThreadEpisodicItemRecord, Option<String>)>> {
         let mut result = BTreeMap::new();
         for portion in hits.chunks(128) {
@@ -121,7 +121,7 @@ impl ThreadEpisodicRecallService {
         }
     }
 
-    pub(crate) fn thread_search_backend(&self) -> &Arc<dyn ThreadEpisodicMemvidBackend> {
+    pub(crate) fn thread_search_backend(&self) -> &Arc<dyn ThreadEpisodicSearchBackend> {
         &self.backend
     }
 }

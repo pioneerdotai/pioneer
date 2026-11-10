@@ -4138,50 +4138,42 @@ fn cli_frozen_reader_catalog_does_not_gain_search_after_upgrade() {
 // Record both legacy and paginated retrieval at the existing backend boundary,
 // while retaining real indexes and source/authorization checks.
 struct RecordingRecallSearchBackend {
-    inner: pioneer_memory::MemvidThreadEpisodicBackend,
+    inner: pioneer_memory::SqliteThreadEpisodicBackend,
     calls: AtomicUsize,
 }
 
 #[async_trait::async_trait]
-impl pioneer_memory::ThreadEpisodicMemvidBackend for RecordingRecallSearchBackend {
-    fn capabilities(&self) -> pioneer_memory::ThreadEpisodicMemvidBackendCapabilities {
-        self.inner.capabilities()
-    }
-
-    async fn index_item(
+impl pioneer_memory::ThreadEpisodicSearchBackend for RecordingRecallSearchBackend {
+    async fn validate_document(
         &self,
-        request: pioneer_memory::ThreadEpisodicMemvidIndexRequest,
+        request: pioneer_memory::ThreadEpisodicIndexDocument,
     ) -> Result<
-        pioneer_memory::ThreadEpisodicMemvidIndexOutput,
-        pioneer_memory::ThreadEpisodicMemvidError,
+        pioneer_memory::ThreadEpisodicValidationResult,
+        pioneer_memory::ThreadEpisodicSearchError,
     > {
-        self.inner.index_item(request).await
+        self.inner.validate_document(request).await
     }
 
     async fn search(
         &self,
-        request: pioneer_memory::ThreadEpisodicMemvidSearchRequest,
-    ) -> Result<
-        pioneer_memory::ThreadEpisodicMemvidSearchOutput,
-        pioneer_memory::ThreadEpisodicMemvidError,
-    > {
+        request: pioneer_memory::ThreadEpisodicSearchRequest,
+    ) -> Result<pioneer_memory::ThreadEpisodicSearchOutput, pioneer_memory::ThreadEpisodicSearchError>
+    {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.inner.search(request).await
     }
 
-    async fn search_segment_page(
+    async fn search_page(
         &self,
-        request: pioneer_memory::ThreadEpisodicMemvidSearchRequest,
+        request: pioneer_memory::ThreadEpisodicSearchRequest,
         page_size: usize,
         cursor: Option<String>,
-        embedding: Option<pioneer_memory::ThreadEpisodicMemvidIndexEmbedding>,
-    ) -> Result<
-        pioneer_memory::ThreadEpisodicMemvidSearchPage,
-        pioneer_memory::ThreadEpisodicMemvidError,
-    > {
+        embedding: Option<pioneer_memory::ThreadEpisodicIndexEmbedding>,
+    ) -> Result<pioneer_memory::ThreadEpisodicSearchPage, pioneer_memory::ThreadEpisodicSearchError>
+    {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.inner
-            .search_segment_page(request, page_size, cursor, embedding)
+            .search_page(request, page_size, cursor, embedding)
             .await
     }
 }
@@ -4190,12 +4182,11 @@ impl pioneer_memory::ThreadEpisodicMemvidBackend for RecordingRecallSearchBacken
 fn admitted_cli_prompt_context_does_not_recall_and_keeps_explicit_history_search() {
     run_standard_stack_message_test("no automatic recall and explicit history search", async {
         use crate::thread_episodic::ThreadEpisodicRecallService;
-        use pioneer_crud::ThreadEpisodicWorkspaceActiveWriteSegmentRequest;
         use pioneer_hooks::*;
         let (_harness, processor, turn_id) =
             start_task_cli_fixture(CLIAgentRuntimeKind::Codex).await;
         let backend = Arc::new(RecordingRecallSearchBackend {
-            inner: pioneer_memory::MemvidThreadEpisodicBackend::new(),
+            inner: pioneer_memory::SqliteThreadEpisodicBackend::new(processor.crud_store.clone()),
             calls: AtomicUsize::new(0),
         });
         let mut configured = processor.as_ref().clone();
@@ -4222,17 +4213,7 @@ fn admitted_cli_prompt_context_does_not_recall_and_keeps_explicit_history_search
             "INSERT INTO thread(id,workspace_id,name,preview,mode,model,model_provider,status,origin_kind,sidebar_visibility,access_class,created_at,updated_at,created_by_actor_kind,created_by_actor_id) SELECT ?,workspace_id,'Other indexed conversation','',mode,model,model_provider,status,origin_kind,sidebar_visibility,'workspace',created_at,updated_at,created_by_actor_kind,created_by_actor_id FROM thread WHERE id=?",
             [other.into(),binding.thread_id.clone().into()])).await.unwrap();
         let temp = tempfile::tempdir().unwrap();
-        let capsule = processor
-            .crud_store
-            .resolve_thread_episodic_workspace_active_write_segment(
-                ThreadEpisodicWorkspaceActiveWriteSegmentRequest {
-                    workspace_id: binding.workspace_id.clone(),
-                    storage_uri_root: format!("file://{}", temp.path().display()),
-                },
-                1_800_000_000,
-            )
-            .await
-            .unwrap();
+        let capsule = binding.workspace_id.clone();
         crate::message::thread_search_tools::tests::seed(
             &processor,
             &capsule,
@@ -4548,21 +4529,26 @@ fn admitted_cli_search_preserves_structured_pages_at_projection_byte_boundary() 
             .unwrap()
             .unwrap();
         let temp = tempfile::tempdir().unwrap();
-        let capsule = processor
-            .crud_store
-            .resolve_thread_episodic_workspace_active_write_segment(
-                pioneer_crud::ThreadEpisodicWorkspaceActiveWriteSegmentRequest {
-                    workspace_id: binding.workspace_id.clone(),
-                    storage_uri_root: format!("file://{}", temp.path().display()),
-                },
-                1_800_000_000,
-            )
-            .await
-            .unwrap();
+        let capsule = binding.workspace_id.clone();
         let mut titles = ["A".to_owned(), "B".to_owned(), "C".to_owned()];
-        for (n, thread) in ["byte-boundary-a", "byte-boundary-b", "byte-boundary-c"]
-            .into_iter()
-            .enumerate()
+        // Give the three sources distinct lexical relevance. Equal documents
+        // are ordered by generated occurrence IDs, not by their thread names.
+        for (n, (thread, text)) in [
+            (
+                "byte-boundary-a",
+                "boundaryneedle boundaryneedle boundaryneedle saved decision",
+            ),
+            (
+                "byte-boundary-b",
+                "boundaryneedle boundaryneedle ordinary saved decision",
+            ),
+            (
+                "byte-boundary-c",
+                "boundaryneedle ordinary ordinary saved decision",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
         {
             processor.crud_store.database_connection().execute_raw(sea_orm::Statement::from_sql_and_values(sea_orm::DatabaseBackend::Sqlite,
                 "INSERT INTO thread(id,workspace_id,name,preview,mode,model,model_provider,status,origin_kind,sidebar_visibility,access_class,created_at,updated_at,created_by_actor_kind,created_by_actor_id) SELECT ?,workspace_id,?,'',mode,model,model_provider,status,origin_kind,sidebar_visibility,'workspace',created_at,updated_at,created_by_actor_kind,created_by_actor_id FROM thread WHERE id=?",
@@ -4572,7 +4558,7 @@ fn admitted_cli_search_preserves_structured_pages_at_projection_byte_boundary() 
                 &capsule,
                 thread,
                 &format!("byte-source-{n}"),
-                "boundaryneedle saved decision",
+                text,
             )
             .await;
         }
@@ -4600,6 +4586,8 @@ fn admitted_cli_search_preserves_structured_pages_at_projection_byte_boundary() 
             raw.as_object_mut().unwrap().remove(key);
         }
         assert_eq!(raw["threads"].as_array().unwrap().len(), 2);
+        assert_eq!(raw["threads"][0]["threadId"], "byte-boundary-a");
+        assert_eq!(raw["threads"][1]["threadId"], "byte-boundary-b");
         assert!(raw["nextCursor"].is_string());
         let limit = 2 * 1024 * 1024;
         let overhead = serde_json::to_vec(&raw).unwrap().len() - titles[0].len();

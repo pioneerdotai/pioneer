@@ -175,7 +175,7 @@ async fn manifest_cantopen_and_text_and_unscoped_json_are_not_transient() {
     assert_eq!(failure.sqlite_primary_code, Some(14));
     for error in [
         anyhow::anyhow!("SQLite BUSY LOCKED code: 5 connection pool timed out"),
-        anyhow::anyhow!("Memvid backend failed: /private/path token=secret"),
+        anyhow::anyhow!("SQLite backend failed: /private/path token=secret"),
         anyhow::Error::new(serde_json::from_str::<serde_json::Value>("{").unwrap_err()),
         anyhow::Error::new(pioneer_memory::MemoryWriteFailure::StorageTransient),
     ] {

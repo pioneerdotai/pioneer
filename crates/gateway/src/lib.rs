@@ -737,16 +737,14 @@ async fn run_gateway_until_shutdown_inner(
 
     let memory_runtime = Arc::new(GatewayMemoryRuntime::from_config(
         crud_store.clone(),
-        runtime_home.as_path(),
         &config.gateway.memory,
     )?);
 
     let task_runtime_config = task_runtime_config_from_gateway_tasks_config(&config.gateway.tasks);
 
-    let thread_episodic_storage_root = config
-        .gateway
-        .memory
-        .resolve_capsules_root(runtime_home.as_path())?;
+    // Retain the existing coordinator lock location and finite legacy cleanup
+    // boundary. Searchable data no longer creates files under this directory.
+    let thread_episodic_lock_root = runtime_home.join("memory/locks");
     let thread_episodic_workspace_vector_search_configs =
         gateway_settings.workspace_thread_episodic_vector_search_configs();
     let self_improvement_workspace_configs = gateway_settings.workspace_self_improvement_configs();
@@ -790,7 +788,7 @@ async fn run_gateway_until_shutdown_inner(
         tool_loop_config,
         memory_runtime,
         runtime_home.clone(),
-        thread_episodic_storage_root.clone(),
+        thread_episodic_lock_root.clone(),
         config.gateway.artifacts.clone(),
         task_runtime_config,
         thread_episodic_runtime_config_from_gateway_config(&config.gateway.thread_episodic),
@@ -896,7 +894,7 @@ async fn run_gateway_until_shutdown_inner(
     let post_message_processor = message_processor.clone();
     let post_crud_store = message_processor.crud_store.clone();
     let post_self_improvement_supervisor = self_improvement_supervisor.clone();
-    let post_thread_episodic_storage_root = thread_episodic_storage_root.clone();
+    let post_thread_episodic_lock_root = thread_episodic_lock_root.clone();
     let post_workspace_vector_search_configs =
         thread_episodic_workspace_vector_search_configs.clone();
     let post_provider_registry = provider_registry.clone();
@@ -1056,7 +1054,7 @@ async fn run_gateway_until_shutdown_inner(
                         post_crud_store.clone(),
                         startup_thread_episodic_indexing_enabled,
                         startup_thread_episodic_index_executor_config,
-                        post_thread_episodic_storage_root,
+                        post_thread_episodic_lock_root,
                         startup_thread_episodic_vector_search_config,
                         post_workspace_vector_search_configs,
                         post_provider_registry,
@@ -1436,7 +1434,6 @@ fn thread_episodic_runtime_config_from_gateway_config(
             retry_base_delay_secs: config.retry_base_delay_secs,
             retry_max_delay_secs: config.retry_max_delay_secs,
             max_attempts: config.max_attempts,
-            near_capacity_percent: config.near_capacity_percent,
         },
         recall_service: ThreadEpisodicRecallServiceConfig {
             enabled: config.enabled && config.recall_enabled,
@@ -1447,7 +1444,6 @@ fn thread_episodic_runtime_config_from_gateway_config(
             max_hit_chars: config.max_hit_chars,
             default_max_candidates: config.default_max_candidates,
             max_candidate_work: config.max_candidate_work,
-            max_segments: config.max_segments,
             min_relevancy: config.min_relevancy,
             min_results: config.min_results,
             snippet_chars: config.snippet_chars,
@@ -1472,7 +1468,6 @@ pub(crate) fn thread_episodic_runtime_config_from_gateway_settings(
             retry_base_delay_secs: settings.retry_base_delay_secs,
             retry_max_delay_secs: settings.retry_max_delay_secs,
             max_attempts: settings.max_attempts,
-            near_capacity_percent: settings.near_capacity_percent,
         },
         recall_service: ThreadEpisodicRecallServiceConfig {
             enabled: settings.enabled && settings.recall_enabled,
@@ -1483,7 +1478,6 @@ pub(crate) fn thread_episodic_runtime_config_from_gateway_settings(
             max_hit_chars: settings.max_hit_chars as usize,
             default_max_candidates: settings.default_max_candidates,
             max_candidate_work: settings.max_candidate_work,
-            max_segments: settings.max_segments as u64,
             min_relevancy: settings.min_relevancy,
             min_results: settings.min_results,
             snippet_chars: settings.snippet_chars,
@@ -1856,7 +1850,6 @@ mod runtime_tests {
             max_hit_chars: 700,
             default_max_candidates: 9,
             max_candidate_work: 33,
-            max_segments: 5,
             min_relevancy: 0.4,
             min_results: 2,
             snippet_chars: 220,
@@ -1864,7 +1857,6 @@ mod runtime_tests {
             retry_base_delay_secs: 11,
             retry_max_delay_secs: 121,
             max_attempts: 4,
-            near_capacity_percent: 81.0,
             vector_search: pioneer_config::GatewayThreadEpisodicVectorSearchConfig::default(),
         };
 
@@ -1880,14 +1872,12 @@ mod runtime_tests {
         assert_eq!(runtime.index_executor.retry_base_delay_secs, 11);
         assert_eq!(runtime.index_executor.retry_max_delay_secs, 121);
         assert_eq!(runtime.index_executor.max_attempts, 4);
-        assert_eq!(runtime.index_executor.near_capacity_percent, 81.0);
         assert!(!runtime.recall_service.enabled);
         assert_eq!(runtime.recall_service.default_prompt_chars, 1_500);
         assert_eq!(runtime.recall_service.max_prompt_chars, 6_000);
         assert_eq!(runtime.recall_service.max_hit_chars, 700);
         assert_eq!(runtime.recall_service.default_max_candidates, 9);
         assert_eq!(runtime.recall_service.max_candidate_work, 33);
-        assert_eq!(runtime.recall_service.max_segments, 5);
         assert_eq!(runtime.recall_service.min_relevancy, 0.4);
         assert_eq!(runtime.recall_service.min_results, 2);
         assert_eq!(runtime.recall_service.snippet_chars, 220);

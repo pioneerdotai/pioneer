@@ -8106,14 +8106,15 @@ impl MessageProcessor {
                             &config.gateway.thread_episodic,
                             Some(workspace_id),
                         );
-                    crate::database::startup::spawn_thread_episodic_workspace_capsule_refill_for_workspace(
+                    crate::database::startup::spawn_thread_episodic_refill_for_workspace(
                         self.crud_store.clone(),
                         workspace_thread_episodic_settings.enabled
                             && workspace_thread_episodic_settings.indexing_enabled,
                         crate::thread_episodic_runtime_config_from_gateway_settings(
                             &workspace_thread_episodic_settings,
-                        ).index_executor,
-                        self.thread_episodic_storage_root.clone(),
+                        )
+                        .index_executor,
+                        self.thread_episodic_lock_root.clone(),
                         workspace_id.to_owned(),
                         workspace_thread_episodic_settings.vector_search,
                         thread_episodic_settings.vector_search.clone(),
@@ -8126,7 +8127,7 @@ impl MessageProcessor {
                     .await;
                     vector_refill_started = true;
                 } else {
-                    crate::database::startup::spawn_thread_episodic_workspace_capsule_refill(
+                    crate::database::startup::spawn_thread_episodic_refill(
                         self.crud_store.clone(),
                         thread_episodic_settings.enabled
                             && thread_episodic_settings.indexing_enabled,
@@ -8134,7 +8135,7 @@ impl MessageProcessor {
                             &thread_episodic_settings,
                         )
                         .index_executor,
-                        self.thread_episodic_storage_root.clone(),
+                        self.thread_episodic_lock_root.clone(),
                         thread_episodic_settings.vector_search.clone(),
                         workspace_vector_search_configs,
                         self.provider_registry.clone(),
@@ -8301,11 +8302,11 @@ impl MessageProcessor {
             return Ok(());
         };
         let projection_target =
-            crate::database::startup::thread_episodic_workspace_capsule_refill::ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_vector_search_config(
+            crate::database::startup::thread_episodic_refill::ThreadEpisodicWorkspaceProjectionTarget::from_vector_search_config(
                 &thread_episodic_settings.vector_search,
             );
         let marker_status =
-            crate::database::startup::thread_episodic_workspace_capsule_refill::refill_status_for_workspace_target(
+            crate::database::startup::thread_episodic_refill::refill_status_for_workspace_target(
                 self.crud_store.as_ref(),
                 workspace_id,
                 &projection_target,

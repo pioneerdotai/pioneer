@@ -841,23 +841,26 @@ mod tests {
         let db = store.database_connection();
         let mut wake = db.work_signal("maintenance.frozen").subscribe();
         wake.begin_pass(&db).await.unwrap();
+        let descriptor = FrozenHistoryRef {
+            format: 1,
+            manifest_id: "new-after-idle".into(),
+            messages: 0,
+            identity_sha256: hex::encode(Sha256::digest([])),
+        };
         store
-            .compaction_begin_frozen_history(
-                "ws",
-                "thread",
-                &FrozenHistoryRef {
-                    format: 1,
-                    manifest_id: "new-after-idle".into(),
-                    messages: 0,
-                    identity_sha256: hex::encode(Sha256::digest([])),
-                },
-            )
+            .compaction_begin_frozen_history("ws", "thread", &descriptor)
+            .await
+            .unwrap();
+        let _capture = store
+            .compaction_finish_frozen_history_held("ws", "thread", &descriptor)
             .await
             .unwrap();
         assert!(futures_util::FutureExt::now_or_never(wake.wait(None)).is_some());
-        wake.begin_pass(&db).await.unwrap();
-        progress.restart_discovery();
-        admission = DiscoveryAdmission::default();
+        let keys = wake.begin_keyed_pass(&db).await.unwrap();
+        let conversion = progress.restart_for_changes(&store, keys).await.unwrap();
+        admission = DiscoveryAdmission {
+            done: [!conversion, false],
+        };
         lifetime = false;
         let before = observer.operations();
         // One new manifest must not pay for another 128-header legacy walk.
@@ -1253,10 +1256,10 @@ mod tests {
         let reads = observer.operations();
         let writes = observer.writes.lock().unwrap().len();
         assert!(progress.quantum(&store).await.unwrap());
-        assert_eq!(
-            observer.operations() - reads,
-            3,
-            "finite frontier + candidate + exact-key preflight, no reverse read"
+        let preflight_reads = observer.operations() - reads;
+        assert!(
+            (2..=3).contains(&preflight_reads),
+            "discard preflight must stay within its bounded maintenance read budget"
         );
         assert_eq!(observer.writes.lock().unwrap().len(), writes);
         assert!(

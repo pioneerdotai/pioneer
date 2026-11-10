@@ -10,24 +10,20 @@ pub(crate) use pioneer_crud::thread_episodic_source::*;
 use pioneer_crud::{
     CrudStore, NewThreadEpisodicEmbeddingArtifactRecord, NewThreadEpisodicIndexJobRecord,
     THREAD_EPISODIC_USER_DELETED_ERROR, THREAD_EPISODIC_USER_EXCLUDED_ERROR,
-    THREAD_EPISODIC_WORKSPACE_CAPSULE_THREAD_ID, ThreadEpisodicCapsuleCapacityUpdate,
-    ThreadEpisodicCapsuleRecord, ThreadEpisodicCapsuleStatus, ThreadEpisodicCapsuleWriteState,
-    ThreadEpisodicGraphEnrichmentState, ThreadEpisodicIndexAttemptOutcome,
-    ThreadEpisodicIndexJobCompletionUpdate, ThreadEpisodicIndexJobFailureUpdate,
-    ThreadEpisodicIndexJobRecord, ThreadEpisodicIndexJobStatus, ThreadEpisodicItemIndexedUpdate,
-    ThreadEpisodicItemRecord, ThreadEpisodicItemStatus, ThreadEpisodicItemVisibility,
-    ThreadEpisodicRepairStatus,
+    ThreadEpisodicIndexAttemptOutcome, ThreadEpisodicIndexJobCompletionUpdate,
+    ThreadEpisodicIndexJobFailureUpdate, ThreadEpisodicIndexJobRecord,
+    ThreadEpisodicIndexJobStatus, ThreadEpisodicItemIndexedUpdate, ThreadEpisodicItemRecord,
+    ThreadEpisodicItemStatus, ThreadEpisodicItemVisibility,
     ThreadEpisodicSourceActorRole as StoreThreadEpisodicSourceActorRole,
     ThreadEpisodicSourceReconcileOutcome, ThreadEpisodicSourceRuntimeKind,
-    ThreadEpisodicWorkspaceActiveWriteSegmentRequest, thread_episodic_item_uri,
 };
 use pioneer_memory::{
-    THREAD_EPISODIC_MEMVID_BATCH_BYTES, THREAD_EPISODIC_MEMVID_BATCH_ITEMS,
-    ThreadEpisodicEmbeddingError, ThreadEpisodicEmbeddingProvider, ThreadEpisodicMemvidBackend,
-    ThreadEpisodicMemvidEmbedder, ThreadEpisodicMemvidError, ThreadEpisodicMemvidFailureKind,
-    ThreadEpisodicMemvidIndexEmbedding, ThreadEpisodicMemvidIndexOutput,
-    ThreadEpisodicMemvidIndexRequest, ThreadEpisodicMemvidStats, ThreadEpisodicWorkspaceOwnership,
-    thread_episodic_memvid_metadata, try_lock_thread_episodic_workspace,
+    THREAD_EPISODIC_INDEX_BATCH_BYTES, THREAD_EPISODIC_INDEX_BATCH_ITEMS,
+    ThreadEpisodicEmbeddingError, ThreadEpisodicEmbeddingProvider, ThreadEpisodicIndexDocument,
+    ThreadEpisodicIndexEmbedding, ThreadEpisodicSearchBackend, ThreadEpisodicSearchError,
+    ThreadEpisodicSearchFailureKind, ThreadEpisodicValidationResult,
+    ThreadEpisodicWorkspaceOwnership, thread_episodic_source_metadata,
+    try_lock_thread_episodic_workspace,
 };
 use pioneer_protocol::{ThreadEpisodicSourceContext, ThreadHistoryEventPayload};
 use pioneer_provider::ProviderRegistry;
@@ -87,7 +83,6 @@ pub(crate) struct ThreadEpisodicIndexExecutorConfig {
     pub retry_base_delay_secs: i64,
     pub retry_max_delay_secs: i64,
     pub max_attempts: i64,
-    pub near_capacity_percent: f64,
 }
 
 impl Default for ThreadEpisodicIndexExecutorConfig {
@@ -97,7 +92,6 @@ impl Default for ThreadEpisodicIndexExecutorConfig {
             retry_base_delay_secs: 30,
             retry_max_delay_secs: 15 * 60,
             max_attempts: 5,
-            near_capacity_percent: 85.0,
         }
     }
 }
@@ -132,8 +126,6 @@ pub(crate) struct ThreadEpisodicItemIndexDiagnostic {
     pub source_context: ThreadEpisodicSourceContext,
     pub text_hash: String,
     pub source_text_hash: String,
-    pub capsule_id: Option<String>,
-    pub frame_uri: Option<String>,
     pub indexed_at_unix: Option<i64>,
     pub deleted_at_unix: Option<i64>,
 }
@@ -145,16 +137,10 @@ pub(crate) struct ThreadEpisodicIndexJobDiagnostic {
     pub thread_id: String,
     pub index_item_id: String,
     pub status: ThreadEpisodicIndexJobStatus,
-    pub graph_enrichment_state: ThreadEpisodicGraphEnrichmentState,
     pub attempt_count: i64,
-    pub capacity_error_count: i64,
     pub last_attempt_latency_ms: Option<i64>,
     pub next_run_at_unix: i64,
     pub last_error: Option<String>,
-    pub capsule_id: Option<String>,
-    pub capsule_ref: Option<String>,
-    pub segment_index: Option<i64>,
-    pub frame_uri: Option<String>,
     pub created_at_unix: i64,
     pub updated_at_unix: i64,
     pub completed_at_unix: Option<i64>,
@@ -173,37 +159,9 @@ pub(crate) struct ThreadEpisodicIndexMetricsDiagnostic {
     pub failed_jobs: usize,
     pub canceled_jobs: usize,
     pub total_attempts: i64,
-    pub total_capacity_errors: i64,
     pub max_attempt_count: i64,
     pub completed_latency_avg_ms: Option<f64>,
     pub failed_latency_avg_ms: Option<f64>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct ThreadEpisodicSegmentCapacityDiagnostic {
-    pub workspace_id: String,
-    pub thread_id: String,
-    pub capsule_scope: String,
-    pub capsule_id: String,
-    pub capsule_ref: String,
-    pub storage_uri: String,
-    pub segment_index: i64,
-    pub write_state: ThreadEpisodicCapsuleWriteState,
-    pub status: ThreadEpisodicCapsuleStatus,
-    pub repair_status: ThreadEpisodicRepairStatus,
-    pub active_frame_count: i64,
-    pub capacity_bytes: Option<i64>,
-    pub size_bytes: Option<i64>,
-    pub utilization_percent: Option<f64>,
-    pub last_capacity_check_at_unix: Option<i64>,
-    pub near_capacity_at_unix: Option<i64>,
-    pub capacity_exceeded_at_unix: Option<i64>,
-    pub last_vacuumed_at_unix: Option<i64>,
-    pub last_compacted_at_unix: Option<i64>,
-    pub rotation_target_capsule_id: Option<String>,
-    pub rotation_target_segment_index: Option<i64>,
-    pub metadata_json: Option<String>,
-    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -228,8 +186,7 @@ pub(crate) struct ThreadEpisodicThreadReindexSummary {
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ThreadEpisodicResolvedIndexRequest {
-    pub request: ThreadEpisodicMemvidIndexRequest,
-    pub segment_index: i64,
+    pub request: ThreadEpisodicIndexDocument,
     pub embedding_artifact_id: Option<String>,
     pub source_payload: String,
 }
@@ -315,7 +272,6 @@ pub(crate) trait ThreadEpisodicIndexEmbeddingProviderResolver: Send + Sync {
 
 pub(crate) struct StoreThreadEpisodicIndexPayloadProvider {
     crud_store: Arc<CrudStore>,
-    storage_uri_root: String,
 }
 
 #[cfg(test)]
@@ -354,11 +310,8 @@ struct CachedAggregatorEmbeddingModel {
 }
 
 impl StoreThreadEpisodicIndexPayloadProvider {
-    pub(crate) fn new(crud_store: Arc<CrudStore>, storage_uri_root: impl Into<String>) -> Self {
-        Self {
-            crud_store: Arc::new(crud_store.with_maintenance_access()),
-            storage_uri_root: storage_uri_root.into(),
-        }
+    pub(crate) fn new(crud_store: Arc<CrudStore>) -> Self {
+        Self { crud_store }
     }
 }
 
@@ -384,7 +337,7 @@ impl RuntimeVectorThreadEpisodicIndexPayloadProvider {
         Self {
             inner,
             embedding_provider_resolver,
-            crud_store: Arc::new(crud_store.with_maintenance_access()),
+            crud_store,
             artifact_locks: StdMutex::new(BTreeMap::new()),
         }
     }
@@ -841,9 +794,9 @@ impl RuntimeVectorThreadEpisodicIndexPayloadProvider {
         };
 
         resolved.request.embedding = Some(
-            ThreadEpisodicMemvidIndexEmbedding::new(identity, artifact.vector).map_err(
-                |error| ThreadEpisodicIndexResolutionError::non_retryable(error.message),
-            )?,
+            ThreadEpisodicIndexEmbedding::new(identity, artifact.vector).map_err(|error| {
+                ThreadEpisodicIndexResolutionError::non_retryable(error.message)
+            })?,
         );
         resolved.embedding_artifact_id = Some(artifact.id);
         Ok(())
@@ -881,6 +834,7 @@ fn validate_embedding_artifact(
         || artifact.dimension != identity.dimension
         || artifact.normalized != identity.normalized
         || artifact.vector.len() != identity.dimension
+        || artifact.vector.iter().any(|value| !value.is_finite())
     {
         return Err(ThreadEpisodicIndexResolutionError::non_retryable(
             "thread episodic embedding artifact identity mismatch",
@@ -903,7 +857,7 @@ fn attach_embedding_to_resolved_request(
         .embed_text_checked(resolved.request.text.as_str())
         .map_err(embedding_resolution_error)?;
     resolved.request.embedding = Some(
-        ThreadEpisodicMemvidIndexEmbedding::new(identity, vector)
+        ThreadEpisodicIndexEmbedding::new(identity, vector)
             .map_err(|error| ThreadEpisodicIndexResolutionError::non_retryable(error.message))?,
     );
     Ok(())
@@ -986,50 +940,17 @@ impl ThreadEpisodicIndexPayloadProvider for StoreThreadEpisodicIndexPayloadProvi
             ));
         }
 
-        let capsule = self
-            .crud_store
-            .resolve_thread_episodic_workspace_active_write_segment(
-                ThreadEpisodicWorkspaceActiveWriteSegmentRequest {
-                    workspace_id: item.workspace_id.clone(),
-                    storage_uri_root: self.storage_uri_root.clone(),
-                },
-                chrono::Utc::now().timestamp(),
-            )
-            .await
-            .map_err(|error| {
-                ThreadEpisodicIndexResolutionError::retryable(format!(
-                    "failed to resolve thread episodic active segment: {error}"
-                ))
-                .with_source_payload(source_payload.as_str())
-            })?;
-        let frame_uri = thread_episodic_item_uri(
-            item.workspace_id.as_str(),
-            item.thread_id.as_str(),
-            item.turn_id.as_str(),
-            item.item_id.as_str(),
-            item.id.as_str(),
-        )
-        .map_err(|error| {
-            ThreadEpisodicIndexResolutionError::non_retryable(format!(
-                "failed to build thread episodic frame uri: {error}"
-            ))
-            .with_source_payload(source_payload.as_str())
-        })?;
         let source_context_json = serde_json::to_string(&item.source_context).map_err(|error| {
             ThreadEpisodicIndexResolutionError::non_retryable(format!(
                 "failed to serialize thread episodic source context: {error}"
             ))
             .with_source_payload(source_payload.as_str())
         })?;
-        let request = ThreadEpisodicMemvidIndexRequest {
-            storage_uri: capsule.storage_uri,
-            capsule_id: capsule.id,
-            capsule_ref: capsule.capsule_ref,
-            workspace_capsule: true,
+        let request = ThreadEpisodicIndexDocument {
+            workspace_id: item.workspace_id.clone(),
             index_item_id: item.id,
-            frame_uri,
             text: source_text,
-            metadata: thread_episodic_memvid_metadata(
+            metadata: thread_episodic_source_metadata(
                 item.workspace_id.as_str(),
                 item.thread_id.as_str(),
                 item.turn_id.as_str(),
@@ -1045,7 +966,6 @@ impl ThreadEpisodicIndexPayloadProvider for StoreThreadEpisodicIndexPayloadProvi
 
         Ok(ThreadEpisodicResolvedIndexRequest {
             request,
-            segment_index: capsule.segment_index,
             embedding_artifact_id: None,
             source_payload,
         })
@@ -1055,15 +975,15 @@ impl ThreadEpisodicIndexPayloadProvider for StoreThreadEpisodicIndexPayloadProvi
 impl StoreThreadEpisodicIndexPayloadProvider {
     async fn resolve_item_source_text(
         &self,
-        index_item: &ThreadEpisodicItemRecord,
+        validate_document: &ThreadEpisodicItemRecord,
     ) -> std::result::Result<(String, String), ThreadEpisodicIndexResolutionError> {
         let canonical = self
             .crud_store
             .get_thread_episodic_canonical_item(
-                index_item.workspace_id.as_str(),
-                index_item.thread_id.as_str(),
-                index_item.turn_id.as_str(),
-                index_item.item_id.as_str(),
+                validate_document.workspace_id.as_str(),
+                validate_document.thread_id.as_str(),
+                validate_document.turn_id.as_str(),
+                validate_document.item_id.as_str(),
             )
             .await
             .map_err(|error| thread_item_events_resolution_error(error))?
@@ -1072,12 +992,12 @@ impl StoreThreadEpisodicIndexPayloadProvider {
                     "canonical thread item is missing for thread episodic indexing",
                 )
             })?;
-        canonical_source_text(index_item, canonical)
+        canonical_source_text(validate_document, canonical)
     }
 }
 
 fn canonical_source_text(
-    index_item: &ThreadEpisodicItemRecord,
+    validate_document: &ThreadEpisodicItemRecord,
     canonical: pioneer_crud::ThreadEpisodicCanonicalItem,
 ) -> std::result::Result<(String, String), ThreadEpisodicIndexResolutionError> {
     if !canonical.committed {
@@ -1086,10 +1006,10 @@ fn canonical_source_text(
         ));
     }
     let committed = ThreadEpisodicCommittedItem {
-        workspace_id: index_item.workspace_id.clone(),
-        thread_id: index_item.thread_id.clone(),
-        turn_id: index_item.turn_id.clone(),
-        item_id: index_item.item_id.clone(),
+        workspace_id: validate_document.workspace_id.clone(),
+        thread_id: validate_document.thread_id.clone(),
+        turn_id: validate_document.turn_id.clone(),
+        item_id: validate_document.item_id.clone(),
         item_type: canonical.item.item_type(),
         source_actor_role: committed_item_source_actor_role(&canonical.item),
         source_context: committed_item_source_context(&canonical.item),
@@ -1127,7 +1047,6 @@ pub(crate) struct ThreadEpisodicRecallServiceConfig {
     pub max_hit_chars: usize,
     pub default_max_candidates: u32,
     pub max_candidate_work: u32,
-    pub max_segments: u64,
     pub min_relevancy: f32,
     pub min_results: u32,
     pub snippet_chars: u32,
@@ -1144,7 +1063,6 @@ impl Default for ThreadEpisodicRecallServiceConfig {
             max_hit_chars: 1_200,
             default_max_candidates: 32,
             max_candidate_work: 128,
-            max_segments: 16,
             min_relevancy: 0.25,
             min_results: 1,
             snippet_chars: 360,
@@ -1154,7 +1072,7 @@ impl Default for ThreadEpisodicRecallServiceConfig {
 
 pub(crate) struct ThreadEpisodicRecallService {
     crud_store: Arc<CrudStore>,
-    backend: Arc<dyn ThreadEpisodicMemvidBackend>,
+    backend: Arc<dyn ThreadEpisodicSearchBackend>,
     embedding_provider_resolver: Option<Arc<dyn ThreadEpisodicIndexEmbeddingProviderResolver>>,
     config: StdRwLock<ThreadEpisodicRecallServiceConfig>,
     workspace_vector_search_configs:
@@ -1164,7 +1082,7 @@ pub(crate) struct ThreadEpisodicRecallService {
 impl ThreadEpisodicRecallService {
     pub(crate) fn with_embedding_provider_resolver(
         crud_store: Arc<CrudStore>,
-        backend: Arc<dyn ThreadEpisodicMemvidBackend>,
+        backend: Arc<dyn ThreadEpisodicSearchBackend>,
         embedding_provider_resolver: Option<Arc<dyn ThreadEpisodicIndexEmbeddingProviderResolver>>,
     ) -> Self {
         Self {
@@ -1203,10 +1121,10 @@ impl ThreadEpisodicRecallService {
             .unwrap_or_else(|| default_config.clone())
     }
 
-    async fn resolve_hybrid_recall_embedder(
+    async fn resolve_recall_embedding_provider(
         &self,
         workspace_id: &str,
-    ) -> std::result::Result<Arc<ThreadEpisodicMemvidEmbedder>, String> {
+    ) -> std::result::Result<Arc<dyn ThreadEpisodicEmbeddingProvider>, String> {
         let Some(resolver) = self.embedding_provider_resolver.as_ref() else {
             return Err("active embedding provider resolver is not configured".to_owned());
         };
@@ -1220,14 +1138,14 @@ impl ThreadEpisodicRecallService {
                 .unwrap_or_else(|| "active embedding provider is not ready".to_owned()));
         };
 
-        Ok(Arc::new(ThreadEpisodicMemvidEmbedder::new(provider)))
+        Ok(provider)
     }
 
     async fn reconstruct_item_text(
         &self,
         item: &ThreadEpisodicItemRecord,
     ) -> std::result::Result<String, String> {
-        let provider = StoreThreadEpisodicIndexPayloadProvider::new(self.crud_store.clone(), "");
+        let provider = StoreThreadEpisodicIndexPayloadProvider::new(self.crud_store.clone());
         let (source_text, _source_payload) = provider
             .resolve_item_source_text(item)
             .await
@@ -1253,16 +1171,10 @@ fn index_job_diagnostic(
         thread_id: job.thread_id,
         index_item_id: job.index_item_id,
         status: job.status,
-        graph_enrichment_state: job.graph_enrichment_state,
         attempt_count: job.attempt_count,
-        capacity_error_count: job.capacity_error_count,
         last_attempt_latency_ms: job.last_attempt_latency_ms,
         next_run_at_unix: job.next_run_at.timestamp(),
         last_error: job.last_error,
-        capsule_id: job.capsule_id,
-        capsule_ref: job.capsule_ref,
-        segment_index: job.segment_index,
-        frame_uri: job.frame_uri,
         created_at_unix: job.created_at.timestamp(),
         updated_at_unix: job.updated_at.timestamp(),
         completed_at_unix: job.completed_at.map(|value| value.timestamp()),
@@ -1308,9 +1220,6 @@ fn index_metrics_diagnostic(
             ThreadEpisodicIndexJobStatus::Canceled => metrics.canceled_jobs += 1,
         }
         metrics.total_attempts = metrics.total_attempts.saturating_add(job.attempt_count);
-        metrics.total_capacity_errors = metrics
-            .total_capacity_errors
-            .saturating_add(job.capacity_error_count);
         metrics.max_attempt_count = metrics.max_attempt_count.max(job.attempt_count);
     }
 
@@ -1321,65 +1230,6 @@ fn index_metrics_diagnostic(
 
 fn average_i64(sum: i64, count: i64) -> Option<f64> {
     (count > 0).then(|| sum as f64 / count as f64)
-}
-
-pub(crate) fn memvid_stats_reach_capacity_threshold(
-    stats: &ThreadEpisodicMemvidStats,
-    threshold_percent: f64,
-) -> bool {
-    if stats
-        .utilization_percent
-        .is_some_and(|value| value >= threshold_percent)
-    {
-        return true;
-    }
-    match (stats.size_bytes, stats.capacity_bytes) {
-        (Some(size_bytes), Some(capacity_bytes)) if capacity_bytes > 0 => {
-            (size_bytes as f64 / capacity_bytes as f64) * 100.0 >= threshold_percent
-        }
-        _ => false,
-    }
-}
-
-fn segment_capacity_diagnostic(
-    capsule: &ThreadEpisodicCapsuleRecord,
-) -> ThreadEpisodicSegmentCapacityDiagnostic {
-    let workspace_capsule = capsule.thread_id == THREAD_EPISODIC_WORKSPACE_CAPSULE_THREAD_ID;
-    ThreadEpisodicSegmentCapacityDiagnostic {
-        workspace_id: capsule.workspace_id.clone(),
-        thread_id: if workspace_capsule {
-            String::new()
-        } else {
-            capsule.thread_id.clone()
-        },
-        capsule_scope: if workspace_capsule {
-            "workspace".to_owned()
-        } else {
-            "thread".to_owned()
-        },
-        capsule_id: capsule.id.clone(),
-        capsule_ref: capsule.capsule_ref.clone(),
-        storage_uri: capsule.storage_uri.clone(),
-        segment_index: capsule.segment_index,
-        write_state: capsule.write_state,
-        status: capsule.status,
-        repair_status: capsule.repair_status,
-        active_frame_count: capsule.active_frame_count,
-        capacity_bytes: capsule.capacity_bytes,
-        size_bytes: capsule.size_bytes,
-        utilization_percent: capsule.utilization_percent,
-        last_capacity_check_at_unix: capsule
-            .last_capacity_check_at
-            .map(|value| value.timestamp()),
-        near_capacity_at_unix: capsule.near_capacity_at.map(|value| value.timestamp()),
-        capacity_exceeded_at_unix: capsule.capacity_exceeded_at.map(|value| value.timestamp()),
-        last_vacuumed_at_unix: capsule.last_vacuumed_at.map(|value| value.timestamp()),
-        last_compacted_at_unix: capsule.last_compacted_at.map(|value| value.timestamp()),
-        rotation_target_capsule_id: None,
-        rotation_target_segment_index: None,
-        metadata_json: capsule.metadata_json.clone(),
-        last_error: capsule.last_error.clone(),
-    }
 }
 
 fn item_index_diagnostic(item: ThreadEpisodicItemRecord) -> ThreadEpisodicItemIndexDiagnostic {
@@ -1394,8 +1244,6 @@ fn item_index_diagnostic(item: ThreadEpisodicItemRecord) -> ThreadEpisodicItemIn
         source_context: item.source_context,
         text_hash: item.text_hash,
         source_text_hash: item.source_text_hash,
-        capsule_id: item.capsule_id,
-        frame_uri: item.frame_uri,
         indexed_at_unix: item.indexed_at.map(|value| value.timestamp()),
         deleted_at_unix: item.deleted_at.map(|value| value.timestamp()),
     }
@@ -1495,7 +1343,7 @@ struct OwnedEpisodicAttempt {
 
 pub(crate) struct ThreadEpisodicIndexExecutor {
     crud_store: Arc<CrudStore>,
-    backend: Arc<dyn ThreadEpisodicMemvidBackend>,
+    backend: Arc<dyn ThreadEpisodicSearchBackend>,
     payload_provider: Arc<dyn ThreadEpisodicIndexPayloadProvider>,
     config: StdRwLock<ThreadEpisodicIndexExecutorConfig>,
     indexing_enabled: std::sync::atomic::AtomicBool,
@@ -1603,7 +1451,7 @@ struct ThreadEpisodicPrimaryPersistenceFault {
 impl ThreadEpisodicIndexExecutor {
     pub(crate) fn new(
         crud_store: Arc<CrudStore>,
-        backend: Arc<dyn ThreadEpisodicMemvidBackend>,
+        backend: Arc<dyn ThreadEpisodicSearchBackend>,
         payload_provider: Arc<dyn ThreadEpisodicIndexPayloadProvider>,
     ) -> Self {
         let wake_notification = crud_store.thread_episodic_work_notification();
@@ -1693,7 +1541,7 @@ impl ThreadEpisodicIndexExecutor {
     #[cfg(test)]
     async fn advance_managed_time_for_test(&self, seconds: i64) {
         // Keep the durable scheduling clock deterministic while SQLite and
-        // Memvid use native threads. Pause Tokio only to release the runner's
+        // Prepared work may use native threads. Pause Tokio only to release the runner's
         // timer, then resume before awaiting DB/FS work; idle auto-advance must
         // not expire pool or provider timeouts during those operations.
         {
@@ -1909,7 +1757,6 @@ impl ThreadEpisodicIndexExecutor {
                         "episodic executor attempt interrupted before durable settlement"
                             .to_owned(),
                     ),
-                    capacity_error: false,
                     last_attempt_latency_ms: None,
                 },
                 now_unix,
@@ -2217,24 +2064,6 @@ impl ThreadEpisodicIndexExecutor {
     }
 
     #[allow(dead_code)]
-    pub(crate) async fn debug_segment_capacity_for_thread(
-        &self,
-        workspace_id: &str,
-        _thread_id: &str,
-        limit: u64,
-    ) -> Result<Vec<ThreadEpisodicSegmentCapacityDiagnostic>> {
-        let capsules = self
-            .crud_store
-            .list_thread_episodic_workspace_capsules(workspace_id, limit)
-            .await?;
-        let mut diagnostics = Vec::with_capacity(capsules.len());
-        for capsule in &capsules {
-            diagnostics.push(segment_capacity_diagnostic(capsule));
-        }
-        Ok(diagnostics)
-    }
-
-    #[allow(dead_code)]
     pub(crate) async fn retry_failed_or_stale_index_job(
         &self,
         job_id: &str,
@@ -2518,7 +2347,7 @@ impl ThreadEpisodicIndexExecutor {
             || candidate.attempt_count.checked_add(1).is_none();
         let projection_changed = candidate.last_error.as_deref()
             == Some(pioneer_crud::THREAD_EPISODIC_PROJECTION_CHANGED_ERROR);
-        use crate::database::startup::thread_episodic_workspace_capsule_refill as refill;
+        use crate::database::startup::thread_episodic_refill as refill;
         if let Some((root, resolver, supervisor)) = self
             .projection_runtime
             .as_ref()
@@ -2535,9 +2364,11 @@ impl ThreadEpisodicIndexExecutor {
                 }
             };
             let target = if let Some(provider) = &provider {
-                refill::ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_embedding_provider(provider.as_ref())?
+                refill::ThreadEpisodicWorkspaceProjectionTarget::from_embedding_provider(
+                    provider.as_ref(),
+                )?
             } else {
-                refill::ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::lexical_only()
+                refill::ThreadEpisodicWorkspaceProjectionTarget::lexical_only()
             };
             if !refill::projection_accepts_index_target(&self.crud_store, workspace, &target)
                 .await?
@@ -2570,8 +2401,8 @@ impl ThreadEpisodicIndexExecutor {
                             let provider = resolver.resolve_active_embedding_provider(&workspace).await
                                 .map_err(|error| anyhow::anyhow!(error.message))?;
                             let target = if let Some(provider) = &provider {
-                                refill::ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_embedding_provider(provider.as_ref())?
-                            } else { refill::ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::lexical_only() };
+                                refill::ThreadEpisodicWorkspaceProjectionTarget::from_embedding_provider(provider.as_ref())?
+                            } else { refill::ThreadEpisodicWorkspaceProjectionTarget::lexical_only() };
                             refill::refill_once_with_projection_resolver_and_config(
                                 store.clone(), &root, &workspace, target,
                                 provider.map(|_| resolver), None, config, Some(&ownership_acquired),
@@ -2714,13 +2545,13 @@ impl ThreadEpisodicIndexExecutor {
         // scheduler or an extra claim/attempt budget.
         if !prepared.is_empty()
             && (!compatible
-                || prepared.len() >= THREAD_EPISODIC_MEMVID_BATCH_ITEMS
-                || bytes.saturating_add(item.prepared_bytes()) > THREAD_EPISODIC_MEMVID_BATCH_BYTES
+                || prepared.len() >= THREAD_EPISODIC_INDEX_BATCH_ITEMS
+                || bytes.saturating_add(item.prepared_bytes()) > THREAD_EPISODIC_INDEX_BATCH_BYTES
                 || job.attempt_count > 1)
         {
             self.flush_prepared(prepared, now_unix, config, summary)
                 .await?;
-            // Completion may rotate the active segment. Never dispatch a
+            // Completion advances the projection. Never dispatch a
             // request prepared against the old catalog after that boundary.
             item = match self
                 .prepare_claimed_job(job.clone(), now_unix, config, ownership)
@@ -2730,10 +2561,10 @@ impl ThreadEpisodicIndexExecutor {
                 Err(outcome) => return self.account_outcome(&job.id, outcome, summary),
             };
         }
-        let single = item.job.attempt_count > 1
-            || item.prepared_bytes() > THREAD_EPISODIC_MEMVID_BATCH_BYTES;
+        let single =
+            item.job.attempt_count > 1 || item.prepared_bytes() > THREAD_EPISODIC_INDEX_BATCH_BYTES;
         prepared.push(item);
-        if single || prepared.len() >= THREAD_EPISODIC_MEMVID_BATCH_ITEMS {
+        if single || prepared.len() >= THREAD_EPISODIC_INDEX_BATCH_ITEMS {
             self.flush_prepared(prepared, now_unix, config, summary)
                 .await?;
         }
@@ -2790,7 +2621,7 @@ impl ThreadEpisodicIndexExecutor {
         };
         let result = self
             .backend
-            .index_item_with_workspace_ownership(
+            .validate_document_with_workspace_ownership(
                 item.resolved.request.clone(),
                 item.ownership.clone(),
             )
@@ -2827,7 +2658,7 @@ impl ThreadEpisodicIndexExecutor {
             .swap(false, std::sync::atomic::Ordering::AcqRel)
         {
             return Err(ThreadEpisodicIndexJobProcessOutcome::PersistenceFailure(
-                anyhow::anyhow!("controlled readiness read failure before filesystem"),
+                anyhow::anyhow!("controlled readiness read failure before publication"),
             ));
         }
         self.validate_dispatch_attempt(&job, Some(&resolved), now_unix)
@@ -2866,11 +2697,16 @@ impl ThreadEpisodicIndexExecutor {
             return Err(Outcome::StaleAttempt);
         }
         if let Some(resolved) = resolved.filter(|_| self.projection_runtime.is_some()) {
-            use crate::database::startup::thread_episodic_workspace_capsule_refill as refill;
+            use crate::database::startup::thread_episodic_refill as refill;
             let target = match &resolved.request.embedding {
-                Some(embedding) => refill::ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_embedding_identity(&embedding.identity),
-                None => Ok(refill::ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::lexical_only()),
-            }.map_err(Outcome::PersistenceFailure)?;
+                Some(embedding) => {
+                    refill::ThreadEpisodicWorkspaceProjectionTarget::from_embedding_identity(
+                        &embedding.identity,
+                    )
+                }
+                None => Ok(refill::ThreadEpisodicWorkspaceProjectionTarget::lexical_only()),
+            }
+            .map_err(Outcome::PersistenceFailure)?;
             if !refill::projection_accepts_index_target(
                 &self.crud_store,
                 &job.workspace_id,
@@ -2898,7 +2734,7 @@ impl ThreadEpisodicIndexExecutor {
         }
         if self.stopping.is_cancelled() {
             return Err(Outcome::PersistenceFailure(anyhow::anyhow!(
-                "episodic executor stopped before filesystem dispatch"
+                "episodic executor stopped before projection publication"
             )));
         }
         Ok(())
@@ -2950,7 +2786,7 @@ impl ThreadEpisodicIndexExecutor {
         let mut results = if count == 1 {
             vec![
                 self.backend
-                    .index_item_with_workspace_ownership(
+                    .validate_document_with_workspace_ownership(
                         items[0].resolved.request.clone(),
                         items[0].ownership.clone(),
                     )
@@ -2958,12 +2794,12 @@ impl ThreadEpisodicIndexExecutor {
             ]
         } else {
             self.backend
-                .index_batch_with_workspace_ownership(requests, items[0].ownership.clone())
+                .validate_documents_with_workspace_ownership(requests, items[0].ownership.clone())
                 .await
         };
         if results.len() != count {
             results = vec![
-                Err(ThreadEpisodicMemvidError::retryable(
+                Err(ThreadEpisodicSearchError::retryable(
                     "invalid batch result count; outcome unknown"
                 ));
                 count
@@ -2998,7 +2834,7 @@ impl ThreadEpisodicIndexExecutor {
     async fn finish_prepared(
         &self,
         item: PreparedEpisodicAttempt,
-        result: std::result::Result<ThreadEpisodicMemvidIndexOutput, ThreadEpisodicMemvidError>,
+        result: std::result::Result<ThreadEpisodicValidationResult, ThreadEpisodicSearchError>,
         now_unix: i64,
         config: ThreadEpisodicIndexExecutorConfig,
     ) -> ThreadEpisodicIndexJobProcessOutcome {
@@ -3014,22 +2850,6 @@ impl ThreadEpisodicIndexExecutor {
                     &job,
                     resolved,
                     output,
-                    now_unix,
-                    config,
-                    attempt_started_at,
-                )
-                .await
-            }
-            Err(error)
-                if matches!(
-                    error.kind,
-                    ThreadEpisodicMemvidFailureKind::CapacityExceeded
-                ) =>
-            {
-                self.retry_once_after_capacity_rotation(
-                    &job,
-                    resolved,
-                    error,
                     now_unix,
                     config,
                     attempt_started_at,
@@ -3054,28 +2874,33 @@ impl ThreadEpisodicIndexExecutor {
         &self,
         job: &ThreadEpisodicIndexJobRecord,
         resolved: ThreadEpisodicResolvedIndexRequest,
-        output: ThreadEpisodicMemvidIndexOutput,
+        _output: ThreadEpisodicValidationResult,
         now_unix: i64,
         config: ThreadEpisodicIndexExecutorConfig,
         attempt_started_at: Instant,
     ) -> ThreadEpisodicIndexJobProcessOutcome {
-        let indexed_capsule_id = resolved.request.capsule_id.clone();
+        let projection_guard = if self.projection_runtime.is_some() {
+            use crate::database::startup::thread_episodic_refill::ThreadEpisodicWorkspaceProjectionTarget as Target;
+            let target = match &resolved.request.embedding {
+                Some(embedding) => Target::from_embedding_identity(&embedding.identity),
+                None => Ok(Target::lexical_only()),
+            };
+            match target.and_then(|target| target.publication_guard(&job.workspace_id)) {
+                Ok(guard) => Some(guard),
+                Err(error) => {
+                    return ThreadEpisodicIndexJobProcessOutcome::PersistenceFailure(error);
+                }
+            }
+        } else {
+            None
+        };
         let source_payload = resolved.source_payload.clone();
-        let output_stats = output.stats.clone();
-        let frame_uri = output.frame_uri;
         let item_update = ThreadEpisodicItemIndexedUpdate {
-            capsule_id: resolved.request.capsule_id.clone(),
-            capsule_ref: resolved.request.capsule_ref.clone(),
-            segment_index: resolved.segment_index,
-            frame_id: output.frame_id,
-            frame_uri: frame_uri.clone(),
-            embedding_artifact_id: resolved.embedding_artifact_id.clone(),
+            projection_guard,
+            search_text: resolved.request.text,
+            embedding_artifact_id: resolved.embedding_artifact_id,
         };
         let update = ThreadEpisodicIndexJobCompletionUpdate {
-            capsule_id: resolved.request.capsule_id,
-            capsule_ref: resolved.request.capsule_ref,
-            segment_index: resolved.segment_index,
-            frame_uri,
             last_attempt_latency_ms: Some(elapsed_ms(attempt_started_at)),
         };
         match self
@@ -3091,20 +2916,6 @@ impl ThreadEpisodicIndexExecutor {
             .await
         {
             Ok(ThreadEpisodicIndexAttemptOutcome::Applied) => {
-                self.update_capsule_capacity(
-                    indexed_capsule_id.as_str(),
-                    &output_stats,
-                    None,
-                    false,
-                    now_unix,
-                )
-                .await;
-                self.rotate_capsule_if_near_capacity(
-                    indexed_capsule_id.as_str(),
-                    &output_stats,
-                    now_unix,
-                )
-                .await;
                 ThreadEpisodicIndexJobProcessOutcome::Completed
             }
             Ok(ThreadEpisodicIndexAttemptOutcome::StaleAttempt) => {
@@ -3115,7 +2926,8 @@ impl ThreadEpisodicIndexExecutor {
                 );
                 ThreadEpisodicIndexJobProcessOutcome::StaleAttempt
             }
-            Ok(ThreadEpisodicIndexAttemptOutcome::SourceChanged)
+            Ok(ThreadEpisodicIndexAttemptOutcome::ProjectionChanged)
+            | Ok(ThreadEpisodicIndexAttemptOutcome::SourceChanged)
             | Ok(ThreadEpisodicIndexAttemptOutcome::Excluded) => {
                 self.reconcile_and_release_claim(job, now_unix, config, attempt_started_at)
                     .await
@@ -3130,7 +2942,6 @@ impl ThreadEpisodicIndexExecutor {
                     .persist_failure(
                         job,
                         job.attempt_count < config.max_attempts,
-                        false,
                         None,
                         Some(format!("failed to complete index job: {error}")),
                         Some(source_payload.as_str()),
@@ -3224,7 +3035,6 @@ impl ThreadEpisodicIndexExecutor {
                 self.persist_failure(
                     job,
                     false,
-                    false,
                     None,
                     Some(
                         "thread episodic source changed repeatedly while resolving the same claim"
@@ -3239,7 +3049,6 @@ impl ThreadEpisodicIndexExecutor {
             Ok(None) => {
                 self.persist_failure(
                     job,
-                    false,
                     false,
                     None,
                     Some(
@@ -3278,7 +3087,6 @@ impl ThreadEpisodicIndexExecutor {
                 self.persist_failure(
                     job,
                     retryable,
-                    false,
                     None,
                     Some(format!(
                         "failed to reconcile changed thread episodic source: {error:#}"
@@ -3290,58 +3098,6 @@ impl ThreadEpisodicIndexExecutor {
                 .await
             }
         }
-    }
-
-    async fn retry_once_after_capacity_rotation(
-        &self,
-        job: &ThreadEpisodicIndexJobRecord,
-        resolved: ThreadEpisodicResolvedIndexRequest,
-        error: ThreadEpisodicMemvidError,
-        now_unix: i64,
-        config: ThreadEpisodicIndexExecutorConfig,
-        attempt_started_at: Instant,
-    ) -> ThreadEpisodicIndexJobProcessOutcome {
-        let sanitized_error = sanitize_thread_episodic_index_error(error.message.as_str());
-        let capsule_id = resolved.request.capsule_id.clone();
-        let retryable = job.attempt_count < config.max_attempts;
-        let outcome = self
-            .persist_failure(
-                job,
-                retryable,
-                true,
-                None,
-                Some(sanitized_error.clone()),
-                Some(resolved.source_payload.as_str()),
-                now_unix,
-                attempt_started_at,
-            )
-            .await;
-        if matches!(&outcome, ThreadEpisodicIndexJobProcessOutcome::Requeued) {
-            return self
-                .reconcile_and_release_claim(job, now_unix, config, attempt_started_at)
-                .await;
-        }
-        if matches!(
-            &outcome,
-            ThreadEpisodicIndexJobProcessOutcome::RetryableFailure
-                | ThreadEpisodicIndexJobProcessOutcome::TerminalFailure
-        ) {
-            self.update_capsule_capacity(
-                capsule_id.as_str(),
-                &ThreadEpisodicMemvidStats::default(),
-                Some(sanitized_error),
-                true,
-                now_unix,
-            )
-            .await;
-            self.rotate_capsule_after_capacity_event(
-                capsule_id.as_str(),
-                now_unix,
-                "capacity_exceeded",
-            )
-            .await;
-        }
-        outcome
     }
 
     async fn record_resolution_failure(
@@ -3364,7 +3120,6 @@ impl ThreadEpisodicIndexExecutor {
             .persist_failure(
                 job,
                 retryable,
-                false,
                 retry_after_ms,
                 Some(message),
                 source_payload.as_deref(),
@@ -3384,25 +3139,17 @@ impl ThreadEpisodicIndexExecutor {
         &self,
         job: &ThreadEpisodicIndexJobRecord,
         resolved: ThreadEpisodicResolvedIndexRequest,
-        error: ThreadEpisodicMemvidError,
+        error: ThreadEpisodicSearchError,
         now_unix: i64,
         config: ThreadEpisodicIndexExecutorConfig,
         attempt_started_at: Instant,
     ) -> ThreadEpisodicIndexJobProcessOutcome {
-        let retryable = matches!(
-            error.kind,
-            ThreadEpisodicMemvidFailureKind::Retryable
-                | ThreadEpisodicMemvidFailureKind::CapacityExceeded
-        ) && job.attempt_count < config.max_attempts;
-        let capacity_error = matches!(
-            error.kind,
-            ThreadEpisodicMemvidFailureKind::CapacityExceeded
-        );
+        let retryable = matches!(error.kind, ThreadEpisodicSearchFailureKind::Retryable)
+            && job.attempt_count < config.max_attempts;
         let outcome = self
             .persist_failure(
                 job,
                 retryable,
-                capacity_error,
                 None,
                 Some(error.message),
                 Some(resolved.source_payload.as_str()),
@@ -3422,31 +3169,25 @@ impl ThreadEpisodicIndexExecutor {
         &self,
         job: &ThreadEpisodicIndexJobRecord,
         retryable: bool,
-        capacity_error: bool,
         retry_after_ms: Option<u64>,
         error_message: Option<String>,
         expected_source_payload: Option<&str>,
         now_unix: i64,
         attempt_started_at: Instant,
     ) -> ThreadEpisodicIndexJobProcessOutcome {
-        let next_run_at_unix = if retryable && capacity_error {
-            Some(now_unix)
-        } else {
-            retryable.then(|| {
-                embedding_retry_at(
-                    self.next_retry_at(job, now_unix),
-                    self.now_unix().max(now_unix),
-                    retry_after_ms,
-                )
-            })
-        };
+        let next_run_at_unix = retryable.then(|| {
+            embedding_retry_at(
+                self.next_retry_at(job, now_unix),
+                self.now_unix().max(now_unix),
+                retry_after_ms,
+            )
+        });
         let sanitized_error =
             error_message.map(|message| sanitize_thread_episodic_index_error(&message));
         let update = ThreadEpisodicIndexJobFailureUpdate {
             retryable,
             next_run_at_unix,
             last_error: sanitized_error.clone(),
-            capacity_error,
             last_attempt_latency_ms: Some(elapsed_ms(attempt_started_at)),
         };
         let injected_persistence_error = self.take_primary_persistence_failure().await;
@@ -3498,7 +3239,6 @@ impl ThreadEpisodicIndexExecutor {
                         )
                     }),
                     last_error: Some(persistence_error),
-                    capacity_error: false,
                     last_attempt_latency_ms: Some(elapsed_ms(attempt_started_at)),
                 };
                 let recovered =
@@ -3542,7 +3282,8 @@ impl ThreadEpisodicIndexExecutor {
                     Ok(ThreadEpisodicIndexAttemptOutcome::StaleAttempt) => {
                         return ThreadEpisodicIndexJobProcessOutcome::StaleAttempt;
                     }
-                    Ok(ThreadEpisodicIndexAttemptOutcome::SourceChanged)
+                    Ok(ThreadEpisodicIndexAttemptOutcome::ProjectionChanged)
+                    | Ok(ThreadEpisodicIndexAttemptOutcome::SourceChanged)
                     | Ok(ThreadEpisodicIndexAttemptOutcome::Excluded) => {
                         return ThreadEpisodicIndexJobProcessOutcome::PersistenceFailure(
                             anyhow::anyhow!(
@@ -3567,7 +3308,8 @@ impl ThreadEpisodicIndexExecutor {
             ThreadEpisodicIndexAttemptOutcome::StaleAttempt => {
                 return ThreadEpisodicIndexJobProcessOutcome::StaleAttempt;
             }
-            ThreadEpisodicIndexAttemptOutcome::SourceChanged
+            ThreadEpisodicIndexAttemptOutcome::ProjectionChanged
+            | ThreadEpisodicIndexAttemptOutcome::SourceChanged
             | ThreadEpisodicIndexAttemptOutcome::Excluded => {
                 return ThreadEpisodicIndexJobProcessOutcome::Requeued;
             }
@@ -3579,13 +3321,7 @@ impl ThreadEpisodicIndexExecutor {
                 workspace_id = %job.workspace_id,
                 thread_id = %job.thread_id,
                 index_item_id = %job.index_item_id,
-                capsule_id = job.capsule_id.as_deref(),
-                capsule_ref = job.capsule_ref.as_deref(),
-                segment_index = job.segment_index,
-                frame_uri = job.frame_uri.as_deref(),
                 attempt_count = job.attempt_count,
-                capacity_error_count = job.capacity_error_count,
-                capacity_error,
                 latency_ms = elapsed_ms(attempt_started_at),
                 error = sanitized_error.as_deref().unwrap_or("unknown thread episodic index failure"),
                 "thread episodic index job failed terminally"
@@ -3595,96 +3331,6 @@ impl ThreadEpisodicIndexExecutor {
             ThreadEpisodicIndexJobProcessOutcome::RetryableFailure
         } else {
             ThreadEpisodicIndexJobProcessOutcome::TerminalFailure
-        }
-    }
-
-    async fn update_capsule_capacity(
-        &self,
-        capsule_id: &str,
-        stats: &ThreadEpisodicMemvidStats,
-        last_error: Option<String>,
-        capacity_exceeded: bool,
-        now_unix: i64,
-    ) {
-        let config = self.config.read().map(|config| *config).unwrap_or_default();
-        let now = fixed_datetime_from_unix(now_unix);
-        let utilization = stats.utilization_percent;
-        let near_capacity_at =
-            utilization.and_then(|value| (value >= config.near_capacity_percent).then_some(now));
-        let update = ThreadEpisodicCapsuleCapacityUpdate {
-            capacity_bytes: stats.capacity_bytes,
-            size_bytes: stats.size_bytes,
-            utilization_percent: stats.utilization_percent,
-            active_frame_count: stats.active_frame_count,
-            near_capacity_at,
-            capacity_exceeded_at: capacity_exceeded.then_some(now),
-            last_error,
-        };
-        if let Err(error) = self
-            .crud_store
-            .update_thread_episodic_capsule_capacity(capsule_id, update, now_unix)
-            .await
-        {
-            tracing::debug!(
-                capsule_id,
-                error = %error,
-                "failed to update thread episodic capsule capacity metadata"
-            );
-        }
-    }
-
-    async fn rotate_capsule_if_near_capacity(
-        &self,
-        capsule_id: &str,
-        stats: &ThreadEpisodicMemvidStats,
-        now_unix: i64,
-    ) {
-        let config = self.config.read().map(|config| *config).unwrap_or_default();
-        if !memvid_stats_reach_capacity_threshold(stats, config.near_capacity_percent) {
-            return;
-        }
-        self.rotate_capsule_after_capacity_event(capsule_id, now_unix, "near_capacity")
-            .await;
-    }
-
-    async fn rotate_capsule_after_capacity_event(
-        &self,
-        capsule_id: &str,
-        now_unix: i64,
-        reason: &str,
-    ) {
-        match self
-            .crud_store
-            .transition_thread_episodic_active_write_segment(
-                capsule_id,
-                ThreadEpisodicCapsuleWriteState::Full,
-                now_unix,
-            )
-            .await
-        {
-            Ok(Some(rotated)) => {
-                tracing::info!(
-                    capsule_id = %rotated.id,
-                    segment_index = rotated.segment_index,
-                    reason,
-                    "thread episodic active write segment rotated to full"
-                );
-            }
-            Ok(None) => {
-                tracing::debug!(
-                    capsule_id,
-                    reason,
-                    "thread episodic active write segment rotation skipped"
-                );
-            }
-            Err(error) => {
-                tracing::warn!(
-                    capsule_id,
-                    reason,
-                    error = %error,
-                    "failed to rotate thread episodic active write segment"
-                );
-            }
         }
     }
 
@@ -4143,12 +3789,7 @@ impl StoreThreadEpisodicIngestor {
                         workspace_id: item.workspace_id.clone(),
                         thread_id: item.thread_id.clone(),
                         index_item_id: item.id.clone(),
-                        capsule_id: None,
-                        capsule_ref: None,
-                        segment_index: None,
-                        frame_uri: None,
                         status: ThreadEpisodicIndexJobStatus::Queued,
-                        graph_enrichment_state: ThreadEpisodicGraphEnrichmentState::NotSupported,
                         next_run_at: fixed_datetime_from_unix(request.now_unix),
                         last_error: None,
                     },
@@ -4237,26 +3878,22 @@ fn thread_episodic_source_context_is_recallable(
 mod tests {
     use super::*;
     use crate::bootstrap::bootstrap;
-    use crate::database::startup::thread_episodic_workspace_capsule_refill::ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget;
+    use crate::database::startup::thread_episodic_refill::ThreadEpisodicWorkspaceProjectionTarget;
+    use crate::tests::episodic_projection::PersistedProjection;
     use crate::workspace::WorkspaceManager;
     use migration::{Migrator, MigratorTrait};
-    use pioneer_crud::thread_episodic_thread_uri_prefix;
     use pioneer_crud::{
         CrudStore, NewThreadEpisodicExclusionRecord, NewThreadEpisodicItemRecord,
-        THREAD_EPISODIC_SOURCE_VERSION_SUPERSEDED_ERROR, ThreadEpisodicCapsuleWriteState,
-        ThreadEpisodicExclusionReason, ThreadEpisodicIndexJobStatus,
-        ThreadEpisodicThreadDirectorySelection,
+        THREAD_EPISODIC_SOURCE_VERSION_SUPERSEDED_ERROR, ThreadEpisodicExclusionReason,
+        ThreadEpisodicIndexJobStatus, ThreadEpisodicThreadDirectorySelection,
     };
     use pioneer_entity::turn;
+    use pioneer_memory::ThreadEpisodicSearchProfile;
     use pioneer_memory::{
         InMemoryMemoryBackend, MemoryOperationContext, MemoryService, MemoryServiceConfig,
-        MemvidThreadEpisodicBackend, ThreadEpisodicAdaptiveRetrievalImplementation,
-        ThreadEpisodicEmbeddingErrorKind, ThreadEpisodicMemvidBackendCapabilities,
-        ThreadEpisodicMemvidCapabilityState, ThreadEpisodicMemvidSearchOutput,
-        ThreadEpisodicMemvidSearchRequest, ThreadEpisodicMemvidStats,
-        ThreadEpisodicSearchProfileKind, thread_episodic_storage_uri_from_path,
+        SqliteThreadEpisodicBackend, ThreadEpisodicEmbeddingErrorKind, ThreadEpisodicSearchOutput,
+        ThreadEpisodicSearchProfileKind, ThreadEpisodicSearchRequest,
     };
-    use pioneer_memory::{ThreadEpisodicMemvidSearchSegment, ThreadEpisodicSearchProfile};
     use pioneer_protocol::ThreadEpisodicSourceActorRole;
     use pioneer_protocol::{AgentMessagePhase, TaskStatus, TaskTurnItem, TurnItem, TurnItemType};
     use pioneer_protocol::{
@@ -4388,30 +4025,26 @@ mod tests {
         }
     }
 
-    struct FakeThreadEpisodicMemvidBackend {
-        capabilities: ThreadEpisodicMemvidBackendCapabilities,
+    struct PreparedDocumentBackend {
         outcomes: Mutex<
             VecDeque<
-                std::result::Result<ThreadEpisodicMemvidIndexOutput, ThreadEpisodicMemvidError>,
+                std::result::Result<ThreadEpisodicValidationResult, ThreadEpisodicSearchError>,
             >,
         >,
-        requests: Mutex<Vec<ThreadEpisodicMemvidIndexRequest>>,
+        requests: Mutex<Vec<ThreadEpisodicIndexDocument>>,
         source_update_during_index: Mutex<Option<(Arc<CrudStore>, ItemUpdatedNotification, i64)>>,
         exclusion_during_index:
             Mutex<Option<(Arc<CrudStore>, NewThreadEpisodicExclusionRecord, i64)>>,
         index_barriers: Mutex<Option<(Arc<tokio::sync::Barrier>, Arc<tokio::sync::Barrier>)>>,
     }
 
-    impl FakeThreadEpisodicMemvidBackend {
+    impl PreparedDocumentBackend {
         fn new(
             outcomes: Vec<
-                std::result::Result<ThreadEpisodicMemvidIndexOutput, ThreadEpisodicMemvidError>,
+                std::result::Result<ThreadEpisodicValidationResult, ThreadEpisodicSearchError>,
             >,
         ) -> Self {
             Self {
-                capabilities: fake_memvid_backend_capabilities(
-                    ThreadEpisodicMemvidCapabilityState::Disabled,
-                ),
                 outcomes: Mutex::new(VecDeque::from(outcomes)),
                 requests: Mutex::new(Vec::new()),
                 source_update_during_index: Mutex::new(None),
@@ -4438,21 +4071,17 @@ mod tests {
             *self.exclusion_during_index.lock().await = Some((crud_store, exclusion, now_unix));
         }
 
-        async fn requests(&self) -> Vec<ThreadEpisodicMemvidIndexRequest> {
+        async fn requests(&self) -> Vec<ThreadEpisodicIndexDocument> {
             self.requests.lock().await.clone()
         }
     }
 
     #[async_trait]
-    impl ThreadEpisodicMemvidBackend for FakeThreadEpisodicMemvidBackend {
-        fn capabilities(&self) -> ThreadEpisodicMemvidBackendCapabilities {
-            self.capabilities.clone()
-        }
-
-        async fn index_item(
+    impl ThreadEpisodicSearchBackend for PreparedDocumentBackend {
+        async fn validate_document(
             &self,
-            request: ThreadEpisodicMemvidIndexRequest,
-        ) -> std::result::Result<ThreadEpisodicMemvidIndexOutput, ThreadEpisodicMemvidError>
+            request: ThreadEpisodicIndexDocument,
+        ) -> std::result::Result<ThreadEpisodicValidationResult, ThreadEpisodicSearchError>
         {
             self.requests.lock().await.push(request.clone());
             let barriers = self.index_barriers.lock().await.take();
@@ -4477,54 +4106,31 @@ mod tests {
                     .expect("test exclusion during indexing should persist");
             }
             let Some(outcome) = self.outcomes.lock().await.pop_front() else {
-                return Ok(ThreadEpisodicMemvidIndexOutput {
-                    frame_id: 99,
-                    embedding_identity: request
-                        .embedding
-                        .as_ref()
-                        .map(|embedding| embedding.identity.clone()),
-                    frame_uri: request.frame_uri,
-                    stats: ThreadEpisodicMemvidStats {
-                        active_frame_count: Some(1),
-                        frame_count: Some(1),
-                        size_bytes: Some(128),
-                        capacity_bytes: Some(1_024),
-                        remaining_capacity_bytes: Some(896),
-                        utilization_percent: Some(12.5),
-                    },
-                });
+                return Ok(());
             };
-            outcome.map(|mut output| {
-                if output.frame_uri.is_empty() {
-                    output.frame_uri = request.frame_uri;
-                }
-                output
-            })
+            outcome
         }
 
         async fn search(
             &self,
-            _request: ThreadEpisodicMemvidSearchRequest,
-        ) -> std::result::Result<ThreadEpisodicMemvidSearchOutput, ThreadEpisodicMemvidError>
-        {
-            Err(ThreadEpisodicMemvidError::non_retryable(
+            _request: ThreadEpisodicSearchRequest,
+        ) -> std::result::Result<ThreadEpisodicSearchOutput, ThreadEpisodicSearchError> {
+            Err(ThreadEpisodicSearchError::non_retryable(
                 "unexpected search in indexing fixture",
             ))
         }
-    }
 
-    fn fake_memvid_backend_capabilities(
-        hybrid_search: ThreadEpisodicMemvidCapabilityState,
-    ) -> ThreadEpisodicMemvidBackendCapabilities {
-        ThreadEpisodicMemvidBackendCapabilities {
-            adaptive_retrieval: ThreadEpisodicMemvidCapabilityState::Supported,
-            adaptive_retrieval_implementation:
-                ThreadEpisodicAdaptiveRetrievalImplementation::PioneerFallback,
-            semantic_search: hybrid_search,
-            hybrid_search,
-            lexical_search: ThreadEpisodicMemvidCapabilityState::Supported,
-            temporal_search: ThreadEpisodicMemvidCapabilityState::Supported,
-            graph_search: ThreadEpisodicMemvidCapabilityState::Disabled,
+        async fn search_page(
+            &self,
+            _request: ThreadEpisodicSearchRequest,
+            _page_size: usize,
+            _cursor: Option<String>,
+            _embedding: Option<ThreadEpisodicIndexEmbedding>,
+        ) -> std::result::Result<pioneer_memory::ThreadEpisodicSearchPage, ThreadEpisodicSearchError>
+        {
+            Err(ThreadEpisodicSearchError::non_retryable(
+                "unexpected search in indexing fixture",
+            ))
         }
     }
 
@@ -4592,26 +4198,8 @@ mod tests {
         visibility: ThreadEpisodicItemVisibility,
         projection_group_id: &str,
     ) -> ThreadEpisodicItemRecord {
-        let capsule = crud_store
-            .resolve_thread_episodic_workspace_active_write_segment(
-                ThreadEpisodicWorkspaceActiveWriteSegmentRequest {
-                    workspace_id: workspace_id.to_owned(),
-                    storage_uri_root: "file:///tmp/pioneer-thread-episodic-tests".to_owned(),
-                },
-                1_700_000_000,
-            )
-            .await
-            .expect("workspace capsule should resolve");
         let index_item_id = pioneer_protocol::generate_id(21);
-        let frame_uri = thread_episodic_item_uri(
-            workspace_id,
-            thread_id,
-            turn_id,
-            item_id,
-            index_item_id.as_str(),
-        )
-        .expect("canonical frame URI");
-        let index_item = crud_store
+        let validate_document = crud_store
             .upsert_thread_episodic_item(
                 NewThreadEpisodicItemRecord {
                     id: Some(index_item_id),
@@ -4623,7 +4211,11 @@ mod tests {
                     source_runtime_kind: ThreadEpisodicSourceRuntimeKind::UserTurn,
                     source_context: ThreadEpisodicSourceContext::UserVisibleThreadItem,
                     visibility,
-                    status,
+                    status: if status == ThreadEpisodicItemStatus::Active {
+                        ThreadEpisodicItemStatus::PendingIndex
+                    } else {
+                        status
+                    },
                     text_hash: item_text_hash(
                         &ThreadEpisodicCommittedItem {
                             workspace_id: workspace_id.to_owned(),
@@ -4645,20 +4237,30 @@ mod tests {
                     projection_group_id: projection_group_id.to_owned(),
                     language_hint: None,
                     token_estimate: 8,
-                    capsule_id: Some(capsule.id),
-                    capsule_ref: Some(capsule.capsule_ref),
-                    segment_index: Some(capsule.segment_index),
-                    frame_id: Some(42),
-                    frame_uri: Some(frame_uri),
-                    indexed_at: (status == ThreadEpisodicItemStatus::Active)
-                        .then(|| fixed_datetime_from_unix(1_700_000_001)),
+                    indexed_at: None,
                     deleted_at: None,
                 },
                 1_700_000_000,
             )
             .await
             .expect("item should insert");
-        index_item
+        if status == ThreadEpisodicItemStatus::Active {
+            crud_store
+                .mark_thread_episodic_item_indexed(
+                    &validate_document.id,
+                    ThreadEpisodicItemIndexedUpdate {
+                        projection_guard: None,
+                        search_text: source_text.to_owned(),
+                        embedding_artifact_id: None,
+                    },
+                    1_700_000_001,
+                )
+                .await
+                .unwrap()
+                .unwrap()
+        } else {
+            validate_document
+        }
     }
 
     #[tokio::test]
@@ -4868,10 +4470,7 @@ mod tests {
             .await
             .expect("reconciled task projections should list");
         assert_eq!(items.len(), 7);
-        let provider = StoreThreadEpisodicIndexPayloadProvider::new(
-            crud_store.clone(),
-            "file:///tmp/pioneer-thread-episodic-canonical-task-test".to_owned(),
-        );
+        let provider = StoreThreadEpisodicIndexPayloadProvider::new(crud_store.clone());
         for item in items {
             let expected_text = expected
                 .get(item.item_id.as_str())
@@ -4958,10 +4557,7 @@ mod tests {
             )
             .await
             .expect("canonical source should update after enqueue");
-        let payload_provider = StoreThreadEpisodicIndexPayloadProvider::new(
-            crud_store.clone(),
-            "file:///tmp/pioneer-thread-episodic-resume-test".to_owned(),
-        );
+        let payload_provider = StoreThreadEpisodicIndexPayloadProvider::new(crud_store.clone());
         let resolution_error = payload_provider
             .resolve_index_request(&old_job)
             .await
@@ -4977,7 +4573,6 @@ mod tests {
                     retryable: false,
                     next_run_at_unix: None,
                     last_error: Some(resolution_error.message),
-                    capacity_error: false,
                     last_attempt_latency_ms: Some(1),
                 },
                 1_700_000_035,
@@ -5034,11 +4629,8 @@ mod tests {
                 .mark_thread_episodic_item_indexed(
                     old_item.id.as_str(),
                     ThreadEpisodicItemIndexedUpdate {
-                        capsule_id: "late_capsule".to_owned(),
-                        capsule_ref: "late_capsule_ref".to_owned(),
-                        segment_index: 1,
-                        frame_id: 99,
-                        frame_uri: "late_frame".to_owned(),
+                        search_text: "fixture indexed source".to_owned(),
+                        projection_guard: None,
                         embedding_artifact_id: None,
                     },
                     1_700_000_050,
@@ -5052,10 +4644,6 @@ mod tests {
                 .complete_thread_episodic_index_job(
                     old_job.id.as_str(),
                     ThreadEpisodicIndexJobCompletionUpdate {
-                        capsule_id: "late_capsule".to_owned(),
-                        capsule_ref: "late_capsule_ref".to_owned(),
-                        segment_index: 1,
-                        frame_uri: "late_frame".to_owned(),
                         last_attempt_latency_ms: Some(1),
                     },
                     1_700_000_050,
@@ -5184,18 +4772,11 @@ mod tests {
                 w1.attempt_count,
                 source_payload.as_str(),
                 ThreadEpisodicItemIndexedUpdate {
-                    capsule_id: "stale-capsule".to_owned(),
-                    capsule_ref: "stale-capsule-ref".to_owned(),
-                    segment_index: 0,
-                    frame_id: 66,
-                    frame_uri: "mv2://attempt/stale-a".to_owned(),
+                    search_text: "fixture indexed source".to_owned(),
+                    projection_guard: None,
                     embedding_artifact_id: None,
                 },
                 ThreadEpisodicIndexJobCompletionUpdate {
-                    capsule_id: "stale-capsule".to_owned(),
-                    capsule_ref: "stale-capsule-ref".to_owned(),
-                    segment_index: 0,
-                    frame_uri: "mv2://attempt/stale-a".to_owned(),
                     last_attempt_latency_ms: Some(10),
                 },
                 1_700_010_008,
@@ -5217,7 +4798,6 @@ mod tests {
                         retryable,
                         next_run_at_unix: retryable.then_some(1_700_010_100),
                         last_error: Some("delayed W1 HTTP 403 failure".to_owned()),
-                        capacity_error: false,
                         last_attempt_latency_ms: Some(10),
                     },
                     1_700_010_009,
@@ -5240,11 +4820,8 @@ mod tests {
         }
 
         let item_update = ThreadEpisodicItemIndexedUpdate {
-            capsule_id: "capsule-a".to_owned(),
-            capsule_ref: "capsule-ref-a".to_owned(),
-            segment_index: 0,
-            frame_id: 77,
-            frame_uri: "mv2://attempt/a".to_owned(),
+            search_text: "fixture indexed source".to_owned(),
+            projection_guard: None,
             embedding_artifact_id: None,
         };
         let applied = crud_store
@@ -5254,10 +4831,6 @@ mod tests {
                 source_payload.as_str(),
                 item_update,
                 ThreadEpisodicIndexJobCompletionUpdate {
-                    capsule_id: "capsule-a".to_owned(),
-                    capsule_ref: "capsule-ref-a".to_owned(),
-                    segment_index: 0,
-                    frame_uri: "mv2://attempt/a".to_owned(),
                     last_attempt_latency_ms: Some(1),
                 },
                 1_700_010_010,
@@ -5277,7 +4850,10 @@ mod tests {
             .expect("item lookup should succeed")
             .expect("item should remain");
         assert_eq!(item.status, ThreadEpisodicItemStatus::Active);
-        assert_eq!(item.frame_id, Some(77));
+        assert_eq!(
+            item.projection_text(&crud_store).await.as_deref(),
+            Some("fixture indexed source")
+        );
     }
 
     #[tokio::test]
@@ -5309,7 +4885,7 @@ mod tests {
             )
             .await
             .expect("initial source should reconcile");
-        let backend = Arc::new(FakeThreadEpisodicMemvidBackend::new(Vec::new()));
+        let backend = Arc::new(PreparedDocumentBackend::new(Vec::new()));
         backend
             .update_source_during_next_index(
                 crud_store.clone(),
@@ -5328,7 +4904,6 @@ mod tests {
             .await;
         let provider = Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
             crud_store.clone(),
-            "file:///tmp/pioneer-thread-episodic-during-backend".to_owned(),
         ));
         let executor =
             ThreadEpisodicIndexExecutor::new(crud_store.clone(), backend.clone(), provider);
@@ -5373,7 +4948,13 @@ mod tests {
             active.source_text_hash,
             source_text_hash("version changed during backend")
         );
-        assert_eq!(active.frame_id, Some(99));
+        assert!(
+            active
+                .projection_text(&crud_store)
+                .await
+                .as_deref()
+                .is_some_and(|text| !text.is_empty())
+        );
     }
 
     #[tokio::test]
@@ -5405,8 +4986,8 @@ mod tests {
             )
             .await
             .expect("initial source should reconcile");
-        let backend = Arc::new(FakeThreadEpisodicMemvidBackend::new(vec![Err(
-            ThreadEpisodicMemvidError::non_retryable("failure belonging to A"),
+        let backend = Arc::new(PreparedDocumentBackend::new(vec![Err(
+            ThreadEpisodicSearchError::non_retryable("failure belonging to A"),
         )]));
         backend
             .update_source_during_next_index(
@@ -5426,7 +5007,6 @@ mod tests {
             .await;
         let provider = Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
             crud_store.clone(),
-            "file:///tmp/pioneer-thread-episodic-before-failure-commit".to_owned(),
         ));
         let executor = ThreadEpisodicIndexExecutor::new(crud_store.clone(), backend, provider);
         let first = executor
@@ -5493,10 +5073,9 @@ mod tests {
             )
             .await
             .expect("source should change after enqueue");
-        let backend = Arc::new(FakeThreadEpisodicMemvidBackend::new(Vec::new()));
+        let backend = Arc::new(PreparedDocumentBackend::new(Vec::new()));
         let provider = Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
             crud_store.clone(),
-            "file:///tmp/pioneer-thread-episodic-after-enqueue".to_owned(),
         ));
         let executor =
             ThreadEpisodicIndexExecutor::new(crud_store.clone(), backend.clone(), provider);
@@ -5565,13 +5144,12 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let backend = Arc::new(FakeThreadEpisodicMemvidBackend::new(Vec::new()));
+        let backend = Arc::new(PreparedDocumentBackend::new(Vec::new()));
         let executor = ThreadEpisodicIndexExecutor::new(
             crud_store.clone(),
             backend.clone(),
             Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
                 crud_store.clone(),
-                "file:///tmp/pioneer-restore-source".to_owned(),
             )),
         );
         assert_eq!(executor.run_once(1_700_016_104).await.unwrap().completed, 1);
@@ -5628,13 +5206,12 @@ mod tests {
             )
             .await
             .unwrap();
-        let backend = Arc::new(FakeThreadEpisodicMemvidBackend::new(Vec::new()));
+        let backend = Arc::new(PreparedDocumentBackend::new(Vec::new()));
         let executor = ThreadEpisodicIndexExecutor::new(
             crud_store.clone(),
             backend.clone(),
             Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
                 crud_store.clone(),
-                "file:///tmp/pioneer-same-ready-content".to_owned(),
             )),
         );
         assert_eq!(executor.run_once(1_700_000_002).await.unwrap().completed, 1);
@@ -5679,7 +5256,10 @@ mod tests {
 
     #[tokio::test]
     async fn ordinary_ingest_restores_completed_superseded_source_without_reindexing() {
-        for projection_replaced in [false, true] {
+        use sea_orm::{ActiveModelTrait, IntoActiveModel, Set};
+        for (vector, projection_replaced) in
+            [(false, false), (false, true), (true, false), (true, true)]
+        {
             let (crud_store, workspace_id) = setup_thread_episodic_store().await;
             let thread_id = "thread_ingest_restore_completed";
             let turn_id = "turn_ingest_restore_completed";
@@ -5711,14 +5291,55 @@ mod tests {
                 )
                 .await
                 .expect("ordinary ingest should enqueue version A");
-            let backend = Arc::new(FakeThreadEpisodicMemvidBackend::new(Vec::new()));
+            let backend = Arc::new(PreparedDocumentBackend::new(Vec::new()));
+            let embedding_provider =
+                Arc::new(StaticThreadEpisodicEmbeddingProvider::with_identity(
+                    "openrouter",
+                    "vendor/cache-test",
+                    vec![0.4, 0.5, 0.6],
+                ));
+            let target = if vector {
+                let target = ThreadEpisodicWorkspaceProjectionTarget::from_embedding_provider(
+                    embedding_provider.as_ref(),
+                )
+                .unwrap();
+                let mut marker = pioneer_crud::find_projection_meta(
+                    &crud_store.database_connection(),
+                    &pioneer_crud::thread_episodic_refill_projection_key(&workspace_id).unwrap(),
+                )
+                .await
+                .unwrap()
+                .unwrap()
+                .into_active_model();
+                let config = target.meta_config_record();
+                marker.projection_config_hash = Set(config.projection_config_hash);
+                marker.projection_config_json = Set(config.projection_config_json);
+                marker
+                    .update(&crud_store.database_connection())
+                    .await
+                    .unwrap();
+                target
+            } else {
+                ThreadEpisodicWorkspaceProjectionTarget::lexical_only()
+            };
+            let payload_provider: Arc<dyn ThreadEpisodicIndexPayloadProvider> = Arc::new(
+                StoreThreadEpisodicIndexPayloadProvider::new(crud_store.clone()),
+            );
+            let payload_provider: Arc<dyn ThreadEpisodicIndexPayloadProvider> = if vector {
+                let resolver = Arc::new(SharedThreadEpisodicIndexEmbeddingProviderResolver::new());
+                resolver.set_active_provider(Some(embedding_provider.clone()));
+                Arc::new(RuntimeVectorThreadEpisodicIndexPayloadProvider::new(
+                    payload_provider,
+                    resolver,
+                    crud_store.clone(),
+                ))
+            } else {
+                payload_provider
+            };
             let executor = ThreadEpisodicIndexExecutor::new(
                 crud_store.clone(),
                 backend.clone(),
-                Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
-                    crud_store.clone(),
-                    "file:///tmp/pioneer-thread-episodic-ingest-restore-completed".to_owned(),
-                )),
+                payload_provider,
             );
             let claim_now = chrono::Utc::now().timestamp().saturating_add(60);
             assert_eq!(
@@ -5735,6 +5356,7 @@ mod tests {
                 .expect("version A should list")
                 .pop()
                 .expect("version A should exist");
+            assert_eq!(version_a.embedding_artifact_id.is_some(), vector);
             let version_a_job = crud_store
                 .find_thread_episodic_index_job_by_item(version_a.id.as_str())
                 .await
@@ -5775,16 +5397,23 @@ mod tests {
             );
 
             if projection_replaced {
-                crate::database::startup::thread_episodic_workspace_capsule_refill::mark_projection_reset(&crud_store.database_connection(), &workspace_id, pioneer_crud::PROJECTION_META_STATUS_PENDING, &ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::lexical_only()).await.unwrap();
+                crate::database::startup::thread_episodic_refill::mark_projection_reset(
+                    &crud_store.database_connection(),
+                    &workspace_id,
+                    pioneer_crud::PROJECTION_META_STATUS_PENDING,
+                    &target,
+                )
+                .await
+                .unwrap();
                 crud_store
                     .reset_thread_episodic_projection(&workspace_id, claim_now + 2)
                     .await
                     .unwrap();
-                crate::database::startup::thread_episodic_workspace_capsule_refill::mark_projection_reset(
+                crate::database::startup::thread_episodic_refill::mark_projection_reset(
                     &crud_store.database_connection(),
                     &workspace_id,
                     pioneer_crud::PROJECTION_META_STATUS_COMPLETE,
-                    &ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::lexical_only(),
+                    &target,
                 )
                 .await
                 .unwrap();
@@ -5862,7 +5491,23 @@ mod tests {
                 .expect("version B should remain unique");
             assert_eq!(restored_a.id, version_a.id);
             assert_eq!(restored_a.status, ThreadEpisodicItemStatus::Active);
-            assert!(restored_a.frame_id.is_some());
+            assert_eq!(
+                restored_a.projection_text(&crud_store).await.as_deref(),
+                Some("version A")
+            );
+            assert_eq!(
+                restored_a.embedding_artifact_id,
+                version_a.embedding_artifact_id
+            );
+            if let Some(artifact_id) = &restored_a.embedding_artifact_id {
+                let artifact = crud_store
+                    .find_thread_episodic_embedding_artifact(artifact_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(artifact.vector, vec![0.4, 0.5, 0.6]);
+                assert_eq!(artifact.model, "vendor/cache-test");
+            }
             assert_eq!(retired_b.status, ThreadEpisodicItemStatus::Superseded);
             let restored_a_job = crud_store
                 .find_thread_episodic_index_job_by_item(restored_a.id.as_str())
@@ -5977,13 +5622,12 @@ mod tests {
             )
             .await
             .expect("ordinary ingest should reconcile canonical B");
-        let backend = Arc::new(FakeThreadEpisodicMemvidBackend::new(Vec::new()));
+        let backend = Arc::new(PreparedDocumentBackend::new(Vec::new()));
         let executor = ThreadEpisodicIndexExecutor::new(
             crud_store.clone(),
             backend.clone(),
             Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
                 crud_store.clone(),
-                "file:///tmp/pioneer-thread-episodic-ingest-restore-unfinished".to_owned(),
             )),
         );
         let claim_now = chrono::Utc::now().timestamp().saturating_add(60);
@@ -6121,7 +5765,7 @@ mod tests {
             .expect("projection should list")
             .pop()
             .expect("projection should exist");
-        let backend = Arc::new(FakeThreadEpisodicMemvidBackend::new(Vec::new()));
+        let backend = Arc::new(PreparedDocumentBackend::new(Vec::new()));
         backend
             .exclude_during_next_index(
                 crud_store.clone(),
@@ -6141,7 +5785,6 @@ mod tests {
             backend.clone(),
             Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
                 crud_store.clone(),
-                "file:///tmp/pioneer-thread-episodic-exclusion-race".to_owned(),
             )),
         );
 
@@ -6162,7 +5805,7 @@ mod tests {
             .expect("excluded projection lookup should succeed")
             .expect("excluded projection should remain");
         assert_eq!(excluded.status, ThreadEpisodicItemStatus::Excluded);
-        assert!(excluded.frame_id.is_none());
+        assert!(excluded.projection_text(&crud_store).await.is_none());
         assert!(
             crud_store
                 .find_thread_episodic_exclusion_by_item(
@@ -6197,12 +5840,7 @@ mod tests {
                     workspace_id: workspace_id.clone(),
                     thread_id: item.thread_id.clone(),
                     index_item_id: item.id.clone(),
-                    capsule_id: None,
-                    capsule_ref: None,
-                    segment_index: None,
-                    frame_uri: None,
                     status: ThreadEpisodicIndexJobStatus::Queued,
-                    graph_enrichment_state: ThreadEpisodicGraphEnrichmentState::NotSupported,
                     next_run_at: fixed_datetime_from_unix(1_700_016_300),
                     last_error: None,
                 },
@@ -6210,13 +5848,12 @@ mod tests {
             )
             .await
             .expect("orphan job should insert");
-        let backend = Arc::new(FakeThreadEpisodicMemvidBackend::new(Vec::new()));
+        let backend = Arc::new(PreparedDocumentBackend::new(Vec::new()));
         let executor = ThreadEpisodicIndexExecutor::new(
             crud_store.clone(),
             backend.clone(),
             Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
                 crud_store.clone(),
-                "file:///tmp/pioneer-thread-episodic-missing-source".to_owned(),
             )),
         );
 
@@ -6304,7 +5941,6 @@ mod tests {
                     last_error: Some(
                         pioneer_crud::THREAD_EPISODIC_LEGACY_SOURCE_HASH_MISMATCH_ERROR.to_owned(),
                     ),
-                    capacity_error: false,
                     last_attempt_latency_ms: None,
                 },
                 1_700_019_003,
@@ -6330,13 +5966,12 @@ mod tests {
         assert_eq!(recovered.status, ThreadEpisodicIndexJobStatus::Queued);
         assert_eq!(recovered.attempt_count, claimed.attempt_count);
 
-        let backend = Arc::new(FakeThreadEpisodicMemvidBackend::new(Vec::new()));
+        let backend = Arc::new(PreparedDocumentBackend::new(Vec::new()));
         let executor = ThreadEpisodicIndexExecutor::new(
             crud_store.clone(),
             backend.clone(),
             Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
                 crud_store.clone(),
-                "file:///tmp/pioneer-thread-episodic-legacy-return".to_owned(),
             )),
         );
         let summary = executor
@@ -6402,7 +6037,6 @@ mod tests {
                     retryable: false,
                     next_run_at_unix: None,
                     last_error: Some("real old provider failure".to_owned()),
-                    capacity_error: false,
                     last_attempt_latency_ms: None,
                 },
                 1_700_019_102,
@@ -6497,7 +6131,6 @@ mod tests {
                     retryable: false,
                     next_run_at_unix: None,
                     last_error: Some("independent terminal provider failure".to_owned()),
-                    capacity_error: false,
                     last_attempt_latency_ms: None,
                 },
                 1_700_019_107,
@@ -6577,7 +6210,6 @@ mod tests {
                         retryable: true,
                         next_run_at_unix: Some(1_700_019_300),
                         last_error: Some("completion persistence failed".to_owned()),
-                        capacity_error: false,
                         last_attempt_latency_ms: None,
                     },
                     1_700_019_202,
@@ -6616,7 +6248,6 @@ mod tests {
             retryable: false,
             next_run_at_unix: None,
             last_error: Some("failure persistence failed at retry limit".to_owned()),
-            capacity_error: false,
             last_attempt_latency_ms: None,
         };
         assert_eq!(
@@ -6832,12 +6463,7 @@ mod tests {
                     workspace_id: workspace_id.clone(),
                     thread_id: item.thread_id.clone(),
                     index_item_id: item.id.clone(),
-                    capsule_id: None,
-                    capsule_ref: None,
-                    segment_index: None,
-                    frame_uri: None,
                     status: ThreadEpisodicIndexJobStatus::Queued,
-                    graph_enrichment_state: ThreadEpisodicGraphEnrichmentState::NotSupported,
                     next_run_at: fixed_datetime_from_unix(1_700_025_000),
                     last_error: None,
                 },
@@ -6865,8 +6491,11 @@ mod tests {
             .expect("job lookup should succeed")
             .expect("job should remain");
         assert_eq!(recovered.status, ThreadEpisodicIndexJobStatus::Completed);
-        assert_eq!(recovered.capsule_id, item.capsule_id);
-        assert_eq!(recovered.frame_uri, item.frame_uri);
+        assert_eq!(recovered.index_item_id, item.id);
+        assert_eq!(
+            item.projection_text(&crud_store).await.as_deref(),
+            Some("already indexed")
+        );
         let directory = crud_store
             .list_thread_episodic_thread_directory_entries_for_workspace(workspace_id.as_str(), 10)
             .await
@@ -6940,11 +6569,6 @@ mod tests {
                         projection_group_id: format!("many-version-{index}"),
                         language_hint: None,
                         token_estimate: 1,
-                        capsule_id: None,
-                        capsule_ref: None,
-                        segment_index: None,
-                        frame_id: None,
-                        frame_uri: None,
                         indexed_at: None,
                         deleted_at: None,
                     },
@@ -7021,11 +6645,6 @@ mod tests {
                         projection_group_id: format!("legacy-excluded-{index}"),
                         language_hint: None,
                         token_estimate: 1,
-                        capsule_id: None,
-                        capsule_ref: None,
-                        segment_index: None,
-                        frame_id: None,
-                        frame_uri: None,
                         indexed_at: None,
                         deleted_at: None,
                     },
@@ -7057,16 +6676,11 @@ mod tests {
                         workspace_id: workspace_id.clone(),
                         thread_id: thread_id.to_owned(),
                         index_item_id: item.id.clone(),
-                        capsule_id: None,
-                        capsule_ref: None,
-                        segment_index: None,
-                        frame_uri: None,
                         status: if index == 39 {
                             ThreadEpisodicIndexJobStatus::Completed
                         } else {
                             ThreadEpisodicIndexJobStatus::Canceled
                         },
-                        graph_enrichment_state: ThreadEpisodicGraphEnrichmentState::NotSupported,
                         next_run_at: fixed_datetime_from_unix(1_700_062_060 + index as i64),
                         last_error: if index == 39 {
                             Some("completed job diagnostic".to_owned())
@@ -7105,12 +6719,7 @@ mod tests {
                         workspace_id: workspace_id.clone(),
                         thread_id: unrelated.thread_id.clone(),
                         index_item_id: unrelated.id,
-                        capsule_id: None,
-                        capsule_ref: None,
-                        segment_index: None,
-                        frame_uri: None,
                         status: ThreadEpisodicIndexJobStatus::Canceled,
-                        graph_enrichment_state: ThreadEpisodicGraphEnrichmentState::NotSupported,
                         next_run_at: fixed_datetime_from_unix(1_700_062_100 + index),
                         last_error: Some("independent terminal provider failure".to_owned()),
                     },
@@ -7327,11 +6936,6 @@ mod tests {
                     projection_group_id: "legacy-deleted".to_owned(),
                     language_hint: None,
                     token_estimate: 1,
-                    capsule_id: None,
-                    capsule_ref: None,
-                    segment_index: None,
-                    frame_id: None,
-                    frame_uri: None,
                     indexed_at: None,
                     deleted_at: Some(fixed_datetime_from_unix(1_700_062_300)),
                 },
@@ -7346,12 +6950,7 @@ mod tests {
                     workspace_id: workspace_id.clone(),
                     thread_id: deleted.thread_id.clone(),
                     index_item_id: deleted.id.clone(),
-                    capsule_id: None,
-                    capsule_ref: None,
-                    segment_index: None,
-                    frame_uri: None,
                     status: ThreadEpisodicIndexJobStatus::Canceled,
-                    graph_enrichment_state: ThreadEpisodicGraphEnrichmentState::NotSupported,
                     next_run_at: fixed_datetime_from_unix(1_700_062_301),
                     last_error: Some("legacy terminal error before tombstone repair".to_owned()),
                 },
@@ -7466,8 +7065,7 @@ mod tests {
     }
 
     struct StaticThreadEpisodicIndexPayloadProvider {
-        request: ThreadEpisodicMemvidIndexRequest,
-        segment_index: i64,
+        request: ThreadEpisodicIndexDocument,
         source_payload: String,
     }
 
@@ -7567,7 +7165,6 @@ mod tests {
         > {
             Ok(ThreadEpisodicResolvedIndexRequest {
                 request: self.request.clone(),
-                segment_index: self.segment_index,
                 embedding_artifact_id: None,
                 source_payload: self.source_payload.clone(),
             })
@@ -7577,8 +7174,7 @@ mod tests {
     async fn static_index_payload_provider(
         crud_store: &CrudStore,
         item: &ThreadEpisodicItemRecord,
-        request: ThreadEpisodicMemvidIndexRequest,
-        segment_index: i64,
+        mut request: ThreadEpisodicIndexDocument,
     ) -> Arc<StaticThreadEpisodicIndexPayloadProvider> {
         let canonical = crud_store
             .get_thread_episodic_canonical_item(
@@ -7590,9 +7186,20 @@ mod tests {
             .await
             .expect("canonical item lookup should succeed")
             .expect("canonical item should exist");
+        request.workspace_id = item.workspace_id.clone();
+        let committed = committed_item_ingestion_input_from_parts(
+            &item.workspace_id,
+            &item.thread_id,
+            &item.turn_id,
+            canonical.item,
+        )
+        .unwrap();
+        request.text = match select_committed_item_source(&committed) {
+            ThreadEpisodicSourceSelection::Indexable(source) => source.text.trim().to_owned(),
+            other => panic!("invalid canonical fixture: {other:?}"),
+        };
         Arc::new(StaticThreadEpisodicIndexPayloadProvider {
             request,
-            segment_index,
             source_payload: canonical.source_payload,
         })
     }
@@ -7664,14 +7271,9 @@ mod tests {
             1_700_000_000,
         )
         .await;
-        let request = static_index_request(
-            "file:///tmp/vector-payload-config.mv2".to_owned(),
-            "capsule_vector_payload_config",
-            "mv2://pioneer/thread_episodic/test/capsules/capsule_vector_payload_config",
-            item.id.as_str(),
-        );
+        let request = static_index_request(item.id.as_str());
         let provider = VectorThreadEpisodicIndexPayloadProvider::new(
-            static_index_payload_provider(crud_store.as_ref(), &item, request, 3).await,
+            static_index_payload_provider(crud_store.as_ref(), &item, request).await,
             Arc::new(StaticThreadEpisodicEmbeddingProvider::with_error(
                 ThreadEpisodicEmbeddingError::missing_key("test", "test-embedding"),
             )),
@@ -7711,14 +7313,11 @@ mod tests {
             .await
             .unwrap();
         }
-        let backend = Arc::new(MemvidThreadEpisodicBackend::new());
+        let backend = Arc::new(SqliteThreadEpisodicBackend::new(store.clone()));
         let executor = ThreadEpisodicIndexExecutor::new(
             store.clone(),
             backend,
-            Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
-                store.clone(),
-                thread_episodic_storage_uri_from_path(root.path()),
-            )),
+            Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(store.clone())),
         );
         executor.apply_config(ThreadEpisodicIndexExecutorConfig {
             batch_limit: 2,
@@ -7923,8 +7522,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ordinary_request_identity_change_after_claim_cannot_write_old_capsule() {
-        use crate::database::startup::thread_episodic_workspace_capsule_refill as refill;
+    async fn ordinary_request_identity_change_after_claim_cannot_publish_old_projection() {
+        use crate::database::startup::thread_episodic_refill as refill;
         for dimension_b in [3, 4] {
             let (store, workspace) = setup_thread_episodic_store().await;
             let root = TempDir::new().unwrap();
@@ -7934,10 +7533,8 @@ mod tests {
                 vec![0.1; 3],
             ));
             let target_a =
-                ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_embedding_provider(
-                    a.as_ref(),
-                )
-                .unwrap();
+                ThreadEpisodicWorkspaceProjectionTarget::from_embedding_provider(a.as_ref())
+                    .unwrap();
             let ready = seed_pending_thread_episodic_item(
                 &store,
                 &workspace,
@@ -7963,12 +7560,11 @@ mod tests {
             )
             .await
             .unwrap();
-            let capsules = store
-                .list_all_thread_episodic_capsules_for_workspace(&workspace)
+            let before = store
+                .find_thread_episodic_item(&ready.id)
                 .await
+                .unwrap()
                 .unwrap();
-            let old_file = capsules[0].storage_uri.strip_prefix("file://").unwrap();
-            let before = std::fs::read(old_file).unwrap();
             let extra = seed_pending_thread_episodic_item(
                 &store,
                 &workspace,
@@ -7990,12 +7586,9 @@ mod tests {
             let executor = Arc::new(
                 ThreadEpisodicIndexExecutor::new(
                     store.clone(),
-                    Arc::new(MemvidThreadEpisodicBackend::new()),
+                    Arc::new(SqliteThreadEpisodicBackend::new(store.clone())),
                     Arc::new(RuntimeVectorThreadEpisodicIndexPayloadProvider::new(
-                        Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
-                            store.clone(),
-                            thread_episodic_storage_uri_from_path(root.path()),
-                        )),
+                        Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(store.clone())),
                         resolver.clone(),
                         store.clone(),
                     )),
@@ -8049,7 +7642,14 @@ mod tests {
             // The real payload provider attached B, but the guarded executor
             // released its claim without calling actual capsule FS for B.
             assert_eq!(b.calls(), 1);
-            assert_eq!(std::fs::read(old_file).unwrap(), before);
+            assert_eq!(
+                store
+                    .find_thread_episodic_item(&ready.id)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                before
+            );
             let released = store
                 .find_thread_episodic_index_job(&job.id)
                 .await
@@ -8085,12 +7685,9 @@ mod tests {
             let resumed = Arc::new(
                 ThreadEpisodicIndexExecutor::new(
                     store.clone(),
-                    Arc::new(MemvidThreadEpisodicBackend::new()),
+                    Arc::new(SqliteThreadEpisodicBackend::new(store.clone())),
                     Arc::new(RuntimeVectorThreadEpisodicIndexPayloadProvider::new(
-                        Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
-                            store.clone(),
-                            thread_episodic_storage_uri_from_path(root.path()),
-                        )),
+                        Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(store.clone())),
                         resolver.clone(),
                         store.clone(),
                     )),
@@ -8126,8 +7723,7 @@ mod tests {
                             retryable: false,
                             next_run_at_unix: None,
                             last_error: Some("late A callback".to_owned()),
-                            capacity_error: false,
-                            last_attempt_latency_ms: None
+                            last_attempt_latency_ms: None,
                         },
                         chrono::Utc::now().timestamp(),
                     )
@@ -8145,39 +7741,25 @@ mod tests {
             );
 
             let target_b =
-                ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_embedding_provider(
-                    b.as_ref(),
-                )
-                .unwrap();
+                ThreadEpisodicWorkspaceProjectionTarget::from_embedding_provider(b.as_ref())
+                    .unwrap();
             assert!(
                 refill::refill_is_current_for_workspace_target(&store, &workspace, &target_b)
                     .await
                     .unwrap()
             );
-            let current = store
-                .list_all_thread_episodic_capsules_for_workspace(&workspace)
-                .await
-                .unwrap();
-            let capsule = memvid_core::Memvid::open_read_only(
-                current[0].storage_uri.strip_prefix("file://").unwrap(),
-            )
-            .unwrap();
-            assert_eq!(
-                capsule.effective_vec_index_dimension().unwrap(),
-                Some(u32::try_from(dimension_b).unwrap())
-            );
             for id in [&ready.id, &extra.id] {
                 let source = store.find_thread_episodic_item(id).await.unwrap().unwrap();
-                let frame = capsule
-                    .frame_by_uri(source.frame_uri.as_deref().unwrap())
+                assert!(source.projection_text(&store).await.is_some());
+                let artifact = store
+                    .find_thread_episodic_embedding_artifact(
+                        source.embedding_artifact_id.as_deref().unwrap(),
+                    )
+                    .await
+                    .unwrap()
                     .unwrap();
-                assert_eq!(
-                    frame
-                        .extra_metadata
-                        .get("pioneer.thread_episodic.embedding.model")
-                        .map(String::as_str),
-                    Some("vendor/b")
-                );
+                assert_eq!(artifact.dimension, dimension_b);
+                assert_eq!(artifact.model, "vendor/b");
             }
             resumed.shutdown().await;
         }
@@ -8203,8 +7785,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ordinary_same_identity_exhaustion_is_provider_free_and_preserves_ready_capsule() {
-        use crate::database::startup::thread_episodic_workspace_capsule_refill as refill;
+    async fn ordinary_same_identity_exhaustion_is_provider_free_and_preserves_ready_projection() {
+        use crate::database::startup::thread_episodic_refill as refill;
         for status in [
             ThreadEpisodicIndexJobStatus::Queued,
             ThreadEpisodicIndexJobStatus::Failed,
@@ -8217,10 +7799,8 @@ mod tests {
                 vec![0.1; 3],
             ));
             let target_a =
-                ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_embedding_provider(
-                    a.as_ref(),
-                )
-                .unwrap();
+                ThreadEpisodicWorkspaceProjectionTarget::from_embedding_provider(a.as_ref())
+                    .unwrap();
             let ready =
                 runner_source_job_for_test(&store, &workspace, "exhaustion_ready_a", 1_700_000_000)
                     .await;
@@ -8238,14 +7818,11 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            let capsule = store
-                .list_thread_episodic_workspace_capsules(&workspace, 1)
+            let before = store
+                .find_thread_episodic_item(&ready.index_item_id)
                 .await
                 .unwrap()
-                .pop()
                 .unwrap();
-            let path = PathBuf::from(capsule.storage_uri.strip_prefix("file://").unwrap());
-            let before = std::fs::read(&path).unwrap();
             let now = chrono::Utc::now().timestamp();
             let extra =
                 runner_source_job_for_test(&store, &workspace, "same_identity_exhausted", now)
@@ -8274,7 +7851,6 @@ mod tests {
                             retryable: true,
                             next_run_at_unix: Some(now),
                             last_error: Some("provider unavailable".to_owned()),
-                            capacity_error: false,
                             last_attempt_latency_ms: None,
                         },
                         now,
@@ -8288,12 +7864,9 @@ mod tests {
             let executor = Arc::new(
                 ThreadEpisodicIndexExecutor::new(
                     store.clone(),
-                    Arc::new(MemvidThreadEpisodicBackend::new()),
+                    Arc::new(SqliteThreadEpisodicBackend::new(store.clone())),
                     Arc::new(RuntimeVectorThreadEpisodicIndexPayloadProvider::new(
-                        Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
-                            store.clone(),
-                            thread_episodic_storage_uri_from_path(root.path()),
-                        )),
+                        Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(store.clone())),
                         resolver.clone(),
                         store.clone(),
                     )),
@@ -8335,7 +7908,14 @@ mod tests {
                     .attempt_count,
                 1
             );
-            assert_eq!(std::fs::read(&path).unwrap(), before);
+            assert_eq!(
+                store
+                    .find_thread_episodic_item(&ready.index_item_id)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                before
+            );
             assert!(
                 refill::refill_is_current_for_workspace_target(&store, &workspace, &target_a)
                     .await
@@ -8346,7 +7926,7 @@ mod tests {
 
     #[tokio::test]
     async fn settings_cancel_runtime_transition_releases_its_claim_without_renewing_budget() {
-        use crate::database::startup::thread_episodic_workspace_capsule_refill as refill;
+        use crate::database::startup::thread_episodic_refill as refill;
         let (store, workspace) = setup_thread_episodic_store().await;
         let root = TempDir::new().unwrap();
         let ready = seed_pending_thread_episodic_item(
@@ -8363,10 +7943,7 @@ mod tests {
             vec![0.1; 3],
         ));
         let target_a =
-            ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_embedding_provider(
-                a.as_ref(),
-            )
-            .unwrap();
+            ThreadEpisodicWorkspaceProjectionTarget::from_embedding_provider(a.as_ref()).unwrap();
         refill::refill_once_with_workspace_projection(
             store.clone(),
             root.path(),
@@ -8398,10 +7975,7 @@ mod tests {
             vec![0.2; 4],
         ));
         let target_b =
-            ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_embedding_provider(
-                b.as_ref(),
-            )
-            .unwrap();
+            ThreadEpisodicWorkspaceProjectionTarget::from_embedding_provider(b.as_ref()).unwrap();
         let resolver = Arc::new(SharedThreadEpisodicIndexEmbeddingProviderResolver::new());
         resolver.set_active_provider(Some(b.clone()));
         let supervisor =
@@ -8409,12 +7983,9 @@ mod tests {
         let executor = Arc::new(
             ThreadEpisodicIndexExecutor::new(
                 store.clone(),
-                Arc::new(MemvidThreadEpisodicBackend::new()),
+                Arc::new(SqliteThreadEpisodicBackend::new(store.clone())),
                 Arc::new(RuntimeVectorThreadEpisodicIndexPayloadProvider::new(
-                    Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
-                        store.clone(),
-                        thread_episodic_storage_uri_from_path(root.path()),
-                    )),
+                    Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(store.clone())),
                     resolver.clone(),
                     store.clone(),
                 )),
@@ -8577,7 +8148,7 @@ mod tests {
 
     #[tokio::test]
     async fn canceled_generation_drops_recovery_admission_and_does_not_retry_rejected_storage() {
-        use crate::database::startup::thread_episodic_workspace_capsule_refill as refill;
+        use crate::database::startup::thread_episodic_refill as refill;
         use sea_orm::TransactionTrait;
         for queued_admission in [true, false] {
             let database_root = TempDir::new().unwrap();
@@ -8596,10 +8167,8 @@ mod tests {
                 std::sync::atomic::AtomicBool::new(true),
             ));
             let target =
-                ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_embedding_provider(
-                    provider.as_ref(),
-                )
-                .unwrap();
+                ThreadEpisodicWorkspaceProjectionTarget::from_embedding_provider(provider.as_ref())
+                    .unwrap();
             let resolver = Arc::new(SharedThreadEpisodicIndexEmbeddingProviderResolver::new());
             resolver.set_active_provider(Some(provider.clone()));
             let supervisor = Arc::new(
@@ -8608,12 +8177,9 @@ mod tests {
             let executor = Arc::new(
                 ThreadEpisodicIndexExecutor::new(
                     store.clone(),
-                    Arc::new(MemvidThreadEpisodicBackend::new()),
+                    Arc::new(SqliteThreadEpisodicBackend::new(store.clone())),
                     Arc::new(RuntimeVectorThreadEpisodicIndexPayloadProvider::new(
-                        Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
-                            store.clone(),
-                            thread_episodic_storage_uri_from_path(root.path()),
-                        )),
+                        Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(store.clone())),
                         resolver.clone(),
                         store.clone(),
                     )),
@@ -8753,7 +8319,7 @@ mod tests {
 
     #[tokio::test]
     async fn managed_refill_retry_wait_does_not_block_ready_workspace_runner() {
-        use crate::database::startup::thread_episodic_workspace_capsule_refill as refill;
+        use crate::database::startup::thread_episodic_refill as refill;
         let (store, a) = setup_thread_episodic_store().await;
         let root = TempDir::new().unwrap();
         let b = "ready_b_during_refill_backoff";
@@ -8771,10 +8337,7 @@ mod tests {
             vec![0.1; 3],
         ));
         let old_target =
-            ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_embedding_provider(
-                old.as_ref(),
-            )
-            .unwrap();
+            ThreadEpisodicWorkspaceProjectionTarget::from_embedding_provider(old.as_ref()).unwrap();
         refill::refill_once_with_workspace_projection(
             store.clone(),
             root.path(),
@@ -8792,10 +8355,9 @@ mod tests {
         )
         .await;
         let provider = Arc::new(RefillBackoffEmbeddingProvider);
-        let target = ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_embedding_provider(
-            provider.as_ref(),
-        )
-        .unwrap();
+        let target =
+            ThreadEpisodicWorkspaceProjectionTarget::from_embedding_provider(provider.as_ref())
+                .unwrap();
         refill::refill_once_with_workspace_projection(
             store.clone(),
             root.path(),
@@ -8812,12 +8374,9 @@ mod tests {
         let executor = Arc::new(
             ThreadEpisodicIndexExecutor::new(
                 store.clone(),
-                Arc::new(MemvidThreadEpisodicBackend::new()),
+                Arc::new(SqliteThreadEpisodicBackend::new(store.clone())),
                 Arc::new(RuntimeVectorThreadEpisodicIndexPayloadProvider::new(
-                    Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
-                        store.clone(),
-                        thread_episodic_storage_uri_from_path(root.path()),
-                    )),
+                    Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(store.clone())),
                     resolver.clone(),
                     store.clone(),
                 )),
@@ -8896,11 +8455,8 @@ mod tests {
         let executor = Arc::new(
             ThreadEpisodicIndexExecutor::new(
                 store.clone(),
-                Arc::new(MemvidThreadEpisodicBackend::new()),
-                Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
-                    store,
-                    thread_episodic_storage_uri_from_path(root),
-                )),
+                Arc::new(SqliteThreadEpisodicBackend::new(store.clone())),
+                Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(store)),
             )
             .with_projection_runtime(
                 root.to_owned(),
@@ -8994,7 +8550,6 @@ mod tests {
                     retryable: true,
                     next_run_at_unix: Some(executor.now_unix() + 60),
                     last_error: Some("controlled future retry".to_owned()),
-                    capacity_error: false,
                     last_attempt_latency_ms: None,
                 },
                 executor.now_unix(),
@@ -9172,7 +8727,6 @@ mod tests {
                         retryable: true,
                         next_run_at_unix: Some(now),
                         last_error: Some("due old retry".to_owned()),
-                        capacity_error: false,
                         last_attempt_latency_ms: None,
                     },
                     now,
@@ -9312,7 +8866,6 @@ mod tests {
                     retryable: true,
                     next_run_at_unix: Some(now + 60),
                     last_error: Some("future retry".to_owned()),
-                    capacity_error: false,
                     last_attempt_latency_ms: None,
                 },
                 now,
@@ -9359,12 +8912,9 @@ mod tests {
         let (_release_tx, release_rx) = tokio::sync::oneshot::channel();
         let executor = Arc::new(ThreadEpisodicIndexExecutor::new(
             store.clone(),
-            Arc::new(MemvidThreadEpisodicBackend::new()),
+            Arc::new(SqliteThreadEpisodicBackend::new(store.clone())),
             Arc::new(PausedNativePayloadProvider {
-                inner: StoreThreadEpisodicIndexPayloadProvider::new(
-                    store.clone(),
-                    thread_episodic_storage_uri_from_path(root.path()),
-                ),
+                inner: StoreThreadEpisodicIndexPayloadProvider::new(store.clone()),
                 pause: AsyncMutex::new(Some((claimed_tx, release_rx))),
             }),
         ));
@@ -9521,17 +9071,15 @@ mod tests {
             newer
         );
         assert_eq!(newer.attempt_count, 2);
-        use crate::database::startup::thread_episodic_workspace_capsule_refill as refill;
+        use crate::database::startup::thread_episodic_refill as refill;
         let next_model = Arc::new(StaticThreadEpisodicEmbeddingProvider::with_identity(
             "openrouter",
             "vendor/replacement-after-local-error",
             vec![0.1; 3],
         ));
         let next_target =
-            ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_embedding_provider(
-                next_model.as_ref(),
-            )
-            .unwrap();
+            ThreadEpisodicWorkspaceProjectionTarget::from_embedding_provider(next_model.as_ref())
+                .unwrap();
         refill::refill_once_with_workspace_projection(
             store.clone(),
             root.path(),
@@ -9808,23 +9356,17 @@ mod tests {
             let payload: Arc<dyn ThreadEpisodicIndexPayloadProvider> =
                 if matches!(stage, "creation" | "poll") {
                     Arc::new(UnwindingNativePayloadProvider {
-                        inner: StoreThreadEpisodicIndexPayloadProvider::new(
-                            store.clone(),
-                            thread_episodic_storage_uri_from_path(root.path()),
-                        ),
+                        inner: StoreThreadEpisodicIndexPayloadProvider::new(store.clone()),
                         job_id: b_job.id.clone(),
                         creation: stage == "creation",
                         armed: std::sync::atomic::AtomicBool::new(true),
                     })
                 } else {
-                    Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
-                        store.clone(),
-                        thread_episodic_storage_uri_from_path(root.path()),
-                    ))
+                    Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(store.clone()))
                 };
             let executor = Arc::new(ThreadEpisodicIndexExecutor::new(
                 store.clone(),
-                Arc::new(MemvidThreadEpisodicBackend::new()),
+                Arc::new(SqliteThreadEpisodicBackend::new(store.clone())),
                 payload,
             ));
             executor.use_managed_time_for_test();
@@ -9879,7 +9421,10 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            assert_eq!(item.frame_id.is_some(), stage == "result");
+            assert_eq!(
+                item.projection_text(&store).await.is_some(),
+                stage == "result"
+            );
             assert!(executor.in_flight.lock().unwrap().is_empty());
             assert!(try_lock_thread_episodic_workspace(&b).await.is_some());
             store
@@ -9909,9 +9454,8 @@ mod tests {
     // Uses real native mutations; records only dispatch boundaries and injects
     // a returned failure before dispatch or after a durable file result.
     #[derive(Default)]
-    struct RecordingNativeBatchBackend {
-        native: MemvidThreadEpisodicBackend,
-        dispatches: AsyncMutex<Vec<Vec<ThreadEpisodicMemvidIndexRequest>>>,
+    struct RecordingValidationBackend {
+        dispatches: AsyncMutex<Vec<Vec<ThreadEpisodicIndexDocument>>>,
         failure: AsyncMutex<Option<bool>>,
         after_commit: AsyncMutex<
             Option<(
@@ -9922,49 +9466,44 @@ mod tests {
     }
 
     #[async_trait]
-    impl ThreadEpisodicMemvidBackend for RecordingNativeBatchBackend {
-        fn capabilities(&self) -> pioneer_memory::ThreadEpisodicMemvidBackendCapabilities {
-            self.native.capabilities()
-        }
-        async fn index_item(
+    impl ThreadEpisodicSearchBackend for RecordingValidationBackend {
+        async fn validate_document(
             &self,
-            request: ThreadEpisodicMemvidIndexRequest,
-        ) -> std::result::Result<ThreadEpisodicMemvidIndexOutput, ThreadEpisodicMemvidError>
+            request: ThreadEpisodicIndexDocument,
+        ) -> std::result::Result<ThreadEpisodicValidationResult, ThreadEpisodicSearchError>
         {
-            self.native.index_item(request).await
+            request.validate_prepared()
         }
-        async fn index_item_with_workspace_ownership(
+        async fn validate_document_with_workspace_ownership(
             &self,
-            request: ThreadEpisodicMemvidIndexRequest,
+            request: ThreadEpisodicIndexDocument,
             ownership: ThreadEpisodicWorkspaceOwnership,
-        ) -> std::result::Result<ThreadEpisodicMemvidIndexOutput, ThreadEpisodicMemvidError>
+        ) -> std::result::Result<ThreadEpisodicValidationResult, ThreadEpisodicSearchError>
         {
             self.dispatches.lock().await.push(vec![request.clone()]);
-            self.native
-                .index_item_with_workspace_ownership(request, ownership)
-                .await
+            request.validate_prepared()
         }
-        async fn index_batch_with_workspace_ownership(
+        async fn validate_documents_with_workspace_ownership(
             &self,
-            requests: Vec<ThreadEpisodicMemvidIndexRequest>,
+            requests: Vec<ThreadEpisodicIndexDocument>,
             ownership: ThreadEpisodicWorkspaceOwnership,
-        ) -> Vec<std::result::Result<ThreadEpisodicMemvidIndexOutput, ThreadEpisodicMemvidError>>
+        ) -> Vec<std::result::Result<ThreadEpisodicValidationResult, ThreadEpisodicSearchError>>
         {
             self.dispatches.lock().await.push(requests.clone());
             let count = requests.len();
             let failure = self.failure.lock().await.take();
             if failure == Some(false) {
                 return vec![
-                    Err(ThreadEpisodicMemvidError::retryable(
+                    Err(ThreadEpisodicSearchError::retryable(
                         "controlled file failure before publication"
                     ));
                     count
                 ];
             }
-            let outputs = self
-                .native
-                .index_batch_with_workspace_ownership(requests, ownership)
-                .await;
+            let outputs = requests
+                .iter()
+                .map(ThreadEpisodicIndexDocument::validate_prepared)
+                .collect::<Vec<_>>();
             if let Some((started, release)) = self.after_commit.lock().await.take() {
                 assert!(outputs.iter().all(std::result::Result::is_ok));
                 let _ = started.send(());
@@ -9973,7 +9512,7 @@ mod tests {
             if failure == Some(true) {
                 assert!(outputs.iter().all(std::result::Result::is_ok));
                 return vec![
-                    Err(ThreadEpisodicMemvidError::retryable(
+                    Err(ThreadEpisodicSearchError::retryable(
                         "controlled unknown outcome after file commit"
                     ));
                     count
@@ -9983,26 +9522,37 @@ mod tests {
         }
         async fn search(
             &self,
-            request: ThreadEpisodicMemvidSearchRequest,
-        ) -> std::result::Result<ThreadEpisodicMemvidSearchOutput, ThreadEpisodicMemvidError>
+            request: ThreadEpisodicSearchRequest,
+        ) -> std::result::Result<ThreadEpisodicSearchOutput, ThreadEpisodicSearchError> {
+            Err(ThreadEpisodicSearchError::non_retryable(
+                "unexpected search in indexing fixture",
+            ))
+        }
+
+        async fn search_page(
+            &self,
+            _request: ThreadEpisodicSearchRequest,
+            _page_size: usize,
+            _cursor: Option<String>,
+            _embedding: Option<ThreadEpisodicIndexEmbedding>,
+        ) -> std::result::Result<pioneer_memory::ThreadEpisodicSearchPage, ThreadEpisodicSearchError>
         {
-            self.native.search(request).await
+            Err(ThreadEpisodicSearchError::non_retryable(
+                "unexpected search in indexing fixture",
+            ))
         }
     }
 
     fn recording_batch_executor(
         store: Arc<CrudStore>,
         root: &std::path::Path,
-        backend: Arc<RecordingNativeBatchBackend>,
+        backend: Arc<RecordingValidationBackend>,
         limit: u64,
     ) -> ThreadEpisodicIndexExecutor {
         let executor = ThreadEpisodicIndexExecutor::new(
             store.clone(),
             backend,
-            Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
-                store,
-                thread_episodic_storage_uri_from_path(root),
-            )),
+            Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(store)),
         );
         executor.apply_config(ThreadEpisodicIndexExecutorConfig {
             batch_limit: limit,
@@ -10015,7 +9565,7 @@ mod tests {
     async fn native_executor_batches_within_existing_candidate_quantum_and_item_bound() {
         let (store, workspace) = setup_thread_episodic_store().await;
         let root = TempDir::new().unwrap();
-        let backend = Arc::new(RecordingNativeBatchBackend::default());
+        let backend = Arc::new(RecordingValidationBackend::default());
         let executor = recording_batch_executor(store.clone(), root.path(), backend.clone(), 10);
         let now = chrono::Utc::now().timestamp() + 60;
         let mut jobs = Vec::new();
@@ -10040,14 +9590,20 @@ mod tests {
         assert_eq!(calls.iter().map(Vec::len).collect::<Vec<_>>(), vec![8, 2]);
         assert!(calls.iter().all(
             |group| group.iter().map(|r| r.prepared_bytes()).sum::<usize>()
-                <= THREAD_EPISODIC_MEMVID_BATCH_BYTES
+                <= THREAD_EPISODIC_INDEX_BATCH_BYTES
         ));
-        let capsule = store
-            .find_thread_episodic_capsule(&calls[0][0].capsule_id)
+        let published = store
+            .database_connection()
+            .query_one_raw(Statement::from_string(
+                DatabaseBackend::Sqlite,
+                "SELECT COUNT(*) AS count FROM thread_episodic_items WHERE search_text IS NOT NULL",
+            ))
             .await
             .unwrap()
+            .unwrap()
+            .try_get::<i64>("", "count")
             .unwrap();
-        assert_eq!(capsule.active_frame_count, 10);
+        assert_eq!(published, 10);
         assert_eq!(executor.run_once(now).await.unwrap().completed, 1);
         for job in jobs {
             let saved = store
@@ -10062,7 +9618,10 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            assert_eq!(item.frame_uri, saved.frame_uri);
+            assert_eq!(
+                item.projection_text(&store).await.as_deref(),
+                Some(format!("canonical source for {}", item.item_id).as_str())
+            );
         }
     }
 
@@ -10090,7 +9649,7 @@ mod tests {
             }
             if self.vector_job.as_deref() == Some(job.id.as_str()) {
                 resolved.request.embedding = Some(
-                    ThreadEpisodicMemvidIndexEmbedding::new(
+                    ThreadEpisodicIndexEmbedding::new(
                         pioneer_memory::ThreadEpisodicEmbeddingIdentity::new(
                             "test",
                             "prepared-batch-model",
@@ -10104,7 +9663,7 @@ mod tests {
             }
             if self.poison_job.as_deref() == Some(job.id.as_str()) {
                 // Corrupt prepared data, bypassing the validating constructor.
-                resolved.request.embedding = Some(ThreadEpisodicMemvidIndexEmbedding {
+                resolved.request.embedding = Some(ThreadEpisodicIndexEmbedding {
                     identity: pioneer_memory::ThreadEpisodicEmbeddingIdentity::new(
                         "test", "invalid", 3, true,
                     ),
@@ -10121,7 +9680,7 @@ mod tests {
             let poison = case == 2;
             let (store, workspace) = setup_thread_episodic_store().await;
             let root = TempDir::new().unwrap();
-            let backend = Arc::new(RecordingNativeBatchBackend::default());
+            let backend = Arc::new(RecordingValidationBackend::default());
             let now = chrono::Utc::now().timestamp() + 60;
             let mut jobs = Vec::new();
             for i in 0..3 {
@@ -10165,10 +9724,7 @@ mod tests {
                 store.clone(),
                 backend.clone(),
                 Arc::new(BatchSizedPayloadProvider {
-                    inner: StoreThreadEpisodicIndexPayloadProvider::new(
-                        store.clone(),
-                        thread_episodic_storage_uri_from_path(root.path()),
-                    ),
+                    inner: StoreThreadEpisodicIndexPayloadProvider::new(store.clone()),
                     poison_job: poison.then(|| jobs[1].id.clone()),
                     vector_job: None,
                     metadata_bytes: if case == 0 { 140 * 1024 } else { 0 },
@@ -10205,7 +9761,7 @@ mod tests {
                 runner_workspace_for_test(&store, &other_workspace).await;
             }
             let root = TempDir::new().unwrap();
-            let backend = Arc::new(RecordingNativeBatchBackend::default());
+            let backend = Arc::new(RecordingValidationBackend::default());
             let now = chrono::Utc::now().timestamp() + 60;
             let first =
                 runner_source_job_for_test(&store, &workspace, "split_prepared_a", now - 2).await;
@@ -10224,10 +9780,7 @@ mod tests {
                 store.clone(),
                 backend.clone(),
                 Arc::new(BatchSizedPayloadProvider {
-                    inner: StoreThreadEpisodicIndexPayloadProvider::new(
-                        store.clone(),
-                        thread_episodic_storage_uri_from_path(root.path()),
-                    ),
+                    inner: StoreThreadEpisodicIndexPayloadProvider::new(store.clone()),
                     poison_job: None,
                     vector_job: (!different_workspace).then(|| second.id.clone()),
                     metadata_bytes: 0,
@@ -10237,7 +9790,7 @@ mod tests {
             let calls = backend.dispatches.lock().await.clone();
             assert_eq!(calls.iter().map(Vec::len).collect::<Vec<_>>(), vec![1, 1]);
             assert_eq!(
-                calls[0][0].storage_uri != calls[1][0].storage_uri,
+                calls[0][0].workspace_id != calls[1][0].workspace_id,
                 different_workspace
             );
             assert_eq!(calls[1][0].embedding.is_some(), !different_workspace);
@@ -10248,21 +9801,9 @@ mod tests {
                     .unwrap()
                     .unwrap();
                 assert_eq!(item.status, ThreadEpisodicItemStatus::Active);
-                let capsule = store
-                    .find_thread_episodic_capsule(item.capsule_id.as_deref().unwrap())
-                    .await
-                    .unwrap()
-                    .unwrap();
-                let memvid = memvid_core::Memvid::open_read_only(
-                    capsule.storage_uri.strip_prefix("file://").unwrap(),
-                )
-                .unwrap();
                 assert_eq!(
-                    memvid
-                        .frame_by_uri(item.frame_uri.as_deref().unwrap())
-                        .unwrap()
-                        .id,
-                    item.frame_id.unwrap() as u64
+                    item.projection_text(&store).await.as_deref(),
+                    Some(format!("canonical source for {}", item.item_id).as_str())
                 );
             }
         }
@@ -10273,7 +9814,7 @@ mod tests {
         for published in [false, true] {
             let (store, workspace) = setup_thread_episodic_store().await;
             let root = TempDir::new().unwrap();
-            let backend = Arc::new(RecordingNativeBatchBackend::default());
+            let backend = Arc::new(RecordingValidationBackend::default());
             *backend.failure.lock().await = Some(published);
             let executor = recording_batch_executor(store.clone(), root.path(), backend.clone(), 3);
             let now = chrono::Utc::now().timestamp() + 60;
@@ -10307,13 +9848,11 @@ mod tests {
                         .await
                         .unwrap()
                         .unwrap()
-                        .frame_id
+                        .projection_text(&store)
+                        .await
                         .is_none()
                 );
             }
-            let call = backend.dispatches.lock().await[0][0].clone();
-            let path = call.storage_uri.strip_prefix("file://").unwrap();
-            assert_eq!(std::path::Path::new(path).exists(), published);
             let retried = executor.run_once(now + 60).await.unwrap();
             assert_eq!((retried.claimed, retried.completed), (3, 3));
             assert_eq!(
@@ -10326,8 +9865,6 @@ mod tests {
                     .collect::<Vec<_>>(),
                 vec![3, 1, 1, 1]
             );
-            let memvid = memvid_core::Memvid::open_read_only(path).unwrap();
-            assert_eq!(memvid.stats().unwrap().active_frame_count, 3);
             for job in jobs {
                 let saved = store
                     .find_thread_episodic_index_job(&job.id)
@@ -10336,10 +9873,14 @@ mod tests {
                     .unwrap();
                 assert_eq!(saved.attempt_count, 2);
                 assert_eq!(saved.status, ThreadEpisodicIndexJobStatus::Completed);
-                assert!(
-                    memvid
-                        .frame_by_uri(saved.frame_uri.as_deref().unwrap())
-                        .is_ok()
+                let item = store
+                    .find_thread_episodic_item(&saved.index_item_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    item.projection_text(&store).await.as_deref(),
+                    Some(format!("canonical source for {}", item.item_id).as_str())
                 );
             }
         }
@@ -10349,7 +9890,7 @@ mod tests {
     async fn partial_db_completion_after_native_batch_commit_replays_only_unacked_job() {
         let (store, workspace) = setup_thread_episodic_store().await;
         let root = TempDir::new().unwrap();
-        let backend = Arc::new(RecordingNativeBatchBackend::default());
+        let backend = Arc::new(RecordingValidationBackend::default());
         let executor = recording_batch_executor(store.clone(), root.path(), backend.clone(), 3);
         let now = chrono::Utc::now().timestamp() + 60;
         let mut jobs = Vec::new();
@@ -10364,24 +9905,18 @@ mod tests {
         store.database_connection().execute_unprepared("CREATE TRIGGER reject_batch_ack_b BEFORE UPDATE ON thread_episodic_index_jobs WHEN OLD.thread_id = 'batch_ack_b' AND NEW.status = 'completed' BEGIN SELECT RAISE(ABORT, 'controlled batch completion rollback'); END").await.unwrap();
         let first = executor.run_once(now).await.unwrap();
         assert_eq!((first.completed, first.failed_retryable), (2, 1));
-        let capsule_request = backend.dispatches.lock().await[0][0].clone();
-        let path = capsule_request.storage_uri.strip_prefix("file://").unwrap();
-        assert_eq!(
-            memvid_core::Memvid::open_read_only(path)
-                .unwrap()
-                .stats()
-                .unwrap()
-                .active_frame_count,
-            3
-        );
+        let rolled_back = store
+            .find_thread_episodic_item(&jobs[1].index_item_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(rolled_back.projection_text(&store).await.is_none());
         store
             .database_connection()
             .execute_unprepared("DROP TRIGGER reject_batch_ack_b")
             .await
             .unwrap();
         assert_eq!(executor.run_once(now + 60).await.unwrap().completed, 1);
-        let memvid = memvid_core::Memvid::open_read_only(path).unwrap();
-        assert_eq!(memvid.stats().unwrap().active_frame_count, 3);
         for (i, job) in jobs.into_iter().enumerate() {
             let saved = store
                 .find_thread_episodic_index_job(&job.id)
@@ -10396,11 +9931,8 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert_eq!(
-                memvid
-                    .frame_by_uri(item.frame_uri.as_deref().unwrap())
-                    .unwrap()
-                    .id,
-                item.frame_id.unwrap() as u64
+                item.projection_text(&store).await.as_deref(),
+                Some(format!("canonical source for {}", item.item_id).as_str())
             );
         }
     }
@@ -10409,7 +9941,7 @@ mod tests {
     async fn committed_batch_keeps_source_exclusion_and_stale_attempt_cas_per_job() {
         let (store, workspace) = setup_thread_episodic_store().await;
         let root = TempDir::new().unwrap();
-        let backend = Arc::new(RecordingNativeBatchBackend::default());
+        let backend = Arc::new(RecordingValidationBackend::default());
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
         *backend.after_commit.lock().await = Some((started_tx, release_rx));
@@ -10517,67 +10049,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn batch_rotation_keeps_all_outputs_bound_to_committed_physical_capsule() {
-        let (store, workspace) = setup_thread_episodic_store().await;
-        let root = TempDir::new().unwrap();
-        let backend = Arc::new(RecordingNativeBatchBackend::default());
-        let executor = recording_batch_executor(store.clone(), root.path(), backend.clone(), 9);
-        executor.apply_config(ThreadEpisodicIndexExecutorConfig {
-            batch_limit: 9,
-            near_capacity_percent: 0.0,
-            ..Default::default()
-        });
-        let now = chrono::Utc::now().timestamp() + 60;
-        let mut jobs = Vec::new();
-        for i in 0..9 {
-            jobs.push(
-                runner_source_job_for_test(
-                    &store,
-                    &workspace,
-                    &format!("batch_rotation_{i}"),
-                    now - 9 + i,
-                )
-                .await,
-            );
-        }
-        assert_eq!(executor.run_once(now).await.unwrap().completed, 9);
-        let calls = backend.dispatches.lock().await.clone();
-        assert_eq!(calls.iter().map(Vec::len).collect::<Vec<_>>(), vec![8, 1]);
-        assert_ne!(calls[0][0].capsule_id, calls[1][0].capsule_id);
-        assert_ne!(calls[0][0].storage_uri, calls[1][0].storage_uri);
-        for group in calls {
-            let memvid = memvid_core::Memvid::open_read_only(
-                group[0].storage_uri.strip_prefix("file://").unwrap(),
-            )
-            .unwrap();
-            assert_eq!(
-                memvid.stats().unwrap().active_frame_count,
-                group.len() as u64
-            );
-            for request in group {
-                let item = store
-                    .find_thread_episodic_item(&request.index_item_id)
-                    .await
-                    .unwrap()
-                    .unwrap();
-                assert_eq!(
-                    item.capsule_id.as_deref(),
-                    Some(request.capsule_id.as_str())
-                );
-                assert_eq!(
-                    memvid
-                        .frame_by_uri(item.frame_uri.as_deref().unwrap())
-                        .unwrap()
-                        .id,
-                    item.frame_id.unwrap() as u64
-                );
-            }
-        }
-    }
-
     struct BlockingNativeRunnerBackend {
-        native: Arc<MemvidThreadEpisodicBackend>,
+        native: Arc<SqliteThreadEpisodicBackend>,
         barrier: AsyncMutex<
             Option<(
                 tokio::sync::oneshot::Sender<()>,
@@ -10586,28 +10059,25 @@ mod tests {
         >,
     }
     #[async_trait]
-    impl ThreadEpisodicMemvidBackend for BlockingNativeRunnerBackend {
-        fn capabilities(&self) -> pioneer_memory::ThreadEpisodicMemvidBackendCapabilities {
-            self.native.capabilities()
-        }
-        async fn index_item(
+    impl ThreadEpisodicSearchBackend for BlockingNativeRunnerBackend {
+        async fn validate_document(
             &self,
-            request: ThreadEpisodicMemvidIndexRequest,
-        ) -> std::result::Result<ThreadEpisodicMemvidIndexOutput, ThreadEpisodicMemvidError>
+            request: ThreadEpisodicIndexDocument,
+        ) -> std::result::Result<ThreadEpisodicValidationResult, ThreadEpisodicSearchError>
         {
-            self.native.index_item(request).await
+            request.validate_prepared()
         }
-        async fn index_item_with_workspace_ownership(
+        async fn validate_document_with_workspace_ownership(
             &self,
-            request: ThreadEpisodicMemvidIndexRequest,
+            request: ThreadEpisodicIndexDocument,
             ownership: ThreadEpisodicWorkspaceOwnership,
-        ) -> std::result::Result<ThreadEpisodicMemvidIndexOutput, ThreadEpisodicMemvidError>
+        ) -> std::result::Result<ThreadEpisodicValidationResult, ThreadEpisodicSearchError>
         {
             let barrier = self.barrier.lock().await.take();
             let Some((started, release)) = barrier else {
                 return self
                     .native
-                    .index_item_with_workspace_ownership(request, ownership)
+                    .validate_document_with_workspace_ownership(request, ownership)
                     .await;
             };
             let runtime = tokio::runtime::Handle::current();
@@ -10616,24 +10086,25 @@ mod tests {
                 let _ = started.send(());
                 // Sender drop on panic releases this blocking task as well.
                 release.recv().map_err(|_| {
-                    ThreadEpisodicMemvidError::retryable("blocking test release dropped")
+                    ThreadEpisodicSearchError::retryable("blocking test release dropped")
                 })?;
-                runtime.block_on(native.index_item_with_workspace_ownership(request, ownership))
+                runtime
+                    .block_on(native.validate_document_with_workspace_ownership(request, ownership))
             })
             .await
-            .map_err(|error| ThreadEpisodicMemvidError::retryable(error.to_string()))?
+            .map_err(|error| ThreadEpisodicSearchError::retryable(error.to_string()))?
         }
-        async fn index_batch_with_workspace_ownership(
+        async fn validate_documents_with_workspace_ownership(
             &self,
-            requests: Vec<ThreadEpisodicMemvidIndexRequest>,
+            requests: Vec<ThreadEpisodicIndexDocument>,
             ownership: ThreadEpisodicWorkspaceOwnership,
-        ) -> Vec<std::result::Result<ThreadEpisodicMemvidIndexOutput, ThreadEpisodicMemvidError>>
+        ) -> Vec<std::result::Result<ThreadEpisodicValidationResult, ThreadEpisodicSearchError>>
         {
             let barrier = self.barrier.lock().await.take();
             let Some((started, release)) = barrier else {
                 return self
                     .native
-                    .index_batch_with_workspace_ownership(requests, ownership)
+                    .validate_documents_with_workspace_ownership(requests, ownership)
                     .await;
             };
             let runtime = tokio::runtime::Handle::current();
@@ -10643,25 +10114,41 @@ mod tests {
                 let _ = started.send(());
                 if release.recv().is_err() {
                     return vec![
-                        Err(ThreadEpisodicMemvidError::retryable(
+                        Err(ThreadEpisodicSearchError::retryable(
                             "blocking test release dropped"
                         ));
                         count
                     ];
                 }
-                runtime.block_on(native.index_batch_with_workspace_ownership(requests, ownership))
+                runtime.block_on(
+                    native.validate_documents_with_workspace_ownership(requests, ownership),
+                )
             })
             .await
             .unwrap_or_else(|error| {
-                vec![Err(ThreadEpisodicMemvidError::retryable(error.to_string())); count]
+                vec![Err(ThreadEpisodicSearchError::retryable(error.to_string())); count]
             })
         }
         async fn search(
             &self,
-            request: ThreadEpisodicMemvidSearchRequest,
-        ) -> std::result::Result<ThreadEpisodicMemvidSearchOutput, ThreadEpisodicMemvidError>
+            request: ThreadEpisodicSearchRequest,
+        ) -> std::result::Result<ThreadEpisodicSearchOutput, ThreadEpisodicSearchError> {
+            Err(ThreadEpisodicSearchError::non_retryable(
+                "unexpected search in indexing fixture",
+            ))
+        }
+
+        async fn search_page(
+            &self,
+            _request: ThreadEpisodicSearchRequest,
+            _page_size: usize,
+            _cursor: Option<String>,
+            _embedding: Option<ThreadEpisodicIndexEmbedding>,
+        ) -> std::result::Result<pioneer_memory::ThreadEpisodicSearchPage, ThreadEpisodicSearchError>
         {
-            self.native.search(request).await
+            Err(ThreadEpisodicSearchError::non_retryable(
+                "unexpected search in indexing fixture",
+            ))
         }
     }
 
@@ -10699,16 +10186,13 @@ mod tests {
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let backend = Arc::new(BlockingNativeRunnerBackend {
-            native: Arc::new(MemvidThreadEpisodicBackend::new()),
+            native: Arc::new(SqliteThreadEpisodicBackend::new(store.clone())),
             barrier: AsyncMutex::new(Some((started_tx, release_rx))),
         });
         let executor = Arc::new(ThreadEpisodicIndexExecutor::new(
             store.clone(),
             backend,
-            Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
-                store.clone(),
-                thread_episodic_storage_uri_from_path(root.path()),
-            )),
+            Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(store.clone())),
         ));
         let now = chrono::Utc::now().timestamp() + 60;
         let mut jobs = Vec::new();
@@ -10764,7 +10248,8 @@ mod tests {
                     .await
                     .unwrap()
                     .unwrap()
-                    .frame_id
+                    .projection_text(&store)
+                    .await
                     .is_none()
             );
         }
@@ -10782,16 +10267,13 @@ mod tests {
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let backend = Arc::new(BlockingNativeRunnerBackend {
-            native: Arc::new(MemvidThreadEpisodicBackend::new()),
+            native: Arc::new(SqliteThreadEpisodicBackend::new(store.clone())),
             barrier: AsyncMutex::new(Some((started_tx, release_rx))),
         });
         let executor = Arc::new(ThreadEpisodicIndexExecutor::new(
             store.clone(),
             backend,
-            Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
-                store.clone(),
-                thread_episodic_storage_uri_from_path(root.path()),
-            )),
+            Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(store.clone())),
         ));
         let job = runner_source_job_for_test(
             &store,
@@ -10847,7 +10329,8 @@ mod tests {
                     .await
                     .unwrap()
                     .unwrap()
-                    .frame_id
+                    .projection_text(&store)
+                    .await
                     .is_none()
             );
         }
@@ -10856,16 +10339,6 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let capsules = store
-            .list_all_thread_episodic_capsules_for_workspace(&workspace)
-            .await
-            .unwrap();
-        let bytes = capsules
-            .iter()
-            .map(|capsule| {
-                std::fs::read(capsule.storage_uri.strip_prefix("file://").unwrap()).unwrap()
-            })
-            .collect::<Vec<_>>();
         executor.wake();
         assert!(
             executor
@@ -10891,12 +10364,6 @@ mod tests {
                 .unwrap(),
             source
         );
-        for (capsule, bytes) in capsules.iter().zip(bytes) {
-            assert_eq!(
-                std::fs::read(capsule.storage_uri.strip_prefix("file://").unwrap()).unwrap(),
-                bytes
-            );
-        }
         assert!(
             try_lock_thread_episodic_workspace(&workspace)
                 .await
@@ -10905,9 +10372,13 @@ mod tests {
     }
 
     async fn physical_runner_store_for_test(path: &std::path::Path) -> (Arc<CrudStore>, String) {
+        pioneer_sqlite::search::register_auto_extension_once().unwrap();
         use sea_orm::ConnectOptions;
         let mut options = ConnectOptions::new(format!("sqlite://{}?mode=rwc", path.display()));
-        options.max_connections(1).sqlx_logging(false);
+        options
+            .max_connections(1)
+            .sqlx_logging(false)
+            .map_sqlx_sqlite_opts(|options| options.pragma("foreign_keys", "OFF"));
         let writer = Database::connect(options).await.unwrap();
         Migrator::up(&writer, None).await.unwrap();
         bootstrap(&writer).await.unwrap();
@@ -10936,6 +10407,7 @@ mod tests {
                 options
                     .read_only(true)
                     .create_if_missing(false)
+                    .pragma("foreign_keys", "OFF")
                     .pragma("query_only", "ON")
             });
         let reader = Database::connect(options).await.unwrap();
@@ -10960,15 +10432,12 @@ mod tests {
             let (notice_tx, notice_rx) = tokio::sync::oneshot::channel();
             let (release_tx, release_rx) = tokio::sync::oneshot::channel();
             let payload = Arc::new(PausedNativePayloadProvider {
-                inner: StoreThreadEpisodicIndexPayloadProvider::new(
-                    store.clone(),
-                    thread_episodic_storage_uri_from_path(root.path()),
-                ),
+                inner: StoreThreadEpisodicIndexPayloadProvider::new(store.clone()),
                 pause: AsyncMutex::new((phase == "provider").then_some((notice_tx, release_rx))),
             });
             let executor = Arc::new(ThreadEpisodicIndexExecutor::new(
                 store.clone(),
-                Arc::new(MemvidThreadEpisodicBackend::new()),
+                Arc::new(SqliteThreadEpisodicBackend::new(store.clone())),
                 payload,
             ));
             let job = if phase == "idle" {
@@ -11095,11 +10564,8 @@ mod tests {
         .await;
         let executor = ThreadEpisodicIndexExecutor::new(
             store.clone(),
-            Arc::new(MemvidThreadEpisodicBackend::new()),
-            Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
-                store.clone(),
-                thread_episodic_storage_uri_from_path(root.path()),
-            )),
+            Arc::new(SqliteThreadEpisodicBackend::new(store.clone())),
+            Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(store.clone())),
         );
         store.database_connection().execute_unprepared("CREATE TRIGGER reject_candidate_claim BEFORE UPDATE ON thread_episodic_index_jobs WHEN NEW.status = 'running' BEGIN SELECT RAISE(ABORT, 'controlled claim rollback'); END").await.unwrap();
         let now = chrono::Utc::now().timestamp();
@@ -11114,10 +10580,13 @@ mod tests {
         );
         assert!(
             store
-                .list_all_thread_episodic_capsules_for_workspace(&workspace)
+                .find_thread_episodic_item(&job.index_item_id)
                 .await
                 .unwrap()
-                .is_empty()
+                .unwrap()
+                .projection_text(&store)
+                .await
+                .is_none()
         );
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
         store
@@ -11145,7 +10614,6 @@ mod tests {
                     retryable: true,
                     next_run_at_unix: Some(now + 600),
                     last_error: Some("backoff after selected snapshot".to_owned()),
-                    capacity_error: false,
                     last_attempt_latency_ms: None,
                 },
                 now,
@@ -11279,14 +10747,17 @@ mod tests {
 
     #[tokio::test]
     async fn projection_reset_owns_prepared_requests_and_new_source_claims() {
-        use crate::database::startup::thread_episodic_workspace_capsule_refill as refill;
+        use crate::database::startup::thread_episodic_refill as refill;
         use pioneer_sqlite::{SqliteDatabase, sqlite_read_only_connection_url};
         use sea_orm::{ConnectOptions, TransactionTrait};
         let root = TempDir::new().unwrap();
         let db_path = root.path().join("ownership.sqlite");
         let mut writer_options =
             ConnectOptions::new(format!("sqlite://{}?mode=rwc", db_path.display()));
-        writer_options.max_connections(1).sqlx_logging(false);
+        writer_options
+            .max_connections(1)
+            .sqlx_logging(false)
+            .map_sqlx_sqlite_opts(|options| options.pragma("foreign_keys", "OFF"));
         let writer = Database::connect(writer_options).await.unwrap();
         Migrator::up(&writer, None).await.unwrap();
         bootstrap(&writer).await.unwrap();
@@ -11314,6 +10785,7 @@ mod tests {
                 options
                     .read_only(true)
                     .create_if_missing(false)
+                    .pragma("foreign_keys", "OFF")
                     .pragma("query_only", "ON")
             });
         let reader = Database::connect(reader_options).await.unwrap();
@@ -11328,10 +10800,8 @@ mod tests {
             vec![0.1; 3],
         ));
         let target_a =
-            ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_embedding_provider(
-                model_a.as_ref(),
-            )
-            .unwrap();
+            ThreadEpisodicWorkspaceProjectionTarget::from_embedding_provider(model_a.as_ref())
+                .unwrap();
         let ready = seed_pending_thread_episodic_item(
             &store,
             &workspace,
@@ -11378,13 +10848,10 @@ mod tests {
         let (prepared_tx, prepared_rx) = tokio::sync::oneshot::channel();
         let executor_a = Arc::new(ThreadEpisodicIndexExecutor::new(
             store.clone(),
-            Arc::new(MemvidThreadEpisodicBackend::new()),
+            Arc::new(SqliteThreadEpisodicBackend::new(store.clone())),
             Arc::new(PausedIndexPayloadProvider {
                 inner: Arc::new(RuntimeVectorThreadEpisodicIndexPayloadProvider::new(
-                    Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
-                        store.clone(),
-                        thread_episodic_storage_uri_from_path(root.path()),
-                    )),
+                    Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(store.clone())),
                     resolver_a,
                     store.clone(),
                 )),
@@ -11408,10 +10875,8 @@ mod tests {
             vec![0.1; 4],
         ));
         let target_b =
-            ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_embedding_provider(
-                model_b.as_ref(),
-            )
-            .unwrap();
+            ThreadEpisodicWorkspaceProjectionTarget::from_embedding_provider(model_b.as_ref())
+                .unwrap();
         let (reset_started_tx, reset_started_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
         let reset_resolver = Arc::new(PausedEmbeddingResolver {
@@ -11478,7 +10943,7 @@ mod tests {
             .unwrap();
         let executor_b = ThreadEpisodicIndexExecutor::new(
             store.clone(),
-            Arc::new(MemvidThreadEpisodicBackend::new()),
+            Arc::new(SqliteThreadEpisodicBackend::new(store.clone())),
             executor_a.payload_provider.clone(),
         );
         // The transition owns this workspace, but canonical source/job writes
@@ -11625,12 +11090,19 @@ mod tests {
             assert_eq!(job.status, ThreadEpisodicIndexJobStatus::Completed);
             assert_eq!(job.attempt_count, 1);
         }
-        let capsules = store
-            .list_all_thread_episodic_capsules_for_workspace(&workspace)
-            .await
-            .unwrap();
-        let before =
-            std::fs::read(capsules[0].storage_uri.strip_prefix("file://").unwrap()).unwrap();
+        let before = {
+            let mut rows = Vec::new();
+            for source in [&ready, &extra, &during] {
+                let current = store
+                    .find_thread_episodic_item(&source.id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let text = current.projection_text(&store).await;
+                rows.push((current, text));
+            }
+            rows
+        };
         let late = executor_a
             .process_claimed_job(
                 old_claim,
@@ -11645,7 +11117,19 @@ mod tests {
         ));
         assert_eq!(model_a.calls(), a_calls);
         assert_eq!(
-            std::fs::read(capsules[0].storage_uri.strip_prefix("file://").unwrap()).unwrap(),
+            {
+                let mut rows = Vec::new();
+                for source in [&ready, &extra, &during] {
+                    let current = store
+                        .find_thread_episodic_item(&source.id)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    let text = current.projection_text(&store).await;
+                    rows.push((current, text));
+                }
+                rows
+            },
             before
         );
         let idle = refill::refill_once_with_projection_resolver(
@@ -11683,17 +11167,14 @@ mod tests {
 
     #[tokio::test]
     async fn late_refill_preserves_live_executor_claim_and_ready_projection() {
-        use crate::database::startup::thread_episodic_workspace_capsule_refill as refill;
+        use crate::database::startup::thread_episodic_refill as refill;
         let (store, workspace) = setup_thread_episodic_store().await;
         let root = TempDir::new().unwrap();
-        let backend = Arc::new(FakeThreadEpisodicMemvidBackend::new(vec![]));
+        let backend = Arc::new(PreparedDocumentBackend::new(vec![]));
         let executor = Arc::new(ThreadEpisodicIndexExecutor::new(
             store.clone(),
             backend.clone(),
-            Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
-                store.clone(),
-                thread_episodic_storage_uri_from_path(root.path()),
-            )),
+            Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(store.clone())),
         ));
         let ready = seed_pending_thread_episodic_item(
             &store,
@@ -11772,7 +11253,7 @@ mod tests {
         assert_eq!(live.attempt_count, inherited.attempt_count + 1);
         // Late maintenance runs while real index execution is blocked. There is
         // no +1-second ownership trick: its admission cannot recover any claim.
-        let target = ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::lexical_only();
+        let target = ThreadEpisodicWorkspaceProjectionTarget::lexical_only();
         let (waiting_tx, waiting_rx) = tokio::sync::oneshot::channel();
         refill::notify_ownership_wait_for_test(root.path(), waiting_tx);
         let maintenance = tokio::spawn({
@@ -11811,8 +11292,7 @@ mod tests {
                         retryable: false,
                         next_run_at_unix: None,
                         last_error: Some("old callback".to_owned()),
-                        capacity_error: false,
-                        last_attempt_latency_ms: None
+                        last_attempt_latency_ms: None,
                     },
                     claim_second
                 )
@@ -11851,16 +11331,13 @@ mod tests {
                 .unwrap(),
             1
         );
-        let failed_backend = Arc::new(FakeThreadEpisodicMemvidBackend::new(vec![Err(
-            ThreadEpisodicMemvidError::non_retryable("extra source provider failure"),
+        let failed_backend = Arc::new(PreparedDocumentBackend::new(vec![Err(
+            ThreadEpisodicSearchError::non_retryable("extra source provider failure"),
         )]));
         let failed_executor = ThreadEpisodicIndexExecutor::new(
             store.clone(),
             failed_backend,
-            Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
-                store.clone(),
-                thread_episodic_storage_uri_from_path(root.path()),
-            )),
+            Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(store.clone())),
         );
         assert_eq!(
             failed_executor
@@ -11934,7 +11411,7 @@ mod tests {
 
     #[tokio::test]
     async fn complete_custom_projection_keeps_old_frames_through_preflight_and_retry_errors() {
-        use crate::database::startup::thread_episodic_workspace_capsule_refill as refill;
+        use crate::database::startup::thread_episodic_refill as refill;
         use sea_orm::{ActiveModelTrait, IntoActiveModel, Set};
         let (store, workspace) = setup_thread_episodic_store().await;
         let root = TempDir::new().unwrap();
@@ -11951,21 +11428,17 @@ mod tests {
             "vendor/custom-embed",
             vec![0.1, 0.2, 0.3],
         ));
-        let target = ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_embedding_provider(
-            provider.as_ref(),
-        )
-        .unwrap();
+        let target =
+            ThreadEpisodicWorkspaceProjectionTarget::from_embedding_provider(provider.as_ref())
+                .unwrap();
         let resolver = Arc::new(SharedThreadEpisodicIndexEmbeddingProviderResolver::new());
         resolver.set_active_provider(Some(provider));
-        let backend = Arc::new(FakeThreadEpisodicMemvidBackend::new(vec![]));
+        let backend = Arc::new(PreparedDocumentBackend::new(vec![]));
         let executor = ThreadEpisodicIndexExecutor::new(
             store.clone(),
             backend.clone(),
             Arc::new(RuntimeVectorThreadEpisodicIndexPayloadProvider::new(
-                Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
-                    store.clone(),
-                    thread_episodic_storage_uri_from_path(root.path()),
-                )),
+                Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(store.clone())),
                 resolver.clone(),
                 store.clone(),
             )),
@@ -12032,9 +11505,7 @@ mod tests {
         .await;
         resolver.set_active_provider_unavailable_reason("provider preflight unavailable");
         let configured_target =
-            ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_vector_search_config(
-                &config,
-            );
+            ThreadEpisodicWorkspaceProjectionTarget::from_vector_search_config(&config);
         assert!(
             refill::refill_once_with_projection_resolver(
                 store.clone(),
@@ -12119,7 +11590,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn additional_refill_cancellation_after_embedding_claim_keeps_complete_projection() {
-        use crate::database::startup::thread_episodic_workspace_capsule_refill as refill;
+        use crate::database::startup::thread_episodic_refill as refill;
         let (store, workspace) = setup_thread_episodic_store().await;
         let root = TempDir::new().unwrap();
         let ready = seed_pending_thread_episodic_item(
@@ -12143,10 +11614,9 @@ mod tests {
             "vendor/custom-embed",
             vec![0.1, 0.2, 0.3],
         ));
-        let target = ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_embedding_provider(
-            provider.as_ref(),
-        )
-        .unwrap();
+        let target =
+            ThreadEpisodicWorkspaceProjectionTarget::from_embedding_provider(provider.as_ref())
+                .unwrap();
         let resolver = Arc::new(SharedThreadEpisodicIndexEmbeddingProviderResolver::new());
         resolver.set_active_provider(Some(provider));
         // Build real frames through the production refill before extra work.
@@ -12251,7 +11721,7 @@ mod tests {
                 .unwrap(),
             ready
         );
-        assert!(ready.frame_id.is_some());
+        assert!(ready.projection_text(&store).await.is_some());
 
         // On the next startup this canceled execution future is inherited.
         // A terminal provider failure inside refill must retain the ready gate,
@@ -12317,32 +11787,16 @@ mod tests {
                 .unwrap()
         );
         // Verify the persisted frames through the backend used by threads_search.
-        let segments = store
-            .list_thread_episodic_workspace_capsules(&workspace, 16)
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|capsule| ThreadEpisodicMemvidSearchSegment {
-                capsule_id: capsule.id,
-                capsule_ref: capsule.capsule_ref,
-                storage_uri: capsule.storage_uri,
-                segment_index: capsule.segment_index,
-            })
-            .collect();
         let mut profile =
             ThreadEpisodicSearchProfile::for_kind(ThreadEpisodicSearchProfileKind::DefaultContext);
         profile.mode = ThreadEpisodicSearchMode::Lexical;
-        let output = MemvidThreadEpisodicBackend::new()
-            .search(ThreadEpisodicMemvidSearchRequest {
+        let output = SqliteThreadEpisodicBackend::new(store.clone())
+            .search(ThreadEpisodicSearchRequest {
+                access: pioneer_crud::ThreadEpisodicSearchAccess::default(),
                 workspace_id: workspace.clone(),
                 thread_id: "cancel_refill_thread".into(),
                 query: "canonical source".into(),
-                scope: Some(
-                    thread_episodic_thread_uri_prefix(&workspace, "cancel_refill_thread").unwrap(),
-                ),
                 profile,
-                segments,
-                exact_source: None,
             })
             .await
             .unwrap();
@@ -12363,9 +11817,17 @@ mod tests {
     }
 
     async fn setup_thread_episodic_store() -> (Arc<CrudStore>, String) {
-        let connection = Database::connect("sqlite::memory:")
-            .await
-            .expect("must connect to sqlite memory");
+        pioneer_sqlite::search::register_auto_extension_once().unwrap();
+        let connection = Database::connect({
+            let mut options = sea_orm::ConnectOptions::new("sqlite::memory:");
+            options
+                .max_connections(1)
+                .sqlx_logging(false)
+                .map_sqlx_sqlite_opts(|options| options.pragma("foreign_keys", "OFF"));
+            options
+        })
+        .await
+        .expect("must connect to sqlite memory");
         Migrator::up(&connection, None)
             .await
             .expect("migrations must succeed");
@@ -12409,12 +11871,12 @@ mod tests {
     ) {
         let now = fixed_datetime_from_unix(1_700_000_000);
         let projection_target =
-            crate::database::startup::thread_episodic_workspace_capsule_refill::ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::lexical_only();
+            crate::database::startup::thread_episodic_refill::ThreadEpisodicWorkspaceProjectionTarget::lexical_only();
         pioneer_crud::upsert_projection_meta_with_config(
             &crud_store.database_connection(),
             pioneer_crud::ProjectionMetaRecord {
-                projection_key: crate::database::startup::thread_episodic_workspace_capsule_refill::refill_projection_key_for_workspace(workspace_id).unwrap(),
-                projection_version: crate::database::startup::thread_episodic_workspace_capsule_refill::THREAD_EPISODIC_WORKSPACE_CAPSULE_REFILL_VERSION,
+                projection_key: crate::database::startup::thread_episodic_refill::refill_projection_key_for_workspace(workspace_id).unwrap(),
+                projection_version: crate::database::startup::thread_episodic_refill::THREAD_EPISODIC_REFILL_VERSION,
                 status: status.to_owned(),
                 source_thread_count: 0,
                 source_turn_count: 0,
@@ -12439,9 +11901,29 @@ mod tests {
         turn_id: &str,
         item_id: &str,
     ) -> ThreadEpisodicItemRecord {
+        let text = format!("canonical source for {item_id}");
+        seed_pending_thread_episodic_item_with_text(
+            crud_store,
+            workspace_id,
+            thread_id,
+            turn_id,
+            item_id,
+            &text,
+        )
+        .await
+    }
+
+    async fn seed_pending_thread_episodic_item_with_text(
+        crud_store: &CrudStore,
+        workspace_id: &str,
+        thread_id: &str,
+        turn_id: &str,
+        item_id: &str,
+        text: &str,
+    ) -> ThreadEpisodicItemRecord {
         let canonical_item = TurnItem::UserMessage {
             id: item_id.to_owned(),
-            text: format!("canonical source for {item_id}"),
+            text: text.to_owned(),
             attachments: Vec::new(),
         };
         materialize_thread_with_item(
@@ -12497,11 +11979,6 @@ mod tests {
                     source_text_hash,
                     language_hint: None,
                     token_estimate: 1,
-                    capsule_id: None,
-                    capsule_ref: None,
-                    segment_index: None,
-                    frame_id: None,
-                    frame_uri: None,
                     indexed_at: None,
                     deleted_at: None,
                 },
@@ -12525,12 +12002,7 @@ mod tests {
                     workspace_id: workspace_id.to_owned(),
                     thread_id: thread_id.to_owned(),
                     index_item_id: index_item_id.to_owned(),
-                    capsule_id: None,
-                    capsule_ref: None,
-                    segment_index: None,
-                    frame_uri: None,
                     status: ThreadEpisodicIndexJobStatus::Queued,
-                    graph_enrichment_state: ThreadEpisodicGraphEnrichmentState::NotSupported,
                     next_run_at: fixed_datetime_from_unix(next_run_at_unix),
                     last_error: None,
                 },
@@ -12540,19 +12012,10 @@ mod tests {
             .expect("job should insert")
     }
 
-    fn static_index_request(
-        storage_uri: String,
-        capsule_id: &str,
-        capsule_ref: &str,
-        index_item_id: &str,
-    ) -> ThreadEpisodicMemvidIndexRequest {
-        ThreadEpisodicMemvidIndexRequest {
-            storage_uri,
-            capsule_id: capsule_id.to_owned(),
-            capsule_ref: capsule_ref.to_owned(),
-            workspace_capsule: false,
+    fn static_index_request(index_item_id: &str) -> ThreadEpisodicIndexDocument {
+        ThreadEpisodicIndexDocument {
+            workspace_id: String::new(),
             index_item_id: index_item_id.to_owned(),
-            frame_uri: format!("{capsule_ref}/index/{index_item_id}"),
             text: "test".to_owned(),
             metadata: Default::default(),
             embedding: None,
@@ -12667,28 +12130,9 @@ mod tests {
         )
         .await;
         let temp_dir = TempDir::new().expect("temp dir");
-        let request = static_index_request(
-            thread_episodic_storage_uri_from_path(temp_dir.path()),
-            "capsule_1",
-            "mv2://pioneer/thread_episodic/test/capsules/capsule_1",
-            item.id.as_str(),
-        );
-        let backend = Arc::new(FakeThreadEpisodicMemvidBackend::new(vec![Ok(
-            ThreadEpisodicMemvidIndexOutput {
-                frame_id: 42,
-                frame_uri: request.frame_uri.clone(),
-                embedding_identity: None,
-                stats: ThreadEpisodicMemvidStats {
-                    active_frame_count: Some(1),
-                    frame_count: Some(1),
-                    size_bytes: Some(128),
-                    capacity_bytes: Some(1_024),
-                    remaining_capacity_bytes: Some(896),
-                    utilization_percent: Some(12.5),
-                },
-            },
-        )]));
-        let provider = static_index_payload_provider(crud_store.as_ref(), &item, request, 1).await;
+        let request = static_index_request(item.id.as_str());
+        let backend = Arc::new(PreparedDocumentBackend::new(vec![Ok(())]));
+        let provider = static_index_payload_provider(crud_store.as_ref(), &item, request).await;
         let executor = ThreadEpisodicIndexExecutor::new(crud_store.clone(), backend, provider);
 
         let summary = executor
@@ -12711,8 +12155,10 @@ mod tests {
             .expect("item read")
             .expect("item exists");
         assert_eq!(stored_item.status, ThreadEpisodicItemStatus::Active);
-        assert_eq!(stored_item.capsule_id.as_deref(), Some("capsule_1"));
-        assert_eq!(stored_item.frame_id, Some(42));
+        assert_eq!(
+            stored_item.projection_text(&crud_store).await.as_deref(),
+            Some("canonical source for item_index_complete")
+        );
         let diagnostics = executor
             .debug_index_jobs_for_thread(workspace_id.as_str(), thread_id, 10)
             .await
@@ -12735,7 +12181,6 @@ mod tests {
         assert_eq!(metrics.completed_jobs, 1);
         assert_eq!(metrics.failed_jobs, 0);
         assert_eq!(metrics.total_attempts, 1);
-        assert_eq!(metrics.total_capacity_errors, 0);
         assert_eq!(metrics.max_attempt_count, 1);
         assert!(metrics.completed_latency_avg_ms.is_some());
     }
@@ -12760,20 +12205,15 @@ mod tests {
             1_700_000_000,
         )
         .await;
-        let request = static_index_request(
-            "file:///tmp/thread-index-runtime-vector.mv2".to_owned(),
-            "capsule_runtime_vector",
-            "mv2://pioneer/thread_episodic/test/capsules/capsule_runtime_vector",
-            item.id.as_str(),
-        );
-        let backend = Arc::new(FakeThreadEpisodicMemvidBackend::new(Vec::new()));
+        let request = static_index_request(item.id.as_str());
+        let backend = Arc::new(PreparedDocumentBackend::new(Vec::new()));
         let resolver = Arc::new(SharedThreadEpisodicIndexEmbeddingProviderResolver::new());
         let embedding_provider = Arc::new(StaticThreadEpisodicEmbeddingProvider::new(vec![
             0.4, 0.5, 0.6,
         ]));
         resolver.set_active_provider(Some(embedding_provider.clone()));
         let provider = Arc::new(RuntimeVectorThreadEpisodicIndexPayloadProvider::new(
-            static_index_payload_provider(crud_store.as_ref(), &item, request, 1).await,
+            static_index_payload_provider(crud_store.as_ref(), &item, request).await,
             resolver,
             crud_store.clone(),
         ));
@@ -12825,20 +12265,22 @@ mod tests {
     #[tokio::test]
     async fn runtime_vector_provider_reuses_embedding_for_distinct_thread_occurrences() {
         let (crud_store, workspace_id) = setup_thread_episodic_store().await;
-        let parent_item = seed_pending_thread_episodic_item(
+        let parent_item = seed_pending_thread_episodic_item_with_text(
             crud_store.as_ref(),
             workspace_id.as_str(),
             "thread_embedding_parent",
             "turn_embedding_parent",
             "item_embedding_parent",
+            "shared canonical embedding source",
         )
         .await;
-        let child_item = seed_pending_thread_episodic_item(
+        let child_item = seed_pending_thread_episodic_item_with_text(
             crud_store.as_ref(),
             workspace_id.as_str(),
             "thread_embedding_child",
             "turn_embedding_child",
             "item_embedding_child",
+            "shared canonical embedding source",
         )
         .await;
         let parent_job = seed_thread_episodic_job(
@@ -12866,13 +12308,7 @@ mod tests {
             static_index_payload_provider(
                 crud_store.as_ref(),
                 &parent_item,
-                static_index_request(
-                    "file:///tmp/thread-embedding-parent.mv2".to_owned(),
-                    "capsule_embedding_parent",
-                    "mv2://pioneer/thread_episodic/test/capsules/capsule_embedding_parent",
-                    parent_item.id.as_str(),
-                ),
-                1,
+                static_index_request(parent_item.id.as_str()),
             )
             .await,
             resolver.clone(),
@@ -12882,13 +12318,7 @@ mod tests {
             static_index_payload_provider(
                 crud_store.as_ref(),
                 &child_item,
-                static_index_request(
-                    "file:///tmp/thread-embedding-child.mv2".to_owned(),
-                    "capsule_embedding_child",
-                    "mv2://pioneer/thread_episodic/test/capsules/capsule_embedding_child",
-                    child_item.id.as_str(),
-                ),
-                2,
+                static_index_request(child_item.id.as_str()),
             )
             .await,
             resolver,
@@ -12906,7 +12336,6 @@ mod tests {
 
         assert_eq!(embedding_provider.calls(), 1);
         assert_ne!(parent.request.index_item_id, child.request.index_item_id);
-        assert_ne!(parent.request.frame_uri, child.request.frame_uri);
         assert_eq!(
             parent.embedding_artifact_id, child.embedding_artifact_id,
             "identical embedding input and pipeline should share one artifact"
@@ -12942,13 +12371,8 @@ mod tests {
             1_700_000_000,
         )
         .await;
-        let request = static_index_request(
-            "file:///tmp/thread-index-runtime-vector-retryable.mv2".to_owned(),
-            "capsule_runtime_vector_retryable",
-            "mv2://pioneer/thread_episodic/test/capsules/capsule_runtime_vector_retryable",
-            item.id.as_str(),
-        );
-        let backend = Arc::new(FakeThreadEpisodicMemvidBackend::new(Vec::new()));
+        let request = static_index_request(item.id.as_str());
+        let backend = Arc::new(PreparedDocumentBackend::new(Vec::new()));
         let resolver = Arc::new(SharedThreadEpisodicIndexEmbeddingProviderResolver::new());
         let embedding_provider = Arc::new(StaticThreadEpisodicEmbeddingProvider::with_error(
             ThreadEpisodicEmbeddingError::retryable_provider_failure(
@@ -12959,7 +12383,7 @@ mod tests {
         ));
         resolver.set_active_provider(Some(embedding_provider.clone()));
         let provider = Arc::new(RuntimeVectorThreadEpisodicIndexPayloadProvider::new(
-            static_index_payload_provider(crud_store.as_ref(), &item, request, 1).await,
+            static_index_payload_provider(crud_store.as_ref(), &item, request).await,
             resolver,
             crud_store.clone(),
         ));
@@ -12997,7 +12421,7 @@ mod tests {
             .expect("item read")
             .expect("item exists");
         assert_eq!(stored_item.status, ThreadEpisodicItemStatus::PendingIndex);
-        assert!(stored_item.frame_id.is_none());
+        assert!(stored_item.projection_text(&crud_store).await.is_none());
     }
 
     #[test]
@@ -13060,18 +12484,13 @@ mod tests {
             );
             let resolver = Arc::new(SharedThreadEpisodicIndexEmbeddingProviderResolver::new());
             resolver.set_active_provider(Some(remote));
-            let request = static_index_request(
-                "file:///tmp/episodic-403.mv2".to_owned(),
-                "capsule_403",
-                "mv2://pioneer/thread_episodic/test/capsules/403",
-                &item.id,
-            );
+            let request = static_index_request(&item.id);
             let payload = Arc::new(RuntimeVectorThreadEpisodicIndexPayloadProvider::new(
-                static_index_payload_provider(&store, &item, request, 1).await,
+                static_index_payload_provider(&store, &item, request).await,
                 resolver,
                 store.clone(),
             ));
-            let backend = Arc::new(FakeThreadEpisodicMemvidBackend::new(Vec::new()));
+            let backend = Arc::new(PreparedDocumentBackend::new(Vec::new()));
             let mut executor =
                 ThreadEpisodicIndexExecutor::new(store.clone(), backend.clone(), payload.clone());
             // Use the existing worker clock so provider completion time is deterministic.
@@ -13106,7 +12525,13 @@ mod tests {
                         .unwrap()
                         .unwrap();
                     assert_eq!(indexed.status, ThreadEpisodicItemStatus::Active);
-                    assert_eq!(indexed.frame_id, Some(99));
+                    assert!(
+                        indexed
+                            .projection_text(&store)
+                            .await
+                            .as_deref()
+                            .is_some_and(|text| !text.is_empty())
+                    );
                     break;
                 }
                 assert!(
@@ -13164,7 +12589,6 @@ mod tests {
                                     retryable: false,
                                     next_run_at_unix: None,
                                     last_error: Some("late duplicate 403".to_owned()),
-                                    capacity_error: false,
                                     last_attempt_latency_ms: None,
                                 },
                                 now
@@ -13220,16 +12644,11 @@ mod tests {
             1_700_000_000,
         )
         .await;
-        let request = static_index_request(
-            "file:///tmp/thread-index-runtime-lexical-disabled-vector.mv2".to_owned(),
-            "capsule_runtime_lexical",
-            "mv2://pioneer/thread_episodic/test/capsules/capsule_runtime_lexical",
-            item.id.as_str(),
-        );
-        let backend = Arc::new(FakeThreadEpisodicMemvidBackend::new(Vec::new()));
+        let request = static_index_request(item.id.as_str());
+        let backend = Arc::new(PreparedDocumentBackend::new(Vec::new()));
         let resolver = Arc::new(SharedThreadEpisodicIndexEmbeddingProviderResolver::new());
         let provider = Arc::new(RuntimeVectorThreadEpisodicIndexPayloadProvider::new(
-            static_index_payload_provider(crud_store.as_ref(), &item, request, 1).await,
+            static_index_payload_provider(crud_store.as_ref(), &item, request).await,
             resolver,
             crud_store.clone(),
         ));
@@ -13251,13 +12670,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn store_payload_provider_resolves_same_workspace_capsule_for_multiple_threads() {
+    async fn store_payload_provider_preserves_workspace_and_source_occurrences() {
         let (crud_store, workspace_id) = setup_thread_episodic_store().await;
         let temp_dir = TempDir::new().expect("temp dir");
-        let provider = StoreThreadEpisodicIndexPayloadProvider::new(
-            crud_store.clone(),
-            thread_episodic_storage_uri_from_path(temp_dir.path()),
-        );
+        let provider = StoreThreadEpisodicIndexPayloadProvider::new(crud_store.clone());
 
         let mut resolved = Vec::new();
         for (thread_id, turn_id, item) in [
@@ -13326,53 +12742,30 @@ mod tests {
         }
 
         assert_eq!(resolved.len(), 2);
-        assert_eq!(
-            resolved[0].request.capsule_id,
-            resolved[1].request.capsule_id
+        assert_eq!(resolved[0].request.workspace_id, workspace_id);
+        assert_eq!(resolved[1].request.workspace_id, workspace_id);
+        assert_ne!(
+            resolved[0].request.index_item_id,
+            resolved[1].request.index_item_id
         );
-        assert!(
-            resolved
-                .iter()
-                .all(|resolved| resolved.request.workspace_capsule)
-        );
-
-        for resolved in &resolved {
-            let thread_id = resolved
-                .request
-                .metadata
-                .get("pioneer.thread_episodic.thread_id")
-                .expect("thread id metadata");
-            let thread_scope = pioneer_crud::thread_episodic_thread_uri_prefix(
-                workspace_id.as_str(),
-                thread_id.as_str(),
-            )
-            .expect("thread scope");
-            assert!(
-                resolved
-                    .request
-                    .frame_uri
-                    .starts_with(thread_scope.as_str())
-            );
-            assert_eq!(
-                resolved
+        let threads = resolved
+            .iter()
+            .map(|entry| {
+                entry
                     .request
                     .metadata
-                    .get("pioneer.thread_episodic.workspace_id")
-                    .map(String::as_str),
-                Some(workspace_id.as_str())
-            );
-        }
-
-        let workspace_capsules = crud_store
-            .list_thread_episodic_workspace_capsules(workspace_id.as_str(), 10)
-            .await
-            .expect("workspace capsules read");
-        assert_eq!(workspace_capsules.len(), 1);
+                    .get("pioneer.thread_episodic.thread_id")
+                    .unwrap()
+                    .as_str()
+            })
+            .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(
-            workspace_capsules[0].thread_id,
-            pioneer_crud::THREAD_EPISODIC_WORKSPACE_CAPSULE_THREAD_ID
+            threads,
+            std::collections::BTreeSet::from([
+                "thread_workspace_index_a",
+                "thread_workspace_index_b"
+            ])
         );
-        assert_eq!(workspace_capsules[0].id, resolved[0].request.capsule_id);
     }
 
     #[tokio::test]
@@ -13575,22 +12968,10 @@ mod tests {
             .await
             .expect("projected item lookup should succeed")
             .expect("projected item should exist");
-        let request = static_index_request(
-            "file:///tmp/thread-ingestor-due-second.mv2".to_owned(),
-            "capsule_due_second",
-            "mv2://pioneer/thread_episodic/test/capsules/capsule_due_second",
-            job.index_item_id.as_str(),
-        );
-        let backend = Arc::new(FakeThreadEpisodicMemvidBackend::new(vec![Ok(
-            ThreadEpisodicMemvidIndexOutput {
-                frame_id: 7,
-                frame_uri: request.frame_uri.clone(),
-                stats: ThreadEpisodicMemvidStats::default(),
-                embedding_identity: None,
-            },
-        )]));
+        let request = static_index_request(job.index_item_id.as_str());
+        let backend = Arc::new(PreparedDocumentBackend::new(vec![Ok(())]));
         let provider =
-            static_index_payload_provider(crud_store.as_ref(), &projected_item, request, 1).await;
+            static_index_payload_provider(crud_store.as_ref(), &projected_item, request).await;
         let executor = ThreadEpisodicIndexExecutor::new(crud_store.clone(), backend, provider);
 
         let summary = executor
@@ -13631,15 +13012,9 @@ mod tests {
             1_700_000_000,
         )
         .await;
-        let backend = Arc::new(FakeThreadEpisodicMemvidBackend::new(Vec::new()));
+        let backend = Arc::new(PreparedDocumentBackend::new(Vec::new()));
         let provider = Arc::new(StaticThreadEpisodicIndexPayloadProvider {
-            request: static_index_request(
-                "file:///tmp/thread-index-hidden-debug.mv2".to_owned(),
-                "capsule_hidden",
-                "mv2://pioneer/thread_episodic/test/capsules/capsule_hidden",
-                item.id.as_str(),
-            ),
-            segment_index: 1,
+            request: static_index_request(item.id.as_str()),
             source_payload: String::new(),
         });
         let executor = ThreadEpisodicIndexExecutor::new(crud_store, backend, provider);
@@ -13682,16 +13057,11 @@ mod tests {
             1_700_000_000,
         )
         .await;
-        let request = static_index_request(
-            "file:///tmp/thread-index-retryable.mv2".to_owned(),
-            "capsule_retry",
-            "mv2://pioneer/thread_episodic/test/capsules/capsule_retry",
-            item.id.as_str(),
-        );
-        let backend = Arc::new(FakeThreadEpisodicMemvidBackend::new(vec![Err(
-            ThreadEpisodicMemvidError::retryable("temporary backend failure\nwith detail"),
+        let request = static_index_request(item.id.as_str());
+        let backend = Arc::new(PreparedDocumentBackend::new(vec![Err(
+            ThreadEpisodicSearchError::retryable("temporary backend failure\nwith detail"),
         )]));
-        let provider = static_index_payload_provider(crud_store.as_ref(), &item, request, 1).await;
+        let provider = static_index_payload_provider(crud_store.as_ref(), &item, request).await;
         let executor = ThreadEpisodicIndexExecutor::new(crud_store.clone(), backend, provider);
 
         let summary = executor
@@ -13768,16 +13138,11 @@ mod tests {
             1_700_000_000,
         )
         .await;
-        let request = static_index_request(
-            "file:///tmp/thread-index-terminal.mv2".to_owned(),
-            "capsule_terminal",
-            "mv2://pioneer/thread_episodic/test/capsules/capsule_terminal",
-            item.id.as_str(),
-        );
-        let backend = Arc::new(FakeThreadEpisodicMemvidBackend::new(vec![Err(
-            ThreadEpisodicMemvidError::non_retryable("bad source state"),
+        let request = static_index_request(item.id.as_str());
+        let backend = Arc::new(PreparedDocumentBackend::new(vec![Err(
+            ThreadEpisodicSearchError::non_retryable("bad source state"),
         )]));
-        let provider = static_index_payload_provider(crud_store.as_ref(), &item, request, 1).await;
+        let provider = static_index_payload_provider(crud_store.as_ref(), &item, request).await;
         let executor = ThreadEpisodicIndexExecutor::new(crud_store.clone(), backend, provider);
 
         let summary = executor
@@ -13819,8 +13184,8 @@ mod tests {
             1_700_060_000,
         )
         .await;
-        let backend = Arc::new(FakeThreadEpisodicMemvidBackend::new(vec![Err(
-            ThreadEpisodicMemvidError::capacity_exceeded("workspace capsule full"),
+        let backend = Arc::new(PreparedDocumentBackend::new(vec![Err(
+            ThreadEpisodicSearchError::retryable("workspace capsule full"),
         )]));
         let temp_dir = TempDir::new().expect("temp dir");
         let executor = ThreadEpisodicIndexExecutor::new(
@@ -13828,7 +13193,6 @@ mod tests {
             backend.clone(),
             Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
                 crud_store.clone(),
-                thread_episodic_storage_uri_from_path(temp_dir.path()),
             )),
         );
         executor.apply_config(ThreadEpisodicIndexExecutorConfig {
@@ -13854,22 +13218,20 @@ mod tests {
             .expect("failed job should remain");
         assert_eq!(failed.status, ThreadEpisodicIndexJobStatus::Failed);
         assert_eq!(failed.next_run_at, fixed_datetime_from_unix(1_700_060_031));
-        assert_eq!(failed.capacity_error_count, 0);
         assert!(failed.last_error.as_deref().is_some_and(|error| {
             error.contains("injected primary failure persistence error")
                 && error.contains("workspace capsule full")
         }));
-        let capsules = crud_store
-            .list_thread_episodic_workspace_capsules(workspace_id.as_str(), 10)
-            .await
-            .expect("capsules should list");
-        assert_eq!(capsules.len(), 1);
-        assert_ne!(
-            capsules[0].write_state,
-            ThreadEpisodicCapsuleWriteState::Full
+        assert!(
+            crud_store
+                .find_thread_episodic_item(&item.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .projection_text(&crud_store)
+                .await
+                .is_none()
         );
-        assert!(capsules[0].capacity_exceeded_at.is_none());
-
         executor
             .run_once(1_700_060_030)
             .await
@@ -13890,7 +13252,6 @@ mod tests {
                         retryable: false,
                         next_run_at_unix: None,
                         last_error: Some("late first attempt".to_owned()),
-                        capacity_error: false,
                         last_attempt_latency_ms: None,
                     },
                     1_700_060_032,
@@ -13917,8 +13278,8 @@ mod tests {
             1_700_060_100,
         )
         .await;
-        let changed_backend = Arc::new(FakeThreadEpisodicMemvidBackend::new(vec![Err(
-            ThreadEpisodicMemvidError::capacity_exceeded("stale capacity result"),
+        let changed_backend = Arc::new(PreparedDocumentBackend::new(vec![Err(
+            ThreadEpisodicSearchError::retryable("stale capacity result"),
         )]));
         let changed_temp_dir = TempDir::new().expect("changed temp dir");
         let changed_executor = ThreadEpisodicIndexExecutor::new(
@@ -13926,7 +13287,6 @@ mod tests {
             changed_backend.clone(),
             Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
                 changed_store.clone(),
-                thread_episodic_storage_uri_from_path(changed_temp_dir.path()),
             )),
         );
         changed_executor
@@ -13978,17 +13338,16 @@ mod tests {
                 .count(),
             1
         );
-        let changed_capsules = changed_store
-            .list_thread_episodic_workspace_capsules(changed_workspace.as_str(), 10)
-            .await
-            .expect("changed capsules should list");
         assert!(
-            changed_capsules
-                .iter()
-                .all(|capsule| capsule.capacity_exceeded_at.is_none()
-                    && capsule.write_state != ThreadEpisodicCapsuleWriteState::Full)
+            changed_store
+                .find_thread_episodic_item(&changed_item.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .projection_text(&changed_store)
+                .await
+                .is_none()
         );
-
         let (terminal_store, terminal_workspace) = setup_thread_episodic_store().await;
         let terminal_item = seed_pending_thread_episodic_item(
             terminal_store.as_ref(),
@@ -14006,8 +13365,8 @@ mod tests {
             1_700_060_200,
         )
         .await;
-        let terminal_backend = Arc::new(FakeThreadEpisodicMemvidBackend::new(vec![Err(
-            ThreadEpisodicMemvidError::capacity_exceeded("terminal stale capacity result"),
+        let terminal_backend = Arc::new(PreparedDocumentBackend::new(vec![Err(
+            ThreadEpisodicSearchError::retryable("terminal stale capacity result"),
         )]));
         let terminal_temp_dir = TempDir::new().expect("terminal temp dir");
         let terminal_executor = ThreadEpisodicIndexExecutor::new(
@@ -14015,7 +13374,6 @@ mod tests {
             terminal_backend.clone(),
             Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
                 terminal_store.clone(),
-                thread_episodic_storage_uri_from_path(terminal_temp_dir.path()),
             )),
         );
         terminal_executor.apply_config(ThreadEpisodicIndexExecutorConfig {
@@ -14042,15 +13400,15 @@ mod tests {
             .await
             .expect("terminal rescan should succeed");
         assert_eq!(terminal_backend.requests().await.len(), 1);
-        let terminal_capsules = terminal_store
-            .list_thread_episodic_workspace_capsules(terminal_workspace.as_str(), 10)
-            .await
-            .expect("terminal capsules should list");
         assert!(
-            terminal_capsules
-                .iter()
-                .all(|capsule| capsule.capacity_exceeded_at.is_none()
-                    && capsule.write_state != ThreadEpisodicCapsuleWriteState::Full)
+            terminal_store
+                .find_thread_episodic_item(&terminal_item.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .projection_text(&terminal_store)
+                .await
+                .is_none()
         );
     }
 
@@ -14138,11 +13496,9 @@ mod tests {
                 "CREATE TRIGGER forbid_suppressed_job_deletion BEFORE DELETE ON thread_episodic_index_jobs BEGIN SELECT RAISE(FAIL, 'durable user outcome must not be deleted'); END".to_owned(),
             )).await.expect("deletion guard should install");
             let temp_dir = TempDir::new().expect("temp dir");
-            let base_provider: Arc<dyn ThreadEpisodicIndexPayloadProvider> =
-                Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
-                    crud_store.clone(),
-                    thread_episodic_storage_uri_from_path(temp_dir.path()),
-                ));
+            let base_provider: Arc<dyn ThreadEpisodicIndexPayloadProvider> = Arc::new(
+                StoreThreadEpisodicIndexPayloadProvider::new(crud_store.clone()),
+            );
             let embedding_provider = Arc::new(StaticThreadEpisodicEmbeddingProvider::new(vec![
                 0.1, 0.2, 0.3,
             ]));
@@ -14150,7 +13506,7 @@ mod tests {
                 base_provider,
                 embedding_provider.clone(),
             ));
-            let backend = Arc::new(FakeThreadEpisodicMemvidBackend::new(Vec::new()));
+            let backend = Arc::new(PreparedDocumentBackend::new(Vec::new()));
             let executor = ThreadEpisodicIndexExecutor::new(
                 crud_store.clone(),
                 backend.clone(),
@@ -14230,11 +13586,11 @@ mod tests {
             )
             .await;
         }
-        let backend = Arc::new(FakeThreadEpisodicMemvidBackend::new(vec![
-            Err(ThreadEpisodicMemvidError::retryable(
+        let backend = Arc::new(PreparedDocumentBackend::new(vec![
+            Err(ThreadEpisodicSearchError::retryable(
                 "first backend failure",
             )),
-            Err(ThreadEpisodicMemvidError::retryable(
+            Err(ThreadEpisodicSearchError::retryable(
                 "second backend failure",
             )),
         ]));
@@ -14244,7 +13600,6 @@ mod tests {
             backend.clone(),
             Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
                 crud_store.clone(),
-                thread_episodic_storage_uri_from_path(temp_dir.path()),
             )),
         );
         executor
@@ -14313,8 +13668,8 @@ mod tests {
             1_700_061_100,
         )
         .await;
-        let target_backend = Arc::new(FakeThreadEpisodicMemvidBackend::new(vec![Err(
-            ThreadEpisodicMemvidError::retryable("target backend failure"),
+        let target_backend = Arc::new(PreparedDocumentBackend::new(vec![Err(
+            ThreadEpisodicSearchError::retryable("target backend failure"),
         )]));
         let target_temp = TempDir::new().expect("target temp dir");
         let target_executor = ThreadEpisodicIndexExecutor::new(
@@ -14322,7 +13677,6 @@ mod tests {
             target_backend,
             Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
                 target_store.clone(),
-                thread_episodic_storage_uri_from_path(target_temp.path()),
             )),
         );
         target_executor
@@ -14385,14 +13739,13 @@ mod tests {
             )
             .await
             .expect("source update should persist");
-        let transition_backend = Arc::new(FakeThreadEpisodicMemvidBackend::new(Vec::new()));
+        let transition_backend = Arc::new(PreparedDocumentBackend::new(Vec::new()));
         let transition_temp = TempDir::new().expect("transition temp dir");
         let transition_executor = ThreadEpisodicIndexExecutor::new(
             transition_store.clone(),
             transition_backend.clone(),
             Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
                 transition_store,
-                thread_episodic_storage_uri_from_path(transition_temp.path()),
             )),
         );
         transition_executor
@@ -14410,114 +13763,6 @@ mod tests {
                 .contains("requeue transition unavailable")
         );
         assert!(transition_backend.requests().await.is_empty());
-    }
-
-    #[tokio::test]
-    async fn store_payload_provider_rotates_workspace_segment_after_capacity_failure() {
-        let (crud_store, workspace_id) = setup_thread_episodic_store().await;
-        let temp_dir = TempDir::new().expect("temp dir");
-        let thread_id = "thread_index_capacity";
-        let turn_id = "turn_index_capacity";
-        let item = TurnItem::UserMessage {
-            id: "item_index_capacity".to_owned(),
-            text: "  thread context survives compaction  ".to_owned(),
-            attachments: Vec::new(),
-        };
-        materialize_thread_with_item(
-            crud_store.as_ref(),
-            workspace_id.as_str(),
-            thread_id,
-            turn_id,
-            item.clone(),
-            1_700_000_000,
-        )
-        .await;
-        let ingestor = StoreThreadEpisodicIngestor::new(crud_store.clone());
-        ingestor
-            .ingest_committed_item(ThreadEpisodicCommittedItem {
-                workspace_id: workspace_id.clone(),
-                thread_id: thread_id.to_owned(),
-                turn_id: turn_id.to_owned(),
-                item_id: item.item_id().to_owned(),
-                item_type: item.item_type(),
-                source_actor_role: committed_item_source_actor_role(&item),
-                source_context: committed_item_source_context(&item),
-                item,
-            })
-            .await
-            .expect("ingestion should succeed");
-        let items = crud_store
-            .list_thread_episodic_items_for_thread(workspace_id.as_str(), thread_id, 10)
-            .await
-            .expect("items read");
-        let item = items.first().expect("item exists");
-        let jobs = crud_store
-            .list_thread_episodic_index_jobs_for_thread(workspace_id.as_str(), thread_id, 10)
-            .await
-            .expect("jobs read");
-        let job = jobs.first().expect("job exists");
-        let backend = Arc::new(FakeThreadEpisodicMemvidBackend::new(vec![Err(
-            ThreadEpisodicMemvidError::capacity_exceeded("workspace capsule full"),
-        )]));
-        let provider = Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
-            crud_store.clone(),
-            thread_episodic_storage_uri_from_path(temp_dir.path()),
-        ));
-        let executor =
-            ThreadEpisodicIndexExecutor::new(crud_store.clone(), backend.clone(), provider);
-        let now_unix = chrono::Utc::now().timestamp().saturating_add(1);
-
-        let summary = executor
-            .run_once(now_unix)
-            .await
-            .expect("executor should run");
-
-        assert_eq!(summary.completed, 0);
-        assert_eq!(summary.failed_retryable, 1);
-        let requests = backend.requests().await;
-        assert_eq!(requests.len(), 1);
-        assert!(requests[0].workspace_capsule);
-        assert_eq!(requests[0].text, "thread context survives compaction");
-        let capsules = crud_store
-            .list_thread_episodic_workspace_capsules(workspace_id.as_str(), 10)
-            .await
-            .expect("capsules read");
-        assert_eq!(capsules.len(), 1);
-        assert_eq!(
-            capsules[0].write_state,
-            ThreadEpisodicCapsuleWriteState::Full
-        );
-        assert!(capsules[0].capacity_exceeded_at.is_some());
-        let capacity_diagnostics = executor
-            .debug_segment_capacity_for_thread(workspace_id.as_str(), thread_id, 10)
-            .await
-            .expect("capacity diagnostics should read");
-        assert_eq!(capacity_diagnostics.len(), 1);
-        assert_eq!(capacity_diagnostics[0].capsule_scope, "workspace");
-        assert_eq!(capacity_diagnostics[0].thread_id, "");
-        assert_eq!(capacity_diagnostics[0].capsule_id, capsules[0].id);
-        assert_ne!(
-            capacity_diagnostics[0].thread_id,
-            pioneer_crud::THREAD_EPISODIC_WORKSPACE_CAPSULE_THREAD_ID
-        );
-        let indexed_item = crud_store
-            .find_thread_episodic_item(item.id.as_str())
-            .await
-            .expect("item read")
-            .expect("item exists");
-        assert_eq!(indexed_item.status, ThreadEpisodicItemStatus::PendingIndex);
-        assert_eq!(indexed_item.frame_id, None);
-        let failed_job = crud_store
-            .find_thread_episodic_index_job(job.id.as_str())
-            .await
-            .expect("job read")
-            .expect("job exists");
-        assert_eq!(failed_job.status, ThreadEpisodicIndexJobStatus::Failed);
-        assert_eq!(failed_job.capacity_error_count, 1);
-        assert_eq!(
-            failed_job.graph_enrichment_state,
-            ThreadEpisodicGraphEnrichmentState::NotSupported
-        );
     }
 
     #[test]
@@ -14817,6 +14062,860 @@ mod tests {
         assert_ne!(
             task_result_projection_group_id("workspace", "run_1", text_hash.as_str()),
             task_result_projection_group_id("workspace", "run_2", text_hash.as_str())
+        );
+    }
+
+    async fn observed_search_store_for_test(
+        path: &std::path::Path,
+        evidence: Arc<SearchSchedulingEvidence>,
+    ) -> (Arc<CrudStore>, String) {
+        pioneer_sqlite::search::register_auto_extension_once().unwrap();
+        use sea_orm::ConnectOptions;
+        let mut options = ConnectOptions::new(format!("sqlite://{}?mode=rwc", path.display()));
+        options
+            .max_connections(1)
+            .sqlx_logging(false)
+            .map_sqlx_sqlite_opts(|options| options.pragma("foreign_keys", "OFF"));
+        let writer = Database::connect(options).await.unwrap();
+        Migrator::up(&writer, None).await.unwrap();
+        bootstrap(&writer).await.unwrap();
+        writer
+            .execute_unprepared("PRAGMA journal_mode=WAL")
+            .await
+            .unwrap();
+        pioneer_entity::workspace::Entity::delete_many()
+            .exec(&writer)
+            .await
+            .unwrap();
+        let workspace = WorkspaceManager::new(writer.clone())
+            .create_workspace(
+                &pioneer_protocol::generate_id(21),
+                Some("Physical episodic test"),
+            )
+            .await
+            .unwrap()
+            .id;
+        let mut options =
+            ConnectOptions::new(pioneer_sqlite::sqlite_read_only_connection_url(path));
+        options
+            .max_connections(2)
+            .sqlx_logging(false)
+            .map_sqlx_sqlite_opts(|options| {
+                options
+                    .read_only(true)
+                    .create_if_missing(false)
+                    .pragma("foreign_keys", "OFF")
+                    .pragma("query_only", "ON")
+            });
+        let reader = Database::connect(options).await.unwrap();
+        let database = pioneer_sqlite::SqliteDatabase::from_executor_with_read_observer(
+            reader,
+            pioneer_sqlite::SqliteWriteExecutor::with_observer(writer, evidence.clone()),
+            evidence,
+        );
+        database.validate_reader().await.unwrap();
+        let store = Arc::new(CrudStore::new(database));
+        mark_thread_episodic_workspace_refill_complete_for_test(&store, &workspace).await;
+        (store, workspace)
+    }
+    #[derive(Default)]
+    struct SearchSchedulingEvidence {
+        reads: std::sync::Mutex<Vec<pioneer_sqlite::SqliteReadClass>>,
+        writes: std::sync::Mutex<Vec<pioneer_sqlite::SqliteWriteClass>>,
+    }
+    impl pioneer_sqlite::SqliteReadObserver for SearchSchedulingEvidence {
+        fn observe(&self, event: pioneer_sqlite::SqliteReadEvent) {
+            if let pioneer_sqlite::SqliteReadEvent::OperationFinished { class, .. } = event {
+                self.reads.lock().unwrap().push(class);
+            }
+        }
+    }
+    impl pioneer_sqlite::SqliteWriteObserver for SearchSchedulingEvidence {
+        fn observe(&self, event: pioneer_sqlite::SqliteWriteEvent) {
+            if let pioneer_sqlite::SqliteWriteEvent::Acquired { class, .. } = event {
+                self.writes.lock().unwrap().push(class);
+            }
+        }
+    }
+
+    async fn sql_search_pending(
+        store: &Arc<CrudStore>,
+        workspace: &str,
+        id: &str,
+        text: &str,
+    ) -> (
+        ThreadEpisodicItemRecord,
+        ThreadEpisodicIndexJobRecord,
+        ThreadEpisodicResolvedIndexRequest,
+    ) {
+        let item = TurnItem::UserMessage {
+            id: id.into(),
+            text: text.into(),
+            attachments: Vec::new(),
+        };
+        let turn = format!("turn_{id}");
+        materialize_thread_with_item(
+            store,
+            workspace,
+            "sql_search_thread",
+            &turn,
+            item.clone(),
+            1_700_000_000,
+        )
+        .await;
+        StoreThreadEpisodicIngestor::new(store.clone())
+            .ingest_committed_item(
+                committed_item_ingestion_input_from_parts(
+                    workspace,
+                    "sql_search_thread",
+                    &turn,
+                    item,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let item = store
+            .list_thread_episodic_items_for_thread(workspace, "sql_search_thread", 300)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|item| item.item_id == id)
+            .unwrap();
+        let job = store
+            .find_thread_episodic_index_job_by_item(&item.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let job = store
+            .claim_thread_episodic_index_job_if_due(
+                &job.id,
+                chrono::Utc::now().timestamp().saturating_add(60),
+                5,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let resolved = StoreThreadEpisodicIndexPayloadProvider::new(store.clone())
+            .resolve_index_request(&job)
+            .await
+            .unwrap();
+        (item, job, resolved)
+    }
+
+    async fn sql_search_publish(
+        store: &CrudStore,
+        item: &ThreadEpisodicItemRecord,
+        job: &ThreadEpisodicIndexJobRecord,
+        resolved: &ThreadEpisodicResolvedIndexRequest,
+        vector: Option<Vec<f32>>,
+    ) -> Result<ThreadEpisodicIndexAttemptOutcome> {
+        let artifact = if let Some(vector) = vector {
+            Some(
+                store
+                    .insert_thread_episodic_embedding_artifact_if_absent(
+                        NewThreadEpisodicEmbeddingArtifactRecord {
+                            id: format!("artifact_{}", item.id),
+                            workspace_id: item.workspace_id.clone(),
+                            pipeline_identity_hash: "test-pipeline".into(),
+                            input_hash: item.source_text_hash.clone(),
+                            provider_id: "test".into(),
+                            model: "axis".into(),
+                            dimension: vector.len(),
+                            normalized: false,
+                            vector,
+                        },
+                        1_800_000_000,
+                    )
+                    .await?
+                    .id,
+            )
+        } else {
+            None
+        };
+        store
+            .complete_thread_episodic_index_attempt(
+                &job.id,
+                job.attempt_count,
+                &resolved.source_payload,
+                ThreadEpisodicItemIndexedUpdate {
+                    projection_guard: None,
+                    search_text: resolved.request.text.clone(),
+                    embedding_artifact_id: artifact,
+                },
+                ThreadEpisodicIndexJobCompletionUpdate {
+                    last_attempt_latency_ms: Some(1),
+                },
+                1_800_000_001,
+            )
+            .await
+    }
+
+    fn sql_search_request(workspace: &str, query: &str) -> ThreadEpisodicSearchRequest {
+        let mut profile =
+            ThreadEpisodicSearchProfile::for_kind(ThreadEpisodicSearchProfileKind::DefaultContext);
+        profile.mode = ThreadEpisodicSearchMode::Lexical;
+        ThreadEpisodicSearchRequest {
+            workspace_id: workspace.into(),
+            thread_id: String::new(),
+            query: query.into(),
+            profile,
+            access: pioneer_crud::ThreadEpisodicSearchAccess::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn sqlite_projection_commits_text_vector_and_job_together_on_scoped_runtime() {
+        use pioneer_sqlite::{SqliteReadClass, SqliteWriteClass};
+        use sea_orm::TransactionTrait;
+        let root = TempDir::new().unwrap();
+        let evidence = Arc::new(SearchSchedulingEvidence::default());
+        let (store, workspace) = observed_search_store_for_test(
+            &root.path().join("projection.sqlite"),
+            evidence.clone(),
+        )
+        .await;
+        assert!(
+            store
+                .database_connection()
+                .reader_query_only_enabled()
+                .await
+                .unwrap()
+        );
+        let reader = store.database_connection().begin_read().await.unwrap();
+        assert!(
+            reader
+                .execute_unprepared("UPDATE thread_episodic_items SET search_text='forbidden'")
+                .await
+                .is_err()
+        );
+        drop(reader);
+        let maintenance = Arc::new(store.with_maintenance_access());
+        let (item, job, resolved) = sql_search_pending(
+            &maintenance,
+            &workspace,
+            "atomic",
+            "committedneedle canonical text",
+        )
+        .await;
+        let backend = SqliteThreadEpisodicBackend::new(store.clone());
+        let request = sql_search_request(&workspace, "committedneedle");
+        assert!(
+            backend
+                .search_page(request.clone(), 10, None, None)
+                .await
+                .unwrap()
+                .hits
+                .is_empty()
+        );
+        maintenance.database_connection().execute_unprepared("CREATE TRIGGER reject_search_completion BEFORE UPDATE ON thread_episodic_index_jobs WHEN NEW.status='completed' BEGIN SELECT RAISE(ABORT,'injected completion rollback'); END;").await.unwrap();
+        assert!(
+            sql_search_publish(
+                &maintenance,
+                &item,
+                &job,
+                &resolved,
+                Some(vec![8.0, 0.0, 0.0])
+            )
+            .await
+            .is_err()
+        );
+        assert!(item.projection_text(&store).await.is_none());
+        assert_eq!(
+            store
+                .find_thread_episodic_index_job(&job.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            ThreadEpisodicIndexJobStatus::Running
+        );
+        assert!(
+            backend
+                .search_page(request.clone(), 10, None, None)
+                .await
+                .unwrap()
+                .hits
+                .is_empty()
+        );
+        maintenance
+            .database_connection()
+            .execute_unprepared("DROP TRIGGER reject_search_completion")
+            .await
+            .unwrap();
+        evidence.reads.lock().unwrap().clear();
+        evidence.writes.lock().unwrap().clear();
+        assert_eq!(
+            sql_search_publish(
+                &maintenance,
+                &item,
+                &job,
+                &resolved,
+                Some(vec![8.0, 0.0, 0.0])
+            )
+            .await
+            .unwrap(),
+            ThreadEpisodicIndexAttemptOutcome::Applied
+        );
+        assert!(!evidence.reads.lock().unwrap().is_empty());
+        assert!(
+            evidence
+                .reads
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|class| *class == SqliteReadClass::Maintenance)
+        );
+        assert!(
+            evidence
+                .writes
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|class| *class == SqliteWriteClass::Maintenance)
+        );
+        evidence.reads.lock().unwrap().clear();
+        evidence.writes.lock().unwrap().clear();
+        let page = backend
+            .search_page(request.clone(), 10, None, None)
+            .await
+            .unwrap();
+        assert_eq!(page.hits.len(), 1);
+        assert_eq!(page.hits[0].index_item_id, item.id);
+        assert_eq!(page.hits[0].text, "committedneedle canonical text");
+        assert!(evidence.writes.lock().unwrap().is_empty());
+        assert!(
+            evidence
+                .reads
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|class| *class == SqliteReadClass::Interactive)
+        );
+        let (comparison, comparison_job, comparison_input) = sql_search_pending(
+            &maintenance,
+            &workspace,
+            "comparison",
+            "orthogonalneedle comparator",
+        )
+        .await;
+        assert_eq!(
+            sql_search_publish(
+                &maintenance,
+                &comparison,
+                &comparison_job,
+                &comparison_input,
+                Some(vec![1.0, 1.0, 0.0])
+            )
+            .await
+            .unwrap(),
+            ThreadEpisodicIndexAttemptOutcome::Applied
+        );
+        let mut semantic = request.clone();
+        semantic.profile.mode = ThreadEpisodicSearchMode::Semantic;
+        let embedding = ThreadEpisodicIndexEmbedding::new(
+            pioneer_memory::ThreadEpisodicEmbeddingIdentity::new("test", "axis", 3, false),
+            vec![2.0, 0.0, 0.0],
+        )
+        .unwrap();
+        assert_eq!(
+            backend
+                .search_page(semantic.clone(), 10, None, Some(embedding.clone()))
+                .await
+                .unwrap()
+                .hits[0]
+                .index_item_id,
+            item.id
+        );
+        let mut hybrid = request.clone();
+        hybrid.profile.mode = ThreadEpisodicSearchMode::Auto;
+        let combined = backend
+            .search_page(hybrid, 10, None, Some(embedding.clone()))
+            .await
+            .unwrap();
+        assert_eq!(combined.hits[0].index_item_id, item.id);
+        assert_eq!(combined.hits[0].rank_score(), 1.0);
+        assert!(combined.hits[1].rank_score() > 0.49 && combined.hits[1].rank_score() < 0.5);
+        let mut recent = request.clone();
+        recent.profile.mode = ThreadEpisodicSearchMode::Temporal;
+        recent.profile.recent_start_unix =
+            Some(chrono::Utc::now().timestamp().saturating_add(86_400));
+        assert!(
+            backend
+                .search_page(recent, 10, None, Some(embedding.clone()))
+                .await
+                .unwrap()
+                .hits
+                .is_empty()
+        );
+        let wrong = ThreadEpisodicIndexEmbedding::new(
+            pioneer_memory::ThreadEpisodicEmbeddingIdentity::new("test", "other-model", 2, false),
+            vec![1.0, 0.0],
+        )
+        .unwrap();
+        let mismatch = backend
+            .search_page(semantic, 10, None, Some(wrong))
+            .await
+            .unwrap();
+        assert!(mismatch.hits.is_empty());
+        assert!(!mismatch.warnings.is_empty());
+        let database = maintenance.database_connection();
+        let transaction = database.begin().await.unwrap();
+        transaction.execute_unprepared("UPDATE thread_episodic_items SET search_text='rolledbackneedle' WHERE item_id='atomic'").await.unwrap();
+        transaction.rollback().await.unwrap();
+        assert!(
+            backend
+                .search_page(
+                    sql_search_request(&workspace, "rolledbackneedle"),
+                    10,
+                    None,
+                    None
+                )
+                .await
+                .unwrap()
+                .hits
+                .is_empty()
+        );
+        assert_eq!(
+            backend
+                .search_page(request.clone(), 10, None, None)
+                .await
+                .unwrap()
+                .hits
+                .len(),
+            1
+        );
+        store
+            .exclude_thread_episodic_item(
+                NewThreadEpisodicExclusionRecord {
+                    id: None,
+                    workspace_id: workspace.clone(),
+                    thread_id: item.thread_id.clone(),
+                    index_item_id: item.id.clone(),
+                    reason: ThreadEpisodicExclusionReason::UserRequested,
+                    created_by: "test".into(),
+                },
+                1_800_000_002,
+            )
+            .await
+            .unwrap();
+        assert!(
+            backend
+                .search_page(request, 10, None, Some(embedding))
+                .await
+                .unwrap()
+                .hits
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_plain_text_queries_and_bounded_pages_use_actual_unicode_tokenizer() {
+        let (store, workspace) = setup_thread_episodic_store().await;
+        for (id, text) in [
+            ("operators", "AND OR NOT альфа 東京 a"),
+            ("one", "pagingneedle first"),
+            ("two", "pagingneedle second"),
+            ("three", "pagingneedle third"),
+        ] {
+            let (item, job, resolved) = sql_search_pending(&store, &workspace, id, text).await;
+            assert_eq!(
+                sql_search_publish(&store, &item, &job, &resolved, None)
+                    .await
+                    .unwrap(),
+                ThreadEpisodicIndexAttemptOutcome::Applied
+            );
+        }
+        let backend = SqliteThreadEpisodicBackend::new(store.clone());
+        for query in ["AND", "(OR)", "\"NOT\"", "альфа", "東京", "a", "AND:OR-NOT"] {
+            let page = backend
+                .search_page(sql_search_request(&workspace, query), 10, None, None)
+                .await
+                .unwrap();
+            assert_eq!(page.hits.len(), 1, "{query}");
+            assert_eq!(page.hits[0].item_id, "operators");
+        }
+        for query in ["", " ", "()\" :- !!!", "unmatchedneedle"] {
+            assert!(
+                backend
+                    .search_page(sql_search_request(&workspace, query), 10, None, None)
+                    .await
+                    .unwrap()
+                    .hits
+                    .is_empty(),
+                "{query}"
+            );
+        }
+        let request = sql_search_request(&workspace, "pagingneedle");
+        let first = backend
+            .search_page(request.clone(), 2, None, None)
+            .await
+            .unwrap();
+        let replay = backend
+            .search_page(request.clone(), 2, None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            first
+                .hits
+                .iter()
+                .map(|hit| &hit.index_item_id)
+                .collect::<Vec<_>>(),
+            replay
+                .hits
+                .iter()
+                .map(|hit| &hit.index_item_id)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(first.hits.len(), 2);
+        assert!(first.next_cursor.is_some());
+        let second = backend
+            .search_page(request, 2, first.next_cursor, None)
+            .await
+            .unwrap();
+        assert_eq!(second.hits.len(), 1);
+        assert!(second.next_cursor.is_none());
+        assert!(
+            first
+                .hits
+                .iter()
+                .all(|hit| hit.index_item_id != second.hits[0].index_item_id)
+        );
+        assert!(
+            first
+                .hits
+                .iter()
+                .chain(&second.hits)
+                .all(|hit| { hit.rank_score() > 0.25 && hit.rank_score() <= 0.5 })
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_publication_rechecks_target_even_when_source_and_claim_are_unchanged() {
+        let (store, workspace) = setup_thread_episodic_store().await;
+        let (item, job, resolved) =
+            sql_search_pending(&store, &workspace, "late_target", "latepublicationneedle").await;
+        let old = ThreadEpisodicWorkspaceProjectionTarget::lexical_only();
+        let guard = old.publication_guard(&workspace).unwrap();
+        let now = fixed_datetime_from_unix(1_800_000_000);
+        let target = ThreadEpisodicWorkspaceProjectionTarget::from_embedding_identity(
+            &pioneer_memory::ThreadEpisodicEmbeddingIdentity::new("test", "replacement", 2, false),
+        )
+        .unwrap();
+        pioneer_crud::upsert_projection_meta_with_config(
+            &store.database_connection(),
+            pioneer_crud::ProjectionMetaRecord {
+                projection_key: guard.projection_key.clone(),
+                projection_version: guard.projection_version,
+                status: pioneer_crud::PROJECTION_META_STATUS_COMPLETE.into(),
+                source_thread_count: 0,
+                source_turn_count: 0,
+                source_turn_item_count: 0,
+                source_turn_event_count: 0,
+                last_error: None,
+                backfill_started_at: Some(now),
+                backfilled_at: Some(now),
+                created_at: now,
+                updated_at: now,
+            },
+            target.meta_config_record(),
+        )
+        .await
+        .unwrap();
+        let result = store
+            .complete_thread_episodic_index_attempt(
+                &job.id,
+                job.attempt_count,
+                &resolved.source_payload,
+                ThreadEpisodicItemIndexedUpdate {
+                    projection_guard: Some(guard),
+                    search_text: resolved.request.text,
+                    embedding_artifact_id: None,
+                },
+                ThreadEpisodicIndexJobCompletionUpdate {
+                    last_attempt_latency_ms: Some(1),
+                },
+                1_800_000_001,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result, ThreadEpisodicIndexAttemptOutcome::ProjectionChanged);
+        assert_eq!(
+            store
+                .find_thread_episodic_index_job(&job.id)
+                .await
+                .unwrap()
+                .unwrap(),
+            job
+        );
+        assert!(item.projection_text(&store).await.is_none());
+        let backend = SqliteThreadEpisodicBackend::new(store.clone());
+        assert!(
+            backend
+                .search_page(
+                    sql_search_request(&workspace, "latepublicationneedle"),
+                    10,
+                    None,
+                    None
+                )
+                .await
+                .unwrap()
+                .hits
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_common_retrieval_keeps_lexical_results_and_reports_embedding_failures() {
+        use pioneer_memory::ThreadEpisodicRetrievalMode;
+        let (store, workspace) = setup_thread_episodic_store().await;
+        let (item, job, resolved) = sql_search_pending(
+            &store,
+            &workspace,
+            "provider_failure",
+            "fallbackneedle stored without a provider",
+        )
+        .await;
+        assert_eq!(
+            sql_search_publish(&store, &item, &job, &resolved, None)
+                .await
+                .unwrap(),
+            ThreadEpisodicIndexAttemptOutcome::Applied
+        );
+        let backend = SqliteThreadEpisodicBackend::new(store);
+        for (error, warning, retryable) in [
+            (
+                ThreadEpisodicEmbeddingError::retryable_provider_failure(
+                    "test",
+                    "test-embedding",
+                    "rate limited",
+                ),
+                "query_embedding_retryable_failure",
+                true,
+            ),
+            (
+                ThreadEpisodicEmbeddingError::non_retryable_provider_failure(
+                    "test",
+                    "test-embedding",
+                    "unavailable",
+                ),
+                "query_embedding_unavailable",
+                false,
+            ),
+        ] {
+            let provider = Arc::new(StaticThreadEpisodicEmbeddingProvider::with_error(error));
+            let request = sql_search_request(&workspace, "fallbackneedle");
+            let output = backend
+                .ask_retrieval(
+                    request.clone(),
+                    ThreadEpisodicRetrievalMode::Hybrid,
+                    provider.clone(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(output.hits.len(), 1);
+            assert_eq!(output.hits[0].hit.index_item_id, item.id);
+            assert!(
+                output
+                    .diagnostics
+                    .warnings
+                    .iter()
+                    .any(|value| value == warning)
+            );
+            let failure = backend
+                .ask_retrieval(request, ThreadEpisodicRetrievalMode::Semantic, provider)
+                .await
+                .unwrap_err();
+            assert_eq!(failure.is_retryable(), retryable);
+        }
+    }
+
+    #[tokio::test]
+    async fn sqlite_maximum_page_keeps_lookahead_and_returns_the_last_source() {
+        let (store, workspace) = setup_thread_episodic_store().await;
+        for index in 0..257 {
+            let (item, job, resolved) = sql_search_pending(
+                &store,
+                &workspace,
+                &format!("maximum_{index:03}"),
+                "maximumpageneedle",
+            )
+            .await;
+            assert_eq!(
+                sql_search_publish(&store, &item, &job, &resolved, None)
+                    .await
+                    .unwrap(),
+                ThreadEpisodicIndexAttemptOutcome::Applied
+            );
+        }
+        let backend = SqliteThreadEpisodicBackend::new(store);
+        let request = sql_search_request(&workspace, "maximumpageneedle");
+        let first = backend
+            .search_page(request.clone(), 256, None, None)
+            .await
+            .unwrap();
+        assert_eq!(first.hits.len(), 256);
+        assert!(first.next_cursor.is_some());
+        let second = backend
+            .search_page(request, 256, first.next_cursor, None)
+            .await
+            .unwrap();
+        assert_eq!(second.hits.len(), 1);
+        assert!(second.next_cursor.is_none());
+        let ids = first
+            .hits
+            .into_iter()
+            .chain(second.hits)
+            .map(|hit| hit.index_item_id)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(ids.len(), 257);
+    }
+
+    #[tokio::test]
+    async fn sqlite_lexical_snippet_shows_late_unicode_match_within_character_budget() {
+        let (store, workspace) = setup_thread_episodic_store().await;
+        let text = format!(
+            "{} левый контекст latecontextneedle правый контекст",
+            "далеко начало ".repeat(2000)
+        );
+        let (item, job, resolved) =
+            sql_search_pending(&store, &workspace, "late_snippet", &text).await;
+        assert_eq!(
+            sql_search_publish(&store, &item, &job, &resolved, None)
+                .await
+                .unwrap(),
+            ThreadEpisodicIndexAttemptOutcome::Applied
+        );
+        let mut request = sql_search_request(&workspace, "latecontextneedle");
+        request.profile.snippet_chars = 120;
+        let page = SqliteThreadEpisodicBackend::new(store)
+            .search_page(request, 10, None, None)
+            .await
+            .unwrap();
+        assert_eq!(page.hits.len(), 1);
+        let hit = &page.hits[0];
+        assert_eq!(hit.index_item_id, item.id);
+        assert!(hit.text.contains("latecontextneedle"));
+        assert!(hit.text.contains("контекст"));
+        assert!(hit.text.chars().count() <= 120);
+        assert_eq!(
+            hit.metadata.get("pioneer.thread_episodic.source_text_hash"),
+            Some(&item.source_text_hash)
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_directory_count_tracks_publication_retry_rollback_recreation_and_exclusion() {
+        use sea_orm::TransactionTrait;
+        let (store, workspace) = setup_thread_episodic_store().await;
+        let (item, job, resolved) = sql_search_pending(
+            &store,
+            &workspace,
+            "directory_delta",
+            "directory count source",
+        )
+        .await;
+        assert_eq!(
+            sql_search_publish(&store, &item, &job, &resolved, None)
+                .await
+                .unwrap(),
+            ThreadEpisodicIndexAttemptOutcome::Applied
+        );
+        let directory = store
+            .find_thread_episodic_thread_directory_entry(&workspace, &item.thread_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(directory.indexed_item_count, 1);
+        assert_eq!(
+            sql_search_publish(&store, &item, &job, &resolved, None)
+                .await
+                .unwrap(),
+            ThreadEpisodicIndexAttemptOutcome::StaleAttempt
+        );
+        assert_eq!(
+            store
+                .find_thread_episodic_thread_directory_entry(&workspace, &item.thread_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .indexed_item_count,
+            1
+        );
+        let tx = store.database_connection().begin().await.unwrap();
+        tx.execute_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "UPDATE thread_episodic_items SET search_text=NULL,status='pending_index' WHERE id=?",
+            [item.id.clone().into()],
+        ))
+        .await
+        .unwrap();
+        let inside =
+            pioneer_entity::thread_episodic_thread_directory::Entity::find_by_id(&directory.id)
+                .one(&tx)
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(inside.indexed_item_count, 0);
+        tx.rollback().await.unwrap();
+        assert_eq!(
+            store
+                .find_thread_episodic_thread_directory_entry(&workspace, &item.thread_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .indexed_item_count,
+            1
+        );
+        store
+            .delete_thread_episodic_thread_directory_entries_for_workspace(&workspace)
+            .await
+            .unwrap();
+        let restored = store
+            .upsert_thread_episodic_thread_directory_entry(
+                pioneer_crud::NewThreadEpisodicThreadDirectoryRecord {
+                    id: None,
+                    workspace_id: workspace.clone(),
+                    thread_id: item.thread_id.clone(),
+                    title: directory.title,
+                    summary_hash: directory.summary_hash,
+                    summary_ref: directory.summary_ref,
+                    thread_created_at: directory.thread_created_at,
+                    thread_updated_at: directory.thread_updated_at,
+                    last_indexed_at: directory.last_indexed_at,
+                    indexed_item_count: 999,
+                    task_affinity_json: directory.task_affinity_json,
+                    project_affinity_json: directory.project_affinity_json,
+                    visibility: directory.visibility,
+                    status: directory.status,
+                },
+                1_800_000_002,
+            )
+            .await
+            .unwrap();
+        assert_eq!(restored.indexed_item_count, 1);
+        store
+            .exclude_thread_episodic_item(
+                NewThreadEpisodicExclusionRecord {
+                    id: None,
+                    workspace_id: workspace.clone(),
+                    thread_id: item.thread_id.clone(),
+                    index_item_id: item.id,
+                    reason: ThreadEpisodicExclusionReason::UserRequested,
+                    created_by: "test".into(),
+                },
+                1_800_000_003,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .find_thread_episodic_thread_directory_entry(&workspace, &item.thread_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .indexed_item_count,
+            0
         );
     }
 }

@@ -1,10 +1,9 @@
 use anyhow::{Result, bail};
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::mem::size_of;
 
-pub const THREAD_EPISODIC_WORKSPACE_CAPSULE_THREAD_ID: &str = "__workspace__";
-pub const THREAD_EPISODIC_WORKSPACE_SEGMENT_CAPACITY_BYTES: i64 = 50 * 1024 * 1024;
 pub const THREAD_EPISODIC_SOURCE_VERSION_SUPERSEDED_ERROR: &str =
     "thread episodic source version superseded during reconciliation";
 pub const THREAD_EPISODIC_USER_DELETED_ERROR: &str = "thread episodic source deleted by user";
@@ -41,7 +40,7 @@ impl ThreadEpisodicIndexClaimBatch {
 /// replacement batch, so a restart never grants that source another budget.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ThreadEpisodicProjectionResetProgress {
-    pub files_cleaned: bool,
+    pub reset_started: bool,
     pub after_source: Option<[String; 4]>,
 }
 
@@ -50,30 +49,6 @@ pub fn thread_episodic_projection_reset_key(workspace_id: &str) -> Result<String
         "thread_episodic_projection_reset:{}",
         thread_episodic_key_hash("workspace", workspace_id)?
     ))
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ThreadEpisodicCapsuleWriteState {
-    ActiveWrite,
-    ReadOnly,
-    Full,
-    Compacting,
-    Deleted,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ThreadEpisodicCapsuleStatus {
-    Active,
-    Missing,
-    RepairNeeded,
-    Deleted,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ThreadEpisodicRepairStatus {
-    Ok,
-    RepairNeeded,
-    Failed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,15 +96,6 @@ pub enum ThreadEpisodicIndexJobStatus {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ThreadEpisodicGraphEnrichmentState {
-    NotSupported,
-    Disabled,
-    Pending,
-    Completed,
-    Failed,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThreadEpisodicExclusionReason {
     UserRequested,
     Deletion,
@@ -150,51 +116,6 @@ pub enum ThreadEpisodicThreadDirectoryStatus {
     Deleted,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct ThreadEpisodicCapsuleRecord {
-    pub id: String,
-    pub workspace_id: String,
-    pub workspace_key_hash: String,
-    pub thread_id: String,
-    pub thread_key_hash: String,
-    pub segment_index: i64,
-    pub write_state: ThreadEpisodicCapsuleWriteState,
-    pub capsule_ref: String,
-    pub storage_uri: String,
-    pub backend: String,
-    pub format: String,
-    pub encrypted: bool,
-    pub status: ThreadEpisodicCapsuleStatus,
-    pub repair_status: ThreadEpisodicRepairStatus,
-    pub active_frame_count: i64,
-    pub capacity_bytes: Option<i64>,
-    pub size_bytes: Option<i64>,
-    pub utilization_percent: Option<f64>,
-    pub last_capacity_check_at: Option<DateTimeWithTimeZone>,
-    pub near_capacity_at: Option<DateTimeWithTimeZone>,
-    pub capacity_exceeded_at: Option<DateTimeWithTimeZone>,
-    pub last_vacuumed_at: Option<DateTimeWithTimeZone>,
-    pub last_compacted_at: Option<DateTimeWithTimeZone>,
-    pub content_hash: Option<String>,
-    pub metadata_json: Option<String>,
-    pub last_error: Option<String>,
-    pub created_at: DateTimeWithTimeZone,
-    pub updated_at: DateTimeWithTimeZone,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ThreadEpisodicActiveWriteSegmentRequest {
-    pub workspace_id: String,
-    pub thread_id: String,
-    pub storage_uri_root: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ThreadEpisodicWorkspaceActiveWriteSegmentRequest {
-    pub workspace_id: String,
-    pub storage_uri_root: String,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ThreadEpisodicRefillSourceCounts {
     pub source_thread_count: i64,
@@ -206,42 +127,6 @@ pub struct ThreadEpisodicRefillSourceCounts {
 pub struct ThreadEpisodicRefillThread {
     pub workspace_id: String,
     pub thread_id: String,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct NewThreadEpisodicCapsuleRecord {
-    pub id: String,
-    pub workspace_id: String,
-    pub workspace_key_hash: String,
-    pub thread_id: String,
-    pub thread_key_hash: String,
-    pub segment_index: i64,
-    pub write_state: ThreadEpisodicCapsuleWriteState,
-    pub capsule_ref: String,
-    pub storage_uri: String,
-    pub backend: String,
-    pub format: String,
-    pub encrypted: bool,
-    pub status: ThreadEpisodicCapsuleStatus,
-    pub repair_status: ThreadEpisodicRepairStatus,
-    pub active_frame_count: i64,
-    pub capacity_bytes: Option<i64>,
-    pub size_bytes: Option<i64>,
-    pub utilization_percent: Option<f64>,
-    pub content_hash: Option<String>,
-    pub metadata_json: Option<String>,
-    pub last_error: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct ThreadEpisodicCapsuleCapacityUpdate {
-    pub capacity_bytes: Option<i64>,
-    pub size_bytes: Option<i64>,
-    pub utilization_percent: Option<f64>,
-    pub active_frame_count: Option<i64>,
-    pub near_capacity_at: Option<DateTimeWithTimeZone>,
-    pub capacity_exceeded_at: Option<DateTimeWithTimeZone>,
-    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -262,11 +147,6 @@ pub struct ThreadEpisodicItemRecord {
     pub embedding_artifact_id: Option<String>,
     pub language_hint: Option<String>,
     pub token_estimate: i64,
-    pub capsule_id: Option<String>,
-    pub capsule_ref: Option<String>,
-    pub segment_index: Option<i64>,
-    pub frame_id: Option<i64>,
-    pub frame_uri: Option<String>,
     pub indexed_at: Option<DateTimeWithTimeZone>,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
@@ -290,11 +170,6 @@ pub struct NewThreadEpisodicItemRecord {
     pub projection_group_id: String,
     pub language_hint: Option<String>,
     pub token_estimate: i64,
-    pub capsule_id: Option<String>,
-    pub capsule_ref: Option<String>,
-    pub segment_index: Option<i64>,
-    pub frame_id: Option<i64>,
-    pub frame_uri: Option<String>,
     pub indexed_at: Option<DateTimeWithTimeZone>,
     pub deleted_at: Option<DateTimeWithTimeZone>,
 }
@@ -319,6 +194,7 @@ pub enum ThreadEpisodicSourceReconcileOutcome {
 pub enum ThreadEpisodicIndexAttemptOutcome {
     Applied,
     StaleAttempt,
+    ProjectionChanged,
     SourceChanged,
     Excluded,
 }
@@ -329,14 +205,8 @@ pub struct ThreadEpisodicIndexJobRecord {
     pub workspace_id: String,
     pub thread_id: String,
     pub index_item_id: String,
-    pub capsule_id: Option<String>,
-    pub capsule_ref: Option<String>,
-    pub segment_index: Option<i64>,
-    pub frame_uri: Option<String>,
     pub status: ThreadEpisodicIndexJobStatus,
-    pub graph_enrichment_state: ThreadEpisodicGraphEnrichmentState,
     pub attempt_count: i64,
-    pub capacity_error_count: i64,
     pub last_attempt_latency_ms: Option<i64>,
     pub next_run_at: DateTimeWithTimeZone,
     pub last_error: Option<String>,
@@ -351,22 +221,13 @@ pub struct NewThreadEpisodicIndexJobRecord {
     pub workspace_id: String,
     pub thread_id: String,
     pub index_item_id: String,
-    pub capsule_id: Option<String>,
-    pub capsule_ref: Option<String>,
-    pub segment_index: Option<i64>,
-    pub frame_uri: Option<String>,
     pub status: ThreadEpisodicIndexJobStatus,
-    pub graph_enrichment_state: ThreadEpisodicGraphEnrichmentState,
     pub next_run_at: DateTimeWithTimeZone,
     pub last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ThreadEpisodicIndexJobCompletionUpdate {
-    pub capsule_id: String,
-    pub capsule_ref: String,
-    pub segment_index: i64,
-    pub frame_uri: String,
     pub last_attempt_latency_ms: Option<i64>,
 }
 
@@ -375,17 +236,13 @@ pub struct ThreadEpisodicIndexJobFailureUpdate {
     pub retryable: bool,
     pub next_run_at_unix: Option<i64>,
     pub last_error: Option<String>,
-    pub capacity_error: bool,
     pub last_attempt_latency_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ThreadEpisodicItemIndexedUpdate {
-    pub capsule_id: String,
-    pub capsule_ref: String,
-    pub segment_index: i64,
-    pub frame_id: i64,
-    pub frame_uri: String,
+    pub projection_guard: Option<ThreadEpisodicPublicationGuard>,
+    pub search_text: String,
     pub embedding_artifact_id: Option<String>,
 }
 
@@ -523,50 +380,6 @@ pub struct ThreadEpisodicThreadDirectorySelection {
     pub limit: u64,
 }
 
-pub fn thread_episodic_capsule_ref(
-    workspace_key_hash: &str,
-    thread_key_hash: &str,
-    segment_index: i64,
-    capsule_id: &str,
-) -> Result<String> {
-    ensure_ref_part("workspace_key_hash", workspace_key_hash)?;
-    ensure_ref_part("thread_key_hash", thread_key_hash)?;
-    ensure_ref_part("capsule_id", capsule_id)?;
-    if segment_index < 0 {
-        bail!("thread episodic segment index cannot be negative");
-    }
-    Ok(format!(
-        "mv2://pioneer/thread_episodic/{}/{}/segments/{:06}/capsules/{}",
-        workspace_key_hash, thread_key_hash, segment_index, capsule_id
-    ))
-}
-
-pub fn thread_episodic_capsule_storage_uri(
-    storage_uri_root: &str,
-    workspace_key_hash: &str,
-    thread_key_hash: &str,
-    segment_index: i64,
-    capsule_id: &str,
-) -> Result<String> {
-    ensure_ref_part("workspace_key_hash", workspace_key_hash)?;
-    ensure_ref_part("thread_key_hash", thread_key_hash)?;
-    ensure_ref_part("capsule_id", capsule_id)?;
-    if storage_uri_root.trim().is_empty() {
-        bail!("thread episodic storage uri root cannot be empty");
-    }
-    if segment_index < 0 {
-        bail!("thread episodic segment index cannot be negative");
-    }
-    Ok(format!(
-        "{}/thread_episodic/workspace/{}/thread/{}/segments/{:06}/{}.mv2",
-        storage_uri_root.trim_end_matches('/'),
-        workspace_key_hash,
-        thread_key_hash,
-        segment_index,
-        capsule_id
-    ))
-}
-
 pub fn thread_episodic_key_hash(kind: &str, key: &str) -> Result<String> {
     let kind = kind.trim();
     let key = key.trim();
@@ -582,166 +395,6 @@ pub fn thread_episodic_key_hash(kind: &str, key: &str) -> Result<String> {
     hasher.update([0]);
     hasher.update(key.as_bytes());
     Ok(hex::encode(hasher.finalize()))
-}
-
-pub fn deterministic_thread_episodic_capsule_id(
-    workspace_key_hash: &str,
-    thread_key_hash: &str,
-    segment_index: i64,
-) -> Result<String> {
-    ensure_ref_part("workspace_key_hash", workspace_key_hash)?;
-    ensure_ref_part("thread_key_hash", thread_key_hash)?;
-    if segment_index < 0 {
-        bail!("thread episodic segment index cannot be negative");
-    }
-    let mut hasher = Sha256::new();
-    hasher.update(b"thread_episodic_capsule\0");
-    hasher.update(workspace_key_hash.as_bytes());
-    hasher.update([0]);
-    hasher.update(thread_key_hash.as_bytes());
-    hasher.update([0]);
-    hasher.update(segment_index.to_string().as_bytes());
-    let hash = hex::encode(hasher.finalize());
-    Ok(hash.chars().take(21).collect())
-}
-
-pub fn deterministic_thread_episodic_workspace_capsule_id(
-    workspace_key_hash: &str,
-    segment_index: i64,
-) -> Result<String> {
-    ensure_ref_part("workspace_key_hash", workspace_key_hash)?;
-    if segment_index < 0 {
-        bail!("thread episodic workspace segment index cannot be negative");
-    }
-    let mut hasher = Sha256::new();
-    hasher.update(b"thread_episodic_workspace_capsule\0");
-    hasher.update(workspace_key_hash.as_bytes());
-    hasher.update([0]);
-    hasher.update(segment_index.to_string().as_bytes());
-    let hash = hex::encode(hasher.finalize());
-    Ok(hash.chars().take(21).collect())
-}
-
-pub fn thread_episodic_workspace_capsule_ref(
-    workspace_key_hash: &str,
-    segment_index: i64,
-    capsule_id: &str,
-) -> Result<String> {
-    ensure_ref_part("workspace_key_hash", workspace_key_hash)?;
-    ensure_ref_part("capsule_id", capsule_id)?;
-    if segment_index < 0 {
-        bail!("thread episodic workspace segment index cannot be negative");
-    }
-    Ok(format!(
-        "mv2://pioneer/thread_episodic/workspace/{}/segments/{:06}/capsules/{}",
-        workspace_key_hash, segment_index, capsule_id
-    ))
-}
-
-pub fn thread_episodic_workspace_capsule_storage_uri(
-    storage_uri_root: &str,
-    workspace_key_hash: &str,
-    segment_index: i64,
-    capsule_id: &str,
-) -> Result<String> {
-    ensure_ref_part("workspace_key_hash", workspace_key_hash)?;
-    ensure_ref_part("capsule_id", capsule_id)?;
-    if storage_uri_root.trim().is_empty() {
-        bail!("thread episodic storage uri root cannot be empty");
-    }
-    if segment_index < 0 {
-        bail!("thread episodic workspace segment index cannot be negative");
-    }
-    Ok(format!(
-        "{}/thread_episodic/workspace/{}/segments/{:06}/{}.mv2",
-        storage_uri_root.trim_end_matches('/'),
-        workspace_key_hash,
-        segment_index,
-        capsule_id
-    ))
-}
-
-pub fn thread_episodic_frame_uri(capsule_ref: &str, index_item_id: &str) -> Result<String> {
-    ensure_ref_part("capsule_ref", capsule_ref)?;
-    ensure_ref_part("index_item_id", index_item_id)?;
-    Ok(format!("{capsule_ref}/index/{index_item_id}"))
-}
-
-pub fn thread_episodic_workspace_uri_prefix(workspace_id: &str) -> Result<String> {
-    Ok(format!(
-        "mv2://workspace/{}/",
-        encode_thread_episodic_uri_segment("workspace_id", workspace_id)?
-    ))
-}
-
-pub fn thread_episodic_thread_uri_prefix(workspace_id: &str, thread_id: &str) -> Result<String> {
-    Ok(format!(
-        "{}thread/{}/",
-        thread_episodic_workspace_uri_prefix(workspace_id)?,
-        encode_thread_episodic_uri_segment("thread_id", thread_id)?
-    ))
-}
-
-pub fn thread_episodic_turn_uri_prefix(
-    workspace_id: &str,
-    thread_id: &str,
-    turn_id: &str,
-) -> Result<String> {
-    Ok(format!(
-        "{}turn/{}/",
-        thread_episodic_thread_uri_prefix(workspace_id, thread_id)?,
-        encode_thread_episodic_uri_segment("turn_id", turn_id)?
-    ))
-}
-
-pub fn thread_episodic_item_uri(
-    workspace_id: &str,
-    thread_id: &str,
-    turn_id: &str,
-    item_id: &str,
-    index_item_id: &str,
-) -> Result<String> {
-    Ok(format!(
-        "{}item/{}/index/{}",
-        thread_episodic_turn_uri_prefix(workspace_id, thread_id, turn_id)?,
-        encode_thread_episodic_uri_segment("item_id", item_id)?,
-        encode_thread_episodic_uri_segment("index_item_id", index_item_id)?
-    ))
-}
-
-pub(crate) fn thread_episodic_capsule_record_from_model(
-    model: pioneer_entity::thread_episodic_capsules::Model,
-) -> Result<ThreadEpisodicCapsuleRecord> {
-    Ok(ThreadEpisodicCapsuleRecord {
-        id: model.id,
-        workspace_id: model.workspace_id,
-        workspace_key_hash: model.workspace_key_hash,
-        thread_id: model.thread_id,
-        thread_key_hash: model.thread_key_hash,
-        segment_index: model.segment_index,
-        write_state: capsule_write_state_from_db(model.write_state.as_str())?,
-        capsule_ref: model.capsule_ref,
-        storage_uri: model.storage_uri,
-        backend: model.backend,
-        format: model.format,
-        encrypted: model.encrypted,
-        status: capsule_status_from_db(model.status.as_str())?,
-        repair_status: repair_status_from_db(model.repair_status.as_str())?,
-        active_frame_count: model.active_frame_count,
-        capacity_bytes: model.capacity_bytes,
-        size_bytes: model.size_bytes,
-        utilization_percent: model.utilization_percent,
-        last_capacity_check_at: model.last_capacity_check_at,
-        near_capacity_at: model.near_capacity_at,
-        capacity_exceeded_at: model.capacity_exceeded_at,
-        last_vacuumed_at: model.last_vacuumed_at,
-        last_compacted_at: model.last_compacted_at,
-        content_hash: model.content_hash,
-        metadata_json: model.metadata_json,
-        last_error: model.last_error,
-        created_at: model.created_at,
-        updated_at: model.updated_at,
-    })
 }
 
 pub(crate) fn thread_episodic_item_record_from_model(
@@ -768,11 +421,6 @@ pub(crate) fn thread_episodic_item_record_from_model(
         embedding_artifact_id: model.embedding_artifact_id,
         language_hint: model.language_hint,
         token_estimate: model.token_estimate,
-        capsule_id: model.capsule_id,
-        capsule_ref: model.capsule_ref,
-        segment_index: model.segment_index,
-        frame_id: model.frame_id,
-        frame_uri: model.frame_uri,
         indexed_at: model.indexed_at,
         created_at: model.created_at,
         updated_at: model.updated_at,
@@ -800,7 +448,13 @@ pub(crate) fn thread_episodic_embedding_artifact_record_from_model(
         .vector_bytes
         .chunks_exact(size_of::<f32>())
         .map(|bytes| f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
-        .collect();
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        dimension > 0
+            && vector.iter().all(|value| value.is_finite())
+            && vector.iter().any(|value| *value != 0.0),
+        "invalid stored embedding artifact"
+    );
     Ok(ThreadEpisodicEmbeddingArtifactRecord {
         id: model.id,
         workspace_id: model.workspace_id,
@@ -824,16 +478,8 @@ pub(crate) fn thread_episodic_index_job_record_from_model(
         workspace_id: model.workspace_id,
         thread_id: model.thread_id,
         index_item_id: model.index_item_id,
-        capsule_id: model.capsule_id,
-        capsule_ref: model.capsule_ref,
-        segment_index: model.segment_index,
-        frame_uri: model.frame_uri,
         status: index_job_status_from_db(model.status.as_str())?,
-        graph_enrichment_state: graph_enrichment_state_from_db(
-            model.graph_enrichment_state.as_str(),
-        )?,
         attempt_count: model.attempt_count,
-        capacity_error_count: model.capacity_error_count,
         last_attempt_latency_ms: model.last_attempt_latency_ms,
         next_run_at: model.next_run_at,
         last_error: model.last_error,
@@ -899,63 +545,6 @@ pub(crate) fn thread_episodic_thread_directory_record_from_model(
         status: thread_directory_status_from_db(model.status.as_str()),
         created_at: model.created_at,
         updated_at: model.updated_at,
-    }
-}
-
-pub(crate) fn capsule_write_state_to_db(state: ThreadEpisodicCapsuleWriteState) -> &'static str {
-    match state {
-        ThreadEpisodicCapsuleWriteState::ActiveWrite => "active_write",
-        ThreadEpisodicCapsuleWriteState::ReadOnly => "read_only",
-        ThreadEpisodicCapsuleWriteState::Full => "full",
-        ThreadEpisodicCapsuleWriteState::Compacting => "compacting",
-        ThreadEpisodicCapsuleWriteState::Deleted => "deleted",
-    }
-}
-
-pub(crate) fn capsule_write_state_from_db(value: &str) -> Result<ThreadEpisodicCapsuleWriteState> {
-    match value {
-        "active_write" => Ok(ThreadEpisodicCapsuleWriteState::ActiveWrite),
-        "read_only" => Ok(ThreadEpisodicCapsuleWriteState::ReadOnly),
-        "full" => Ok(ThreadEpisodicCapsuleWriteState::Full),
-        "compacting" => Ok(ThreadEpisodicCapsuleWriteState::Compacting),
-        "deleted" => Ok(ThreadEpisodicCapsuleWriteState::Deleted),
-        other => bail!("unknown thread episodic capsule write state `{other}`"),
-    }
-}
-
-pub(crate) fn capsule_status_to_db(status: ThreadEpisodicCapsuleStatus) -> &'static str {
-    match status {
-        ThreadEpisodicCapsuleStatus::Active => "active",
-        ThreadEpisodicCapsuleStatus::Missing => "missing",
-        ThreadEpisodicCapsuleStatus::RepairNeeded => "repair_needed",
-        ThreadEpisodicCapsuleStatus::Deleted => "deleted",
-    }
-}
-
-pub(crate) fn capsule_status_from_db(value: &str) -> Result<ThreadEpisodicCapsuleStatus> {
-    match value {
-        "active" => Ok(ThreadEpisodicCapsuleStatus::Active),
-        "missing" => Ok(ThreadEpisodicCapsuleStatus::Missing),
-        "repair_needed" => Ok(ThreadEpisodicCapsuleStatus::RepairNeeded),
-        "deleted" => Ok(ThreadEpisodicCapsuleStatus::Deleted),
-        other => bail!("unknown thread episodic capsule status `{other}`"),
-    }
-}
-
-pub(crate) fn repair_status_to_db(status: ThreadEpisodicRepairStatus) -> &'static str {
-    match status {
-        ThreadEpisodicRepairStatus::Ok => "ok",
-        ThreadEpisodicRepairStatus::RepairNeeded => "repair_needed",
-        ThreadEpisodicRepairStatus::Failed => "failed",
-    }
-}
-
-pub(crate) fn repair_status_from_db(value: &str) -> Result<ThreadEpisodicRepairStatus> {
-    match value {
-        "ok" => Ok(ThreadEpisodicRepairStatus::Ok),
-        "repair_needed" => Ok(ThreadEpisodicRepairStatus::RepairNeeded),
-        "failed" => Ok(ThreadEpisodicRepairStatus::Failed),
-        other => bail!("unknown thread episodic repair status `{other}`"),
     }
 }
 
@@ -1060,32 +649,6 @@ pub(crate) fn index_job_status_from_db(value: &str) -> Result<ThreadEpisodicInde
 }
 
 #[allow(dead_code)]
-pub(crate) fn graph_enrichment_state_to_db(
-    state: ThreadEpisodicGraphEnrichmentState,
-) -> &'static str {
-    match state {
-        ThreadEpisodicGraphEnrichmentState::NotSupported => "not_supported",
-        ThreadEpisodicGraphEnrichmentState::Disabled => "disabled",
-        ThreadEpisodicGraphEnrichmentState::Pending => "pending",
-        ThreadEpisodicGraphEnrichmentState::Completed => "completed",
-        ThreadEpisodicGraphEnrichmentState::Failed => "failed",
-    }
-}
-
-pub(crate) fn graph_enrichment_state_from_db(
-    value: &str,
-) -> Result<ThreadEpisodicGraphEnrichmentState> {
-    match value {
-        "not_supported" => Ok(ThreadEpisodicGraphEnrichmentState::NotSupported),
-        "disabled" => Ok(ThreadEpisodicGraphEnrichmentState::Disabled),
-        "pending" => Ok(ThreadEpisodicGraphEnrichmentState::Pending),
-        "completed" => Ok(ThreadEpisodicGraphEnrichmentState::Completed),
-        "failed" => Ok(ThreadEpisodicGraphEnrichmentState::Failed),
-        other => bail!("unknown thread episodic graph enrichment state `{other}`"),
-    }
-}
-
-#[allow(dead_code)]
 pub(crate) fn exclusion_reason_to_db(reason: ThreadEpisodicExclusionReason) -> &'static str {
     match reason {
         ThreadEpisodicExclusionReason::UserRequested => "user_requested",
@@ -1141,35 +704,6 @@ pub(crate) fn thread_directory_status_from_db(value: &str) -> ThreadEpisodicThre
     }
 }
 
-fn ensure_ref_part(field: &str, value: &str) -> Result<()> {
-    if value.trim().is_empty() {
-        bail!("thread episodic {field} cannot be empty");
-    }
-    if value.chars().any(char::is_whitespace) {
-        bail!("thread episodic {field} cannot contain whitespace");
-    }
-    Ok(())
-}
-
-fn encode_thread_episodic_uri_segment(field: &str, value: &str) -> Result<String> {
-    if value.trim().is_empty() {
-        bail!("thread episodic {field} cannot be empty");
-    }
-    let mut encoded = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                encoded.push(byte as char);
-            }
-            _ => {
-                encoded.push('%');
-                encoded.push_str(format!("{byte:02X}").as_str());
-            }
-        }
-    }
-    Ok(encoded)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1183,6 +717,7 @@ mod tests {
     #[test]
     fn item_model_conversion_preserves_typed_boundaries_without_text_payload() {
         let model = thread_episodic_items::Model {
+            search_text: Some("derived text".to_owned()),
             id: "item_1".to_owned(),
             workspace_id: "workspace_1".to_owned(),
             thread_id: "thread_1".to_owned(),
@@ -1202,14 +737,6 @@ mod tests {
             embedding_artifact_id: Some("embedding_artifact".to_owned()),
             language_hint: Some("ru".to_owned()),
             token_estimate: 8,
-            capsule_id: Some("capsule_1".to_owned()),
-            capsule_ref: Some(
-                "mv2://pioneer/thread_episodic/ws/thread/segments/000000/capsules/capsule_1"
-                    .to_owned(),
-            ),
-            segment_index: Some(0),
-            frame_id: Some(42),
-            frame_uri: Some("mv2://frame".to_owned()),
             indexed_at: Some(timestamp()),
             created_at: timestamp(),
             updated_at: timestamp(),
@@ -1230,111 +757,85 @@ mod tests {
             Some("embedding_artifact")
         );
     }
+}
 
-    #[test]
-    fn capsule_and_frame_refs_are_logical_mv2_refs() {
-        let capsule_ref =
-            thread_episodic_capsule_ref("workspace_hash", "thread_hash", 3, "capsule_id")
-                .expect("capsule ref");
-        assert_eq!(
-            capsule_ref,
-            "mv2://pioneer/thread_episodic/workspace_hash/thread_hash/segments/000003/capsules/capsule_id"
-        );
+/// Conditions supplied by the product's authorization boundary. A missing
+/// principal restricts no ACL only when the caller has an absolute read grant.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ThreadEpisodicSearchAccess {
+    pub principal_id: Option<String>,
+    pub root_thread_id: Option<String>,
+    pub include_internal: bool,
+    pub current_thread_id: Option<String>,
+}
 
-        let frame_uri =
-            thread_episodic_frame_uri(capsule_ref.as_str(), "index_item_id").expect("frame uri");
-        assert_eq!(
-            frame_uri,
-            "mv2://pioneer/thread_episodic/workspace_hash/thread_hash/segments/000003/capsules/capsule_id/index/index_item_id"
-        );
+/// Equal-weight reciprocal-rank policy, independent of the storage engine.
+/// Its top score is 1 when both branches rank a result first. A single first
+/// rank scores 0.5; this scale is suitable for the existing 0..1 thresholds.
+pub const THREAD_SEARCH_RRF_K: f64 = 60.0;
+pub fn thread_search_rank_score(lexical_rank: Option<i64>, semantic_rank: Option<i64>) -> f32 {
+    let contribution = |rank: Option<i64>| {
+        rank.filter(|rank| *rank > 0).map_or(0.0, |rank| {
+            (THREAD_SEARCH_RRF_K + 1.0) / (THREAD_SEARCH_RRF_K + rank as f64)
+        })
+    };
+    ((contribution(lexical_rank) + contribution(semantic_rank)) / 2.0) as f32
+}
+
+#[derive(Debug, Clone)]
+pub struct ThreadEpisodicSearchQuery {
+    pub workspace_id: String,
+    pub thread_id: Option<String>,
+    pub access: ThreadEpisodicSearchAccess,
+    pub query: String,
+    pub lexical: bool,
+    pub embedding: Option<ThreadEpisodicSearchEmbedding>,
+    pub created_after_unix: Option<i64>,
+    pub offset: u64,
+    pub limit: u32,
+    pub snippet_chars: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct ThreadEpisodicSearchEmbedding {
+    pub provider_id: String,
+    pub model: String,
+    pub dimension: usize,
+    pub normalized: bool,
+    pub vector: Vec<f32>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ThreadEpisodicSearchRow {
+    pub item: ThreadEpisodicItemRecord,
+    pub text: String,
+    pub lexical_rank: Option<i64>,
+    pub semantic_rank: Option<i64>,
+}
+
+/// Snapshot of the existing projection owner marker, prepared before acquiring
+/// database capacity and revalidated with source/attempt in the publish commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThreadEpisodicPublicationGuard {
+    pub projection_key: String,
+    pub reset_checkpoint_key: String,
+    pub projection_version: i64,
+    pub config_hash: String,
+    pub config_json: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ThreadEpisodicSearchResult {
+    pub rows: Vec<ThreadEpisodicSearchRow>,
+    pub coverage_incomplete: bool,
+}
+
+pub fn thread_episodic_refill_projection_key(workspace_id: &str) -> Result<String> {
+    if workspace_id == "__default__" {
+        return Ok("thread_episodic_workspace_capsule_refill".to_owned());
     }
-
-    #[test]
-    fn workspace_episodic_uri_helpers_build_prefix_chain() {
-        let workspace_prefix =
-            thread_episodic_workspace_uri_prefix("workspace_1").expect("workspace prefix");
-        assert_eq!(workspace_prefix, "mv2://workspace/workspace_1/");
-
-        let thread_prefix =
-            thread_episodic_thread_uri_prefix("workspace_1", "thread_1").expect("thread prefix");
-        assert_eq!(
-            thread_prefix,
-            "mv2://workspace/workspace_1/thread/thread_1/"
-        );
-        assert!(thread_prefix.starts_with(workspace_prefix.as_str()));
-
-        let turn_prefix = thread_episodic_turn_uri_prefix("workspace_1", "thread_1", "turn_1")
-            .expect("turn prefix");
-        assert_eq!(
-            turn_prefix,
-            "mv2://workspace/workspace_1/thread/thread_1/turn/turn_1/"
-        );
-        assert!(turn_prefix.starts_with(thread_prefix.as_str()));
-
-        let item_uri =
-            thread_episodic_item_uri("workspace_1", "thread_1", "turn_1", "item_1", "index_1")
-                .expect("item uri");
-        assert_eq!(
-            item_uri,
-            "mv2://workspace/workspace_1/thread/thread_1/turn/turn_1/item/item_1/index/index_1"
-        );
-        assert!(item_uri.starts_with(turn_prefix.as_str()));
-    }
-
-    #[test]
-    fn workspace_episodic_uri_helpers_escape_unsafe_segments() {
-        let item_uri = thread_episodic_item_uri(
-            "workspace 1/日本",
-            "thread/1",
-            "turn?x=1",
-            "item #1",
-            "index/1",
-        )
-        .expect("item uri");
-
-        assert_eq!(
-            item_uri,
-            "mv2://workspace/workspace%201%2F%E6%97%A5%E6%9C%AC/thread/thread%2F1/turn/turn%3Fx%3D1/item/item%20%231/index/index%2F1"
-        );
-        assert!(thread_episodic_workspace_uri_prefix("  ").is_err());
-    }
-
-    #[test]
-    fn workspace_capsule_helpers_are_workspace_scoped_and_deterministic() {
-        let first = deterministic_thread_episodic_workspace_capsule_id("workspace_hash", 1)
-            .expect("workspace capsule id");
-        let second = deterministic_thread_episodic_workspace_capsule_id("workspace_hash", 1)
-            .expect("workspace capsule id");
-        let next = deterministic_thread_episodic_workspace_capsule_id("workspace_hash", 2)
-            .expect("workspace capsule id");
-        assert_eq!(first, second);
-        assert_ne!(first, next);
-        assert_eq!(first.len(), 21);
-
-        let capsule_ref =
-            thread_episodic_workspace_capsule_ref("workspace_hash", 1, first.as_str())
-                .expect("workspace capsule ref");
-        assert_eq!(
-            capsule_ref,
-            format!(
-                "mv2://pioneer/thread_episodic/workspace/workspace_hash/segments/000001/capsules/{first}"
-            )
-        );
-
-        let storage_uri = thread_episodic_workspace_capsule_storage_uri(
-            "file:///memory/root/",
-            "workspace_hash",
-            1,
-            first.as_str(),
-        )
-        .expect("workspace storage uri");
-        assert_eq!(
-            storage_uri,
-            format!(
-                "file:///memory/root/thread_episodic/workspace/workspace_hash/segments/000001/{first}.mv2"
-            )
-        );
-        assert!(!storage_uri.contains("thread_1"));
-        assert!(!capsule_ref.contains("thread_1"));
-    }
+    Ok(format!(
+        "thread_episodic_workspace_capsule_refill:{}",
+        thread_episodic_key_hash("workspace", workspace_id)?
+    ))
 }

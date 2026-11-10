@@ -303,7 +303,6 @@ pub struct GatewayThreadEpisodicSettings {
     pub max_hit_chars: u32,
     pub default_max_candidates: u32,
     pub max_candidate_work: u32,
-    pub max_segments: u32,
     pub min_relevancy: f32,
     pub min_results: u32,
     pub snippet_chars: u32,
@@ -311,7 +310,6 @@ pub struct GatewayThreadEpisodicSettings {
     pub retry_base_delay_secs: i64,
     pub retry_max_delay_secs: i64,
     pub max_attempts: i64,
-    pub near_capacity_percent: f64,
     pub vector_search: GatewayThreadEpisodicVectorSearchConfig,
 }
 
@@ -341,8 +339,6 @@ struct GatewayThreadEpisodicSettingsOverride {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     max_candidate_work: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    max_segments: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     min_relevancy: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     min_results: Option<u32>,
@@ -356,8 +352,6 @@ struct GatewayThreadEpisodicSettingsOverride {
     retry_max_delay_secs: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     max_attempts: Option<i64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    near_capacity_percent: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     vector_search: Option<GatewayThreadEpisodicVectorSearchConfig>,
 }
@@ -1267,7 +1261,6 @@ impl GatewayThreadEpisodicSettings {
             max_hit_chars: config.max_hit_chars.min(u32::MAX as usize) as u32,
             default_max_candidates: config.default_max_candidates,
             max_candidate_work: config.max_candidate_work,
-            max_segments: config.max_segments.min(u32::MAX as u64) as u32,
             min_relevancy: config.min_relevancy,
             min_results: config.min_results,
             snippet_chars: config.snippet_chars,
@@ -1275,7 +1268,6 @@ impl GatewayThreadEpisodicSettings {
             retry_base_delay_secs: config.retry_base_delay_secs,
             retry_max_delay_secs: config.retry_max_delay_secs,
             max_attempts: config.max_attempts,
-            near_capacity_percent: config.near_capacity_percent,
             vector_search: config.vector_search.clone(),
         }
     }
@@ -1290,7 +1282,6 @@ impl GatewayThreadEpisodicSettings {
             max_hit_chars: settings.max_hit_chars,
             default_max_candidates: settings.default_max_candidates,
             max_candidate_work: settings.max_candidate_work,
-            max_segments: settings.max_segments,
             min_relevancy: settings.min_relevancy,
             min_results: settings.min_results,
             snippet_chars: settings.snippet_chars,
@@ -1298,7 +1289,6 @@ impl GatewayThreadEpisodicSettings {
             retry_base_delay_secs: settings.retry_base_delay_secs,
             retry_max_delay_secs: settings.retry_max_delay_secs,
             max_attempts: settings.max_attempts,
-            near_capacity_percent: settings.near_capacity_percent,
             vector_search: vector_search_config_from_protocol(settings.vector_search),
         }
     }
@@ -1313,7 +1303,6 @@ impl GatewayThreadEpisodicSettings {
             max_hit_chars: self.max_hit_chars,
             default_max_candidates: self.default_max_candidates,
             max_candidate_work: self.max_candidate_work,
-            max_segments: self.max_segments,
             min_relevancy: self.min_relevancy,
             min_results: self.min_results,
             snippet_chars: self.snippet_chars,
@@ -1321,7 +1310,6 @@ impl GatewayThreadEpisodicSettings {
             retry_base_delay_secs: self.retry_base_delay_secs,
             retry_max_delay_secs: self.retry_max_delay_secs,
             max_attempts: self.max_attempts,
-            near_capacity_percent: self.near_capacity_percent,
             vector_search: vector_search_config_to_protocol(&self.vector_search),
         }
     }
@@ -1620,7 +1608,6 @@ fn thread_episodic_settings_update_has_global_fields(
         || update.max_hit_chars.is_some()
         || update.default_max_candidates.is_some()
         || update.max_candidate_work.is_some()
-        || update.max_segments.is_some()
         || update.min_relevancy.is_some()
         || update.min_results.is_some()
         || update.snippet_chars.is_some()
@@ -1628,7 +1615,6 @@ fn thread_episodic_settings_update_has_global_fields(
         || update.retry_base_delay_secs.is_some()
         || update.retry_max_delay_secs.is_some()
         || update.max_attempts.is_some()
-        || update.near_capacity_percent.is_some()
 }
 
 fn vector_provider_to_protocol(
@@ -1894,7 +1880,6 @@ impl GatewayThreadEpisodicSettingsOverride {
             max_hit_chars: Some(settings.max_hit_chars),
             default_max_candidates: Some(settings.default_max_candidates),
             max_candidate_work: Some(settings.max_candidate_work),
-            max_segments: Some(settings.max_segments),
             min_relevancy: Some(settings.min_relevancy),
             min_results: Some(settings.min_results),
             snippet_chars: Some(settings.snippet_chars),
@@ -1902,7 +1887,6 @@ impl GatewayThreadEpisodicSettingsOverride {
             retry_base_delay_secs: Some(settings.retry_base_delay_secs),
             retry_max_delay_secs: Some(settings.retry_max_delay_secs),
             max_attempts: Some(settings.max_attempts),
-            near_capacity_percent: Some(settings.near_capacity_percent),
             vector_search: Some(settings.vector_search),
         }
     }
@@ -1935,9 +1919,6 @@ impl GatewayThreadEpisodicSettingsOverride {
         if let Some(max_candidate_work) = self.max_candidate_work {
             settings.max_candidate_work = max_candidate_work;
         }
-        if let Some(max_segments) = self.max_segments {
-            settings.max_segments = max_segments;
-        }
         if let Some(min_relevancy) = self.min_relevancy {
             settings.min_relevancy = min_relevancy;
         }
@@ -1958,9 +1939,6 @@ impl GatewayThreadEpisodicSettingsOverride {
         }
         if let Some(max_attempts) = self.max_attempts {
             settings.max_attempts = max_attempts;
-        }
-        if let Some(near_capacity_percent) = self.near_capacity_percent {
-            settings.near_capacity_percent = near_capacity_percent;
         }
         if let Some(vector_search) = &self.vector_search {
             settings.vector_search = vector_search.clone();
@@ -1996,9 +1974,6 @@ impl GatewayThreadEpisodicSettingsOverride {
         if let Some(max_candidate_work) = update.max_candidate_work {
             self.max_candidate_work = Some(max_candidate_work);
         }
-        if let Some(max_segments) = update.max_segments {
-            self.max_segments = Some(max_segments);
-        }
         if let Some(min_relevancy) = update.min_relevancy {
             self.min_relevancy = Some(min_relevancy);
         }
@@ -2019,9 +1994,6 @@ impl GatewayThreadEpisodicSettingsOverride {
         }
         if let Some(max_attempts) = update.max_attempts {
             self.max_attempts = Some(max_attempts);
-        }
-        if let Some(near_capacity_percent) = update.near_capacity_percent {
-            self.near_capacity_percent = Some(near_capacity_percent);
         }
         if let Some(vector_update) = update.vector_search {
             let mut vector_search = self.vector_search.clone().unwrap_or_default();
@@ -2045,7 +2017,6 @@ impl GatewayThreadEpisodicSettingsOverride {
         config.max_hit_chars = settings.max_hit_chars as usize;
         config.default_max_candidates = settings.default_max_candidates;
         config.max_candidate_work = settings.max_candidate_work;
-        config.max_segments = settings.max_segments as u64;
         config.min_relevancy = settings.min_relevancy;
         config.min_results = settings.min_results;
         config.snippet_chars = settings.snippet_chars;
@@ -2053,7 +2024,6 @@ impl GatewayThreadEpisodicSettingsOverride {
         config.retry_base_delay_secs = settings.retry_base_delay_secs;
         config.retry_max_delay_secs = settings.retry_max_delay_secs;
         config.max_attempts = settings.max_attempts;
-        config.near_capacity_percent = settings.near_capacity_percent;
         config.vector_search = settings.vector_search;
         config
     }
@@ -3089,7 +3059,6 @@ proactive_writes_model = { source = "custom", model_provider = "extractor-provid
         .expect("gateway settings should parse");
 
         let base = GatewayMemoryConfig {
-            capsules_dir: "memory/custom".to_owned(),
             allow_global_user_by_default: false,
             allow_global_agent_by_default: true,
             tools_enabled: false,
@@ -3101,7 +3070,6 @@ proactive_writes_model = { source = "custom", model_provider = "extractor-provid
 
         let mapped = settings.apply_to_gateway_memory_config(base);
 
-        assert_eq!(mapped.capsules_dir, "memory/custom");
         assert!(!mapped.allow_global_user_by_default);
         assert!(mapped.allow_global_agent_by_default);
         assert!(!mapped.enabled);
@@ -3606,7 +3574,6 @@ max_prompt_chars = 4800
 max_hit_chars = 600
 default_max_candidates = 12
 max_candidate_work = 24
-max_segments = 4
 min_relevancy = 0.45
 min_results = 2
 snippet_chars = 240
@@ -3614,7 +3581,6 @@ index_batch_limit = 4
 retry_base_delay_secs = 12
 retry_max_delay_secs = 120
 max_attempts = 3
-near_capacity_percent = 75.0
 
 [thread_episodic.vector_search]
 enabled = true
@@ -3637,7 +3603,6 @@ use_search_instructions = true
             max_hit_chars: 1_200,
             default_max_candidates: 32,
             max_candidate_work: 128,
-            max_segments: 16,
             min_relevancy: 0.25,
             min_results: 1,
             snippet_chars: 360,
@@ -3645,7 +3610,6 @@ use_search_instructions = true
             retry_base_delay_secs: 30,
             retry_max_delay_secs: 900,
             max_attempts: 5,
-            near_capacity_percent: 85.0,
             vector_search: pioneer_config::GatewayThreadEpisodicVectorSearchConfig::default(),
         };
 
@@ -3659,7 +3623,6 @@ use_search_instructions = true
         assert_eq!(mapped.max_hit_chars, 600);
         assert_eq!(mapped.default_max_candidates, 12);
         assert_eq!(mapped.max_candidate_work, 24);
-        assert_eq!(mapped.max_segments, 4);
         assert_eq!(mapped.min_relevancy, 0.45);
         assert_eq!(mapped.min_results, 2);
         assert_eq!(mapped.snippet_chars, 240);
@@ -3667,7 +3630,6 @@ use_search_instructions = true
         assert_eq!(mapped.retry_base_delay_secs, 12);
         assert_eq!(mapped.retry_max_delay_secs, 120);
         assert_eq!(mapped.max_attempts, 3);
-        assert_eq!(mapped.near_capacity_percent, 75.0);
         assert!(mapped.vector_search.enabled);
         assert_eq!(
             mapped.vector_search.provider,
@@ -3985,7 +3947,9 @@ embedding_normalized = true
                             },
                         ),
                         ..Default::default()
-                    }),
+
+
+}),
                     ..Default::default()
                 },
                 Some("workspace_a"),
@@ -4062,7 +4026,6 @@ use_search_instructions = false
             max_hit_chars: 600,
             default_max_candidates: 12,
             max_candidate_work: 24,
-            max_segments: 4,
             min_relevancy: 0.45,
             min_results: 2,
             snippet_chars: 240,
@@ -4070,7 +4033,6 @@ use_search_instructions = false
             retry_base_delay_secs: 12,
             retry_max_delay_secs: 120,
             max_attempts: 3,
-            near_capacity_percent: 75.0,
             vector_search: pioneer_config::GatewayThreadEpisodicVectorSearchConfig::default(),
         });
         save_gateway_settings(&path, &settings).expect("settings should save");

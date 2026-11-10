@@ -34,7 +34,6 @@ pub async fn enqueue_repair_job<C: ConnectionTrait>(
             .map(str::to_owned)),
         scope_key_hash: Set(job.scope_key_hash),
         memory_id: Set(job.memory_id),
-        capsule_id: Set(job.capsule_id),
         priority: Set(job.priority),
         attempts: Set(0),
         max_attempts: Set(i64::from(job.max_attempts)),
@@ -74,10 +73,6 @@ async fn find_open_repair_job<C: ConnectionTrait>(
     query = match job.memory_id.as_deref() {
         Some(memory_id) => query.filter(agent_memory_repair_job::Column::MemoryId.eq(memory_id)),
         None => query.filter(agent_memory_repair_job::Column::MemoryId.is_null()),
-    };
-    query = match job.capsule_id.as_deref() {
-        Some(capsule_id) => query.filter(agent_memory_repair_job::Column::CapsuleId.eq(capsule_id)),
-        None => query.filter(agent_memory_repair_job::Column::CapsuleId.is_null()),
     };
 
     query
@@ -308,4 +303,56 @@ pub async fn list_repair_jobs_for_memory<C: ConnectionTrait>(
         .all(db)
         .await
         .with_context(|| format!("failed to list memory repair jobs for `{memory_id}`"))
+}
+
+pub async fn legacy_storage_job_ids<C: ConnectionTrait>(db: &C) -> Result<Vec<String>> {
+    Ok(agent_memory_repair_job::Entity::find()
+        .select_only()
+        .column(agent_memory_repair_job::Column::Id)
+        .filter(agent_memory_repair_job::Column::JobKind.starts_with("memvid_"))
+        .filter(agent_memory_repair_job::Column::Status.is_in(["pending", "running", "failed"]))
+        .order_by_asc(agent_memory_repair_job::Column::Id)
+        .limit(64)
+        .into_tuple::<String>()
+        .all(db)
+        .await?)
+}
+
+pub async fn retire_legacy_storage_job<C: ConnectionTrait>(
+    db: &C,
+    id: &str,
+    now: DateTimeWithTimeZone,
+) -> Result<()> {
+    use sea_orm::sea_query::Expr;
+    agent_memory_repair_job::Entity::update_many()
+        .col_expr(
+            agent_memory_repair_job::Column::Status,
+            Expr::value("completed"),
+        )
+        .col_expr(
+            agent_memory_repair_job::Column::LockedBy,
+            Expr::value(None::<String>),
+        )
+        .col_expr(
+            agent_memory_repair_job::Column::LockExpiresAt,
+            Expr::value(None::<DateTimeWithTimeZone>),
+        )
+        .col_expr(
+            agent_memory_repair_job::Column::CompletedAt,
+            Expr::value(Some(now)),
+        )
+        .col_expr(agent_memory_repair_job::Column::UpdatedAt, Expr::value(now))
+        .col_expr(
+            agent_memory_repair_job::Column::LastError,
+            Expr::value(None::<String>),
+        )
+        .col_expr(
+            agent_memory_repair_job::Column::ResultJson,
+            Expr::value("{\"retired_by_storage_reset\":true}"),
+        )
+        .filter(agent_memory_repair_job::Column::Id.eq(id))
+        .filter(agent_memory_repair_job::Column::JobKind.starts_with("memvid_"))
+        .exec(db)
+        .await?;
+    Ok(())
 }

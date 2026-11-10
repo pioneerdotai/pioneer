@@ -263,7 +263,6 @@ sqlx_logging = false
 
 [gateway.memory]
 enabled = true
-capsules_dir = "memory/capsules"
 allow_global_user_by_default = true
 allow_global_agent_by_default = false
 tools_enabled = true
@@ -285,7 +284,6 @@ max_prompt_chars = 12000
 max_hit_chars = 1200
 default_max_candidates = 32
 max_candidate_work = 128
-max_segments = 16
 min_relevancy = 0.25
 min_results = 1
 snippet_chars = 360
@@ -293,7 +291,6 @@ index_batch_limit = 16
 retry_base_delay_secs = 30
 retry_max_delay_secs = 900
 max_attempts = 5
-near_capacity_percent = 85.0
 
 [gateway.thread_episodic.vector_search]
 enabled = false

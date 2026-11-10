@@ -1,3 +1,4 @@
+use crate::tests::episodic_projection::PersistedProjection;
 impl super::MessageProcessor {
     // Test callers await the same owned request used by the production socket pump.
     pub(crate) async fn process_owned_request(
@@ -45250,11 +45251,10 @@ async fn thread_episodic_store_ingestor_creates_items_and_jobs_idempotently() {
         .await
         .expect("index jobs should be readable");
     assert_eq!(jobs.len(), 2);
-    assert!(jobs.iter().all(|job| {
-        job.status == pioneer_crud::ThreadEpisodicIndexJobStatus::Queued
-            && job.graph_enrichment_state
-                == pioneer_crud::ThreadEpisodicGraphEnrichmentState::NotSupported
-    }));
+    assert!(
+        jobs.iter()
+            .all(|job| { job.status == pioneer_crud::ThreadEpisodicIndexJobStatus::Queued })
+    );
 }
 
 // Exercise canonical commit -> durable episodic delivery -> ingestion -> the
@@ -45324,7 +45324,7 @@ async fn save_and_deliver_episodic_wake_for_test(
 #[tokio::test]
 async fn production_episodic_wakes_drain_batches_and_survive_busy_idle_race_and_delivery_cancellation()
  {
-    use crate::database::startup::thread_episodic_workspace_capsule_refill as refill;
+    use crate::database::startup::thread_episodic_refill as refill;
     use crate::thread_episodic::{
         RuntimeVectorThreadEpisodicIndexPayloadProvider,
         SharedThreadEpisodicIndexEmbeddingProviderResolver,
@@ -45344,12 +45344,11 @@ async fn production_episodic_wakes_drain_batches_and_survive_busy_idle_race_and_
     let executor = Arc::new(
         ThreadEpisodicIndexExecutor::new(
             store.clone(),
-            Arc::new(pioneer_memory::MemvidThreadEpisodicBackend::new()),
+            Arc::new(pioneer_memory::SqliteThreadEpisodicBackend::new(
+                store.clone(),
+            )),
             Arc::new(RuntimeVectorThreadEpisodicIndexPayloadProvider::new(
-                Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
-                    store.clone(),
-                    pioneer_memory::thread_episodic_storage_uri_from_path(root.path()),
-                )),
+                Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(store.clone())),
                 resolver.clone(),
                 store.clone(),
             )),
@@ -45372,7 +45371,7 @@ async fn production_episodic_wakes_drain_batches_and_survive_busy_idle_race_and_
         store.clone(),
         root.path(),
         &workspace,
-        refill::ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::lexical_only(),
+        refill::ThreadEpisodicWorkspaceProjectionTarget::lexical_only(),
         None,
     )
     .await
@@ -45541,11 +45540,10 @@ async fn production_snapshot_save_wakes_idle_runner_and_preserves_draft_unchange
     );
     let executor = Arc::new(ThreadEpisodicIndexExecutor::new(
         store.clone(),
-        Arc::new(pioneer_memory::MemvidThreadEpisodicBackend::new()),
-        Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
+        Arc::new(pioneer_memory::SqliteThreadEpisodicBackend::new(
             store.clone(),
-            pioneer_memory::thread_episodic_storage_uri_from_path(root.path()),
         )),
+        Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(store.clone())),
     ));
     processor.thread_episodic_index_executor = executor.clone();
     let thread = "snapshot_wake_thread";
@@ -45783,15 +45781,15 @@ impl crate::thread_episodic::ThreadEpisodicIndexEmbeddingProviderResolver
 }
 
 #[tokio::test]
-async fn production_settings_recovery_transitions_projection_before_new_source_capsule_write() {
-    use crate::database::startup::thread_episodic_workspace_capsule_refill as refill;
+async fn production_settings_recovery_transitions_projection_before_new_source_publication() {
+    use crate::database::startup::thread_episodic_refill as refill;
     use crate::thread_episodic::{
         RuntimeVectorThreadEpisodicIndexPayloadProvider, StoreThreadEpisodicIndexPayloadProvider,
         ThreadEpisodicIndexExecutor, ThreadEpisodicRuntimeConfig,
     };
     use pioneer_memory::ThreadEpisodicEmbeddingProvider;
     let (workspace_manager, store, _) = setup_workspace_manager().await;
-    // Capsule ownership is process-wide and keyed by workspace ID. Separate
+    // Refill ownership is process-wide and keyed by workspace ID. Separate
     // databases/storage roots alone do not isolate the default workspace lock
     // from other concurrently running Gateway fixtures.
     let workspace = workspace_manager
@@ -45822,12 +45820,11 @@ async fn production_settings_recovery_transitions_projection_before_new_source_c
     let executor = Arc::new(
         ThreadEpisodicIndexExecutor::new(
             store.clone(),
-            Arc::new(pioneer_memory::MemvidThreadEpisodicBackend::new()),
+            Arc::new(pioneer_memory::SqliteThreadEpisodicBackend::new(
+                store.clone(),
+            )),
             Arc::new(RuntimeVectorThreadEpisodicIndexPayloadProvider::new(
-                Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
-                    store.clone(),
-                    pioneer_memory::thread_episodic_storage_uri_from_path(root.path()),
-                )),
+                Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(store.clone())),
                 resolver.clone(),
                 store.clone(),
             )),
@@ -45864,12 +45861,17 @@ async fn production_settings_recovery_transitions_projection_before_new_source_c
             .list_thread_episodic_index_jobs_for_thread(&workspace, "wake_thread", 100)
             .await
             .unwrap();
-        let old_capsules = store
-            .list_all_thread_episodic_capsules_for_workspace(&workspace)
-            .await
-            .unwrap();
-        let old_bytes =
-            std::fs::read(old_capsules[0].storage_uri.strip_prefix("file://").unwrap()).unwrap();
+        let mut old_projections = Vec::new();
+        for old in &old_items {
+            let artifact = store
+                .find_thread_episodic_embedding_artifact(
+                    old.embedding_artifact_id.as_deref().unwrap(),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            old_projections.push((old.projection_text(&store).await, artifact));
+        }
         *resolver.provider.write().unwrap() = None;
         let config = pioneer_config::GatewayThreadEpisodicVectorSearchConfig {
             enabled: true,
@@ -45891,9 +45893,7 @@ async fn production_settings_recovery_transitions_projection_before_new_source_c
             std::collections::BTreeMap::from([(workspace.clone(), config.clone())]),
         );
         let selected =
-            refill::ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_vector_search_config(
-                &config,
-            );
+            refill::ThreadEpisodicWorkspaceProjectionTarget::from_vector_search_config(&config);
         assert!(
             refill::refill_once_with_projection_resolver(
                 store.clone(),
@@ -45930,10 +45930,17 @@ async fn production_settings_recovery_transitions_projection_before_new_source_c
                 .attempt_count,
             0
         );
-        assert_eq!(
-            std::fs::read(old_capsules[0].storage_uri.strip_prefix("file://").unwrap()).unwrap(),
-            old_bytes
-        );
+        for (old, (text, artifact)) in old_items.iter().zip(&old_projections) {
+            assert_eq!(old.projection_text(&store).await, *text);
+            assert_eq!(
+                store
+                    .find_thread_episodic_embedding_artifact(&artifact.id)
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                Some(artifact)
+            );
+        }
         for old in &old_jobs {
             assert_eq!(
                 store
@@ -45994,29 +46001,17 @@ async fn production_settings_recovery_transitions_projection_before_new_source_c
             .list_thread_episodic_items_for_thread(&workspace, "wake_thread", 100)
             .await
             .unwrap();
-        let capsules = store
-            .list_all_thread_episodic_capsules_for_workspace(&workspace)
-            .await
-            .unwrap();
-        let capsule = memvid_core::Memvid::open_read_only(
-            capsules[0].storage_uri.strip_prefix("file://").unwrap(),
-        )
-        .unwrap();
-        assert_eq!(
-            capsule.effective_vec_index_dimension().unwrap(),
-            Some(u32::try_from(dimension).unwrap())
-        );
         for source in current_items {
-            let frame = capsule
-                .frame_by_uri(source.frame_uri.as_deref().unwrap())
+            assert!(source.projection_text(&store).await.is_some());
+            let artifact = store
+                .find_thread_episodic_embedding_artifact(
+                    source.embedding_artifact_id.as_deref().unwrap(),
+                )
+                .await
+                .unwrap()
                 .unwrap();
-            assert_eq!(
-                frame
-                    .extra_metadata
-                    .get("pioneer.thread_episodic.embedding.model")
-                    .map(String::as_str),
-                Some(model)
-            );
+            assert_eq!(artifact.dimension, dimension);
+            assert_eq!(artifact.model, model);
             let job = store
                 .find_thread_episodic_index_job_by_item(&source.id)
                 .await
@@ -65556,7 +65551,7 @@ where
         .build()
         .expect("test runtime should build");
     let result = runtime.block_on(async move { tokio::spawn(test()).await });
-    // Message tests can leave best-effort Memvid indexing on spawn_blocking.
+    // Message tests may leave provider preparation on spawn_blocking.
     // Runtime::drop waits for blocking tasks without a deadline, even after
     // the test future and all of its assertions have completed.
     runtime.shutdown_timeout(Duration::from_secs(5));
@@ -78897,6 +78892,7 @@ async fn mcp_install_itemizes_valid_and_invalid_servers() {
 }
 
 async fn setup_workspace_manager() -> (Arc<WorkspaceManager>, Arc<CrudStore>, String) {
+    pioneer_sqlite::search::register_auto_extension_once().unwrap();
     let connection = Database::connect("sqlite::memory:")
         .await
         .expect("must connect to sqlite memory");
@@ -78923,6 +78919,7 @@ async fn setup_pooled_file_workspace_manager_with_observer(
 ) {
     use sea_orm::{ConnectOptions, ConnectionTrait};
 
+    pioneer_sqlite::search::register_auto_extension_once().unwrap();
     let directory = tempfile::tempdir().expect("isolated Gateway database directory");
     let path = directory.path().join("gateway.sqlite");
     let url = format!("sqlite://{}?mode=rwc", path.display());
@@ -79973,7 +79970,6 @@ async fn setup_memory_gateway_harness_with_backend(
         .await;
     let runtime_home = unique_temp_dir(&format!("memory_{case_id}"));
     std::fs::create_dir_all(runtime_home.as_path()).expect("create memory runtime home");
-    let uses_memvid = backend.is_none();
     let memory_runtime = Arc::new(match backend {
         Some(backend) => {
             assert!(enabled, "custom memory backend requires an enabled runtime");
@@ -79981,10 +79977,8 @@ async fn setup_memory_gateway_harness_with_backend(
         }
         None => GatewayMemoryRuntime::from_config(
             crud_store.clone(),
-            runtime_home.as_path(),
             &GatewayMemoryConfig {
                 enabled,
-                capsules_dir: "memory/capsules".to_owned(),
                 allow_global_user_by_default: true,
                 allow_global_agent_by_default: false,
                 ..GatewayMemoryConfig::default()
@@ -79995,14 +79989,6 @@ async fn setup_memory_gateway_harness_with_backend(
 
     if enabled {
         assert!(memory_runtime.is_enabled());
-    }
-    if enabled && uses_memvid {
-        assert!(
-            memory_runtime
-                .capsules_root()
-                .expect("enabled runtime should expose capsules root")
-                .starts_with(runtime_home.as_path())
-        );
     }
 
     let processor = Arc::new(MessageProcessor::new_with_memory_runtime(
@@ -80077,10 +80063,8 @@ async fn setup_memory_agent_e2e_harness_on_workspace(
     let memory_runtime = Arc::new(
         GatewayMemoryRuntime::from_config(
             crud_store.clone(),
-            runtime_home.as_path(),
             &GatewayMemoryConfig {
                 enabled: true,
-                capsules_dir: "memory/capsules".to_owned(),
                 allow_global_user_by_default: true,
                 allow_global_agent_by_default: false,
                 ..GatewayMemoryConfig::default()
@@ -80557,7 +80541,7 @@ async fn memory_remember_get_list_roundtrip() {
 }
 
 #[tokio::test]
-async fn memory_search_returns_memvid_backed_hits_filtered_by_control_plane() {
+async fn memory_search_returns_sqlite_hits_filtered_by_control_plane() {
     let mut harness = setup_memory_gateway_harness("search_filter", true).await;
     let request_context = harness.request_context().await;
     let scope = workspace_memory_scope(harness.workspace_id.as_str());
@@ -80699,7 +80683,7 @@ async fn memory_search_returns_memvid_backed_hits_filtered_by_control_plane() {
             .hits
             .iter()
             .any(|hit| hit.record.id == target_payload.record.id),
-        "deleted memory must not leak through memvid search"
+        "deleted memory must not leak through search"
     );
 
     let _ = std::fs::remove_dir_all(harness.runtime_home);
@@ -81494,8 +81478,8 @@ async fn memory_tool_remember_writes_memory_with_turn_provenance() {
 #[tokio::test]
 async fn supervised_memory_mutations_prompt_before_real_database_side_effects() {
     // Exercise the real approval broker, tools, memory service and SQLite writes.
-    // Memvid indexing is covered separately; its Tantivy writer lifecycle must
-    // not make this permission regression depend on filesystem lock timing.
+    // Storage adapter behavior is covered separately; this fixture isolates
+    // approval and publication through the existing memory service contract.
     let harness = setup_memory_gateway_harness_with_backend(
         "tool_supervised_consent",
         true,
@@ -82536,7 +82520,7 @@ async fn wait_for_cli_runtime_turn_starts(
     session: &RecordingCliRuntimeSession,
     expected: usize,
 ) -> Vec<CLIAgentRuntimeTurnStartParams> {
-    // The gateway crate runs a large number of SQLite/memvid tests in parallel.
+    // The gateway crate runs a large number of SQLite tests in parallel.
     // A valid child dispatch can therefore be delayed by scheduler and I/O
     // contention even though the runtime contract is healthy. Keep this test
     // observation bounded, but do not turn that transient contention into a

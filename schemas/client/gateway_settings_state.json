@@ -582,10 +582,8 @@
             "max_candidate_work": 128,
             "max_hit_chars": 1200,
             "max_prompt_chars": 12000,
-            "max_segments": 16,
             "min_relevancy": 0.25,
             "min_results": 1,
-            "near_capacity_percent": 85.0,
             "recall_enabled": true,
             "retry_base_delay_secs": 30,
             "retry_max_delay_secs": 900,
@@ -662,11 +660,6 @@
           "format": "uint32",
           "minimum": 0
         },
-        "max_segments": {
-          "type": "integer",
-          "format": "uint32",
-          "minimum": 0
-        },
         "min_relevancy": {
           "type": "number",
           "format": "float"
@@ -675,10 +668,6 @@
           "type": "integer",
           "format": "uint32",
           "minimum": 0
-        },
-        "near_capacity_percent": {
-          "type": "number",
-          "format": "double"
         },
         "recall_enabled": {
           "type": "boolean"
@@ -720,15 +709,13 @@
         "max_hit_chars",
         "default_max_candidates",
         "max_candidate_work",
-        "max_segments",
         "min_relevancy",
         "min_results",
         "snippet_chars",
         "index_batch_limit",
         "retry_base_delay_secs",
         "retry_max_delay_secs",
-        "max_attempts",
-        "near_capacity_percent"
+        "max_attempts"
       ]
     },
     "GatewayThreadEpisodicVectorLocalModelStatus": {

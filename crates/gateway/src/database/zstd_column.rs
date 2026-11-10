@@ -1990,7 +1990,7 @@ mod tests {
                     "active raw rows must not keep the compression owner runnable");
                 assert_eq!(query_i64(&db, &format!("SELECT COUNT(*) AS value FROM {} WHERE {} IS NULL", config.backing_table, config.dict_column)).await, DICTIONARY_MIN_SAMPLE_ROWS as i64);
             }
-            assert_eq!(query_i64(&db, "SELECT COUNT(*) AS value FROM _zstd_dicts").await, 0,
+            assert_eq!(query_i64(&db, "SELECT COUNT(*) AS value FROM _zstd_dicts WHERE id <> -1").await, 0,
                 "active data must not train a dictionary");
             // A terminal status alone is insufficient while its watermark lags.
             db.execute_unprepared("UPDATE turn_event_projection_stream_state SET projected_through_sequence=0 WHERE turn_id='turn_zstd'").await.unwrap();

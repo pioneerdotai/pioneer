@@ -5,29 +5,13 @@ use crate::tests::authorization::{
     MEMBER_A_ID, THREAD_RED_PRIVATE_A_ID, THREAD_RED_PRIVATE_B_ID, WORKSPACE_RED_ID,
 };
 use pioneer_crud::*;
-use pioneer_memory::{
-    MemvidThreadEpisodicBackend, ThreadEpisodicMemvidBackend, ThreadEpisodicMemvidIndexRequest,
-    thread_episodic_memvid_metadata,
-};
+use pioneer_memory::SqliteThreadEpisodicBackend;
 use pioneer_protocol::{ItemCompletedNotification, TurnItem};
 use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
 
-async fn capsule(p: &MessageProcessor, root: &str) -> ThreadEpisodicCapsuleRecord {
-    p.crud_store
-        .resolve_thread_episodic_workspace_active_write_segment(
-            ThreadEpisodicWorkspaceActiveWriteSegmentRequest {
-                workspace_id: WORKSPACE_RED_ID.into(),
-                storage_uri_root: root.into(),
-            },
-            1_800_000_000,
-        )
-        .await
-        .unwrap()
-}
-
 pub(in crate::message) async fn seed(
     p: &MessageProcessor,
-    c: &ThreadEpisodicCapsuleRecord,
+    workspace: &str,
     thread: &str,
     id: &str,
     text: &str,
@@ -39,7 +23,7 @@ pub(in crate::message) async fn seed(
     p.crud_store
         .materialize_item_completed(
             ItemCompletedNotification {
-                workspace_id: c.workspace_id.clone().into(),
+                workspace_id: workspace.to_owned(),
                 thread_id: thread.into(),
                 turn_id: turn.clone(),
                 item: TurnItem::AgentMessage {
@@ -58,7 +42,7 @@ pub(in crate::message) async fn seed(
     // the stored item must be a committed canonical assistant source.
     let canonical = p
         .crud_store
-        .get_thread_episodic_canonical_item(&c.workspace_id, thread, &turn, id)
+        .get_thread_episodic_canonical_item(workspace, thread, &turn, id)
         .await
         .unwrap()
         .unwrap();
@@ -66,96 +50,123 @@ pub(in crate::message) async fn seed(
     assert!(
         matches!(&canonical.item, TurnItem::AgentMessage { id: actual, text: actual_text, .. } if actual == id && actual_text == text)
     );
-    let hash = pioneer_crud::thread_episodic_source::source_text_hash(text);
-    let item = p
-        .crud_store
-        .upsert_thread_episodic_item(
-            NewThreadEpisodicItemRecord {
-                id: Some(format!("search-index-{id}")),
-                workspace_id: c.workspace_id.clone().into(),
-                thread_id: thread.into(),
-                turn_id: turn,
-                item_id: id.into(),
-                source_actor_role: ThreadEpisodicSourceActorRole::Assistant,
-                source_runtime_kind: ThreadEpisodicSourceRuntimeKind::AssistantTurn,
-                source_context:
-                    pioneer_protocol::ThreadEpisodicSourceContext::UserVisibleThreadItem,
-                visibility: ThreadEpisodicItemVisibility::UserVisible,
-                status: ThreadEpisodicItemStatus::Active,
-                text_hash: hash.clone(),
-                source_text_hash: hash,
-                projection_group_id: format!("projection-{id}"),
-                language_hint: None,
-                token_estimate: 20,
-                capsule_id: Some(c.id.clone()),
-                capsule_ref: Some(c.capsule_ref.clone()),
-                segment_index: Some(c.segment_index),
-                frame_id: None,
-                frame_uri: None,
-                indexed_at: None,
-                deleted_at: None,
-            },
-            1_800_000_000,
-        )
-        .await
-        .unwrap();
-    index(p, c, &item, text).await;
-    item
-}
-
-async fn index(
-    p: &MessageProcessor,
-    c: &ThreadEpisodicCapsuleRecord,
-    item: &ThreadEpisodicItemRecord,
-    text: &str,
-) {
-    let uri = thread_episodic_item_uri(
-        &item.workspace_id,
-        &item.thread_id,
-        &item.turn_id,
-        &item.item_id,
-        &item.id,
-    )
-    .unwrap();
-    let output = MemvidThreadEpisodicBackend::new()
-        .index_item(ThreadEpisodicMemvidIndexRequest {
-            storage_uri: c.storage_uri.clone(),
-            capsule_id: c.id.clone(),
-            capsule_ref: c.capsule_ref.clone(),
-            workspace_capsule: true,
-            index_item_id: item.id.clone(),
-            frame_uri: uri,
-            text: text.into(),
-            metadata: thread_episodic_memvid_metadata(
-                &item.workspace_id,
-                &item.thread_id,
-                &item.turn_id,
-                &item.item_id,
-                "assistant",
-                "agent",
-                "user_visible_thread_item",
-                &item.text_hash,
-                &item.source_text_hash,
-            ),
-            embedding: None,
+    use crate::thread_episodic::{
+        StoreThreadEpisodicIngestor, ThreadEpisodicCommittedItem, ThreadEpisodicIngestor,
+    };
+    StoreThreadEpisodicIngestor::new(p.crud_store.clone())
+        .ingest_committed_item(ThreadEpisodicCommittedItem {
+            workspace_id: workspace.to_owned(),
+            thread_id: thread.into(),
+            turn_id: turn.clone(),
+            item_id: id.into(),
+            item_type: canonical.item.item_type(),
+            source_actor_role: Some(pioneer_protocol::ThreadEpisodicSourceActorRole::Assistant),
+            source_context: pioneer_protocol::ThreadEpisodicSourceContext::UserVisibleThreadItem,
+            item: canonical.item,
         })
         .await
         .unwrap();
-    p.crud_store
-        .mark_thread_episodic_item_indexed(
-            &item.id,
-            ThreadEpisodicItemIndexedUpdate {
-                capsule_id: c.id.clone(),
-                capsule_ref: c.capsule_ref.clone(),
-                segment_index: c.segment_index,
-                frame_id: output.frame_id,
-                frame_uri: output.frame_uri,
-                embedding_artifact_id: None,
-            },
-            1_800_000_001,
+    let item = p
+        .crud_store
+        .list_thread_episodic_items_for_thread(workspace, thread, 1000)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|item| item.item_id == id)
+        .unwrap();
+    let job = p
+        .crud_store
+        .find_thread_episodic_index_job_by_item(&item.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let now = chrono::Utc::now().timestamp().max(1_800_000_001);
+    if let Some(claim) = p
+        .crud_store
+        .claim_thread_episodic_index_job_if_due(&job.id, now, 5)
+        .await
+        .unwrap()
+    {
+        // Obtain a real durable claim and publish through the same atomic
+        // repository boundary as the executor. No file receipt or second
+        // background owner is fabricated by a retrieval fixture.
+        assert_eq!(
+            p.crud_store
+                .complete_thread_episodic_index_attempt(
+                    &claim.id,
+                    claim.attempt_count,
+                    &canonical.source_payload,
+                    ThreadEpisodicItemIndexedUpdate {
+                        projection_guard: None,
+                        search_text: text.trim().into(),
+                        embedding_artifact_id: None
+                    },
+                    ThreadEpisodicIndexJobCompletionUpdate {
+                        last_attempt_latency_ms: Some(1)
+                    },
+                    now
+                )
+                .await
+                .unwrap(),
+            ThreadEpisodicIndexAttemptOutcome::Applied
+        );
+    } else {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            p.thread_episodic_index_executor
+                .wait_for_completed_source_for_test(&item.id),
         )
         .await
         .unwrap();
+    }
+    // Mark coverage through the existing refill metadata, with the current target.
+    use crate::database::startup::thread_episodic_refill::{
+        THREAD_EPISODIC_REFILL_VERSION, ThreadEpisodicWorkspaceProjectionTarget,
+    };
+    let now = chrono::Utc::now().fixed_offset();
+    pioneer_crud::upsert_projection_meta_with_config(
+        &p.crud_store.database_connection(),
+        pioneer_crud::ProjectionMetaRecord {
+            projection_key: pioneer_crud::thread_episodic_refill_projection_key(workspace).unwrap(),
+            projection_version: THREAD_EPISODIC_REFILL_VERSION,
+            status: pioneer_crud::PROJECTION_META_STATUS_COMPLETE.into(),
+            source_thread_count: 0,
+            source_turn_count: 0,
+            source_turn_item_count: 0,
+            source_turn_event_count: 0,
+            last_error: None,
+            backfill_started_at: Some(now),
+            backfilled_at: Some(now),
+            created_at: now,
+            updated_at: now,
+        },
+        ThreadEpisodicWorkspaceProjectionTarget::lexical_only().meta_config_record(),
+    )
+    .await
+    .unwrap();
+    p.crud_store
+        .list_thread_episodic_items_for_thread(workspace, thread, 1000)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|item| item.item_id == id && item.status == ThreadEpisodicItemStatus::Active)
+        .unwrap()
+}
+
+async fn reconcile(p: &MessageProcessor, workspace: &str, item: &ThreadEpisodicItemRecord) {
+    // Repeated delivery of a canonical source must not create another
+    // occurrence or duplicate an FTS hit.
+    let outcome = crate::thread_episodic::StoreThreadEpisodicIngestor::new(p.crud_store.clone())
+        .reconcile_canonical_source_occurrence(
+            workspace,
+            &item.thread_id,
+            &item.turn_id,
+            &item.item_id,
+            chrono::Utc::now().timestamp(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(outcome, ThreadEpisodicSourceReconcileOutcome::Current);
 }
 
 async fn search(
@@ -164,20 +175,22 @@ async fn search(
     position: usize,
     limit: usize,
 ) -> (Vec<FoundSource>, bool, bool) {
-    p.search_thread_sources(
-        a,
-        ThreadSearchRequest {
-            query: "searchneedle",
-            position,
-            limit,
-        },
-    )
-    .await
-    .unwrap()
+    let (found, more, incomplete, _next) = p
+        .search_thread_sources(
+            a,
+            ThreadSearchRequest {
+                query: "searchneedle",
+                position,
+                limit,
+            },
+        )
+        .await
+        .unwrap();
+    (found, more, incomplete)
 }
 
 #[tokio::test]
-async fn all_files_and_conversations_participate_with_canonical_dedup_and_position_pages() {
+async fn conversations_participate_with_canonical_dedup_and_position_pages() {
     let (_h, p) = fixture().await;
     let temp = tempfile::tempdir().unwrap();
     let root = format!("file://{}", temp.path().display());
@@ -195,7 +208,7 @@ async fn all_files_and_conversations_participate_with_canonical_dedup_and_positi
                 "INSERT INTO thread(id,workspace_id,name,preview,mode,model,model_provider,status,origin_kind,sidebar_visibility,access_class,created_at,updated_at,created_by_actor_kind,created_by_actor_id) SELECT ?,workspace_id,?,'',mode,model,model_provider,status,origin_kind,sidebar_visibility,'workspace',created_at,updated_at,created_by_actor_kind,created_by_actor_id FROM thread WHERE id=?",
                 [thread.clone().into(), format!("Full title {number}").into(), THREAD_RED_PRIVATE_A_ID.into()])).await.unwrap();
         }
-        let c = capsule(&p, &root).await;
+        let c = WORKSPACE_RED_ID;
         let item = seed(
             &p,
             &c,
@@ -209,22 +222,8 @@ async fn all_files_and_conversations_participate_with_canonical_dedup_and_positi
             duplicate = Some(item);
         }
         if number == 17 {
-            index(
-                &p,
-                &c,
-                duplicate.as_ref().unwrap(),
-                "searchneedle saved decision",
-            )
-            .await;
+            reconcile(&p, &c, duplicate.as_ref().unwrap()).await;
         }
-        p.crud_store
-            .transition_thread_episodic_active_write_segment(
-                &c.id,
-                ThreadEpisodicCapsuleWriteState::Full,
-                1_800_000_002,
-            )
-            .await
-            .unwrap();
     }
     let mut seen = std::collections::BTreeSet::new();
     for position in [0, 7, 14] {
@@ -265,7 +264,7 @@ async fn all_files_and_conversations_participate_with_canonical_dedup_and_positi
 async fn filtered_engine_pages_fill_results_and_disclosure_rechecks_source_and_acl() {
     let (_h, p) = fixture().await;
     let temp = tempfile::tempdir().unwrap();
-    let c = capsule(&p, &format!("file://{}", temp.path().display())).await;
+    let c = WORKSPACE_RED_ID;
     // More than one engine quantum of inaccessible candidates must not hide a later own source.
     let mut source_ids = Vec::new();
     for n in 0..140 {
@@ -336,7 +335,7 @@ async fn filtered_engine_pages_fill_results_and_disclosure_rechecks_source_and_a
                 id: None,
                 workspace_id: WORKSPACE_RED_ID.into(),
                 thread_id: THREAD_RED_PRIVATE_A_ID.into(),
-                index_item_id: item.id,
+                index_item_id: item.id.clone(),
                 reason: ThreadEpisodicExclusionReason::UserRequested,
                 created_by: MEMBER_A_ID.into(),
             },
@@ -348,7 +347,7 @@ async fn filtered_engine_pages_fill_results_and_disclosure_rechecks_source_and_a
     assert!(search(&p, &a, 0, 3).await.0.is_empty());
     assert!(
         p.crud_store
-            .thread_search_source_batch(WORKSPACE_RED_ID, &["search-index-readable".into()])
+            .thread_search_source_batch(WORKSPACE_RED_ID, &[item.id.clone()])
             .await
             .unwrap()
             .is_empty()
@@ -406,9 +405,14 @@ async fn filtered_engine_pages_fill_results_and_disclosure_rechecks_source_and_a
         .await
         .unwrap();
     assert!(!p.search_response_readable(&a, &response).await.unwrap());
+    let (found, _, incomplete) = search(&p, &a, 0, 3).await;
     assert!(
-        search(&p, &a, 0, 3).await.0.is_empty(),
+        found.is_empty(),
         "old index text cannot replace a changed canonical source"
+    );
+    assert!(
+        incomplete,
+        "a rejected source version leaves incomplete coverage"
     );
 }
 
@@ -416,7 +420,7 @@ async fn filtered_engine_pages_fill_results_and_disclosure_rechecks_source_and_a
 async fn oversized_card_preserves_full_unicode_title_and_rejects_deleted_source_continuation() {
     let (_h, p) = fixture().await;
     let temp = tempfile::tempdir().unwrap();
-    let c = capsule(&p, &format!("file://{}", temp.path().display())).await;
+    let c = WORKSPACE_RED_ID;
     let item = seed(
         &p,
         &c,
@@ -510,7 +514,7 @@ async fn indexed_search_uses_authorized_sources_and_trusted_execution_identity()
     use crate::message::thread_read_tools::tests::member;
     let (_h, p) = fixture().await;
     let temp = tempfile::tempdir().unwrap();
-    let c = capsule(&p, &format!("file://{}", temp.path().display())).await;
+    let c = WORKSPACE_RED_ID;
     seed(
         &p,
         &c,
@@ -591,7 +595,7 @@ async fn indexed_search_uses_authorized_sources_and_trusted_execution_identity()
 async fn saved_search_over_256_kib_reconstructs_exact_payload_and_revalidates_disclosure() {
     let (_h, p) = fixture().await;
     let temp = tempfile::tempdir().unwrap();
-    let c = capsule(&p, &format!("file://{}", temp.path().display())).await;
+    let c = WORKSPACE_RED_ID;
     let source = seed(
         &p,
         &c,
@@ -715,4 +719,49 @@ async fn saved_search_over_256_kib_reconstructs_exact_payload_and_revalidates_di
     p.crud_store.database_connection().execute_raw(Statement::from_sql_and_values(DatabaseBackend::Sqlite,
         "UPDATE turn SET message_deleted_at=CURRENT_TIMESTAMP,message_revision=message_revision+1 WHERE id=?",[source.turn_id.into()])).await.unwrap();
     assert!(p.read_thread_tool_result(params).await.is_err());
+}
+
+#[tokio::test]
+async fn configured_provider_failure_keeps_lexical_results_and_reports_incomplete_coverage() {
+    use crate::thread_episodic::{
+        SharedThreadEpisodicIndexEmbeddingProviderResolver, ThreadEpisodicRecallService,
+        ThreadEpisodicRecallServiceConfig,
+    };
+    let (_h, mut p) = fixture().await;
+    seed(
+        &p,
+        WORKSPACE_RED_ID,
+        THREAD_RED_PRIVATE_A_ID,
+        "provider_failure",
+        "searchneedle survives provider failure",
+    )
+    .await;
+    let resolver = Arc::new(SharedThreadEpisodicIndexEmbeddingProviderResolver::new());
+    resolver.set_active_provider_unavailable_reason("controlled provider outage");
+    let service = ThreadEpisodicRecallService::with_embedding_provider_resolver(
+        p.crud_store.clone(),
+        Arc::new(SqliteThreadEpisodicBackend::new(p.crud_store.clone())),
+        Some(resolver),
+    );
+    service.apply_config(ThreadEpisodicRecallServiceConfig {
+        vector_search: pioneer_config::GatewayThreadEpisodicVectorSearchConfig {
+            enabled: true,
+            provider: Some(pioneer_config::GatewayThreadEpisodicVectorProviderConfig::OpenAi),
+            model: Some("text-embedding-3-small".into()),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    p.thread_episodic_recall_service = Arc::new(service);
+    let (found, more, incomplete) = search(
+        &p,
+        &authority(MEMBER_A_ID, THREAD_RED_PRIVATE_A_ID, true),
+        0,
+        10,
+    )
+    .await;
+    assert_eq!(found.len(), 1);
+    assert!(!more);
+    assert!(incomplete);
+    assert_eq!(found[0].canonical_key.2, "provider_failure");
 }

@@ -169,7 +169,7 @@ fn is_quarantine_reason(reason: MemoryLifecycleReasonCode) -> bool {
         MemoryLifecycleReasonCode::VisibilityRankingSuppression
             | MemoryLifecycleReasonCode::QualityTerminalDecision
             | MemoryLifecycleReasonCode::BackendPayloadStaleOrMissing
-            | MemoryLifecycleReasonCode::MemvidStaleVector
+            | MemoryLifecycleReasonCode::StaleEmbeddingProjection
             | MemoryLifecycleReasonCode::ManualDeveloperAdminQuarantine
             | MemoryLifecycleReasonCode::RepairReconciliation
     )

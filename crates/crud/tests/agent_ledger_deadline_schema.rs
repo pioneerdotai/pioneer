@@ -48,7 +48,10 @@ async fn ledger_deadline_index_fresh_upgrade_down_reapply_preserves_rows() {
         }
         for installed in [true, false, true] {
             if !installed {
-                Migrator::down(&db, Some(1)).await.unwrap();
+                // Roll back the target too when newer migrations follow it.
+                Migrator::down(&db, Some((migrations.len() - position) as u32))
+                    .await
+                    .unwrap();
             } else {
                 // Idempotent Migrator call on fresh/upgrade; reinstalls after down.
                 Migrator::up(&db, None).await.unwrap();

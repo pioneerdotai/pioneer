@@ -51,8 +51,15 @@ fn cached_reads_keep_dialect_and_bound_inputs_separate() {
             assert!(!statement.sql.contains(after));
             assert!(!statement.sql.contains(upper));
             assert!(!statement.sql.contains(id));
+            // SeaQuery may put more than one space between AS and MATERIALIZED.
+            // Check the dialect contract without depending on SQL whitespace.
+            let normalized_sql = statement
+                .sql
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
             assert_eq!(
-                statement.sql.contains("AS MATERIALIZED"),
+                normalized_sql.contains("AS MATERIALIZED"),
                 backend == DbBackend::Sqlite,
                 "materialization must be SQLite-only: {backend:?}"
             );

@@ -1904,6 +1904,21 @@ async fn task_event_pending_index_fresh_upgrade_down_reapply() {
             .all(&connection)
             .await
             .unwrap();
+        let (store, connection) = if upgrade {
+            task_event_pending_schema(&store, true).await;
+            // Apply the registered suffix on the standalone pool, as at startup.
+            // The capsule-route rebuild must manage its own transaction and FK state.
+            drop(connection);
+            drop(store);
+            Migrator::up(&db, None).await.unwrap();
+            let store = CrudStore::new(db.clone()).with_maintenance_access();
+            let connection = store.database_connection();
+            (store, connection)
+        } else {
+            (store, connection)
+        };
+        // Later registered migrations can install their own triggers. The
+        // isolated target rollback/reapply must preserve this complete set.
         let triggers = connection
             .query_all_raw(Statement::from_string(
                 DbBackend::Sqlite,
@@ -1919,19 +1934,6 @@ async fn task_event_pending_index_fresh_upgrade_down_reapply() {
                 )
             })
             .collect::<Vec<_>>();
-        let (store, connection) = if upgrade {
-            task_event_pending_schema(&store, true).await;
-            // Apply the registered suffix on the standalone pool, as at startup.
-            // The capsule-route rebuild must manage its own transaction and FK state.
-            drop(connection);
-            drop(store);
-            Migrator::up(&db, None).await.unwrap();
-            let store = CrudStore::new(db.clone()).with_maintenance_access();
-            let connection = store.database_connection();
-            (store, connection)
-        } else {
-            (store, connection)
-        };
         task_event_pending_schema(&store, false).await;
         assert_eq!(task_event_neighbors(&store).await, neighbors);
         portable_schema_step(&store, &*migration, false)

@@ -464,14 +464,6 @@
           "format": "uint32",
           "minimum": 0
         },
-        "max_segments": {
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "uint32",
-          "minimum": 0
-        },
         "min_relevancy": {
           "type": [
             "number",
@@ -486,13 +478,6 @@
           ],
           "format": "uint32",
           "minimum": 0
-        },
-        "near_capacity_percent": {
-          "type": [
-            "number",
-            "null"
-          ],
-          "format": "double"
         },
         "recall_enabled": {
           "type": [

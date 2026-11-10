@@ -117,7 +117,7 @@ async fn keyed_finalization_does_not_advance_an_independent_full_pass() {
 }
 
 #[tokio::test]
-async fn event_wakes_are_keyed_while_delivery_claims_and_acks_only_wake_delivery() {
+async fn event_wakes_are_keyed_delivery_claims_stay_quiet_and_acks_wake_delivery() {
     let (store, thread, turn) = test_store_with_started_turn(
         "ws_projection_wakes",
         "thr_projection_wakes",
@@ -141,7 +141,8 @@ async fn event_wakes_are_keyed_while_delivery_claims_and_acks_only_wake_delivery
     assert_eq!(claims.len(), 1);
     assert_eq!(
         changes.begin_keyed_pass(&database).await.unwrap(),
-        Some(vec!["delivery".into()])
+        Some(vec![]),
+        "claiming a lease creates no new delivery or projection work"
     );
     let settlements = [TurnEventDeliverySettlement {
         id: claims[0].id.clone(),
