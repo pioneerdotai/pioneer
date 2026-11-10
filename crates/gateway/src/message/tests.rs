@@ -63333,6 +63333,7 @@ fn phase_11_prompt_manifest_hook_sources_roundtrip_existing_event() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn turn_start_materializes_thread_and_turn_state() {
+    crate::compaction::load_test_catalog();
     let connection = Database::connect("sqlite::memory:")
         .await
         .expect("must connect to sqlite memory");
