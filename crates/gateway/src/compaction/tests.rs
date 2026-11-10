@@ -10374,8 +10374,11 @@ async fn native_preparation_with_context_cap(selected_cap: bool) {
         assert!(saved.context_window > 16000);
         saved.context_window = 16000;
         context.context_budget = Some(saved);
+        let summary_provider = providers
+            .get_or_create_for_workspace("ws", "summary-fixture")
+            .unwrap();
         let mut summary = super::native_budget::capture(
-            f.provider.as_ref(),
+            summary_provider.as_ref(),
             "summary-fixture",
             "summary-model",
             None,
