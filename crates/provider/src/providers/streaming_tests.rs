@@ -589,7 +589,7 @@ async fn native_repeated_reasons_and_reasonless_metadata_preserve_late_usage() {
         json!({"candidates":[{"content":{"parts":[{"text":"text"}]},"finishReason":"STOP"}]}),
     ) + &wire(json!({"candidates":[{}]}))
         + &wire(
-            json!({"candidates":[{"finishReason":"STOP"}],"usageMetadata":{"candidatesTokenCount":9}}),
+            json!({"candidates":[{"finishReason":"STOP"}],"usageMetadata":{"candidatesTokenCount":9,"thoughtsTokenCount":0}}),
         );
     let chunks = GeminiProvider::decode_stream(fragmented(&input))
         .collect::<Vec<_>>()

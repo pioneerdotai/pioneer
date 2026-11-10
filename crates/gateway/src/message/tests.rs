@@ -89455,7 +89455,18 @@ async fn auxiliary_chat_keeps_native_usage_before_application_validation() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].status, "completed");
     let retained: pioneer_provider::TokenUsage = serde_json::from_str(&rows[0].usage_json).unwrap();
-    assert_eq!(Some(retained), response.usage);
+    let mut returned = response.usage.unwrap();
+    // Retention omits an absent tariff rather than retaining its null placeholder.
+    if let Some(accounting) = returned
+        .accounting
+        .as_mut()
+        .and_then(JsonValue::as_object_mut)
+    {
+        if accounting.get("pricing").is_some_and(JsonValue::is_null) {
+            accounting.remove("pricing");
+        }
+    }
+    assert_eq!(retained, returned);
     assert!(!rows[0].usage_json.contains("fixture prompt"));
 }
 

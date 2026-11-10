@@ -15075,6 +15075,13 @@ async fn compaction_boundary_stop_and_recovery_deadline_drop_preparation() {
         reasoning: None,
         compiled_prompt: None,
     };
+    let events = Arc::new(pioneer_runtime_events::ExecutionEventHub::new());
+    let mut receiver = events.take_durable_receiver().await.unwrap();
+    let acknowledgements = tokio::spawn(async move {
+        while receiver.recv().await.is_some() {
+            receiver.acknowledge_last(Ok(()));
+        }
+    });
     let context = || NativeContext {
         overflow_recovery: true,
         recovery_deadline_ms: Some(
@@ -15090,7 +15097,7 @@ async fn compaction_boundary_stop_and_recovery_deadline_drop_preparation() {
         conversation_thread_id: None,
         provider_instance: "fixture".into(),
         provider: Arc::new(CaptureStandardProvider::default()),
-        events: Arc::new(pioneer_runtime_events::ExecutionEventHub::new()),
+        events: events.clone(),
         cancellation: tokio_util::sync::CancellationToken::new(),
     };
     let live = Arc::new(AtomicUsize::new(0));
@@ -15112,10 +15119,16 @@ async fn compaction_boundary_stop_and_recovery_deadline_drop_preparation() {
         NativeContextSession::new(context(), Arc::new(PendingContextBoundary(live.clone())));
     let preparing = session.prepare(request(), false);
     tokio::pin!(preparing);
-    tokio::select! { biased;
-        _ = &mut preparing => panic!("fixture preparation must wait"),
-        _ = tokio::task::yield_now() => {}
-    }
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while live.load(Ordering::SeqCst) == 0 {
+            tokio::select! { biased;
+                _ = &mut preparing => panic!("fixture preparation must wait"),
+                _ = tokio::task::yield_now() => {}
+            }
+        }
+    })
+    .await
+    .expect("preparation must enter the context boundary");
     assert_eq!(live.load(Ordering::SeqCst), 1);
     session.context.cancellation.cancel();
     assert!(
@@ -15127,6 +15140,7 @@ async fn compaction_boundary_stop_and_recovery_deadline_drop_preparation() {
             .contains("cancelled")
     );
     assert_eq!(live.load(Ordering::SeqCst), 0);
+    acknowledgements.abort();
 }
 
 #[tokio::test]

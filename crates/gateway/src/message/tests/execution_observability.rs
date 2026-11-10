@@ -13,8 +13,20 @@ async fn rpc(
         .as_object_mut()
         .unwrap()
         .extend(extra.as_object().unwrap().clone());
-    h.processor.process_request_for_connection(h.connection_id,&json!({"jsonrpc":"2.0","id":id,"method":"thread/execution/observability","params":params}).to_string()).await;
-    serde_json::from_value(recv_response_by_id(&mut h.rx, &id).await.result).unwrap()
+    loop {
+        h.processor.process_request_for_connection(h.connection_id,&json!({"jsonrpc":"2.0","id":id,"method":"thread/execution/observability","params":params}).to_string()).await;
+        let response: pioneer_protocol::ExecutionObservabilityResponse =
+            serde_json::from_value(recv_response_by_id(&mut h.rx, &id).await.result).unwrap();
+        if response.records.is_empty() && response.summary.is_none() {
+            if let Some(after) = response.next_after {
+                assert!(after > params["after"].as_i64().unwrap_or(0));
+                params["after"] = after.into();
+                params["through"] = response.through.into();
+                continue;
+            }
+        }
+        return response;
+    }
 }
 async fn charge(
     store: &CrudStore,

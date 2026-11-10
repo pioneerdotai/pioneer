@@ -3949,12 +3949,17 @@ mod partial_observation_tests {
             };
             let receive = async {
                 let mut history = None;
+                let mut usage_checked = false;
                 loop {
                     let event = events.recv().await.unwrap();
                     assert!(!matches!(
                         event,
                         AgentDurableEvent::TurnFinalizationPrepared { .. }
                     ));
+                    let settled = matches!(&event, AgentDurableEvent::ItemCompleted { notification }
+                        if matches!(&notification.item, TurnItem::SystemEvent { code, details, .. }
+                            if code.as_deref() == Some("provider_phase")
+                                && details.as_ref().is_some_and(|d| d["phase"] == "settlement_completed")));
                     let usage = match event {
                         AgentDurableEvent::TurnProviderHistoryAppended { payload, .. } => {
                             history = Some(payload);
@@ -3982,6 +3987,10 @@ mod partial_observation_tests {
                         assert_eq!(details["usage"]["input_tokens"], 10);
                         assert_eq!(details["usage"]["output_tokens"], 2);
                         assert!(!details.to_string().contains("request\""));
+                        usage_checked = true;
+                    }
+                    if settled {
+                        assert!(usage_checked);
                         break history.expect("partial history precedes failure");
                     }
                 }
@@ -4634,8 +4643,8 @@ mod terminal_boundary_tests {
             let usage_completed = matches!(&event,
                 AgentDurableEvent::ItemCompleted { notification }
                     if matches!(&notification.item,
-                        TurnItem::SystemEvent { code, .. }
-                            if code.as_deref() == Some("provider_usage")));
+                        TurnItem::SystemEvent { code, details, .. }
+                            if code.as_deref() == Some("provider_phase") && details.as_ref().is_some_and(|d| d["phase"] == "settlement_completed")));
             receiver.acknowledge_last(Ok(()));
             events.push(event);
             if usage_completed {
@@ -5254,7 +5263,7 @@ mod phased_message_tests {
                             }
                             event = durable.recv() => {
                                 let event = event.unwrap();
-                                let done = matches!(&event,AgentDurableEvent::ItemCompleted{notification} if matches!(&notification.item,TurnItem::SystemEvent{code,..} if code.as_deref()==Some("provider_usage"))) && release.is_none();
+                                let done = matches!(&event,AgentDurableEvent::ItemCompleted{notification} if matches!(&notification.item,TurnItem::SystemEvent{code,details,..} if code.as_deref()==Some("provider_phase") && details.as_ref().is_some_and(|d| d["phase"] == "settlement_completed"))) && release.is_none();
                                 match &event {
                                     AgentDurableEvent::ItemStarted { notification } if matches!(&notification.item,TurnItem::AgentMessage{phase:AgentMessagePhase::FinalAnswer,..}) => {
                                         assert!(release.is_none(), "preview must not start a canonical result");
@@ -5344,7 +5353,7 @@ mod phased_message_tests {
                     }
                     event = durable.recv() => {
                         let event = event.unwrap();
-                        let done = matches!(&event, AgentDurableEvent::ItemCompleted { notification } if matches!(&notification.item, TurnItem::SystemEvent { code, .. } if code.as_deref() == Some("provider_usage")));
+                        let done = matches!(&event, AgentDurableEvent::ItemCompleted { notification } if matches!(&notification.item, TurnItem::SystemEvent { code, details, .. } if code.as_deref() == Some("provider_phase") && details.as_ref().is_some_and(|d| d["phase"] == "settlement_completed")));
                         match &event {
                             AgentDurableEvent::ItemStarted { notification } if matches!(&notification.item, TurnItem::AgentMessage { phase: AgentMessagePhase::FinalAnswer, .. }) => {
                                 assert!(release.is_some());
@@ -5463,8 +5472,11 @@ mod phased_message_tests {
                                         release.send(()).unwrap();
                                     }
                                 }
-                                TurnItem::SystemEvent { code, .. }
-                                    if code.as_deref() == Some("provider_usage") =>
+                                TurnItem::SystemEvent { code, details, .. }
+                                    if code.as_deref() == Some("provider_phase")
+                                        && details.as_ref().is_some_and(|d| {
+                                            d["phase"] == "settlement_completed"
+                                        }) =>
                                 {
                                     receiver.acknowledge_last(Ok(()));
                                     break;
@@ -5539,7 +5551,7 @@ mod phased_message_tests {
                         assert_eq!(envelope.termination, ProviderTermination::Complete);
                         assert_eq!(envelope.ui_copies.unwrap().len(), 1);
                     }
-                    AgentDurableEvent::ItemCompleted { notification } if matches!(&notification.item,TurnItem::SystemEvent{code,..}if code.as_deref()==Some("provider_usage")) =>
+                    AgentDurableEvent::ItemCompleted { notification } if matches!(&notification.item,TurnItem::SystemEvent{code,details,..}if code.as_deref()==Some("provider_phase") && details.as_ref().is_some_and(|d| d["phase"] == "settlement_completed")) =>
                     {
                         receiver.acknowledge_last(Ok(()));
                         break;
@@ -5584,7 +5596,7 @@ mod phased_message_tests {
                     event,
                     AgentDurableEvent::TurnFinalizationPrepared { .. }
                 ));
-                let done = matches!(&event,AgentDurableEvent::ItemCompleted{notification}if matches!(&notification.item,TurnItem::SystemEvent{code,..}if code.as_deref()==Some("provider_usage")));
+                let done = matches!(&event,AgentDurableEvent::ItemCompleted{notification}if matches!(&notification.item,TurnItem::SystemEvent{code,details,..}if code.as_deref()==Some("provider_phase") && details.as_ref().is_some_and(|d| d["phase"] == "settlement_completed")));
                 if let AgentDurableEvent::TurnProviderHistoryAppended { payload, .. } = event {
                     observation = Some(
                         serde_json::from_value::<pioneer_provider::CanonicalProviderRoundEnvelope>(
@@ -5688,7 +5700,7 @@ mod control_deadline_tests {
         let consume = async {
             loop {
                 let event = events.recv().await.unwrap();
-                let done = matches!(&event,AgentDurableEvent::ItemCompleted{notification}if matches!(&notification.item,TurnItem::SystemEvent{code,..}if code.as_deref()==Some("provider_usage")));
+                let done = matches!(&event,AgentDurableEvent::ItemCompleted{notification}if matches!(&notification.item,TurnItem::SystemEvent{code,details,..}if code.as_deref()==Some("provider_phase") && details.as_ref().is_some_and(|d| d["phase"] == "settlement_completed")));
                 events.acknowledge_last(Ok(()));
                 if done {
                     break;
