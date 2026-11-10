@@ -237,8 +237,8 @@ fn capsule_run_with_rounds(
                 assert_eq!(action.status, "committed");
             }
         }
-        // UI metadata deliberately hashes strings. Assert against the canonical
-        // retained result that the model received, without changing UI storage.
+        // UI metadata deliberately hashes strings. Read the result JSON from
+        // the canonical provider message's content, without changing UI storage.
         let mut outputs = Vec::new();
         for entry in store
             .list_turn_llm_context(&lineage.child_turn_id)
@@ -251,9 +251,14 @@ fn capsule_run_with_rounds(
             let name = entry.tool_name.expect("retained tool result has a name");
             let view: pioneer_protocol::ToolResultView =
                 serde_json::from_str(&entry.payload).unwrap();
-            if let pioneer_protocol::ToolResultView::Json { value, .. } = view {
-                outputs.push((name, value));
-            }
+            let pioneer_protocol::ToolResultView::Json { value, .. } = view else {
+                panic!("retained tool result must contain a provider message");
+            };
+            let message: pioneer_provider::ChatMessage = serde_json::from_value(value).unwrap();
+            assert_eq!(message.name.as_deref(), Some(name.as_str()));
+            let result = serde_json::from_str(&message.content)
+                .expect("task tool provider message must contain result JSON");
+            outputs.push((name, result));
         }
         CapsuleStepResult { items, outputs }
     })
