@@ -40904,6 +40904,19 @@ mod tests {
         transaction.rollback().await.expect("release writer");
     }
 
+    async fn seed_observation_workspace(store: &CrudStore, workspace_id: &str) {
+        pioneer_entity::workspace::Entity::insert(pioneer_entity::workspace::ActiveModel {
+            id: Set(workspace_id.to_owned()),
+            name: Set("Observation fixture".to_owned()),
+            is_active: Set(true),
+            is_current: Set(true),
+            ..Default::default()
+        })
+        .exec(&store.connection)
+        .await
+        .expect("observation workspace should exist");
+    }
+
     async fn ensure_test_agent_identity(store: &CrudStore, workspace_id: &str, timestamp: i64) {
         let now = unix_to_datetime(timestamp);
         ensure_pioneer_for_workspace(&store.connection, workspace_id, now.clone())
@@ -58127,6 +58140,7 @@ mod tests {
         let turn_id = "turn_running_pages";
         let thread = sample_thread(workspace_id, thread_id, timestamp);
         let turn = sample_turn(turn_id);
+        seed_observation_workspace(&store, &thread.workspace_id).await;
         store
             .materialize_turn_start(
                 &thread,
@@ -58202,6 +58216,7 @@ mod tests {
         let at = 1_700_000_000;
         let thread = sample_thread("ws_timeout_pages", "thr_timeout_pages", at);
         let turn = sample_turn("turn_timeout_pages");
+        seed_observation_workspace(&store, &thread.workspace_id).await;
         store
             .materialize_turn_start(
                 &thread,
@@ -58632,6 +58647,7 @@ mod tests {
         let thread = sample_thread(workspace_id, thread_id, timestamp);
         let turn = sample_turn(turn_id);
 
+        seed_observation_workspace(&store, &thread.workspace_id).await;
         store
             .materialize_turn_start(
                 &thread,
@@ -59097,6 +59113,7 @@ mod tests {
         let thread = sample_thread(workspace_id, thread_id, timestamp);
         let turn = sample_turn(turn_id);
 
+        seed_observation_workspace(&store, &thread.workspace_id).await;
         store
             .materialize_turn_start(
                 &thread,
@@ -60626,6 +60643,7 @@ mod tests {
             permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
         };
 
+        seed_observation_workspace(&store, &thread.workspace_id).await;
         store
             .materialize_turn_start(
                 &thread,
@@ -63642,6 +63660,7 @@ mod tests {
             permission_profile: permission_profile.clone(),
         };
 
+        seed_observation_workspace(&store, &thread.workspace_id).await;
         store
             .materialize_turn_start(
                 &thread,
@@ -63860,6 +63879,7 @@ mod tests {
         executable_turn.mode = ThreadMode::Agent;
         let mut executable_audit = audit.clone();
         executable_audit.turn_id = executable_turn.id.clone();
+        seed_observation_workspace(&store, &thread.workspace_id).await;
         store
             .materialize_non_executable_system_turn_start_with_permission_audit(
                 &thread,

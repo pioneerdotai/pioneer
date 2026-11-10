@@ -2436,7 +2436,7 @@ where
 {
     let runtime = crate::build_gateway_runtime()
         .unwrap_or_else(|error| panic!("{name} runtime should build: {error}"));
-    let result = runtime.block_on(async move { tokio::spawn(future).await });
+    let result = runtime.block_on(async move { tokio::spawn(Box::pin(future)).await });
     // Test futures may leave best-effort blocking index work behind. Give it
     // a bounded grace period instead of waiting indefinitely during shutdown.
     runtime.shutdown_timeout(Duration::from_secs(5));
@@ -25195,7 +25195,7 @@ where
 {
     let runtime = crate::build_gateway_runtime()
         .unwrap_or_else(|error| panic!("{name} runtime should build: {error}"));
-    let result = runtime.block_on(async move { tokio::spawn(future).await });
+    let result = runtime.block_on(async move { tokio::spawn(Box::pin(future)).await });
     runtime.shutdown_timeout(Duration::from_secs(5));
     result.unwrap_or_else(|error| panic!("{name} task should finish: {error}"));
 }
