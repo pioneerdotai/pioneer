@@ -1030,6 +1030,24 @@ mod tests {
     }
 
     #[test]
+    fn model_launch_tools_cannot_authorize_context_expansion() {
+        for launch in [
+            json!({"contextWindow": 1050000}),
+            json!({"context_window": 1050000}),
+            json!({"contextAuthority": "copied-picker-proof"}),
+            json!({"profile": {"kind":"model", "providerId":"openai", "modelId":"model", "contextWindow":1050000}}),
+            json!({"profile": {"kind":"exact", "id":"P12345678901234567890", "contextWindow":1050000}}),
+        ] {
+            assert!(
+                serde_json::from_value::<AgentStartToolInput>(json!({
+                    "targetOptionId":"current", "input":[], "launch":launch,
+                }))
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
     fn omitted_launch_and_partial_launch_preserve_inheritance_and_direct_model_selection() {
         for launch in [
             None,

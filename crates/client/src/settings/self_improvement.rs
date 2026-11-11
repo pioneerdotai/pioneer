@@ -255,6 +255,8 @@ mod tests {
                 provider: Some(" openai ".to_owned()),
                 model: Some(" gpt-5.4 ".to_owned()),
                 selected_reasoning_effort: None,
+                selected_context_window: None,
+                selected_context_authority: None,
             }),
             Some(selection("openai", "gpt-5.4"))
         );
@@ -263,6 +265,8 @@ mod tests {
                 provider: Some("openai".to_owned()),
                 model: Some(" ".to_owned()),
                 selected_reasoning_effort: None,
+                selected_context_window: None,
+                selected_context_authority: None,
             })
             .is_none()
         );
@@ -274,6 +278,8 @@ mod tests {
                 provider: Some("openrouter".to_owned()),
                 model: Some("model".to_owned()),
                 selected_reasoning_effort: effort.map(str::to_owned),
+                selected_context_window: None,
+                selected_context_authority: None,
             })
             .unwrap();
             assert_eq!(selected.reasoning_effort.as_deref(), effort);

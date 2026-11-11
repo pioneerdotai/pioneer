@@ -54,6 +54,10 @@ remove = "Убрать упоминание"
 cancel = "Отменить ответ"
 
 [chat.composer.model]
+context_label = "Контекстное окно"
+context_auto = "Авто — до %{tokens} токенов"
+context_up_to = "До %{tokens} токенов"
+context_invalid = "Сохранённый вариант контекста недоступен. Выберите Авто или другое окно."
 select_label = "Выбрать модель"
 dialog_title = "Выбор модели"
 provider_label = "Провайдер"

@@ -918,6 +918,8 @@ async fn identical_reordered_and_compaction_only_saves_do_not_invalidate_or_sche
                 .find(|i| i.id == "codex")
                 .unwrap()
                 .compaction_model = Some(pioneer_protocol::GatewayModelSelection::Explicit {
+                context_authority: None,
+                context_window: None,
                 transport: pioneer_protocol::ModelSelectionTransport::Codex,
                 instance: "codex".into(),
                 model: "compaction-only".into(),

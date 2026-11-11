@@ -51,6 +51,20 @@
     "permission_mode": {
       "$ref": "#/$defs/TurnPermissionMode"
     },
+    "selected_context_authority": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "selected_context_window": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "minimum": 0
+    },
     "selected_mode": {
       "anyOf": [
         {

@@ -1094,6 +1094,31 @@ pub async fn set_turn_execution_envelope<C: ConnectionTrait>(
     Ok(update_result.rows_affected > 0)
 }
 
+/// Initialize only the missing Native/API financial cap in an existing owned
+/// execution snapshot. JSON functions are SeaQuery expressions inside Entity
+/// update; the condition makes concurrent legacy recovery initialization first-wins.
+/// No other security fields or versions are replaced by a stale caller.
+pub(crate) async fn pin_turn_native_context<C: ConnectionTrait>(
+    db: &C,
+    workspace: &str,
+    turn_id: &str,
+    budget_json: &str,
+    summary_json: &str,
+) -> Result<bool> {
+    let result = turn::Entity::update_many()
+        .filter(turn::Column::Id.eq(turn_id))
+        .filter(turn::Column::ThreadId.in_subquery(
+            pioneer_entity::thread::Entity::find().select_only().column(pioneer_entity::thread::Column::Id)
+                .filter(pioneer_entity::thread::Column::WorkspaceId.eq(workspace)).into_query(),
+        ))
+        .filter(Expr::cust("json_valid(execution_security_snapshot_json) AND json_type(execution_security_snapshot_json)='object' AND json_extract(execution_security_snapshot_json,'$.backend.execution_backend')='native' AND json_extract(execution_security_snapshot_json,'$.native_context') IS NULL"))
+        .col_expr(turn::Column::ExecutionSecuritySnapshotJson,
+            Expr::cust_with_values("json_set(execution_security_snapshot_json,'$.native_context',json(?),'$.native_summary',json(?))",
+                [budget_json.to_owned(), summary_json.to_owned()]))
+        .exec(db).await?;
+    Ok(result.rows_affected > 0)
+}
+
 pub async fn find_turn_execution_security_snapshot<C: ConnectionTrait>(
     db: &C,
     turn_id: &str,

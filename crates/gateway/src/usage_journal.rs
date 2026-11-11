@@ -149,6 +149,12 @@ impl Provider for JournalProvider {
     async fn prepare_model(&self, model: &str) -> Result<()> {
         self.inner.prepare_model(model).await
     }
+    async fn model_context_tiers(
+        &self,
+        model: &str,
+    ) -> Result<Option<pioneer_protocol::ProviderContextTiers>> {
+        self.inner.model_context_tiers(model).await
+    }
     async fn model_limits(&self, model: &str) -> Result<pioneer_provider::catalog::CatalogLimits> {
         self.inner.model_limits(model).await
     }

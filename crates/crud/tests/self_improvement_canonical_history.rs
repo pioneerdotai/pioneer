@@ -117,6 +117,8 @@ fn thread_with_origin(
     timestamp: i64,
 ) -> Thread {
     Thread {
+        context_window: None,
+        context_authority: None,
         workspace_id: workspace_id.to_owned(),
         id: thread_id.to_owned(),
         name: None,
@@ -300,6 +302,8 @@ async fn seed_failed_collaborative_context(
         data: None,
         finish_request: None,
         composer_work: Some(TaskComposerWork::v1(TurnStartParams {
+            context_authority: None,
+            context_window: None,
             agent_delegation_routes: Vec::new(),
             thread_id: parent_thread.id.clone(),
             turn_id: parent_turn.id.clone(),
@@ -982,6 +986,8 @@ async fn collaborative_canonical_history_contains_only_the_verified_causal_bundl
         data: None,
         finish_request: None,
         composer_work: Some(TaskComposerWork::v1(TurnStartParams {
+            context_authority: None,
+            context_window: None,
             agent_delegation_routes: Vec::new(),
             thread_id: parent_thread.id.clone(),
             turn_id: parent_turn.id.clone(),

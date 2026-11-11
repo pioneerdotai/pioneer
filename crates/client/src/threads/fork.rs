@@ -73,6 +73,8 @@ mod tests {
 
     fn coordinator(thread_id: &str, workspace_id: &str) -> ThreadCoordinator {
         ThreadCoordinator::new(Thread {
+            context_window: None,
+            context_authority: None,
             workspace_id: workspace_id.to_owned(),
             id: thread_id.to_owned(),
             name: Some("Source".to_owned()),

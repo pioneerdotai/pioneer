@@ -6,6 +6,13 @@
     "closed": {
       "type": "boolean"
     },
+    "context_rows": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/ContextWindowRow"
+      },
+      "default": []
+    },
     "owner_generation": {
       "type": "integer",
       "format": "uint64",
@@ -13,6 +20,20 @@
     },
     "picker_id": {
       "type": "string"
+    },
+    "selected_context_authority": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "selected_context_window": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "minimum": 0
     },
     "selected_reasoning_effort": {
       "type": [
@@ -40,6 +61,97 @@
       "enum": [
         "codex",
         "claude"
+      ]
+    },
+    "ContextWindowRow": {
+      "type": "object",
+      "properties": {
+        "window": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "tokens": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "selected": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "tokens",
+        "selected"
+      ]
+    },
+    "ProviderContextTiers": {
+      "description": "Authority-scoped, normalized context choices. Absence on a discovery DTO means unavailable metadata, distinct from a confirmed model without tiers.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "status": {
+              "type": "string",
+              "const": "no_tiers"
+            }
+          },
+          "required": [
+            "status"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "status": {
+              "type": "string",
+              "const": "excluded"
+            }
+          },
+          "required": [
+            "status"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "status": {
+              "type": "string",
+              "const": "invalid"
+            }
+          },
+          "required": [
+            "status"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "status": {
+              "type": "string",
+              "const": "tiered"
+            },
+            "windows": {
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "format": "uint64",
+                "minimum": 0
+              }
+            },
+            "price_order_confirmed": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "status",
+            "windows",
+            "price_order_confirmed"
+          ]
+        }
       ]
     },
     "ProviderModelCapabilities": {
@@ -134,6 +246,22 @@
         },
         "capabilities": {
           "$ref": "#/$defs/ProviderModelCapabilities"
+        },
+        "context_authority": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "context_tiers": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProviderContextTiers"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "created": {
           "type": [
@@ -320,6 +448,7 @@
       "type": "string",
       "enum": [
         "Chat",
+        "AuxiliaryChat",
         "SelfImprovement",
         "Embeddings",
         "Transcription"

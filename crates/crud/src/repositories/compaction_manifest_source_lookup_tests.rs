@@ -1138,6 +1138,8 @@ async fn inherited_input_alias_admits_only_exact_historical_checkpoint_coverage(
     )
     .await;
     let selection = serde_json::to_string(&ModelSelection {
+        context_authority: None,
+        context_window: None,
         transport: Transport::Api,
         instance: "publication-fixture".into(),
         model: "publication-model".into(),
@@ -2549,6 +2551,8 @@ async fn production_plan_scopes_zstd_source_and_logical_frozen_view_lookups() {
 
 fn raw_fixture_snapshot(operation: &str, owner: &str, coverage: Vec<SourceRef>) -> String {
     let selection = ModelSelection {
+        context_authority: None,
+        context_window: None,
         transport: Transport::Api,
         instance: "publication-fixture".into(),
         model: "publication-model".into(),
@@ -2615,6 +2619,8 @@ async fn publication_candidate(fixture: &Fixture, operation: &str, sources: usiz
     }
     let checkpoint = format!("{operation}-checkpoint");
     let selection = serde_json::to_string(&ModelSelection {
+        context_authority: None,
+        context_window: None,
         transport: Transport::Api,
         instance: "publication-fixture".into(),
         model: "publication-model".into(),

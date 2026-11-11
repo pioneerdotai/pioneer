@@ -2184,6 +2184,10 @@ impl ClientCore {
                 return Default::default();
             }
             if let Some(thread) = coordinator.thread_mut() {
+                if mode != pioneer_protocol::ThreadMode::Message {
+                    thread.context_window = update.selected_context_window;
+                    thread.context_authority = update.selected_context_authority.clone();
+                }
                 crate::turns::start::apply_prepared_turn_to_thread_snapshot(
                     thread,
                     mode,
@@ -6039,6 +6043,8 @@ mod tests {
 
     fn thread(thread_id: &str, workspace_id: &str) -> Thread {
         Thread {
+            context_window: None,
+            context_authority: None,
             workspace_id: workspace_id.to_owned(),
             id: thread_id.to_owned(),
             name: None,
@@ -10231,6 +10237,8 @@ mod tests {
                             selected_model: Some("local-model".into()),
                             selected_provider: Some("local-provider".into()),
                             selected_reasoning_effort: Some("high".into()),
+                            selected_context_window: None,
+                            selected_context_authority: None,
                             user_text: "First local message".into(),
                             updated_at_unix: 2,
                         },

@@ -280,6 +280,8 @@ mod tests {
     }
     fn selection() -> ModelSelection {
         ModelSelection {
+            context_authority: None,
+            context_window: None,
             transport: Transport::Api,
             instance: "fixture-instance".into(),
             model: "fixture-model".into(),

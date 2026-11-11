@@ -30,6 +30,8 @@ fn default_test_permission_profile() -> pioneer_protocol::TurnPermissionProfileS
 
 fn thread_snapshot_with_turn(turn: Turn) -> Thread {
     Thread {
+        context_window: None,
+        context_authority: None,
         workspace_id: WORKSPACE_ID.to_owned(),
         id: THREAD_ID.to_owned(),
         name: None,

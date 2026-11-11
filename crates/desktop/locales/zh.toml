@@ -54,6 +54,10 @@ remove = "移除提及"
 cancel = "取消回复"
 
 [chat.composer.model]
+context_label = "上下文窗口"
+context_auto = "自动 — 最多 %{tokens} 个令牌"
+context_up_to = "最多 %{tokens} 个令牌"
+context_invalid = "已保存的选项不可用。请选择自动或其他窗口。"
 select_label = "选择模型"
 dialog_title = "选择模型"
 provider_label = "提供商"

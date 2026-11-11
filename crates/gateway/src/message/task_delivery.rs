@@ -1038,6 +1038,8 @@ impl MessageProcessor {
             return Ok(turn_id);
         }
         let turn_params = TurnStartParams {
+            context_authority: None,
+            context_window: None,
             agent_delegation_routes: Vec::new(),
             thread_id: thread_id.to_owned(),
             turn_id: turn_id.clone(),

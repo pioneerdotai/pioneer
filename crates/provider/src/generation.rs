@@ -1261,6 +1261,8 @@ pub(crate) fn test_discovery(
     id: &str,
 ) -> pioneer_protocol::ProviderModelInfo {
     let mut models = [pioneer_protocol::ProviderModelInfo {
+        context_authority: None,
+        context_tiers: None,
         id: id.into(),
         name: None,
         description: None,

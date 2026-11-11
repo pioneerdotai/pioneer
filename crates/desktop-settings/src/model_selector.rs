@@ -47,6 +47,8 @@ pub(crate) struct ModelSelectorDialogOptions {
     pub(crate) selected_provider: Option<String>,
     pub(crate) selected_model: Option<String>,
     pub(crate) selected_reasoning_effort: Option<String>,
+    pub selected_context_window: Option<u64>,
+    pub selected_context_authority: Option<String>,
     pub(crate) mode: ProviderModelSelectorMode,
     pub(crate) workspace_id: String,
     pub(crate) client: std::sync::Arc<pioneer_client::core::ClientCore>,
@@ -141,6 +143,8 @@ impl SettingsScreenView {
             provider: options.selected_provider,
             model: options.selected_model,
             selected_reasoning_effort: options.selected_reasoning_effort,
+            selected_context_window: options.selected_context_window,
+            selected_context_authority: options.selected_context_authority.clone(),
         })
         .mode(options.mode)
         .on_refresh(Rc::new(move |cx| {
@@ -540,6 +544,13 @@ impl ModelSelectorDialog {
                         model_trigger_loading,
                     ));
 
+                    let form = if let Some(context) =
+                        Self::render_context_selector_section(state.clone())
+                    {
+                        form.child(context)
+                    } else {
+                        form
+                    };
                     if let Some(reasoning_section) =
                         Self::render_reasoning_effort_selector_section(state.clone())
                     {
@@ -882,6 +893,62 @@ impl ModelSelectorDialog {
                         .size_full(),
                     ),
             )
+    }
+
+    fn render_context_selector_section(state: ModelSelectorDialogState) -> Option<Field> {
+        let rows = state.value.borrow().context_rows.clone();
+        if rows.is_empty() {
+            return None;
+        }
+        let invalid = state.value.borrow().selected_context_window.is_some()
+            && !rows.iter().any(|row| row.selected);
+        let mut choices = v_flex().gap_1().w_full();
+        if invalid {
+            choices = choices.child(
+                div()
+                    .text_sm()
+                    .child(t!("chat.composer.model.context_invalid").to_string()),
+            );
+        }
+        for row in rows {
+            let next = state.clone();
+            let window = row.window;
+            let label = if window.is_none() {
+                t!(
+                    "chat.composer.model.context_auto",
+                    tokens = row.tokens.to_string()
+                )
+                .to_string()
+            } else {
+                t!(
+                    "chat.composer.model.context_up_to",
+                    tokens = row.tokens.to_string()
+                )
+                .to_string()
+            };
+            choices = choices.child(
+                default_outline_button(SharedString::from(format!(
+                    "context-window-{}",
+                    window.map_or_else(|| "auto".into(), |v| v.to_string())
+                )))
+                .w_full()
+                .label(label)
+                .selected(row.selected)
+                .on_click(move |_, _, cx| {
+                    next.intent(SettingsModelPickerIntent::SelectContextWindow {
+                        picker_id: next.picker_id.clone(),
+                        expected_owner: next.generation,
+                        window,
+                    });
+                    (next.on_refresh)(cx);
+                }),
+            );
+        }
+        Some(
+            field()
+                .label(t!("chat.composer.model.context_label").to_string())
+                .child(choices),
+        )
     }
 
     fn render_reasoning_effort_selector_section(state: ModelSelectorDialogState) -> Option<Field> {
@@ -1418,6 +1485,8 @@ mod tests {
                     provider: None,
                     model: None,
                     selected_reasoning_effort: None,
+                    selected_context_window: None,
+                    selected_context_authority: None,
                 },
             })
         };

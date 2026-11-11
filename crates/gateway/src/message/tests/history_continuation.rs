@@ -591,6 +591,8 @@ async fn durable_final_case(
         thread.len()
     );
     let selection = ModelSelection {
+        context_authority: None,
+        context_window: None,
         transport: Transport::Api,
         instance: "fixture".into(),
         model: "fixture".into(),

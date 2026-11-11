@@ -3824,6 +3824,8 @@ mod tests {
     #[test]
     fn composer_work_round_trips_exact_launch_and_rebinds_only_execution_ids() {
         let launch = crate::TurnStartParams {
+            context_authority: None,
+            context_window: None,
             agent_delegation_routes: Vec::new(),
             thread_id: "thr_parent".to_owned(),
             turn_id: "turn_planned".to_owned(),

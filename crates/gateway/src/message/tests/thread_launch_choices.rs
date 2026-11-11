@@ -1718,6 +1718,8 @@ async fn cli_parent_selects_only_unambiguous_api_choices_for_threads_and_tasks()
             let pioneer_protocol::TaskDerivedChildLaunchGrant::ResolvedTaskLaunch {
                 identity,
                 profile,
+                native_context,
+                native_summary,
                 ..
             } = serde_json::from_str(actor.derived_child_launch_grant_json.as_deref().unwrap())
                 .unwrap();
@@ -1730,6 +1732,29 @@ async fn cli_parent_selects_only_unambiguous_api_choices_for_threads_and_tasks()
             assert_eq!(
                 profile.backend,
                 pioneer_protocol::AgentExecutionProfileBackend::ApiProvider
+            );
+            let budget = native_context.expect("API Task grant freezes its context before commit");
+            assert_eq!(
+                (&budget.instance, &budget.model),
+                (&profile.provider_id, &profile.model_id)
+            );
+            assert_eq!(
+                budget.manual_window, None,
+                "a model-authored API switch cannot inherit CLI financial choices"
+            );
+            assert!(budget.context_window > 0);
+            if let Some(summary) = native_summary.filter(|summary| summary.inherits_working) {
+                assert_eq!(summary.budget, budget);
+            }
+            let restored = processor
+                .crud_store
+                .get_task_actor_contract(&actor.task_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                restored.derived_child_launch_grant_json,
+                actor.derived_child_launch_grant_json
             );
         } else {
             assert!(matches!(

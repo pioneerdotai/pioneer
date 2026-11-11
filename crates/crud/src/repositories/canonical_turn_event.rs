@@ -1047,6 +1047,8 @@ mod tests {
                 .expect("timestamp"),
             payload: CanonicalTurnEventPayload::TurnStarted(CanonicalTurnStartedEventPayload {
                 thread: Thread {
+                    context_window: None,
+                    context_authority: None,
                     workspace_id: "workspace_message".to_owned(),
                     id: "thread_message".to_owned(),
                     name: None,

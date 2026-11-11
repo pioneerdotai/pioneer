@@ -97,6 +97,8 @@ async fn creation_order_index_installs_upgrades_and_rolls_back_without_changing_
 
 fn thread(id: &str, workspace: &str) -> Thread {
     Thread {
+        context_window: None,
+        context_authority: None,
         workspace_id: workspace.into(),
         id: id.into(),
         name: Some(id.into()),

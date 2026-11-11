@@ -377,6 +377,8 @@ mod tests {
         store
             .materialize_turn_start(
                 &Thread {
+                    context_window: None,
+                    context_authority: None,
                     workspace_id: DEFAULT_WORKSPACE_ID.to_owned(),
                     id: thread_id.to_owned(),
                     name: Some("Bootstrap recovery".to_owned()),

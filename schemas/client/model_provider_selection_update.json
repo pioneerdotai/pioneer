@@ -9,6 +9,20 @@
     "loading_models": {
       "type": "boolean"
     },
+    "selected_context_authority": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "selected_context_window": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "minimum": 0
+    },
     "selected_model": {
       "type": [
         "string",

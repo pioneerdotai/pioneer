@@ -5792,6 +5792,8 @@ mod tests {
     ) {
         let timestamp = 1_700_000_000;
         let thread = Thread {
+            context_window: None,
+            context_authority: None,
             workspace_id: workspace_id.to_owned(),
             id: thread_id.to_owned(),
             name: None,

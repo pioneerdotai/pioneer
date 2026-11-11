@@ -263,6 +263,13 @@ impl ComposerModelPickerView {
                             model_trigger_label,
                             model_trigger_loading,
                         ));
+                    let form = if let Some(context) =
+                        Self::render_context_selector_section(state.clone())
+                    {
+                        form.child(context)
+                    } else {
+                        form
+                    };
                     if let Some(reasoning) = Self::render_reasoning_effort_selector_section(state) {
                         form.child(reasoning)
                     } else {
@@ -579,6 +586,63 @@ impl ComposerModelPickerView {
                         .size_full(),
                     ),
             )
+    }
+
+    fn render_context_selector_section(state: ModelSelectorDialogState) -> Option<Field> {
+        let rows = state.input.context_rows.clone();
+        if rows.is_empty() {
+            return None;
+        }
+        let invalid =
+            state.input.selected_context_window.is_some() && !rows.iter().any(|row| row.selected);
+        let mut choices = v_flex().gap_1().w_full();
+        if invalid {
+            choices = choices.child(
+                div()
+                    .text_sm()
+                    .child(t!("chat.composer.model.context_invalid").to_string()),
+            );
+        }
+        for row in rows {
+            let next = state.clone();
+            let window = row.window;
+            let label = if window.is_none() {
+                t!(
+                    "chat.composer.model.context_auto",
+                    tokens = row.tokens.to_string()
+                )
+                .to_string()
+            } else {
+                t!(
+                    "chat.composer.model.context_up_to",
+                    tokens = row.tokens.to_string()
+                )
+                .to_string()
+            };
+            choices = choices.child(
+                default_outline_button(SharedString::from(format!(
+                    "context-window-{}",
+                    window.map_or_else(|| "auto".into(), |v| v.to_string())
+                )))
+                .w_full()
+                .label(label)
+                .selected(row.selected)
+                .on_click(move |_, _, cx| {
+                    next.send(
+                        ComposerModelPickerIntent::SelectContextWindow {
+                            identity: next.input.identity.clone(),
+                            window,
+                        },
+                        cx,
+                    );
+                }),
+            );
+        }
+        Some(
+            field()
+                .label(t!("chat.composer.model.context_label").to_string())
+                .child(choices),
+        )
     }
 
     fn render_reasoning_effort_selector_section(state: ModelSelectorDialogState) -> Option<Field> {
@@ -1236,6 +1300,7 @@ mod lifecycle_tests {
                 .clone();
             trigger.focus(window, cx);
             let input = Arc::new(ComposerModelPickerPublication {
+                context_rows: vec![],
                 identity: ComposerOperationIdentity {
                     thread_id: "a".into(),
                     draft_id: draft.draft_id(),
@@ -1244,6 +1309,8 @@ mod lifecycle_tests {
                 revision: 1,
                 selector: ProviderModelSelectorState::new(None, None),
                 selected_reasoning_effort: None,
+                selected_context_window: None,
+                selected_context_authority: None,
                 deferred: true,
                 closed: false,
                 providers_request: Default::default(),

@@ -9155,6 +9155,8 @@ mod tests {
         timestamp: i64,
     ) {
         let thread = Thread {
+            context_window: None,
+            context_authority: None,
             workspace_id: workspace_id.to_owned(),
             id: thread_id.to_owned(),
             name: None,

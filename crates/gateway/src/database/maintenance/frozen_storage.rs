@@ -1225,6 +1225,8 @@ mod tests {
             [serde_json::to_string(&state).unwrap().into()],
         )).await.unwrap();
         let selection = ModelSelection {
+            context_authority: None,
+            context_window: None,
             transport: Transport::Api,
             instance: "p".into(),
             model: "m".into(),

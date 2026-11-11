@@ -1290,6 +1290,8 @@ fn provider_model_from_bedrock_model_summary(m: BedrockModelSummary) -> Provider
     };
 
     ProviderModelInfo {
+        context_authority: None,
+        context_tiers: None,
         id: model_id,
         name: m.model_name,
         description: None,

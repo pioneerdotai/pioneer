@@ -7965,6 +7965,8 @@ mod tests {
                 .as_millis() as u64;
             let session = NativeContextSession::new(
                 NativeContext {
+                    context_budget: None,
+                    summary_context: None,
                     overflow_recovery: true,
                     recovery_deadline_ms: Some(now_ms + 60_000),
                     workspace_id: "workspace".into(),
@@ -10713,6 +10715,8 @@ mod tests {
         let mut durable = hub.take_durable_receiver().await.unwrap();
         let session = NativeContextSession::new(
             NativeContext {
+                context_budget: None,
+                summary_context: None,
                 overflow_recovery: false,
                 recovery_deadline_ms: None,
                 workspace_id: "workspace".into(),

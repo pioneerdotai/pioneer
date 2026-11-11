@@ -1278,6 +1278,8 @@ impl crate::traits::Provider for AzureOpenAiProvider {
                 let capabilities = ProviderModelCapabilities::default();
 
                 ProviderModelInfo {
+                    context_authority: None,
+                    context_tiers: Some(pioneer_protocol::ProviderContextTiers::Excluded),
                     id: m.id.clone(),
                     name: None,
                     description: None,

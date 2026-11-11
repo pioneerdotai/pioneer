@@ -4340,6 +4340,8 @@ mod tests {
         ) -> anyhow::Result<Vec<pioneer_protocol::ProviderModelInfo>> {
             self.list_calls.fetch_add(1, Ordering::SeqCst);
             Ok(vec![pioneer_protocol::ProviderModelInfo {
+                context_authority: None,
+                context_tiers: None,
                 id: "vendor/custom-embed".to_owned(),
                 name: Some("Custom Embed".to_owned()),
                 description: None,
@@ -12568,6 +12570,8 @@ mod tests {
         timestamp: i64,
     ) {
         let thread = Thread {
+            context_window: None,
+            context_authority: None,
             workspace_id: workspace_id.to_owned(),
             id: thread_id.to_owned(),
             name: None,

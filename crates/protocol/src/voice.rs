@@ -396,6 +396,10 @@ fn validate_voice_chunk_header_common(
 /// successful transcription.
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
 pub struct VoiceTurnContext {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_authority: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
     /// Workspace active when the voice session starts.
     ///
     /// `TurnStartParams` is still thread-scoped; the gateway keeps the
@@ -447,6 +451,8 @@ impl VoiceTurnContext {
         input.extend(self.prepared_input);
 
         TurnStartParams {
+            context_authority: self.context_authority,
+            context_window: self.context_window,
             agent_delegation_routes: Vec::new(),
             thread_id: self.thread_id,
             turn_id: self.turn_id,
@@ -701,6 +707,8 @@ mod tests {
     #[test]
     fn voice_control_dtos_round_trip_through_serde() {
         let context = VoiceTurnContext {
+            context_authority: None,
+            context_window: None,
             workspace_id: "workspace_1".to_owned(),
             thread_id: "thread_1".to_owned(),
             turn_id: "turn_1".to_owned(),
@@ -800,6 +808,8 @@ mod tests {
     #[test]
     fn voice_context_prepends_transcript_without_embedding_it_in_frozen_context() {
         let context = VoiceTurnContext {
+            context_authority: None,
+            context_window: None,
             workspace_id: "workspace_1".to_owned(),
             thread_id: "thread_1".to_owned(),
             turn_id: "turn_1".to_owned(),

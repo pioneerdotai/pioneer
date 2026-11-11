@@ -335,3 +335,8 @@
 "timeline.web_search.running" = "Recherche sur le web"
 "timeline.work_group.completed" = "A travaillé"
 "chat.composer.preparing_send" = "Préparation du message"
+
+"chat.composer.model.context_label" = "Fenêtre de contexte"
+"chat.composer.model.context_auto" = "Auto — jusqu’à %{tokens} tokens"
+"chat.composer.model.context_up_to" = "Jusqu’à %{tokens} tokens"
+"chat.composer.model.context_invalid" = "Le choix enregistré est indisponible. Choisissez Auto ou une autre fenêtre."

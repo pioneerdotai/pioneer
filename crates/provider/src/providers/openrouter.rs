@@ -1856,6 +1856,8 @@ fn provider_model_from_openrouter_model_entry(m: OpenRouterModelEntry) -> Provid
     }
 
     ProviderModelInfo {
+        context_authority: None,
+        context_tiers: None,
         id: m.id.clone(),
         name: m.name,
         description: m.description,

@@ -1695,6 +1695,8 @@ mod tests {
 
     fn test_context() -> VoiceTurnContext {
         VoiceTurnContext {
+            context_authority: None,
+            context_window: None,
             workspace_id: "workspace_1".to_owned(),
             thread_id: "thread_1".to_owned(),
             turn_id: "turn_1".to_owned(),
