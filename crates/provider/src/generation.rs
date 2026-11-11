@@ -499,7 +499,8 @@ pub(crate) fn chat_fields_from_catalog(
     let native = native_reasoning(provider, &request.model);
     let model = resolved_reasoning_model(catalog, provider, &request.model);
     validate_native_reasoning(provider, request, &Fields::new(), &native)?;
-    let fields = chat_fields_with_model(provider, request, model.as_ref())?;
+    let mut fields = chat_fields_with_model(provider, request, model.as_ref())?;
+    crate::service_mode::apply(provider, "chat_completions", request, &mut fields)?;
     validate_native_reasoning(provider, request, &fields, &native)?;
     Ok(fields)
 }
@@ -573,12 +574,25 @@ fn responses_fields_from_catalog(
     validate_cap_with_catalog(catalog, provider, request)?;
     let model = resolved_reasoning_model(catalog, provider, &request.model);
     let native = native_reasoning(provider, &request.model);
+    if request.service_mode.as_ref().is_some_and(|plan| {
+        matches!(
+            plan.parameters,
+            pioneer_protocol::ServiceModeParameters::OpenAiPro
+        )
+    }) {
+        ensure!(
+            native.get("reasoning.supported") != Some(&Some(false))
+                && model.as_ref().is_none_or(|model| model.reasoning),
+            "selected model authority denies Pro reasoning"
+        );
+    }
     validate_native_reasoning(provider, request, &Fields::new(), &native)?;
-    let fields = if provider == "openai" {
+    let mut fields = if provider == "openai" {
         openai_api_fields(provider, request, model.as_ref(), true)?
     } else {
         responses_fields_with_model(provider, request, model.as_ref())?
     };
+    crate::service_mode::apply(provider, "responses", request, &mut fields)?;
     validate_native_reasoning(provider, request, &fields, &native)?;
     Ok(fields)
 }
@@ -1025,6 +1039,8 @@ fn gemini_thinking_with_model(
 #[cfg(test)]
 pub(crate) fn test_request(model: &str) -> ChatRequest {
     ChatRequest {
+        tool_declarations: None,
+        service_mode: None,
         model: model.into(),
         messages: vec![crate::types::ChatMessage::user("Hello")],
         temperature: None,
@@ -1063,10 +1079,27 @@ pub(crate) fn anthropic_fields_with_catalog(
     provider: &str,
     request: &ChatRequest,
 ) -> Result<Fields> {
+    ensure!(
+        !request.service_mode.as_ref().is_some_and(|plan| matches!(
+            plan.parameters,
+            pioneer_protocol::ServiceModeParameters::BedrockNestedUltrafast
+        )) || request.reasoning.is_none(),
+        "This Bedrock service preset requires model-default reasoning in this adapter; select Default reasoning"
+    );
     validate_cap_with_catalog(catalog, provider, request)?;
     let native = native_reasoning(provider, &request.model);
     let model = resolved_reasoning_model(catalog, provider, &request.model);
-    let fields = anthropic_fields_with_model(provider, request, model.as_ref())?;
+    let mut fields = anthropic_fields_with_model(provider, request, model.as_ref())?;
+    crate::service_mode::apply(
+        provider,
+        if provider == "bedrock" {
+            "bedrock_converse"
+        } else {
+            "messages"
+        },
+        request,
+        &mut fields,
+    )?;
     validate_native_reasoning(provider, request, &fields, &native)?;
     Ok(fields)
 }
@@ -1155,6 +1188,8 @@ pub(crate) fn effort_supported_with_native(
     let model = reasoning_model(provider, model, native);
     let model = model.as_ref();
     let request = ChatRequest {
+        tool_declarations: None,
+        service_mode: None,
         model: id.into(),
         messages: vec![],
         temperature: None,
@@ -1261,6 +1296,9 @@ pub(crate) fn test_discovery(
     id: &str,
 ) -> pioneer_protocol::ProviderModelInfo {
     let mut models = [pioneer_protocol::ProviderModelInfo {
+        service_modes: None,
+        context_authority: None,
+        context_tiers: None,
         id: id.into(),
         name: None,
         description: None,

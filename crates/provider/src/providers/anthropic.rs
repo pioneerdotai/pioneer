@@ -1520,8 +1520,11 @@ impl crate::traits::Provider for AnthropicProvider {
             .header("anthropic-version", ANTHROPIC_VERSION)
             .header("content-type", "application/json")
             .json(&api_request);
-        if crate::continuation::anthropic_inline_tools(&api_request) {
-            request_builder = request_builder.header("anthropic-beta", "inline-tools-2026-09-15");
+        if let Some(beta) = crate::service_mode::anthropic_beta(
+            &request,
+            crate::continuation::anthropic_inline_tools(&api_request),
+        ) {
+            request_builder = request_builder.header("anthropic-beta", beta);
         }
         let response = crate::http::non_stream_request(request_builder, self.timeout_policy)
             .send()
@@ -1579,8 +1582,11 @@ impl crate::traits::Provider for AnthropicProvider {
             .header("anthropic-version", ANTHROPIC_VERSION)
             .header("content-type", "application/json")
             .json(&api_request);
-        if crate::continuation::anthropic_inline_tools(&api_request) {
-            request_builder = request_builder.header("anthropic-beta", "inline-tools-2026-09-15");
+        if let Some(beta) = crate::service_mode::anthropic_beta(
+            &request,
+            crate::continuation::anthropic_inline_tools(&api_request),
+        ) {
+            request_builder = request_builder.header("anthropic-beta", beta);
         }
         let response =
             crate::http::send_stream_request(request_builder, self.timeout_policy).await?;
@@ -1672,6 +1678,9 @@ fn provider_model_from_anthropic_model_entry(m: AnthropicModelEntry) -> Provider
     }
 
     ProviderModelInfo {
+        service_modes: None,
+        context_authority: None,
+        context_tiers: None,
         id: m.id.clone(),
         name: m.display_name,
         description: None,
@@ -1697,6 +1706,122 @@ fn provider_model_from_anthropic_model_entry(m: AnthropicModelEntry) -> Provider
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn disclosed_tools_keep_prefix_in_serialized_payload() {
+        let render = |request: ChatRequest| {
+            let request = crate::tools::policy::prepare_request("anthropic", request).unwrap();
+            serde_json::to_value(
+                AnthropicProvider::build_chat_request_with_catalog(
+                    &request,
+                    None,
+                    Vec::new(),
+                    false,
+                    None,
+                )
+                .unwrap(),
+            )
+            .unwrap()
+        };
+        let mut request = crate::tools::policy::test_request();
+        let before = render(request.clone());
+        let mut added = request.tools.as_ref().unwrap()[0].clone();
+        added.name = "alpha".into();
+        request.tools.as_mut().unwrap().push(added);
+        let body = render(request);
+        assert_eq!(
+            body["tools"][0], before["tools"][0],
+            "entire previously serialized definition must survive expansion"
+        );
+        assert_eq!(body["tools"][0]["name"], "lookup");
+        assert_eq!(body["tools"][1]["name"], "alpha");
+    }
+
+    #[test]
+    fn service_speed_preserves_existing_beta_and_resets_on_standard() {
+        use pioneer_protocol::{NativeServiceModePlan, ServiceModeParameters as P};
+        // Two model-bound contracts: Fast with a required beta, and Fast
+        // without one. Standard omits speed on both (no beta-gated field).
+        for beta in [Some("fast-mode-2026-02-01"), None] {
+            let catalog = crate::generation::test_catalog_model(
+                "anthropic",
+                "speed-fixture",
+                "claude-opus-4-6",
+                serde_json::json!({"sourceMetadata":{"experimental":{"modes":{"fast":{
+                    "provider":{"body":{"speed":"fast"}, "headers": match beta {
+                        Some(token) => serde_json::json!({"anthropic-beta":token}),
+                        None => serde_json::json!({}),
+                    }}
+                }}}}}),
+            );
+            let Some(pioneer_protocol::SourceServiceModes::Known(modes)) =
+                catalog.source_service_modes("anthropic", "speed-fixture")
+            else {
+                panic!("expected model-bound source contract");
+            };
+            let pioneer_protocol::SourceServiceMode::Parsed { descriptor } = &modes["fast"] else {
+                panic!("expected supported Fast shape");
+            };
+            let mut req = crate::generation::test_request("speed-fixture");
+            for (parameters, expected_speed) in [
+                (None, None),                       // legacy/omitted selection
+                (Some(P::AnthropicStandard), None), // Native default
+                (Some(descriptor.parameters.clone()), Some("fast")),
+                (Some(P::AnthropicStandard), None), // explicit reset after Fast
+                (None, None),
+            ] {
+                req.service_mode = parameters.map(|parameters| NativeServiceModePlan {
+                    id: if expected_speed.is_some() {
+                        "fast"
+                    } else {
+                        "standard"
+                    }
+                    .into(),
+                    parameters,
+                });
+                let facts =
+                    crate::service_mode::request_fields("anthropic", "messages", &req).unwrap();
+                for stream in [false, true] {
+                    let body = serde_json::to_value(
+                        AnthropicProvider::build_chat_request_with_catalog(
+                            &req,
+                            None,
+                            vec![],
+                            stream,
+                            Some(&catalog),
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        body.get("speed").and_then(serde_json::Value::as_str),
+                        expected_speed
+                    );
+                    assert_eq!(body["model"], "speed-fixture");
+                    assert_eq!(facts["body"].get("speed"), body.get("speed"));
+                }
+                let service_beta = if expected_speed.is_some() { beta } else { None };
+                assert_eq!(
+                    crate::service_mode::anthropic_beta(&req, false).as_deref(),
+                    service_beta
+                );
+                let expected_header = match service_beta {
+                    Some(_) => "inline-tools-2026-09-15,fast-mode-2026-02-01",
+                    None => "inline-tools-2026-09-15",
+                };
+                assert_eq!(
+                    crate::service_mode::anthropic_beta(&req, true).as_deref(),
+                    Some(expected_header)
+                );
+                assert_eq!(
+                    facts["beta_tokens"],
+                    match service_beta {
+                        Some(token) => serde_json::json!([token]),
+                        None => serde_json::json!([]),
+                    }
+                );
+            }
+        }
+    }
     #[tokio::test]
     async fn native_disabled_mode_overrides_catalog_veto_and_serializes_messages() {
         let id = "quartz-custom-789";
@@ -2581,6 +2706,8 @@ mod tests {
     #[test]
     fn compiled_prompt_payload_overrides_raw_system_messages() {
         let request = ChatRequest {
+            tool_declarations: None,
+            service_mode: None,
             model: "claude-sonnet-4-20250514".into(),
             messages: vec![
                 ChatMessage::system("legacy system prompt should be ignored"),
@@ -2662,6 +2789,8 @@ mod tests {
     async fn chat_fails_without_valid_key() {
         let provider = AnthropicProvider::new("sk-ant-invalid-key");
         let request = ChatRequest {
+            tool_declarations: None,
+            service_mode: None,
             model: "claude-sonnet-4-20250514".into(),
             messages: vec![ChatMessage::user("Hello")],
             temperature: None,

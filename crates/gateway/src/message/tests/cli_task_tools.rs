@@ -4850,6 +4850,15 @@ async fn start_threads_cli_fixture_with_policy(
         .await
         .unwrap();
     let mut security = test_full_access_execution_security_snapshot();
+    security.backend.execution_backend = match kind {
+        CLIAgentRuntimeKind::Codex => pioneer_protocol::TurnSecurityExecutionBackendKind::CodexCli,
+        CLIAgentRuntimeKind::Claude => {
+            pioneer_protocol::TurnSecurityExecutionBackendKind::ClaudeCli
+        }
+        CLIAgentRuntimeKind::OpenCode => {
+            pioneer_protocol::TurnSecurityExecutionBackendKind::OpenCodeCli
+        }
+    };
     security.permission_profile = profile.clone();
     let revalidation = processor
         .execution_leases

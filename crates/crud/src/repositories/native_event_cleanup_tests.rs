@@ -202,6 +202,9 @@ impl Fixture {
     }
     async fn turn_in_schema(&self, id: &str, completed: bool, historical: bool) -> Result<()> {
         let thread = Thread {
+            context_window: None,
+            service_mode: None,
+            context_authority: None,
             workspace_id: "ws-cleanup".into(),
             id: "thread-cleanup".into(),
             name: None,

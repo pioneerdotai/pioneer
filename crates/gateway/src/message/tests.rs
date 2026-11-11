@@ -474,6 +474,9 @@ async fn ensure_test_superuser_execution_turn(
     {
         let timestamp = now_timestamp_secs();
         let thread = Thread {
+            context_window: None,
+            service_mode: None,
+            context_authority: None,
             workspace_id: workspace_id.to_owned(),
             id: thread_id.to_owned(),
             name: None,
@@ -3762,6 +3765,9 @@ async fn materialize_thread_episodic_ingest_turn(
     crud_store
         .materialize_turn_start(
             &Thread {
+                context_window: None,
+                service_mode: None,
+                context_authority: None,
                 workspace_id: workspace_id.to_owned(),
                 id: thread_id.to_owned(),
                 name: None,
@@ -4141,6 +4147,9 @@ impl Provider for DelayedProvider {
 
     async fn list_models(&self) -> anyhow::Result<Vec<pioneer_protocol::ProviderModelInfo>> {
         Ok(vec![pioneer_protocol::ProviderModelInfo {
+            service_modes: None,
+            context_authority: None,
+            context_tiers: None,
             id: "test-model".to_owned(),
             name: Some("Delayed fixture model".to_owned()),
             description: None,
@@ -4588,6 +4597,9 @@ impl Provider for CaptureSummaryProvider {
         Ok(["test-model", "o4-mini"]
             .into_iter()
             .map(|id| pioneer_protocol::ProviderModelInfo {
+                service_modes: None,
+                context_authority: None,
+                context_tiers: None,
                 id: id.to_owned(),
                 name: Some(format!("{id} native capture fixture")),
                 description: None,
@@ -4805,6 +4817,9 @@ impl Provider for PromptParityCaptureProvider {
 
     async fn list_models(&self) -> anyhow::Result<Vec<pioneer_protocol::ProviderModelInfo>> {
         Ok(vec![pioneer_protocol::ProviderModelInfo {
+            service_modes: None,
+            context_authority: None,
+            context_tiers: None,
             id: "gpt-5.4".to_owned(),
             name: Some("GPT-5.4 parity fixture".to_owned()),
             description: Some("Reasoning-capable prompt parity test model".to_owned()),
@@ -8189,6 +8204,8 @@ async fn partial_base_url_write_failure_reconciles_only_its_workspace_authority(
     assert!(
         old_a
             .chat(pioneer_provider::ChatRequest {
+                tool_declarations: None,
+                service_mode: None,
                 model: "fixture".into(),
                 messages: vec![pioneer_provider::ChatMessage::user("hello")],
                 temperature: None,
@@ -8582,6 +8599,9 @@ fn detached_cli_task_create_params(
         finish_request: None,
         composer_work: Some(pioneer_protocol::TaskComposerWork::v1(
             pioneer_protocol::TurnStartParams {
+                service_mode: None,
+                context_authority: None,
+                context_window: None,
                 agent_delegation_routes: Vec::new(),
                 thread_id: parent_thread_id.to_owned(),
                 turn_id: parent_turn_id.to_owned(),
@@ -9234,6 +9254,9 @@ async fn ensure_task_create_parent_turn_for_test(
     {
         let created_at = super::now_timestamp_secs();
         let thread = Thread {
+            context_window: None,
+            service_mode: None,
+            context_authority: None,
             workspace_id: params.workspace_id.clone(),
             id: parent_thread_id.to_owned(),
             name: None,
@@ -9381,6 +9404,9 @@ async fn seed_completed_task_parent_with_inputs_at(
         .crud_store
         .materialize_turn_start(
             &Thread {
+                context_window: None,
+                service_mode: None,
+                context_authority: None,
                 workspace_id: workspace_id.to_owned(),
                 id: parent_thread_id.to_owned(),
                 name: Some("Native Task parent".to_owned()),
@@ -9558,8 +9584,10 @@ async fn detach_task_for_test(
 
 pub(crate) fn test_summary_config() -> super::summary::SummaryConfig {
     super::summary::SummaryConfig {
-        summary_model: Some("test-model".to_owned()),
-        summary_model_provider: Some("echo".to_owned()),
+        // General fixtures inherit the working provider's context budget.
+        // Tests of a separate summarizer configure their own registered provider.
+        summary_model: None,
+        summary_model_provider: None,
         title_model: Some("test-model".to_owned()),
         title_model_provider: Some("echo".to_owned()),
     }
@@ -10136,6 +10164,9 @@ async fn setup_progress_delta_harness(
     };
 
     let thread = pioneer_protocol::Thread {
+        context_window: None,
+        service_mode: None,
+        context_authority: None,
         workspace_id: workspace_id.clone(),
         id: thread_id.clone(),
         name: None,
@@ -12148,6 +12179,9 @@ async fn long_russian_first_message_generates_parent_title_successfully() {
 
     let thread_id = "thr_title_russian_0001";
     let thread = pioneer_protocol::Thread {
+        context_window: None,
+        service_mode: None,
+        context_authority: None,
         workspace_id: workspace_id.clone(),
         id: thread_id.to_owned(),
         name: None,
@@ -12240,6 +12274,9 @@ async fn repeated_title_triggers_are_singleflight_per_thread() {
 
     let thread_id = "thr_title_singleflight_0001";
     let thread = pioneer_protocol::Thread {
+        context_window: None,
+        service_mode: None,
+        context_authority: None,
         workspace_id: workspace_id.clone(),
         id: thread_id.to_owned(),
         name: None,
@@ -12512,6 +12549,9 @@ async fn title_generation_retries_after_transient_failure() {
 
     let thread_id = "thr_title_retry_0001";
     let thread = pioneer_protocol::Thread {
+        context_window: None,
+        service_mode: None,
+        context_authority: None,
         workspace_id: workspace_id.clone(),
         id: thread_id.to_owned(),
         name: None,
@@ -12605,6 +12645,9 @@ async fn child_thread_scope_skips_auto_title_generation() {
     let child_title = "Child keeps parent name";
     let thread_id = "thr_title_child_scope_0001";
     let thread = pioneer_protocol::Thread {
+        context_window: None,
+        service_mode: None,
+        context_authority: None,
         workspace_id: workspace_id.clone(),
         id: thread_id.to_owned(),
         name: Some(child_title.to_owned()),
@@ -15007,6 +15050,9 @@ async fn materialize_artifact_api_thread(
 ) {
     ensure_test_superuser_execution_authority(crud_store).await;
     let thread = pioneer_protocol::Thread {
+        context_window: None,
+        service_mode: None,
+        context_authority: None,
         workspace_id: workspace_id.to_owned(),
         id: thread_id.to_owned(),
         name: None,
@@ -25244,6 +25290,9 @@ async fn task_accept_rpc_finalizes_review_candidate_and_queues_delivery_impl(
     let parent_thread_id = "thr_user_review_accept";
     let parent_turn_id = "turn_user_review_accept";
     let parent_thread = Thread {
+        context_window: None,
+        service_mode: None,
+        context_authority: None,
         workspace_id: workspace_id.clone(),
         id: parent_thread_id.to_owned(),
         name: Some("User review accept parent".to_owned()),
@@ -26958,6 +27007,9 @@ async fn recovered_hidden_task_run_dispatches_restored_child_main_without_planne
     let source_turn_id = "turn_parent_recovered_preflight_task";
     let created_at = super::now_timestamp_secs();
     let parent_thread = Thread {
+        context_window: None,
+        service_mode: None,
+        context_authority: None,
         workspace_id: workspace_id.clone(),
         id: parent_thread_id.to_owned(),
         name: Some("Recovered child parent".to_owned()),
@@ -28446,6 +28498,9 @@ async fn scheduled_task_agent_run_creates_parent_visible_occurrence_turn_impl() 
     let parent_thread_id = "thr_parent_scheduled_task";
     let creation_turn_id = "turn_parent_scheduled_task";
     let parent_thread = Thread {
+        context_window: None,
+        service_mode: None,
+        context_authority: None,
         workspace_id: workspace_id.clone(),
         id: parent_thread_id.to_owned(),
         name: Some("Scheduled parent".to_owned()),
@@ -29530,6 +29585,9 @@ async fn assert_composer_work_replays_exact_launch_payload_for_permission(
     let planned_turn_id = "turn_composer_work_planned";
     let created_at = super::now_timestamp_secs();
     let parent_thread = Thread {
+        context_window: None,
+        service_mode: None,
+        context_authority: None,
         workspace_id: workspace_id.clone(),
         id: parent_thread_id.to_owned(),
         name: Some("Composer work parent".to_owned()),
@@ -29698,6 +29756,9 @@ async fn assert_composer_work_replays_exact_launch_payload_for_permission(
         });
     exact_agent_launch.execution.skill_ids = vec![skill_id.clone()];
     let exact_launch = pioneer_protocol::TurnStartParams {
+        service_mode: None,
+        context_authority: None,
+        context_window: None,
         agent_delegation_routes: Vec::new(),
         thread_id: parent_thread_id.to_owned(),
         turn_id: planned_turn_id.to_owned(),
@@ -30260,6 +30321,9 @@ async fn collaborative_composer_dispatches_codex_and_claude_without_api_provider
             .await
             .expect("dynamic CLI Composer identities should be durable");
         let launch = pioneer_protocol::TurnStartParams {
+            service_mode: None,
+            context_authority: None,
+            context_window: None,
             agent_delegation_routes: Vec::new(),
             thread_id: parent_thread_id.clone(),
             turn_id: turn_id.clone(),
@@ -31272,6 +31336,19 @@ async fn cli_input_admission_impl(case: CliInputAdmissionCase) {
         )),
     ));
     processor
+        .apply_compaction_settings(pioneer_compaction::CompactionSettings {
+            selection: Some(pioneer_compaction::ModelSelection {
+                service_mode: None,
+                context_authority: None,
+                context_window: None,
+                transport: pioneer_compaction::Transport::Api,
+                instance: "echo".into(),
+                model: "test-model".into(),
+                effort: None,
+            }),
+        })
+        .unwrap();
+    processor
         .mark_cli_runtimes_ready_for_tests(&workspace)
         .await
         .unwrap();
@@ -31842,6 +31919,9 @@ async fn cli_transfer_reuses_late_mixed_checkpoint_from_raw_saved_input_aliases_
         );
     }
     let selection = ModelSelection {
+        service_mode: None,
+        context_authority: None,
+        context_window: None,
         transport: Transport::Api,
         instance: "openai".into(),
         model: "test-model".into(),
@@ -32079,6 +32159,19 @@ async fn accepted_task_cli_transfer_compacts_without_later_parent_history_impl(
             CLIAgentRuntimeKind::Codex,
         )),
     ));
+    processor
+        .apply_compaction_settings(pioneer_compaction::CompactionSettings {
+            selection: Some(pioneer_compaction::ModelSelection {
+                service_mode: None,
+                context_authority: None,
+                context_window: None,
+                transport: pioneer_compaction::Transport::Api,
+                instance: "echo".into(),
+                model: "test-model".into(),
+                effort: None,
+            }),
+        })
+        .unwrap();
     processor
         .mark_cli_runtimes_ready_for_tests(&workspace)
         .await
@@ -32878,6 +32971,19 @@ async fn pending_cli_heartbeat_writer_is_dropped_before_compaction_cleanup_impl(
             ),
         ));
         processor
+            .apply_compaction_settings(pioneer_compaction::CompactionSettings {
+                selection: Some(pioneer_compaction::ModelSelection {
+                    service_mode: None,
+                    context_authority: None,
+                    context_window: None,
+                    transport: pioneer_compaction::Transport::Api,
+                    instance: "echo".into(),
+                    model: "test-model".into(),
+                    effort: None,
+                }),
+            })
+            .unwrap();
+        processor
             .mark_cli_runtimes_ready_for_tests(&workspace)
             .await
             .unwrap();
@@ -33071,6 +33177,19 @@ async fn pending_cli_heartbeat_writer_is_dropped_before_compaction_cleanup_impl(
                     supported_test_cli_mcp_readiness(CLIAgentRuntimeKind::Codex),
                 ),
             ));
+            restarted
+                .apply_compaction_settings(pioneer_compaction::CompactionSettings {
+                    selection: Some(pioneer_compaction::ModelSelection {
+                        service_mode: None,
+                        context_authority: None,
+                        context_window: None,
+                        transport: pioneer_compaction::Transport::Api,
+                        instance: "echo".into(),
+                        model: "test-model".into(),
+                        effort: None,
+                    }),
+                })
+                .unwrap();
             restarted
                 .mark_cli_runtimes_ready_for_tests(&workspace)
                 .await
@@ -33463,6 +33582,19 @@ async fn cancelling_cli_history_transfer_stops_before_provider_start_and_release
             CLIAgentRuntimeKind::Codex,
         )),
     ));
+    processor
+        .apply_compaction_settings(pioneer_compaction::CompactionSettings {
+            selection: Some(pioneer_compaction::ModelSelection {
+                service_mode: None,
+                context_authority: None,
+                context_window: None,
+                transport: pioneer_compaction::Transport::Api,
+                instance: "echo".into(),
+                model: "test-model".into(),
+                effort: None,
+            }),
+        })
+        .unwrap();
     processor
         .mark_cli_runtimes_ready_for_tests(&workspace)
         .await
@@ -38504,6 +38636,9 @@ async fn detached_composer_work_matches_parent_llm_prompts_end_to_end_impl() {
     let direct_requests = provider.take_requests();
 
     let exact_launch = pioneer_protocol::TurnStartParams {
+        service_mode: None,
+        context_authority: None,
+        context_window: None,
         agent_delegation_routes: Vec::new(),
         thread_id: task_parent_thread_id.to_owned(),
         turn_id: "turn_prompt_parity_planned".to_owned(),
@@ -38813,6 +38948,9 @@ async fn detached_composer_work_matches_full_parent_llm_request_end_to_end_impl(
     ];
     let direct_turn_id = "turn_full_prompt_parity_direct";
     let mut direct_launch = pioneer_protocol::TurnStartParams {
+        service_mode: None,
+        context_authority: None,
+        context_window: None,
         agent_delegation_routes: Vec::new(),
         thread_id: direct_parent_thread_id.to_owned(),
         turn_id: direct_turn_id.to_owned(),
@@ -38882,6 +39020,9 @@ async fn detached_composer_work_matches_full_parent_llm_request_end_to_end_impl(
 
     let planned_child_turn_id = "turn_full_prompt_parity_planned";
     let mut task_launch = pioneer_protocol::TurnStartParams {
+        service_mode: None,
+        context_authority: None,
+        context_window: None,
         agent_delegation_routes: Vec::new(),
         thread_id: task_parent_thread_id.to_owned(),
         turn_id: planned_child_turn_id.to_owned(),
@@ -41166,6 +41307,9 @@ async fn task_create_inherits_exact_turn_capabilities_for_attached_and_backgroun
         "resend",
     )];
     let parent_turn = pioneer_protocol::TurnStartParams {
+        service_mode: None,
+        context_authority: None,
+        context_window: None,
         agent_delegation_routes: Vec::new(),
         thread_id: parent_thread_id.to_owned(),
         turn_id: parent_turn_id.to_owned(),
@@ -42077,6 +42221,9 @@ async fn task_delivery_reuses_pre_child_occurrence_without_lineage() {
     let thread_id = "thr_pre_child_delivery";
     let run_id = "run_pre_child_delivery";
     let thread = Thread {
+        context_window: None,
+        service_mode: None,
+        context_authority: None,
         workspace_id: workspace_id.clone(),
         id: thread_id.to_owned(),
         name: Some("Pre-child delivery".to_owned()),
@@ -44768,6 +44915,9 @@ async fn user_message_lifecycle_ingests_thread_episodic_source_after_commit() {
     let thread_id = "thr_user_message_episodic_ingest";
     let turn_id = "turn_user_message_episodic_ingest";
     let thread = Thread {
+        context_window: None,
+        service_mode: None,
+        context_authority: None,
         workspace_id: workspace_id.clone(),
         id: thread_id.to_owned(),
         name: None,
@@ -44944,6 +45094,9 @@ async fn user_message_lifecycle_survives_permission_profile_audit_event() {
     let thread_id = "thr_permission_profile_user_message_lifecycle";
     let turn_id = "turn_permission_profile_user_message_lifecycle";
     let thread = Thread {
+        context_window: None,
+        service_mode: None,
+        context_authority: None,
         workspace_id: workspace_id.clone(),
         id: thread_id.to_owned(),
         name: None,
@@ -46394,6 +46547,9 @@ async fn direct_durable_execution_window_lifecycle_updates_rows() {
     thread_manager
         .system_turn_start_with_permission_profile(
             pioneer_protocol::TurnStartParams {
+                service_mode: None,
+                context_authority: None,
+                context_window: None,
                 agent_delegation_routes: Vec::new(),
                 thread_id: thread_id.to_owned(),
                 turn_id: turn_id.to_owned(),
@@ -46989,6 +47145,9 @@ async fn setup_execution_window_terminal_turn_with_input_and_mode(
     let turn_start = thread_manager
         .agent_turn_start_with_permission_profile(
             pioneer_protocol::TurnStartParams {
+                service_mode: None,
+                context_authority: None,
+                context_window: None,
                 agent_delegation_routes: Vec::new(),
                 thread_id: thread_id.to_owned(),
                 turn_id: turn_id.to_owned(),
@@ -50433,6 +50592,9 @@ async fn turn_start_security_snapshot_native_turn_is_persisted_before_dispatch()
             ),
             None,
             pioneer_protocol::TurnStartParams {
+                service_mode: None,
+                context_authority: None,
+                context_window: None,
                 agent_delegation_routes: Vec::new(),
                 thread_id: "thread_security_native".to_owned(),
                 turn_id: "turn_security_native".to_owned(),
@@ -50557,6 +50719,9 @@ async fn native_turn_start_same_request_replays_durable_outcome_without_dispatch
         authenticated_test_superuser().principal_id.clone(),
     );
     let params = pioneer_protocol::TurnStartParams {
+        service_mode: None,
+        context_authority: None,
+        context_window: None,
         agent_delegation_routes: Vec::new(),
         thread_id: thread_id.to_owned(),
         turn_id: turn_id.to_owned(),
@@ -50695,6 +50860,9 @@ async fn turn_start_security_audit_events_include_snapshot_reference() {
             ),
             None,
             pioneer_protocol::TurnStartParams {
+                service_mode: None,
+                context_authority: None,
+                context_window: None,
                 agent_delegation_routes: Vec::new(),
                 thread_id: thread_id.to_owned(),
                 turn_id: turn_id.to_owned(),
@@ -51759,6 +51927,9 @@ async fn production_self_improvement_vertical_e2e_reaches_native_and_excludes_cl
             .await;
         let request_id = generate_test_request_id("cliagentskill", suffix);
         let launch = pioneer_protocol::TurnStartParams {
+            service_mode: None,
+            context_authority: None,
+            context_window: None,
             agent_delegation_routes: Vec::new(),
             thread_id: thread_id.to_owned(),
             turn_id: turn_id.to_owned(),
@@ -54033,6 +54204,9 @@ async fn cli_runtime_reconciliation_uses_full_terminal_lifecycle_for_unloaded_th
     let native_turn_id = "native_turn_cli_runtime_reconciliation_unloaded";
     let now_secs = chrono::Utc::now().timestamp();
     let thread = Thread {
+        context_window: None,
+        service_mode: None,
+        context_authority: None,
         workspace_id: workspace_id.clone(),
         id: thread_id.to_owned(),
         name: Some("Unloaded reconciliation".to_owned()),
@@ -55770,6 +55944,9 @@ async fn run_interrupted_cli_runtime_turn_recovery_scenario(
         .turn_start(
             connection_id,
             pioneer_protocol::TurnStartParams {
+                service_mode: None,
+                context_authority: None,
+                context_window: None,
                 agent_delegation_routes: Vec::new(),
                 thread_id: thread_id.to_owned(),
                 turn_id: turn_id.to_owned(),
@@ -55815,6 +55992,9 @@ async fn run_interrupted_cli_runtime_turn_recovery_scenario(
         crud_store
             .upsert_thread_model(
                 &Thread {
+                    context_window: None,
+                    service_mode: None,
+                    context_authority: None,
                     workspace_id: workspace_id.clone(),
                     id: continuation_thread_id.to_owned(),
                     name: Some("CLI recovery parent".to_owned()),
@@ -56589,6 +56769,9 @@ async fn cli_runtime_stale_db_only_running_binding_schedules_recovery() {
 
     let now_secs = chrono::Utc::now().timestamp();
     let thread = Thread {
+        context_window: None,
+        service_mode: None,
+        context_authority: None,
         workspace_id: workspace_id.clone(),
         id: "thread_cli_stale_db_only".to_owned(),
         name: Some("DB-only stale CLI turn".to_owned()),
@@ -60565,6 +60748,9 @@ async fn cli_runtime_human_wait_without_turn_binding_does_not_defer_timeout() {
 
     let now = chrono::Utc::now().timestamp();
     let thread = Thread {
+        context_window: None,
+        service_mode: None,
+        context_authority: None,
         workspace_id: workspace_id.clone(),
         id: "thread_non_cli_timeout".to_owned(),
         name: Some("Non CLI timeout".to_owned()),
@@ -61707,6 +61893,9 @@ async fn materialize_cli_runtime_turn_with_execution(
     let execution_principal = authenticated_test_superuser();
     let now_secs = chrono::Utc::now().timestamp();
     let thread = Thread {
+        context_window: None,
+        service_mode: None,
+        context_authority: None,
         workspace_id: workspace_id.to_owned(),
         id: thread_id.to_owned(),
         name: Some("CLI approval test".to_owned()),
@@ -63191,6 +63380,7 @@ fn phase_11_prompt_manifest_hook_sources_roundtrip_existing_event() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn turn_start_materializes_thread_and_turn_state() {
+    crate::compaction::load_test_catalog();
     let connection = Database::connect("sqlite::memory:")
         .await
         .expect("must connect to sqlite memory");
@@ -63205,7 +63395,7 @@ async fn turn_start_materializes_thread_and_turn_state() {
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let expected_principal_id = authenticated_test_superuser().principal_id.to_string();
-    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
     let workspace_manager = Arc::new(WorkspaceManager::new(connection.clone()));
     let workspace_id = workspace_manager
         .list_workspaces()
@@ -63606,6 +63796,9 @@ async fn assert_turn_cancel_with_optional_busy_native_actor(
         .turn_start_with_user_metadata(
             connection_id,
             pioneer_protocol::TurnStartParams {
+                service_mode: None,
+                context_authority: None,
+                context_window: None,
                 agent_delegation_routes: Vec::new(),
                 thread_id: "thr_000000000000000022".to_owned(),
                 turn_id: "turn_000000000000000022".to_owned(),
@@ -69359,6 +69552,9 @@ async fn setup_live_semantic_timeline_harness_on_store(
     thread_manager
         .system_turn_start_with_permission_profile(
             pioneer_protocol::TurnStartParams {
+                service_mode: None,
+                context_authority: None,
+                context_window: None,
                 agent_delegation_routes: Vec::new(),
                 thread_id: thread_id.clone(),
                 turn_id: turn_id.clone(),
@@ -70411,6 +70607,9 @@ fn semantic_fixture_thread(
     timestamp: i64,
 ) -> Thread {
     Thread {
+        context_window: None,
+        service_mode: None,
+        context_authority: None,
         workspace_id: workspace_id.to_owned(),
         id: thread_id.to_owned(),
         name: name.map(str::to_owned),
@@ -79106,6 +79305,9 @@ fn phase_13_test_thread(
     timestamp: i64,
 ) -> pioneer_protocol::Thread {
     pioneer_protocol::Thread {
+        context_window: None,
+        service_mode: None,
+        context_authority: None,
         workspace_id: workspace_id.to_owned(),
         id: thread_id.to_owned(),
         name: Some("Phase 13 Thread".to_owned()),
@@ -79386,6 +79588,8 @@ async fn completed_command_history_fits_real_background_preflight_after_projecti
             .unwrap();
         let projected_message = crate::compaction::event_message(event).unwrap().unwrap();
         let request = |message| ChatRequest {
+            tool_declarations: None,
+            service_mode: None,
             model: "gpt-4".into(),
             messages: vec![
                 pioneer_provider::ChatMessage::user("completed command request"),
@@ -79441,6 +79645,9 @@ async fn completed_command_history_fits_real_background_preflight_after_projecti
         turn,
     );
     let current = ModelSelection {
+        service_mode: None,
+        context_authority: None,
+        context_window: None,
         transport: Transport::Api,
         instance: "openai".into(),
         model: "gpt-4".into(),
@@ -79448,6 +79655,9 @@ async fn completed_command_history_fits_real_background_preflight_after_projecti
     };
     let settings = CompactionSettings {
         selection: Some(ModelSelection {
+            service_mode: None,
+            context_authority: None,
+            context_window: None,
             transport: Transport::Api,
             instance: "summary-capture".into(),
             model: "gpt-4".into(),
@@ -79552,6 +79762,9 @@ async fn genuinely_large_command_history_compacts_through_real_background_prefli
         turn,
     );
     let current = ModelSelection {
+        service_mode: None,
+        context_authority: None,
+        context_window: None,
         transport: Transport::Api,
         instance: "openai".into(),
         model: "gpt-4".into(),
@@ -79559,6 +79772,9 @@ async fn genuinely_large_command_history_compacts_through_real_background_prefli
     };
     let settings = CompactionSettings {
         selection: Some(ModelSelection {
+            service_mode: None,
+            context_authority: None,
+            context_window: None,
             transport: Transport::Api,
             instance: "summary-capture".into(),
             model: "gpt-4".into(),
@@ -80326,6 +80542,9 @@ async fn materialize_memory_tools_for_context(
     {
         let now = now_timestamp_secs();
         let thread = Thread {
+            context_window: None,
+            service_mode: None,
+            context_authority: None,
             workspace_id: context.workspace_id.clone(),
             id: context.thread_id.clone(),
             name: Some("Memory tool authority fixture".to_owned()),
@@ -81654,6 +81873,9 @@ async fn memory_tool_uses_parent_thread_scope_with_child_provenance() {
         .crud_store
         .upsert_thread_model(
             &Thread {
+                context_window: None,
+                service_mode: None,
+                context_authority: None,
                 workspace_id: harness.workspace_id.clone(),
                 id: parent_thread_id.to_owned(),
                 name: Some("Effective memory parent".to_owned()),
@@ -83444,6 +83666,9 @@ print(json.dumps([{'type':'system','subtype':'init','model':'claude-sonnet-4-6'}
             workspace.to_owned(),
             crate::settings::WorkspaceCompactionSettings {
                 compaction_model: Some(pioneer_protocol::GatewayModelSelection::Explicit {
+                    service_mode: None,
+                    context_authority: None,
+                    context_window: None,
                     transport: pioneer_protocol::ModelSelectionTransport::Claude,
                     instance: "claude".into(),
                     model: "claude-sonnet-4-6".into(),
@@ -83566,6 +83791,9 @@ async fn check_native_overflow_twice(with_tool: bool, cli_summary: bool) {
     processor
         .apply_compaction_settings(pioneer_compaction::CompactionSettings {
             selection: Some(pioneer_compaction::ModelSelection {
+                service_mode: None,
+                context_authority: None,
+                context_window: None,
                 transport: pioneer_compaction::Transport::Api,
                 instance: "summary-capture".into(),
                 model: "test-model".into(),
@@ -83825,6 +84053,9 @@ async fn compaction_lifecycle_observer_uses_the_operation_scope_for_started_and_
         .reference
         .clone();
     let selection = ModelSelection {
+        service_mode: None,
+        context_authority: None,
+        context_window: None,
         transport: Transport::Api,
         instance: "openai".into(),
         model: "test-model".into(),
@@ -84107,6 +84338,9 @@ async fn native_foreground_controller_uses_interactive_database_scope() {
         payload: source.payload.unwrap(),
     };
     let selection = pioneer_compaction::ModelSelection {
+        service_mode: None,
+        context_authority: None,
+        context_window: None,
         transport: pioneer_compaction::Transport::Api,
         instance: "openai".into(),
         model: "test-model".into(),
@@ -84426,6 +84660,8 @@ async fn native_foreground_controller_uses_interactive_database_scope() {
     let cancel_write_start = observer.writes.lock().unwrap().len();
     let cancel = tokio_util::sync::CancellationToken::new();
     let registration_context = pioneer_agent::compaction::controller::NativeContext {
+        context_budget: None,
+        summary_context: None,
         overflow_recovery: false,
         recovery_deadline_ms: None,
         workspace_id: workspace.clone(),
@@ -84438,6 +84674,8 @@ async fn native_foreground_controller_uses_interactive_database_scope() {
         cancellation: cancel.clone(),
     };
     let registration_request = ChatRequest {
+        tool_declarations: None,
+        service_mode: None,
         model: "test-model".into(),
         messages: vec![pioneer_provider::ChatMessage::user(
             "must not reach provider",
@@ -84467,6 +84705,9 @@ async fn native_foreground_controller_uses_interactive_database_scope() {
     };
     let settings = CompactionSettings {
         selection: Some(ModelSelection {
+            service_mode: None,
+            context_authority: None,
+            context_window: None,
             transport: Transport::Api,
             instance: "openai".into(),
             model: "test-model".into(),
@@ -84768,6 +85009,8 @@ async fn native_history_intent_is_precompleted_idempotent_and_restart_discoverab
     )
     .await;
     let context = pioneer_agent::compaction::controller::NativeContext {
+        context_budget: None,
+        summary_context: None,
         overflow_recovery: false,
         recovery_deadline_ms: None,
         workspace_id: harness.workspace_id.clone(),
@@ -84780,6 +85023,8 @@ async fn native_history_intent_is_precompleted_idempotent_and_restart_discoverab
         cancellation: tokio_util::sync::CancellationToken::new(),
     };
     let request = ChatRequest {
+        tool_declarations: None,
+        service_mode: None,
         model: "test-model".into(),
         messages: vec![pioneer_provider::ChatMessage::user(
             "payload is not persisted",
@@ -84809,6 +85054,9 @@ async fn native_history_intent_is_precompleted_idempotent_and_restart_discoverab
     };
     let settings = CompactionSettings {
         selection: Some(ModelSelection {
+            service_mode: None,
+            context_authority: None,
+            context_window: None,
             transport: Transport::Api,
             instance: "summary-capture".into(),
             model: "test-model".into(),
@@ -85070,7 +85318,7 @@ async fn completed_history_result_write_failure_remains_an_error_with_durable_wo
     // A valid captured descriptor whose unavailable provider produces a normal
     // durable diagnostic. The injected fault affects only recording that result.
     let descriptor = serde_json::json!({
-        "current": ModelSelection { transport: Transport::Api, instance: "missing-result-provider".into(),
+        "current": ModelSelection { service_mode: None, context_authority: None, context_window: None, transport: Transport::Api, instance: "missing-result-provider".into(),
             model: "missing-result-model".into(), effort: None },
         "settings": CompactionSettings { selection: None }, "cli_override": null,
         "deadline_ms": (phase_13_now_secs() * 1000 + 30_000) as u64,
@@ -85642,6 +85890,9 @@ async fn production_background_preflight_ignores_technical_noise_but_budgets_rea
     let harness =
         setup_phase_13_compaction_harness(phase_13_provider_registry(provider.clone())).await;
     let current = pioneer_compaction::ModelSelection {
+        service_mode: None,
+        context_authority: None,
+        context_window: None,
         transport: pioneer_compaction::Transport::Codex,
         instance: "fixture-codex".into(),
         model: "gpt-5.4".into(),
@@ -85649,6 +85900,9 @@ async fn production_background_preflight_ignores_technical_noise_but_budgets_rea
     };
     let settings = pioneer_compaction::CompactionSettings {
         selection: Some(pioneer_compaction::ModelSelection {
+            service_mode: None,
+            context_authority: None,
+            context_window: None,
             transport: pioneer_compaction::Transport::Api,
             instance: "summary-capture".into(),
             model: "test-model".into(),
@@ -86160,6 +86414,9 @@ async fn background_history_preflight_budgets_task_input_copy_once_near_threshol
     let composer_metadata = serde_json::to_string(&pioneer_protocol::TaskMetadata {
         composer_work: Some(pioneer_protocol::TaskComposerWork::v1(
             pioneer_protocol::TurnStartParams {
+                service_mode: None,
+                context_authority: None,
+                context_window: None,
                 agent_delegation_routes: Vec::new(),
                 thread_id: "background-parent".into(),
                 turn_id: "background-parent-turn".into(),
@@ -86206,6 +86463,9 @@ async fn background_history_preflight_budgets_task_input_copy_once_near_threshol
     .unwrap();
 
     let current = ModelSelection {
+        service_mode: None,
+        context_authority: None,
+        context_window: None,
         transport: Transport::Claude,
         instance: "fixture-cli".into(),
         model: "unknown-cli-model".into(),
@@ -86213,6 +86473,9 @@ async fn background_history_preflight_budgets_task_input_copy_once_near_threshol
     };
     let settings = CompactionSettings {
         selection: Some(ModelSelection {
+            service_mode: None,
+            context_authority: None,
+            context_window: None,
             transport: Transport::Api,
             instance: "summary-capture".into(),
             model: "test-model".into(),
@@ -86603,6 +86866,9 @@ async fn creation_order_reaches_native_request_and_both_compaction_inputs() {
         .await;
         let settings = CompactionSettings {
             selection: Some(ModelSelection {
+                service_mode: None,
+                context_authority: None,
+                context_window: None,
                 transport: Transport::Api,
                 instance: "summary-capture".into(),
                 model: "gpt-4o".into(),
@@ -86628,6 +86894,9 @@ async fn creation_order_reaches_native_request_and_both_compaction_inputs() {
                 thread_id,
                 current_turn,
                 &ModelSelection {
+                    service_mode: None,
+                    context_authority: None,
+                    context_window: None,
                     transport: Transport::Api,
                     instance: "openai".into(),
                     model: "gpt-4".into(),
@@ -86651,6 +86920,8 @@ async fn creation_order_reaches_native_request_and_both_compaction_inputs() {
             hub.shutdown_progress().await;
         } else {
             let context = NativeContext {
+                context_budget: None,
+                summary_context: None,
                 overflow_recovery: false,
                 recovery_deadline_ms: None,
                 workspace_id: workspace.clone(),
@@ -86672,6 +86943,8 @@ async fn creation_order_reaches_native_request_and_both_compaction_inputs() {
                 "",
             ));
             let request = ChatRequest {
+                tool_declarations: None,
+                service_mode: None,
                 model: "gpt-4o".into(),
                 messages: vec![input],
                 temperature: None,
@@ -86711,6 +86984,7 @@ async fn creation_order_reaches_native_request_and_both_compaction_inputs() {
                 .prepare(
                     &context,
                     ChatRequest {
+                        tool_declarations: None,
                         model: "gpt-4".into(),
                         ..request
                     },
@@ -86932,6 +87206,9 @@ async fn check_completed_history(
             .unwrap();
     }
     let current = ModelSelection {
+        service_mode: None,
+        context_authority: None,
+        context_window: None,
         transport: Transport::Claude,
         instance: "fixture-cli".into(),
         model: "unknown-cli-model".into(),
@@ -86939,6 +87216,9 @@ async fn check_completed_history(
     };
     let general = CompactionSettings {
         selection: Some(ModelSelection {
+            service_mode: None,
+            context_authority: None,
+            context_window: None,
             transport: Transport::Api,
             instance: "summary-capture".into(),
             model: "test-model".into(),
@@ -86962,6 +87242,8 @@ async fn check_completed_history(
             .await;
         if native {
             let native_context = pioneer_agent::compaction::controller::NativeContext {
+                context_budget: None,
+                summary_context: None,
                 overflow_recovery: false,
                 recovery_deadline_ms: None,
                 workspace_id: harness.workspace_id.clone(),
@@ -86974,6 +87256,8 @@ async fn check_completed_history(
                 cancellation: tokio_util::sync::CancellationToken::new(),
             };
             let request = ChatRequest {
+                tool_declarations: None,
+                service_mode: None,
                 model: "test-model".into(),
                 messages: vec![
                     pioneer_provider::ChatMessage::system("fixed-native-instruction ".repeat(500)),
@@ -87508,6 +87792,9 @@ async fn compaction_history_waits_for_changed_settings_without_spending_provider
         .processor
         .apply_compaction_settings(CompactionSettings {
             selection: Some(ModelSelection {
+                service_mode: None,
+                context_authority: None,
+                context_window: None,
                 transport: Transport::Claude,
                 instance: "missing-summary-instance".into(),
                 model: "sonnet".into(),
@@ -87580,6 +87867,9 @@ async fn compaction_history_waits_for_changed_settings_without_spending_provider
         .processor
         .apply_compaction_settings(CompactionSettings {
             selection: Some(ModelSelection {
+                service_mode: None,
+                context_authority: None,
+                context_window: None,
                 transport: Transport::Api,
                 instance: "summary-capture".into(),
                 model: "test-model".into(),
@@ -87735,6 +88025,9 @@ async fn background_completed_history_projects_reasoning_before_fit_and_compacti
     )).await.unwrap();
 
     let current = ModelSelection {
+        service_mode: None,
+        context_authority: None,
+        context_window: None,
         transport: Transport::Api,
         instance: "openai".into(),
         model: "test-model".into(),
@@ -87742,6 +88035,9 @@ async fn background_completed_history_projects_reasoning_before_fit_and_compacti
     };
     let settings = CompactionSettings {
         selection: Some(ModelSelection {
+            service_mode: None,
+            context_authority: None,
+            context_window: None,
             transport: Transport::Api,
             instance: "summary-capture".into(),
             model: "test-model".into(),
@@ -87988,6 +88284,9 @@ async fn background_deepseek_effort_matches_provider_preflight_and_token_boundar
     }
     let settings = CompactionSettings {
         selection: Some(ModelSelection {
+            service_mode: None,
+            context_authority: None,
+            context_window: None,
             transport: Transport::Api,
             instance: "summary-capture".into(),
             model: "test-model".into(),
@@ -88036,12 +88335,17 @@ async fn background_deepseek_effort_matches_provider_preflight_and_token_boundar
         ),
     ] {
         let current = ModelSelection {
+            service_mode: None,
+            context_authority: None,
+            context_window: None,
             transport: Transport::Api,
             instance: "deepseek".into(),
             model: model.into(),
             effort: effort.map(str::to_owned),
         };
         let original = ChatRequest {
+            tool_declarations: None,
+            service_mode: None,
             model: model.into(),
             messages: captured.messages.clone(),
             temperature: None,
@@ -88146,6 +88450,9 @@ async fn background_deepseek_effort_matches_provider_preflight_and_token_boundar
         thread,
         &turn,
         &ModelSelection {
+            service_mode: None,
+            context_authority: None,
+            context_window: None,
             transport: Transport::Api,
             instance: "deepseek".into(),
             model: model.into(),
@@ -89433,6 +89740,8 @@ async fn auxiliary_chat_keeps_native_usage_before_application_validation() {
     );
     let response = provider
         .chat(ChatRequest {
+            tool_declarations: None,
+            service_mode: None,
             model: "fixture".into(),
             messages: vec![ChatMessage::user("fixture prompt")],
             temperature: None,
@@ -89511,6 +89820,8 @@ async fn auxiliary_terminal_stream_accepts_late_usage_without_reopening_the_atte
     );
     let mut stream = provider
         .stream_chat(ChatRequest {
+            tool_declarations: None,
+            service_mode: None,
             model: "fixture".into(),
             messages: vec![],
             temperature: None,
@@ -89570,6 +89881,8 @@ async fn auxiliary_terminal_stream_accepts_late_usage_without_reopening_the_atte
     );
     let mut stream = failed
         .stream_chat(ChatRequest {
+            tool_declarations: None,
+            service_mode: None,
             model: "fixture".into(),
             messages: vec![],
             temperature: None,
@@ -89615,6 +89928,8 @@ async fn auxiliary_terminal_stream_accepts_late_usage_without_reopening_the_atte
     );
     let mut stream = legacy
         .stream_chat(ChatRequest {
+            tool_declarations: None,
+            service_mode: None,
             model: "fixture".into(),
             messages: vec![],
             temperature: None,
@@ -89687,6 +90002,8 @@ async fn auxiliary_stream_partial_usage_survives_drop_and_retry_without_holding_
         "partial-owner",
     );
     let request = || ChatRequest {
+        tool_declarations: None,
+        service_mode: None,
         model: "fixture".into(),
         messages: vec![],
         temperature: None,
@@ -89930,6 +90247,8 @@ async fn auxiliary_metadata_only_header_survives_failure_without_inventing_count
         "header-owner",
     );
     let request = ChatRequest {
+        tool_declarations: None,
+        service_mode: None,
         model: "requested".into(),
         messages: vec![],
         temperature: None,
@@ -90715,6 +91034,9 @@ fn native_cancellation_race_fallback_preserves_materialization_error_and_require
                 .turn_start_with_user_metadata(
                     connection_id,
                     pioneer_protocol::TurnStartParams {
+                        service_mode: None,
+                        context_authority: None,
+                        context_window: None,
                         agent_delegation_routes: Vec::new(),
                         thread_id: "thr_000000000000000022".to_owned(),
                         turn_id: "turn_000000000000000022".to_owned(),
@@ -91548,6 +91870,8 @@ async fn neutral_provider_preparation_and_delivery_survive_registry_and_journal(
     assert!(provider.capabilities().tool_calling);
     let response = provider
         .stream_chat_with_diagnostics(pioneer_provider::ChatRequest {
+            tool_declarations: None,
+            service_mode: None,
             model: "private/model".into(),
             messages: vec![pioneer_provider::ChatMessage::user("hello")],
             temperature: None,

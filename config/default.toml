@@ -186,10 +186,12 @@ allow_http_tools = true
 allow_function_proxy_tools = true
 
 [gateway.provider]
-non_stream_request_timeout_secs = 120
+# Built-in Standard defaults; an explicit override (even the same value)
+# remains authoritative for Flex requests as well.
+# non_stream_request_timeout_secs = 120
 connect_timeout_secs = 30
-first_chunk_timeout_secs = 180
-inter_chunk_idle_timeout_secs = 180
+# first_chunk_timeout_secs = 180
+# inter_chunk_idle_timeout_secs = 180
 
 [gateway.cli_agent_runtime]
 enabled = false

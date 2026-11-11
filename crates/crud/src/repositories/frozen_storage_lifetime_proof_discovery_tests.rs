@@ -82,6 +82,9 @@ async fn raw_candidate_fixture() -> (CrudStore, Checkpoint) {
         payload: "original".into(),
     };
     let selection = ModelSelection {
+        service_mode: None,
+        context_authority: None,
+        context_window: None,
         transport: Transport::Api,
         instance: "p".into(),
         model: "m".into(),

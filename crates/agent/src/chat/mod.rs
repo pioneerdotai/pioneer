@@ -433,8 +433,8 @@ fn record_requested_tool_names(names: &mut Vec<String>, results: &[ExecutedToolR
             );
         }
     }
-    names.sort();
-    names.dedup();
+    let mut seen = BTreeSet::new();
+    names.retain(|name| seen.insert(name.clone()));
 }
 
 fn restored_requested_tool_names(
@@ -2651,12 +2651,165 @@ fn recovered_system_snapshot(
         })
 }
 
-fn schema_fingerprint(schemas: &Option<Vec<ToolDefinition>>) -> Result<String, ChatTurnError> {
-    let mut schemas = schemas.clone();
-    if let Some(schemas) = &mut schemas {
-        schemas.sort_by(|left, right| left.name.cmp(&right.name));
+// A persisted request proposal is an ordering/disclosure hint, not a delivery
+// ACK or an authorization grant. Re-resolve every name through current policy.
+// Scope to this execution: forks and independent agents must not inherit grants.
+fn restored_tool_disclosure_order(
+    retained: &[RetainedProviderHistoryMessage],
+    workspace: &str,
+    thread: &str,
+    turn: &str,
+) -> Vec<String> {
+    retained
+        .iter()
+        .filter(|entry| is_system_snapshot(&entry.message))
+        .max_by_key(|entry| entry.sequence)
+        .and_then(|entry| entry.message.application_context.as_ref())
+        .filter(|value| {
+            value.get("tool_disclosure_scope")
+                == Some(&serde_json::json!([workspace, thread, turn]))
+        })
+        .and_then(|value| value.get("tool_disclosure_order"))
+        .and_then(|value| serde_json::from_value(value.clone()).ok())
+        .unwrap_or_default()
+}
+
+// Only canonical, complete results bound to a request_tools call in this
+// execution can extend disclosure. Ordinary history/text never grants tools.
+fn restored_request_tools_results(
+    retained: &[RetainedProviderHistoryMessage],
+    workspace: &str,
+    thread: &str,
+    turn: &str,
+) -> Vec<RequestToolsResult> {
+    let owns = |message: &ChatMessage| {
+        message.provenance.as_ref().is_some_and(|origin| {
+            origin.workspace_id == workspace
+                && origin.thread_id == thread
+                && origin
+                    .context_thread
+                    .as_deref()
+                    .is_none_or(|owner| owner == thread)
+                && !origin.inherited
+                && origin.complete
+                && !origin.sources.is_empty()
+                && origin.sources.iter().all(|source| {
+                    source.scope.split_once(':').is_some_and(|(kind, owner)| {
+                        owner == turn
+                            && matches!(
+                                kind,
+                                "context"
+                                    | "item"
+                                    | "pending-assistant"
+                                    | "pending-tool"
+                                    | "pending-item"
+                            )
+                    })
+                })
+        })
+    };
+    let frontier = retained
+        .iter()
+        .filter(|entry| is_system_snapshot(&entry.message))
+        .max_by_key(|entry| entry.sequence)
+        .filter(|entry| {
+            entry
+                .message
+                .application_context
+                .as_ref()
+                .is_some_and(|value| {
+                    value.get("tool_disclosure_scope")
+                        == Some(&serde_json::json!([workspace, thread, turn]))
+                        && value.get("tool_disclosure_order").is_some_and(|order| {
+                            serde_json::from_value::<Vec<String>>(order.clone()).is_ok()
+                        })
+                })
+        })
+        .map(|entry| entry.sequence);
+    let mut ordered = retained.iter().collect::<Vec<_>>();
+    ordered.sort_by_key(|entry| entry.sequence);
+    let mut assistant: Option<&ChatMessage> = None;
+    let mut seen = BTreeSet::new();
+    let mut results = Vec::new();
+    for entry in ordered {
+        let message = &entry.message;
+        if message.role == pioneer_provider::Role::Assistant {
+            assistant = owns(message).then_some(message);
+            seen.clear();
+            continue;
+        }
+        if message.role != pioneer_provider::Role::Tool {
+            assistant = None;
+            continue;
+        }
+        let Some(round) = assistant else {
+            continue;
+        };
+        if frontier.is_some_and(|frontier| entry.sequence <= frontier)
+            || !owns(message)
+            || message.name.as_deref() != Some(REQUEST_TOOLS_TOOL_NAME)
+            || message.provenance.as_ref().map(|origin| &origin.unit_id)
+                != round.provenance.as_ref().map(|origin| &origin.unit_id)
+        {
+            continue;
+        }
+        let Some(call_id) = message.tool_call_id.as_deref() else {
+            continue;
+        };
+        if !round
+            .tool_calls
+            .iter()
+            .flatten()
+            .any(|call| call.id == call_id && call.name == REQUEST_TOOLS_TOOL_NAME)
+            || !seen.insert(call_id.to_owned())
+        {
+            continue;
+        }
+        // Canonical history contains the full builtin result (not its bounded
+        // display). The builtin's complete result shape is emitted only on
+        // success. Error/interruption/projection envelopes are not that shape.
+        let Ok(value) = serde_json::from_str::<JsonValue>(&message.content) else {
+            continue;
+        };
+        if value.get("error").is_some()
+            || value.get("truncated").is_some_and(|value| value != false)
+            || value
+                .pointer("/partial_output/is_partial")
+                .is_some_and(|value| value != false)
+            || value
+                .pointer("/partial_output/truncated")
+                .is_some_and(|value| value != false)
+            || value.get("tool_outcome").is_some_and(|outcome| {
+                !serde_json::from_value::<ToolOutcome>(outcome.clone()).is_ok_and(|outcome| {
+                    outcome.status == pioneer_tools::ToolOutcomeStatus::Ok && !outcome.incomplete
+                })
+            })
+        {
+            continue;
+        }
+        if let Ok(result) = serde_json::from_value::<RequestToolsResult>(value) {
+            results.push(result);
+        }
     }
-    let bytes = serde_json::to_vec(&schemas).map_err(|error| {
+    results
+}
+
+fn reconcile_tool_disclosure_order(
+    order: &mut Vec<String>,
+    callable: &[String],
+    available: &[String],
+) {
+    let mut seen = BTreeSet::new();
+    order.retain(|name| available.contains(name) && seen.insert(name.clone()));
+    for name in callable {
+        if available.contains(name) && !order.contains(name) {
+            order.push(name.clone());
+        }
+    }
+}
+
+fn schema_fingerprint(schemas: &Option<Vec<ToolDefinition>>) -> Result<String, ChatTurnError> {
+    let bytes = serde_json::to_vec(schemas).map_err(|error| {
         ChatTurnError::Terminal(format!("tool snapshot serialization failed: {error}"))
     })?;
     use sha2::{Digest, Sha256};
@@ -2691,6 +2844,8 @@ async fn persist_system_snapshot(
     turn: &str,
     stage: &str,
     schemas: &Option<Vec<ToolDefinition>>,
+    disclosure_order: &[String],
+    declarations: Option<&pioneer_provider::tool_declarations::ToolDeclarations>,
 ) -> Result<Option<ChatMessage>, ChatTurnError> {
     let Some(prompt) = prompt else {
         return Ok(None);
@@ -2700,14 +2855,35 @@ async fn persist_system_snapshot(
     })?;
     use sha2::{Digest, Sha256};
     let schema_hash = schema_fingerprint(schemas)?;
-    let item = format!(
+    // One stage can prepare several same-schema requests. Their retained
+    // positions/prefix proofs differ, so they must not collide at the durable
+    // idempotency key or replace an immutable earlier snapshot.
+    let declaration_bytes = serde_json::to_vec(&declarations)
+        .map_err(|error| ChatTurnError::Terminal(error.to_string()))?;
+    let mut item = format!(
         "system-snapshot:{stage}:{}:{schema_hash}",
-        hex::encode(Sha256::digest(&encoded))
+        hex::encode(Sha256::digest(&encoded)),
     );
+    if declarations.is_some() {
+        item.push(':');
+        item.push_str(&hex::encode(Sha256::digest(declaration_bytes)));
+    }
     let mut message = ChatMessage::user("");
     message.application_context = Some(
-        serde_json::json!({"version":1,"kind":"system_snapshot","system":prompt,"schema_fingerprint":schema_hash}),
+        serde_json::json!({"version":1,"kind":"system_snapshot","system":prompt,"schema_fingerprint":schema_hash,
+            "tool_disclosure_scope": [workspace, thread, turn],
+            "tool_disclosure_order": disclosure_order}),
     );
+    if let Some(declarations) = declarations {
+        declarations
+            .save(
+                message
+                    .application_context
+                    .as_mut()
+                    .expect("snapshot metadata"),
+            )
+            .map_err(|error| ChatTurnError::Terminal(error.to_string()))?;
+    }
     persist_runtime_message(
         event_tx,
         workspace,
@@ -3741,6 +3917,8 @@ async fn execute_standard_provider_response(
     }
 
     let request = ChatRequest {
+        tool_declarations: None,
+        service_mode: None,
         model,
         messages,
         temperature: None,
@@ -4861,6 +5039,8 @@ async fn execute_agent_provider_response(
             turn_id,
             message_item_id,
             &None,
+            &[],
+            None,
         )
         .await?;
         let mut continuation_history = Vec::new();
@@ -5114,8 +5294,45 @@ async fn execute_agent_provider_response(
         thread_id,
         turn_id,
     );
+    let mut tool_disclosure_order = restored_tool_disclosure_order(
+        &retained_provider_history,
+        workspace_id,
+        thread_id,
+        turn_id,
+    );
+    let recovered_requests = restored_request_tools_results(
+        &retained_provider_history,
+        workspace_id,
+        thread_id,
+        turn_id,
+    );
+    let mut recovered_names = Vec::new();
+    for result in &recovered_requests {
+        apply_request_tools_visibility_expansion(&mut recovered_names, result, router.as_ref());
+        for name in result.already_visible.values().flatten() {
+            if router.find_spec(name).is_some() && !recovered_names.contains(name) {
+                recovered_names.push(name.clone());
+            }
+        }
+    }
+    // Results after the last proposal win over an older checkpoint fallback.
+    // Keep the snapshot's surviving prefix; never treat it as delivery ACK.
+    if !tool_disclosure_order.is_empty() {
+        for name in &recovered_names {
+            if !tool_disclosure_order.contains(name) {
+                tool_disclosure_order.push(name.clone());
+            }
+        }
+    }
+    for name in &recovered_names {
+        if !requested_tool_names.contains(name) {
+            requested_tool_names.push(name.clone());
+        }
+    }
+    let mut restored_visible_names = tool_disclosure_order.clone();
+    restored_visible_names.extend(requested_tool_names.iter().cloned());
     let initial_visibility =
-        router.compute_final_visible_tools(&router.core_tool_names(), &requested_tool_names);
+        router.compute_final_visible_tools(&router.core_tool_names(), &restored_visible_names);
     requested_tool_names.retain(|name| initial_visibility.visible_tools.contains(name));
 
     warn_final_visible_tool_diagnostics(
@@ -5420,6 +5637,17 @@ async fn execute_agent_provider_response(
         messages.push(continuation);
     }
 
+    // Scope matches disclosure recovery; inherited snapshots never grant a baseline.
+    let mut tool_declarations = continuation_provider_history
+        .iter()
+        .filter(|entry| is_system_snapshot(&entry.message))
+        .max_by_key(|entry| entry.sequence)
+        .and_then(|entry| entry.message.application_context.as_ref())
+        .filter(|value| {
+            value.get("tool_disclosure_scope")
+                == Some(&serde_json::json!([workspace_id, thread_id, turn_id]))
+        })
+        .and_then(pioneer_provider::tool_declarations::ToolDeclarations::from_metadata);
     let mut recovered_system_pending = recovered_system_snapshot(&continuation_provider_history)?;
     let mut pending_retry_instruction: Option<String> = None;
     let mut applied_retry_instruction: Option<String> = None;
@@ -5528,17 +5756,17 @@ async fn execute_agent_provider_response(
                     &mut visible_tool_names,
                     observation.observations.as_slice(),
                 );
+                apply_review_required_tools_to_visible_tools(
+                    &mut visible_tool_names,
+                    observation.observations.as_slice(),
+                    router.as_ref(),
+                );
                 let has_new_signature = observation
                     .signatures
                     .iter()
                     .any(|signature| !observed_review_required_signatures.contains(signature));
                 if has_new_signature {
                     observed_review_required_signatures.extend(observation.signatures.clone());
-                    apply_review_required_tools_to_visible_tools(
-                        &mut visible_tool_names,
-                        observation.observations.as_slice(),
-                        router.as_ref(),
-                    );
                     let event_item_id = generate_id(TURN_ITEM_ID_LEN);
                     emit_durable_event(
                         event_tx.as_ref(),
@@ -5682,18 +5910,20 @@ async fn execute_agent_provider_response(
                 pending_retry_instruction = next_retry_instruction;
             }
 
+            // Candidate readiness controls calls, not continued disclosure of
+            // an already exposed schema. Policy blocks/deletions still remove
+            // definitions immediately, and definitions always use current specs.
+            let available = router.available_tool_names();
+            visible_tool_names.retain(|name| available.contains(name));
+            router.set_model_visible_tools(&visible_tool_names).await;
+            reconcile_tool_disclosure_order(
+                &mut tool_disclosure_order, &visible_tool_names, &available,
+            );
             let tool_definitions = if round_plan.tools_enabled {
-                router.set_model_visible_tools(&visible_tool_names).await;
-                Some(
-                    router
-                        .model_visible_specs()
-                        .await
-                        .into_iter()
-                        .map(|spec| {
-                            native_provider_tool_definition(spec, &native_file_tool_capability)
-                        })
-                        .collect::<Vec<_>>(),
-                )
+                Some(tool_disclosure_order.iter().filter_map(|name| router.find_spec(name))
+                    .map(|configured| native_provider_tool_definition(
+                        configured.spec.clone(), &native_file_tool_capability,
+                    )).collect::<Vec<_>>())
             } else {
                 None
             };
@@ -5828,12 +6058,19 @@ async fn execute_agent_provider_response(
                 if saved_system_matches_schemas(&continuation_provider_history, &tool_definitions)
                     .map_err(|error| (error, current_thinking_id.clone()))? { Some(saved) } else { round_compiled_prompt }
             } else { round_compiled_prompt };
-            if let Some(snapshot) = persist_system_snapshot(&round_compiled_prompt, event_tx.as_ref(), workspace_id, thread_id, turn_id, current_thinking_id.as_str(), &tool_definitions).await
+            if let Some(definitions) = tool_definitions.as_deref() {
+                tool_declarations = Some(pioneer_provider::tool_declarations::ToolDeclarations::reconcile(
+                    tool_declarations.take(), &messages, definitions,
+                ).map_err(|error| (ChatTurnError::Terminal(error.to_string()), current_thinking_id.clone()))?);
+            }
+            if let Some(snapshot) = persist_system_snapshot(&round_compiled_prompt, event_tx.as_ref(), workspace_id, thread_id, turn_id, current_thinking_id.as_str(), &tool_definitions, &tool_disclosure_order, tool_declarations.as_ref()).await
                 .map_err(|error| (error, current_thinking_id.clone()))? {
                 retain_provider_history_message(&mut continuation_provider_history, &mut next_provider_history_sequence, &snapshot);
             }
             let post_turn_assistant_text_len_before_round = post_turn_assistant_text.len();
             let request = ChatRequest {
+                    tool_declarations: tool_declarations.clone(),
+                service_mode: None,
                     model: model.clone(),
                     messages: messages.clone(),
                     temperature: None,
@@ -8097,6 +8334,8 @@ mod tests {
                 .as_millis() as u64;
             let session = NativeContextSession::new(
                 NativeContext {
+                    context_budget: None,
+                    summary_context: None,
                     overflow_recovery: true,
                     recovery_deadline_ms: Some(now_ms + 60_000),
                     workspace_id: "workspace".into(),
@@ -8124,6 +8363,8 @@ mod tests {
                 session
                     .prepare(
                         ChatRequest {
+                            tool_declarations: None,
+                            service_mode: None,
                             model: "private/model".into(),
                             messages: vec![],
                             temperature: None,
@@ -9805,6 +10046,312 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn review_readiness_changes_calls_without_rewriting_disclosed_inventory() {
+        let built = build_tools_with_extension_names(&["task_accept", "task_revise", "task_get"]);
+        let mut callable = vec!["task_accept".to_owned(), "task_revise".to_owned()];
+        let mut disclosed = callable.clone();
+        sync_review_action_tools_to_observations(&mut callable, &[]);
+        built.router.set_model_visible_tools(&callable).await;
+        super::reconcile_tool_disclosure_order(
+            &mut disclosed,
+            &callable,
+            &built.router.available_tool_names(),
+        );
+        assert_eq!(disclosed, vec!["task_accept", "task_revise"]);
+        let error = built
+            .router
+            .build_model_tool_call(pioneer_tools::RawToolCall {
+                call_id: "blocked_review".into(),
+                tool_name: "task_accept".into(),
+                arguments: "{}".into(),
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(error, pioneer_tools::ToolError::NotVisible(_)));
+        callable.push("task_get".into());
+        super::reconcile_tool_disclosure_order(
+            &mut disclosed,
+            &callable,
+            &built.router.available_tool_names(),
+        );
+        assert_eq!(disclosed, vec!["task_accept", "task_revise", "task_get"]);
+        built
+            .router
+            .set_blocked_tool_names([("task_accept".to_owned(), "revoked".to_owned())]);
+        super::reconcile_tool_disclosure_order(
+            &mut disclosed,
+            &callable,
+            &built.router.available_tool_names(),
+        );
+        assert_eq!(disclosed, vec!["task_revise", "task_get"]);
+    }
+
+    #[tokio::test]
+    async fn declarations_snapshot_waits_for_ack_and_restores_committed_discovery() {
+        use super::{AgentDurableEvent, AgentEventHub};
+        use pioneer_provider::{ToolDefinition, tool_declarations::ToolDeclarations};
+        let built = build_tools_with_extension_names(&["artifact_prepare", "artifact_register"]);
+        let mut built = built;
+        built.runtime = built
+            .runtime
+            .with_execution_security_snapshot(Some(test_full_access_security_snapshot()));
+        let mut visible = vec!["request_tools".to_owned()];
+        built.router.set_model_visible_tools(&visible).await;
+        let definitions = |names: &[String]| {
+            names
+                .iter()
+                .map(|name| {
+                    let spec = built.router.find_spec(name).unwrap().spec.clone();
+                    ToolDefinition {
+                        name: spec.name,
+                        description: spec.description,
+                        parameters: spec.parameters,
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut messages = vec![ChatMessage::user("discover artifacts")];
+        let initial = ToolDeclarations::reconcile(None, &messages, &definitions(&visible)).unwrap();
+        let call = built
+            .router
+            .build_model_tool_call(pioneer_tools::RawToolCall {
+                call_id: "discover".into(),
+                tool_name: "request_tools".into(),
+                arguments: serde_json::json!({"domains":["artifact"],"reason":"Need artifacts"})
+                    .to_string(),
+            })
+            .await
+            .unwrap();
+        let result = built.runtime.execute_tool_call(call).await.unwrap();
+        let discovery: RequestToolsResult =
+            serde_json::from_value(result.raw_output_json()).unwrap();
+        let added = apply_request_tools_visibility_expansion(
+            &mut visible,
+            &discovery,
+            built.router.as_ref(),
+        );
+        assert!(added.contains(&"artifact_prepare".to_owned()));
+        built.router.set_model_visible_tools(&visible).await;
+        let mut assistant = ChatMessage::assistant("");
+        assistant.tool_calls = Some(vec![pioneer_provider::ProviderToolCall {
+            id: "discover".into(),
+            name: "request_tools".into(),
+            arguments: serde_json::json!({"domains":["artifact"],"reason":"Need artifacts"})
+                .to_string(),
+        }]);
+        messages.push(assistant);
+        messages.push(ChatMessage::tool_result(
+            "discover",
+            "request_tools",
+            result.raw_output_json().to_string(),
+        ));
+        let repeated = built
+            .router
+            .build_model_tool_call(pioneer_tools::RawToolCall {
+                call_id: "repeat".into(),
+                tool_name: "request_tools".into(),
+                arguments: serde_json::json!({"domains":["artifact"],"reason":"Need artifacts"})
+                    .to_string(),
+            })
+            .await
+            .unwrap();
+        let repeated = built.runtime.execute_tool_call(repeated).await.unwrap();
+        let repeated: RequestToolsResult =
+            serde_json::from_value(repeated.raw_output_json()).unwrap();
+        assert!(repeated.added.is_empty());
+        let current = definitions(&visible);
+        // Committed discovery is recoverable before the next proposal exists.
+        let mut saved = serde_json::json!({});
+        initial.save(&mut saved).unwrap();
+        let recovered = ToolDeclarations::from_metadata(&saved).unwrap();
+        let next = ToolDeclarations::reconcile(Some(recovered), &messages, &current).unwrap();
+        let prompt = Some(pioneer_provider::CompiledPromptPayload {
+            stable_system_text: "rules".into(),
+            dynamic_system_text: String::new(),
+            boundary_marker: "boundary".into(),
+            full_system_text: "rules".into(),
+        });
+        for accepted in [false, true] {
+            let hub = std::sync::Arc::new(AgentEventHub::new());
+            let mut receiver = hub.take_durable_receiver().await.unwrap();
+            let schemas = Some(current.clone());
+            let publisher = {
+                let hub = hub.clone();
+                let next = next.clone();
+                let prompt = prompt.clone();
+                let visible = visible.clone();
+                tokio::spawn(async move {
+                    super::persist_system_snapshot(
+                        &prompt,
+                        &hub,
+                        "w",
+                        "t",
+                        "turn",
+                        "round",
+                        &schemas,
+                        &visible,
+                        Some(&next),
+                    )
+                    .await
+                })
+            };
+            let event = receiver.recv().await.unwrap();
+            let AgentDurableEvent::TurnLlmContextAppended {
+                payload:
+                    pioneer_protocol::ToolResultView::Json {
+                        value,
+                        truncated: false,
+                    },
+                item_id: first_item,
+                ..
+            } = event
+            else {
+                panic!("complete canonical snapshot required");
+            };
+            assert!(!publisher.is_finished());
+            if !accepted {
+                receiver.acknowledge_last(Err(
+                    pioneer_runtime_events::DurableCommitRejection::permanent(
+                        "fenced",
+                        "proposal rejected",
+                    ),
+                ));
+                assert!(publisher.await.unwrap().is_err());
+                continue;
+            }
+            receiver.acknowledge_last(Ok(()));
+            let published = publisher.await.unwrap().unwrap().unwrap();
+            assert_eq!(serde_json::to_value(&published).unwrap(), value);
+            for _ in 0..2 {
+                let independent: ChatMessage =
+                    serde_json::from_slice(&serde_json::to_vec(&published).unwrap()).unwrap();
+                let restored = ToolDeclarations::from_metadata(
+                    independent.application_context.as_ref().unwrap(),
+                )
+                .unwrap();
+                assert_eq!(restored.budget_tools(), next.budget_tools());
+            }
+            let mut extended = messages.clone();
+            extended.push(ChatMessage::user("next observation"));
+            let later =
+                ToolDeclarations::reconcile(Some(next.clone()), &extended, &current).unwrap();
+            let writer = {
+                let hub = hub.clone();
+                let schemas = Some(current.clone());
+                let prompt = prompt.clone();
+                let visible = visible.clone();
+                tokio::spawn(async move {
+                    super::persist_system_snapshot(
+                        &prompt,
+                        &hub,
+                        "w",
+                        "t",
+                        "turn",
+                        "round",
+                        &schemas,
+                        &visible,
+                        Some(&later),
+                    )
+                    .await
+                })
+            };
+            let AgentDurableEvent::TurnLlmContextAppended {
+                item_id: later_item,
+                ..
+            } = receiver.recv().await.unwrap()
+            else {
+                panic!("snapshot expected");
+            };
+            assert_ne!(
+                first_item, later_item,
+                "same-schema proposals must not overwrite frozen facts"
+            );
+            receiver.acknowledge_last(Ok(()));
+            assert!(writer.await.unwrap().is_ok());
+            let fresh =
+                build_tools_with_extension_names(&["artifact_prepare", "artifact_register"]);
+            let retained = vec![RetainedProviderHistoryMessage {
+                sequence: 1,
+                message: published.clone(),
+            }];
+            let order = super::restored_tool_disclosure_order(&retained, "w", "t", "turn");
+            let selection = fresh
+                .router
+                .compute_final_visible_tools(&fresh.router.core_tool_names(), &order);
+            fresh
+                .router
+                .set_model_visible_tools(&selection.visible_tools)
+                .await;
+            // Declarations never replace the execution router's current authority.
+            assert!(
+                fresh
+                    .router
+                    .build_model_tool_call(pioneer_tools::RawToolCall {
+                        call_id: "available".into(),
+                        tool_name: "artifact_prepare".into(),
+                        arguments: "{}".into(),
+                    })
+                    .await
+                    .is_ok()
+            );
+            fresh
+                .router
+                .set_blocked_tool_names([("artifact_prepare".to_owned(), "revoked".to_owned())]);
+            let selection = fresh
+                .router
+                .compute_final_visible_tools(&fresh.router.core_tool_names(), &order);
+            fresh
+                .router
+                .set_model_visible_tools(&selection.visible_tools)
+                .await;
+            let error = fresh
+                .router
+                .build_model_tool_call(pioneer_tools::RawToolCall {
+                    call_id: "revoked".into(),
+                    tool_name: "artifact_prepare".into(),
+                    arguments: "{}".into(),
+                })
+                .await
+                .expect_err("restored discovery must respect current tool revocation");
+            assert!(matches!(error, pioneer_tools::ToolError::NotVisible(_)));
+        }
+    }
+
+    #[test]
+    fn disclosure_restore_is_scoped_and_legacy_snapshots_are_unknown() {
+        let snapshot = |sequence, metadata| RetainedProviderHistoryMessage {
+            sequence,
+            message: ChatMessage {
+                application_context: Some(metadata),
+                ..ChatMessage::user("")
+            },
+        };
+        let mut retained = vec![snapshot(
+            1,
+            serde_json::json!({
+                "kind":"system_snapshot", "tool_disclosure_scope":["w","t","turn"],
+                "tool_disclosure_order":["lookup","alpha"]
+            }),
+        )];
+        assert_eq!(
+            super::restored_tool_disclosure_order(&retained, "w", "t", "turn"),
+            vec!["lookup", "alpha"]
+        );
+        for scope in [
+            ("w", "other", "turn"),
+            ("w", "t", "next"),
+            ("other", "t", "turn"),
+        ] {
+            assert!(
+                super::restored_tool_disclosure_order(&retained, scope.0, scope.1, scope.2)
+                    .is_empty()
+            );
+        }
+        retained.push(snapshot(2, serde_json::json!({"kind":"system_snapshot"})));
+        assert!(super::restored_tool_disclosure_order(&retained, "w", "t", "turn").is_empty());
+    }
+
+    #[tokio::test]
     async fn request_tools_control_result_reports_unavailable_without_schema_leak() {
         let built = pioneer_tools::build_builtin_tools_with_security_snapshot(
             ".",
@@ -10014,7 +10561,7 @@ mod tests {
         super::record_requested_tool_names(&mut names, &results);
         assert_eq!(
             names,
-            vec!["memory_forget", "memory_get", "memory_remember"]
+            vec!["memory_remember", "memory_forget", "memory_get"]
         );
 
         for reason in [
@@ -11009,6 +11556,8 @@ mod tests {
         let mut durable = hub.take_durable_receiver().await.unwrap();
         let session = NativeContextSession::new(
             NativeContext {
+                context_budget: None,
+                summary_context: None,
                 overflow_recovery: false,
                 recovery_deadline_ms: None,
                 workspace_id: "workspace".into(),

@@ -695,6 +695,9 @@ mod tests {
             let mut original = codex_instance("owned", "Owned CLI");
             original.kind = kind;
             original.compaction_model = Some(GatewayModelSelection::Explicit {
+                service_mode: None,
+                context_authority: None,
+                context_window: None,
                 transport,
                 instance: original.id.clone(),
                 model: "chosen-model".into(),
@@ -717,6 +720,9 @@ mod tests {
                 assert_eq!(
                     instance.compaction_model,
                     Some(GatewayModelSelection::Explicit {
+                        service_mode: None,
+                        context_authority: None,
+                        context_window: None,
                         transport,
                         instance: instance.id.clone(),
                         model: "chosen-model".into(),
@@ -751,6 +757,9 @@ mod tests {
         ] {
             let mut draft = CLIRuntimeProviderDraft::edit(&original);
             draft.compaction_model = GatewayModelSelection::Explicit {
+                service_mode: None,
+                context_authority: None,
+                context_window: None,
                 transport,
                 instance: instance.into(),
                 model: "chosen-model".into(),
