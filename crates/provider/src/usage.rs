@@ -1169,20 +1169,6 @@ fn estimate(
     estimate_from_resolution(guarded_resolution(usage, cost, metadata)?)
 }
 
-fn estimate_with_service_rates(
-    usage: &TokenUsage,
-    cost: &Value,
-    metadata: &std::collections::BTreeMap<String, Value>,
-    confirmed_service_rates: bool,
-) -> Option<Value> {
-    estimate_from_resolution(guarded_resolution_with_service_rates(
-        usage,
-        cost,
-        metadata,
-        confirmed_service_rates,
-    )?)
-}
-
 fn estimate_from_resolution(resolution: Value) -> Option<Value> {
     if resolution["status"] != "complete" {
         return None;
@@ -1468,11 +1454,11 @@ impl UsageContext {
         Self::prepare_request(provider, request)
     }
 
-    fn captured_mode_estimate(
+    fn captured_mode_cost(
         &self,
         usage: &TokenUsage,
         descriptor: &pioneer_protocol::ServiceModeDescriptor,
-    ) -> Option<Value> {
+    ) -> Option<(Value, Option<Value>)> {
         use pioneer_protocol::ProviderContextTiers;
         let catalog = self.catalog.as_ref()?;
         let entry = catalog.model(&self.provider, &self.model)?;
@@ -1542,14 +1528,17 @@ impl UsageContext {
             return None;
         }
         source.insert("raw".into(), rates.clone());
-        let mut estimate = estimate_with_service_rates(usage, &rates, &metadata, true)?;
-        estimate["service_mode"] = json!(descriptor.id);
-        estimate["source_context_input_ceiling"] = json!(context_ceiling);
-        estimate["source_pricing_evidence_version"] = metadata
-            .get("pricingEvidenceVersion")
-            .cloned()
-            .unwrap_or(Value::Null);
-        Some(estimate)
+        let resolution = guarded_resolution_with_service_rates(usage, &rates, &metadata, true)?;
+        let estimate = estimate_from_resolution(resolution.clone()).map(|mut estimate| {
+            estimate["service_mode"] = json!(descriptor.id);
+            estimate["source_context_input_ceiling"] = json!(context_ceiling);
+            estimate["source_pricing_evidence_version"] = metadata
+                .get("pricingEvidenceVersion")
+                .cloned()
+                .unwrap_or(Value::Null);
+            estimate
+        });
+        Some((resolution, estimate))
     }
 
     pub(crate) fn enrich_error(&self, error: anyhow::Error) -> anyhow::Error {
@@ -1690,26 +1679,34 @@ impl UsageContext {
                     P::AnthropicFast { .. } => speed == Some("fast"),
                     _ => false,
                 };
-                let estimate = if downgrade {
-                    accounting
-                        .get("estimated_cost")
-                        .filter(|v| !v.is_null())
-                        .cloned()
+                let (resolution, estimate) = if downgrade {
+                    (
+                        accounting
+                            .get("cost_resolution")
+                            .filter(|v| !v.is_null())
+                            .cloned(),
+                        accounting
+                            .get("estimated_cost")
+                            .filter(|v| !v.is_null())
+                            .cloned(),
+                    )
                 } else if matches_report && accounting["pricing_eligibility"]["eligible"] == true {
-                    descriptor.and_then(|descriptor| self.captured_mode_estimate(usage, descriptor))
+                    descriptor
+                        .and_then(|descriptor| self.captured_mode_cost(usage, descriptor))
+                        .map(|(resolution, estimate)| (Some(resolution), estimate))
+                        .unwrap_or_default()
                 } else {
-                    None
+                    (None, None)
                 };
                 accounting["estimated_cost"] = estimate.clone().unwrap_or(Value::Null);
-                accounting["cost_resolution"] = estimate
-                    .as_ref()
-                    .and_then(|value| value.get("resolution"))
-                    .cloned()
+                // An incomplete calculation still owns meter lines and precise
+                // unresolved reasons. Keep that evidence without inventing a total.
+                accounting["cost_resolution"] = resolution
                     .unwrap_or_else(|| json!({"version":1,"status":"unresolved","reasons":["unsupported_or_unconfirmed_service_price"],"lines":[]}));
                 accounting["unresolved_reasons"] = if estimate.is_some() {
                     json!([])
                 } else {
-                    json!(["unsupported_or_unconfirmed_service_price"])
+                    accounting["cost_resolution"]["reasons"].clone()
                 };
                 accounting["price_status"] = json!(if estimate.is_some() {
                     "captured_service_catalog_estimate"

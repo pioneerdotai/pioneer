@@ -10321,6 +10321,7 @@ mod tests {
         let recovered = ToolDeclarations::from_metadata(&saved).unwrap();
         let next = ToolDeclarations::reconcile(Some(recovered), &messages, &current).unwrap();
         let prompt = Some(pioneer_provider::CompiledPromptPayload {
+            observation_manifest: None,
             stable_system_text: "rules".into(),
             dynamic_system_text: String::new(),
             boundary_marker: "boundary".into(),

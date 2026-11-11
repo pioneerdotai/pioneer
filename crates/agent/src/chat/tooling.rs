@@ -2119,6 +2119,11 @@ mod tests {
                 tool_name: "write_stdin".into(),
                 ts_unix_ms: 1,
                 observation: ObservationContext {
+                    parent_operation_id: None,
+                    phase_boundaries: Vec::new(),
+                    omitted_phase_boundaries: 0,
+                    process_run_id: None,
+                    output_sizes: None,
                     trace_id: "shell".into(),
                     turn_id: "turn".into(),
                     tool_call_id: "shell-item".into(),

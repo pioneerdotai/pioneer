@@ -1656,6 +1656,40 @@ fn native_service_facts_keep_reports_separate_and_hold_request_price_evidence() 
         4
     );
     assert_eq!(downgrade.accounting, frozen);
+    // Service selection must not erase the independently known meter subtotal
+    // when the response omits its output count. Nor may that subtotal become a total.
+    for tier in ["priority", "default"] {
+        let mut partial = billing_usage().with_service_tier(Some(tier));
+        partial.output_tokens = None;
+        context.enrich(&mut partial);
+        let accounting = partial.accounting.as_ref().unwrap();
+        assert!(accounting["estimated_cost"].is_null());
+        assert_eq!(accounting["selected_cost"]["basis"], "provider_reported");
+        assert_eq!(accounting["cost_resolution"]["status"], "partial");
+        assert_eq!(
+            accounting["cost_resolution"]["known_subtotal_decimal"],
+            if tier == "priority" {
+                "0.0004"
+            } else {
+                "0.0002"
+            }
+        );
+        assert!(
+            !accounting["unresolved_reasons"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+    }
+    let mut media = billing_usage().with_service_tier(Some("priority"));
+    context.requested_modalities = vec!["image".into()];
+    context.enrich(&mut media);
+    assert!(media.accounting.as_ref().unwrap()["estimated_cost"].is_null());
+    assert_eq!(
+        media.accounting.as_ref().unwrap()["unresolved_reasons"],
+        json!(["unsupported_application_modality_pricing_contract"])
+    );
+    context.requested_modalities.clear();
     let joint_unknown = billing_catalog_configured("openai", 2., |entry| {
         entry["sourceMetadata"] = json!({"experimental":{"modes":{"fast":{"provider":{"body":{"service_tier":"priority"}},"cost":{"input":4,"output":20}}}}});
         entry["pricingSource"] = json!({"url":"https://models.dev/api.json"});
