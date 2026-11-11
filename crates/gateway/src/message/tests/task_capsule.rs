@@ -280,9 +280,39 @@ fn capsule_run_with_rounds(
                 let status = wait_for_task_status(store.clone(), &id, expected).await;
                 if status != expected {
                     let state = store.get_task(&id).await.unwrap().unwrap();
+                    let mut child_turns = Vec::new();
+                    for run_turn in &state.task_run_turns {
+                        child_turns.push(
+                            store
+                                .get_turn(&run_turn.thread_id, &run_turn.turn_id)
+                                .await
+                                .unwrap(),
+                        );
+                    }
+                    let request = provider.last_request.lock().unwrap().clone();
+                    let recent_messages = request.as_ref().map(|request| {
+                        request
+                            .messages
+                            .iter()
+                            .rev()
+                            .take(8)
+                            .map(|message| {
+                                (
+                                    &message.role,
+                                    &message.name,
+                                    message.content.chars().take(4000).collect::<String>(),
+                                    &message.tool_calls,
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                    });
                     panic!(
-                        "capsule step {step}: {} worker must reach {expected:?}, got {status:?}; task={:?}, runs={:?}, run_turns={:?}",
-                        call.name, state.task, state.runs, state.task_run_turns,
+                        "capsule step {step}: {} worker must reach {expected:?}, got {status:?}; task={:?}, runs={:?}, run_turns={:?}, child_turns={child_turns:?}, scripted_round={}, recent_messages={recent_messages:?}",
+                        call.name,
+                        state.task,
+                        state.runs,
+                        state.task_run_turns,
+                        provider.next_index.load(Ordering::SeqCst),
                     );
                 }
             }
