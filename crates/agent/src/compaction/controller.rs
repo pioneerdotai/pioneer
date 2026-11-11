@@ -59,6 +59,11 @@ impl NativeInputReceipt {
             "reasoning": request.reasoning.map(|v|format!("{v:?}")),
             "output_cap": request.max_tokens, "temperature": request.temperature,
         });
+        if let Some(declarations) =
+            pioneer_provider::tool_declarations::ToolDeclarations::for_request(request)
+        {
+            request_options["tool_declarations"] = declarations.projection_identity();
+        }
         if let Some(plan) = &request.service_mode {
             request_options["service_mode"] = serde_json::to_value(plan)?;
         }
@@ -294,6 +299,7 @@ mod tests {
     use pioneer_provider::{ChatMessage, ReasoningConfig, ReasoningEffort, ToolDefinition};
     fn request() -> ChatRequest {
         ChatRequest {
+            tool_declarations: None,
             service_mode: None,
             model: "m".into(),
             messages: vec![ChatMessage::user("a")],

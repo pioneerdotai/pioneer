@@ -923,6 +923,9 @@ impl CompiledPromptPayload {
 
 #[derive(Debug, Clone)]
 pub struct ChatRequest {
+    /// Host-owned positional proposal. Never an execution grant or delivery ACK.
+    /// Not part of canonical messages or public protocol contracts.
+    pub tool_declarations: Option<crate::tool_declarations::ToolDeclarations>,
     pub service_mode: Option<pioneer_protocol::NativeServiceModePlan>,
     pub model: String,
     pub messages: Vec<ChatMessage>,
@@ -1920,6 +1923,7 @@ mod tests {
     #[test]
     fn rendered_messages_with_compiled_prompt_uses_canonical_full_text() {
         let request = ChatRequest {
+            tool_declarations: None,
             service_mode: None,
             model: "test-model".to_owned(),
             messages: vec![

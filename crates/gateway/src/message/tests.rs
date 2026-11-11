@@ -8204,6 +8204,7 @@ async fn partial_base_url_write_failure_reconciles_only_its_workspace_authority(
     assert!(
         old_a
             .chat(pioneer_provider::ChatRequest {
+                tool_declarations: None,
                 service_mode: None,
                 model: "fixture".into(),
                 messages: vec![pioneer_provider::ChatMessage::user("hello")],
@@ -79587,6 +79588,7 @@ async fn completed_command_history_fits_real_background_preflight_after_projecti
             .unwrap();
         let projected_message = crate::compaction::event_message(event).unwrap().unwrap();
         let request = |message| ChatRequest {
+            tool_declarations: None,
             service_mode: None,
             model: "gpt-4".into(),
             messages: vec![
@@ -84672,6 +84674,7 @@ async fn native_foreground_controller_uses_interactive_database_scope() {
         cancellation: cancel.clone(),
     };
     let registration_request = ChatRequest {
+        tool_declarations: None,
         service_mode: None,
         model: "test-model".into(),
         messages: vec![pioneer_provider::ChatMessage::user(
@@ -85020,6 +85023,7 @@ async fn native_history_intent_is_precompleted_idempotent_and_restart_discoverab
         cancellation: tokio_util::sync::CancellationToken::new(),
     };
     let request = ChatRequest {
+        tool_declarations: None,
         service_mode: None,
         model: "test-model".into(),
         messages: vec![pioneer_provider::ChatMessage::user(
@@ -86939,6 +86943,7 @@ async fn creation_order_reaches_native_request_and_both_compaction_inputs() {
                 "",
             ));
             let request = ChatRequest {
+                tool_declarations: None,
                 service_mode: None,
                 model: "gpt-4o".into(),
                 messages: vec![input],
@@ -86979,6 +86984,7 @@ async fn creation_order_reaches_native_request_and_both_compaction_inputs() {
                 .prepare(
                     &context,
                     ChatRequest {
+                        tool_declarations: None,
                         model: "gpt-4".into(),
                         ..request
                     },
@@ -87250,6 +87256,7 @@ async fn check_completed_history(
                 cancellation: tokio_util::sync::CancellationToken::new(),
             };
             let request = ChatRequest {
+                tool_declarations: None,
                 service_mode: None,
                 model: "test-model".into(),
                 messages: vec![
@@ -88337,6 +88344,7 @@ async fn background_deepseek_effort_matches_provider_preflight_and_token_boundar
             effort: effort.map(str::to_owned),
         };
         let original = ChatRequest {
+            tool_declarations: None,
             service_mode: None,
             model: model.into(),
             messages: captured.messages.clone(),
@@ -89732,6 +89740,7 @@ async fn auxiliary_chat_keeps_native_usage_before_application_validation() {
     );
     let response = provider
         .chat(ChatRequest {
+            tool_declarations: None,
             service_mode: None,
             model: "fixture".into(),
             messages: vec![ChatMessage::user("fixture prompt")],
@@ -89811,6 +89820,7 @@ async fn auxiliary_terminal_stream_accepts_late_usage_without_reopening_the_atte
     );
     let mut stream = provider
         .stream_chat(ChatRequest {
+            tool_declarations: None,
             service_mode: None,
             model: "fixture".into(),
             messages: vec![],
@@ -89871,6 +89881,7 @@ async fn auxiliary_terminal_stream_accepts_late_usage_without_reopening_the_atte
     );
     let mut stream = failed
         .stream_chat(ChatRequest {
+            tool_declarations: None,
             service_mode: None,
             model: "fixture".into(),
             messages: vec![],
@@ -89917,6 +89928,7 @@ async fn auxiliary_terminal_stream_accepts_late_usage_without_reopening_the_atte
     );
     let mut stream = legacy
         .stream_chat(ChatRequest {
+            tool_declarations: None,
             service_mode: None,
             model: "fixture".into(),
             messages: vec![],
@@ -89990,6 +90002,7 @@ async fn auxiliary_stream_partial_usage_survives_drop_and_retry_without_holding_
         "partial-owner",
     );
     let request = || ChatRequest {
+        tool_declarations: None,
         service_mode: None,
         model: "fixture".into(),
         messages: vec![],
@@ -90234,6 +90247,7 @@ async fn auxiliary_metadata_only_header_survives_failure_without_inventing_count
         "header-owner",
     );
     let request = ChatRequest {
+        tool_declarations: None,
         service_mode: None,
         model: "requested".into(),
         messages: vec![],
@@ -91856,6 +91870,7 @@ async fn neutral_provider_preparation_and_delivery_survive_registry_and_journal(
     assert!(provider.capabilities().tool_calling);
     let response = provider
         .stream_chat_with_diagnostics(pioneer_provider::ChatRequest {
+            tool_declarations: None,
             service_mode: None,
             model: "private/model".into(),
             messages: vec![pioneer_provider::ChatMessage::user("hello")],

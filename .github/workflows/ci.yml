@@ -124,6 +124,10 @@ jobs:
           set -euo pipefail
           # Keep the runner's official Ubuntu fallbacks; its Azure mirror stalled CI.
           sudo sed -i '/azure\.archive\.ubuntu\.com/d' /etc/apt/apt-mirrors.txt
+          # Use an independent DNS domain first; archive.ubuntu.com also had DNS failures.
+          # APT retains the runner's remaining mirrors as fallbacks and verifies signatures.
+          printf 'https://mirrors.edge.kernel.org/ubuntu/\tpriority:1\n' | \
+            sudo tee -a /etc/apt/apt-mirrors.txt > /dev/null
           apt_options=(
             -o Acquire::Retries=3
             -o Acquire::http::Timeout=30

@@ -335,6 +335,7 @@ impl AuthorityBoundProvider {
         // example, OpenAI audio chat uses a different API from other models.
         // This only computes a profile; it performs no preparation or I/O.
         let profile = self.inner.request_usage_profile(&ChatRequest {
+            tool_declarations: None,
             service_mode: None,
             model: model.into(),
             messages: vec![],
@@ -1759,6 +1760,7 @@ mod tests {
 
     fn chat_request() -> ChatRequest {
         ChatRequest {
+            tool_declarations: None,
             service_mode: None,
             model: "test-model".to_owned(),
             messages: vec![crate::ChatMessage::user("hello")],

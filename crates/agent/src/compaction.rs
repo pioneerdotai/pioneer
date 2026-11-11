@@ -78,6 +78,7 @@ impl NativeSummarizer {
             })
             .transpose()?;
         Ok(ChatRequest {
+            tool_declarations: None,
             service_mode: self.service_mode.clone(),
             model: request.selection.model.clone(),
             messages: vec![

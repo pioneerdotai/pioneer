@@ -1776,6 +1776,7 @@ mod tests {
         ] {
             let provider = BedrockProvider::new("dummy-access", "dummy-secret", region);
             let request = ChatRequest {
+                tool_declarations: None,
                 service_mode: None,
                 model: "model:0".into(),
                 messages: vec![ChatMessage::user("dummy")],
@@ -1901,6 +1902,7 @@ mod tests {
             ambiguous_input_aliases: vec![],
         });
         let request = ChatRequest {
+            tool_declarations: None,
             service_mode: None,
             model: "anthropic.claude-target".into(),
             messages: vec![message],
@@ -1957,6 +1959,7 @@ mod tests {
             ambiguous_input_aliases: vec![],
         });
         let request = ChatRequest {
+            tool_declarations: None,
             service_mode: None,
             model: "different-model".into(),
             messages: vec![canonical.clone()],
@@ -1980,6 +1983,7 @@ mod tests {
         assert_eq!(json.matches("first second").count(), 1);
         assert!(!json.contains("opaque-one"));
         let same_request = ChatRequest {
+            tool_declarations: None,
             model: "source-model".into(),
             ..request.clone()
         };
@@ -2198,6 +2202,7 @@ mod tests {
     #[test]
     fn convert_messages_uses_compiled_prompt_sections_in_order() {
         let request = ChatRequest {
+            tool_declarations: None,
             service_mode: None,
             model: "anthropic.claude-3-sonnet-20240229-v1:0".to_owned(),
             messages: vec![
@@ -2307,6 +2312,7 @@ mod tests {
     #[test]
     fn bedrock_non_claude_rejects_unimplemented_reasoning_setting() {
         let request = ChatRequest {
+            tool_declarations: None,
             service_mode: None,
             model: "amazon.nova-pro-v1:0".to_owned(),
             messages: vec![ChatMessage::user("Hello")],

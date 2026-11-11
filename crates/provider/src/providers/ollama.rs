@@ -1554,6 +1554,7 @@ mod tests {
     #[test]
     fn build_options_none_when_no_temperature() {
         let request = ChatRequest {
+            tool_declarations: None,
             service_mode: None,
             model: "llama3".into(),
             messages: vec![ChatMessage::user("hi")],
@@ -1571,6 +1572,7 @@ mod tests {
     #[test]
     fn build_options_some_when_temperature_set() {
         let request = ChatRequest {
+            tool_declarations: None,
             service_mode: None,
             model: "llama3".into(),
             messages: vec![ChatMessage::user("hi")],

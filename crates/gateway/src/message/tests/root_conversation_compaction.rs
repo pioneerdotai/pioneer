@@ -326,6 +326,7 @@ async fn published_human_answer_prepares_root_once_and_next_cli_and_native_reuse
             .prepare(
                 &context,
                 ChatRequest {
+                    tool_declarations: None,
                     service_mode: None,
                     model: "test-model".into(),
                     messages: vec![pioneer_provider::ChatMessage::user("uncovered-next-input")],

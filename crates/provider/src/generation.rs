@@ -1039,6 +1039,7 @@ fn gemini_thinking_with_model(
 #[cfg(test)]
 pub(crate) fn test_request(model: &str) -> ChatRequest {
     ChatRequest {
+        tool_declarations: None,
         service_mode: None,
         model: model.into(),
         messages: vec![crate::types::ChatMessage::user("Hello")],
@@ -1187,6 +1188,7 @@ pub(crate) fn effort_supported_with_native(
     let model = reasoning_model(provider, model, native);
     let model = model.as_ref();
     let request = ChatRequest {
+        tool_declarations: None,
         service_mode: None,
         model: id.into(),
         messages: vec![],

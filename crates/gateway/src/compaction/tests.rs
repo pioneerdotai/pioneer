@@ -945,6 +945,7 @@ async fn prepared_history_and_execution_restore_use_source_creation_order() {
     assert_eq!(prepared.messages[2].content, "created later");
     let model = NativeRequestProjection::full(
         ChatRequest {
+            tool_declarations: None,
             service_mode: None,
             model: "fixture-model".into(),
             messages: prepared.messages.clone(),
@@ -1259,6 +1260,7 @@ async fn commentary_phase_reaches_cold_history_and_real_summarizer_input() {
     );
     let native = NativeRequestProjection::full(
         ChatRequest {
+            tool_declarations: None,
             service_mode: None,
             model: "fixture-model".into(),
             messages: messages.iter().map(|message| (*message).clone()).collect(),
@@ -1354,6 +1356,7 @@ async fn published_summary_stays_frozen_while_uncovered_commentary_uses_new_proj
         cancellation: CancellationToken::new(),
     };
     let request = ChatRequest {
+        tool_declarations: None,
         service_mode: None,
         model: "gpt-4".into(),
         messages: vec![history.remove(0), ChatMessage::user("Continue")],
@@ -2437,6 +2440,7 @@ fn native_preflight_counts_the_projected_history_that_will_be_sent() {
         super::history::historical_item_json(&item).unwrap()
     ));
     let request = |message| ChatRequest {
+        tool_declarations: None,
         service_mode: None,
         model: "fixture".into(),
         messages: vec![message, ChatMessage::user("current input")],
@@ -2496,6 +2500,7 @@ async fn canonical_command_history_fits_real_foreground_preflight_after_projecti
         limits.max_output,
     );
     let request = |message| ChatRequest {
+        tool_declarations: None,
         service_mode: None,
         model: "gpt-4".into(),
         messages: vec![message, ChatMessage::user("current foreground input")],
@@ -2611,6 +2616,7 @@ async fn canonical_command_history_fits_real_foreground_preflight_after_projecti
             cancellation: CancellationToken::new(),
         };
         let actual_request = ChatRequest {
+            tool_declarations: None,
             service_mode: None,
             model: "gpt-4".into(),
             messages: history
@@ -2752,6 +2758,7 @@ async fn genuinely_large_command_history_compacts_through_real_foreground_prefli
         },
         &context,
         ChatRequest {
+            tool_declarations: None,
             service_mode: None,
             model: "gpt-4".into(),
             messages: history
@@ -2800,6 +2807,7 @@ fn ordinary_active_api_tool_result_is_not_rewritten_by_history_projection() {
         "active-api-output\nactive-api-output",
     );
     let request = ChatRequest {
+        tool_declarations: None,
         service_mode: None,
         model: "fixture".into(),
         messages: vec![
@@ -6743,6 +6751,7 @@ async fn native_target_rechecks_complete_request_before_checkpoint_publication()
     use pioneer_provider::{ChatMessage, CompiledPromptPayload};
     let f = fixture("old history", vec![], true, false).await;
     let request = ChatRequest {
+        tool_declarations: None,
         service_mode: None,
         model: "fixture-model".into(),
         messages: vec![
@@ -6822,6 +6831,7 @@ async fn compaction_small_window_reduces_saved_tool_text_without_losing_call_or_
         ambiguous_input_aliases: vec![],
     });
     let request = ChatRequest {
+        tool_declarations: None,
         service_mode: None,
         model: "small".into(),
         messages: vec![
@@ -7570,6 +7580,7 @@ async fn native_discovers_working_context_head_published_after_inherited_snapsho
         &settings,
         &d_context,
         ChatRequest {
+            tool_declarations: None,
             service_mode: None,
             model: "gpt-4".into(),
             messages: vec![d_history[0].clone(), ChatMessage::user("Continue D")],
@@ -9399,6 +9410,7 @@ async fn native_discovers_working_context_head_published_after_inherited_snapsho
         &settings,
         &e_context,
         ChatRequest {
+            tool_declarations: None,
             service_mode: None,
             model: "gpt-4".into(),
             messages: e_history
@@ -9805,6 +9817,7 @@ async fn native_discovers_working_context_head_published_after_inherited_snapsho
         cancellation: CancellationToken::new(),
     };
     let request = ChatRequest {
+        tool_declarations: None,
         service_mode: None,
         model: "gpt-4".into(),
         messages: vec![accepted[0].clone(), ChatMessage::user("Continue")],
@@ -9837,6 +9850,7 @@ async fn native_discovers_working_context_head_published_after_inherited_snapsho
         false
     ));
     let compact_request = ChatRequest {
+        tool_declarations: None,
         messages: vec![projected[0].clone(), ChatMessage::user("Continue")],
         ..request.clone()
     };
@@ -10322,6 +10336,7 @@ async fn native_preparation_with_context_cap(selected_cap: bool) {
             },
         ));
     let request = ChatRequest {
+        tool_declarations: None,
         service_mode: None,
         model: "gpt-4o".into(),
         messages: vec![history, current],
@@ -11550,6 +11565,7 @@ async fn native_prepared_history_keeps_captured_epoch_until_admission() {
         "unrelated epoch mutation invalidated an exact prepared reference"
     );
     let request = ChatRequest {
+        tool_declarations: None,
         service_mode: None,
         model: "gpt-4".into(),
         messages: prepared
@@ -14209,6 +14225,7 @@ async fn frozen_fork_uses_compatible_ancestor_without_importing_future_work() {
         cancellation: CancellationToken::new(),
     };
     let native_request = ChatRequest {
+        tool_declarations: None,
         service_mode: None,
         model: "gpt-4".into(),
         messages: excluded_turn
@@ -14357,6 +14374,7 @@ async fn native_media_preparation_materializes_full_request_without_main_provide
             },
         }));
     let request = ChatRequest {
+        tool_declarations: None,
         service_mode: None,
         model: "gpt-4o".into(),
         messages: vec![message],
@@ -14802,6 +14820,7 @@ async fn check_nested_task_basis(legacy: bool) {
         cancellation: CancellationToken::new(),
     };
     let native_request = ChatRequest {
+        tool_declarations: None,
         service_mode: None,
         model: "gpt-4".into(),
         messages: manual_prepared.messages.clone(),
@@ -14867,6 +14886,7 @@ async fn check_nested_task_basis(legacy: bool) {
         .await
         .unwrap();
         let task_request = ChatRequest {
+            tool_declarations: None,
             messages: task_prepared.messages.clone(),
             ..native.request.clone()
         };
@@ -17810,6 +17830,7 @@ async fn composer_reuses_late_mixed_checkpoint_before_attached_child_policy() {
         &settings,
         &context,
         ChatRequest {
+            tool_declarations: None,
             service_mode: None,
             model: "gpt-4".into(),
             messages: request_messages,
@@ -21605,6 +21626,7 @@ async fn foreground_and_background_token_preflight_share_filtered_meaningful_rea
     let projection = |messages| {
         pioneer_agent::compaction::request::NativeRequestProjection::full(
             ChatRequest {
+                tool_declarations: None,
                 service_mode: None,
                 model: "gpt-4".into(),
                 messages,
@@ -21659,6 +21681,7 @@ async fn foreground_and_background_token_preflight_share_filtered_meaningful_rea
         &CompactionSettings::default(),
         &context,
         ChatRequest {
+            tool_declarations: None,
             service_mode: None,
             model: "gpt-4".into(),
             messages: foreground_preflight.request.messages.clone(),
@@ -24792,6 +24815,7 @@ async fn task_input_copy_normalization_survives_capture_restore_and_keeps_distin
         &settings,
         &context,
         ChatRequest {
+            tool_declarations: None,
             service_mode: None,
             model: "gpt-4".into(),
             messages: parent
@@ -24941,6 +24965,7 @@ async fn task_input_copy_normalization_survives_capture_restore_and_keeps_distin
         &settings,
         &context,
         ChatRequest {
+            tool_declarations: None,
             service_mode: None,
             model: "gpt-4".into(),
             messages: composed.clone(),
@@ -25142,6 +25167,7 @@ async fn task_input_copy_normalization_survives_capture_restore_and_keeps_distin
         .protected_input = true;
     let protected_wire = protected_copy_before.clone();
     let request_with = |messages| ChatRequest {
+        tool_declarations: None,
         service_mode: None,
         model: "fixture-model".into(),
         messages,
@@ -28290,6 +28316,7 @@ fn native_budget_measures_portable_reasoning_and_not_incompatible_replay() {
         inherited: false,
     });
     let request = ChatRequest {
+        tool_declarations: None,
         service_mode: None,
         model: "target-model".into(),
         messages: vec![message],
@@ -28309,6 +28336,7 @@ fn native_budget_measures_portable_reasoning_and_not_incompatible_replay() {
         Some(reasoning.as_str())
     );
     let without_reasoning = ChatRequest {
+        tool_declarations: None,
         messages: vec![ChatMessage::assistant("answer")],
         ..projected.clone()
     };
@@ -28334,6 +28362,7 @@ fn native_budget_measures_portable_reasoning_and_not_incompatible_replay() {
     ));
     let canonical = multiblock.clone();
     let multiblock_request = ChatRequest {
+        tool_declarations: None,
         service_mode: None,
         model: "target-model".into(),
         messages: vec![multiblock],
@@ -28356,6 +28385,7 @@ fn native_budget_measures_portable_reasoning_and_not_incompatible_replay() {
     let mut expected_message = canonical.clone();
     expected_message.provider_replay_state = None;
     let expected = ChatRequest {
+        tool_declarations: None,
         messages: vec![expected_message],
         ..outbound.clone()
     };
@@ -28471,6 +28501,7 @@ async fn foreground_native_projection_reuses_one_owner_across_model_windows() {
         }),
     };
     let request = |model: &str| ChatRequest {
+        tool_declarations: None,
         service_mode: None,
         model: model.into(),
         messages: vec![historical.clone(), ChatMessage::user("current input")],
@@ -30461,6 +30492,7 @@ fn completed_history_retains_media_estimates_for_candidate_projection() {
             "image/png",
         )));
     let request = ChatRequest {
+        tool_declarations: None,
         service_mode: None,
         model: "fixture".into(),
         messages: vec![ChatMessage::user("old"), retained.clone()],

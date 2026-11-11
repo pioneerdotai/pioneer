@@ -2706,6 +2706,7 @@ mod tests {
     #[test]
     fn compiled_prompt_payload_overrides_raw_system_messages() {
         let request = ChatRequest {
+            tool_declarations: None,
             service_mode: None,
             model: "claude-sonnet-4-20250514".into(),
             messages: vec![
@@ -2788,6 +2789,7 @@ mod tests {
     async fn chat_fails_without_valid_key() {
         let provider = AnthropicProvider::new("sk-ant-invalid-key");
         let request = ChatRequest {
+            tool_declarations: None,
             service_mode: None,
             model: "claude-sonnet-4-20250514".into(),
             messages: vec![ChatMessage::user("Hello")],

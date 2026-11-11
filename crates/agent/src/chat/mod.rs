@@ -2723,6 +2723,7 @@ async fn persist_system_snapshot(
     stage: &str,
     schemas: &Option<Vec<ToolDefinition>>,
     disclosure_order: &[String],
+    declarations: Option<&pioneer_provider::tool_declarations::ToolDeclarations>,
 ) -> Result<Option<ChatMessage>, ChatTurnError> {
     let Some(prompt) = prompt else {
         return Ok(None);
@@ -2732,16 +2733,35 @@ async fn persist_system_snapshot(
     })?;
     use sha2::{Digest, Sha256};
     let schema_hash = schema_fingerprint(schemas)?;
-    let item = format!(
+    // One stage can prepare several same-schema requests. Their retained
+    // positions/prefix proofs differ, so they must not collide at the durable
+    // idempotency key or replace an immutable earlier snapshot.
+    let declaration_bytes = serde_json::to_vec(&declarations)
+        .map_err(|error| ChatTurnError::Terminal(error.to_string()))?;
+    let mut item = format!(
         "system-snapshot:{stage}:{}:{schema_hash}",
-        hex::encode(Sha256::digest(&encoded))
+        hex::encode(Sha256::digest(&encoded)),
     );
+    if declarations.is_some() {
+        item.push(':');
+        item.push_str(&hex::encode(Sha256::digest(declaration_bytes)));
+    }
     let mut message = ChatMessage::user("");
     message.application_context = Some(
         serde_json::json!({"version":1,"kind":"system_snapshot","system":prompt,"schema_fingerprint":schema_hash,
             "tool_disclosure_scope": [workspace, thread, turn],
             "tool_disclosure_order": disclosure_order}),
     );
+    if let Some(declarations) = declarations {
+        declarations
+            .save(
+                message
+                    .application_context
+                    .as_mut()
+                    .expect("snapshot metadata"),
+            )
+            .map_err(|error| ChatTurnError::Terminal(error.to_string()))?;
+    }
     persist_runtime_message(
         event_tx,
         workspace,
@@ -3775,6 +3795,7 @@ async fn execute_standard_provider_response(
     }
 
     let request = ChatRequest {
+        tool_declarations: None,
         service_mode: None,
         model,
         messages,
@@ -4897,6 +4918,7 @@ async fn execute_agent_provider_response(
             message_item_id,
             &None,
             &[],
+            None,
         )
         .await?;
         let mut continuation_history = Vec::new();
@@ -5493,6 +5515,17 @@ async fn execute_agent_provider_response(
         messages.push(continuation);
     }
 
+    // Scope matches disclosure recovery; inherited snapshots never grant a baseline.
+    let mut tool_declarations = continuation_provider_history
+        .iter()
+        .filter(|entry| is_system_snapshot(&entry.message))
+        .max_by_key(|entry| entry.sequence)
+        .and_then(|entry| entry.message.application_context.as_ref())
+        .filter(|value| {
+            value.get("tool_disclosure_scope")
+                == Some(&serde_json::json!([workspace_id, thread_id, turn_id]))
+        })
+        .and_then(pioneer_provider::tool_declarations::ToolDeclarations::from_metadata);
     let mut recovered_system_pending = recovered_system_snapshot(&continuation_provider_history)?;
     let mut pending_retry_instruction: Option<String> = None;
     let mut applied_retry_instruction: Option<String> = None;
@@ -5903,12 +5936,18 @@ async fn execute_agent_provider_response(
                 if saved_system_matches_schemas(&continuation_provider_history, &tool_definitions)
                     .map_err(|error| (error, current_thinking_id.clone()))? { Some(saved) } else { round_compiled_prompt }
             } else { round_compiled_prompt };
-            if let Some(snapshot) = persist_system_snapshot(&round_compiled_prompt, event_tx.as_ref(), workspace_id, thread_id, turn_id, current_thinking_id.as_str(), &tool_definitions, &tool_disclosure_order).await
+            if let Some(definitions) = tool_definitions.as_deref() {
+                tool_declarations = Some(pioneer_provider::tool_declarations::ToolDeclarations::reconcile(
+                    tool_declarations.take(), &messages, definitions,
+                ).map_err(|error| (ChatTurnError::Terminal(error.to_string()), current_thinking_id.clone()))?);
+            }
+            if let Some(snapshot) = persist_system_snapshot(&round_compiled_prompt, event_tx.as_ref(), workspace_id, thread_id, turn_id, current_thinking_id.as_str(), &tool_definitions, &tool_disclosure_order, tool_declarations.as_ref()).await
                 .map_err(|error| (error, current_thinking_id.clone()))? {
                 retain_provider_history_message(&mut continuation_provider_history, &mut next_provider_history_sequence, &snapshot);
             }
             let post_turn_assistant_text_len_before_round = post_turn_assistant_text.len();
             let request = ChatRequest {
+                    tool_declarations: tool_declarations.clone(),
                 service_mode: None,
                     model: model.clone(),
                     messages: messages.clone(),
@@ -8192,6 +8231,7 @@ mod tests {
                 session
                     .prepare(
                         ChatRequest {
+                            tool_declarations: None,
                             service_mode: None,
                             model: "private/model".into(),
                             messages: vec![],
@@ -9748,6 +9788,237 @@ mod tests {
             &built.router.available_tool_names(),
         );
         assert_eq!(disclosed, vec!["task_revise", "task_get"]);
+    }
+
+    #[tokio::test]
+    async fn declarations_snapshot_waits_for_ack_and_restores_committed_discovery() {
+        use super::{AgentDurableEvent, AgentEventHub};
+        use pioneer_provider::{ToolDefinition, tool_declarations::ToolDeclarations};
+        let built = build_tools_with_extension_names(&["artifact_prepare", "artifact_register"]);
+        let mut built = built;
+        built.runtime = built
+            .runtime
+            .with_execution_security_snapshot(Some(test_full_access_security_snapshot()));
+        let mut visible = vec!["request_tools".to_owned()];
+        built.router.set_model_visible_tools(&visible).await;
+        let definitions = |names: &[String]| {
+            names
+                .iter()
+                .map(|name| {
+                    let spec = built.router.find_spec(name).unwrap().spec.clone();
+                    ToolDefinition {
+                        name: spec.name,
+                        description: spec.description,
+                        parameters: spec.parameters,
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut messages = vec![ChatMessage::user("discover artifacts")];
+        let initial = ToolDeclarations::reconcile(None, &messages, &definitions(&visible)).unwrap();
+        let call = built
+            .router
+            .build_model_tool_call(pioneer_tools::RawToolCall {
+                call_id: "discover".into(),
+                tool_name: "request_tools".into(),
+                arguments: serde_json::json!({"domains":["artifact"],"reason":"Need artifacts"})
+                    .to_string(),
+            })
+            .await
+            .unwrap();
+        let result = built.runtime.execute_tool_call(call).await.unwrap();
+        let discovery: RequestToolsResult =
+            serde_json::from_value(result.raw_output_json()).unwrap();
+        let added = apply_request_tools_visibility_expansion(
+            &mut visible,
+            &discovery,
+            built.router.as_ref(),
+        );
+        assert!(added.contains(&"artifact_prepare".to_owned()));
+        built.router.set_model_visible_tools(&visible).await;
+        let mut assistant = ChatMessage::assistant("");
+        assistant.tool_calls = Some(vec![pioneer_provider::ProviderToolCall {
+            id: "discover".into(),
+            name: "request_tools".into(),
+            arguments: serde_json::json!({"domains":["artifact"],"reason":"Need artifacts"})
+                .to_string(),
+        }]);
+        messages.push(assistant);
+        messages.push(ChatMessage::tool_result(
+            "discover",
+            "request_tools",
+            result.raw_output_json().to_string(),
+        ));
+        let repeated = built
+            .router
+            .build_model_tool_call(pioneer_tools::RawToolCall {
+                call_id: "repeat".into(),
+                tool_name: "request_tools".into(),
+                arguments: serde_json::json!({"domains":["artifact"],"reason":"Need artifacts"})
+                    .to_string(),
+            })
+            .await
+            .unwrap();
+        let repeated = built.runtime.execute_tool_call(repeated).await.unwrap();
+        let repeated: RequestToolsResult =
+            serde_json::from_value(repeated.raw_output_json()).unwrap();
+        assert!(repeated.added.is_empty());
+        let current = definitions(&visible);
+        // Committed discovery is recoverable before the next proposal exists.
+        let mut saved = serde_json::json!({});
+        initial.save(&mut saved).unwrap();
+        let recovered = ToolDeclarations::from_metadata(&saved).unwrap();
+        let next = ToolDeclarations::reconcile(Some(recovered), &messages, &current).unwrap();
+        let prompt = Some(pioneer_provider::CompiledPromptPayload {
+            stable_system_text: "rules".into(),
+            dynamic_system_text: String::new(),
+            boundary_marker: "boundary".into(),
+            full_system_text: "rules".into(),
+        });
+        for accepted in [false, true] {
+            let hub = std::sync::Arc::new(AgentEventHub::new());
+            let mut receiver = hub.take_durable_receiver().await.unwrap();
+            let schemas = Some(current.clone());
+            let publisher = {
+                let hub = hub.clone();
+                let next = next.clone();
+                let prompt = prompt.clone();
+                let visible = visible.clone();
+                tokio::spawn(async move {
+                    super::persist_system_snapshot(
+                        &prompt,
+                        &hub,
+                        "w",
+                        "t",
+                        "turn",
+                        "round",
+                        &schemas,
+                        &visible,
+                        Some(&next),
+                    )
+                    .await
+                })
+            };
+            let event = receiver.recv().await.unwrap();
+            let AgentDurableEvent::TurnLlmContextAppended {
+                payload:
+                    pioneer_protocol::ToolResultView::Json {
+                        value,
+                        truncated: false,
+                    },
+                item_id: first_item,
+                ..
+            } = event
+            else {
+                panic!("complete canonical snapshot required");
+            };
+            assert!(!publisher.is_finished());
+            if !accepted {
+                receiver.acknowledge_last(Err(
+                    pioneer_runtime_events::DurableCommitRejection::permanent(
+                        "fenced",
+                        "proposal rejected",
+                    ),
+                ));
+                assert!(publisher.await.unwrap().is_err());
+                continue;
+            }
+            receiver.acknowledge_last(Ok(()));
+            let published = publisher.await.unwrap().unwrap().unwrap();
+            assert_eq!(serde_json::to_value(&published).unwrap(), value);
+            for _ in 0..2 {
+                let independent: ChatMessage =
+                    serde_json::from_slice(&serde_json::to_vec(&published).unwrap()).unwrap();
+                let restored = ToolDeclarations::from_metadata(
+                    independent.application_context.as_ref().unwrap(),
+                )
+                .unwrap();
+                assert_eq!(restored.budget_tools(), next.budget_tools());
+            }
+            let mut extended = messages.clone();
+            extended.push(ChatMessage::user("next observation"));
+            let later =
+                ToolDeclarations::reconcile(Some(next.clone()), &extended, &current).unwrap();
+            let writer = {
+                let hub = hub.clone();
+                let schemas = Some(current.clone());
+                let prompt = prompt.clone();
+                let visible = visible.clone();
+                tokio::spawn(async move {
+                    super::persist_system_snapshot(
+                        &prompt,
+                        &hub,
+                        "w",
+                        "t",
+                        "turn",
+                        "round",
+                        &schemas,
+                        &visible,
+                        Some(&later),
+                    )
+                    .await
+                })
+            };
+            let AgentDurableEvent::TurnLlmContextAppended {
+                item_id: later_item,
+                ..
+            } = receiver.recv().await.unwrap()
+            else {
+                panic!("snapshot expected");
+            };
+            assert_ne!(
+                first_item, later_item,
+                "same-schema proposals must not overwrite frozen facts"
+            );
+            receiver.acknowledge_last(Ok(()));
+            assert!(writer.await.unwrap().is_ok());
+            let fresh =
+                build_tools_with_extension_names(&["artifact_prepare", "artifact_register"]);
+            let retained = vec![RetainedProviderHistoryMessage {
+                sequence: 1,
+                message: published.clone(),
+            }];
+            let order = super::restored_tool_disclosure_order(&retained, "w", "t", "turn");
+            let selection = fresh
+                .router
+                .compute_final_visible_tools(&fresh.router.core_tool_names(), &order);
+            fresh
+                .router
+                .set_model_visible_tools(&selection.visible_tools)
+                .await;
+            // Declarations never replace the execution router's current authority.
+            assert!(
+                fresh
+                    .router
+                    .build_model_tool_call(pioneer_tools::RawToolCall {
+                        call_id: "available".into(),
+                        tool_name: "artifact_prepare".into(),
+                        arguments: "{}".into(),
+                    })
+                    .await
+                    .is_ok()
+            );
+            fresh
+                .router
+                .set_blocked_tool_names([("artifact_prepare".to_owned(), "revoked".to_owned())]);
+            let selection = fresh
+                .router
+                .compute_final_visible_tools(&fresh.router.core_tool_names(), &order);
+            fresh
+                .router
+                .set_model_visible_tools(&selection.visible_tools)
+                .await;
+            let error = fresh
+                .router
+                .build_model_tool_call(pioneer_tools::RawToolCall {
+                    call_id: "revoked".into(),
+                    tool_name: "artifact_prepare".into(),
+                    arguments: "{}".into(),
+                })
+                .await
+                .expect_err("restored discovery must respect current tool revocation");
+            assert!(matches!(error, pioneer_tools::ToolError::NotVisible(_)));
+        }
     }
 
     #[test]

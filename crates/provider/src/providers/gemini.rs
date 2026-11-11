@@ -1680,6 +1680,7 @@ mod tests {
             ambiguous_input_aliases: vec![],
         });
         let request = ChatRequest {
+            tool_declarations: None,
             service_mode: None,
             model: "gemini-target".into(),
             messages: vec![message],
@@ -1751,6 +1752,7 @@ mod tests {
             )),
         );
         let request = ChatRequest {
+            tool_declarations: None,
             service_mode: None,
             model: "gemini-3-flash-preview".to_owned(),
             messages: vec![
@@ -1878,6 +1880,7 @@ mod tests {
     #[test]
     fn build_request_separates_system_messages() {
         let request = ChatRequest {
+            tool_declarations: None,
             service_mode: None,
             model: "gemini-2.0-flash".into(),
             messages: vec![
@@ -1918,6 +1921,7 @@ mod tests {
     #[test]
     fn build_request_no_system_message() {
         let request = ChatRequest {
+            tool_declarations: None,
             service_mode: None,
             model: "gemini-2.0-flash".into(),
             messages: vec![ChatMessage::user("Hello")],
@@ -1941,6 +1945,7 @@ mod tests {
     #[test]
     fn build_request_multiple_system_messages() {
         let request = ChatRequest {
+            tool_declarations: None,
             service_mode: None,
             model: "gemini-2.0-flash".into(),
             messages: vec![
@@ -1968,6 +1973,7 @@ mod tests {
     #[test]
     fn build_request_uses_compiled_prompt_sections_in_order() {
         let request = ChatRequest {
+            tool_declarations: None,
             service_mode: None,
             model: "gemini-2.0-flash".into(),
             messages: vec![
@@ -2004,6 +2010,7 @@ mod tests {
     #[test]
     fn api_request_serializes_correctly() {
         let request = ChatRequest {
+            tool_declarations: None,
             service_mode: None,
             model: "gemini-2.0-flash".into(),
             messages: vec![
@@ -2042,6 +2049,7 @@ mod tests {
                 "thinkingLevelMap":{"high":"HIGH","xhigh":"XHIGH"}}),
         );
         let mut request = ChatRequest {
+            tool_declarations: None,
             service_mode: None,
             model: id.into(),
             messages: vec![ChatMessage::user("Hello")],

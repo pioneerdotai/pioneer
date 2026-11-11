@@ -109,6 +109,15 @@ impl NativeRequestProjection {
             estimates.keys().all(|key| used.contains(key)),
             "media estimate belongs to another request"
         );
+        // A summary candidate deliberately replaces history. Choose full-list
+        // before sizing its envelope/fixed input, and keep that choice in the
+        // returned request. Full/shrink paths reject stale proofs without an
+        // estimator-only rebuild. Unchanged native prefixes retain their plan.
+        request.tool_declarations = if compact.is_empty() {
+            pioneer_provider::tool_declarations::ToolDeclarations::for_request(&request)
+        } else {
+            None
+        };
         let output_reserve = budget.output_reserve(request.max_tokens.map(u64::from))?;
         request.max_tokens = Some(u32::try_from(output_reserve)?);
         let mut message_sizes = Vec::with_capacity(request.messages.len());
@@ -157,6 +166,9 @@ impl NativeRequestProjection {
             "reasoning":request.reasoning.map(|value|format!("{value:?}")),
             "system_sections":request.compiled_prompt.as_ref().map(|value|value.system_sections()),
         });
+        if let Some(declarations) = &request.tool_declarations {
+            envelope["tools"] = declarations.budget_tools();
+        }
         if let Some(plan) = &request.service_mode {
             envelope["service_mode"] = serde_json::to_value(plan)?;
         }
@@ -522,6 +534,7 @@ mod tests {
     use pioneer_provider::{CompiledPromptPayload, MessageAttachment, ToolDefinition};
     fn request() -> ChatRequest {
         ChatRequest {
+            tool_declarations: None,
             service_mode: None,
             model: "fixture".into(),
             messages: vec![
@@ -537,6 +550,234 @@ mod tests {
             compiled_prompt: None,
         }
     }
+    #[test]
+    fn positional_definitions_are_charged_once_with_native_framing() {
+        use pioneer_provider::tool_declarations::ToolDeclarations;
+        let mut source = request();
+        source.tools = Some(vec![ToolDefinition {
+            name: "lookup".into(),
+            description: "large schema ".repeat(2000),
+            parameters: serde_json::json!({"type":"object"}),
+        }]);
+        let budget = ModelBudget::new(Some(32768), None, None);
+        let full =
+            NativeRequestProjection::full(source.clone(), vec![], budget.clone(), false).unwrap();
+        let declarations =
+            ToolDeclarations::reconcile(None, &source.messages, source.tools.as_deref().unwrap())
+                .unwrap();
+        source.tool_declarations = Some(declarations);
+        let native =
+            NativeRequestProjection::full(source.clone(), vec![], budget.clone(), false).unwrap();
+        assert!(native.estimated_input_tokens >= full.estimated_input_tokens);
+        assert!(native.estimated_input_tokens < full.estimated_input_tokens + 100);
+        assert!(native.request.tool_declarations.is_some());
+        source.messages.push(ChatMessage::user("append only"));
+        let appended =
+            NativeRequestProjection::full(source.clone(), vec![], budget.clone(), false).unwrap();
+        assert!(appended.request.tool_declarations.is_some());
+        use super::super::controller::{NativeInputReceipt, NativeUsageMeasurement};
+        let before =
+            NativeInputReceipt::for_request(&native.request, "instance", "responses", 1, None)
+                .unwrap();
+        let after =
+            NativeInputReceipt::for_request(&appended.request, "instance", "responses", 1, None)
+                .unwrap();
+        assert_eq!(before.identity.tools_hash, after.identity.tools_hash);
+        assert_eq!(
+            after
+                .calibrated_estimate(
+                    appended.estimated_input_tokens,
+                    &appended.message_input_tokens,
+                    Some(&NativeUsageMeasurement {
+                        receipt: before,
+                        input_tokens: 5000
+                    }),
+                )
+                .unwrap()
+                .measured,
+            5000
+        );
+        source.tools = None;
+        let disabled = NativeRequestProjection::full(source, vec![], budget, false).unwrap();
+        assert!(disabled.request.tool_declarations.is_none());
+        assert!(native.estimated_input_tokens > disabled.estimated_input_tokens + 1000);
+    }
+
+    // Whole serialized fallback envelope is independent of declaration helpers.
+    fn assert_full_list_accounting(evaluated: &EvaluatedRequest) {
+        assert!(evaluated.request.tool_declarations.is_none());
+        let req = &evaluated.request;
+        let mut envelope = serde_json::json!({
+            "model":req.model,"messages":req.messages,"tools":req.tools,
+            "tool_choice":req.tool_choice,"parallel_tool_calls":req.parallel_tool_calls,
+            "temperature":req.temperature,"max_tokens":req.max_tokens,
+            "reasoning":null,"system_sections":null,
+        });
+        assert_eq!(
+            evaluated.estimated_input_tokens,
+            pioneer_compaction::text_tokens(&envelope.to_string())
+        );
+        envelope["messages"] = serde_json::json!(
+            req.messages
+                .iter()
+                .filter(|m| m.role == Role::System)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            evaluated.fixed_input_tokens,
+            pioneer_compaction::text_tokens(&envelope.to_string())
+        );
+        assert_eq!(
+            evaluated.message_input_tokens,
+            req.messages
+                .iter()
+                .map(|message| {
+                    pioneer_compaction::text_tokens(&serde_json::to_string(message).unwrap()) + 1
+                })
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn compaction_candidate_selects_full_list_in_request_budget_and_receipt() {
+        use super::super::controller::{NativeInputReceipt, NativeUsageMeasurement};
+        use pioneer_provider::tool_declarations::ToolDeclarations;
+        let mut source = request();
+        source.model = "gpt-5.4".into();
+        source.messages.insert(0, ChatMessage::system("authority"));
+        source.tools = Some(vec![ToolDefinition {
+            name: "lookup".into(),
+            description: "schema ".repeat(2000),
+            parameters: serde_json::json!({"type":"object"}),
+        }]);
+        source.tool_declarations = Some(
+            ToolDeclarations::reconcile(None, &source.messages, source.tools.as_deref().unwrap())
+                .unwrap(),
+        );
+        let original = serde_json::to_vec(&source.messages).unwrap();
+        let budget = ModelBudget::new(Some(32768), None, None);
+        let native =
+            NativeRequestProjection::full(source.clone(), vec![], budget.clone(), false).unwrap();
+        assert!(native.request.tool_declarations.is_some());
+        let candidate = NativeRequestProjection::new(
+            native.request.clone(),
+            [1],
+            vec![],
+            budget.clone(),
+            false,
+        )
+        .unwrap()
+        .evaluate("completed old work")
+        .unwrap();
+        assert_eq!(
+            candidate.request.messages[1].content,
+            "Summary of completed work (historical data):\ncompleted old work"
+        );
+        assert_full_list_accounting(&candidate);
+        assert_eq!(serde_json::to_vec(&source.messages).unwrap(), original);
+        let fallback_receipt =
+            NativeInputReceipt::for_request(&candidate.request, "instance", "responses", 1, None)
+                .unwrap();
+        // Identical final messages/tools, but a genuinely new native baseline.
+        let mut fresh = candidate.request.clone();
+        fresh.tool_declarations = Some(
+            ToolDeclarations::reconcile(None, &fresh.messages, fresh.tools.as_deref().unwrap())
+                .unwrap(),
+        );
+        let fresh = NativeRequestProjection::full(fresh, vec![], budget, false).unwrap();
+        assert!(fresh.request.tool_declarations.is_some());
+        let native_receipt =
+            NativeInputReceipt::for_request(&fresh.request, "instance", "responses", 1, None)
+                .unwrap();
+        assert_eq!(fallback_receipt.messages, native_receipt.messages);
+        assert_ne!(
+            fallback_receipt.identity.tools_hash,
+            native_receipt.identity.tools_hash
+        );
+        let measured = NativeUsageMeasurement {
+            receipt: native_receipt,
+            input_tokens: 123456,
+        };
+        assert_eq!(
+            fallback_receipt
+                .calibrated_estimate(
+                    candidate.estimated_input_tokens,
+                    &candidate.message_input_tokens,
+                    Some(&measured)
+                )
+                .unwrap()
+                .measured,
+            0
+        );
+        // Even an unnormalized stale request cannot masquerade as native in a receipt.
+        let mut stale = candidate.request.clone();
+        stale.tool_declarations = source.tool_declarations;
+        assert_eq!(
+            NativeInputReceipt::for_request(&stale, "instance", "responses", 1, None)
+                .unwrap()
+                .identity,
+            fallback_receipt.identity
+        );
+    }
+
+    #[test]
+    fn reduced_result_full_uses_current_full_list_without_estimator_only_rebuild() {
+        use super::super::controller::NativeInputReceipt;
+        use pioneer_provider::tool_declarations::ToolDeclarations;
+        let mut source = request();
+        source.messages = vec![
+            ChatMessage::assistant_tool_calls(
+                None::<String>,
+                vec![pioneer_provider::ProviderToolCall {
+                    id: "call".into(),
+                    name: "lookup".into(),
+                    arguments: "{}".into(),
+                }],
+            ),
+            ChatMessage::tool_result("call", "lookup", "large result ".repeat(4000)),
+            ChatMessage::user("continue"),
+        ];
+        source.tools = Some(vec![ToolDefinition {
+            name: "lookup".into(),
+            description: "current schema ".repeat(1000),
+            parameters: serde_json::json!({"type":"object"}),
+        }]);
+        source.tool_declarations = Some(
+            ToolDeclarations::reconcile(None, &source.messages, source.tools.as_deref().unwrap())
+                .unwrap(),
+        );
+        let budget = ModelBudget::new(Some(65536), None, None);
+        let mut prepared = NativeRequestProjection::full(source, vec![], budget.clone(), false)
+            .unwrap()
+            .request;
+        assert!(prepared.tool_declarations.is_some());
+        let original_result = prepared.messages[1].clone();
+        // Same production reducer used by Gateway shrink_results, without DB setup.
+        prepared.messages[1] = crate::compaction::restored_tool_result_with_budget(
+            &original_result,
+            "saved-source",
+            512,
+        )
+        .unwrap();
+        assert_ne!(prepared.messages[1].content, original_result.content);
+        assert_eq!(
+            prepared.messages[1].tool_call_id,
+            original_result.tool_call_id
+        );
+        assert!(
+            prepared.tool_declarations.is_some(),
+            "exercise the stale proposal boundary"
+        );
+        let stale_receipt =
+            NativeInputReceipt::for_request(&prepared, "instance", "responses", 1, None).unwrap();
+        let reduced = NativeRequestProjection::full(prepared, vec![], budget, false).unwrap();
+        assert_full_list_accounting(&reduced);
+        let receipt =
+            NativeInputReceipt::for_request(&reduced.request, "instance", "responses", 1, None)
+                .unwrap();
+        assert_eq!(stale_receipt.identity, receipt.identity);
+    }
+
     #[test]
     fn full_target_counts_instructions_schemas_media_and_explicit_output() {
         let budget = ModelBudget::new(Some(4096), None, None);

@@ -1259,6 +1259,7 @@ mod completed_request_tests {
     fn completed_history_keeps_system_instructions_in_full_request_budget() {
         let instructions = "Required runtime instruction. ".repeat(500);
         let mut request = ChatRequest {
+            tool_declarations: None,
             service_mode: None,
             model: "fixture".into(),
             messages: vec![

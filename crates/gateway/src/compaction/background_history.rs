@@ -485,6 +485,7 @@ pub(crate) async fn prepare_completed_history_owned(
             None
         };
         let request = ChatRequest {
+            tool_declarations: None,
             service_mode: if current.transport == Transport::Api {
                 saved_context.and_then(|saved| saved.service_mode.clone())
             } else {
@@ -504,6 +505,7 @@ pub(crate) async fn prepare_completed_history_owned(
             pioneer_provider::history::project_request_for_provider(&catalog, request)?
         } else {
             ChatRequest {
+                tool_declarations: None,
                 messages: request
                     .messages
                     .iter()

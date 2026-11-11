@@ -121,6 +121,9 @@ fn prepare_request_for_api(
     responses: bool,
 ) -> Result<ChatRequest> {
     let provider = policy_id(provider);
+    if !responses {
+        request.tool_declarations = None;
+    }
     let use_public_catalog = DISCOVERY_TOOLS
         .try_with(|(owner, public, _)| owner != provider || *public)
         .unwrap_or(true);
@@ -467,6 +470,7 @@ pub(crate) fn ordered_tool_results(messages: &[ChatMessage]) -> Vec<usize> {
 #[cfg(test)]
 pub(crate) fn test_request() -> ChatRequest {
     ChatRequest {
+        tool_declarations: None,
         service_mode: None,
         model: "test-tool-model".into(),
         messages: vec![ChatMessage::user("use tools")],

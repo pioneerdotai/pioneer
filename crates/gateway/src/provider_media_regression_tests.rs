@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 fn request() -> ChatRequest {
     ChatRequest {
+        tool_declarations: None,
         service_mode: None,
         model: "text-only-fixture".into(),
         messages: vec![ChatMessage::user("hello")],

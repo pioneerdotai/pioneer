@@ -306,6 +306,7 @@ mod tests {
         // Default preparation must not require a catalog entry or discovery.
         provider.prepare_model("test-model").await.unwrap();
         let request = ChatRequest {
+            tool_declarations: None,
             service_mode: None,
             model: "test-model".into(),
             messages: vec![ChatMessage::user("hello")],
@@ -380,6 +381,7 @@ mod tests {
             ambiguous_input_aliases: vec![],
         });
         let request = ChatRequest {
+            tool_declarations: None,
             service_mode: None,
             model: "target-model".into(),
             messages: vec![message.clone()],

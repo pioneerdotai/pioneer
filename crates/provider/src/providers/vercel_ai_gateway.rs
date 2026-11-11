@@ -1407,6 +1407,7 @@ mod tests {
         let response = crate::attachments::runtime::with_async_authority_scope(
             provider.authority_fingerprint().unwrap().to_owned(),
             provider.chat(ChatRequest {
+                tool_declarations: None,
                 service_mode: None,
                 model: "private/agent".into(),
                 messages: vec![crate::ChatMessage::user("hello")],
@@ -1468,6 +1469,7 @@ mod tests {
                 .await
                 .unwrap();
             let request = ChatRequest {
+                tool_declarations: None,
                 service_mode: None,
                 model: if index == 1 {
                     "private/other"
@@ -1647,6 +1649,7 @@ mod tests {
         for id in ["private/embed", "private/language-batch"] {
             let error = provider
                 .prepare_input_budget(ChatRequest {
+                    tool_declarations: None,
                     service_mode: None,
                     model: id.into(),
                     messages: vec![crate::ChatMessage::user("hello")],
