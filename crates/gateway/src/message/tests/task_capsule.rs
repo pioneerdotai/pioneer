@@ -142,8 +142,7 @@ fn capsule_run_with_rounds(
         let provider = Arc::new(provider);
         let processor = processor_with_review_config(
             Arc::new(pioneer_provider::ProviderRegistry::with_provider(
-                "openai",
-                provider.clone(),
+                "openai", provider,
             )),
             Arc::new(SessionManager::new()),
             workspace_manager,
@@ -212,41 +211,11 @@ fn capsule_run_with_rounds(
             )
             .await
             .expect("start independent root execution");
-            let status =
-                wait_for_task_status(store.clone(), &response.task.id, TaskStatus::Completed).await;
-            if status != TaskStatus::Completed {
-                let request = provider.last_request.lock().unwrap().clone();
-                let tools = request
-                    .as_ref()
-                    .and_then(|request| request.tools.as_ref())
-                    .map(|tools| {
-                        tools
-                            .iter()
-                            .map(|tool| tool.name.as_str())
-                            .collect::<Vec<_>>()
-                    });
-                let messages = request.as_ref().map(|request| {
-                    request
-                        .messages
-                        .iter()
-                        .rev()
-                        .take(8)
-                        .map(|message| {
-                            (
-                                &message.role,
-                                &message.name,
-                                message.content.chars().take(4000).collect::<String>(),
-                                &message.tool_calls,
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                });
-                let state = store.get_task(&response.task.id).await.unwrap();
-                panic!(
-                    "capsule step {step} must finish: status={status:?}, scripted_round={}, tools={tools:?}, recent_messages={messages:?}, task={state:?}",
-                    provider.next_index.load(Ordering::SeqCst),
-                );
-            }
+            assert_eq!(
+                wait_for_task_status(store.clone(), &response.task.id, TaskStatus::Completed).await,
+                TaskStatus::Completed,
+                "capsule step {step} must finish"
+            );
             (response.task.id, response.run.unwrap().id)
         };
         // Keep the reconstructed runtime alive until any background worker launched
@@ -277,44 +246,10 @@ fn capsule_run_with_rounds(
                 } else {
                     TaskStatus::Completed
                 };
-                let status = wait_for_task_status(store.clone(), &id, expected).await;
-                if status != expected {
-                    let state = store.get_task(&id).await.unwrap().unwrap();
-                    let mut child_turns = Vec::new();
-                    for run_turn in &state.task_run_turns {
-                        child_turns.push(
-                            store
-                                .get_turn(&run_turn.thread_id, &run_turn.turn_id)
-                                .await
-                                .unwrap(),
-                        );
-                    }
-                    let request = provider.last_request.lock().unwrap().clone();
-                    let recent_messages = request.as_ref().map(|request| {
-                        request
-                            .messages
-                            .iter()
-                            .rev()
-                            .take(8)
-                            .map(|message| {
-                                (
-                                    &message.role,
-                                    &message.name,
-                                    message.content.chars().take(4000).collect::<String>(),
-                                    &message.tool_calls,
-                                )
-                            })
-                            .collect::<Vec<_>>()
-                    });
-                    panic!(
-                        "capsule step {step}: {} worker must reach {expected:?}, got {status:?}; task={:?}, runs={:?}, run_turns={:?}, child_turns={child_turns:?}, scripted_round={}, recent_messages={recent_messages:?}",
-                        call.name,
-                        state.task,
-                        state.runs,
-                        state.task_run_turns,
-                        provider.next_index.load(Ordering::SeqCst),
-                    );
-                }
+                assert_eq!(
+                    wait_for_task_status(store.clone(), &id, expected).await,
+                    expected
+                );
             }
         }
         let lineage = wait_for_child_lineage_for_run(store.clone(), &owner_run_id).await;
