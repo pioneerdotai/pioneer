@@ -559,6 +559,8 @@ impl ToolCallRuntime {
                             1,
                             projection,
                             call.output_projection.is_shell(&call.tool_name),
+                            output.output.retained_output_log(),
+                            output.output.retained_output_log_item().map(str::to_owned),
                         )
                         .await?;
                 }
@@ -585,12 +587,19 @@ impl ToolCallRuntime {
                     classify_call_error(&call, &error, source, &workdir)
                 };
                 trace.emit_stage(1, "runtime.failed", Some(error.to_string()), None);
+                let retained_output_log =
+                    matches!(
+                        &call.output_projection,
+                        crate::ToolOutputProjectionKind::Builtin
+                    ) && matches!(&call.payload, crate::ToolPayload::LocalShell(_))
+                        && trace.has_saved_output_log();
                 trace
                     .emit_failed_with_outcome(
                         1,
                         error.to_string().as_str(),
                         &outcome,
                         call.output_policy,
+                        retained_output_log,
                     )
                     .await?;
                 self.event_bus.finish_trace(trace.trace_id());
@@ -634,6 +643,10 @@ impl ToolCallRuntime {
             .unwrap_or(call.execution_class == ExecutionClass::Exclusive);
         let identity = Arc::as_ptr(&self.global_lock) as usize;
         let cua_path = self.router.computer_use_leaf(&call.tool_name).is_some();
+        let native_shell_path = matches!(
+            &call.output_projection,
+            crate::ToolOutputProjectionKind::Builtin
+        ) && matches!(&call.payload, crate::ToolPayload::LocalShell(_));
         let parent_name = call.tool_name.clone();
         let dispatch = self.router.dispatch(
             self.orchestrator.as_ref(),
@@ -662,9 +675,12 @@ impl ToolCallRuntime {
         tokio::select! {
             result = &mut dispatch => result,
             _ = cancellation.cancelled() => {
-                if !cua_path {
+                if !cua_path && !native_shell_path {
                     return Err(ToolError::cancelled("tool dispatch cancelled"));
                 }
+                // The existing bounded grace lets native shell terminate/drain
+                // and acknowledge output before its future is dropped. No
+                // command or durable save is detached from the owning attempt.
                 match timeout(Duration::from_millis(DISPATCH_CANCEL_GRACE_MS), &mut dispatch).await {
                     Ok(result) => result,
                     Err(_) => Err(ToolError::cancelled("tool dispatch cancelled")),

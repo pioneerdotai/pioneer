@@ -57,6 +57,8 @@ async fn shell_outcome(
     fields.insert("recovered_from_terminal_item".into(), true.into());
     let policy: pioneer_protocol::ToolOutputPolicySnapshot =
         serde_json::from_value(value["outputPolicy"].clone())?;
+    let mut retained_output_log = false;
+    let mut retained_output_log_item = None;
     let full = if compact {
         // This receipt precedes the terminal item and contains no output bytes.
         let controls = store
@@ -69,6 +71,10 @@ async fn shell_outcome(
             truncated: false,
         }) = controls
         {
+            retained_output_log = controls["retained_output_log"] == true;
+            retained_output_log_item = controls["retained_output_log_item"]
+                .as_str()
+                .map(str::to_owned);
             for field in ["session_id", "output_stats", "command"] {
                 if let Some(value) = controls.get(field) {
                     observation[field] = value.clone();
@@ -127,6 +133,11 @@ async fn shell_outcome(
         )
         .into_chat_message()
     };
+    let mut full = full;
+    if compact && retained_output_log {
+        full.application_context = Some(serde_json::json!({"retained_output_log":true,
+            "retained_output_log_item":retained_output_log_item}));
+    }
     let locator = serde_json::json!({"workspace_id": workspace, "thread_id": thread, "turn_id": turn, "item_id": item_id}).to_string();
     let message = if compact {
         pioneer_agent::compaction::recovered_shell_result_message(

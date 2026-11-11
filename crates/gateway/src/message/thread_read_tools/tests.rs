@@ -962,12 +962,13 @@ async fn public_result_reader_honors_token_budget_with_real_cursors_for_all_sour
         assert!(error.to_string().contains("budget"));
         params.max_tokens = Some(500);
         // The legacy saved view has typed metadata as well as stdout. Compare
-        // every byte with its complete public, unbudgeted representation too.
+        // every byte with its explicitly enlarged public representation too.
         let expected = if let Some(expected) = expected {
             expected
         } else {
             let unbudgeted = ThreadToolResultReadParams {
-                max_tokens: None,
+                max_tokens: Some(500_000),
+                max_bytes: Some(2 * 1024 * 1024),
                 ..params.clone()
             };
             let whole: ThreadToolResultReadResponse =
@@ -981,6 +982,29 @@ async fn public_result_reader_honors_token_budget_with_real_cursors_for_all_sour
             assert_eq!(saved["item"]["display"]["stdout"], text);
             whole.text
         };
+        let mut defaults = ThreadToolResultReadParams {
+            max_tokens: None,
+            max_bytes: None,
+            cursor: None,
+            ..params.clone()
+        };
+        let mut default_text = String::new();
+        loop {
+            let output = call(handler, &defaults).await.unwrap();
+            let wire = output.raw_text();
+            assert!(wire.len() <= 32768 && pioneer_compaction::text_tokens(&wire) <= 4096);
+            let page: ThreadToolResultReadResponse = serde_json::from_str(&wire).unwrap();
+            default_text.push_str(&page.text);
+            if page.eof {
+                break;
+            }
+            assert!(!page.text.is_empty());
+            defaults.cursor = page.next;
+            // Equivalent explicit defaults must retain the same cursor scope.
+            defaults.max_tokens = Some(4096);
+            defaults.max_bytes = Some(32768);
+        }
+        assert_eq!(default_text, expected);
         let mut restored = String::new();
         let mut pages = 0;
         let mut rollovers = 0;
@@ -1207,6 +1231,8 @@ async fn saved_observation_result_cannot_replay_a_now_inaccessible_thread() {
         let page = processor.read_thread_tool_result(request).await.unwrap();
         let projected = serde_json::to_value(&page).unwrap();
         assert!(pioneer_tools::thread_read_page_fits(&projected));
+        let encoded = serde_json::to_string(&projected).unwrap();
+        assert!(encoded.len() <= 32768 && pioneer_compaction::text_tokens(&encoded) <= 4096);
         restored.push_str(&page.text);
         pages += 1;
         if page.eof {
@@ -1888,7 +1914,17 @@ async fn shell_saved_source_survives_summary_timeline_and_compact_replay() {
         "session_id":19,"timed_out":false,"duration_ms":10,
         "truncated":{"stdout":false,"stderr":false,"aggregated_output":false},
         "output_stats":{"full_output_available":false}});
-    for (index, proxy) in [false, true].into_iter().enumerate() {
+    for (index, (proxy, log_source)) in [(false, false), (true, false), (false, true)]
+        .into_iter()
+        .enumerate()
+    {
+        let mut raw = raw.clone();
+        if log_source {
+            raw["stdout"] = "bounded native tail".into();
+            raw["aggregated_output"] = "bounded native tail".into();
+            raw["output_stats"] =
+                json!({"full_output_available":true,"truncation_method":"retained_output_log"});
+        }
         let item_id = format!("saved-shell-{index}");
         let name = "skill.fixture.shell";
         let mut policy = ToolOutputPolicySnapshot::for_tool_name("exec_command");
@@ -1920,7 +1956,7 @@ async fn shell_saved_source_survives_summary_timeline_and_compact_replay() {
             output_projection: &kind,
         });
         assert!(
-            matches!(&envelope.storage,pioneer_protocol::ToolStoragePayload::Shell { stdout:Some(text),.. } if text.contains(unique))
+            matches!(&envelope.storage,pioneer_protocol::ToolStoragePayload::Shell { stdout:Some(text),.. } if text.contains(unique) != log_source)
         );
         assert!(
             !serde_json::to_string(&envelope.display)
@@ -1955,12 +1991,157 @@ async fn shell_saved_source_survives_summary_timeline_and_compact_replay() {
             )
             .await
             .unwrap();
-        let reference = json!({"workspace_id":WORKSPACE_RED_ID,"thread_id":THREAD_RED_PRIVATE_A_ID,
+        if log_source {
+            processor
+                .crud_store
+                .record_tool_output(
+                    &format!("native-source-{index}"),
+                    &pioneer_protocol::ItemDeltaNotification {
+                        workspace_id: WORKSPACE_RED_ID.into(),
+                        thread_id: THREAD_RED_PRIVATE_A_ID.into(),
+                        turn_id: "shell-source-turn".into(),
+                        item_id: item_id.clone(),
+                        stream: Some(pioneer_protocol::ItemDeltaStream::Stdout),
+                        delta: stdout.clone(),
+                        payload: None,
+                        markdown: None,
+                        markdown_version: None,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        if log_source {
+            // Crash after native failure terminal ACK, before canonical delivery.
+            let interrupted = format!("{item_id}-interrupted");
+            let controls = pioneer_tools::ToolResultView::Json {
+                value: json!({"retained_output_log":true,"retained_output_log_item":item_id,
+                    "output_stats":{"full_output_available":false,"truncation_method":"retained_output_log"}}),
+                truncated: false,
+            };
+            processor
+                .crud_store
+                .append_turn_llm_context(
+                    pioneer_crud::NewTurnLlmContextEntry {
+                        turn_id: "shell-source-turn".into(),
+                        item_id: Some(interrupted.clone()),
+                        attempt_id: None,
+                        sequence: 0,
+                        source: "shell_control_v1".into(),
+                        tool_name: Some(name.into()),
+                        payload: serde_json::to_string(&controls).unwrap(),
+                        output_policy_snapshot: serde_json::to_string(&policy).unwrap(),
+                        created_at: chrono::Utc::now().fixed_offset(),
+                        expires_at: None,
+                    },
+                    &format!("interrupted-controls-{index}"),
+                )
+                .await
+                .unwrap();
+            processor
+                .crud_store
+                .materialize_item_completed(
+                    pioneer_protocol::ItemCompletedNotification {
+                        workspace_id: WORKSPACE_RED_ID.into(),
+                        thread_id: THREAD_RED_PRIVATE_A_ID.into(),
+                        turn_id: "shell-source-turn".into(),
+                        item: TurnItem::DynamicToolCall {
+                            id: interrupted.clone(),
+                            tool_name: name.into(),
+                            arguments: json!({}),
+                            status: ToolCallStatus::Failed,
+                            execution_class: TurnItemExecutionClass::Standard,
+                            recovery_policy: None,
+                            output_policy: policy.clone(),
+                            display: pioneer_protocol::ToolDisplayPayload::Hidden,
+                            storage: pioneer_protocol::ToolStoragePayload::Shell {
+                                stdout: None,
+                                stderr: Some("cancelled after capture".into()),
+                                aggregated_output: None,
+                                exit_code: None,
+                                duration_ms: None,
+                                timed_out: None,
+                                truncated: true,
+                            },
+                            recovery: None,
+                            success: Some(false),
+                            outcome: None,
+                            observation: None,
+                        },
+                    },
+                    1_800_000_001,
+                )
+                .await
+                .unwrap();
+            processor
+                .crud_store
+                .record_tool_output(
+                    &format!("interrupted-output-{index}"),
+                    &pioneer_protocol::ItemDeltaNotification {
+                        workspace_id: WORKSPACE_RED_ID.into(),
+                        thread_id: THREAD_RED_PRIVATE_A_ID.into(),
+                        turn_id: "shell-source-turn".into(),
+                        item_id: interrupted.clone(),
+                        stream: Some(pioneer_protocol::ItemDeltaStream::Stdout),
+                        delta: stdout.clone(),
+                        payload: None,
+                        markdown: None,
+                        markdown_version: None,
+                    },
+                )
+                .await
+                .unwrap();
+            let (_, recovered) = crate::compaction::recover_undelivered_shell_outcome(
+                &processor.crud_store,
+                WORKSPACE_RED_ID,
+                THREAD_RED_PRIVATE_A_ID,
+                "shell-source-turn",
+                &interrupted,
+                "interrupted-provider-call",
+                name,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let recovered_value: Value = serde_json::from_str(&recovered.content).unwrap();
+            assert_eq!(
+                recovered_value["saved_source"]["reference"]["output_log"],
+                true
+            );
+            assert_eq!(
+                recovered_value["output_stats"]["full_output_available"],
+                false
+            );
+            assert_eq!(
+                recovered_value["saved_source"]["reference"]["item_id"],
+                item_id
+            );
+            assert!(!recovered.content.contains(unique));
+            let (_, replayed) = crate::compaction::recover_undelivered_shell_outcome(
+                &processor.crud_store,
+                WORKSPACE_RED_ID,
+                THREAD_RED_PRIVATE_A_ID,
+                "shell-source-turn",
+                &interrupted,
+                "interrupted-provider-call",
+                name,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(replayed, recovered);
+        }
+        let mut reference = json!({"workspace_id":WORKSPACE_RED_ID,"thread_id":THREAD_RED_PRIVATE_A_ID,
             "turn_id":"shell-source-turn","item_id":item_id});
+        let mut model_message = envelope
+            .to_model_input_item("provider-call", name)
+            .into_chat_message();
+        if log_source {
+            // Host attestation is supplied only after the real saved chunk ACK.
+            model_message.application_context = Some(json!({"retained_output_log":true}));
+        }
         let compact = pioneer_agent::compaction::recovered_shell_result_message(
-            envelope
-                .to_model_input_item("provider-call", name)
-                .into_chat_message(),
+            model_message,
             &policy,
             true,
             &reference.to_string(),
@@ -1970,8 +2151,11 @@ async fn shell_saved_source_survives_summary_timeline_and_compact_replay() {
         assert!(!compact.content.contains(unique));
         assert!(model.get("aggregated_output").is_none());
         assert_eq!(model["session_id"], 19);
+        if log_source {
+            reference["output_log"] = true.into();
+        }
         assert_eq!(model["saved_source"]["reference"], reference);
-        assert_eq!(model["output_stats"]["full_output_available"], false);
+        assert_eq!(model["output_stats"]["full_output_available"], log_source);
         let payload = serde_json::to_string(&pioneer_tools::ToolResultView::Json {
             value: serde_json::to_value(&compact).unwrap(),
             truncated: false,
@@ -2070,7 +2254,7 @@ async fn shell_saved_source_survives_summary_timeline_and_compact_replay() {
             cursor: None,
             max_tokens: Some(8192),
             max_bytes: Some(32768),
-            output_log: false,
+            output_log: log_source,
         };
         let mut complete = String::new();
         loop {

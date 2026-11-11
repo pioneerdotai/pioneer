@@ -1316,11 +1316,42 @@ pub(crate) fn prepare_shell_model_message(
     if saved_output_available
         && !matches!(policy.llm, pioneer_protocol::LlmOutputPolicy::SummaryOnly)
     {
-        value["saved_source"] = serde_json::json!({"reference": serde_json::from_str::<serde_json::Value>(reference).map_err(|e| ChatTurnError::Blocked(e.to_string()))?, "read_tool":"threads_tools_result_read"});
+        let mut source_reference: serde_json::Value =
+            serde_json::from_str(reference).map_err(|e| ChatTurnError::Blocked(e.to_string()))?;
+        if message
+            .application_context
+            .as_ref()
+            .is_some_and(|context| context["retained_output_log"] == true)
+        {
+            source_reference["output_log"] = true.into();
+            if let Some(item) = message
+                .application_context
+                .as_ref()
+                .and_then(|context| context["retained_output_log_item"].as_str())
+            {
+                source_reference["item_id"] = item.into();
+            }
+        }
+        value["saved_source"] = serde_json::json!({"reference": source_reference, "read_tool":"threads_tools_result_read"});
     }
     message.content =
         serde_json::to_string(&value).map_err(|e| ChatTurnError::Blocked(e.to_string()))?;
+    let retained_output_log = message
+        .application_context
+        .as_ref()
+        .is_some_and(|context| context["retained_output_log"] == true);
+    let retained_output_log_item = message
+        .application_context
+        .as_ref()
+        .and_then(|context| context.get("retained_output_log_item"))
+        .cloned();
     message.application_context = Some(serde_json::json!({"kind":"shell_output","version":1}));
+    if retained_output_log {
+        message.application_context.as_mut().unwrap()["retained_output_log"] = true.into();
+        if let Some(item) = retained_output_log_item {
+            message.application_context.as_mut().unwrap()["retained_output_log_item"] = item;
+        }
+    }
     bounded_shell_result_message(&message, Some(policy), pioneer_compaction::RESULT_TOKENS)
 }
 
@@ -7400,11 +7431,17 @@ async fn execute_agent_provider_response(
                         let tool_correlation = tool_call.observation.correlation();
                         let tool_attempt_started = Instant::now();
                         let shell_model_projection = tool_call.output_projection.is_shell(&tool_name).then(|| tool_call.output_policy.clone());
-                        let dispatch_result = if runtime.router().computer_use_leaf(&tool_name).is_some() {
+                        let native_shell_log = matches!(&tool_call.output_projection, pioneer_tools::ToolOutputProjectionKind::Builtin)
+                            && matches!(&tool_call.payload, pioneer_tools::ToolPayload::LocalShell(_));
+                        let native_file_page = tool_call.output_projection.is_file_page(&tool_name);
+                        let output_trace = runtime.event_bus().trace_with_id(tool_call.trace_id.clone(), turn_id.clone(), item_id.clone(), tool_name.clone());
+                        let dispatch_result = pioneer_tools::with_model_result_framing(provider_call_id.clone(), tool_name.clone(), tool_call.output_policy.clone(), tool_call.output_projection.clone(), async {
+                            if runtime.router().computer_use_leaf(&tool_name).is_some() {
                             runtime.execute_tool_call_with_deferred_delivery(tool_call, attempt_token.clone()).await
                         } else {
                             runtime.execute_tool_call_with_cancellation(tool_call, attempt_token.clone()).await
-                        };
+                            }
+                        }).await;
                         let delivery = dispatch_result.as_ref().ok()
                             .and_then(|result| result.output.delivery_receipt())
                             .map(|receipt| NativeToolDelivery {
@@ -7424,12 +7461,16 @@ async fn execute_agent_provider_response(
 
                         let full_source_in_item = dispatch_result.as_ref().ok().and_then(|r| r.projection()).is_some_and(|p| matches!(p.storage, pioneer_protocol::ToolStoragePayload::Shell { .. }) && matches!(p.output_policy.storage, pioneer_protocol::StorageOutputPolicy::Full { .. }));
                         let full_message = dispatch_result.as_ref().ok().map(|result| {
-                            let mut message = result.to_history_message();
+                            let mut message = if native_file_page {
+                                result.to_model_input_item().into_chat_message()
+                            } else { result.to_history_message() };
                             message.tool_call_id = Some(provider_call_id.clone());
                             message.name = Some(tool_name.clone());
                             message
                         });
-                        let full_source_in_item = full_source_in_item && full_message.as_ref().is_none_or(|message| message.content_parts.is_empty());
+                        let full_source_in_item = (full_source_in_item || (dispatch_result.is_err() && native_shell_log
+                            && output_trace.has_saved_output_log() && shell_model_projection.as_ref().is_some_and(|policy|
+                                matches!(policy.storage, pioneer_protocol::StorageOutputPolicy::Full { .. })))) && full_message.as_ref().is_none_or(|message| message.content_parts.is_empty());
                         let (
                             tool_output,
                             success,
@@ -7458,6 +7499,10 @@ async fn execute_agent_provider_response(
                                     let mut message =
                                         result.to_model_input_item().into_chat_message();
                                     message.tool_call_id = Some(provider_call_id.clone());
+                                    if result.output.retained_output_log() {
+                                        message.application_context = Some(serde_json::json!({"retained_output_log":true,
+                                            "retained_output_log_item":result.output.retained_output_log_item()}));
+                                    }
                                     if shell_model_projection.is_some() && projection.is_some_and(|p| matches!(p.llm_view, ToolResultView::Empty)) {
                                         message.content.clear();
                                     }
@@ -7474,12 +7519,19 @@ async fn execute_agent_provider_response(
                                 Err(error) => {
                                     let output = error.to_string();
                                     let outcome = runtime.router().classify_tool_error(tool_name.as_str(), &error);
-                                    let message = tooling::build_tool_error_message(
+                                    let mut message = tooling::build_tool_error_message(
                                         provider_call_id.clone(),
                                         tool_name.clone(),
                                         output.clone(),
                                         outcome.clone(),
                                     );
+                                    if native_shell_log && output_trace.has_saved_output_log() {
+                                        message.application_context = Some(serde_json::json!({"retained_output_log":true}));
+                                        if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&message.content) {
+                                            value["full_output_available"] = false.into();
+                                            message.content = value.to_string();
+                                        }
+                                    }
                                     (output, false, outcome, None, None, None, message)
                                 }
                             };

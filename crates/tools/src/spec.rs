@@ -297,7 +297,7 @@ pub fn builtin_tool_specs() -> Vec<ConfiguredToolSpec> {
         ),
         configured_builtin_spec(
             "read_file",
-            "Read exact UTF-8 text without changing it. `path` may be relative to the turn cwd or an authorized absolute path. To choose where to start, pass either `start_line` (1-based) or `start_byte` (0-based); omit the other. If both are passed, `start_line` takes precedence. An explicit offset also takes precedence over `cursor`. The result returns the resolved absolute path and one bounded text page; when `truncated` is true, omit both offsets and pass its exact `continuation` back as `cursor` to read the next page.",
+            "Read exact UTF-8 text without changing it. `path` may be relative to the turn cwd or an authorized absolute path. To choose where to start, pass either `start_line` (1-based) or `start_byte` (0-based); omit the other. If both are passed, `start_line` takes precedence. An explicit offset also takes precedence over `cursor`. The result returns the resolved absolute path and one bounded text page; when `truncated` is true, omit both offsets and pass its exact `continuation` back as `cursor` to read the next page. Defaults are ceilings of 2000 lines / 50 KiB; the working message budget may select less even for explicit limits. partial_line=true identifies a page starting or ending inside a line: follow the cursor, not next_line. For a large unfamiliar file, first locate relevant areas with narrow search, then read sufficient contiguous ranges; read known locations directly. On rechecking, start with the current diff and needed callers. Reuse unchanged text only when its current version remains in your own context; reread after edits, compaction, handoff or doubt. A full audit requires the entire relevant diff and related code; follow continuation/saved sources on truncation.",
             read_file_schema(),
             PayloadKind::Function,
             ExecutionClass::Shared,
@@ -325,7 +325,7 @@ pub fn builtin_tool_specs() -> Vec<ConfiguredToolSpec> {
         ),
         configured_builtin_spec(
             "grep_files",
-            "Search UTF-8 text under a scoped directory or file. `path` may be cwd-relative or an authorized absolute path; use the narrowest path and optional glob you can infer. Results use reusable absolute paths. `no_matches` means the search completed without matches; `partial` means some results were omitted. If the result says `needs_narrowing`, follow its `next_action` and do not repeat the same broad search.",
+            "Search UTF-8 text under a scoped directory or file. `path` may be cwd-relative or an authorized absolute path; use the narrowest path and optional glob you can infer. Results use reusable absolute paths. `no_matches` means the search completed without matches; `partial` means some results were omitted. Long-line previews are separately marked and include a read_file start_byte; use read_file to inspect the source. Previews do not replace a complete audit. If the result says `needs_narrowing`, follow its `next_action` and do not repeat the same broad search.",
             grep_files_schema(),
             PayloadKind::Function,
             ExecutionClass::Shared,
@@ -450,7 +450,7 @@ fn exec_command_schema() -> JsonValue {
                 "minimum": 1,
                 "description": "Hard deadline in milliseconds. Pioneer terminates the process when this expires. Do not retry a timed-out command with only a larger value; materially change the strategy first."
             },
-            "max_output_tokens": { "type": "integer", "minimum": 1 },
+            "max_output_tokens": { "type": "integer", "minimum": 1, "description": "Bounds the inline preview, not the retained output source. Native output is separately saved under storage quotas; follow saved_source with threads_tools_result_read. A session source is the delta saved by that poll; keep earlier source references. full_output_available=false reports incomplete capture/save; EOF is only the saved state." },
             "yield_time_ms": { "type": "integer", "minimum": 0 },
             "tty": { "type": "boolean" }
         },
@@ -466,7 +466,7 @@ fn write_stdin_schema() -> JsonValue {
             "session_id": { "type": "integer", "minimum": 1 },
             "chars": { "type": "string" },
             "yield_time_ms": { "type": "integer", "minimum": 0 },
-            "max_output_tokens": { "type": "integer", "minimum": 1 }
+            "max_output_tokens": { "type": "integer", "minimum": 1, "description": "Bounds the inline preview. Follow saved_source for the retained delta from this poll and keep earlier references for the whole session. Output statistics are cumulative; full_output_available=false marks incomplete capture/save. EOF describes the saved snapshot." }
         },
         "required": ["session_id"],
         "additionalProperties": false

@@ -1240,12 +1240,12 @@ async fn shell_control_cleanup_defers_to_the_existing_child_receipt_gate() {
             .unwrap()
             .resolution_pending
     );
-    // Settled audit history is insufficient without positive execution evidence.
+    // Settled audit history is insufficient while execution is still running.
     pioneer_entity::turn_execution::Entity::update_many()
         .filter(pioneer_entity::turn_execution::Column::TurnId.eq("settled_shell_child"))
         .col_expr(
             pioneer_entity::turn_execution::Column::Status,
-            Expr::value("recovering"),
+            Expr::value("running"),
         )
         .col_expr(
             pioneer_entity::turn_execution::Column::CompletedAt,

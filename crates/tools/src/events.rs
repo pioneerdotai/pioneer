@@ -201,6 +201,10 @@ pub struct ToolCallCompletedEvent {
     /// Trusted runtime projection origin, never copied from a tool's JSON.
     #[serde(default)]
     pub shell_output: bool,
+    #[serde(default)]
+    pub retained_output_log: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retained_output_log_item: Option<String>,
     pub success: bool,
     pub outcome: ToolOutcome,
     pub llm_view: ToolResultView,
@@ -214,6 +218,9 @@ pub struct ToolCallCompletedEvent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolCallFailedEvent {
+    /// Trusted native failure path, backed by a positive output-log ACK.
+    #[serde(default)]
+    pub retained_output_log: bool,
     pub error: String,
     pub outcome: ToolOutcome,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -268,13 +275,19 @@ impl DurableToolEventEnvelope {
     }
 }
 
+#[derive(Default)]
+struct TraceState {
+    sequence: AtomicU64,
+    output_saved: AtomicBool,
+}
+
 #[derive(Clone)]
 pub struct ToolEventBus {
     tx: broadcast::Sender<ToolEvent>,
     durable_tx: Arc<Mutex<Option<tokio::sync::mpsc::Sender<DurableToolEventEnvelope>>>>,
     durable_installed: Arc<AtomicBool>,
     durable_capacity: usize,
-    trace_sequences: Arc<Mutex<HashMap<String, Arc<AtomicU64>>>>,
+    trace_sequences: Arc<Mutex<HashMap<String, Arc<TraceState>>>>,
     thread_id: Arc<String>,
 }
 
@@ -285,11 +298,25 @@ pub struct ToolEventTrace {
     turn_id: String,
     tool_call_id: String,
     tool_name: String,
-    sequence: Arc<AtomicU64>,
+    state: Arc<TraceState>,
     thread_id: Arc<String>,
 }
 
 impl ToolEventTrace {
+    /// A positive durable ACK for this exact trace, including partial/error logs.
+    pub fn has_saved_output_log(&self) -> bool {
+        self.state.output_saved.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn has_durable_consumer(&self) -> bool {
+        self.event_bus.durable_installed.load(Ordering::SeqCst)
+            && self
+                .event_bus
+                .durable_tx
+                .lock()
+                .is_ok_and(|sender| sender.is_some())
+    }
+
     pub fn trace_id(&self) -> &str {
         self.trace_id.as_str()
     }
@@ -334,6 +361,7 @@ impl ToolEventTrace {
     fn next_context(&self, pipeline_stage: &str, attempt_id: u32) -> ObservationContext {
         let ts_unix_ms = now_unix_ms();
         let event_seq = self
+            .state
             .sequence
             .fetch_add(1, Ordering::SeqCst)
             .saturating_add(1);
@@ -474,6 +502,8 @@ impl ToolEventTrace {
         attempt_id: u32,
         envelope: &ToolResultEnvelope,
         shell_output: bool,
+        retained_output_log: bool,
+        retained_output_log_item: Option<String>,
     ) -> Result<(), ToolError> {
         self.event_bus
             .emit_durable(
@@ -482,6 +512,8 @@ impl ToolEventTrace {
                 "runtime.call.completed",
                 ToolEventPayload::CallCompleted(ToolCallCompletedEvent {
                     shell_output,
+                    retained_output_log,
+                    retained_output_log_item,
                     success: envelope.success,
                     outcome: envelope.outcome.clone(),
                     llm_view: envelope.llm_view.clone(),
@@ -500,6 +532,7 @@ impl ToolEventTrace {
         error: &str,
         outcome: &ToolOutcome,
         output_policy: ToolOutputPolicySnapshot,
+        retained_output_log: bool,
     ) -> Result<(), ToolError> {
         let summary = ToolOutputSummary {
             title: "Tool execution failed".to_owned(),
@@ -510,7 +543,23 @@ impl ToolEventTrace {
             truncated: false,
         };
         let display = display_for_policy(&output_policy, summary.clone());
-        let storage = storage_for_policy(&output_policy, summary);
+        let storage = if retained_output_log
+            && matches!(output_policy.storage, StorageOutputPolicy::Full { .. })
+        {
+            // Preserve the typed shell recovery lane after a native error or
+            // cancellation. Only already acknowledged log chunks are promised.
+            ToolStoragePayload::Shell {
+                stdout: None,
+                stderr: Some(error.to_owned()),
+                aggregated_output: None,
+                exit_code: None,
+                duration_ms: None,
+                timed_out: None,
+                truncated: true,
+            }
+        } else {
+            storage_for_policy(&output_policy, summary)
+        };
         let recovery = ToolRecoveryView {
             error_class: outcome.error_class.map(|class| format!("{class:?}")),
             retry_hint: outcome.retry_hint.clone(),
@@ -528,6 +577,7 @@ impl ToolEventTrace {
                 attempt_id,
                 "runtime.call.failed",
                 ToolEventPayload::CallFailed(ToolCallFailedEvent {
+                    retained_output_log,
                     error: error.to_owned(),
                     outcome: outcome.clone(),
                     llm_view: None,
@@ -631,11 +681,11 @@ impl ToolEventBus {
     ) -> ToolEventTrace {
         let trace_id = trace_id.into();
         let turn_id = turn_id.into();
-        let sequence = {
+        let state = {
             let mut guard = self.trace_sequences.lock().expect("trace sequences lock");
             guard
                 .entry(trace_id.clone())
-                .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+                .or_insert_with(|| Arc::new(TraceState::default()))
                 .clone()
         };
         ToolEventTrace {
@@ -644,7 +694,7 @@ impl ToolEventBus {
             turn_id,
             tool_call_id: tool_call_id.into(),
             tool_name: tool_name.into(),
-            sequence,
+            state,
             thread_id: self.thread_id.clone(),
         }
     }
@@ -767,6 +817,9 @@ impl ToolEventBus {
                                     "tool durable event commit was rejected: {reason}"
                                 ))
                             })?;
+                        if matches!(event.payload, ToolEventPayload::OutputDelta(_)) {
+                            trace.state.output_saved.store(true, Ordering::Release);
+                        }
                     }
                     (true, None) => {
                         return Err(ToolError::execution_failed(
@@ -851,6 +904,7 @@ mod tests {
         let bus = ToolEventBus::new(8);
         let mut receiver = bus.take_durable_receiver().expect("receiver");
         let trace = bus.trace_with_id("trace", "turn", "call", "exec_command");
+        let proof = trace.clone();
         let send = tokio::spawn(async move { trace.emit_delta(1, "must persist".into()).await });
         let envelope = receiver.recv().await.unwrap();
         assert_eq!(envelope.event.kind(), ToolEventKind::OutputDelta);
@@ -861,6 +915,50 @@ mod tests {
         assert!(!send.is_finished());
         envelope.acknowledge(Err("storage unavailable".into()));
         assert!(send.await.unwrap().is_err());
+        assert!(!proof.has_saved_output_log());
+        let next = proof.clone();
+        let send = tokio::spawn(async move { next.emit_delta(1, "retained prefix".into()).await });
+        let envelope = receiver.recv().await.unwrap();
+        assert!(!proof.has_saved_output_log(), "queued is not committed");
+        envelope.acknowledge(Ok(()));
+        send.await.unwrap().unwrap();
+        assert!(proof.has_saved_output_log());
+        let failed = proof.clone();
+        let send = tokio::spawn(async move {
+            failed
+                .emit_failed_with_outcome(
+                    1,
+                    "cancelled after output",
+                    &ToolOutcome::partial("cancelled", "inspect saved output"),
+                    ToolOutputPolicySnapshot::for_tool_name("exec_command"),
+                    true,
+                )
+                .await
+        });
+        let envelope = receiver.recv().await.unwrap();
+        let ToolEventPayload::CallFailed(failed) = &envelope.event.payload else {
+            panic!("expected native failure");
+        };
+        assert!(failed.retained_output_log);
+        assert!(matches!(
+            &failed.storage,
+            ToolStoragePayload::Shell {
+                truncated: true,
+                stdout: None,
+                ..
+            }
+        ));
+        envelope.acknowledge(Ok(()));
+        send.await.unwrap().unwrap();
+        bus.finish_trace("trace");
+        assert!(
+            proof.has_saved_output_log(),
+            "owner-held proof survives terminal map cleanup"
+        );
+        assert!(
+            !bus.start_trace("turn", "other", "exec_command")
+                .has_saved_output_log()
+        );
     }
 
     #[tokio::test]
@@ -908,8 +1006,11 @@ mod tests {
             trace.emit_heartbeat(1);
         }
         let completion_trace = trace.clone();
-        let completion =
-            tokio::spawn(async move { completion_trace.emit_completed(1, &envelope, false).await });
+        let completion = tokio::spawn(async move {
+            completion_trace
+                .emit_completed(1, &envelope, false, false, None)
+                .await
+        });
         tokio::pin!(completion);
         assert!(
             timeout(Duration::from_millis(20), &mut completion)
