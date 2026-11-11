@@ -1706,6 +1706,35 @@ fn provider_model_from_anthropic_model_entry(m: AnthropicModelEntry) -> Provider
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn disclosed_tools_keep_prefix_in_serialized_payload() {
+        let render = |request: ChatRequest| {
+            let request = crate::tools::policy::prepare_request("anthropic", request).unwrap();
+            serde_json::to_value(
+                AnthropicProvider::build_chat_request_with_catalog(
+                    &request,
+                    None,
+                    Vec::new(),
+                    false,
+                    None,
+                )
+                .unwrap(),
+            )
+            .unwrap()
+        };
+        let mut request = crate::tools::policy::test_request();
+        let before = render(request.clone());
+        let mut added = request.tools.as_ref().unwrap()[0].clone();
+        added.name = "alpha".into();
+        request.tools.as_mut().unwrap().push(added);
+        let body = render(request);
+        assert_eq!(
+            body["tools"][0], before["tools"][0],
+            "entire previously serialized definition must survive expansion"
+        );
+        assert_eq!(body["tools"][0]["name"], "lookup");
+        assert_eq!(body["tools"][1]["name"], "alpha");
+    }
 
     #[test]
     fn service_speed_preserves_existing_beta_and_resets_on_standard() {

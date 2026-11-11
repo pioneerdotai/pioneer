@@ -1343,6 +1343,33 @@ mod tests {
         );
     }
     #[test]
+    fn disclosed_tools_keep_prefix_in_serialized_payload() {
+        let render = |request: ChatRequest| {
+            let provider = BedrockProvider::new("unused", "unused", "us-east-1");
+            let prepared = prepare_messages_for_provider(
+                "bedrock",
+                &provider.capabilities(),
+                &request.messages,
+            )
+            .unwrap();
+            serde_json::to_value(BedrockProvider::build_request(&request, &prepared).unwrap())
+                .unwrap()
+        };
+        let mut request = crate::tools::policy::test_request();
+        let before = render(request.clone());
+        let mut added = request.tools.as_ref().unwrap()[0].clone();
+        added.name = "alpha".into();
+        request.tools.as_mut().unwrap().push(added);
+        let body = render(request);
+        assert_eq!(
+            body["toolConfig"]["tools"][0], before["toolConfig"]["tools"][0],
+            "entire previously serialized definition must survive expansion"
+        );
+        assert_eq!(body["toolConfig"]["tools"][0]["toolSpec"]["name"], "lookup");
+        assert_eq!(body["toolConfig"]["tools"][1]["toolSpec"]["name"], "alpha");
+    }
+
+    #[test]
     fn confirmed_opus_45_effort_includes_required_beta_in_converse_body() {
         let template = "anthropic.claude-opus-4-5-20251101-v1:0";
         for (base, requires_beta) in [

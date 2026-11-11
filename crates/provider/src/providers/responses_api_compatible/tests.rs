@@ -3106,6 +3106,35 @@ fn vercel_routing_outcomes_survive_json_and_sse_without_session_identifiers() {
 }
 
 #[tokio::test]
+async fn disclosed_tools_keep_prefix_in_serialized_payload() {
+    crate::attachments::runtime::with_async_authority_scope("fixture-authority".into(), async {
+        let provider = ResponsesApiCompatibleProvider::new(
+            "openai",
+            "https://fixture.invalid/v1",
+            "unused",
+            AuthStyle::Bearer,
+        );
+        let mut req = request();
+        let first = provider
+            .prepare(req.clone(), &provider.capabilities())
+            .await
+            .unwrap();
+        let first = provider.render(&first, false).unwrap();
+        let mut added = req.tools.as_ref().unwrap()[0].clone();
+        added.name = "alpha".into();
+        req.tools.as_mut().unwrap().push(added);
+        let expanded = provider
+            .prepare(req, &provider.capabilities())
+            .await
+            .unwrap();
+        let expanded = provider.render(&expanded, false).unwrap();
+        assert_eq!(expanded["tools"][0], first["tools"][0]);
+        assert_eq!(expanded["tools"][1]["name"], "alpha");
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn admitted_service_presets_survive_production_preparation_without_leakage() {
     use crate::attachments::{admission::AdmissionState, regression::scoped};
     use pioneer_protocol::{NativeServiceModePlan, OpenAiTier, ServiceModeParameters as P};
