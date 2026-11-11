@@ -425,6 +425,7 @@ fn thread(
 ) -> Thread {
     Thread {
         context_window: None,
+        service_mode: None,
         context_authority: None,
         workspace_id: workspace_id.to_owned(),
         id: thread_id.to_owned(),
@@ -541,6 +542,7 @@ async fn seed_successful_collaborative_delivery(
         data: None,
         finish_request: None,
         composer_work: Some(TaskComposerWork::v1(TurnStartParams {
+            service_mode: None,
             context_authority: None,
             context_window: None,
             agent_delegation_routes: Vec::new(),

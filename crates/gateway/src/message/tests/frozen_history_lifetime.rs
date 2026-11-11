@@ -471,6 +471,7 @@ async fn fixture_with_mode(mode: FixtureMode) -> FrozenFixture {
         .await
         .unwrap();
     let selection = ModelSelection {
+        service_mode: None,
         context_authority: None,
         context_window: None,
         transport: Transport::Api,
@@ -1628,6 +1629,7 @@ async fn larger_checkpoint_closure_does_not_expand_one_retained_output_grant() {
         payload: event.payload.unwrap(),
     };
     let selection = ModelSelection {
+        service_mode: None,
         context_authority: None,
         context_window: None,
         transport: Transport::Api,

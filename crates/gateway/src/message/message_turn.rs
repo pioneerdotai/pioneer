@@ -586,6 +586,7 @@ mod tests {
 
     fn message_params() -> TurnStartParams {
         TurnStartParams {
+            service_mode: None,
             context_authority: None,
             context_window: None,
             agent_delegation_routes: Vec::new(),

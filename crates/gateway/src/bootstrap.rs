@@ -378,6 +378,7 @@ mod tests {
             .materialize_turn_start(
                 &Thread {
                     context_window: None,
+                    service_mode: None,
                     context_authority: None,
                     workspace_id: DEFAULT_WORKSPACE_ID.to_owned(),
                     id: thread_id.to_owned(),

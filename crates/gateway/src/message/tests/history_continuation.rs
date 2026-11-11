@@ -80,6 +80,7 @@ async fn prepare_history_for_provider(
     assert!(adapter.authority_fingerprint().is_some());
     adapter
         .prepare_input_budget(ChatRequest {
+            service_mode: None,
             model: model.into(),
             messages: messages.to_vec(),
             temperature: None,
@@ -591,6 +592,7 @@ async fn durable_final_case(
         thread.len()
     );
     let selection = ModelSelection {
+        service_mode: None,
         context_authority: None,
         context_window: None,
         transport: Transport::Api,

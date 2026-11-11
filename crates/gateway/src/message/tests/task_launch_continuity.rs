@@ -92,6 +92,10 @@ pub(super) async fn assert_materialized_child_security(
             .unwrap();
         let budget = parent_security.native_context.clone().unwrap_or_else(|| {
             pioneer_protocol::NativeContextBudget {
+                service_mode: Some(pioneer_protocol::NativeServiceModePlan {
+                    id: "standard".into(),
+                    parameters: pioneer_protocol::ServiceModeParameters::Neutral,
+                }),
                 instance: "openai".into(),
                 authority: provider.authority_fingerprint().map(str::to_owned),
                 model: "test-model".into(),

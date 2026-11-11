@@ -1330,6 +1330,7 @@ impl MessageProcessor {
                     || summary_config.summary_model_provider.is_some()
                 {
                     Some(pioneer_compaction::ModelSelection {
+                        service_mode: None,
                         context_authority: None,
                         context_window: None,
                         transport: pioneer_compaction::Transport::Api,

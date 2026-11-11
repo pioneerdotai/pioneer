@@ -1464,6 +1464,7 @@ impl MessageProcessor {
 
 fn provider_model_info_to_protocol(m: ProviderModelInfo) -> ProviderModelInfo {
     ProviderModelInfo {
+        service_modes: None,
         context_authority: None,
         context_tiers: None,
         id: m.id,

@@ -83,6 +83,8 @@ pub struct PrepareVoiceComposerSnapshotRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected_context_window: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_service_mode: Option<pioneer_protocol::NativeServiceModeSelection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected_context_authority: Option<String>,
     pub cli_runtime_options: Option<TurnCLIRuntimeOptions>,
 }
@@ -128,6 +130,7 @@ pub struct PreparedComposerTurnSubmitContext {
     pub execution_backend: Option<AgentExecutionBackend>,
     pub selected_reasoning_effort: Option<String>,
     pub selected_context_window: Option<u64>,
+    pub selected_service_mode: Option<pioneer_protocol::NativeServiceModeSelection>,
     pub selected_context_authority: Option<String>,
     pub cli_runtime_options: Option<TurnCLIRuntimeOptions>,
     pub updated_at_unix: i64,
@@ -139,6 +142,7 @@ pub struct PreparedComposerThreadSnapshotUpdate {
     pub selected_provider: Option<String>,
     pub selected_reasoning_effort: Option<String>,
     pub selected_context_window: Option<u64>,
+    pub selected_service_mode: Option<pioneer_protocol::NativeServiceModeSelection>,
     pub selected_context_authority: Option<String>,
     pub user_text: String,
     pub updated_at_unix: i64,
@@ -283,6 +287,7 @@ where
             execution_backend: request.execution_backend,
             selected_reasoning_effort: request.selected_reasoning_effort,
             selected_context_window: request.selected_context_window,
+            selected_service_mode: request.selected_service_mode.clone(),
             selected_context_authority: request.selected_context_authority.clone(),
             cli_runtime_options: request.cli_runtime_options,
         },
@@ -303,6 +308,7 @@ pub struct PreparedVoiceComposerSnapshotContext {
     pub execution_backend: Option<AgentExecutionBackend>,
     pub selected_reasoning_effort: Option<String>,
     pub selected_context_window: Option<u64>,
+    pub selected_service_mode: Option<pioneer_protocol::NativeServiceModeSelection>,
     pub selected_context_authority: Option<String>,
     pub cli_runtime_options: Option<TurnCLIRuntimeOptions>,
 }
@@ -380,6 +386,15 @@ pub fn build_prepared_voice_composer_snapshot(
 
     Ok(PreparedVoiceComposerSnapshot {
         context: VoiceTurnContext {
+            service_mode: if message_mode
+                || matches!(
+                    &execution_backend,
+                    Some(AgentExecutionBackend::CLIAgentRuntime { .. })
+                ) {
+                None
+            } else {
+                context.selected_service_mode
+            },
             context_authority: if message_mode
                 || matches!(
                     &execution_backend,
@@ -681,6 +696,9 @@ pub fn reduce_prepared_composer_turn_submit_success(
             &context.execution_backend,
             Some(AgentExecutionBackend::CLIAgentRuntime { .. })
         );
+    let selected_service_mode = native_context
+        .then_some(context.selected_service_mode)
+        .flatten();
     let selected_context_window = native_context
         .then_some(context.selected_context_window)
         .flatten();
@@ -724,6 +742,7 @@ pub fn reduce_prepared_composer_turn_submit_success(
             selected_provider: context.selected_provider.clone(),
             selected_reasoning_effort,
             selected_context_window,
+            selected_service_mode: selected_service_mode.clone(),
             selected_context_authority: selected_context_authority.clone(),
             user_text: prepared.user_text.clone(),
             updated_at_unix: context.updated_at_unix,
@@ -739,6 +758,7 @@ pub fn reduce_prepared_composer_turn_submit_success(
             prepared.user_attachments.clone(),
         ),
         turn_start_params_plan: turn_start::TurnStartParamsPlan {
+            service_mode: selected_service_mode,
             context_authority: selected_context_authority,
             context_window: selected_context_window,
             thread_id: context.thread_id,
@@ -1355,6 +1375,7 @@ mod tests {
             execution_backend: None,
             selected_reasoning_effort: None,
             selected_context_window: None,
+            selected_service_mode: None,
             selected_context_authority: None,
             cli_runtime_options: None,
         }
@@ -1829,6 +1850,7 @@ mod tests {
                 execution_backend: None,
                 selected_reasoning_effort: None,
                 selected_context_window: None,
+                selected_service_mode: None,
                 selected_context_authority: None,
                 cli_runtime_options: None,
             },
@@ -1882,6 +1904,7 @@ mod tests {
                 execution_backend: None,
                 selected_reasoning_effort: None,
                 selected_context_window: None,
+                selected_service_mode: None,
                 selected_context_authority: None,
                 cli_runtime_options: None,
                 updated_at_unix: 42,
@@ -1990,6 +2013,7 @@ mod tests {
                 execution_backend: None,
                 selected_reasoning_effort: None,
                 selected_context_window: None,
+                selected_service_mode: None,
                 selected_context_authority: None,
                 cli_runtime_options: None,
                 updated_at_unix: 42,
@@ -2031,6 +2055,7 @@ mod tests {
                 execution_backend: None,
                 selected_reasoning_effort: Some(" high ".to_owned()),
                 selected_context_window: Some(1050000),
+                selected_service_mode: None,
                 selected_context_authority: Some("picker-proof".into()),
                 cli_runtime_options: None,
                 updated_at_unix: 42,
@@ -2084,6 +2109,7 @@ mod tests {
                 }),
                 selected_reasoning_effort: Some("high".to_owned()),
                 selected_context_window: Some(1050000),
+                selected_service_mode: None,
                 selected_context_authority: Some("stale-api-proof".into()),
                 cli_runtime_options: None,
                 updated_at_unix: 42,

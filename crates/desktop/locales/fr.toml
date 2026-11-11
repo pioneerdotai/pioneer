@@ -54,6 +54,9 @@ remove = "Supprimer la mention"
 cancel = "Annuler la réponse"
 
 [chat.composer.model]
+service_label = "Niveau de service"
+service_standard = "Standard"
+service_invalid = "Le niveau enregistré est indisponible. Choisissez Standard ou un autre mode."
 context_label = "Fenêtre de contexte"
 context_auto = "Auto — jusqu’à %{tokens} tokens"
 context_up_to = "Jusqu’à %{tokens} tokens"

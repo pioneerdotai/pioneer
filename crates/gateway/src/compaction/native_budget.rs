@@ -48,6 +48,9 @@ pub(crate) async fn capture(
         }
     };
     Ok(NativeContextBudget {
+        service_mode: Some(
+            pioneer_provider::catalog::service::capture_plan(provider, model, None).await?,
+        ),
         instance: instance.into(),
         authority: provider.authority_fingerprint().map(str::to_owned),
         model: model.into(),
@@ -56,6 +59,75 @@ pub(crate) async fn capture(
         max_input: limits.max_input,
         max_output: limits.max_output,
     })
+}
+
+/// User choices are validated before snapshot persistence. Standard is explicit
+/// only on Native/API paths; CLI never calls this resolver.
+pub(crate) async fn capture_with_mode(
+    provider: &dyn Provider,
+    instance: &str,
+    model: &str,
+    manual_window: Option<u64>,
+    mode: Option<&pioneer_protocol::NativeServiceModeSelection>,
+) -> Result<NativeContextBudget> {
+    let mut budget = capture(provider, instance, model, manual_window).await?;
+    budget.service_mode =
+        Some(pioneer_provider::catalog::service::capture_plan(provider, model, mode).await?);
+    Ok(budget)
+}
+
+/// Fill missing legacy plans using their own admitted scopes, without consulting
+/// changed workspace selections or replacing the pinned context cap.
+pub(crate) async fn legacy_modes(
+    processor: &crate::message::MessageProcessor,
+    workspace: &str,
+    mut budget: NativeContextBudget,
+    mut summary: Option<pioneer_protocol::NativeSummaryContext>,
+) -> Result<(
+    NativeContextBudget,
+    Option<pioneer_protocol::NativeSummaryContext>,
+)> {
+    if budget.service_mode.is_none() {
+        let provider = processor
+            .provider_registry()
+            .get_or_create_for_workspace(workspace, &budget.instance)?;
+        ensure!(
+            budget.authority.as_deref() == provider.authority_fingerprint(),
+            "Legacy service mode authority changed"
+        );
+        budget.service_mode = Some(
+            pioneer_provider::catalog::service::capture_plan(
+                provider.as_ref(),
+                &budget.model,
+                None,
+            )
+            .await?,
+        );
+    }
+    if let Some(summary) = &mut summary {
+        if summary.budget.service_mode.is_none() {
+            if summary.inherits_working {
+                summary.budget.service_mode = budget.service_mode.clone();
+            } else {
+                let provider = processor
+                    .provider_registry()
+                    .get_or_create_for_workspace(workspace, &summary.budget.instance)?;
+                ensure!(
+                    summary.budget.authority.as_deref() == provider.authority_fingerprint(),
+                    "Legacy summary service authority changed"
+                );
+                summary.budget.service_mode = Some(
+                    pioneer_provider::catalog::service::capture_plan(
+                        provider.as_ref(),
+                        &summary.budget.model,
+                        None,
+                    )
+                    .await?,
+                );
+            }
+        }
+    }
+    Ok((budget, summary))
 }
 
 /// A saved launch can narrow under current technical limits, never widen.
@@ -83,6 +155,9 @@ pub(crate) async fn effective(
         saved.context_window > 0,
         "Invalid saved Native context budget"
     );
+    if let Some(plan) = &saved.service_mode {
+        pioneer_provider::catalog::service::validate_plan(provider, model, plan).await?;
+    }
     let limits = provider.model_limits(model).await?;
     let current_window = match provider.model_context_tiers(model).await? {
         Some(metadata) => metadata
@@ -118,6 +193,23 @@ pub(crate) async fn capture_summary(
     workspace: &str,
     working: &NativeContextBudget,
 ) -> Result<Option<pioneer_protocol::NativeSummaryContext>> {
+    capture_summary_impl(processor, workspace, working, true).await
+}
+
+pub(crate) async fn capture_summary_legacy(
+    processor: &crate::message::MessageProcessor,
+    workspace: &str,
+    working: &NativeContextBudget,
+) -> Result<Option<pioneer_protocol::NativeSummaryContext>> {
+    capture_summary_impl(processor, workspace, working, false).await
+}
+
+async fn capture_summary_impl(
+    processor: &crate::message::MessageProcessor,
+    workspace: &str,
+    working: &NativeContextBudget,
+    allow_service_choice: bool,
+) -> Result<Option<pioneer_protocol::NativeSummaryContext>> {
     let configured = processor.compaction_settings_for_workspace(workspace)?;
     let (budget, effort, inherits_working) = match configured.selection {
         None => (working.clone(), None, true),
@@ -132,11 +224,15 @@ pub(crate) async fn capture_summary(
                 selection.context_authority.as_deref(),
             )?;
             (
-                capture(
+                capture_with_mode(
                     provider.as_ref(),
                     &selection.instance,
                     &selection.model,
                     selection.context_window,
+                    selection
+                        .service_mode
+                        .as_ref()
+                        .filter(|_| allow_service_choice),
                 )
                 .await?,
                 selection.effort,
@@ -157,6 +253,20 @@ pub(crate) fn summary_selection(
     current_effort: Option<String>,
 ) -> pioneer_compaction::ModelSelection {
     pioneer_compaction::ModelSelection {
+        service_mode: saved
+            .budget
+            .service_mode
+            .as_ref()
+            .filter(|plan| plan.id != "standard")
+            .and_then(|plan| {
+                Some(pioneer_protocol::NativeServiceModeSelection {
+                    id: plan.id.clone(),
+                    authority: pioneer_provider::catalog::context_choice_authority(
+                        saved.budget.authority.as_deref()?,
+                        &saved.budget.model,
+                    ),
+                })
+            }),
         context_authority: saved.budget.authority.as_deref().map(|authority| {
             pioneer_provider::catalog::context_choice_authority(authority, &saved.budget.model)
         }),
@@ -248,6 +358,7 @@ mod tests {
     use pioneer_protocol::ProviderContextTiers;
     use pioneer_provider::{ChatRequest, ChatResponse, StreamChunk};
     struct BudgetProvider {
+        pro_available: bool,
         authority: &'static str,
         windows: Vec<u64>,
     }
@@ -273,6 +384,19 @@ mod tests {
                 price_order_confirmed: true,
             }))
         }
+        async fn model_service_modes(
+            &self,
+            model: &str,
+        ) -> Result<Option<pioneer_protocol::SourceServiceModes>> {
+            let modes = if self.pro_available && model == "model" {
+                serde_json::from_value(
+                    serde_json::json!({"status":"known","modes":{"pro":{"status":"parsed","descriptor":{"id":"pro","label":"Pro","parameters":{"kind":"open_ai_pro"},"source_provider":"openai","source_model":"model","source_api":"openai-responses"}}}}),
+                )?
+            } else {
+                pioneer_protocol::SourceServiceModes::Known(Default::default())
+            };
+            Ok(Some(modes))
+        }
         async fn chat(&self, _: ChatRequest) -> Result<ChatResponse> {
             unreachable!("budget preparation must not call inference")
         }
@@ -289,6 +413,7 @@ mod tests {
     #[tokio::test]
     async fn durable_native_cap_never_widens_and_complete_request_uses_it() {
         let provider = BudgetProvider {
+            pro_available: true,
             authority: "account-a",
             windows: vec![1000, 10000],
         };
@@ -297,6 +422,43 @@ mod tests {
         assert!(validate_manual_authority(&provider, "other", Some(10000), Some(&proof)).is_err());
         assert!(validate_manual_authority(&provider, "model", Some(10000), None).is_err());
         let saved = capture(&provider, "instance", "model", None).await.unwrap();
+        let choice = pioneer_protocol::NativeServiceModeSelection {
+            id: "pro".into(),
+            authority: proof.clone(),
+        };
+        let pro = capture_with_mode(&provider, "instance", "model", None, Some(&choice))
+            .await
+            .unwrap();
+        assert_eq!(pro.context_window, 1000);
+        assert_eq!(
+            pro.service_mode.as_ref().unwrap().parameters,
+            pioneer_protocol::ServiceModeParameters::OpenAiPro
+        );
+        let restored: NativeContextBudget =
+            serde_json::from_str(&serde_json::to_string(&pro).unwrap()).unwrap();
+        assert_eq!(
+            effective(&provider, "instance", "model", Some(&restored), None)
+                .await
+                .unwrap()
+                .context,
+            1000
+        );
+        assert!(
+            capture_with_mode(&provider, "instance", "other", None, Some(&choice))
+                .await
+                .is_err()
+        );
+        let unavailable = BudgetProvider {
+            pro_available: false,
+            authority: "account-a",
+            windows: vec![1000, 10000],
+        };
+        assert!(
+            effective(&unavailable, "instance", "model", Some(&restored), None)
+                .await
+                .is_err()
+        );
+
         let budget = effective(&provider, "instance", "model", Some(&saved), None)
             .await
             .unwrap();
@@ -305,6 +467,7 @@ mod tests {
             (1000, Some(9000), Some(2048))
         );
         let request = ChatRequest {
+            service_mode: None,
             model: "model".into(),
             messages: vec![
                 pioneer_provider::ChatMessage::system("fixed system"),
@@ -344,6 +507,7 @@ mod tests {
             .fits
         );
         let refreshed = BudgetProvider {
+            pro_available: true,
             authority: "account-a",
             windows: vec![2000, 10000],
         };
@@ -355,6 +519,7 @@ mod tests {
             1000
         );
         let other = BudgetProvider {
+            pro_available: true,
             authority: "account-b",
             windows: vec![1000, 10000],
         };

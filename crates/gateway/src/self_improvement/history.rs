@@ -1538,6 +1538,7 @@ mod tests {
     ) -> Thread {
         Thread {
             context_window: None,
+            service_mode: None,
             context_authority: None,
             workspace_id: "ws_history".to_owned(),
             id: thread_id.to_owned(),

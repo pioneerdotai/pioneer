@@ -12,6 +12,8 @@ pub struct ComposerModelSelection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected_context_window: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_service_mode: Option<pioneer_protocol::NativeServiceModeSelection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected_context_authority: Option<String>,
 }
 
@@ -35,6 +37,8 @@ pub struct ComposerModelSelectionState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected_context_window: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_service_mode: Option<pioneer_protocol::NativeServiceModeSelection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected_context_authority: Option<String>,
     pub manually_selected: bool,
 }
@@ -49,6 +53,8 @@ pub struct ModelSelectorSelection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected_context_window: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_service_mode: Option<pioneer_protocol::NativeServiceModeSelection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected_context_authority: Option<String>,
 }
 
@@ -61,6 +67,8 @@ pub struct ModelProviderSelectionUpdate {
     pub selected_reasoning_effort: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected_context_window: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_service_mode: Option<pioneer_protocol::NativeServiceModeSelection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected_context_authority: Option<String>,
     pub clear_models: bool,
@@ -75,6 +83,7 @@ impl ComposerModelSelection {
             thread.reasoning_effort.as_deref(),
         )?;
         selection.selected_context_window = thread.context_window;
+        selection.selected_service_mode = thread.service_mode.clone();
         selection.selected_context_authority = thread.context_authority.clone();
         Some(selection)
     }
@@ -114,6 +123,7 @@ impl ComposerModelSelectionState {
             selected_model,
             selected_reasoning_effort,
             selected_context_window: None,
+            selected_service_mode: None,
             selected_context_authority: None,
             manually_selected,
         }
@@ -142,6 +152,7 @@ impl ComposerModelSelectionState {
         if selection_changed {
             self.selected_reasoning_effort = None;
             self.selected_context_window = None;
+            self.selected_service_mode = None;
             self.selected_context_authority = None;
         }
         self.manually_selected = true;
@@ -184,6 +195,9 @@ impl ComposerModelSelectionState {
 
     pub fn apply_resolved_selection(&mut self, selection: Option<ComposerModelSelection>) -> bool {
         let selected_context_window = selection.as_ref().and_then(|s| s.selected_context_window);
+        let selected_service_mode = selection
+            .as_ref()
+            .and_then(|s| s.selected_service_mode.clone());
         let selected_context_authority = selection
             .as_ref()
             .and_then(|s| s.selected_context_authority.clone());
@@ -194,11 +208,13 @@ impl ComposerModelSelectionState {
             || self.selected_model != selected_model
             || self.selected_reasoning_effort != selected_reasoning_effort
             || self.selected_context_window != selected_context_window
+            || self.selected_service_mode != selected_service_mode
             || self.selected_context_authority != selected_context_authority;
         self.selected_provider = selected_provider;
         self.selected_model = selected_model;
         self.selected_reasoning_effort = selected_reasoning_effort;
         self.selected_context_window = selected_context_window;
+        self.selected_service_mode = selected_service_mode;
         self.selected_context_authority = selected_context_authority;
         changed
     }
@@ -258,6 +274,7 @@ pub fn composer_model_selection_from_parts_with_reasoning_effort(
         model: model.to_owned(),
         selected_reasoning_effort,
         selected_context_window: None,
+        selected_service_mode: None,
         selected_context_authority: None,
     })
 }
@@ -307,6 +324,7 @@ pub fn resolve_composer_model_selection(
         .map(|(_, mut selection)| {
             // Following a model from a different thread never follows its financial permission.
             selection.selected_context_window = None;
+            selection.selected_service_mode = None;
             selection.selected_context_authority = None;
             selection
         })
@@ -335,6 +353,7 @@ pub fn select_model_provider(provider_name: String) -> ModelProviderSelectionUpd
         selected_model: None,
         selected_reasoning_effort: None,
         selected_context_window: None,
+        selected_service_mode: None,
         selected_context_authority: None,
         clear_models: true,
         loading_models: true,
@@ -360,6 +379,7 @@ mod tests {
             model: model.to_owned(),
             selected_reasoning_effort: selected_reasoning_effort.map(str::to_owned),
             selected_context_window: None,
+            selected_service_mode: None,
             selected_context_authority: None,
         })
     }
@@ -408,6 +428,7 @@ mod tests {
     ) -> Thread {
         Thread {
             context_window: None,
+            service_mode: None,
             context_authority: None,
             workspace_id: "ws".to_owned(),
             id: "thread".to_owned(),

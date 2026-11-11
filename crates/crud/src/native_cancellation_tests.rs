@@ -1378,6 +1378,7 @@ async fn seed_main_schema_history(db: &pioneer_sqlite::SqliteDatabase) -> Histor
     let terminal_at = unix_to_datetime(NOW + 1);
     let thread = Thread {
         context_window: None,
+        service_mode: None,
         context_authority: None,
         workspace_id: workspace_id.to_owned(),
         id: thread_id.to_owned(),

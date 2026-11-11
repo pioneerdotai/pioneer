@@ -344,6 +344,7 @@ mod tests {
     fn thread(thread_id: &str, workspace_id: &str, updated_at: i64) -> Thread {
         Thread {
             context_window: None,
+            service_mode: None,
             context_authority: None,
             workspace_id: workspace_id.to_owned(),
             id: thread_id.to_owned(),

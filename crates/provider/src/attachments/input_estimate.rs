@@ -802,6 +802,7 @@ mod tests {
                 "image/png",
             )));
         let request = ChatRequest {
+            service_mode: None,
             model: "gpt-4o".into(),
             messages: vec![message],
             temperature: None,

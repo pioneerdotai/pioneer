@@ -57,9 +57,32 @@ pub(super) async fn make_summarizer(
                 limits.max_output,
             )
         };
-        return Ok(Arc::new(NativeSummarizer::new(
-            provider, selection, budget,
-        )?));
+        let plan = if native_context {
+            match saved.and_then(|budget| budget.service_mode.clone()) {
+                Some(plan) => {
+                    pioneer_provider::catalog::service::validate_plan(
+                        provider.as_ref(),
+                        &selection.model,
+                        &plan,
+                    )
+                    .await?;
+                    Some(plan)
+                }
+                None => Some(
+                    pioneer_provider::catalog::service::capture_plan(
+                        provider.as_ref(),
+                        &selection.model,
+                        None, // missing admitted summary plan is legacy Standard, not current settings
+                    )
+                    .await?,
+                ),
+            }
+        } else {
+            None
+        };
+        return Ok(Arc::new(
+            NativeSummarizer::new(provider, selection, budget)?.with_service_mode(plan),
+        ));
     }
 
     let processor =
@@ -863,8 +886,40 @@ mod tests {
     }
 
     #[test]
+    fn cli_owned_api_summary_retains_legacy_selection_identity() {
+        let api: ModelSelection = serde_json::from_value(serde_json::json!({
+            "transport":"api", "instance":"fixture", "model":"fixture-model", "effort":"high"
+        }))
+        .unwrap();
+        let legacy_identity = serde_json::to_vec(&api).unwrap();
+        let mut settings = pioneer_compaction::CompactionSettings {
+            selection: Some(api.clone()),
+        };
+        settings.selection.as_mut().unwrap().service_mode =
+            Some(pioneer_protocol::NativeServiceModeSelection {
+                id: "pro".into(),
+                authority: "native-scope".into(),
+            });
+        let mut current = api;
+        current.transport = Transport::Codex;
+        let mut cli_override = None;
+        crate::compaction::isolate_cli_summary_service_modes(
+            &mut current,
+            &mut settings,
+            &mut cli_override,
+        );
+        let admission = settings.admit(&current, None, 0).unwrap();
+        assert_eq!(
+            serde_json::to_vec(&admission.selection).unwrap(),
+            legacy_identity
+        );
+        assert!(current.service_mode.is_none());
+    }
+
+    #[test]
     fn cli_summary_input_keeps_projected_command_output_once() {
         let selection = ModelSelection {
+            service_mode: None,
             context_authority: None,
             context_window: None,
             transport: Transport::Claude,
@@ -965,6 +1020,7 @@ print(json.dumps([{'type':'system','subtype':'init','model':'claude-sonnet-4-6'}
             debug_native_events: false,
         };
         let selection = ModelSelection {
+            service_mode: None,
             context_authority: None,
             context_window: None,
             transport: Transport::Claude,

@@ -120,6 +120,7 @@ pub fn resolve_voice_turn_selection(
             model,
             selected_reasoning_effort: None,
             selected_context_window: None,
+            selected_service_mode: None,
             selected_context_authority: None,
         }),
         (None, None) => None,
@@ -275,6 +276,7 @@ pub fn resolve_turn_selection(
             model,
             selected_reasoning_effort: None,
             selected_context_window: None,
+            selected_service_mode: None,
             selected_context_authority: None,
         }),
         (None, None) => None,
@@ -543,6 +545,7 @@ impl ClientCore {
         let domain = plan.draft.domain;
         let selected_model = domain.selected_model;
         let selected_provider = domain.selected_provider;
+        let selected_service_mode = domain.selected_service_mode;
         let selected_context_authority = domain.selected_context_authority;
         let selected_context_window = domain.selected_context_window;
         let selected_reasoning_effort = domain.selected_reasoning_effort;
@@ -694,6 +697,7 @@ impl ClientCore {
                 execution_backend: execution_target.execution_backend,
                 selected_reasoning_effort,
                 selected_context_window,
+                selected_service_mode,
                 selected_context_authority,
                 cli_runtime_options: None,
                 updated_at_unix: now_unix_seconds(),
@@ -964,6 +968,7 @@ impl ClientCore {
                     execution_backend,
                     selected_reasoning_effort: domain.selected_reasoning_effort,
                     selected_context_window: domain.selected_context_window,
+                    selected_service_mode: domain.selected_service_mode.clone(),
                     selected_context_authority: domain.selected_context_authority.clone(),
                     cli_runtime_options: None,
                 },
@@ -1795,6 +1800,7 @@ mod tests {
     ) -> super::super::turn_prepare::PreparedComposerTurnSubmitReduction {
         core.upsert_thread(Thread {
             context_window: None,
+            service_mode: None,
             context_authority: None,
             workspace_id: "workspace".into(),
             id: "a".into(),
@@ -1834,6 +1840,7 @@ mod tests {
                 execution_backend: None,
                 selected_reasoning_effort: None,
                 selected_context_window: None,
+                selected_service_mode: None,
                 selected_context_authority: None,
                 cli_runtime_options: None,
                 updated_at_unix: 1,

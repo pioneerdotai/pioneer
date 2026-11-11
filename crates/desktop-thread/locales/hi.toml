@@ -340,3 +340,9 @@
 "chat.composer.model.context_auto" = "ऑटो — %{tokens} टोकन तक"
 "chat.composer.model.context_up_to" = "%{tokens} टोकन तक"
 "chat.composer.model.context_invalid" = "सहेजा गया विकल्प उपलब्ध नहीं है। ऑटो या दूसरी विंडो चुनें।"
+
+"chat.composer.model.service_label" = "सेवा स्तर"
+
+"chat.composer.model.service_standard" = "मानक"
+
+"chat.composer.model.service_invalid" = "सहेजा गया सेवा स्तर उपलब्ध नहीं है। मानक या दूसरा मोड चुनें।"

@@ -54,6 +54,9 @@ remove = "Erwähnung entfernen"
 cancel = "Antwort abbrechen"
 
 [chat.composer.model]
+service_label = "Servicestufe"
+service_standard = "Standard"
+service_invalid = "Die gespeicherte Servicestufe ist nicht verfügbar. Wählen Sie Standard oder einen anderen Modus."
 context_label = "Kontextfenster"
 context_auto = "Automatisch — bis %{tokens} Token"
 context_up_to = "Bis %{tokens} Token"

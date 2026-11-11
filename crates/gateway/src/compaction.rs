@@ -80,6 +80,21 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 
+/// Shared settings can carry a Native service choice. CLI-owned compaction,
+/// including its API summarizer, retains its previous selection/wire identity.
+pub(crate) fn isolate_cli_summary_service_modes(
+    current: &mut pioneer_compaction::ModelSelection,
+    settings: &mut pioneer_compaction::CompactionSettings,
+    cli_override: &mut Option<pioneer_compaction::ModelSelection>,
+) {
+    if current.transport != pioneer_compaction::Transport::Api {
+        current.service_mode = None;
+        for selection in settings.selection.iter_mut().chain(cli_override.iter_mut()) {
+            selection.service_mode = None;
+        }
+    }
+}
+
 #[async_trait]
 pub(crate) trait CompactionClock: Send + Sync {
     fn now_ms(&self) -> u64;

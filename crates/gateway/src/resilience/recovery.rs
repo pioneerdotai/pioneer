@@ -7644,6 +7644,7 @@ mod tests {
         let timestamp = 1_700_000_000;
         let thread = Thread {
             context_window: None,
+            service_mode: None,
             context_authority: None,
             workspace_id: workspace_id.to_owned(),
             id: thread_id.to_owned(),
@@ -10907,6 +10908,7 @@ mod tests {
         .expect("workspace should persist");
         let thread = Thread {
             context_window: None,
+            service_mode: None,
             context_authority: None,
             workspace_id: "ws_terminal_backfill".to_owned(),
             id: "thr_terminal_backfill".to_owned(),
@@ -11055,6 +11057,7 @@ mod tests {
         let timestamp = 1_700_000_000;
         let thread = Thread {
             context_window: None,
+            service_mode: None,
             context_authority: None,
             workspace_id: "ws_timeout_liveness".to_owned(),
             id: "thr_timeout_liveness".to_owned(),

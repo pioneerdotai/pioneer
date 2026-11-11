@@ -1325,6 +1325,7 @@ mod tests {
         let timestamp = chrono::Utc::now().timestamp();
         let new_thread = Thread {
             context_window: None,
+            service_mode: None,
             context_authority: None,
             id: thread_id.clone(),
             workspace_id: fixture.red_workspace_id.clone(),
@@ -1417,6 +1418,7 @@ mod tests {
         let turn_id = generate_id(AUTH_DOMAIN_ID_LEN);
         let thread = Thread {
             context_window: None,
+            service_mode: None,
             context_authority: None,
             id: thread_id.clone(),
             workspace_id: fixture.red_workspace_id.clone(),
@@ -1584,6 +1586,7 @@ mod tests {
         let workspace_turn_id = generate_id(AUTH_DOMAIN_ID_LEN);
         let workspace_thread = Thread {
             context_window: None,
+            service_mode: None,
             context_authority: None,
             id: workspace_thread_id.clone(),
             visibility: Some(ThreadVisibility::Workspace),
@@ -1650,6 +1653,7 @@ mod tests {
         let timestamp = chrono::Utc::now().timestamp();
         let new_thread = Thread {
             context_window: None,
+            service_mode: None,
             context_authority: None,
             id: thread_id.clone(),
             workspace_id: fixture.red_workspace_id,
@@ -1769,6 +1773,7 @@ mod tests {
         let timestamp = now.timestamp();
         let new_thread = Thread {
             context_window: None,
+            service_mode: None,
             context_authority: None,
             id: thread_id.clone(),
             workspace_id: fixture.red_workspace_id.clone(),
@@ -1967,6 +1972,7 @@ mod tests {
         let thread_id = generate_id(AUTH_DOMAIN_ID_LEN);
         let new_thread = Thread {
             context_window: None,
+            service_mode: None,
             context_authority: None,
             id: thread_id.clone(),
             workspace_id: fixture.red_workspace_id.clone(),

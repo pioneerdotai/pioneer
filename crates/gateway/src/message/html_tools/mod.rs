@@ -507,6 +507,7 @@ impl MessageProcessor {
         );
         result.content_parts = parts;
         let request = pioneer_provider::ChatRequest {
+            service_mode: None,
             model: model_id.into(),
             messages: vec![
                 pioneer_provider::ChatMessage::assistant_tool_calls(

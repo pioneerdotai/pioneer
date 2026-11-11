@@ -194,6 +194,10 @@ pub(crate) async fn prepare_completed_history_owned(
     root_check_revision: Option<i64>,
     diagnostic: &mut HistoryCheckDiagnostic,
 ) -> Result<HistoryCheckOutcome> {
+    let (mut current, mut settings, mut cli_override) =
+        (current.clone(), settings.clone(), cli_override.cloned());
+    super::isolate_cli_summary_service_modes(&mut current, &mut settings, &mut cli_override);
+    let (current, settings, cli_override) = (&current, &settings, cli_override.as_ref());
     // The owner chooses the database class: foreground transfer is part of
     // turn startup; the completed-turn worker passes a maintenance handle.
     let store = scoped_store.clone();
@@ -378,24 +382,46 @@ pub(crate) async fn prepare_completed_history_owned(
         };
         let saved = if current.transport == Transport::Api {
             let mut record = store.get_turn_execution_security_snapshot(turn).await?;
-            if record
-                .as_ref()
-                .is_some_and(|record| record.snapshot.native_context.is_none())
-            {
+            if record.as_ref().is_some_and(|record| {
+                record
+                    .snapshot
+                    .native_context
+                    .as_ref()
+                    .is_none_or(|budget| budget.service_mode.is_none())
+            }) {
                 let provider = processor
                     .provider_registry()
                     .get_or_create_for_workspace(workspace, &current.instance)?;
                 // Legacy launches had no user-authorized expansion. Pin Auto once,
                 // before building any runner identity or reusing a fits proof.
-                let budget = super::native_budget::capture(
-                    provider.as_ref(),
-                    &current.instance,
-                    catalog_model,
-                    None,
-                )
-                .await?;
-                let summary =
-                    super::native_budget::capture_summary(processor, workspace, &budget).await?;
+                let budget = if let Some(budget) = record
+                    .as_ref()
+                    .and_then(|record| record.snapshot.native_context.clone())
+                {
+                    budget
+                } else {
+                    super::native_budget::capture(
+                        provider.as_ref(),
+                        &current.instance,
+                        catalog_model,
+                        None,
+                    )
+                    .await?
+                };
+                let summary = if record
+                    .as_ref()
+                    .is_some_and(|record| record.snapshot.native_context.is_some())
+                {
+                    record
+                        .as_ref()
+                        .and_then(|record| record.snapshot.native_summary.clone())
+                } else {
+                    super::native_budget::capture_summary_legacy(processor, workspace, &budget)
+                        .await?
+                };
+                let (budget, summary) =
+                    super::native_budget::legacy_modes(processor, workspace, budget, summary)
+                        .await?;
                 store
                     .pin_turn_native_context(workspace, turn, &budget, summary.as_ref())
                     .await?;
@@ -459,6 +485,11 @@ pub(crate) async fn prepare_completed_history_owned(
             None
         };
         let request = ChatRequest {
+            service_mode: if current.transport == Transport::Api {
+                saved_context.and_then(|saved| saved.service_mode.clone())
+            } else {
+                None
+            },
             model: current.model.clone(),
             messages,
             temperature: None,

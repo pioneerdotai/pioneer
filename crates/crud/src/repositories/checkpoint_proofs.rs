@@ -2924,6 +2924,7 @@ mod tests {
             admission: CompactionSettings::default()
                 .admit(
                     &ModelSelection {
+                        service_mode: None,
                         context_authority: None,
                         context_window: None,
                         transport: Transport::Api,

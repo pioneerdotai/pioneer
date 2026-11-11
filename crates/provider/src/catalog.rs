@@ -3,6 +3,7 @@
 mod context;
 mod fetch;
 mod input;
+pub mod service;
 pub use input::InputCapabilityState;
 pub(crate) use input::effective_input_model;
 pub mod generator;
@@ -125,11 +126,23 @@ pub struct ModelCatalog {
     models: BTreeMap<String, BTreeMap<String, CatalogModel>>,
     origins: BTreeMap<String, BTreeMap<String, ModelOrigins>>,
     context_tiers: BTreeMap<String, BTreeMap<String, pioneer_protocol::ProviderContextTiers>>,
+    service_modes: BTreeMap<String, BTreeMap<String, service::SourceServiceModes>>,
     snapshot_id: String,
     tool_capabilities: Option<ToolCapabilities>,
 }
 
 impl ModelCatalog {
+    /// Source evidence only; callers must apply authority and adapter admission.
+    pub fn source_service_modes(
+        &self,
+        provider: &str,
+        model: &str,
+    ) -> Option<&service::SourceServiceModes> {
+        self.service_modes
+            .get(&catalog_provider(provider))?
+            .get(model)
+    }
+
     pub fn context_tiers(
         &self,
         provider: &str,
@@ -177,6 +190,7 @@ impl ModelCatalog {
             },
             tool_capabilities,
             context_tiers: BTreeMap::new(),
+            service_modes: BTreeMap::new(),
         };
         // Old Vercel cache records describe a different wire contract. Isolate
         // only those records; last-good evidence for every other source survives.
@@ -254,6 +268,19 @@ impl ModelCatalog {
                     models
                         .iter()
                         .map(|(id, model)| (id.clone(), context::normalize(model)))
+                        .collect(),
+                )
+            })
+            .collect();
+        catalog.service_modes = catalog
+            .models
+            .iter()
+            .map(|(provider, models)| {
+                (
+                    provider.clone(),
+                    models
+                        .iter()
+                        .map(|(id, model)| (id.clone(), service::normalize(model)))
                         .collect(),
                 )
             })

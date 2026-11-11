@@ -594,3 +594,9 @@ mod model_selection;
 pub use model_selection::{GatewayModelSelection, ModelSelectionTransport};
 
 pub use artifact::{HtmlPublication, compact_html_timeline_item, compact_html_timeline_value};
+
+mod service_mode;
+pub use service_mode::{
+    NativeServiceModePlan, NativeServiceModeSelection, OpenAiTier, ServiceModeDescriptor,
+    ServiceModeParameters, SourceServiceMode, SourceServiceModes,
+};

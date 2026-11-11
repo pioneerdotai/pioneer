@@ -15025,6 +15025,7 @@ impl crate::compaction::controller::NativeContextController for PendingContextBo
 async fn compaction_boundary_stop_and_recovery_deadline_drop_preparation() {
     use crate::compaction::controller::{NativeContext, NativeContextSession};
     let request = || ChatRequest {
+        service_mode: None,
         model: "fixture".into(),
         messages: vec![ChatMessage::user("request")],
         temperature: None,

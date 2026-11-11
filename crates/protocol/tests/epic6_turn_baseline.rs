@@ -5,6 +5,7 @@ use pioneer_protocol::{
 
 fn turn_start(mode: ThreadMode) -> TurnStartParams {
     TurnStartParams {
+        service_mode: None,
         context_authority: None,
         context_window: None,
         agent_delegation_routes: Vec::new(),

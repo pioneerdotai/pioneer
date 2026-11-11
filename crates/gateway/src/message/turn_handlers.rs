@@ -1930,11 +1930,12 @@ impl MessageProcessor {
                 )
                 .map_err(|error| TurnStartFailure::policy_denied(error.to_string()))?;
                 Some(
-                    crate::compaction::native_budget::capture(
+                    crate::compaction::native_budget::capture_with_mode(
                         provider.as_ref(),
                         &task_model_provider,
                         &outcome.materialization.thread.model,
                         launch.context_window,
+                        launch.service_mode.as_ref(),
                     )
                     .await
                     .map_err(|e| TurnStartFailure::policy_denied(e.to_string()))?,
@@ -9980,11 +9981,12 @@ impl MessageProcessor {
                 )
                 .map_err(|error| TurnStartFailure::policy_denied(error.to_string()))?;
                 snapshot.native_context = Some(
-                    crate::compaction::native_budget::capture(
+                    crate::compaction::native_budget::capture_with_mode(
                         provider.as_ref(),
                         &thread.model_provider,
                         &thread.model,
                         params.context_window,
+                        params.service_mode.as_ref(),
                     )
                     .await
                     .map_err(|e| {
@@ -10431,6 +10433,7 @@ impl MessageProcessor {
             };
             let current = pioneer_compaction::ModelSelection {
                 context_window: None,
+                service_mode: None,
                 context_authority: None,
                 transport,
                 instance: runtime_id.to_owned(),
@@ -12965,6 +12968,7 @@ pub(super) fn provider_model_from_runtime_model_for_reasoning_lookup(
     });
 
     ProviderModelInfo {
+        service_modes: None,
         context_authority: None,
         context_tiers: None,
         id: model.id,
@@ -13543,6 +13547,7 @@ mod tests {
             mode: pioneer_protocol::TurnPermissionMode::Supervised,
         };
         TurnStartParams {
+            service_mode: None,
             context_authority: None,
             context_window: None,
             agent_delegation_routes: Vec::new(),
@@ -13665,6 +13670,7 @@ mod tests {
         reasoning: Option<ProviderModelReasoningCapabilities>,
     ) -> ProviderModelInfo {
         ProviderModelInfo {
+            service_modes: None,
             context_authority: None,
             context_tiers: None,
             id: "model-a".to_owned(),

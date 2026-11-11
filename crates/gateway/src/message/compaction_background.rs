@@ -112,6 +112,10 @@ impl MessageProcessor {
     ) -> anyhow::Result<()> {
         let clock = SystemCompactionClock::default();
         let current = ModelSelection {
+            service_mode: context
+                .context_budget
+                .as_ref()
+                .and_then(|saved| saved.service_choice()),
             context_authority: context.context_budget.as_ref().and_then(|saved| {
                 saved.authority.as_deref().map(|authority| {
                     pioneer_provider::catalog::context_choice_authority(authority, &saved.model)
@@ -677,7 +681,7 @@ impl MessageProcessor {
         }
         diagnostic.stage = "configuration".into();
         let legacy = self.compaction_settings()?;
-        let (settings, cli_override) = {
+        let (mut settings, mut cli_override) = {
             let workspace = self
                 .workspace_compaction_settings
                 .read()
@@ -739,6 +743,7 @@ impl MessageProcessor {
             };
             CapturedCheck {
                 current: ModelSelection {
+                    service_mode: None,
                     context_authority: None,
                     context_window: None,
                     transport,
@@ -758,6 +763,16 @@ impl MessageProcessor {
             }
         };
         diagnostic.stage = "configuration".into();
+        crate::compaction::isolate_cli_summary_service_modes(
+            &mut captured.current,
+            &mut captured.settings,
+            &mut captured.cli_override,
+        );
+        crate::compaction::isolate_cli_summary_service_modes(
+            &mut captured.current,
+            &mut settings,
+            &mut cli_override,
+        );
         // Compare only relevant settings/authorities. No secrets or paths are
         // persisted; the fingerprint is a one-way digest. Waiting never calls a model.
         let waiting_settings = row.outcome.as_deref() == Some("waiting_settings");

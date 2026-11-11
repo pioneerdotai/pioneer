@@ -2146,6 +2146,7 @@ impl TaskAgentExecutor {
             .unwrap_or_default();
         let is_composer_service_turn = composer_launch.is_some();
         let turn_params = composer_launch.unwrap_or_else(|| TurnStartParams {
+            service_mode: None,
             context_authority: None,
             context_window: None,
             agent_delegation_routes: Vec::new(),
@@ -3485,6 +3486,7 @@ impl TaskAgentExecutor {
             let task_run_id = run.id.clone();
             let execution_id = execution.id.clone();
             let prepare_params = TurnStartParams {
+                service_mode: None,
                 context_authority: None,
                 context_window: None,
                 agent_delegation_routes: Vec::new(),
@@ -3576,6 +3578,7 @@ impl TaskAgentExecutor {
             .thread_manager
             .agent_turn_start_with_permission_profile(
                 TurnStartParams {
+                    service_mode: None,
                     context_authority: None,
                     context_window: None,
                     agent_delegation_routes: Vec::new(),
@@ -4577,6 +4580,7 @@ impl TaskAgentExecutor {
             .await
             .context("failed to load restored task turn input")?;
         let turn_start_params = TurnStartParams {
+            service_mode: None,
             context_authority: None,
             context_window: None,
             agent_delegation_routes: Vec::new(),
@@ -6149,6 +6153,7 @@ impl TaskAgentExecutor {
             let prepared = processor
                 .prepare_task_cli_runtime_turn(
                     TurnStartParams {
+                        service_mode: None,
                         context_authority: None,
                         context_window: None,
                         agent_delegation_routes: Vec::new(),
@@ -6210,6 +6215,7 @@ impl TaskAgentExecutor {
             .thread_manager
             .agent_turn_start_with_permission_profile(
                 TurnStartParams {
+                    service_mode: None,
                     context_authority: None,
                     context_window: None,
                     agent_delegation_routes: Vec::new(),
@@ -8934,6 +8940,7 @@ mod prepared_snapshot_tests {
         let request = |messages| {
             pioneer_agent::compaction::request::NativeRequestProjection::full(
                 pioneer_provider::ChatRequest {
+                    service_mode: None,
                     model: "gpt-4".into(),
                     messages,
                     temperature: None,

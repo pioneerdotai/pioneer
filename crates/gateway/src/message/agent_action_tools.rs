@@ -5287,6 +5287,7 @@ impl AgentActionToolHandler {
             ToolError::internal(format!("failed to encode child authority: {error:#}"))
         })?;
         let params = TurnStartParams {
+            service_mode: None,
             context_authority: None,
             context_window: None,
             agent_delegation_routes: Vec::new(),
@@ -6055,6 +6056,7 @@ impl AgentActionToolHandler {
         }
         let thread = pioneer_protocol::Thread {
             context_window: None,
+            service_mode: None,
             context_authority: None,
             workspace_id: self.context.workspace_id.clone(),
             id: thread_id.clone(),
@@ -6298,6 +6300,7 @@ impl AgentActionToolHandler {
             &format!("agent-message-turn\0{}", plan.projection.action_id),
         );
         let params = TurnStartParams {
+            service_mode: None,
             context_authority: None,
             context_window: None,
             agent_delegation_routes: Vec::new(),

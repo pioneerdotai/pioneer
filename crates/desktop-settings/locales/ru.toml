@@ -355,6 +355,9 @@ reason_cancelled = "Запуск отменён."
 reason_unknown = "Операция не завершилась ожидаемым образом. Проверьте логи Gateway."
 
 [chat.composer.model]
+service_label = "Режим обслуживания"
+service_standard = "Стандартный"
+service_invalid = "Сохранённый режим недоступен. Выберите стандартный или другой режим."
 context_label = "Контекстное окно"
 context_auto = "Авто — до %{tokens} токенов"
 context_up_to = "До %{tokens} токенов"

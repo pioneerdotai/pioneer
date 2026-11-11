@@ -54,6 +54,9 @@ remove = "Quitar mención"
 cancel = "Cancelar respuesta"
 
 [chat.composer.model]
+service_label = "Nivel de servicio"
+service_standard = "Estándar"
+service_invalid = "El nivel guardado no está disponible. Elige Estándar u otro modo."
 context_label = "Ventana de contexto"
 context_auto = "Auto — hasta %{tokens} tokens"
 context_up_to = "Hasta %{tokens} tokens"

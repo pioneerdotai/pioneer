@@ -503,6 +503,21 @@ async fn prepare_native_projection_with_prepared(
         if matches!(&accepted_projection, Some(AcceptedProjection::Prepared(_))) {
             observe_reused_projection(store, workspace, thread);
         }
+        request.service_mode = match context
+            .context_budget
+            .as_ref()
+            .and_then(|budget| budget.service_mode.clone())
+        {
+            Some(plan) => Some(plan),
+            None => Some(
+                pioneer_provider::catalog::service::capture_plan(
+                    context.provider.as_ref(),
+                    &request.model,
+                    None,
+                )
+                .await?,
+            ),
+        };
         let budget = super::native_budget::effective(
             context.provider.as_ref(),
             &context.provider_instance,
@@ -581,6 +596,10 @@ async fn prepare_native_projection_with_prepared(
             None => None,
         };
         let current = ModelSelection {
+            service_mode: context
+                .context_budget
+                .as_ref()
+                .and_then(|saved| saved.service_choice()),
             context_authority: context.context_budget.as_ref().and_then(|saved| {
                 saved.authority.as_deref().map(|authority| {
                     pioneer_provider::catalog::context_choice_authority(authority, &saved.model)
@@ -987,24 +1006,48 @@ impl pioneer_agent::compaction::controller::NativeContextController
             result = refresh => result?,
         };
         let mut context = context.clone();
-        if context.context_budget.is_none() {
+        if context
+            .context_budget
+            .as_ref()
+            .is_none_or(|budget| budget.service_mode.is_none())
+        {
             let saved = processor
                 .crud_store
                 .get_turn_execution_security_snapshot(&context.turn_id)
                 .await?;
             if let Some(record) = saved {
-                if record.snapshot.native_context.is_none() {
-                    let budget = super::native_budget::capture(
-                        context.provider.as_ref(),
-                        &context.provider_instance,
-                        &request.model,
-                        None,
-                    )
-                    .await?;
-                    let summary = super::native_budget::capture_summary(
+                if record
+                    .snapshot
+                    .native_context
+                    .as_ref()
+                    .is_none_or(|budget| budget.service_mode.is_none())
+                {
+                    let budget = if let Some(budget) = record.snapshot.native_context.clone() {
+                        budget
+                    } else {
+                        super::native_budget::capture(
+                            context.provider.as_ref(),
+                            &context.provider_instance,
+                            &request.model,
+                            None,
+                        )
+                        .await?
+                    };
+                    let summary = if record.snapshot.native_context.is_some() {
+                        record.snapshot.native_summary.clone()
+                    } else {
+                        super::native_budget::capture_summary_legacy(
+                            &processor,
+                            &context.workspace_id,
+                            &budget,
+                        )
+                        .await?
+                    };
+                    let (budget, summary) = super::native_budget::legacy_modes(
                         &processor,
                         &context.workspace_id,
-                        &budget,
+                        budget,
+                        summary,
                     )
                     .await?;
                     processor
@@ -1216,6 +1259,7 @@ mod completed_request_tests {
     fn completed_history_keeps_system_instructions_in_full_request_budget() {
         let instructions = "Required runtime instruction. ".repeat(500);
         let mut request = ChatRequest {
+            service_mode: None,
             model: "fixture".into(),
             messages: vec![
                 ChatMessage::system(instructions.clone()),

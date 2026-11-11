@@ -182,6 +182,8 @@ pub struct NativeSummaryContext {
 /// Never sent to a provider or accepted as a child tool's requested variant.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct NativeContextBudget {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_mode: Option<crate::NativeServiceModePlan>,
     pub instance: String,
     pub authority: Option<String>,
     pub model: String,
@@ -190,6 +192,20 @@ pub struct NativeContextBudget {
     pub context_window: u64,
     pub max_input: Option<u64>,
     pub max_output: Option<u64>,
+}
+
+impl NativeContextBudget {
+    /// Project the admitted choice, retaining this authority/model scope.
+    pub fn service_choice(&self) -> Option<crate::NativeServiceModeSelection> {
+        let plan = self
+            .service_mode
+            .as_ref()
+            .filter(|plan| plan.id != "standard")?;
+        Some(crate::NativeServiceModeSelection {
+            id: plan.id.clone(),
+            authority: native_context_choice_authority(self.authority.as_deref()?, &self.model),
+        })
+    }
 }
 
 /// Authority-scoped, normalized context choices. Absence on a discovery DTO
@@ -271,6 +287,8 @@ impl ProviderContextTiers {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ProviderModelInfo {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_modes: Option<crate::SourceServiceModes>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_authority: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

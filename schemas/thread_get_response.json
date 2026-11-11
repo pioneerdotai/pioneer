@@ -464,6 +464,29 @@
         },
         "workspace_id": {
           "type": "string"
+        },
+        "service_mode": {
+          "anyOf": [
+            {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string"
+                },
+                "authority": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id",
+                "authority"
+              ],
+              "additionalProperties": false
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [
