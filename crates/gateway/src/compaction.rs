@@ -20,6 +20,7 @@ pub(crate) use history::load_exact_line_history;
 pub(crate) use history::pause_selected_turn_load;
 pub(crate) use history::provider_round_aliases;
 mod native;
+pub(crate) mod native_budget;
 mod origins;
 #[cfg(test)]
 pub(crate) use origins::resolve_message_origins;
@@ -78,6 +79,21 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio_util::sync::CancellationToken;
+
+/// Shared settings can carry a Native service choice. CLI-owned compaction,
+/// including its API summarizer, retains its previous selection/wire identity.
+pub(crate) fn isolate_cli_summary_service_modes(
+    current: &mut pioneer_compaction::ModelSelection,
+    settings: &mut pioneer_compaction::CompactionSettings,
+    cli_override: &mut Option<pioneer_compaction::ModelSelection>,
+) {
+    if current.transport != pioneer_compaction::Transport::Api {
+        current.service_mode = None;
+        for selection in settings.selection.iter_mut().chain(cli_override.iter_mut()) {
+            selection.service_mode = None;
+        }
+    }
+}
 
 #[async_trait]
 pub(crate) trait CompactionClock: Send + Sync {

@@ -247,6 +247,9 @@ mod tests {
     fn started_payload(actor: Option<PersistedActorRef>) -> CanonicalTurnStartedEventPayload {
         CanonicalTurnStartedEventPayload {
             thread: Thread {
+                context_window: None,
+                service_mode: None,
+                context_authority: None,
                 workspace_id: "workspace".to_owned(),
                 id: "thread".to_owned(),
                 name: Some("Thread".to_owned()),

@@ -113,6 +113,7 @@ mod tests {
             .get_or_create("echo")
             .expect("test provider should resolve with an authority fingerprint");
         let request = ChatRequest {
+            service_mode: None,
             model: "test".into(),
             messages: vec![
                 ChatMessage::system("system prompt"),
@@ -138,6 +139,7 @@ mod tests {
             .get_or_create("echo")
             .expect("test provider should resolve with an authority fingerprint");
         let request = ChatRequest {
+            service_mode: None,
             model: "test".into(),
             messages: vec![ChatMessage::user("streaming test")],
             temperature: None,

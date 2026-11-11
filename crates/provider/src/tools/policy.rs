@@ -467,6 +467,7 @@ pub(crate) fn ordered_tool_results(messages: &[ChatMessage]) -> Vec<usize> {
 #[cfg(test)]
 pub(crate) fn test_request() -> ChatRequest {
     ChatRequest {
+        service_mode: None,
         model: "test-tool-model".into(),
         messages: vec![ChatMessage::user("use tools")],
         temperature: None,

@@ -21,7 +21,19 @@ pub struct SettingsModelPickerPublication {
     pub owner_generation: u64,
     pub workspace_id: String,
     pub selector: ProviderModelSelectorState,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub context_rows: Vec<presentation::ContextWindowRow>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub service_rows: Vec<presentation::ServiceModeRow>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub default_reasoning_only: bool,
     pub selected_reasoning_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_context_window: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_service_mode: Option<pioneer_protocol::NativeServiceModeSelection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_context_authority: Option<String>,
     pub closed: bool,
 }
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
@@ -43,6 +55,16 @@ pub enum SettingsModelPickerIntent {
         picker_id: String,
         expected_owner: u64,
         model: String,
+    },
+    SelectServiceMode {
+        picker_id: String,
+        expected_owner: u64,
+        id: String,
+    },
+    SelectContextWindow {
+        picker_id: String,
+        expected_owner: u64,
+        window: Option<u64>,
     },
     SelectReasoningEffort {
         picker_id: String,
@@ -68,6 +90,8 @@ impl SettingsModelPickerIntent {
             Self::Open { picker_id, .. }
             | Self::SelectProvider { picker_id, .. }
             | Self::SelectModel { picker_id, .. }
+            | Self::SelectServiceMode { picker_id, .. }
+            | Self::SelectContextWindow { picker_id, .. }
             | Self::SelectReasoningEffort { picker_id, .. }
             | Self::RetryProviders { picker_id, .. }
             | Self::RetryModels { picker_id, .. }
@@ -79,6 +103,8 @@ impl SettingsModelPickerIntent {
             Self::Open { .. } => None,
             Self::SelectProvider { expected_owner, .. }
             | Self::SelectModel { expected_owner, .. }
+            | Self::SelectServiceMode { expected_owner, .. }
+            | Self::SelectContextWindow { expected_owner, .. }
             | Self::SelectReasoningEffort { expected_owner, .. }
             | Self::RetryProviders { expected_owner, .. }
             | Self::RetryModels { expected_owner, .. }
@@ -176,6 +202,9 @@ impl ClientCore {
             provider,
             model,
             selected_reasoning_effort: value.selected_reasoning_effort.clone(),
+            selected_context_window: value.selected_context_window.clone(),
+            selected_service_mode: value.selected_service_mode.clone(),
+            selected_context_authority: value.selected_context_authority.clone(),
         })
     }
     pub fn settings_model_picker_intent(
@@ -250,18 +279,27 @@ impl ClientCore {
                 *mode,
             );
             selector.mark_providers_loading();
-            let runtime = *mode == ProviderModelSelectorMode::Chat;
+            let runtime = matches!(
+                *mode,
+                ProviderModelSelectorMode::Chat | ProviderModelSelectorMode::AuxiliaryChat
+            );
             if runtime {
                 observe = Some(workspace_id.clone());
                 selector.sync_cli_runtime_snapshot(runtimes);
             }
             let selected = selector.preload_selected_provider_models();
             let value = SettingsModelPickerPublication {
+                context_rows: vec![],
+                service_rows: vec![],
+                default_reasoning_only: false,
                 picker_id: id.clone(),
                 owner_generation: store.generation,
                 workspace_id: workspace_id.clone(),
                 selector,
                 selected_reasoning_effort: selection.selected_reasoning_effort.clone(),
+                selected_context_window: selection.selected_context_window.clone(),
+                selected_service_mode: selection.selected_service_mode.clone(),
+                selected_context_authority: selection.selected_context_authority.clone(),
                 closed: false,
             };
             let session = Session {
@@ -317,6 +355,9 @@ impl ClientCore {
                     }
                     let provider = next.selector.select_provider(provider);
                     next.selected_reasoning_effort = None;
+                    next.selected_context_window = None;
+                    next.selected_service_mode = None;
+                    next.selected_context_authority = None;
                     session.model_generation += 1;
                     session.model_pending = true;
                     work.push(model_work(session, provider));
@@ -328,9 +369,57 @@ impl ClientCore {
                     if next.selector.selected_model() != Some(model.as_str()) {
                         next.selector.set_selected_model(model);
                         next.selected_reasoning_effort = None;
+                        next.selected_context_window = None;
+                        next.selected_service_mode = None;
+                        next.selected_context_authority = None;
                     }
                 }
+                SettingsModelPickerIntent::SelectServiceMode { id, .. } => {
+                    let Some(model) =
+                        next.selector.models().iter().find(|model| {
+                            Some(model.id.as_str()) == next.selector.selected_model()
+                        })
+                    else {
+                        return self.reject_intent();
+                    };
+                    if !next
+                        .selector
+                        .service_rows(next.selected_service_mode.as_ref())
+                        .iter()
+                        .any(|row| row.id == id && row.available)
+                    {
+                        return self.reject_intent();
+                    }
+                    let Some(choice) = presentation::service_mode_choice(model, &id) else {
+                        return self.reject_intent();
+                    };
+                    next.selected_service_mode = choice;
+                }
+                SettingsModelPickerIntent::SelectContextWindow { window, .. } => {
+                    let rows = next.selector.context_rows(
+                        next.selected_context_window,
+                        next.selected_context_authority.as_deref(),
+                    );
+                    if rows.is_empty() || !rows.iter().any(|row| row.window == window) {
+                        return self.reject_intent();
+                    }
+                    next.selected_context_authority = window.and_then(|_| {
+                        next.selector
+                            .models()
+                            .iter()
+                            .find(|model| Some(model.id.as_str()) == next.selector.selected_model())
+                            .and_then(|model| model.context_authority.clone())
+                    });
+                    next.selected_context_window = window;
+                }
                 SettingsModelPickerIntent::SelectReasoningEffort { effort, .. } => {
+                    if effort.is_some()
+                        && next
+                            .selector
+                            .service_default_reasoning_only(next.selected_service_mode.as_ref())
+                    {
+                        return self.reject_intent();
+                    }
                     let rows = next
                         .selector
                         .models()
@@ -341,6 +430,16 @@ impl ClientCore {
                         })
                         .unwrap_or_default();
                     if effort.is_some() && !rows.iter().any(|row| row.selected) {
+                        return self.reject_intent();
+                    }
+                    if next
+                        .selected_service_mode
+                        .as_ref()
+                        .is_some_and(|mode| mode.id == "pro")
+                        && effort
+                            .as_deref()
+                            .is_some_and(|effort| matches!(effort, "none" | "off"))
+                    {
                         return self.reject_intent();
                     }
                     next.selected_reasoning_effort = effort;
@@ -389,6 +488,9 @@ impl ClientCore {
                     next.closed = true;
                     next.selector = ProviderModelSelectorState::new(None, None);
                     next.selected_reasoning_effort = None;
+                    next.selected_context_window = None;
+                    next.selected_service_mode = None;
+                    next.selected_context_authority = None;
                     if session.runtime_demand {
                         released = Some(next.workspace_id.clone());
                         session.runtime_demand = false;
@@ -396,6 +498,16 @@ impl ClientCore {
                 }
                 SettingsModelPickerIntent::Open { .. } => unreachable!(),
             }
+            next.service_rows = next
+                .selector
+                .service_rows(next.selected_service_mode.as_ref());
+            next.default_reasoning_only = next
+                .selector
+                .service_default_reasoning_only(next.selected_service_mode.as_ref());
+            next.context_rows = next.selector.context_rows(
+                next.selected_context_window,
+                next.selected_context_authority.as_deref(),
+            );
             session.value = Arc::new(next);
         }
         let value = store.sessions[&id].value.clone();
@@ -608,6 +720,16 @@ impl ClientCore {
                 Err(error) => next.selector.apply_provider_list_error(error),
             }
         }
+        next.service_rows = next
+            .selector
+            .service_rows(next.selected_service_mode.as_ref());
+        next.default_reasoning_only = next
+            .selector
+            .service_default_reasoning_only(next.selected_service_mode.as_ref());
+        next.context_rows = next.selector.context_rows(
+            next.selected_context_window,
+            next.selected_context_authority.as_deref(),
+        );
         session.value = Arc::new(next);
         self.publish_settings_value(scope(&work.id), (*session.value).clone());
     }
@@ -701,6 +823,16 @@ impl ClientCore {
                             work
                         });
                     }
+                    next.service_rows = next
+                        .selector
+                        .service_rows(next.selected_service_mode.as_ref());
+                    next.default_reasoning_only = next
+                        .selector
+                        .service_default_reasoning_only(next.selected_service_mode.as_ref());
+                    next.context_rows = next.selector.context_rows(
+                        next.selected_context_window,
+                        next.selected_context_authority.as_deref(),
+                    );
                     session.value = Arc::new(next);
                     self.publish_settings_value(scope(&value.picker_id), (*session.value).clone());
                     let sender = store.sender.clone();
@@ -787,6 +919,9 @@ mod tests {
                 provider: Some("openai".into()),
                 model: Some("baseline".into()),
                 selected_reasoning_effort: None,
+                selected_context_window: None,
+                selected_service_mode: None,
+                selected_context_authority: None,
             },
         });
         core.settings_model_picker("picker")
@@ -823,6 +958,9 @@ mod tests {
                     provider: Some("openai".into()),
                     model: Some("baseline".into()),
                     selected_reasoning_effort: Some("high".into()),
+                    selected_context_window: None,
+                    selected_service_mode: None,
+                    selected_context_authority: None,
                 },
             });
             let catalog = requests.try_recv().unwrap();
@@ -1102,6 +1240,9 @@ mod tests {
                 provider: Some("cli_runtime:codex".into()),
                 model: Some("model".into()),
                 selected_reasoning_effort: None,
+                selected_context_window: None,
+                selected_service_mode: None,
+                selected_context_authority: None,
             },
         });
         let _providers = requests.try_recv().unwrap();
@@ -1218,6 +1359,9 @@ mod tests {
                 provider: Some(crate::providers::list::cli_runtime_provider_key("codex")),
                 model: None,
                 selected_reasoning_effort: None,
+                selected_context_window: None,
+                selected_service_mode: None,
+                selected_context_authority: None,
             },
         });
         requests.try_recv().unwrap();

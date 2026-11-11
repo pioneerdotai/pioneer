@@ -1138,6 +1138,25 @@ impl MessageProcessor {
             context.resolved_launch_identity = Some(identity);
             context.resolved_launch_profile = Some(profile);
         }
+        if let Err(error) = crate::compaction::native_budget::freeze_task_context(
+            self,
+            &params.workspace_id,
+            None,
+            &mut context,
+        )
+        .await
+        {
+            self.send_error(
+                connection_id,
+                task_public_error(
+                    Some(request_id),
+                    pioneer_protocol::PublicErrorStage::Preparation,
+                    format!("Native Task context: {error:#}"),
+                ),
+            )
+            .await;
+            return;
+        }
         context.agent_authorization_grant = task_agent_authorization_grant;
         context.execution_admission = task_execution_admission;
         if let Some(seed) = context.execution_admission.as_ref()

@@ -54,6 +54,13 @@ remove = "Erwähnung entfernen"
 cancel = "Antwort abbrechen"
 
 [chat.composer.model]
+service_label = "Servicestufe"
+service_standard = "Standard"
+service_invalid = "Die gespeicherte Servicestufe ist nicht verfügbar. Wählen Sie Standard oder einen anderen Modus."
+context_label = "Kontextfenster"
+context_auto = "Automatisch — bis %{tokens} Token"
+context_up_to = "Bis %{tokens} Token"
+context_invalid = "Die gespeicherte Kontextauswahl ist nicht verfügbar. Wählen Sie Automatisch oder ein anderes Fenster."
 select_label = "Modell auswählen"
 dialog_title = "Modell auswählen"
 provider_label = "Anbieter"

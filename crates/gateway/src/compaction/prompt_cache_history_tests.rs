@@ -220,6 +220,7 @@ async fn retry_resolution_between_call_and_result_survives_cold_accepted_and_res
         .await
         .unwrap();
         let request = |messages| ChatRequest {
+            service_mode: None,
             model: "gpt-5.1".into(),
             messages,
             temperature: None,
@@ -280,6 +281,8 @@ async fn retry_resolution_between_call_and_result_survives_cold_accepted_and_res
             .insert("main-fixture", Arc::new(SmallWindowMain))
             .unwrap();
         let context = pioneer_agent::compaction::controller::NativeContext {
+            context_budget: None,
+            summary_context: None,
             overflow_recovery: false,
             recovery_deadline_ms: None,
             workspace_id: "ws".into(),

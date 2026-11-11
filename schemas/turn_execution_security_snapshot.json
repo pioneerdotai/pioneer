@@ -19,6 +19,26 @@
     "enforcement": {
       "$ref": "#/$defs/TurnSecurityEnforcementStatus"
     },
+    "native_context": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/NativeContextBudget"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "native_summary": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/NativeSummaryContext"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "network": {
       "$ref": "#/$defs/TurnNetworkPolicySnapshot"
     },
@@ -99,6 +119,221 @@
         "supports_turn_scope_approval",
         "supports_session_scope_approval",
         "supports_request_permissions"
+      ]
+    },
+    "NativeContextBudget": {
+      "type": "object",
+      "properties": {
+        "instance": {
+          "type": "string"
+        },
+        "authority": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "model": {
+          "type": "string"
+        },
+        "manual_window": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "context_window": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max_input": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max_output": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "service_mode": {
+          "anyOf": [
+            {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string"
+                },
+                "parameters": {
+                  "oneOf": [
+                    {
+                      "type": "object",
+                      "properties": {
+                        "kind": {
+                          "const": "neutral",
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "kind"
+                      ],
+                      "additionalProperties": false
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "kind": {
+                          "const": "open_ai_standard",
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "kind"
+                      ],
+                      "additionalProperties": false
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "kind": {
+                          "const": "anthropic_standard",
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "kind"
+                      ],
+                      "additionalProperties": false
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "kind": {
+                          "const": "bedrock_standard",
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "kind"
+                      ],
+                      "additionalProperties": false
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "kind": {
+                          "const": "open_ai_pro",
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "kind"
+                      ],
+                      "additionalProperties": false
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "kind": {
+                          "const": "bedrock_nested_ultrafast",
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "kind"
+                      ],
+                      "additionalProperties": false
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "kind": {
+                          "const": "open_ai_tier",
+                          "type": "string"
+                        },
+                        "tier": {
+                          "enum": [
+                            "priority",
+                            "flex",
+                            "ultrafast"
+                          ],
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "kind",
+                        "tier"
+                      ],
+                      "additionalProperties": false
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "kind": {
+                          "const": "anthropic_fast",
+                          "type": "string"
+                        },
+                        "beta": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "kind"
+                      ],
+                      "additionalProperties": false
+                    }
+                  ]
+                }
+              },
+              "required": [
+                "id",
+                "parameters"
+              ],
+              "additionalProperties": false
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "instance",
+        "model",
+        "context_window"
+      ]
+    },
+    "NativeSummaryContext": {
+      "type": "object",
+      "properties": {
+        "budget": {
+          "$ref": "#/$defs/NativeContextBudget"
+        },
+        "effort": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "inherits_working": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "budget",
+        "inherits_working"
       ]
     },
     "PermissionBehavior": {

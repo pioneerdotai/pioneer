@@ -5085,6 +5085,9 @@ stderr_ring_lines = 73
             instance: "claude".into(),
             model: "claude-selected".into(),
             reasoning_effort: Some("high".into()),
+            service_mode: None,
+            context_window: None,
+            context_authority: None,
         };
         let update = GatewaySettingsUpdate {
             general: Some(GatewayGeneralSettingsUpdate {
@@ -5148,6 +5151,9 @@ stderr_ring_lines = 73
             instance: "codex".into(),
             model: "codex-selected".into(),
             reasoning_effort: Some("high".into()),
+            service_mode: None,
+            context_window: None,
+            context_authority: None,
         };
         runtimes.instances[0].compaction_model = Some(selected.clone());
         let update = GatewaySettingsUpdate {
@@ -5164,6 +5170,9 @@ stderr_ring_lines = 73
             instance: "claude".into(),
             model: "other".into(),
             reasoning_effort: None,
+            service_mode: None,
+            context_window: None,
+            context_authority: None,
         });
         assert!(
             settings
@@ -5323,6 +5332,9 @@ fn compaction_selection(
     value: &pioneer_protocol::GatewayModelSelection,
 ) -> Option<pioneer_compaction::ModelSelection> {
     let pioneer_protocol::GatewayModelSelection::Explicit {
+        service_mode,
+        context_authority,
+        context_window,
         transport,
         instance,
         model,
@@ -5332,6 +5344,9 @@ fn compaction_selection(
         return None;
     };
     Some(pioneer_compaction::ModelSelection {
+        service_mode: service_mode.clone(),
+        context_authority: context_authority.clone(),
+        context_window: *context_window,
         transport: match transport {
             pioneer_protocol::ModelSelectionTransport::Api => pioneer_compaction::Transport::Api,
             pioneer_protocol::ModelSelectionTransport::Codex => {
@@ -5377,6 +5392,9 @@ fn legacy_model_selection(
         return pioneer_protocol::GatewayModelSelection::Inherit;
     }
     pioneer_protocol::GatewayModelSelection::Explicit {
+        service_mode: None,
+        context_authority: None,
+        context_window: None,
         transport: pioneer_protocol::ModelSelectionTransport::Api,
         instance: provider.unwrap_or_default().to_owned(),
         model: model.unwrap_or_default().to_owned(),

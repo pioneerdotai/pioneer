@@ -11,6 +11,8 @@ use tokio_util::sync::CancellationToken;
 
 #[derive(Clone)]
 pub struct NativeContext {
+    pub context_budget: Option<pioneer_protocol::NativeContextBudget>,
+    pub summary_context: Option<pioneer_protocol::NativeSummaryContext>,
     pub overflow_recovery: bool,
     pub recovery_deadline_ms: Option<u64>,
     pub workspace_id: String,
@@ -51,12 +53,16 @@ impl NativeInputReceipt {
                 .filter_map(|message| message.provider_replay_state.as_ref())
                 .find_map(|state| state.payload.get("prefix_context")),
         }))?;
-        let tools_hash = digest(&serde_json::json!({
+        let mut request_options = serde_json::json!({
             "tools": request.tools, "tool_choice": request.tool_choice,
             "parallel_tool_calls": request.parallel_tool_calls,
             "reasoning": request.reasoning.map(|v|format!("{v:?}")),
             "output_cap": request.max_tokens, "temperature": request.temperature,
-        }))?;
+        });
+        if let Some(plan) = &request.service_mode {
+            request_options["service_mode"] = serde_json::to_value(plan)?;
+        }
+        let tools_hash = digest(&request_options)?;
         let messages = request
             .messages
             .iter()
@@ -288,6 +294,7 @@ mod tests {
     use pioneer_provider::{ChatMessage, ReasoningConfig, ReasoningEffort, ToolDefinition};
     fn request() -> ChatRequest {
         ChatRequest {
+            service_mode: None,
             model: "m".into(),
             messages: vec![ChatMessage::user("a")],
             temperature: None,
@@ -338,6 +345,8 @@ mod tests {
     fn recorded_normalized_usage_does_not_add_cache_output_or_reasoning_and_unknown_clears_anchor()
     {
         let context = NativeContext {
+            context_budget: None,
+            summary_context: None,
             overflow_recovery: false,
             recovery_deadline_ms: None,
             workspace_id: "ws".into(),

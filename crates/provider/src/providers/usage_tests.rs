@@ -57,6 +57,7 @@ pub(super) async fn fixture_with_headers(
 }
 fn request(model: &str) -> ChatRequest {
     ChatRequest {
+        service_mode: None,
         model: model.into(),
         messages: vec![ChatMessage::user("test")],
         temperature: None,
