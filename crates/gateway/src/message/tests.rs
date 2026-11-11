@@ -8685,7 +8685,24 @@ async fn complete_recorded_cli_task_turn_with_recovery(
                 .await
                 .expect("native Task binding lookup should succeed")
             {
-                break binding;
+                // Native ownership is persisted before admission confirms the
+                // provider context. Wait for that confirmation before injecting
+                // terminal events, just as the ordinary buffered consumer does.
+                let thread_binding = processor
+                    .crud_store
+                    .get_cli_runtime_thread_binding(binding.continuation_thread_id.as_str())
+                    .await
+                    .expect("native Task context receipt lookup should succeed");
+                if let Some(thread_binding) = thread_binding {
+                    let cursor: serde_json::Value =
+                        serde_json::from_str(&thread_binding.resume_cursor_json)
+                            .expect("native Task context receipt should decode");
+                    if cursor["pioneerContext"]["acceptedTurnId"].as_str()
+                        == Some(binding.turn_id.as_str())
+                    {
+                        break binding;
+                    }
+                }
             }
             tokio::task::yield_now().await;
         }
