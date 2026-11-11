@@ -560,7 +560,7 @@ fn threads_first_cli_outbox_dispatch_uses_committed_turn_once() {
 // Creation returns a durable TaskRun before its asynchronously admitted child
 // necessarily exists. Observe that run's authoritative binding, rather than
 // assuming nullable child ids in a creation response are already populated.
-async fn wait_for_task_cli_child(
+pub(super) async fn wait_for_task_cli_child(
     processor: &MessageProcessor,
     run_id: &str,
     previous_turn_id: Option<&str>,
@@ -1407,6 +1407,9 @@ fn cli_observation_tracks_the_child_outcome_across_same_run_resume() {
                 // The fixture keeps both terminal snapshots alive across the
                 // resume. Heap-own the storage future rather than composing
                 // its transaction state into this already large CLI scenario.
+                let closing_bus = processor.task_runtime.event_bus();
+                let closing_ticket = closing_bus.closing_lifecycle_ticket();
+                let old_generation = closing_bus.closing_run_generation(run_id);
                 let resumed = Box::pin(processor.crud_store.resume_task_owned_turn(
                     &a_child.thread_id,
                     &a_child.turn_id,
@@ -1419,6 +1422,7 @@ fn cli_observation_tracks_the_child_outcome_across_same_run_resume() {
                 .unwrap()
                 .unwrap();
                 let pioneer_crud::TaskOwnedTurnResumeOutcome::Resumed {
+                    observation_sequence,
                     task,
                     run,
                     task_run_turn: mut resumed_turn,
@@ -1429,6 +1433,16 @@ fn cli_observation_tracks_the_child_outcome_across_same_run_resume() {
                 };
                 assert_eq!(run.id, run_id);
                 assert!(task.revision > before);
+                assert!(observation_sequence > 0);
+                closing_bus.admit_closing_run(
+                    closing_ticket,
+                    &task.id,
+                    &run.id,
+                    observation_sequence,
+                    true,
+                );
+                assert_ne!(closing_bus.closing_run_generation(run_id), old_generation);
+                assert!(closing_bus.closing_run_generation(run_id).is_some());
                 assert!(
                     processor
                         .crud_store
@@ -4836,6 +4850,15 @@ async fn start_threads_cli_fixture_with_policy(
         .await
         .unwrap();
     let mut security = test_full_access_execution_security_snapshot();
+    security.backend.execution_backend = match kind {
+        CLIAgentRuntimeKind::Codex => pioneer_protocol::TurnSecurityExecutionBackendKind::CodexCli,
+        CLIAgentRuntimeKind::Claude => {
+            pioneer_protocol::TurnSecurityExecutionBackendKind::ClaudeCli
+        }
+        CLIAgentRuntimeKind::OpenCode => {
+            pioneer_protocol::TurnSecurityExecutionBackendKind::OpenCodeCli
+        }
+    };
     security.permission_profile = profile.clone();
     let revalidation = processor
         .execution_leases

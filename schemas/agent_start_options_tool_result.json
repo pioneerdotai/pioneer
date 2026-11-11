@@ -120,6 +120,17 @@
         "acp"
       ]
     },
+    "AgentRouteAction": {
+      "type": "string",
+      "enum": [
+        "send_message",
+        "start_agent",
+        "create_task",
+        "schedule_task",
+        "review_task_result",
+        "deliver_result"
+      ]
+    },
     "AgentToolIdentityOption": {
       "type": "object",
       "properties": {
@@ -197,17 +208,37 @@
       "description": "Opaque action target projected by the server. Returned navigation IDs do\nnot replace this option or grant authority to write or launch.",
       "type": "object",
       "properties": {
+        "allowedActions": {
+          "description": "Effective execution/route intersection, using the route action vocabulary.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/AgentRouteAction"
+          }
+        },
         "id": {
           "type": "string"
         },
         "label": {
           "type": "string"
+        },
+        "threadId": {
+          "description": "Navigation identity for matching destinations, never an authorization token.",
+          "type": "string"
+        },
+        "title": {
+          "description": "Current saved name; null means the thread has no name.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "additionalProperties": false,
       "required": [
         "id",
-        "label"
+        "label",
+        "threadId",
+        "allowedActions"
       ]
     },
     "AgentToolThreadCreationOption": {

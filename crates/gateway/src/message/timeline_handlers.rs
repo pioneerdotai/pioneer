@@ -296,6 +296,11 @@ impl MessageProcessor {
         request_id: RequestId,
         params: ThreadTimelinePageParams,
     ) {
+        let mut page_observation = pioneer_observability::opening::Measure::start(
+            pioneer_observability::opening::Phase::TimelinePage,
+            &pioneer_observability::scenario::Correlation::capture(),
+            &[],
+        );
         let connection_id = request_context.connection_id();
         if authorization.thread_id() != params.thread_id.trim() {
             self.send_error(
@@ -303,6 +308,7 @@ impl MessageProcessor {
                 AuthorizationExternalError::NotFound.response(request_id),
             )
             .await;
+            page_observation.finish(pioneer_observability::opening::Result::Rejected);
             return;
         }
         if params.thread_id.trim().is_empty() {
@@ -318,6 +324,7 @@ impl MessageProcessor {
                 ),
             )
             .await;
+            page_observation.finish(pioneer_observability::opening::Result::Rejected);
             return;
         }
 
@@ -330,6 +337,7 @@ impl MessageProcessor {
                         error.into_error_response(request_id, methods::THREAD_TIMELINE_PAGE),
                     )
                     .await;
+                    page_observation.finish(pioneer_observability::opening::Result::Rejected);
                     return;
                 }
             };
@@ -346,6 +354,7 @@ impl MessageProcessor {
                     error.into_error_response(request_id, methods::THREAD_TIMELINE_PAGE),
                 )
                 .await;
+                page_observation.finish(pioneer_observability::opening::Result::Rejected);
                 return;
             }
         };
@@ -394,6 +403,7 @@ impl MessageProcessor {
                     ),
                 )
                 .await;
+                page_observation.finish(pioneer_observability::opening::Result::Failed);
                 trace.finish_failure();
                 return;
             }
@@ -408,6 +418,7 @@ impl MessageProcessor {
                     ),
                 )
                 .await;
+                page_observation.finish(pioneer_observability::opening::Result::Failed);
                 trace.finish_failure();
                 return;
             }
@@ -418,6 +429,7 @@ impl MessageProcessor {
                 AuthorizationExternalError::NotFound.response(request_id),
             )
             .await;
+            page_observation.finish(pioneer_observability::opening::Result::Failed);
             trace.finish_failure();
             return;
         }
@@ -495,6 +507,7 @@ impl MessageProcessor {
                     ),
                 )
                 .await;
+                page_observation.finish(pioneer_observability::opening::Result::Failed);
                 trace.finish_failure();
                 return;
             }
@@ -526,6 +539,7 @@ impl MessageProcessor {
                     ),
                 )
                 .await;
+                page_observation.finish(pioneer_observability::opening::Result::Failed);
                 trace.finish_failure();
                 return;
             }
@@ -554,6 +568,7 @@ impl MessageProcessor {
                     ),
                 )
                 .await;
+                page_observation.finish(pioneer_observability::opening::Result::Failed);
                 trace.finish_failure();
                 return;
             }
@@ -571,6 +586,7 @@ impl MessageProcessor {
                 ),
             )
             .await;
+            page_observation.finish(pioneer_observability::opening::Result::Failed);
             trace.finish_failure();
             return;
         }
@@ -602,6 +618,7 @@ impl MessageProcessor {
                         ),
                     )
                     .await;
+                    page_observation.finish(pioneer_observability::opening::Result::Failed);
                     trace.finish_failure();
                     return;
                 }
@@ -648,6 +665,7 @@ impl MessageProcessor {
                     ),
                 )
                 .await;
+                page_observation.finish(pioneer_observability::opening::Result::Failed);
                 trace.finish_failure();
                 return;
             }
@@ -662,10 +680,12 @@ impl MessageProcessor {
                 error = %format!("{error:#}"),
                 "failed to send thread/timeline/page response"
             );
+            page_observation.finish(pioneer_observability::opening::Result::Failed);
             trace.finish_failure();
             return;
         }
         response_send_stage.succeed();
+        page_observation.finish(pioneer_observability::opening::Result::Returned);
         trace.finish_success();
     }
 
@@ -1795,60 +1815,33 @@ impl MessageProcessor {
             }
         }
 
-        let item_turn_ids = item_targets
-            .iter()
-            .map(|(turn_id, _)| turn_id.clone())
-            .collect::<HashSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
-        let turn_items = if item_turn_ids.is_empty() {
-            HashMap::new()
-        } else {
-            self.crud_store
-                .list_turn_items_with_status_by_type_for_turns(
-                    item_turn_ids.as_slice(),
-                    "agent_message",
-                )
-                .await?
-        };
+        let turn_items = self
+            .crud_store
+            .get_timeline_assistant_items(&rows[0].workspace_id, thread_id, &item_targets)
+            .await?;
         let mut items = HashMap::new();
         let mut statuses = HashMap::new();
-        let mut html = HashMap::new();
+        let mut html_targets = Vec::new();
         for (turn_id, item_id) in &item_targets {
-            let (item, status) = turn_items
-                .get(turn_id.as_str())
-                .and_then(|items| items.iter().find(|(item, _)| item.item_id() == item_id))
+            let (item, status, is_final) = turn_items
+                .get(&(turn_id.clone(), item_id.clone()))
                 .with_context(|| {
                     format!("assistant message item `{item_id}` for turn `{turn_id}` was not found")
                 })?;
-            if !matches!(item, TurnItem::AgentMessage { .. }) {
-                bail!("assistant message timeline target is not an Agent message");
-            }
-            let is_final = turn_items
-                .get(turn_id)
-                .and_then(|items| {
-                    items.iter().rev().find(|(item, _)| {
-                        matches!(
-                            item,
-                            TurnItem::AgentMessage {
-                                phase: pioneer_protocol::AgentMessagePhase::FinalAnswer,
-                                ..
-                            }
-                        )
-                    })
-                })
-                .is_some_and(|(final_item, _)| final_item.item_id() == item_id);
-            if is_final || pioneer_protocol::task_delivery_id_from_result_item_id(item_id).is_some()
+            if *is_final
+                || pioneer_protocol::task_delivery_id_from_result_item_id(item_id).is_some()
             {
-                let publications = self
-                    .html_publications_for_agent_response(
-                        &rows[0].workspace_id,
-                        thread_id,
-                        turn_id,
-                        item_id,
-                    )
-                    .await?;
-                html.insert((turn_id.clone(), item_id.clone()), publications);
+                html_targets.push((
+                    turn_id.clone(),
+                    item_id.clone(),
+                    matches!(
+                        item,
+                        pioneer_protocol::TurnItem::AgentMessage {
+                            phase: pioneer_protocol::AgentMessagePhase::FinalAnswer,
+                            ..
+                        }
+                    ),
+                ));
             }
             statuses.insert(
                 (turn_id.clone(), item_id.clone()),
@@ -1856,6 +1849,10 @@ impl MessageProcessor {
             );
             items.insert((turn_id.clone(), item_id.clone()), item.clone());
         }
+
+        let html = self
+            .html_publications_for_agent_responses(&rows[0].workspace_id, thread_id, &html_targets)
+            .await?;
 
         let authors = self
             .timeline_row_authors(&turns, turn_ids.as_slice())
@@ -2259,12 +2256,22 @@ impl MessageProcessor {
         request_context: &RequestContext,
         blocks: &mut [TimelineBlock],
     ) -> Result<()> {
-        use crate::authorization::{
-            AuthorizationResolver, AuthorizationService, ProofResolution, ResourceAction,
-        };
+        use crate::authorization::{AuthorizationResolver, AuthorizationService, ResourceAction};
+        let source_turns = blocks
+            .iter()
+            .filter_map(|block| match &block.kind {
+                TimelineBlockKind::DetachedTaskRun { task, .. } => task.child_turn_id.clone(),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let reads = self
+            .crud_store
+            .codex_retry_notice_reads(&source_turns)
+            .await?;
+        if reads.is_empty() {
+            return Ok(());
+        }
         let principal = request_context.principal();
-        // The resolver authorizes this read through the root and separately
-        // requires ChildObserve for the internal execution child.
         let action = ResourceAction::ThreadRead;
         let gate = AuthorizationService::new().authorize_action(
             principal.kind,
@@ -2272,54 +2279,64 @@ impl MessageProcessor {
             action,
         );
         let resolver = AuthorizationResolver::new((*self.crud_store).clone());
-        for block in blocks {
-            let TimelineBlockKind::DetachedTaskRun {
-                task,
+        let requested = blocks
+            .iter()
+            .filter_map(|block| match &block.kind {
+                TimelineBlockKind::DetachedTaskRun { task, .. }
+                    if task
+                        .child_turn_id
+                        .as_ref()
+                        .is_some_and(|id| reads.contains_key(id)) =>
+                {
+                    task.child_thread_id
+                        .as_ref()
+                        .map(|child| (block.workspace_id.clone(), child.clone()))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let authorized = resolver
+            .authorize_internal_thread_page(principal, &gate, action, &requested)
+            .await?;
+        let mut indices = Vec::new();
+        let mut targets = Vec::new();
+        for (index, block) in blocks.iter().enumerate() {
+            let TimelineBlockKind::DetachedTaskRun { task, .. } = &block.kind else {
+                continue;
+            };
+            let (Some(child), Some(child_turn), Some(turn_id)) =
+                (&task.child_thread_id, &task.child_turn_id, &block.turn_id)
+            else {
+                continue;
+            };
+            if reads.contains_key(child_turn)
+                && authorized.contains(&(block.workspace_id.clone(), child.clone()))
+            {
+                indices.push(index);
+                targets.push(pioneer_crud::CodexRetryNoticeTarget {
+                    workspace_id: block.workspace_id.clone(),
+                    thread_id: block.thread_id.clone(),
+                    turn_id: turn_id.clone(),
+                    task: task.clone(),
+                });
+            }
+        }
+        let notices = self
+            .crud_store
+            .codex_retry_notices_for_tasks(&targets, &reads)
+            .await?;
+        anyhow::ensure!(
+            notices.len() == indices.len(),
+            "retry notice batch lost a page target"
+        );
+        for (index, notices) in indices.into_iter().zip(notices) {
+            if let TimelineBlockKind::DetachedTaskRun {
                 codex_retry_notices,
                 ..
-            } = &mut block.kind
-            else {
-                continue;
-            };
-            let (Some(child), Some(turn_id)) =
-                (task.child_thread_id.as_deref(), block.turn_id.as_deref())
-            else {
-                continue;
-            };
-            let Some(child_turn) = task.child_turn_id.as_deref() else {
-                continue;
-            };
-            if !self
-                .crud_store
-                .get_cli_runtime_turn_binding(child_turn)
-                .await?
-                .is_some_and(|binding| {
-                    binding.runtime_kind == "codex"
-                        && binding.thread_id == child
-                        && binding.workspace_id == block.workspace_id
-                })
+            } = &mut blocks[index].kind
             {
-                continue;
+                *codex_retry_notices = notices;
             }
-            // Reading the presentation thread alone is not a child-observation grant.
-            if !matches!(
-                resolver
-                    .authorize_internal_thread_via_root(
-                        principal,
-                        &gate,
-                        action,
-                        child,
-                        Some(&block.workspace_id)
-                    )
-                    .await?,
-                ProofResolution::Authorized(_)
-            ) {
-                continue;
-            }
-            *codex_retry_notices = self
-                .crud_store
-                .codex_retry_notices_for_task(&block.workspace_id, &block.thread_id, turn_id, task)
-                .await?;
         }
         Ok(())
     }

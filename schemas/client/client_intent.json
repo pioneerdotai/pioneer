@@ -3802,6 +3802,20 @@
             }
           ]
         },
+        "selected_context_authority": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "selected_context_window": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
         "selected_mentions": {
           "type": "array",
           "items": {
@@ -3840,6 +3854,29 @@
           "items": {
             "$ref": "#/$defs/ComposerSkillSelection"
           }
+        },
+        "selected_service_mode": {
+          "anyOf": [
+            {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string"
+                },
+                "authority": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id",
+                "authority"
+              ],
+              "additionalProperties": false
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "additionalProperties": false,
@@ -4426,6 +4463,50 @@
         {
           "type": "object",
           "properties": {
+            "identity": {
+              "$ref": "#/$defs/ComposerOperationIdentity"
+            },
+            "kind": {
+              "type": "string",
+              "const": "select_service_mode"
+            },
+            "id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "identity",
+            "id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "identity": {
+              "$ref": "#/$defs/ComposerOperationIdentity"
+            },
+            "kind": {
+              "type": "string",
+              "const": "select_context_window"
+            },
+            "window": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint64",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "kind",
+            "identity"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
             "effort": {
               "type": [
                 "string",
@@ -4520,10 +4601,47 @@
         "provider": {
           "type": "string"
         },
+        "selected_context_authority": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "selected_context_window": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
         "selected_reasoning_effort": {
           "type": [
             "string",
             "null"
+          ]
+        },
+        "selected_service_mode": {
+          "anyOf": [
+            {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string"
+                },
+                "authority": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id",
+                "authority"
+              ],
+              "additionalProperties": false
+            },
+            {
+              "type": "null"
+            }
           ]
         }
       },
@@ -4900,6 +5018,20 @@
         {
           "type": "object",
           "properties": {
+            "context_authority": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "context_window": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint64",
+              "minimum": 0
+            },
             "instance": {
               "type": "string"
             },
@@ -4918,6 +5050,29 @@
             },
             "transport": {
               "$ref": "#/$defs/ModelSelectionTransport"
+            },
+            "service_mode": {
+              "anyOf": [
+                {
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "string"
+                    },
+                    "authority": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "authority"
+                  ],
+                  "additionalProperties": false
+                },
+                {
+                  "type": "null"
+                }
+              ]
             }
           },
           "additionalProperties": false,
@@ -6270,10 +6425,47 @@
             "null"
           ]
         },
+        "selected_context_authority": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "selected_context_window": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
         "selected_reasoning_effort": {
           "type": [
             "string",
             "null"
+          ]
+        },
+        "selected_service_mode": {
+          "anyOf": [
+            {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string"
+                },
+                "authority": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id",
+                "authority"
+              ],
+              "additionalProperties": false
+            },
+            {
+              "type": "null"
+            }
           ]
         }
       }
@@ -7832,6 +8024,7 @@
       "type": "string",
       "enum": [
         "Chat",
+        "AuxiliaryChat",
         "SelfImprovement",
         "Embeddings",
         "Transcription"
@@ -8840,6 +9033,62 @@
             "picker_id",
             "expected_owner",
             "model"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "expected_owner": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "kind": {
+              "type": "string",
+              "const": "select_service_mode"
+            },
+            "picker_id": {
+              "type": "string"
+            },
+            "id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "picker_id",
+            "expected_owner",
+            "id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "expected_owner": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "kind": {
+              "type": "string",
+              "const": "select_context_window"
+            },
+            "picker_id": {
+              "type": "string"
+            },
+            "window": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint64",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "kind",
+            "picker_id",
+            "expected_owner"
           ]
         },
         {
@@ -10108,6 +10357,20 @@
             }
           ]
         },
+        "context_authority": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "context_window": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
         "execution_backend": {
           "anyOf": [
             {
@@ -10189,6 +10452,29 @@
         "workspace_id": {
           "description": "Workspace active when the voice session starts.\n\n`TurnStartParams` is still thread-scoped; the gateway keeps the\nworkspace here to validate/session-route the frozen voice context.",
           "type": "string"
+        },
+        "service_mode": {
+          "anyOf": [
+            {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string"
+                },
+                "authority": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id",
+                "authority"
+              ],
+              "additionalProperties": false
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [

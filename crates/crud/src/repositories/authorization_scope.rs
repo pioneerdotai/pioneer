@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 use anyhow::{Context, Result};
 use pioneer_entity::{
@@ -121,6 +121,156 @@ pub async fn resolve_thread_authorization_scope<C: ConnectionTrait>(
         return Ok(None);
     }
     thread_scope_from_model(db, model).await
+}
+
+/// Page-local facts for the existing internal-child policy. No access decision
+/// is cached or granted here. All reads are bounded metadata projections.
+pub struct InternalThreadAuthorizationFacts {
+    pub child: ThreadAuthorizationScope,
+    pub root: ThreadAuthorizationScope,
+    pub parent_turn_id: String,
+    pub workspace_member: bool,
+    pub root_thread_member: bool,
+    pub root_collaboration_thread_id: Option<String>,
+}
+
+pub async fn load_internal_thread_authorization_facts<C: ConnectionTrait>(
+    db: &C,
+    child_ids: &[String],
+    principal: &PrincipalId,
+) -> Result<Vec<InternalThreadAuthorizationFacts>> {
+    let ids = child_ids
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let mut result = Vec::new();
+    for chunk in ids.chunks(64) {
+        let lineages = thread_lineage::Entity::find()
+            .filter(thread_lineage::Column::ChildThreadId.is_in(chunk.iter().cloned()))
+            .all(db)
+            .await?;
+        let thread_ids = chunk
+            .iter()
+            .cloned()
+            .chain(lineages.iter().map(|l| l.root_thread_id.clone()))
+            .collect::<BTreeSet<_>>();
+        let rows = thread::Entity::find()
+            .select_only()
+            .columns([
+                thread::Column::Id,
+                thread::Column::WorkspaceId,
+                thread::Column::AccessClass,
+                thread::Column::CreatedByActorKind,
+                thread::Column::CreatedByActorId,
+            ])
+            .filter(thread::Column::Id.is_in(thread_ids.iter().cloned()))
+            .into_tuple::<(String, String, String, Option<String>, Option<String>)>()
+            .all(db)
+            .await?;
+        let workspace_ids = rows.iter().map(|r| r.1.clone()).collect::<BTreeSet<_>>();
+        let workspaces = workspace::Entity::find()
+            .select_only()
+            .columns([workspace::Column::Id, workspace::Column::IsActive])
+            .filter(workspace::Column::Id.is_in(workspace_ids.iter().cloned()))
+            .into_tuple::<(String, bool)>()
+            .all(db)
+            .await?
+            .into_iter()
+            .collect::<HashMap<_, _>>();
+        let workspace_members = pioneer_entity::workspace_membership::Entity::find()
+            .select_only()
+            .column(pioneer_entity::workspace_membership::Column::WorkspaceId)
+            .filter(pioneer_entity::workspace_membership::Column::WorkspaceId.is_in(workspace_ids))
+            .filter(
+                pioneer_entity::workspace_membership::Column::PrincipalId.eq(principal.as_str()),
+            )
+            .into_tuple::<String>()
+            .all(db)
+            .await?
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let thread_members = pioneer_entity::thread_membership::Entity::find()
+            .select_only()
+            .column(pioneer_entity::thread_membership::Column::ThreadId)
+            .filter(
+                pioneer_entity::thread_membership::Column::ThreadId
+                    .is_in(thread_ids.iter().cloned()),
+            )
+            .filter(pioneer_entity::thread_membership::Column::PrincipalId.eq(principal.as_str()))
+            .into_tuple::<String>()
+            .all(db)
+            .await?
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let root_lineages = thread_lineage::Entity::find()
+            .filter(thread_lineage::Column::ChildThreadId.is_in(thread_ids))
+            .all(db)
+            .await?
+            .into_iter()
+            .map(|l| (l.child_thread_id.clone(), l))
+            .collect::<HashMap<_, _>>();
+        let mut scopes = HashMap::new();
+        for (id, workspace_id, access, kind, actor) in rows {
+            let Some(active) = workspaces.get(&workspace_id) else {
+                continue;
+            };
+            let Ok(access_class) = persisted_thread_access_class_from_db(&access) else {
+                continue;
+            };
+            let creator_principal_id = match actor_ref_from_db(kind.as_deref(), actor.as_deref()) {
+                Ok(Some(PersistedActorRef::Principal(p))) => Some(p),
+                Ok(_) => None,
+                Err(_) => continue,
+            };
+            scopes.insert(
+                id.clone(),
+                ThreadAuthorizationScope {
+                    workspace_id,
+                    thread_id: id,
+                    workspace_is_active: *active,
+                    access_class,
+                    creator_principal_id,
+                },
+            );
+        }
+        for lineage in lineages {
+            let (Some(child), Some(root), Some(parent_turn_id)) = (
+                scopes.get(&lineage.child_thread_id),
+                scopes.get(&lineage.root_thread_id),
+                lineage.created_by_turn_id,
+            ) else {
+                continue;
+            };
+            if child.access_class != PersistedThreadAccessClass::Internal
+                || child.thread_id == root.thread_id
+                || child.workspace_id != root.workspace_id
+            {
+                continue;
+            }
+            // authorize_thread also requires an internal root to have valid
+            // non-self lineage, even for an absolute-policy principal.
+            if root.access_class == PersistedThreadAccessClass::Internal
+                && !root_lineages
+                    .get(&root.thread_id)
+                    .is_some_and(|l| l.root_thread_id != root.thread_id)
+            {
+                continue;
+            }
+            result.push(InternalThreadAuthorizationFacts {
+                workspace_member: workspace_members.contains(&root.workspace_id),
+                root_thread_member: thread_members.contains(&root.thread_id),
+                child: child.clone(),
+                root: root.clone(),
+                parent_turn_id,
+                root_collaboration_thread_id: (root.access_class
+                    == PersistedThreadAccessClass::Internal)
+                    .then(|| root_lineages[&root.thread_id].root_thread_id.clone()),
+            });
+        }
+    }
+    Ok(result)
 }
 
 pub async fn resolve_thread_start_authorization_scope<C: ConnectionTrait>(

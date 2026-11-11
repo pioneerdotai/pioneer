@@ -180,8 +180,9 @@ enum RefreshRange {
     Through(String),
     End,
 }
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 struct Request {
+    opening: Option<crate::threads::opening::Handle>,
     workspace: String,
     generation: u64,
     identity: InboxIdentity,
@@ -195,6 +196,38 @@ struct Request {
     push_revision: Option<(String, u64)>,
     refresh_range: Option<RefreshRange>,
 }
+// Observation association is excluded: request equality remains its original
+// business fence, including every pre-existing field.
+impl PartialEq for Request {
+    fn eq(&self, other: &Self) -> bool {
+        self.workspace == other.workspace
+            && self.generation == other.generation
+            && self.identity == other.identity
+            && self.notification == other.notification
+            && self.open == other.open
+            && self.read_all == other.read_all
+            && self.viewed == other.viewed
+            && self.viewed_epoch == other.viewed_epoch
+            && self.navigation_revision == other.navigation_revision
+            && self.cursor == other.cursor
+            && self.push_revision == other.push_revision
+            && self.refresh_range == other.refresh_range
+    }
+}
+impl Eq for Request {}
+
+struct PendingAction {
+    intent: TaskNotificationIntent,
+    opening: Option<crate::threads::opening::Handle>,
+}
+impl From<TaskNotificationIntent> for PendingAction {
+    fn from(intent: TaskNotificationIntent) -> Self {
+        Self {
+            intent,
+            opening: None,
+        }
+    }
+}
 #[derive(Default)]
 struct Inbox {
     dispatching_action: bool,
@@ -203,7 +236,7 @@ struct Inbox {
     publication: TaskInboxPublication,
     request: Option<Request>,
     refresh_again: bool,
-    pending_actions: std::collections::VecDeque<TaskNotificationIntent>,
+    pending_actions: std::collections::VecDeque<PendingAction>,
 }
 #[derive(Default)]
 pub struct TaskNotificationStore {
@@ -349,6 +382,7 @@ impl TaskNotificationStore {
                 }
             });
         let request = Request {
+            opening: None,
             workspace,
             generation: self.generation,
             identity,
@@ -800,6 +834,30 @@ impl ClientCore {
         .payload::<TaskInboxPublication>()
     }
     pub fn task_notification_intent(&self, intent: TaskNotificationIntent) -> ClientTransition {
+        let opening = match &intent {
+            TaskNotificationIntent::Open { .. }
+            | TaskNotificationIntent::NativeCompletion {
+                completion: TaskNotificationCompletion::Activated,
+                ..
+            } => Some(self.begin_opening(None, pioneer_observability::opening::Fact::Task)),
+            _ => None,
+        };
+        let execute = || self.task_notification_intent_observed(intent, opening.clone());
+        let transition = if let Some(handle) = &opening {
+            handle.correlation().run(execute)
+        } else {
+            execute()
+        };
+        if let Some(handle) = opening {
+            handle.finish_unadmitted();
+        }
+        transition
+    }
+    fn task_notification_intent_observed(
+        &self,
+        intent: TaskNotificationIntent,
+        opening: Option<crate::threads::opening::Handle>,
+    ) -> ClientTransition {
         if let TaskNotificationIntent::NativeCompletion {
             workspace_id,
             effect,
@@ -822,18 +880,21 @@ impl ClientCore {
                 return self.transition(&authority, vec![], vec![]);
             }
             drop(owner);
-            return self.task_notification_intent(match completion {
-                TaskNotificationCompletion::Activated => TaskNotificationIntent::Open {
-                    workspace_id,
-                    notification_id: effect.notification_id,
-                    revision: effect.revision,
+            return self.task_notification_intent_observed(
+                match completion {
+                    TaskNotificationCompletion::Activated => TaskNotificationIntent::Open {
+                        workspace_id,
+                        notification_id: effect.notification_id,
+                        revision: effect.revision,
+                    },
+                    TaskNotificationCompletion::Dismissed => TaskNotificationIntent::Dismiss {
+                        workspace_id,
+                        notification_id: effect.notification_id,
+                        revision: effect.revision,
+                    },
                 },
-                TaskNotificationCompletion::Dismissed => TaskNotificationIntent::Dismiss {
-                    workspace_id,
-                    notification_id: effect.notification_id,
-                    revision: effect.revision,
-                },
-            });
+                opening,
+            );
         }
         if let TaskNotificationIntent::Viewed { params } = &intent {
             if params.run_ids.len() + params.result_turn_ids.len() + params.result_items.len() > 100
@@ -967,9 +1028,25 @@ impl ClientCore {
                         return self.transition(&authority, vec![], vec![]);
                     }
                     if inbox.pending_actions.len() < 100
-                        && !inbox.pending_actions.contains(&deferred_intent)
+                        && !inbox
+                            .pending_actions
+                            .iter()
+                            .any(|pending| pending.intent == deferred_intent)
                     {
-                        inbox.pending_actions.push_back(deferred_intent);
+                        if let Some(handle) = &opening {
+                            handle.handed_off();
+                        }
+                        inbox.pending_actions.push_back(PendingAction {
+                            intent: deferred_intent,
+                            opening: opening.clone(),
+                        });
+                    } else if let Some(handle) = &opening {
+                        handle.fact(pioneer_observability::opening::Fact::CoverageRetired);
+                        handle.finish(if inbox.pending_actions.len() >= 100 {
+                            pioneer_observability::opening::Result::Rejected
+                        } else {
+                            pioneer_observability::opening::Result::Noop
+                        });
                     }
                     if read_all || load_more {
                         inbox.publication.loading = true;
@@ -1030,6 +1107,10 @@ impl ClientCore {
             .expect("inbox exists")
             .request = Some(request.clone());
         if open {
+            request.opening = opening.clone();
+            if let Some(handle) = &opening {
+                handle.handed_off();
+            }
             request.open = true;
             request.navigation_revision = self
                 .snapshot(&ClientScope::Navigation)
@@ -1046,6 +1127,9 @@ impl ClientCore {
             .as_ref()
             .is_none_or(|sender| sender.try_send(request.clone()).is_err())
         {
+            if let Some(handle) = &opening {
+                handle.finish(pioneer_observability::opening::Result::Rejected);
+            }
             owner
                 .store
                 .complete(&request, Err("Task inbox request unavailable".into()));
@@ -1053,6 +1137,18 @@ impl ClientCore {
         self.publish_task_inbox(&mut owner.store, &workspace)
     }
     fn open_task_notification(&self, request: Request) {
+        let opening = request.opening.clone();
+        let execute = || self.open_task_notification_observed(request);
+        if let Some(handle) = &opening {
+            handle.correlation().run(execute);
+        } else {
+            execute();
+        }
+        if let Some(handle) = opening {
+            self.finish_pending_opening(&handle);
+        }
+    }
+    fn open_task_notification_observed(&self, request: Request) {
         let Some((notification_id, revision)) = request.notification.as_ref() else {
             return;
         };
@@ -1066,6 +1162,9 @@ impl ClientCore {
                 .map(|item| item.notification.clone())
         });
         let Some(notification) = notification else {
+            if let Some(handle) = &request.opening {
+                handle.finish(pioneer_observability::opening::Result::Superseded);
+            }
             // A push may have removed or revised the queued card. Finalize only
             // this request and drain deferred actions without stale navigation.
             self.complete_task_inbox(request, Ok(None));
@@ -1086,6 +1185,9 @@ impl ClientCore {
             Ok(thread)
         })();
         if self.task_inbox_identity(&request.workspace, false).as_ref() != Some(&request.identity) {
+            if let Some(handle) = &request.opening {
+                handle.finish(pioneer_observability::opening::Result::Superseded);
+            }
             return;
         }
         let mut owner = self.task_notifications.lock().expect("task inbox poisoned");
@@ -1093,6 +1195,9 @@ impl ClientCore {
             return;
         };
         if inbox.request.as_ref() != Some(&request) || self.is_stopped() {
+            if let Some(handle) = &request.opening {
+                handle.finish(pioneer_observability::opening::Result::Superseded);
+            }
             return;
         }
         inbox.request = None;
@@ -1100,6 +1205,11 @@ impl ClientCore {
         inbox.publication.loading = false;
         for item in &mut inbox.publication.items {
             item.dismissing = false;
+        }
+        if let Err(error) = &result {
+            if let Some(handle) = &request.opening {
+                handle.finish(crate::threads::opening::failure(error));
+            }
         }
         match result {
             Ok(thread)
@@ -1111,10 +1221,11 @@ impl ClientCore {
             {
                 let thread_id = thread.id.clone();
                 self.upsert_thread(thread);
-                let transition = self.open_workspace_thread(
+                let transition = self.open_workspace_thread_observed(
                     request.workspace.clone(),
                     Some(thread_id.clone()),
                     request.navigation_revision,
+                    request.opening.clone(),
                 );
                 if !matches!(
                     transition.outcome(),
@@ -1130,7 +1241,11 @@ impl ClientCore {
                     });
                 }
             }
-            Ok(_) => {}
+            Ok(_) => {
+                if let Some(handle) = &request.opening {
+                    handle.finish(pioneer_observability::opening::Result::Superseded);
+                }
+            }
             Err(_) if inbox.push_revision != request.push_revision => {
                 // This Open RPC no longer owns the current stream's cards or
                 // total. Release its request, retaining newer authority.
@@ -1150,7 +1265,7 @@ impl ClientCore {
         // Skip stale deferred actions without stranding a later valid action.
         // A started request owns the remainder until its matching completion.
         loop {
-            let (next, resume_push) = {
+            let (next, resume_push, opening) = {
                 let mut owner = self.task_notifications.lock().expect("task inbox poisoned");
                 let Some(inbox) = owner.store.inboxes.get_mut(workspace) else {
                     return;
@@ -1160,14 +1275,17 @@ impl ClientCore {
                 }
                 let next = inbox.pending_actions.pop_front().or_else(|| {
                     std::mem::take(&mut inbox.refresh_again).then(|| {
-                        TaskNotificationIntent::Refresh {
+                        PendingAction::from(TaskNotificationIntent::Refresh {
                             workspace_id: workspace.to_owned(),
-                        }
+                        })
                     })
                 });
                 // Keep the slot busy across the unlocked queue-to-request handoff.
                 inbox.dispatching_action = next.is_some();
-                (next, inbox.push_paused)
+                let (next, opening) = next
+                    .map(|pending| (Some(pending.intent), pending.opening))
+                    .unwrap_or((None, None));
+                (next, inbox.push_paused, opening)
             };
             let Some(intent) = next else {
                 // Queue drain may have skipped stale/no-op actions without starting an RPC.
@@ -1187,9 +1305,31 @@ impl ClientCore {
                 }
                 return;
             };
-            self.task_notification_intent(intent);
+            let observed = opening.clone();
+            let execute = || self.task_notification_intent_observed(intent, opening);
+            if let Some(handle) = &observed {
+                handle.correlation().run(execute);
+            } else {
+                execute();
+            }
             let mut owner = self.task_notifications.lock().expect("task inbox poisoned");
             if let Some(inbox) = owner.store.inboxes.get_mut(workspace) {
+                if let Some(handle) = observed {
+                    let retained = inbox
+                        .request
+                        .as_ref()
+                        .and_then(|request| request.opening.as_ref())
+                        .is_some_and(|current| current.same(&handle))
+                        || inbox.pending_actions.iter().any(|pending| {
+                            pending
+                                .opening
+                                .as_ref()
+                                .is_some_and(|current| current.same(&handle))
+                        });
+                    if !retained {
+                        handle.finish(pioneer_observability::opening::Result::Superseded);
+                    }
+                }
                 inbox.dispatching_action = false;
             }
         }
@@ -1705,11 +1845,14 @@ mod tests {
             .get_mut("workspace")
             .unwrap()
             .pending_actions
-            .push_back(TaskNotificationIntent::Open {
-                workspace_id: "workspace".into(),
-                notification_id: "gone".into(),
-                revision: 0,
-            });
+            .push_back(
+                TaskNotificationIntent::Open {
+                    workspace_id: "workspace".into(),
+                    notification_id: "gone".into(),
+                    revision: 0,
+                }
+                .into(),
+            );
         store.complete_request(&dismiss, Ok(None));
         core.publish_task_inbox(&mut store, "workspace");
         let completed = core.task_inbox("workspace").unwrap();
@@ -1919,13 +2062,14 @@ mod tests {
                 .complete(&request, response(vec![notification("n", "a")]));
             let inbox = owner.store.inboxes.get_mut("a").unwrap();
             for revision in 1..4 {
-                inbox
-                    .pending_actions
-                    .push_back(TaskNotificationIntent::Dismiss {
+                inbox.pending_actions.push_back(
+                    TaskNotificationIntent::Dismiss {
                         workspace_id: "a".into(),
                         notification_id: "n".into(),
                         revision,
-                    });
+                    }
+                    .into(),
+                );
             }
             inbox.refresh_again = true;
             core.publish_task_inbox(&mut owner.store, "a");
@@ -2570,11 +2714,12 @@ mod tests {
                 request.open = true;
                 let inbox = owner.store.inboxes.get_mut("a").unwrap();
                 inbox.request = Some(request.clone());
-                inbox
-                    .pending_actions
-                    .push_back(TaskNotificationIntent::ReadAll {
+                inbox.pending_actions.push_back(
+                    TaskNotificationIntent::ReadAll {
                         workspace_id: "a".into(),
-                    });
+                    }
+                    .into(),
+                );
                 request
             };
             let open_operation = request.generation;

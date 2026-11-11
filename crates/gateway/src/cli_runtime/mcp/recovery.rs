@@ -434,6 +434,9 @@ mod tests {
     ) {
         let now = chrono::Utc::now().timestamp();
         let thread = Thread {
+            context_window: None,
+            service_mode: None,
+            context_authority: None,
             workspace_id: workspace_id.to_owned(),
             id: thread_id.to_owned(),
             name: Some("MCP recovery".to_owned()),

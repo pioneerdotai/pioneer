@@ -1,3 +1,6 @@
+#[path = "artifact_publications.rs"]
+mod publications;
+
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 

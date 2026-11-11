@@ -40,7 +40,9 @@ async fn due_run_page_filters_future_work_before_limit_and_rotates() {
         );
     }
     runs.sort_by(|left, right| left.id.cmp(&right.id));
-    let now = runs[0].created_at;
+    // UUID order does not imply creation order; all three immediate runs must
+    // already be due even when fixture creation crosses a wall-clock second.
+    let now = runs.iter().map(|run| run.created_at).max().unwrap();
     let db = runtime.service().store().database_connection();
     // Fixture repair uses the scoped serialized database path, with FK disabled
     // as in the production runtime. This early ID must not consume LIMIT.

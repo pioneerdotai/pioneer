@@ -127,6 +127,8 @@ pub fn build_task_actor_contract(
         .map(|((identity, profile), authorization)| {
             serde_json::to_string(
                 &pioneer_protocol::TaskDerivedChildLaunchGrant::ResolvedTaskLaunch {
+                    native_context: context.native_context.clone(),
+                    native_summary: context.native_summary.clone(),
                     identity: identity.clone(),
                     profile: profile.clone(),
                     role_key: authorization.role_key.clone(),

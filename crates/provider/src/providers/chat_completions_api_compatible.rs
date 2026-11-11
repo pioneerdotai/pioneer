@@ -519,6 +519,9 @@ impl ChatCompletionsApiCompatibleProvider {
         entries
             .into_iter()
             .map(|m| ProviderModelInfo {
+                service_modes: None,
+                context_authority: None,
+                context_tiers: None,
                 id: m.id.clone(),
                 name: None,
                 description: None,
@@ -2357,6 +2360,9 @@ mod tests {
             assert_eq!(body["reasoning_effort"], "medium");
         }
         let mut discovered = vec![ProviderModelInfo {
+            service_modes: None,
+            context_authority: None,
+            context_tiers: None,
             id: request.model.clone(),
             name: None,
             description: None,
@@ -2769,6 +2775,7 @@ mod tests {
             Some("artifact-file")
         );
         let request = ChatRequest {
+            service_mode: None,
             model: "fixture-media".into(),
             messages: messages.clone(),
             temperature: None,
@@ -3205,6 +3212,7 @@ mod tests {
             Some(replay_state),
         );
         let request = ChatRequest {
+            service_mode: None,
             model: "compatible-model".to_owned(),
             messages: vec![
                 message,
@@ -3267,6 +3275,7 @@ mod tests {
         );
         assert!(replay.model.is_none());
         let request = ChatRequest {
+            service_mode: None,
             model: "compatible-model".to_owned(),
             messages: vec![ChatMessage::assistant_tool_calls_with_provider_state(
                 None::<String>,
@@ -3476,6 +3485,7 @@ mod tests {
     fn merge_mode_uses_compiled_prompt_full_text() {
         let provider = test_provider().with_merge_system_into_user(true);
         let request = ChatRequest {
+            service_mode: None,
             model: "test-model".to_owned(),
             messages: vec![
                 ChatMessage::system("legacy system prompt should be ignored"),
@@ -3557,6 +3567,7 @@ mod tests {
     fn unknown_compatible_model_rejects_explicit_unverified_reasoning() {
         let provider = test_provider();
         let request = ChatRequest {
+            service_mode: None,
             model: "custom-compatible-model".to_owned(),
             messages: vec![ChatMessage::user("Hello")],
             temperature: None,

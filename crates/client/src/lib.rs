@@ -114,3 +114,5 @@ pub(crate) static OBSERVABILITY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mut
 
 /// Shared package delivery for Skills and Plugins.
 pub mod package_delivery;
+#[cfg(test)]
+mod scenario_test_support;

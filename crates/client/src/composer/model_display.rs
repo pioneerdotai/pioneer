@@ -466,6 +466,7 @@ impl ClientCore {
                         return;
                     };
                     core.refresh_composer_model_selections();
+                    core.observe_opening_core();
                 }
             })
             .expect("composer model worker");
@@ -545,6 +546,9 @@ mod tests {
                     selected_provider: Some("provider".into()),
                     selected_model: Some("model".into()),
                     selected_reasoning_effort: Some("high".into()),
+                    selected_context_window: None,
+                    selected_service_mode: None,
+                    selected_context_authority: None,
                     ..Default::default()
                 },
             });

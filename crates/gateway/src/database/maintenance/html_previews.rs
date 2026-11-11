@@ -235,9 +235,7 @@ pub(super) async fn run(
     let io_notification = store.html_preview_io_work_notification();
     let database = store.database_connection();
     let mut wake = database.work_signal("maintenance.html").subscribe();
-    let mut released = database
-        .work_signal("maintenance.frozen.release")
-        .subscribe();
+    let mut released = database.work_signal("maintenance.html.release").subscribe();
     let mut begin = true;
     loop {
         if begin {

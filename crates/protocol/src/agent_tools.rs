@@ -254,6 +254,12 @@ pub struct AgentToolThreadCreationOption {
 pub struct AgentToolTargetOption {
     pub id: String,
     pub label: String,
+    /// Navigation identity for matching destinations, never an authorization token.
+    pub thread_id: String,
+    /// Current saved name; null means the thread has no name.
+    pub title: Option<String>,
+    /// Effective execution/route intersection, using the route action vocabulary.
+    pub allowed_actions: Vec<crate::AgentRouteAction>,
 }
 
 impl AgentToolOptionsProjection {
@@ -772,6 +778,15 @@ fn backend_kind(backend: AgentExecutionProfileBackend) -> AgentToolBackendKind {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn model_authored_launch_cannot_request_a_financial_service_preset() {
+        for field in ["service_mode", "serviceMode", "service_tier", "serviceTier"] {
+            let mut input = serde_json::json!({});
+            input[field] = serde_json::json!({"id":"pro","authority":"copied-public-proof"});
+            assert!(serde_json::from_value::<AgentToolLaunchSelection>(input).is_err());
+        }
+    }
     use super::*;
     use crate::{
         AgentExecutionProfileBackend, AgentExecutionProfileId, AgentExecutionProfileProjection,
@@ -1021,6 +1036,24 @@ mod tests {
             }
         });
         assert!(serde_json::from_value::<AgentStartToolInput>(nested_profile_injection).is_err());
+    }
+
+    #[test]
+    fn model_launch_tools_cannot_authorize_context_expansion() {
+        for launch in [
+            json!({"contextWindow": 1050000}),
+            json!({"context_window": 1050000}),
+            json!({"contextAuthority": "copied-picker-proof"}),
+            json!({"profile": {"kind":"model", "providerId":"openai", "modelId":"model", "contextWindow":1050000}}),
+            json!({"profile": {"kind":"exact", "id":"P12345678901234567890", "contextWindow":1050000}}),
+        ] {
+            assert!(
+                serde_json::from_value::<AgentStartToolInput>(json!({
+                    "targetOptionId":"current", "input":[], "launch":launch,
+                }))
+                .is_err()
+            );
+        }
     }
 
     #[test]

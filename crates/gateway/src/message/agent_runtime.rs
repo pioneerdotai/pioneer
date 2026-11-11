@@ -4,6 +4,7 @@ use super::*;
 use crate::patch_history_observer::{SqlitePatchObserver, reserve_patch_history_capacity};
 use anyhow::{Context, Result, bail};
 use futures_util::{FutureExt, StreamExt};
+use pioneer_observability::closing::{Closing, Fact, Phase};
 use pioneer_observability::{
     GatewayMarkdownMessageMetric, GatewayMarkdownMessageOutcome, GatewayMarkdownOutcome,
     GatewayMarkdownStage, GatewayMarkdownStageMetric, GatewayMarkdownStreamKind,
@@ -995,7 +996,8 @@ impl MessageProcessor {
                             durable_receiver.pending_enqueue_age().unwrap_or_default();
                         let projection_started = Instant::now();
                         let work=durable_receiver.pending_work();
-                        let (commit_result, listener_failed) = match AssertUnwindSafe(work.scope_result(async {
+                        let closing_correlation = durable_receiver.pending_closing_correlation();
+                        let (commit_result, listener_failed) = match AssertUnwindSafe(work.scope_result(closing_correlation.scope(async {
                             if let Some(weak) = &this {
                                 let Some(this) = weak.upgrade() else {
                                     return Err(DurableCommitRejection::permanent(
@@ -1014,7 +1016,7 @@ impl MessageProcessor {
                                     "gateway message processor is no longer available",
                                 )) }
                             }
-                        }))
+                        })))
                         .catch_unwind()
                         .await
                         {
@@ -1934,7 +1936,7 @@ impl MessageProcessor {
         }
         match self
             .crud_store
-            .get_cli_runtime_turn_binding(&notification.turn_id)
+            .get_cli_runtime_turn_binding_control(&notification.turn_id)
             .await
         {
             Ok(Some(binding)) => {
@@ -2002,6 +2004,9 @@ impl MessageProcessor {
         cli_blocked_guard: Option<pioneer_protocol::CliRuntimeBlockedTurnGuard>,
         mut turn_transition: Option<Arc<tokio::sync::OwnedMutexGuard<()>>>,
     ) -> MessageFuture<'a, Result<(), DurableCommitRejection>> {
+        let closing_correlation = (event.is_terminal()
+            || matches!(&event, AgentDurableEvent::TurnFinalizationPrepared { .. }))
+        .then(pioneer_observability::scenario::Correlation::capture);
         let foreground_activation = match &event {
             AgentDurableEvent::NativeCancellationContextPrepared {
                 preparation,
@@ -2110,7 +2115,7 @@ impl MessageProcessor {
                 {
                     let binding = self
                         .crud_store
-                        .get_cli_runtime_turn_binding(turn_id)
+                        .get_cli_runtime_turn_binding_control(turn_id)
                         .await
                         .map_err(|_| {
                             DurableCommitRejection::retryable(
@@ -2121,7 +2126,7 @@ impl MessageProcessor {
                     if let Some(binding) = binding {
                         let expected = self
                             .crud_store
-                            .cli_runtime_turn_terminal_guard(&binding)
+                            .cli_runtime_turn_terminal_control_guard(&binding)
                             .await
                             .map_err(|_| {
                                 DurableCommitRejection::retryable(
@@ -2149,7 +2154,7 @@ impl MessageProcessor {
                         if expected.is_none()
                             || self
                                 .crud_store
-                                .cli_runtime_turn_terminal_guard(&binding)
+                                .cli_runtime_turn_terminal_control_guard(&binding)
                                 .await
                                 .map_err(|_| {
                                     DurableCommitRejection::retryable(
@@ -2462,7 +2467,12 @@ impl MessageProcessor {
         message_future(pioneer_observability::turn_startup::scope_stage(
             startup_key,
             pioneer_observability::turn_startup::Stage::Projection,
-            future,
+            async move {
+                match closing_correlation {
+                    Some(correlation) => correlation.scope(future).await,
+                    None => future.await,
+                }
+            },
         ))
     }
 
@@ -3294,6 +3304,14 @@ impl MessageProcessor {
             .claim_due_turn_event_deliveries_with_deadline(consumer, now_unix, limit)
             .await?;
         let processed = batch.deliveries.len() as u64;
+        if processed == 1 {
+            self.process_claimed_native_turn_event_delivery(
+                batch.deliveries.into_iter().next().expect("one delivery"),
+            )
+            .await?;
+            return Ok((processed, batch.next_eligible_at_unix));
+        }
+
         let mut by_turn = std::collections::BTreeMap::<
             String,
             Vec<pioneer_crud::ClaimedTurnEventDeliveryRecord>,
@@ -3304,20 +3322,51 @@ impl MessageProcessor {
                 .or_default()
                 .push(delivery);
         }
+        // Claim discovery admits only causal heads, so each turn has one
+        // outstanding delivery. Keep per-turn sequencing explicit if that
+        // representation changes; other turns remain independent.
+        let deliveries = futures_util::stream::iter(by_turn.into_values())
+            .map(|deliveries| async move {
+                let mut outcomes = Vec::with_capacity(deliveries.len());
+                for delivery in deliveries {
+                    outcomes.push(
+                        self.prepare_native_turn_event_delivery_settlement(delivery)
+                            .await,
+                    );
+                }
+                outcomes
+            })
+            .buffer_unordered(16)
+            .ready_chunks(64);
         let storage_failed = AtomicBool::new(false);
-        futures_util::stream::iter(by_turn.into_values())
-            .for_each_concurrent(Some(16), |deliveries| {
+        deliveries
+            .for_each_concurrent(Some(16), |ready| {
                 let storage_failed = &storage_failed;
                 async move {
-                    for delivery in deliveries {
-                        if self
-                            .process_claimed_native_turn_event_delivery(delivery)
-                            .await
-                            .is_err()
-                        {
-                            storage_failed.store(true, Ordering::Relaxed);
+                    let ready = ready.into_iter().flatten().collect::<Vec<_>>();
+                    // ready_chunks never waits to fill a batch. Settlement futures
+                    // are polled alongside delivery, so waiting for the writer
+                    // cannot suspend the other turns' notification futures.
+                    if self
+                        .crud_store
+                        .settle_turn_event_deliveries(&ready)
+                        .await
+                        .is_err()
+                    {
+                        // Isolate a poison row. Exact tokens also fence a replay
+                        // following an unknown but actually committed batch write.
+                        for outcome in ready {
+                            if self
+                                .crud_store
+                                .settle_turn_event_deliveries(&[outcome])
+                                .await
+                                .is_err()
+                            {
+                                storage_failed.store(true, Ordering::Relaxed);
+                            }
                         }
                     }
+                    tokio::task::yield_now().await;
                 }
             })
             .await;
@@ -3527,7 +3576,9 @@ impl MessageProcessor {
                 if !self.complete {
                     self.running.store(false, Ordering::Release);
                     if !self.shutdown.is_cancelled() {
-                        self.control.notify();
+                        self.control.notify_keys(&[
+                            pioneer_crud::GatewayControlWake::NativeRetention.key(),
+                        ]);
                     }
                 }
             }
@@ -4198,7 +4249,7 @@ impl MessageProcessor {
     ) -> Result<()> {
         let selected = self
             .crud_store
-            .get_cli_runtime_turn_binding(&expected.turn_id)
+            .get_cli_runtime_turn_binding_control(&expected.turn_id)
             .await?
             .ok_or(pioneer_crud::UnactivatedTurnPhaseChanged)?;
         let selected_attempt = self
@@ -4215,7 +4266,7 @@ impl MessageProcessor {
         // another durable owner/generation inherits this early Stop's proof.
         let binding = self
             .crud_store
-            .get_cli_runtime_turn_binding(&expected.turn_id)
+            .get_cli_runtime_turn_binding_control(&expected.turn_id)
             .await?
             .ok_or(pioneer_crud::UnactivatedTurnPhaseChanged)?;
         anyhow::ensure!(
@@ -4230,7 +4281,7 @@ impl MessageProcessor {
         );
         let source = self
             .crud_store
-            .cli_runtime_turn_terminal_guard(&binding)
+            .cli_runtime_turn_terminal_control_guard(&binding)
             .await?
             .ok_or(pioneer_crud::UnactivatedTurnPhaseChanged)?;
         anyhow::ensure!(
@@ -4820,72 +4871,48 @@ impl MessageProcessor {
         &self,
         delivery: pioneer_crud::ClaimedTurnEventDeliveryRecord,
     ) -> Result<()> {
-        if delivery.consumer == pioneer_crud::NATIVE_TURN_EVENT_LIVE_CONSUMER
+        let settlement = self
+            .prepare_native_turn_event_delivery_settlement(delivery)
+            .await;
+        self.crud_store
+            .settle_turn_event_deliveries(&[settlement])
+            .await?;
+        Ok(())
+    }
+
+    async fn prepare_native_turn_event_delivery_settlement(
+        &self,
+        delivery: pioneer_crud::ClaimedTurnEventDeliveryRecord,
+    ) -> pioneer_crud::TurnEventDeliverySettlement {
+        use pioneer_crud::{TurnEventDeliveryOutcome as Outcome, TurnEventDeliverySettlement};
+        let outcome = if delivery.consumer == pioneer_crud::NATIVE_TURN_EVENT_LIVE_CONSUMER
             && self.foreground_starts.pending(
                 delivery.event.payload.thread_id(),
                 delivery.event.payload.turn_id(),
+            ) {
+            Outcome::ForegroundDeferred
+        } else {
+            match tokio::time::timeout(
+                Duration::from_secs(5),
+                self.deliver_native_turn_event(&delivery),
             )
-        {
-            self.crud_store
-                .defer_turn_event_delivery_for_foreground_start(
-                    &delivery.id,
-                    &delivery.claim_token,
-                    now_timestamp_secs(),
-                )
-                .await?;
-            return Ok(());
-        }
-        let result = tokio::time::timeout(
-            Duration::from_secs(5),
-            self.deliver_native_turn_event(&delivery),
-        )
-        .await
-        .map_err(|_| anyhow::anyhow!("optional turn-event delivery timed out"))
-        .and_then(|result| result);
-        let completed_at = now_timestamp_secs();
-        match result {
-            Ok(()) => {
-                if let Err(error) = self
-                    .crud_store
-                    .complete_turn_event_delivery(
-                        delivery.id.as_str(),
-                        delivery.claim_token.as_str(),
-                        completed_at,
-                    )
-                    .await
-                {
-                    warn!(
-                        delivery_id = delivery.id,
-                        consumer = delivery.consumer,
-                        error = %format!("{error:#}"),
-                        "failed to acknowledge optional turn-event delivery"
-                    );
-                    return Err(error);
-                }
+            .await
+            .map_err(|_| anyhow::anyhow!("optional turn-event delivery timed out"))
+            .and_then(|result| result)
+            {
+                Ok(()) => Outcome::Delivered,
+                Err(error) => Outcome::Failed {
+                    attempt_count: delivery.attempt_count,
+                    error: format!("{error:#}"),
+                },
             }
-            Err(error) => {
-                if let Err(mark_error) = self
-                    .crud_store
-                    .fail_turn_event_delivery(
-                        delivery.id.as_str(),
-                        delivery.claim_token.as_str(),
-                        delivery.attempt_count,
-                        format!("{error:#}"),
-                        completed_at,
-                    )
-                    .await
-                {
-                    warn!(
-                        delivery_id = delivery.id,
-                        consumer = delivery.consumer,
-                        error = %format!("{mark_error:#}"),
-                        "failed to record optional turn-event delivery failure"
-                    );
-                    return Err(mark_error);
-                }
-            }
+        };
+        TurnEventDeliverySettlement {
+            id: delivery.id,
+            claim_token: delivery.claim_token,
+            at_unix: now_timestamp_secs(),
+            outcome,
         }
-        Ok(())
     }
 
     async fn deliver_native_turn_event(
@@ -5790,18 +5817,24 @@ impl MessageProcessor {
                 generation,
                 task_finalization_revision,
             } => message_future(async move {
+                let artifact = self.artifact_finalization_ref(&notification.turn_id).await;
+                let mut closing = Closing::start_linked(
+                    Phase::NativePreparation,
+                    &Closing::capture(),
+                    artifact.as_slice(),
+                );
                 let mut notification = notification;
                 self.enrich_item_completed_markdown(&mut notification).await;
                 let thread_id = notification.thread_id.clone();
                 let turn_id = notification.turn_id.clone();
-                if let Err(error) = self
-                    .crud_store
-                    .prepare_turn_finalization(
+                if let Err(error) = closing
+                    .correlation()
+                    .scope(self.crud_store.prepare_turn_finalization(
                         &notification,
                         generation,
                         task_finalization_revision.as_deref(),
                         now_timestamp_secs(),
-                    )
+                    ))
                     .await
                 {
                     self.report_legacy_turn_failure(
@@ -5812,6 +5845,7 @@ impl MessageProcessor {
                     .await;
                     return false;
                 }
+                closing.finish(Fact::Confirmed);
                 self.progress_items
                     .lock()
                     .await
@@ -7431,10 +7465,43 @@ impl MessageProcessor {
         Vec<TimeoutCandidate>,
         Option<pioneer_crud::TimeoutCandidateCursor>,
     )> {
-        let (candidates, next) = self
-            .timeout_supervisor
-            .list_timeout_candidate_page(now_unix, limit, after)
-            .await?;
+        self.poll_timeout_candidate_page_scoped(None, now_unix, limit, after)
+            .await
+    }
+
+    pub(super) async fn poll_timeout_candidate_page_for_turn(
+        &self,
+        turn_id: &str,
+        now_unix: i64,
+        limit: u64,
+        after: Option<&pioneer_crud::TimeoutCandidateCursor>,
+    ) -> Result<(
+        Vec<TimeoutCandidate>,
+        Option<pioneer_crud::TimeoutCandidateCursor>,
+    )> {
+        self.poll_timeout_candidate_page_scoped(Some(turn_id), now_unix, limit, after)
+            .await
+    }
+
+    async fn poll_timeout_candidate_page_scoped(
+        &self,
+        turn_id: Option<&str>,
+        now_unix: i64,
+        limit: u64,
+        after: Option<&pioneer_crud::TimeoutCandidateCursor>,
+    ) -> Result<(
+        Vec<TimeoutCandidate>,
+        Option<pioneer_crud::TimeoutCandidateCursor>,
+    )> {
+        let (candidates, next) = if let Some(turn_id) = turn_id {
+            self.crud_store
+                .list_timeout_candidate_page_for_turn(turn_id, now_unix, limit, after)
+                .await?
+        } else {
+            self.timeout_supervisor
+                .list_timeout_candidate_page(now_unix, limit, after)
+                .await?
+        };
         let now_unix_ms = now_unix.saturating_mul(1_000);
         let mut timed_out = Vec::new();
         let mut human_waits = HashMap::<String, bool>::new();
@@ -8276,10 +8343,28 @@ impl MessageProcessor {
         now_unix: i64,
         limit: u64,
     ) -> Result<TurnFinalizationReconciliationSummary> {
-        let mut summary = self
-            .crud_store
-            .reconcile_prepared_turn_finalizations(limit, now_unix)
-            .await?;
+        self.reconcile_prepared_native_turn_finalizations_scoped(now_unix, limit, None)
+            .await
+    }
+
+    pub(super) async fn reconcile_prepared_native_turn_finalizations_scoped(
+        &self,
+        now_unix: i64,
+        limit: u64,
+        turns: Option<&[String]>,
+    ) -> Result<TurnFinalizationReconciliationSummary> {
+        let mut summary = match turns {
+            Some(turns) => {
+                self.crud_store
+                    .reconcile_prepared_turn_finalizations_for_turns(turns, now_unix)
+                    .await?
+            }
+            None => {
+                self.crud_store
+                    .reconcile_prepared_turn_finalizations(limit, now_unix)
+                    .await?
+            }
+        };
         for committed in &summary.committed {
             if !committed.already_committed {
                 self.recover_completed_turn_title(
@@ -8768,7 +8853,7 @@ impl MessageProcessor {
             .await;
         let result = self
             .crud_store
-            .cli_runtime_turn_terminal_guard(binding)
+            .cli_runtime_turn_terminal_control_guard(binding)
             .await;
         let diagnostic = match result {
             Ok(Some(snapshot)) => return Some(snapshot),
@@ -9249,7 +9334,7 @@ impl MessageProcessor {
 
         let is_cli_runtime_turn = self
             .crud_store
-            .get_cli_runtime_turn_binding(turn_id)
+            .get_cli_runtime_turn_binding_control(turn_id)
             .await?
             .is_some();
         if !is_cli_runtime_turn {
@@ -9863,6 +9948,12 @@ impl MessageProcessor {
         recovery: Option<pioneer_protocol::RecoveryAttemptContext>,
         recover_title: bool,
     ) -> bool {
+        let artifact = self.artifact_finalization_ref(&turn_id).await;
+        let mut closing = Closing::start_linked(
+            Phase::TerminalTransition,
+            &Closing::capture(),
+            artifact.as_slice(),
+        );
         let terminal_actor_generation = self
             .agent_manager
             .turn_owner_generation(thread_id.as_str(), turn_id.as_str())
@@ -9900,9 +9991,15 @@ impl MessageProcessor {
                     self.finalize_agent_execution_for_turn(&current_turn, "completed")
                         .await;
                 }
+                closing.finish(if committed {
+                    Fact::Duplicate
+                } else {
+                    Fact::Unconfirmed
+                });
                 return committed;
             }
             if current_turn.status != TurnStatus::InProgress {
+                closing.finish(Fact::Superseded);
                 self.retire_execution_progress_state(turn_id.as_str()).await;
                 return false;
             }
@@ -9934,6 +10031,7 @@ impl MessageProcessor {
             .artifact_finalization_blocks_completion(thread_id.as_str(), turn_id.as_str())
             .await
         {
+            closing.finish(Fact::Rejected);
             return false;
         }
 
@@ -9966,14 +10064,20 @@ impl MessageProcessor {
         };
 
         let event_timestamp = now_timestamp_secs();
-        if let Err(error) = self
-            .materialize_native_agent_turn_event(
+        let persisted = closing
+            .correlation()
+            .scope(self.materialize_native_agent_turn_event(
                 pioneer_crud::CanonicalTurnEventPayload::TurnCompleted(turn_completed.clone()),
                 event_timestamp,
                 None,
-            )
-            .await
-        {
+            ))
+            .await;
+        let fact = if persisted.is_ok() {
+            Fact::Confirmed
+        } else {
+            Fact::Unconfirmed
+        };
+        if let Err(error) = persisted {
             let rolled_back = self
                 .rollback_terminal_turn_finish_if_event_not_appended(
                     finish_outcome.rollback_context,
@@ -9993,6 +10097,7 @@ impl MessageProcessor {
                 return false;
             }
         }
+        closing.finish(fact);
         if recover_title {
             self.recover_completed_turn_title(thread_id.clone(), &turn_completed.turn)
                 .await;
@@ -10021,17 +10126,20 @@ impl MessageProcessor {
         // projection does not inherit the complete native-event listener stack.
         // Abort-on-drop is safe here: an interrupted reconciliation remains
         // discoverable by the durable terminal-child reconciler.
+        self.observe_cli_terminal_phase(&turn_id, "reconcile_task_result")
+            .await;
         let task_reconciliation = {
             let executor = Arc::clone(&self.task_agent_executor);
             let reconciliation_thread_id = thread_id.clone();
             let reconciliation_turn_id = turn_id.clone();
+            let correlation = closing.correlation();
             message_fresh_task(async move {
-                executor
-                    .reconcile_child_turn_completed(
+                correlation
+                    .scope(executor.reconcile_child_turn_completed(
                         reconciliation_thread_id.as_str(),
                         reconciliation_turn_id.as_str(),
                         TaskChildReconciliationOrigin::Live,
-                    )
+                    ))
                     .await
             })
             .await
@@ -10070,6 +10178,8 @@ impl MessageProcessor {
         // the immutable provider/result input.  Keep both durable records
         // until the live/startup reconciler completes the task transition.
         if task_reconciliation_succeeded {
+            self.observe_cli_terminal_phase(&turn_id, "delete_task_context")
+                .await;
             if let Err(error) = self
                 .crud_store
                 .delete_turn_llm_context_for_turn(turn_id.as_str())
@@ -10082,6 +10192,8 @@ impl MessageProcessor {
                     "failed to delete turn_llm_context rows after turn completion"
                 );
             }
+            self.observe_cli_terminal_phase(&turn_id, "delete_runtime_snapshot")
+                .await;
             self.delete_turn_runtime_snapshot_for_closed_turn(
                 thread_id.as_str(),
                 turn_id.as_str(),
@@ -10089,9 +10201,13 @@ impl MessageProcessor {
             )
             .await;
         }
+        self.observe_cli_terminal_phase(&turn_id, "clear_artifact_state")
+            .await;
         self.clear_artifact_finalization_state(turn_id.as_str())
             .await;
 
+        self.observe_cli_terminal_phase(&turn_id, "reconcile_terminal_recovery")
+            .await;
         match self
             .recovery_coordinator
             .complete_active_recovery_for_turn(turn_id.as_str(), recovery.as_ref(), event_timestamp)
@@ -10112,6 +10228,8 @@ impl MessageProcessor {
             }
         }
 
+        self.observe_cli_terminal_phase(&turn_id, "retire_terminal_actor")
+            .await;
         if task_reconciliation_succeeded
             && self
                 .thread_manager
@@ -10689,6 +10807,12 @@ impl MessageProcessor {
         turn_id: String,
         recovery: Option<pioneer_protocol::RecoveryAttemptContext>,
     ) -> bool {
+        let artifact = self.artifact_finalization_ref(&turn_id).await;
+        let mut closing = Closing::start_linked(
+            Phase::NativeFinalization,
+            &Closing::capture(),
+            artifact.as_slice(),
+        );
         if let Some(recovery) = recovery.as_ref() {
             match self
                 .recovery_coordinator
@@ -10722,7 +10846,13 @@ impl MessageProcessor {
             .await
         {
             Ok(true) => {}
-            Ok(false) => return self.complete_turn(thread_id, turn_id, recovery).await,
+            Ok(false) => {
+                closing.finish(Fact::Returned);
+                return closing
+                    .correlation()
+                    .scope(self.complete_turn(thread_id, turn_id, recovery))
+                    .await;
+            }
             Err(error) => {
                 warn!(
                     thread_id,
@@ -10734,13 +10864,17 @@ impl MessageProcessor {
             }
         }
 
-        let committed = match self
-            .crud_store
-            .commit_prepared_turn_finalization(turn_id.as_str(), now_timestamp_secs())
+        let committed = match closing
+            .correlation()
+            .scope(
+                self.crud_store
+                    .commit_prepared_turn_finalization(turn_id.as_str(), now_timestamp_secs()),
+            )
             .await
         {
             Ok(TurnFinalizationCommitOutcome::Committed(committed)) => committed,
             Ok(TurnFinalizationCommitOutcome::DeferredByPredecessor) => {
+                closing.finish(Fact::Pending);
                 debug!(
                     thread_id,
                     turn_id, "native Turn finalization is waiting for an earlier projection"
@@ -10748,6 +10882,7 @@ impl MessageProcessor {
                 return false;
             }
             Ok(TurnFinalizationCommitOutcome::SupersededByTerminalStatus(status)) => {
+                closing.finish(Fact::Superseded);
                 debug!(
                     thread_id,
                     turn_id,
@@ -10775,6 +10910,11 @@ impl MessageProcessor {
             );
             return false;
         }
+        closing.finish(if committed.already_committed {
+            Fact::Duplicate
+        } else {
+            Fact::Confirmed
+        });
         if !committed.already_committed {
             self.recover_completed_turn_title(thread_id.clone(), &committed.turn_completed.turn)
                 .await;
@@ -10786,7 +10926,9 @@ impl MessageProcessor {
         // Reuse terminal cleanup/recovery/task reconciliation. Its canonical
         // TurnCompleted write is now an exact idempotent replay of the already
         // committed terminal half of the finalization transaction.
-        self.complete_turn_with_title_recovery(thread_id, turn_id, recovery, false)
+        closing
+            .correlation()
+            .scope(self.complete_turn_with_title_recovery(thread_id, turn_id, recovery, false))
             .await
     }
 
@@ -10847,11 +10989,15 @@ impl MessageProcessor {
             // Cancellation wins over Blocked, but still cannot bypass a CLI
             // transition already performing terminal effects or admission.
             let _acquired = if transition.is_none() {
-                match self.crud_store.get_cli_runtime_turn_binding(&turn_id).await {
+                match self
+                    .crud_store
+                    .get_cli_runtime_turn_binding_control(&turn_id)
+                    .await
+                {
                     Ok(Some(binding)) => {
                         let expected = self
                             .crud_store
-                            .cli_runtime_turn_terminal_guard(&binding)
+                            .cli_runtime_turn_terminal_control_guard(&binding)
                             .await
                             .ok()
                             .flatten();
@@ -10866,7 +11012,7 @@ impl MessageProcessor {
                         if expected.is_none()
                             || self
                                 .crud_store
-                                .cli_runtime_turn_terminal_guard(&binding)
+                                .cli_runtime_turn_terminal_control_guard(&binding)
                                 .await
                                 .ok()
                                 .flatten()
@@ -11032,11 +11178,15 @@ impl MessageProcessor {
         let turn_transition = if turn_transition.is_some() {
             turn_transition
         } else {
-            match self.crud_store.get_cli_runtime_turn_binding(&turn_id).await {
+            match self
+                .crud_store
+                .get_cli_runtime_turn_binding_control(&turn_id)
+                .await
+            {
                 Ok(Some(binding)) => {
                     let expected = match self
                         .crud_store
-                        .cli_runtime_turn_terminal_guard(&binding)
+                        .cli_runtime_turn_terminal_control_guard(&binding)
                         .await
                     {
                         Ok(Some(expected)) => expected,
@@ -11048,7 +11198,7 @@ impl MessageProcessor {
                     };
                     if self
                         .crud_store
-                        .cli_runtime_turn_terminal_guard(&binding)
+                        .cli_runtime_turn_terminal_control_guard(&binding)
                         .await
                         .ok()
                         .flatten()
@@ -11571,7 +11721,11 @@ impl MessageProcessor {
         reason: Option<&str>,
         transition: Option<&Arc<tokio::sync::OwnedMutexGuard<()>>>,
     ) -> bool {
-        match self.crud_store.get_cli_runtime_turn_binding(turn_id).await {
+        match self
+            .crud_store
+            .get_cli_runtime_turn_binding_control(turn_id)
+            .await
+        {
             Ok(Some(binding)) => {
                 if binding.thread_id != thread_id
                     || !self

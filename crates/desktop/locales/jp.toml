@@ -54,6 +54,13 @@ remove = "メンションを削除"
 cancel = "返信をキャンセル"
 
 [chat.composer.model]
+service_label = "サービス階層"
+service_standard = "標準"
+service_invalid = "保存されたサービス階層は利用できません。標準または別のモードを選択してください。"
+context_label = "コンテキストウィンドウ"
+context_auto = "自動 — 最大 %{tokens} トークン"
+context_up_to = "最大 %{tokens} トークン"
+context_invalid = "保存された選択は利用できません。自動または別のウィンドウを選択してください。"
 select_label = "モデルを選択"
 dialog_title = "モデルを選択"
 provider_label = "プロバイダー"

@@ -474,3 +474,190 @@ async fn owned_cli_hub_shutdown_rejects_queued_publication_and_late_progress() {
     assert!(live.try_recv().is_err());
     hub.shutdown_and_wait().await.unwrap();
 }
+
+#[tokio::test]
+async fn terminal_flush_precedes_capacity_and_envelope_keeps_origin_until_ack_or_loss() {
+    use pioneer_observability::scenario::{accept_params, inject_params};
+    use std::future::{Future, poll_fn};
+    use std::task::Poll;
+    let _lock = crate::OBSERVATION_TEST_LOCK.lock().unwrap();
+    pioneer_observability::set_telemetry_enabled(true);
+    let mut params = serde_json::json!({"_pioneer_correlation":{
+        "v":1,"trace":"dddddddddddddddddddddddddddddddd",
+        "span":"2222222222222222","flags":1}});
+    let (source, _) = accept_params("thread/open", &mut params);
+    let hub = ExecutionEventHub::with_progress_config(1, 8, test_config());
+    let mut live = hub.subscribe_live();
+    let mut receiver = hub.take_durable_receiver().await.unwrap();
+    hub.publish_durable(completed("occupies_capacity"))
+        .await
+        .unwrap();
+    hub.publish_progress(delta("final delta"));
+    let published = source.run(|| hub.publish_durable_and_wait(completed("turn_1")));
+    let mut published = std::pin::pin!(published);
+    poll_fn(|cx| {
+        assert!(published.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    assert!(
+        matches!(live.try_recv(), Ok(AgentProgressEvent::ItemDelta { notification })
+        if notification.delta == "final delta")
+    );
+    receiver.recv().await.unwrap();
+    receiver.acknowledge_last(Ok(()));
+    poll_fn(|cx| {
+        assert!(published.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    receiver.recv().await.unwrap();
+    let mut applied = serde_json::json!({});
+    receiver.pending_closing_correlation().run(|| {
+        inject_params("thread/open", &mut applied);
+    });
+    assert_eq!(
+        applied["_pioneer_correlation"]["trace"],
+        "dddddddddddddddddddddddddddddddd"
+    );
+    // Same passive seam used by the stale CLI branch: decline projection
+    // confirmation while preserving the pre-existing business ACK contract.
+    receiver.supersede_last_observation();
+    receiver.acknowledge_last(Ok(()));
+    published.await.unwrap();
+    // A tool result can be durable while its turn is still running. Its
+    // source must survive the same consumer envelope without a terminal owner.
+    source
+        .run(|| {
+            hub.publish_durable(AgentDurableEvent::ItemCompleted {
+                notification: ItemCompletedNotification {
+                    workspace_id: "ws_1".into(),
+                    thread_id: "thread_1".into(),
+                    turn_id: "turn_1".into(),
+                    item: TurnItem::AgentMessage {
+                        id: "item_1".into(),
+                        text: "result".into(),
+                        phase: AgentMessagePhase::FinalAnswer,
+                        markdown: None,
+                        markdown_version: None,
+                    },
+                },
+            })
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        receiver.recv().await,
+        Some(AgentDurableEvent::ItemCompleted { .. })
+    ));
+    let consumer = receiver.pending_closing_correlation();
+    let work = receiver.pending_work();
+    let mut notification = serde_json::json!({"threadId":"thread_1","turnId":"turn_1"});
+    work.run(|| {
+        consumer.run(|| {
+            pioneer_observability::updates::decorate("turn/completed", &mut notification);
+        })
+    });
+    assert_eq!(
+        notification["_pioneer_update"]["trace"],
+        "dddddddddddddddddddddddddddddddd"
+    );
+    receiver.acknowledge_last(Ok(()));
+    // Independent regression: UPDATE A surrounds explicit domain B. The plain
+    // case above cannot catch source_inner preferring A over the producer B.
+    let mut outer_params = serde_json::json!({"_pioneer_correlation":{
+        "v":1,"trace":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "span":"1111111111111111","flags":1}});
+    let (outer, _) = accept_params("thread/open", &mut outer_params);
+    let update = outer
+        .run(|| pioneer_observability::updates::UpdateContext::source(None))
+        .unwrap();
+    let carrier = update.run(|| {
+        pioneer_observability::work::WorkCarrier::child(
+            pioneer_observability::work::Boundary::EventLane,
+            pioneer_observability::work::WorkKind::Event,
+            pioneer_observability::work::Trigger::Event,
+            pioneer_observability::work::ExecutorRole::Event,
+        )
+    });
+    let nested = source.run(|| {
+        hub.publish_durable_and_wait(AgentDurableEvent::ItemCompleted {
+            notification: ItemCompletedNotification {
+                workspace_id: "ws_1".into(),
+                thread_id: "thread_1".into(),
+                turn_id: "turn_1".into(),
+                item: TurnItem::AgentMessage {
+                    id: "item_nested".into(),
+                    text: "result".into(),
+                    phase: AgentMessagePhase::FinalAnswer,
+                    markdown: None,
+                    markdown_version: None,
+                },
+            },
+        })
+    });
+    let mut nested = std::pin::pin!(carrier.scope_result(nested));
+    poll_fn(|cx| {
+        assert!(nested.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    assert!(
+        pioneer_observability::updates::carried().is_none(),
+        "poll restores previous UPDATE"
+    );
+    assert!(matches!(
+        receiver.recv().await,
+        Some(AgentDurableEvent::ItemCompleted { .. })
+    ));
+    let consumer = receiver.pending_closing_correlation();
+    let work = receiver.pending_work();
+    let mut downstream = serde_json::json!({"threadId":"thread_1","turnId":"turn_1"});
+    work.run(|| {
+        consumer.run(|| {
+            pioneer_observability::updates::decorate("turn/completed", &mut downstream);
+        })
+    });
+    let mut outer_wire = serde_json::json!({"threadId":"thread_1","turnId":"turn_1"});
+    update.run(|| {
+        pioneer_observability::updates::decorate("turn/completed", &mut outer_wire);
+    });
+    assert_eq!(
+        outer_wire["_pioneer_update"]["trace"],
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    );
+    assert_eq!(
+        downstream["_pioneer_update"]["trace"],
+        "dddddddddddddddddddddddddddddddd"
+    );
+    assert_ne!(
+        downstream["_pioneer_update"]["trace"], outer_wire["_pioneer_update"]["trace"],
+        "the actual producer B must not be replaced by ambient update A"
+    );
+    assert!(
+        pioneer_observability::updates::carried().is_none(),
+        "consumer restores UPDATE"
+    );
+    receiver.acknowledge_last(Ok(()));
+    nested.await.unwrap();
+    let lost = source.run(|| hub.publish_durable_and_wait(completed("turn_2")));
+    let mut lost = std::pin::pin!(lost);
+    poll_fn(|cx| {
+        assert!(lost.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    receiver.recv().await.unwrap();
+    drop(receiver);
+    assert!(
+        matches!(lost.await, Err(ExecutionEventHubError::CommitRejected(reason))
+        if reason.is_retryable())
+    );
+    assert!(
+        !pioneer_observability::live::snapshot()
+            .unwrap()
+            .active
+            .iter()
+            .any(|work| work.context.trace_id == Some([0xdd; 16]))
+    );
+}

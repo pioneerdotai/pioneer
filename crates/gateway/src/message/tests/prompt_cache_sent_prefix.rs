@@ -717,6 +717,9 @@ fn sequential_detached_executions_keep_the_sent_input_prefix_on_both_wires() {
                 instance,
                 provider.clone(),
             ));
+            registry
+                .insert("summary-capture", provider.clone())
+                .unwrap();
             let harness = setup_phase_13_compaction_harness(registry).await;
             let processor = &harness.processor;
             let store = &harness.crud_store;

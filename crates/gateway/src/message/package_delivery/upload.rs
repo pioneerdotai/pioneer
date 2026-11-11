@@ -171,7 +171,8 @@ impl MessageProcessor {
             .crud_store
             .database_connection()
             .work_signal("gateway.control")
-            .changing();
+            .changing()
+            .with_keys(&[pioneer_crud::GatewayControlWake::Skills.key()]);
         if let Err(error) = fs::create_dir_all(workspace_upload_dir.as_path())
             .and_then(|()| fs::create_dir(upload_dir.as_path()))
         {
@@ -819,7 +820,8 @@ impl MessageProcessor {
             .crud_store
             .database_connection()
             .work_signal("gateway.control")
-            .changing();
+            .changing()
+            .with_keys(&[pioneer_crud::GatewayControlWake::Skills.key()]);
         let cleanup_root = context
             .materialized_root
             .join(pioneer_protocol::generate_id(21));

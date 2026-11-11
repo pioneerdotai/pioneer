@@ -3208,3 +3208,113 @@ async fn input_failure_keeps_gate_open_through_eof_and_retry_adopts_source() {
     assert_eq!(bindings.len(), 1);
     assert_eq!(bindings[0].artifact_version_id.as_deref(), Some("v1"));
 }
+
+// The cap is an actual retirement hold even when none of the held histories
+// contains this turn. Its release must reach HTML without waking frozen work.
+#[tokio::test]
+async fn html_reader_limit_release_wakes_only_the_waiting_owner() {
+    let f = fixture().await;
+    for index in 0..65 {
+        manifest(&f, &format!("held-{index:02}"), "parent", &[], &[], 0, None).await;
+    }
+    let mut after = String::new();
+    let mut progress = None;
+    for _ in 0..512 {
+        if !index_quantum(&f.store, &mut after, &mut progress, "\u{10ffff}")
+            .await
+            .unwrap()
+        {
+            break;
+        }
+    }
+    f.sql("UPDATE html_preview_index_backfill SET complete=1,inputs_complete=1 WHERE singleton=1")
+        .await;
+    let root = crate::canonical_agent_id('E', "root-agent-turn\0parent-turn");
+    let database = f.store.database_connection();
+    let released = database.work_signal("maintenance.html.release");
+    let mut html = released.subscribe();
+    let mut frozen = database
+        .work_signal("maintenance.frozen.release")
+        .subscribe();
+    assert!(
+        unowned(
+            &f.store.connection,
+            "ws",
+            "parent",
+            "parent-turn",
+            &root,
+            &f.store.frozen_readers,
+            &released
+        )
+        .await
+        .unwrap()
+    );
+    let mut holds = Vec::new();
+    for index in 0..65 {
+        holds.push(
+            f.store
+                .compaction_acquire_frozen_history(
+                    "ws",
+                    &pioneer_compaction::frozen::FrozenHistoryRef {
+                        format: 1,
+                        manifest_id: format!("held-{index:02}"),
+                        messages: 0,
+                        identity_sha256:
+                            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                                .into(),
+                    },
+                )
+                .await
+                .unwrap(),
+        );
+    }
+    assert!(
+        !unowned(
+            &f.store.connection,
+            "ws",
+            "parent",
+            "parent-turn",
+            &root,
+            &f.store.frozen_readers,
+            &released
+        )
+        .await
+        .unwrap()
+    );
+    assert!(html.changed().now_or_never().is_none());
+    drop(holds.pop().unwrap());
+    assert!(html.changed().now_or_never().is_some());
+    assert!(frozen.changed().now_or_never().is_none());
+    assert!(
+        unowned(
+            &f.store.connection,
+            "ws",
+            "parent",
+            "parent-turn",
+            &root,
+            &f.store.frozen_readers,
+            &released
+        )
+        .await
+        .unwrap()
+    );
+    drop(holds);
+    html.begin_pass(&database).await.unwrap();
+    let ordinary = f
+        .store
+        .compaction_acquire_frozen_history(
+            "ws",
+            &pioneer_compaction::frozen::FrozenHistoryRef {
+                format: 1,
+                manifest_id: "held-00".into(),
+                messages: 0,
+                identity_sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                    .into(),
+            },
+        )
+        .await
+        .unwrap();
+    drop(ordinary);
+    assert!(html.changed().now_or_never().is_none());
+    assert!(frozen.changed().now_or_never().is_none());
+}

@@ -1,4 +1,8 @@
 use pioneer_observability::queues::{QueueBytes, QueueKind, QueueObserver, QueueOutcome};
+use pioneer_observability::{
+    closing::{Closing, Fact, Phase},
+    scenario::Correlation,
+};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::future::Future;
@@ -105,6 +109,9 @@ impl Error for ExecutionEventHubError {}
 
 #[derive(Debug)]
 struct DurableEventEnvelope {
+    source_correlation: Correlation,
+    closing: Option<Correlation>,
+    closing_residence: Option<Closing>,
     work: pioneer_observability::work::WorkCarrier,
     event: Box<AgentDurableEvent>,
     committed_tx: Option<oneshot::Sender<Result<(), DurableCommitRejection>>>,
@@ -117,6 +124,8 @@ struct DurableEventEnvelope {
 /// be acknowledged explicitly after their durable projection succeeds.
 #[derive(Debug)]
 pub struct DurableEventReceiver {
+    pending_closing: Option<Closing>,
+    pending_correlation: Option<Correlation>,
     pending_work: pioneer_observability::work::WorkCarrier,
     pending_queue: Option<QueueObserver>,
     lane: Arc<DurableLane>,
@@ -132,7 +141,7 @@ impl DurableEventReceiver {
             "consumer_missing_ack",
             "durable event consumer requested the next event without acknowledging the previous commit",
         )));
-        let (envelope, observer) = {
+        let (mut envelope, observer) = {
             let mut receiver = self.lane.receiver.lock().await;
             // Tokio recv itself is poll_fn(poll_recv). Couple only the native
             // nonblocking poll/mutation to send+current publication. The depth
@@ -164,12 +173,25 @@ impl DurableEventReceiver {
                 callback();
             }
         });
+        if let Some(residence) = &mut envelope.closing_residence {
+            residence.finish(Fact::Returned);
+        }
         observer.dequeued(QueueBytes::Unsupported);
         self.pending_queue = Some(observer);
         self.pending_work = envelope.work.received(
             pioneer_observability::work::Boundary::EventLane,
             pioneer_observability::work::WorkKind::Event,
             pioneer_observability::work::ExecutorRole::Event,
+        );
+        self.pending_closing = envelope
+            .closing
+            .as_ref()
+            .map(|parent| Closing::start(Phase::DurableConsumer, parent));
+        self.pending_correlation = Some(
+            self.pending_closing
+                .as_ref()
+                .map(Closing::correlation)
+                .unwrap_or(envelope.source_correlation),
         );
         self.pending_commit = envelope.committed_tx;
         self.pending_turn_transition = envelope.turn_transition;
@@ -182,6 +204,12 @@ impl DurableEventReceiver {
     /// received. It contains no identifiers and is cleared with the ACK.
     pub fn pending_work(&self) -> pioneer_observability::work::WorkCarrier {
         self.pending_work.clone()
+    }
+
+    pub fn pending_closing_correlation(&self) -> Correlation {
+        self.pending_correlation
+            .clone()
+            .unwrap_or_else(Correlation::capture)
     }
 
     pub fn pending_enqueue_age(&self) -> Option<Duration> {
@@ -200,7 +228,19 @@ impl DurableEventReceiver {
         self.pending_turn_transition.is_some()
     }
 
+    /// A stale consumer can preserve its existing business ACK while declining
+    /// to confirm a projection that it intentionally did not process.
+    pub fn supersede_last_observation(&mut self) {
+        if let Some(mut closing) = self.pending_closing.take() {
+            closing.finish(Fact::Superseded);
+        }
+    }
+
     pub fn acknowledge_last(&mut self, result: Result<(), DurableCommitRejection>) {
+        if let Some(mut closing) = self.pending_closing.take() {
+            closing.finish(commit_fact(&result));
+        }
+        self.pending_correlation = None;
         if let Some(observer) = self.pending_queue.take() {
             observer.outcome(
                 if result.is_ok() {
@@ -320,7 +360,12 @@ impl ExecutionEventHub {
         &self,
         event: AgentDurableEvent,
     ) -> impl Future<Output = Result<(), ExecutionEventHubError>> + Send + '_ {
-        self.publish_durable_envelope(Box::new(event), None, None, None)
+        let correlation = Closing::capture();
+        async move {
+            correlation
+                .scope(self.publish_durable_envelope(Box::new(event), None, None, None))
+                .await
+        }
     }
 
     pub fn publish_durable_and_wait(
@@ -348,20 +393,46 @@ impl ExecutionEventHub {
         turn_transition: Option<Arc<tokio::sync::OwnedMutexGuard<()>>>,
         cli_blocked_guard: Option<pioneer_protocol::CliRuntimeBlockedTurnGuard>,
     ) -> impl Future<Output = Result<(), ExecutionEventHubError>> + Send + '_ {
+        let parent = Closing::capture();
+        let terminal = terminal_event(&event);
         let event = Box::new(event);
         async move {
+            let mut ack = terminal.then(|| Closing::start(Phase::DurableAck, &parent));
+            let correlation = ack.as_ref().map(Closing::correlation).unwrap_or(parent);
             let (committed_tx, committed_rx) = oneshot::channel();
-            self.publish_durable_envelope(
-                event,
-                Some(committed_tx),
-                turn_transition,
-                cli_blocked_guard,
-            )
-            .await?;
-            committed_rx
+            correlation
+                .scope(self.publish_durable_envelope(
+                    event,
+                    Some(committed_tx),
+                    turn_transition,
+                    cli_blocked_guard,
+                ))
+                .await?;
+            let mut waiter = ack
+                .as_ref()
+                .map(|ack| Closing::start(Phase::AckWait, &ack.correlation()));
+            if let Some(waiter) = &mut waiter {
+                waiter.wait(pioneer_observability::live::WaitKind::Reply);
+            }
+            let result = committed_rx
                 .await
                 .map_err(|_| ExecutionEventHubError::CommitAcknowledgementDropped)?
-                .map_err(ExecutionEventHubError::CommitRejected)
+                .map_err(ExecutionEventHubError::CommitRejected);
+            if let Some(waiter) = &mut waiter {
+                waiter.finish(match &result {
+                    Ok(()) => Fact::Confirmed,
+                    Err(ExecutionEventHubError::CommitRejected(reason)) => rejection_fact(reason),
+                    _ => Fact::Unconfirmed,
+                });
+            }
+            if let Some(ack) = &mut ack {
+                ack.finish(match &result {
+                    Ok(()) => Fact::Confirmed,
+                    Err(ExecutionEventHubError::CommitRejected(reason)) => rejection_fact(reason),
+                    _ => Fact::Unconfirmed,
+                });
+            }
+            result
         }
     }
 
@@ -372,8 +443,34 @@ impl ExecutionEventHub {
         turn_transition: Option<Arc<tokio::sync::OwnedMutexGuard<()>>>,
         cli_blocked_guard: Option<pioneer_protocol::CliRuntimeBlockedTurnGuard>,
     ) -> Result<(), ExecutionEventHubError> {
+        let mut closing =
+            terminal_event(&event).then(|| Closing::current(Phase::TerminalCandidate));
+        let correlation = closing.as_ref().map(Closing::correlation);
+        let mut flush = correlation
+            .as_ref()
+            .map(|parent| Closing::start(Phase::PrerequisiteFlush, parent));
+        // Capture before prerequisite flush. Terminal Closing owns its source;
+        // a nonterminal domain producer owns provenance even with outer UPDATE.
+        // The surrounding update remains an optional bounded contextual link.
+        let capture_source = || pioneer_observability::updates::UpdateContext::source(None);
+        let source = match &correlation {
+            Some(parent) => {
+                pioneer_observability::updates::with_context(None, || parent.run(capture_source))
+            }
+            None => pioneer_observability::updates::UpdateContext::source_for_producer(
+                None,
+                &Correlation::capture(),
+            ),
+        };
+        let source_correlation = source
+            .as_ref()
+            .map(|source| source.correlation())
+            .unwrap_or_else(Correlation::capture);
         self.flush_progress_for_durable(&event).await;
         self.flush_snapshots_for_durable(&event);
+        if let Some(flush) = &mut flush {
+            flush.finish(Fact::Confirmed);
+        }
         // Start queue residence only after prerequisite coalescer flushes.
         // The duration still includes bounded-channel backpressure, but not
         // unrelated pre-enqueue projection work.
@@ -386,14 +483,30 @@ impl ExecutionEventHub {
         .await
         .map_err(|_| ExecutionEventHubError::DurableLaneClosed)?;
         send_wait.complete();
-        let envelope = DurableEventEnvelope {
-            work: pioneer_observability::work::WorkCarrier::child(
+        let residence = correlation.as_ref().map(|parent| {
+            let mut residence = Closing::start(Phase::DurableResidence, parent);
+            residence.wait(pioneer_observability::live::WaitKind::QueueItem);
+            residence
+        });
+        let consumer_parent = residence.as_ref().map(Closing::correlation).or(correlation);
+        let make_work = || {
+            pioneer_observability::work::WorkCarrier::child(
                 pioneer_observability::work::Boundary::EventLane,
                 pioneer_observability::work::WorkKind::Event,
                 pioneer_observability::work::Trigger::Event,
                 pioneer_observability::work::ExecutorRole::Event,
             )
-            .queued(),
+            .queued()
+        };
+        let work = match source {
+            Some(context) => context.run(make_work),
+            None => make_work(),
+        };
+        let envelope = DurableEventEnvelope {
+            source_correlation,
+            closing: consumer_parent,
+            closing_residence: residence,
+            work,
             event,
             committed_tx,
             enqueued_at,
@@ -411,6 +524,9 @@ impl ExecutionEventHub {
             *depth += 1;
             permit.send(envelope); // nonblocking; reserve and handler are outside
             observer.current(*depth, QueueBytes::Unsupported);
+        }
+        if let Some(closing) = &mut closing {
+            closing.finish(Fact::Returned);
         }
         Ok(())
     }
@@ -522,6 +638,8 @@ impl ExecutionEventHub {
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .ok()?;
         Some(DurableEventReceiver {
+            pending_closing: None,
+            pending_correlation: None,
             pending_work: Default::default(),
             pending_queue: None,
             lane: self.durable_lane.clone(),
@@ -684,5 +802,29 @@ mod depth_tests {
         receiver.acknowledge_last(Ok(()));
         assert_eq!(read().depth, 0);
         pioneer_observability::set_telemetry_enabled(old);
+    }
+}
+
+fn terminal_event(event: &AgentDurableEvent) -> bool {
+    matches!(
+        event,
+        AgentDurableEvent::TurnFinalizationPrepared { .. }
+            | AgentDurableEvent::TurnCompleted { .. }
+            | AgentDurableEvent::TurnFailed { .. }
+            | AgentDurableEvent::TurnBlocked { .. }
+            | AgentDurableEvent::TurnInterrupted { .. }
+    )
+}
+fn rejection_fact(reason: &DurableCommitRejection) -> Fact {
+    match reason.kind() {
+        DurableCommitRejectionKind::Retryable => Fact::Retryable,
+        DurableCommitRejectionKind::Permanent => Fact::Rejected,
+        DurableCommitRejectionKind::SupersededByDurableInterruption => Fact::Superseded,
+    }
+}
+fn commit_fact(result: &Result<(), DurableCommitRejection>) -> Fact {
+    match result {
+        Ok(()) => Fact::Confirmed,
+        Err(reason) => rejection_fact(reason),
     }
 }

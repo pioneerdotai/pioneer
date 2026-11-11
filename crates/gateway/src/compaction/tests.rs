@@ -945,6 +945,7 @@ async fn prepared_history_and_execution_restore_use_source_creation_order() {
     assert_eq!(prepared.messages[2].content, "created later");
     let model = NativeRequestProjection::full(
         ChatRequest {
+            service_mode: None,
             model: "fixture-model".into(),
             messages: prepared.messages.clone(),
             temperature: None,
@@ -1258,6 +1259,7 @@ async fn commentary_phase_reaches_cold_history_and_real_summarizer_input() {
     );
     let native = NativeRequestProjection::full(
         ChatRequest {
+            service_mode: None,
             model: "fixture-model".into(),
             messages: messages.iter().map(|message| (*message).clone()).collect(),
             temperature: None,
@@ -1336,6 +1338,8 @@ async fn published_summary_stays_frozen_while_uncovered_commentary_uses_new_proj
         .insert("main-fixture", Arc::new(SmallWindowMain))
         .unwrap();
     let context = NativeContext {
+        context_budget: None,
+        summary_context: None,
         overflow_recovery: false,
         recovery_deadline_ms: None,
         workspace_id: "ws".into(),
@@ -1350,6 +1354,7 @@ async fn published_summary_stays_frozen_while_uncovered_commentary_uses_new_proj
         cancellation: CancellationToken::new(),
     };
     let request = ChatRequest {
+        service_mode: None,
         model: "gpt-4".into(),
         messages: vec![history.remove(0), ChatMessage::user("Continue")],
         temperature: None,
@@ -1363,6 +1368,9 @@ async fn published_summary_stays_frozen_while_uncovered_commentary_uses_new_proj
     let raw_request = request.clone();
     let settings = CompactionSettings {
         selection: Some(ModelSelection {
+            service_mode: None,
+            context_authority: None,
+            context_window: None,
             transport: Transport::Api,
             instance: "summary-fixture".into(),
             model: "summary-model".into(),
@@ -2429,6 +2437,7 @@ fn native_preflight_counts_the_projected_history_that_will_be_sent() {
         super::history::historical_item_json(&item).unwrap()
     ));
     let request = |message| ChatRequest {
+        service_mode: None,
         model: "fixture".into(),
         messages: vec![message, ChatMessage::user("current input")],
         temperature: None,
@@ -2487,6 +2496,7 @@ async fn canonical_command_history_fits_real_foreground_preflight_after_projecti
         limits.max_output,
     );
     let request = |message| ChatRequest {
+        service_mode: None,
         model: "gpt-4".into(),
         messages: vec![message, ChatMessage::user("current foreground input")],
         temperature: None,
@@ -2585,6 +2595,8 @@ async fn canonical_command_history_fits_real_foreground_preflight_after_projecti
             .insert("main-fixture", Arc::new(SmallWindowMain))
             .unwrap();
         let context = NativeContext {
+            context_budget: None,
+            summary_context: None,
             overflow_recovery: false,
             recovery_deadline_ms: None,
             workspace_id: "ws".into(),
@@ -2599,6 +2611,7 @@ async fn canonical_command_history_fits_real_foreground_preflight_after_projecti
             cancellation: CancellationToken::new(),
         };
         let actual_request = ChatRequest {
+            service_mode: None,
             model: "gpt-4".into(),
             messages: history
                 .into_iter()
@@ -2619,6 +2632,9 @@ async fn canonical_command_history_fits_real_foreground_preflight_after_projecti
             &providers,
             &CompactionSettings {
                 selection: Some(ModelSelection {
+                    service_mode: None,
+                    context_authority: None,
+                    context_window: None,
                     transport: Transport::Api,
                     instance: "summary-fixture".into(),
                     model: "fixture-model".into(),
@@ -2705,6 +2721,8 @@ async fn genuinely_large_command_history_compacts_through_real_foreground_prefli
         .insert("main-fixture", Arc::new(SmallWindowMain))
         .unwrap();
     let context = NativeContext {
+        context_budget: None,
+        summary_context: None,
         overflow_recovery: false,
         recovery_deadline_ms: None,
         workspace_id: "ws".into(),
@@ -2723,6 +2741,9 @@ async fn genuinely_large_command_history_compacts_through_real_foreground_prefli
         &providers,
         &CompactionSettings {
             selection: Some(ModelSelection {
+                service_mode: None,
+                context_authority: None,
+                context_window: None,
                 transport: Transport::Api,
                 instance: "summary-fixture".into(),
                 model: "fixture-model".into(),
@@ -2731,6 +2752,7 @@ async fn genuinely_large_command_history_compacts_through_real_foreground_prefli
         },
         &context,
         ChatRequest {
+            service_mode: None,
             model: "gpt-4".into(),
             messages: history
                 .into_iter()
@@ -2778,6 +2800,7 @@ fn ordinary_active_api_tool_result_is_not_rewritten_by_history_projection() {
         "active-api-output\nactive-api-output",
     );
     let request = ChatRequest {
+        service_mode: None,
         model: "fixture".into(),
         messages: vec![
             ChatMessage::assistant_tool_calls(
@@ -4560,6 +4583,9 @@ async fn fixture_with_canonical_payloads_observer_and_budget(
         .unwrap()
         .unwrap_or_default();
     let selection = ModelSelection {
+        service_mode: None,
+        context_authority: None,
+        context_window: None,
         transport: Transport::Api,
         instance: "fixture-instance".into(),
         model: "fixture-model".into(),
@@ -6717,6 +6743,7 @@ async fn native_target_rechecks_complete_request_before_checkpoint_publication()
     use pioneer_provider::{ChatMessage, CompiledPromptPayload};
     let f = fixture("old history", vec![], true, false).await;
     let request = ChatRequest {
+        service_mode: None,
         model: "fixture-model".into(),
         messages: vec![
             ChatMessage::user("old history"),
@@ -6795,6 +6822,7 @@ async fn compaction_small_window_reduces_saved_tool_text_without_losing_call_or_
         ambiguous_input_aliases: vec![],
     });
     let request = ChatRequest {
+        service_mode: None,
         model: "small".into(),
         messages: vec![
             ChatMessage::user("Keep this input exactly"),
@@ -7501,6 +7529,9 @@ async fn native_discovers_working_context_head_published_after_inherited_snapsho
         .unwrap();
     let settings = CompactionSettings {
         selection: Some(ModelSelection {
+            service_mode: None,
+            context_authority: None,
+            context_window: None,
             transport: Transport::Api,
             instance: "summary-fixture".into(),
             model: "summary-model".into(),
@@ -7508,6 +7539,8 @@ async fn native_discovers_working_context_head_published_after_inherited_snapsho
         }),
     };
     let d_context = NativeContext {
+        context_budget: None,
+        summary_context: None,
         overflow_recovery: false,
         recovery_deadline_ms: None,
         workspace_id: "ws".into(),
@@ -7537,6 +7570,7 @@ async fn native_discovers_working_context_head_published_after_inherited_snapsho
         &settings,
         &d_context,
         ChatRequest {
+            service_mode: None,
             model: "gpt-4".into(),
             messages: vec![d_history[0].clone(), ChatMessage::user("Continue D")],
             temperature: None,
@@ -7951,6 +7985,9 @@ async fn native_discovers_working_context_head_published_after_inherited_snapsho
     // boundary, while the recaptured model history contains only the summary.
     let delivered_summary_owner = super::native::native_owner("ws", "context-d");
     let delivered_summary_selection = ModelSelection {
+        service_mode: None,
+        context_authority: None,
+        context_window: None,
         transport: Transport::Api,
         instance: "summary-fixture".into(),
         model: "summary-model".into(),
@@ -8836,6 +8873,9 @@ async fn native_discovers_working_context_head_published_after_inherited_snapsho
     // ordinal 1 is the model-invisible technical event between them.
     let output_summary_owner = super::native::native_owner("ws", "thread");
     let output_summary_selection = ModelSelection {
+        service_mode: None,
+        context_authority: None,
+        context_window: None,
         transport: Transport::Api,
         instance: "summary-fixture".into(),
         model: "summary-model".into(),
@@ -9338,6 +9378,8 @@ async fn native_discovers_working_context_head_published_after_inherited_snapsho
         "the reused checkpoint must not accompany raw covered H"
     );
     let e_context = NativeContext {
+        context_budget: None,
+        summary_context: None,
         overflow_recovery: false,
         recovery_deadline_ms: None,
         workspace_id: "ws".into(),
@@ -9357,6 +9399,7 @@ async fn native_discovers_working_context_head_published_after_inherited_snapsho
         &settings,
         &e_context,
         ChatRequest {
+            service_mode: None,
             model: "gpt-4".into(),
             messages: e_history
                 .into_iter()
@@ -9567,6 +9610,9 @@ async fn native_discovers_working_context_head_published_after_inherited_snapsho
         .await
         .unwrap();
     let selection = ModelSelection {
+        service_mode: None,
+        context_authority: None,
+        context_window: None,
         transport: Transport::Api,
         instance: "summary-fixture".into(),
         model: "summary-model".into(),
@@ -9743,6 +9789,8 @@ async fn native_discovers_working_context_head_published_after_inherited_snapsho
     assert!(projected_origin.inherited);
 
     let context = NativeContext {
+        context_budget: None,
+        summary_context: None,
         overflow_recovery: false,
         recovery_deadline_ms: None,
         workspace_id: "ws".into(),
@@ -9757,6 +9805,7 @@ async fn native_discovers_working_context_head_published_after_inherited_snapsho
         cancellation: CancellationToken::new(),
     };
     let request = ChatRequest {
+        service_mode: None,
         model: "gpt-4".into(),
         messages: vec![accepted[0].clone(), ChatMessage::user("Continue")],
         temperature: None,
@@ -10191,11 +10240,20 @@ async fn native_discovers_working_context_head_published_after_inherited_snapsho
 
 #[tokio::test]
 async fn native_preparation_applies_real_runner_and_reuses_checkpoint_without_generation() {
+    native_preparation_with_context_cap(false).await;
+}
+
+#[tokio::test]
+async fn native_selected_cap_compacts_fitting_request_and_freezes_summary_admission() {
+    native_preparation_with_context_cap(true).await;
+}
+
+async fn native_preparation_with_context_cap(selected_cap: bool) {
     use pioneer_agent::compaction::controller::NativeContext;
     use pioneer_provider::{ChatMessage, MessageProvenance, MessageSourceRef, ProviderRegistry};
-    // Exceed the vision model's context so this still exercises compaction,
-    // while its PDF attachment uses a supported native input contract.
-    let old = "old fact ".repeat(64_000);
+    // Retain the original over-technical-window case. The additional case
+    // fits the real model but requires compaction under its saved Native cap.
+    let old = "old fact ".repeat(if selected_cap { 12_000 } else { 64_000 });
     let f = fixture(&old, vec![], true, false).await;
     let source = f
         .store
@@ -10212,7 +10270,9 @@ async fn native_preparation_applies_real_runner_and_reuses_checkpoint_without_ge
     providers
         .insert("main-fixture", Arc::new(SmallWindowMain))
         .unwrap();
-    let context = NativeContext {
+    let mut context = NativeContext {
+        context_budget: None,
+        summary_context: None,
         overflow_recovery: false,
         recovery_deadline_ms: None,
         workspace_id: "ws".into(),
@@ -10262,6 +10322,7 @@ async fn native_preparation_applies_real_runner_and_reuses_checkpoint_without_ge
             },
         ));
     let request = ChatRequest {
+        service_mode: None,
         model: "gpt-4o".into(),
         messages: vec![history, current],
         temperature: None,
@@ -10272,14 +10333,67 @@ async fn native_preparation_applies_real_runner_and_reuses_checkpoint_without_ge
         reasoning: None,
         compiled_prompt: None,
     };
-    let settings = CompactionSettings {
+    let mut settings = CompactionSettings {
         selection: Some(ModelSelection {
+            service_mode: None,
+            context_authority: None,
+            context_window: None,
             transport: Transport::Api,
             instance: "summary-fixture".into(),
             model: "summary-model".into(),
             effort: None,
         }),
     };
+    if selected_cap {
+        let fitting = super::test_support::prepare_native_request(
+            &f.store,
+            &providers,
+            &settings,
+            &context,
+            request.clone(),
+            None,
+            false,
+            f.observer.clone(),
+            f.clock.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(fitting.receipt.identity.checkpoint.is_none());
+        assert!(
+            f.provider.calls.lock().unwrap().is_empty(),
+            "a fitting child/start must not summarize"
+        );
+        let mut saved = super::native_budget::capture(
+            context.provider.as_ref(),
+            "main-fixture",
+            "gpt-4o",
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(saved.context_window > 16000);
+        saved.context_window = 16000;
+        context.context_budget = Some(saved);
+        let summary_provider = providers
+            .get_or_create_for_workspace("ws", "summary-fixture")
+            .unwrap();
+        let mut summary = super::native_budget::capture(
+            summary_provider.as_ref(),
+            "summary-fixture",
+            "summary-model",
+            None,
+        )
+        .await
+        .unwrap();
+        summary.context_window = 16000;
+        context.summary_context = Some(pioneer_protocol::NativeSummaryContext {
+            budget: summary,
+            effort: None,
+            inherits_working: false,
+        });
+        settings.selection.as_mut().unwrap().model =
+            "mutable-settings-must-not-replace-saved-model".into();
+    }
     let raw_request = request.clone();
     let prepared = super::test_support::prepare_native_request(
         &f.store,
@@ -10308,6 +10422,31 @@ async fn native_preparation_applies_real_runner_and_reuses_checkpoint_without_ge
     assert!(prepared.receipt.identity.checkpoint.is_some());
     let count = f.provider.calls.lock().unwrap().len();
     assert!(count > 0);
+    if selected_cap {
+        assert!(
+            count > 1,
+            "history larger than the summary cap must use existing portions"
+        );
+        let saved = &context.summary_context.as_ref().unwrap().budget;
+        let summary_budget = ModelBudget::new(
+            Some(saved.context_window),
+            saved.max_input,
+            saved.max_output,
+        );
+        for request in f.provider.calls.lock().unwrap().iter() {
+            assert!(
+                pioneer_agent::compaction::request::NativeRequestProjection::full(
+                    request.clone(),
+                    vec![],
+                    summary_budget.clone(),
+                    false
+                )
+                .unwrap()
+                .fits
+            );
+        }
+    }
+
     let checkpoint_ref = f
         .store
         .compaction_checkpoint_source(
@@ -10331,6 +10470,11 @@ async fn native_preparation_applies_real_runner_and_reuses_checkpoint_without_ge
         .unwrap()
         .unwrap();
     let original: OperationSnapshot = serde_json::from_str(&admitted.snapshot).unwrap();
+    if selected_cap {
+        assert_eq!(original.admission.selection.model, "summary-model");
+        assert_eq!(original.admission.selection.context_window, Some(16000));
+    }
+
     assert!(!original.plan.compact.is_empty());
     assert!(
         published
@@ -10908,6 +11052,9 @@ async fn prepared_graph_keeps_published_roots_after_historical_edit_and_delete()
         .await
         .unwrap();
         let selection = ModelSelection {
+            service_mode: None,
+            context_authority: None,
+            context_window: None,
             transport: Transport::Api,
             instance: "fixture".into(),
             model: "fixture".into(),
@@ -11293,6 +11440,9 @@ async fn native_prepared_history_keeps_captured_epoch_until_admission() {
         .unwrap();
     let settings = CompactionSettings {
         selection: Some(ModelSelection {
+            service_mode: None,
+            context_authority: None,
+            context_window: None,
             transport: Transport::Api,
             instance: "summary-fixture".into(),
             model: "summary-model".into(),
@@ -11300,6 +11450,8 @@ async fn native_prepared_history_keeps_captured_epoch_until_admission() {
         }),
     };
     let context = NativeContext {
+        context_budget: None,
+        summary_context: None,
         overflow_recovery: false,
         recovery_deadline_ms: None,
         workspace_id: "ws".into(),
@@ -11398,6 +11550,7 @@ async fn native_prepared_history_keeps_captured_epoch_until_admission() {
         "unrelated epoch mutation invalidated an exact prepared reference"
     );
     let request = ChatRequest {
+        service_mode: None,
         model: "gpt-4".into(),
         messages: prepared
             .messages
@@ -12802,6 +12955,9 @@ async fn execution_restore_normalizes_covering_and_partial_checkpoint_replacemen
     ) {
         let owner = super::native::native_owner("ws", owner_thread);
         let selection = ModelSelection {
+            service_mode: None,
+            context_authority: None,
+            context_window: None,
             transport: Transport::Api,
             instance: "fixture".into(),
             model: "fixture".into(),
@@ -13324,6 +13480,9 @@ async fn frozen_fork_uses_compatible_ancestor_without_importing_future_work() {
             })
             .collect::<Vec<_>>();
         let selection = ModelSelection {
+            service_mode: None,
+            context_authority: None,
+            context_window: None,
             transport: Transport::Api,
             instance: "fixture".into(),
             model: "fixture".into(),
@@ -14024,6 +14183,9 @@ async fn frozen_fork_uses_compatible_ancestor_without_importing_future_work() {
         .unwrap();
     let settings = CompactionSettings {
         selection: Some(ModelSelection {
+            service_mode: None,
+            context_authority: None,
+            context_window: None,
             transport: Transport::Api,
             instance: "summary-fixture".into(),
             model: "summary-model".into(),
@@ -14031,6 +14193,8 @@ async fn frozen_fork_uses_compatible_ancestor_without_importing_future_work() {
         }),
     };
     let native_context = NativeContext {
+        context_budget: None,
+        summary_context: None,
         overflow_recovery: false,
         recovery_deadline_ms: None,
         workspace_id: "ws".into(),
@@ -14045,6 +14209,7 @@ async fn frozen_fork_uses_compatible_ancestor_without_importing_future_work() {
         cancellation: CancellationToken::new(),
     };
     let native_request = ChatRequest {
+        service_mode: None,
         model: "gpt-4".into(),
         messages: excluded_turn
             .messages
@@ -14152,6 +14317,8 @@ async fn native_media_preparation_materializes_full_request_without_main_provide
         .get_or_create_for_workspace("ws", "media-fixture")
         .unwrap();
     let context = NativeContext {
+        context_budget: None,
+        summary_context: None,
         overflow_recovery: false,
         recovery_deadline_ms: None,
         workspace_id: "ws".into(),
@@ -14190,6 +14357,7 @@ async fn native_media_preparation_materializes_full_request_without_main_provide
             },
         }));
     let request = ChatRequest {
+        service_mode: None,
         model: "gpt-4o".into(),
         messages: vec![message],
         temperature: None,
@@ -14618,6 +14786,8 @@ async fn check_nested_task_basis(legacy: bool) {
         .insert("main-fixture", Arc::new(SmallWindowMain))
         .unwrap();
     let native_context = pioneer_agent::compaction::controller::NativeContext {
+        context_budget: None,
+        summary_context: None,
         overflow_recovery: false,
         recovery_deadline_ms: None,
         workspace_id: "ws".into(),
@@ -14632,6 +14802,7 @@ async fn check_nested_task_basis(legacy: bool) {
         cancellation: CancellationToken::new(),
     };
     let native_request = ChatRequest {
+        service_mode: None,
         model: "gpt-4".into(),
         messages: manual_prepared.messages.clone(),
         temperature: None,
@@ -15718,6 +15889,9 @@ async fn exact_task_grants_survive_summary_projection_independently_of_new_conve
     install_execution(&db, "consumer-one", &parent_json).await;
 
     let selection = ModelSelection {
+        service_mode: None,
+        context_authority: None,
+        context_window: None,
         transport: Transport::Api,
         instance: "fixture".into(),
         model: "fixture".into(),
@@ -16059,6 +16233,9 @@ async fn exact_task_grants_survive_summary_projection_independently_of_new_conve
             })
             .collect::<Vec<_>>();
         let selection = ModelSelection {
+            service_mode: None,
+            context_authority: None,
+            context_window: None,
             transport: Transport::Api,
             instance: "fixture".into(),
             model: "fixture".into(),
@@ -17600,6 +17777,9 @@ async fn composer_reuses_late_mixed_checkpoint_before_attached_child_policy() {
         .unwrap();
     let settings = CompactionSettings {
         selection: Some(ModelSelection {
+            service_mode: None,
+            context_authority: None,
+            context_window: None,
             transport: Transport::Api,
             instance: "summary-fixture".into(),
             model: "summary-model".into(),
@@ -17607,6 +17787,8 @@ async fn composer_reuses_late_mixed_checkpoint_before_attached_child_policy() {
         }),
     };
     let context = pioneer_agent::compaction::controller::NativeContext {
+        context_budget: None,
+        summary_context: None,
         overflow_recovery: false,
         recovery_deadline_ms: None,
         workspace_id: "ws".into(),
@@ -17628,6 +17810,7 @@ async fn composer_reuses_late_mixed_checkpoint_before_attached_child_policy() {
         &settings,
         &context,
         ChatRequest {
+            service_mode: None,
             model: "gpt-4".into(),
             messages: request_messages,
             temperature: None,
@@ -20084,6 +20267,9 @@ async fn covered_input_rows_keep_their_mixed_ui_copy_suppressed_across_frozen_ro
         .collect::<Vec<_>>();
     let owner = super::native::native_owner("ws", "thread");
     let selection = ModelSelection {
+        service_mode: None,
+        context_authority: None,
+        context_window: None,
         transport: Transport::Api,
         instance: "fixture".into(),
         model: "fixture".into(),
@@ -20698,6 +20884,9 @@ async fn covered_event_input_still_suppresses_its_uncovered_mixed_ui_copy() {
     };
     let owner = super::native::native_owner("ws", "thread");
     let selection = ModelSelection {
+        service_mode: None,
+        context_authority: None,
+        context_window: None,
         transport: Transport::Api,
         instance: "fixture".into(),
         model: "fixture".into(),
@@ -21416,6 +21605,7 @@ async fn foreground_and_background_token_preflight_share_filtered_meaningful_rea
     let projection = |messages| {
         pioneer_agent::compaction::request::NativeRequestProjection::full(
             ChatRequest {
+                service_mode: None,
                 model: "gpt-4".into(),
                 messages,
                 temperature: None,
@@ -21448,6 +21638,8 @@ async fn foreground_and_background_token_preflight_share_filtered_meaningful_rea
     let providers =
         ProviderRegistry::with_provider("filtered-preflight", Arc::new(SmallWindowMain));
     let context = NativeContext {
+        context_budget: None,
+        summary_context: None,
         overflow_recovery: false,
         recovery_deadline_ms: None,
         workspace_id: "ws".into(),
@@ -21467,6 +21659,7 @@ async fn foreground_and_background_token_preflight_share_filtered_meaningful_rea
         &CompactionSettings::default(),
         &context,
         ChatRequest {
+            service_mode: None,
             model: "gpt-4".into(),
             messages: foreground_preflight.request.messages.clone(),
             temperature: None,
@@ -22649,6 +22842,9 @@ async fn accepted_execution_keeps_conflicting_admitted_and_external_input_proofs
             .unwrap();
         let owner = super::native::native_owner("ws", owner_thread);
         let selection = ModelSelection {
+            service_mode: None,
+            context_authority: None,
+            context_window: None,
             transport: Transport::Api,
             instance: "fixture".into(),
             model: "fixture".into(),
@@ -23570,6 +23766,9 @@ async fn accepted_execution_keeps_conflicting_admitted_and_external_input_proofs
 
 fn task_input_launch_metadata(thread: &str, turn: &str, text: &str) -> String {
     let launch = pioneer_protocol::TurnStartParams {
+        service_mode: None,
+        context_authority: None,
+        context_window: None,
         agent_delegation_routes: Vec::new(),
         thread_id: thread.into(),
         turn_id: turn.into(),
@@ -24562,6 +24761,9 @@ async fn task_input_copy_normalization_survives_capture_restore_and_keeps_distin
         .unwrap();
     let settings = CompactionSettings {
         selection: Some(ModelSelection {
+            service_mode: None,
+            context_authority: None,
+            context_window: None,
             transport: Transport::Api,
             instance: "summary-fixture".into(),
             model: "summary-model".into(),
@@ -24569,6 +24771,8 @@ async fn task_input_copy_normalization_survives_capture_restore_and_keeps_distin
         }),
     };
     let context = pioneer_agent::compaction::controller::NativeContext {
+        context_budget: None,
+        summary_context: None,
         overflow_recovery: false,
         recovery_deadline_ms: None,
         workspace_id: "ws".into(),
@@ -24588,6 +24792,7 @@ async fn task_input_copy_normalization_survives_capture_restore_and_keeps_distin
         &settings,
         &context,
         ChatRequest {
+            service_mode: None,
             model: "gpt-4".into(),
             messages: parent
                 .messages
@@ -24736,6 +24941,7 @@ async fn task_input_copy_normalization_survives_capture_restore_and_keeps_distin
         &settings,
         &context,
         ChatRequest {
+            service_mode: None,
             model: "gpt-4".into(),
             messages: composed.clone(),
             temperature: None,
@@ -24936,6 +25142,7 @@ async fn task_input_copy_normalization_survives_capture_restore_and_keeps_distin
         .protected_input = true;
     let protected_wire = protected_copy_before.clone();
     let request_with = |messages| ChatRequest {
+        service_mode: None,
         model: "fixture-model".into(),
         messages,
         temperature: None,
@@ -28083,6 +28290,7 @@ fn native_budget_measures_portable_reasoning_and_not_incompatible_replay() {
         inherited: false,
     });
     let request = ChatRequest {
+        service_mode: None,
         model: "target-model".into(),
         messages: vec![message],
         temperature: None,
@@ -28126,6 +28334,7 @@ fn native_budget_measures_portable_reasoning_and_not_incompatible_replay() {
     ));
     let canonical = multiblock.clone();
     let multiblock_request = ChatRequest {
+        service_mode: None,
         model: "target-model".into(),
         messages: vec![multiblock],
         temperature: None,
@@ -28235,6 +28444,8 @@ async fn foreground_native_projection_reuses_one_owner_across_model_windows() {
         .insert("summary-fixture", f.provider.clone())
         .unwrap();
     let context = NativeContext {
+        context_budget: None,
+        summary_context: None,
         overflow_recovery: false,
         recovery_deadline_ms: None,
         workspace_id: "ws".into(),
@@ -28250,6 +28461,9 @@ async fn foreground_native_projection_reuses_one_owner_across_model_windows() {
     };
     let settings = CompactionSettings {
         selection: Some(ModelSelection {
+            service_mode: None,
+            context_authority: None,
+            context_window: None,
             transport: Transport::Api,
             instance: "summary-fixture".into(),
             model: "summary-model".into(),
@@ -28257,6 +28471,7 @@ async fn foreground_native_projection_reuses_one_owner_across_model_windows() {
         }),
     };
     let request = |model: &str| ChatRequest {
+        service_mode: None,
         model: model.into(),
         messages: vec![historical.clone(), ChatMessage::user("current input")],
         temperature: None,
@@ -30246,6 +30461,7 @@ fn completed_history_retains_media_estimates_for_candidate_projection() {
             "image/png",
         )));
     let request = ChatRequest {
+        service_mode: None,
         model: "fixture".into(),
         messages: vec![ChatMessage::user("old"), retained.clone()],
         temperature: None,

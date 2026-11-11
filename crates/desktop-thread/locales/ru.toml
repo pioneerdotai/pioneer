@@ -347,3 +347,14 @@
 "chat.composer.preparing_send" = "Подготовка сообщения"
 "plugins.retry" = "Повторить"
 "plugins.stale" = "Выбранная версия больше не актуальна"
+
+"chat.composer.model.context_label" = "Контекстное окно"
+"chat.composer.model.context_auto" = "Авто — до %{tokens} токенов"
+"chat.composer.model.context_up_to" = "До %{tokens} токенов"
+"chat.composer.model.context_invalid" = "Сохранённый вариант контекста недоступен. Выберите Авто или другое окно."
+
+"chat.composer.model.service_label" = "Режим обслуживания"
+
+"chat.composer.model.service_standard" = "Стандартный"
+
+"chat.composer.model.service_invalid" = "Сохранённый режим недоступен. Выберите стандартный или другой режим."

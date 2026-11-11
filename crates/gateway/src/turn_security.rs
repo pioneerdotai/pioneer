@@ -1247,6 +1247,9 @@ mod tests {
     #[test]
     fn security_resolver_input_builds_from_api_provider_turn_start_params() {
         let params = TurnStartParams {
+            service_mode: None,
+            context_authority: None,
+            context_window: None,
             agent_delegation_routes: Vec::new(),
             thread_id: "thread_1".to_owned(),
             turn_id: "turn_1".to_owned(),
@@ -1299,6 +1302,9 @@ mod tests {
     #[test]
     fn security_resolver_input_rejects_missing_cwd() {
         let params = TurnStartParams {
+            service_mode: None,
+            context_authority: None,
+            context_window: None,
             agent_delegation_routes: Vec::new(),
             thread_id: "thread_1".to_owned(),
             turn_id: "turn_1".to_owned(),
@@ -1330,6 +1336,9 @@ mod tests {
     #[test]
     fn security_resolver_input_maps_cli_backend_without_provider_knobs() {
         let params = TurnStartParams {
+            service_mode: None,
+            context_authority: None,
+            context_window: None,
             agent_delegation_routes: Vec::new(),
             thread_id: "thread_1".to_owned(),
             turn_id: "turn_1".to_owned(),
@@ -1397,6 +1406,9 @@ mod tests {
             ),
         ] {
             let params = TurnStartParams {
+                service_mode: None,
+                context_authority: None,
+                context_window: None,
                 agent_delegation_routes: Vec::new(),
                 thread_id: "thread_1".to_owned(),
                 turn_id: "turn_1".to_owned(),
@@ -1872,6 +1884,9 @@ mod tests {
         execution_backend: Option<AgentExecutionBackend>,
     ) -> TurnSecurityResolverInput {
         let params = TurnStartParams {
+            service_mode: None,
+            context_authority: None,
+            context_window: None,
             agent_delegation_routes: Vec::new(),
             thread_id: "thread_1".to_owned(),
             turn_id: "turn_1".to_owned(),
@@ -2561,6 +2576,9 @@ mod tests {
             TurnPermissionProfileSource::Composer,
         );
         let params = TurnStartParams {
+            service_mode: None,
+            context_authority: None,
+            context_window: None,
             agent_delegation_routes: Vec::new(),
             thread_id: "thread_1".to_owned(),
             turn_id: "turn_1".to_owned(),

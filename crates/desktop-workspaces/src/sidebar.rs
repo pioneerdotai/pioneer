@@ -580,6 +580,7 @@ impl ThreadSidebarView {
         cx: &mut Context<Self>,
     ) {
         let Some(workspace_id) = self.active_workspace_id().map(str::to_owned) else {
+            self.client.observe_unavailable_thread_selection();
             return;
         };
         if self.command(

@@ -7,10 +7,10 @@ use pioneer_protocol::{
     generate_id,
 };
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
-use sea_orm::sea_query::{Expr, OnConflict};
+use sea_orm::sea_query::{Alias, Expr, ExprTrait, OnConflict, Query};
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, DatabaseBackend, EntityTrait, FromQueryResult, PaginatorTrait,
-    QueryFilter, QueryOrder, QuerySelect, QueryTrait, Set, Statement,
+    ColumnTrait, Condition, ConnectionTrait, DatabaseBackend, EntityTrait, FromQueryResult,
+    JoinType, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, QueryTrait, Set, Statement,
 };
 
 use crate::convention::{
@@ -1095,6 +1095,45 @@ pub async fn set_turn_execution_envelope<C: ConnectionTrait>(
     Ok(update_result.rows_affected > 0)
 }
 
+/// Initialize only the missing Native/API financial cap in an existing owned
+/// execution snapshot. JSON functions are SeaQuery expressions inside Entity
+/// update; the condition makes concurrent legacy recovery initialization first-wins.
+/// No other security fields or versions are replaced by a stale caller.
+pub(crate) async fn pin_turn_native_context<C: ConnectionTrait>(
+    db: &C,
+    workspace: &str,
+    turn_id: &str,
+    budget_json: &str,
+    summary_json: &str,
+) -> Result<bool> {
+    let result = turn::Entity::update_many()
+        .filter(turn::Column::Id.eq(turn_id))
+        .filter(turn::Column::ThreadId.in_subquery(
+            pioneer_entity::thread::Entity::find().select_only().column(pioneer_entity::thread::Column::Id)
+                .filter(pioneer_entity::thread::Column::WorkspaceId.eq(workspace)).into_query(),
+        ))
+        .filter(Expr::cust("json_valid(execution_security_snapshot_json) AND json_type(execution_security_snapshot_json)='object' AND json_extract(execution_security_snapshot_json,'$.backend.execution_backend')='native' AND json_extract(execution_security_snapshot_json,'$.native_context') IS NULL"))
+        .col_expr(turn::Column::ExecutionSecuritySnapshotJson,
+            Expr::cust_with_values("json_set(execution_security_snapshot_json,'$.native_context',json(?),'$.native_summary',json(?))",
+                [budget_json.to_owned(), summary_json.to_owned()]))
+        .exec(db).await?;
+    // Legacy context-tier snapshots already have a pinned cap. Fill only the
+    // missing service plan; never replace that cap or any authorization fields.
+    // Values were serialized before writer acquisition by CrudStore.
+    let mode_result = turn::Entity::update_many()
+        .filter(turn::Column::Id.eq(turn_id))
+        .filter(turn::Column::ThreadId.in_subquery(
+            pioneer_entity::thread::Entity::find().select_only().column(pioneer_entity::thread::Column::Id)
+                .filter(pioneer_entity::thread::Column::WorkspaceId.eq(workspace)).into_query(),
+        ))
+        .filter(Expr::cust("json_valid(execution_security_snapshot_json) AND json_extract(execution_security_snapshot_json,'$.backend.execution_backend')='native' AND json_extract(execution_security_snapshot_json,'$.native_context') IS NOT NULL AND json_extract(execution_security_snapshot_json,'$.native_context.service_mode') IS NULL"))
+        .filter(Expr::cust_with_values("json_extract(?,'$.service_mode') IS NOT NULL AND json_extract(execution_security_snapshot_json,'$.native_context.instance')=json_extract(?,'$.instance') AND json_extract(execution_security_snapshot_json,'$.native_context.model')=json_extract(?,'$.model') AND json_extract(execution_security_snapshot_json,'$.native_context.authority') IS json_extract(?,'$.authority')", [budget_json.to_owned(),budget_json.to_owned(),budget_json.to_owned(),budget_json.to_owned()]))
+        .col_expr(turn::Column::ExecutionSecuritySnapshotJson,
+            Expr::cust_with_values("CASE WHEN json_extract(execution_security_snapshot_json,'$.native_summary') IS NOT NULL AND json_extract(execution_security_snapshot_json,'$.native_summary.budget.service_mode') IS NULL THEN json_set(execution_security_snapshot_json,'$.native_context.service_mode',json_extract(?,'$.service_mode'),'$.native_summary.budget.service_mode',json_extract(?,'$.budget.service_mode')) ELSE json_set(execution_security_snapshot_json,'$.native_context.service_mode',json_extract(?,'$.service_mode')) END", [budget_json.to_owned(),summary_json.to_owned(),budget_json.to_owned()]))
+        .exec(db).await?;
+    Ok(result.rows_affected > 0 || mode_result.rows_affected > 0)
+}
+
 pub async fn find_turn_execution_security_snapshot<C: ConnectionTrait>(
     db: &C,
     turn_id: &str,
@@ -1673,6 +1712,191 @@ pub(crate) async fn is_completed_agent_message<C: ConnectionTrait>(
         .await
         .context("failed to validate completed response position")?
         > 0)
+}
+
+/// Exact page bodies plus a metadata-only final-answer decision from the same
+/// SQL snapshot. No non-page body participates in the final-answer lookup.
+#[derive(Debug, FromQueryResult)]
+pub(crate) struct TimelineAssistantItemRow {
+    pub turn_id: String,
+    pub item_id: String,
+    pub item_type: String,
+    pub payload: String,
+    pub status: Option<String>,
+    pub is_last_final: bool,
+}
+
+pub(crate) async fn timeline_assistant_items<C: ConnectionTrait>(
+    db: &C,
+    workspace_id: &str,
+    thread_id: &str,
+    targets: &[(String, String)],
+) -> Result<Vec<TimelineAssistantItemRow>> {
+    use pioneer_entity::{thread, thread_timeline_block as block};
+    let mut result = Vec::with_capacity(targets.len());
+    for targets in targets.chunks(64) {
+        let mut exact = Condition::any();
+        for (turn, item) in targets {
+            exact = exact.add(
+                Condition::all()
+                    .add(turn_item::Column::TurnId.eq(turn.clone()))
+                    .add(turn_item::Column::ItemId.eq(item.clone())),
+            );
+        }
+        // The projection classifies final answers, including legacy messages
+        // whose omitted phase defaults to FinalAnswer. Canonical item order is
+        // (created_at,item_id), not publication/sort_key or completion time.
+        let newer = Query::select()
+            .expr(Expr::val(1_i64))
+            .from_as(turn_item::Entity, Alias::new("later_item"))
+            .join(
+                JoinType::InnerJoin,
+                block::Entity,
+                Condition::all()
+                    .add(
+                        Expr::col((block::Entity, block::Column::TurnId)).eq(Expr::col((
+                            Alias::new("later_item"),
+                            turn_item::Column::TurnId,
+                        ))),
+                    )
+                    .add(
+                        Expr::col((block::Entity, block::Column::SourceKey)).eq(Expr::col((
+                            Alias::new("later_item"),
+                            turn_item::Column::ItemId,
+                        ))),
+                    ),
+            )
+            .and_where(
+                Expr::col((Alias::new("later_item"), turn_item::Column::TurnId))
+                    .eq(Expr::col((turn_item::Entity, turn_item::Column::TurnId))),
+            )
+            .and_where(block::Column::WorkspaceId.eq(workspace_id))
+            .and_where(block::Column::ThreadId.eq(thread_id))
+            .and_where(
+                block::Column::BlockKind
+                    .eq(super::thread_timeline_projection::BLOCK_KIND_ASSISTANT_MESSAGE),
+            )
+            .and_where(
+                Expr::col((Alias::new("later_item"), turn_item::Column::ItemType))
+                    .eq("agent_message"),
+            )
+            .cond_where(
+                Condition::any()
+                    .add(
+                        Expr::col((Alias::new("later_item"), turn_item::Column::CreatedAt))
+                            .gt(Expr::col((turn_item::Entity, turn_item::Column::CreatedAt))),
+                    )
+                    .add(
+                        Condition::all()
+                            .add(
+                                Expr::col((Alias::new("later_item"), turn_item::Column::CreatedAt))
+                                    .eq(Expr::col((
+                                        turn_item::Entity,
+                                        turn_item::Column::CreatedAt,
+                                    ))),
+                            )
+                            .add(
+                                Expr::col((Alias::new("later_item"), turn_item::Column::ItemId))
+                                    .gt(Expr::col((turn_item::Entity, turn_item::Column::ItemId))),
+                            ),
+                    ),
+            )
+            .to_owned();
+        let rows = turn_item::Entity::find()
+            .select_only()
+            .columns([
+                turn_item::Column::TurnId,
+                turn_item::Column::ItemId,
+                turn_item::Column::ItemType,
+                turn_item::Column::Payload,
+                turn_item::Column::Status,
+            ])
+            .column_as(Expr::exists(newer).not(), "is_last_final")
+            .join(
+                JoinType::InnerJoin,
+                turn_item::Entity::belongs_to(turn::Entity)
+                    .from(turn_item::Column::TurnId)
+                    .to(turn::Column::Id)
+                    .into(),
+            )
+            .join(
+                JoinType::InnerJoin,
+                turn::Entity::belongs_to(thread::Entity)
+                    .from(turn::Column::ThreadId)
+                    .to(thread::Column::Id)
+                    .into(),
+            )
+            .filter(thread::Column::WorkspaceId.eq(workspace_id))
+            .filter(turn::Column::ThreadId.eq(thread_id))
+            .filter(exact)
+            .into_model::<TimelineAssistantItemRow>()
+            .all(db)
+            .await
+            .context("failed to load exact timeline assistant items")?;
+        result.extend(rows);
+    }
+    Ok(result)
+}
+
+/// Only exact source messages, never all bodies in a source Turn.
+#[derive(FromQueryResult)]
+pub(crate) struct ExactAgentMessageRow {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub item_id: String,
+    pub payload: String,
+}
+
+pub(crate) async fn exact_agent_messages<C: ConnectionTrait>(
+    db: &C,
+    workspace: &str,
+    targets: &[(String, String, String)],
+) -> Result<Vec<ExactAgentMessageRow>> {
+    use pioneer_entity::thread;
+    let mut rows = Vec::new();
+    for targets in targets.chunks(64) {
+        let mut exact = Condition::any();
+        for (thread, turn, item) in targets {
+            exact = exact.add(
+                Condition::all()
+                    .add(turn::Column::ThreadId.eq(thread.clone()))
+                    .add(turn_item::Column::TurnId.eq(turn.clone()))
+                    .add(turn_item::Column::ItemId.eq(item.clone())),
+            );
+        }
+        rows.extend(
+            turn_item::Entity::find()
+                .select_only()
+                .column_as(turn::Column::ThreadId, "thread_id")
+                .columns([
+                    turn_item::Column::TurnId,
+                    turn_item::Column::ItemId,
+                    turn_item::Column::Payload,
+                ])
+                .join(
+                    JoinType::InnerJoin,
+                    turn_item::Entity::belongs_to(turn::Entity)
+                        .from(turn_item::Column::TurnId)
+                        .to(turn::Column::Id)
+                        .into(),
+                )
+                .join(
+                    JoinType::InnerJoin,
+                    turn::Entity::belongs_to(thread::Entity)
+                        .from(turn::Column::ThreadId)
+                        .to(thread::Column::Id)
+                        .into(),
+                )
+                .filter(thread::Column::WorkspaceId.eq(workspace))
+                .filter(turn_item::Column::ItemType.eq("agent_message"))
+                .filter(exact)
+                .into_model::<ExactAgentMessageRow>()
+                .all(db)
+                .await
+                .context("failed to load exact source messages")?,
+        );
+    }
+    Ok(rows)
 }
 
 pub async fn list_turn_items_by_ids<C: ConnectionTrait>(

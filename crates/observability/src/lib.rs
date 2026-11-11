@@ -21,12 +21,14 @@ use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::util::SubscriberInitExt;
 
 pub use telemetry::stop_local_observers;
+pub mod closing;
 mod database_workload;
 mod desktop_gateway;
 pub mod diagnostics;
 pub mod identity;
 pub mod live;
 mod metrics;
+pub mod opening;
 mod operations;
 mod patch_telemetry;
 mod performance;
@@ -38,10 +40,13 @@ pub mod query_cpu;
 pub mod queues;
 pub mod resources;
 pub mod runtime;
+pub mod scenario;
 mod startup;
 pub mod symbols;
 mod telemetry;
+pub mod tool_call;
 pub mod turn_startup;
+pub mod updates;
 pub mod work;
 
 pub use database_workload::{
@@ -1489,3 +1494,11 @@ mod sqlite_query_scope;
 #[cfg(test)]
 #[path = "../../gateway/src/database/query_fingerprint.rs"]
 mod query_fingerprint_fixture;
+
+// Same Gateway callback installer and limiter as connection.rs; tests do not
+// register the returned pool observer or reproduce the callback's SQL bridge.
+#[cfg(test)]
+use query_fingerprint_fixture as query_fingerprint;
+#[cfg(test)]
+#[path = "../../gateway/src/database/query_observer.rs"]
+mod gateway_query_observer_fixture;

@@ -157,6 +157,9 @@ impl NativeRequestProjection {
             "reasoning":request.reasoning.map(|value|format!("{value:?}")),
             "system_sections":request.compiled_prompt.as_ref().map(|value|value.system_sections()),
         });
+        if let Some(plan) = &request.service_mode {
+            envelope["service_mode"] = serde_json::to_value(plan)?;
+        }
         if let Some(context) = native_prefix_context {
             envelope["native_prefix_context"] = context.clone();
         }
@@ -519,6 +522,7 @@ mod tests {
     use pioneer_provider::{CompiledPromptPayload, MessageAttachment, ToolDefinition};
     fn request() -> ChatRequest {
         ChatRequest {
+            service_mode: None,
             model: "fixture".into(),
             messages: vec![
                 ChatMessage::user("old history"),

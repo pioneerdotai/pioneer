@@ -121,7 +121,8 @@ impl CrudStore {
         at: i64,
         action: Option<crate::AgentCommitInput>,
     ) -> Result<(bool, Vec<AppendedTaskEvent>)> {
-        let change = crate::task_events::TaskWorkChange::new(&self.connection);
+        let change =
+            crate::task_events::TaskWorkChange::for_tasks(&self.connection, [task_id.to_owned()]);
         let result = async {
             self.run_serialized_write(|| {
                 self.request_task_finish_once(task_id, reason.clone(), at, action.clone())
@@ -220,7 +221,13 @@ impl CrudStore {
                 events.push(outcome_event(task_id, runs.outcome.as_ref(), at)?);
             }
             let prepared = self.prepare_task_events_for_write(events).await?;
-            let control_change = self.connection.work_signal("gateway.control").changing();
+            let control_change = self.control_work_change(
+                "gateway.control",
+                &[
+                    crate::GatewayControlWake::Resources,
+                    crate::GatewayControlWake::Actions,
+                ],
+            );
             let mut action_changed = false;
             let tx = self.connection.begin().await?;
             let result: Result<Option<Vec<DeferredAppendedTaskEvent>>> = async {
@@ -287,7 +294,8 @@ impl CrudStore {
         task_id: &str,
         at: i64,
     ) -> Result<Vec<AppendedTaskEvent>> {
-        let change = crate::task_events::TaskWorkChange::new(&self.connection);
+        let change =
+            crate::task_events::TaskWorkChange::for_tasks(&self.connection, [task_id.to_owned()]);
         let result = async {
             self.run_serialized_write(|| self.discard_finished_task_queue_once(task_id, at))
                 .await

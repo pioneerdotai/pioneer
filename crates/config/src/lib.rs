@@ -4,10 +4,44 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::BTreeMap;
 use std::net::IpAddr;
 use std::path::{Component, Path, PathBuf};
+use std::sync::OnceLock;
 
 const DEFAULT_CONFIG_TOML: &str = include_str!("../../../config/default.toml");
 const DEV_CONFIG_TOML: &str = include_str!("../../../config/dev.toml");
 pub const DEV_GATEWAY_BUNDLE_ID: &str = "ai.pioneer.gateway.dev";
+
+/// Runtime configuration selection, independent of compiler optimizations and
+/// debug assertions. The CLI may select it once, before foreground startup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuntimeEnvironment {
+    Development,
+    Production,
+}
+
+static RUNTIME_ENVIRONMENT: OnceLock<RuntimeEnvironment> = OnceLock::new();
+
+impl RuntimeEnvironment {
+    pub fn current() -> Self {
+        *RUNTIME_ENVIRONMENT.get_or_init(|| {
+            if cfg!(debug_assertions) {
+                Self::Development
+            } else {
+                Self::Production
+            }
+        })
+    }
+
+    /// Select before loading configuration or starting runtime threads. An
+    /// initialized process cannot switch homes underneath existing owners.
+    pub fn select_for_foreground_gateway(self) -> Result<()> {
+        let selected = RUNTIME_ENVIRONMENT.get_or_init(|| self);
+        anyhow::ensure!(
+            *selected == self,
+            "runtime environment was already selected; restart Gateway to change it"
+        );
+        Ok(())
+    }
+}
 
 // Bootstrap constant: this file may override AppConfig values, so we need its name
 // before AppConfig is available.
@@ -1042,27 +1076,63 @@ pub struct GatewayThreadConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(from = "GatewayProviderConfigWire")]
 pub struct GatewayProviderConfig {
-    #[serde(
-        default = "default_provider_non_stream_request_timeout_secs",
-        alias = "default_timeout_secs"
-    )]
     pub non_stream_request_timeout_secs: u64,
-    #[serde(default = "default_provider_connect_timeout_secs")]
     pub connect_timeout_secs: u64,
-    #[serde(default = "default_provider_first_chunk_timeout_secs")]
     pub first_chunk_timeout_secs: u64,
-    #[serde(default = "default_provider_inter_chunk_idle_timeout_secs")]
     pub inter_chunk_idle_timeout_secs: u64,
-    #[serde(default)]
     pub max_stream_duration_secs: Option<u64>,
-    #[serde(default)]
     pub attachments: GatewayProviderAttachmentsConfig,
+    /// Provenance only, not a configurable override. Explicit timeout settings
+    /// remain authoritative even when numerically equal to built-in defaults.
+    pub use_default_flex_timeouts: bool,
+}
+
+#[derive(Deserialize, Default)]
+struct GatewayProviderConfigWire {
+    #[serde(default, alias = "default_timeout_secs")]
+    non_stream_request_timeout_secs: Option<u64>,
+    #[serde(default)]
+    connect_timeout_secs: Option<u64>,
+    #[serde(default)]
+    first_chunk_timeout_secs: Option<u64>,
+    #[serde(default)]
+    inter_chunk_idle_timeout_secs: Option<u64>,
+    #[serde(default)]
+    max_stream_duration_secs: Option<u64>,
+    #[serde(default)]
+    attachments: GatewayProviderAttachmentsConfig,
+}
+impl From<GatewayProviderConfigWire> for GatewayProviderConfig {
+    fn from(wire: GatewayProviderConfigWire) -> Self {
+        let use_default_flex_timeouts = wire.non_stream_request_timeout_secs.is_none()
+            && wire.first_chunk_timeout_secs.is_none()
+            && wire.inter_chunk_idle_timeout_secs.is_none();
+        Self {
+            non_stream_request_timeout_secs: wire
+                .non_stream_request_timeout_secs
+                .unwrap_or_else(default_provider_non_stream_request_timeout_secs),
+            connect_timeout_secs: wire
+                .connect_timeout_secs
+                .unwrap_or_else(default_provider_connect_timeout_secs),
+            first_chunk_timeout_secs: wire
+                .first_chunk_timeout_secs
+                .unwrap_or_else(default_provider_first_chunk_timeout_secs),
+            inter_chunk_idle_timeout_secs: wire
+                .inter_chunk_idle_timeout_secs
+                .unwrap_or_else(default_provider_inter_chunk_idle_timeout_secs),
+            max_stream_duration_secs: wire.max_stream_duration_secs,
+            attachments: wire.attachments,
+            use_default_flex_timeouts,
+        }
+    }
 }
 
 impl Default for GatewayProviderConfig {
     fn default() -> Self {
         Self {
+            use_default_flex_timeouts: true,
             non_stream_request_timeout_secs: default_provider_non_stream_request_timeout_secs(),
             connect_timeout_secs: default_provider_connect_timeout_secs(),
             first_chunk_timeout_secs: default_provider_first_chunk_timeout_secs(),
@@ -3069,7 +3139,7 @@ impl InstallState {
 impl AppConfig {
     pub fn load() -> Result<Self, ConfigError> {
         load_profile_config(
-            cfg!(debug_assertions),
+            RuntimeEnvironment::current() == RuntimeEnvironment::Development,
             workspace_local_config_path(),
             user_override_config_path(),
             std::env::var_os("PIONEER_CONFIG").map(PathBuf::from),
@@ -3510,7 +3580,7 @@ fn user_override_config_path() -> Option<PathBuf> {
 }
 
 fn user_config_directory_name() -> &'static str {
-    if cfg!(debug_assertions) {
+    if RuntimeEnvironment::current() == RuntimeEnvironment::Development {
         "pioneer-dev"
     } else {
         "pioneer"
@@ -3519,6 +3589,25 @@ fn user_config_directory_name() -> &'static str {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn native_flex_distinguishes_omitted_timeouts_from_explicit_default_values() {
+        let implicit: super::GatewayProviderConfig = toml::from_str("").unwrap();
+        assert!(implicit.use_default_flex_timeouts);
+        assert_eq!(implicit.non_stream_request_timeout_secs, 120);
+        for input in [
+            "first_chunk_timeout_secs = 180",
+            "non_stream_request_timeout_secs = 120",
+            "inter_chunk_idle_timeout_secs = 180",
+            "default_timeout_secs = 120",
+        ] {
+            let explicit: super::GatewayProviderConfig = toml::from_str(input).unwrap();
+            assert!(!explicit.use_default_flex_timeouts);
+        }
+        let embedded = load_config_from_sources(DEFAULT_CONFIG_TOML, Vec::new()).unwrap();
+        assert!(embedded.gateway.provider.use_default_flex_timeouts);
+        assert_eq!(embedded.gateway.provider.first_chunk_timeout_secs, 180);
+    }
     use super::{
         DEFAULT_CONFIG_TOML, GatewayCliAgentRuntimeConfig, GatewayCliAgentRuntimeKindConfig,
         GatewayMemoryConfig, GatewayMemoryModelSelectionConfig, GatewayResilienceConfig,
@@ -3556,6 +3645,70 @@ mod tests {
             production.install.macos_associated_bundle_identifier,
             "ai.pioneer.gateway"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn foreground_production_selection_uses_production_config_across_reloads() {
+        const FIXTURE: &str = "PIONEER_TEST_FOREGROUND_PRODUCTION_CONFIG";
+        if let Some(root) = std::env::var_os(FIXTURE) {
+            let root = PathBuf::from(root);
+            super::RuntimeEnvironment::Production
+                .select_for_foreground_gateway()
+                .unwrap();
+            let user = super::user_override_config_path().unwrap();
+            assert!(
+                user.starts_with(&root),
+                "fixture must not touch real user config"
+            );
+            assert_eq!(user.parent().unwrap().file_name().unwrap(), "pioneer");
+            fs::create_dir_all(user.parent().unwrap()).unwrap();
+            fs::write(&user, "[gateway]\nlisten_addr = '127.0.0.1:19078'\n").unwrap();
+            let dev = user.parent().unwrap().parent().unwrap().join("pioneer-dev");
+            fs::create_dir_all(&dev).unwrap();
+            fs::write(
+                dev.join("config.toml"),
+                "home_directory = '.pioneer.dev'\n[gateway]\nlisten_addr = '127.0.0.1:19079'\n",
+            )
+            .unwrap();
+            for _ in 0..2 {
+                let config = super::AppConfig::load().unwrap();
+                assert_eq!(config.home_directory, ".pioneer");
+                assert_eq!(config.gateway.listen_addr, "127.0.0.1:19078");
+                assert_eq!(config.gateway.service_name, "com.pioneer.gateway");
+                assert_eq!(
+                    config.install.macos_associated_bundle_identifier,
+                    "ai.pioneer.gateway"
+                );
+            }
+            assert!(
+                super::RuntimeEnvironment::Development
+                    .select_for_foreground_gateway()
+                    .is_err()
+            );
+            assert!(
+                !root.join("home/.pioneer").exists(),
+                "loading configuration must not start Gateway"
+            );
+            return;
+        }
+        // Process-local selection must not change the environment of parallel tests.
+        let root = unique_temp_file_path("foreground-production-config");
+        fs::create_dir_all(root.join("home")).unwrap();
+        let name = format!(
+            "{}::foreground_production_selection_uses_production_config_across_reloads",
+            module_path!().split_once("::").unwrap().1
+        );
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &name])
+            .env(FIXTURE, &root)
+            .env("HOME", root.join("home"))
+            .env("XDG_CONFIG_HOME", root.join("config"))
+            .env_remove("PIONEER_CONFIG")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -4257,8 +4410,8 @@ hard_secs = 0
         assert_eq!(config.provider_stream_items.hard_secs, 1_800);
     }
 
-    // Contract: older config files retain eight hours; user layers may override
-    // it, but invalid durations cannot accidentally admit unbounded warming.
+    // Contract: shipped defaults use 24 hours, while older config files retain
+    // eight hours. User layers may override either; invalid durations are rejected.
     // Existing resilience tests exercise operation deadlines, not this layer.
     #[test]
     fn conversation_compaction_window_defaults_and_user_override() {
@@ -4268,7 +4421,7 @@ hard_secs = 0
                 .gateway
                 .context_compaction
                 .hot_conversation_window_secs,
-            28_800
+            86_400
         );
         let mut legacy: toml::Value = toml::from_str(DEFAULT_CONFIG_TOML).unwrap();
         legacy["gateway"]

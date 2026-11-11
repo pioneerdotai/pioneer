@@ -142,7 +142,7 @@ impl CrudStore {
             &contracts::TerminalOccurrenceMetadata,
         )>,
     ) -> Result<TaskOccurrenceTerminalRepairOutcome> {
-        let change = crate::task_events::TaskWorkChange::new(&self.connection);
+        let change = crate::task_events::TaskWorkChange::for_source(&self.connection, "r", run_id);
         let result = async {
             let tx = self.connection.begin().await?;
             let result = async {

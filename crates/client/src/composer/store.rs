@@ -643,6 +643,9 @@ impl ClientCore {
             },
         )
         .state;
+        next.draft.domain.selected_context_window = selection.selected_context_window;
+        next.draft.domain.selected_service_mode = selection.selected_service_mode;
+        next.draft.domain.selected_context_authority = selection.selected_context_authority;
         next.execution_capabilities_removed = reduction.execution_capabilities_removed;
         if let Some(policy) = store.policies.get(&identity.thread_id) {
             next.reconciliation = Some(super::reconciliation::reconcile_composer_policy(
@@ -992,6 +995,11 @@ impl ClientCore {
     }
 
     pub fn composer_intent(&self, intent: ComposerIntent) -> ClientTransition {
+        let transition = self.composer_intent_observed(intent);
+        self.observe_opening_core();
+        transition
+    }
+    fn composer_intent_observed(&self, intent: ComposerIntent) -> ClientTransition {
         let intent = match intent {
             ComposerIntent::Activate { thread_id } => {
                 let store = self.composer_store.lock().expect("composer store poisoned");

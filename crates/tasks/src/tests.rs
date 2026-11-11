@@ -366,7 +366,7 @@ async fn runtime() -> TaskRuntime {
     TaskRuntime::new(store)
 }
 
-async fn runtime_with_review_config() -> TaskRuntime {
+pub(crate) async fn runtime_with_review_config() -> TaskRuntime {
     let connection = Database::connect("sqlite::memory:")
         .await
         .expect("sqlite memory database should connect");
@@ -744,6 +744,9 @@ async fn persist_test_agent_turn(
     let actor =
         pioneer_protocol::PersistedActorRef::AgentExecution(snapshot.agent_execution_id.clone());
     let thread = pioneer_protocol::Thread {
+        context_window: None,
+        service_mode: None,
+        context_authority: None,
         workspace_id: TEST_WORKSPACE_ID.to_owned(),
         id: thread_id.to_owned(),
         name: None,
@@ -934,6 +937,8 @@ fn task_create_context_for(params: &TaskCreateParams) -> TaskCreateContext {
     let (launch, identity, profile, authorization) = test_agent_launch_facts();
     assert_eq!(params.launch.as_ref(), Some(&launch));
     TaskCreateContext {
+        native_context: None,
+        native_summary: None,
         webhook_secret_ref: None,
         conversation_frozen_hold: None,
         actor_id: Some(TEST_PRINCIPAL_ID.to_owned()),
@@ -1067,7 +1072,7 @@ fn agent_spec(max_depth: i64) -> TaskAgentSpecInput {
     }
 }
 
-async fn create_waiting_review_agent_task(
+pub(crate) async fn create_waiting_review_agent_task(
     runtime: &TaskRuntime,
     max_revision_rounds: u32,
     candidate_round: u32,
@@ -1088,6 +1093,23 @@ async fn create_waiting_review_agent_task_with_policy(
     candidate_round: u32,
     candidate_status: TaskResultCandidateStatus,
 ) -> (String, String, String) {
+    create_waiting_review_agent_task_with_delivery(
+        runtime,
+        review_policy,
+        candidate_round,
+        candidate_status,
+        None,
+    )
+    .await
+}
+
+async fn create_waiting_review_agent_task_with_delivery(
+    runtime: &TaskRuntime,
+    review_policy: TaskAgentReviewPolicy,
+    candidate_round: u32,
+    candidate_status: TaskResultCandidateStatus,
+    delivery_policy: Option<TaskDeliveryPolicy>,
+) -> (String, String, String) {
     persist_test_agent_turn(
         runtime,
         TEST_PARENT_EXECUTION_ID,
@@ -1103,6 +1125,7 @@ async fn create_waiting_review_agent_task_with_policy(
     let mut spec = agent_spec(3);
     spec.review_policy = Some(review_policy);
     params.agent_spec = Some(spec);
+    params.delivery_policy = delivery_policy;
 
     let response = runtime
         .service()
@@ -1116,7 +1139,7 @@ async fn create_waiting_review_agent_task_with_policy(
         .reserve_execution_for_run(run.id.as_str(), TaskExecutorKind::Agent, run.created_at)
         .await
         .expect("execution should reserve");
-    persist_test_child_agent_execution(runtime, execution.id.as_str()).await;
+    persist_mock_agent_execution(runtime.service().store(), &run).await;
     let handle = TaskExecutionHandle::new(
         runtime.service().store(),
         runtime.event_bus(),
@@ -1318,6 +1341,9 @@ fn composer_work_create_params(
         composer_work: Some(pioneer_protocol::TaskComposerWork {
             version: payload_version,
             launch: pioneer_protocol::TurnStartParams {
+                service_mode: None,
+                context_authority: None,
+                context_window: None,
                 agent_delegation_routes: Vec::new(),
                 thread_id: parent_thread_id.to_owned(),
                 turn_id: format!("planned_{parent_thread_id}"),
@@ -8752,6 +8778,8 @@ async fn compatibility_audit_error_repairs_healthy_work_before_returning_and_set
     );
 }
 
+#[path = "tests_closing.rs"]
+mod closing;
 // Owns assignment consumption regressions at the durable service boundary.
 #[tokio::test]
 async fn one_shot_replacement_after_prior_runs_is_consumed_once_via_both_inputs() {

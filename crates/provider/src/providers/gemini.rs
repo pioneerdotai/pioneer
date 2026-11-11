@@ -1218,6 +1218,9 @@ fn provider_model_from_gemini_model_entry(m: GeminiModelEntry) -> ProviderModelI
     let reasoning = gemini_reasoning_capabilities_for_model_entry(&m);
 
     ProviderModelInfo {
+        service_modes: None,
+        context_authority: None,
+        context_tiers: None,
         id: id.clone(),
         name: m.display_name,
         description: m.description,
@@ -1654,6 +1657,7 @@ mod tests {
             ambiguous_input_aliases: vec![],
         });
         let request = ChatRequest {
+            service_mode: None,
             model: "gemini-target".into(),
             messages: vec![message],
             temperature: None,
@@ -1724,6 +1728,7 @@ mod tests {
             )),
         );
         let request = ChatRequest {
+            service_mode: None,
             model: "gemini-3-flash-preview".to_owned(),
             messages: vec![
                 message,
@@ -1850,6 +1855,7 @@ mod tests {
     #[test]
     fn build_request_separates_system_messages() {
         let request = ChatRequest {
+            service_mode: None,
             model: "gemini-2.0-flash".into(),
             messages: vec![
                 ChatMessage::system("Be helpful"),
@@ -1889,6 +1895,7 @@ mod tests {
     #[test]
     fn build_request_no_system_message() {
         let request = ChatRequest {
+            service_mode: None,
             model: "gemini-2.0-flash".into(),
             messages: vec![ChatMessage::user("Hello")],
             temperature: None,
@@ -1911,6 +1918,7 @@ mod tests {
     #[test]
     fn build_request_multiple_system_messages() {
         let request = ChatRequest {
+            service_mode: None,
             model: "gemini-2.0-flash".into(),
             messages: vec![
                 ChatMessage::system("Rule 1"),
@@ -1937,6 +1945,7 @@ mod tests {
     #[test]
     fn build_request_uses_compiled_prompt_sections_in_order() {
         let request = ChatRequest {
+            service_mode: None,
             model: "gemini-2.0-flash".into(),
             messages: vec![
                 ChatMessage::system("legacy prompt should be ignored"),
@@ -1972,6 +1981,7 @@ mod tests {
     #[test]
     fn api_request_serializes_correctly() {
         let request = ChatRequest {
+            service_mode: None,
             model: "gemini-2.0-flash".into(),
             messages: vec![
                 ChatMessage::system("You are helpful"),
@@ -2009,6 +2019,7 @@ mod tests {
                 "thinkingLevelMap":{"high":"HIGH","xhigh":"XHIGH"}}),
         );
         let mut request = ChatRequest {
+            service_mode: None,
             model: id.into(),
             messages: vec![ChatMessage::user("Hello")],
             temperature: None,

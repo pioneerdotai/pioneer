@@ -67,7 +67,7 @@ Native full-result references can point to a saved complete search page while th
 `threads_start_options`: `{}` or `{ "limit":100, "cursor":"RETURNED_CURSOR" }`. Limit defaults to 100, range 1–100. Returns `identities`, `profiles`, inheritance flags, `allowedSkillIds`, `allowedMcpServerIds`, `maxPermissionProfile`, `threadCreationOptions`, `targetOptions`, `generationFingerprint`, `nextCursor`, `eof`, and `fragments`.
 
 - `threadCreationOptions[]`: `{id,label}`. Pass the selected `id` as create `optionId`.
-- `targetOptions[]`: `{id,label}`. Pass a destination permitting the intended send/start as `targetOptionId`.
+- `targetOptions[]`: `{id,label,threadId,title,allowedActions}`. `title` is nullable. `allowedActions` uses `send_message` / `start_agent` and reflects the execution/route intersection. Match by `threadId` and required action; pass that record’s opaque `id` as `targetOptionId`.
 - `identities[]`: `id`, `displayName`, `nickname`, optional `avatarRevision`, `roleLabel`, and `sourceKind`.
 - `profiles[]`: `id`, `compatibleIdentityIds`, `backend`, `allowedReasoning`, `allowedPermissionProfiles`.
 - Flags: `inheritParentIdentityAvailable`, `defaultPioneerIdentityAvailable`, `derivedEphemeralIdentityAvailable`, `inheritParentProfileAvailable`.
@@ -112,7 +112,7 @@ Start optionally accepts `launch`:
 
 Omitted launch inherits current identity, provider/executor, model, reasoning under server rules, without a preliminary catalog lookup. A targetOptionId remains mandatory.
 
-Mutation results: `status` (`accepted`, `queued`, `completed`, `denied`, `failed`), optional `outcome`, `receiptId`, `outboxId`, `publicMessage`, `threadResult`, and `targetOptions`. Creation refreshes permitted targets, including on replay. `threadResult` contains confirmed navigation references:
+Mutation results: `status` (`accepted`, `queued`, `completed`, `denied`, `failed`), optional `outcome`, `receiptId`, `outboxId`, `publicMessage`, `threadResult`, and `targetOptions`. Create, send, and start refresh permitted targets, including on replay. `threadResult` contains confirmed navigation references:
 
 - Create: `{workspaceId,threadId}` for the created thread.
 - Send: `{workspaceId,threadId,turnId}` for the saved message.

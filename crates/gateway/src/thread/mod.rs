@@ -75,6 +75,8 @@ pub struct TurnStartRollbackContext {
     pub previous_model: String,
     pub previous_model_provider: String,
     pub previous_reasoning_effort: Option<String>,
+    pub previous_context_window: Option<u64>,
+    pub previous_context_authority: Option<String>,
     pub previous_sandbox_mode: SandboxMode,
 }
 
@@ -266,6 +268,9 @@ impl ThreadManager {
 
         Ok((
             Thread {
+                context_window: None,
+                service_mode: None,
+                context_authority: None,
                 id: thread_id.to_owned(),
                 workspace_id: workspace_id.to_owned(),
                 name,
@@ -670,6 +675,9 @@ impl ThreadManager {
                     seed_thread
                 } else {
                     Thread {
+                        context_window: None,
+                        service_mode: None,
+                        context_authority: None,
                         id: thread_id.clone(),
                         workspace_id,
                         name: requested_name,
@@ -1212,6 +1220,9 @@ impl ThreadManager {
             .model_provider
             .clone()
             .context("committed Agent Turn has no pinned provider")?;
+        materialization_thread.context_window = params.context_window;
+        materialization_thread.context_authority =
+            params.context_window.and(params.context_authority.clone());
         materialization_thread.reasoning_effort = params
             .reasoning
             .as_ref()
@@ -1246,6 +1257,8 @@ impl ThreadManager {
                 previous_model: entry.thread.model.clone(),
                 previous_model_provider: entry.thread.model_provider.clone(),
                 previous_reasoning_effort: entry.thread.reasoning_effort.clone(),
+                previous_context_window: entry.thread.context_window,
+                previous_context_authority: entry.thread.context_authority.clone(),
                 previous_sandbox_mode: entry.sandbox_mode,
             },
         })
@@ -1383,6 +1396,8 @@ impl ThreadManager {
         let previous_model = entry.thread.model.clone();
         let previous_model_provider = entry.thread.model_provider.clone();
         let previous_reasoning_effort = entry.thread.reasoning_effort.clone();
+        let previous_context_window = entry.thread.context_window;
+        let previous_context_authority = entry.thread.context_authority.clone();
         let previous_sandbox_mode = entry.sandbox_mode;
         let requested_reasoning_effort = params
             .reasoning
@@ -1399,6 +1414,9 @@ impl ThreadManager {
             entry.thread.model_provider = model_provider;
         }
         entry.thread.reasoning_effort = requested_reasoning_effort;
+        entry.thread.context_window = params.context_window;
+        entry.thread.context_authority =
+            params.context_window.and(params.context_authority.clone());
         let turn = pioneer_protocol::Turn {
             work_owner,
             id: turn_id,
@@ -1461,6 +1479,8 @@ impl ThreadManager {
             previous_model,
             previous_model_provider,
             previous_reasoning_effort,
+            previous_context_window,
+            previous_context_authority,
             previous_sandbox_mode,
         };
 
@@ -1657,6 +1677,8 @@ impl ThreadManager {
         entry.thread.model = context.previous_model;
         entry.thread.model_provider = context.previous_model_provider;
         entry.thread.reasoning_effort = context.previous_reasoning_effort;
+        entry.thread.context_window = context.previous_context_window;
+        entry.thread.context_authority = context.previous_context_authority;
         entry.sandbox_mode = context.previous_sandbox_mode;
 
         let discard_disconnected_runtime_draft = entry.subscribers.is_empty()
@@ -2392,6 +2414,9 @@ mod tests {
             .turn_start(
                 10,
                 TurnStartParams {
+                    service_mode: None,
+                    context_authority: None,
+                    context_window: None,
                     agent_delegation_routes: Vec::new(),
                     thread_id: thread_id.to_owned(),
                     turn_id: "turn_running_agent".to_owned(),
@@ -2421,6 +2446,9 @@ mod tests {
             .prepare_completed_message_turn(
                 10,
                 &TurnStartParams {
+                    service_mode: None,
+                    context_authority: None,
+                    context_window: None,
                     agent_delegation_routes: Vec::new(),
                     thread_id: thread_id.to_owned(),
                     turn_id: "turn_message".to_owned(),
@@ -2524,6 +2552,9 @@ mod tests {
             .await
             .expect("thread should start");
         let params = TurnStartParams {
+            service_mode: None,
+            context_authority: None,
+            context_window: None,
             agent_delegation_routes: Vec::new(),
             thread_id: thread_id.to_owned(),
             turn_id: "turn_native_duplicate_concurrent".to_owned(),
@@ -2581,6 +2612,9 @@ mod tests {
             ("interrupted", TurnStatus::Interrupted),
         ] {
             let params = TurnStartParams {
+                service_mode: None,
+                context_authority: None,
+                context_window: None,
                 agent_delegation_routes: Vec::new(),
                 thread_id: thread_id.to_owned(),
                 turn_id: format!("turn_terminal_{suffix}"),
@@ -2651,6 +2685,9 @@ mod tests {
             agent: None,
         };
         let params = |turn_id: &str, text: &str| TurnStartParams {
+            service_mode: None,
+            context_authority: None,
+            context_window: None,
             agent_delegation_routes: Vec::new(),
             thread_id: thread_id.to_owned(),
             turn_id: turn_id.to_owned(),
@@ -2746,6 +2783,9 @@ mod tests {
         let manager = ThreadManager::new("o4-mini", "openai");
         let seed_updated_at = 1_700_000_000_i64;
         let seed_thread = Thread {
+            context_window: None,
+            service_mode: None,
+            context_authority: None,
             workspace_id: "ws_000000000000000001".to_owned(),
             id: "thr_000000000000000099".to_owned(),
             name: Some("seed".to_owned()),
@@ -2835,6 +2875,9 @@ mod tests {
         let thread_id = "thr_000000000000000121";
         let turn_id = "turn_000000000000000121";
         let thread = Thread {
+            context_window: None,
+            service_mode: None,
+            context_authority: None,
             workspace_id: "ws_000000000000000001".to_owned(),
             id: thread_id.to_owned(),
             name: Some("restored".to_owned()),
@@ -2957,6 +3000,9 @@ mod tests {
         let thread_id = "thr_000000000000000122";
         let task_turn_id = "run_0000000000000000122";
         let thread = Thread {
+            context_window: None,
+            service_mode: None,
+            context_authority: None,
             workspace_id: workspace_id.to_owned(),
             id: thread_id.to_owned(),
             name: Some("restored detached task".to_owned()),
@@ -3020,6 +3066,9 @@ mod tests {
             .turn_start(
                 10,
                 TurnStartParams {
+                    service_mode: None,
+                    context_authority: None,
+                    context_window: None,
                     agent_delegation_routes: Vec::new(),
                     thread_id: thread_id.to_owned(),
                     turn_id: "turn_000000000000000122".to_owned(),
@@ -3191,6 +3240,9 @@ mod tests {
             .turn_start(
                 10,
                 TurnStartParams {
+                    service_mode: None,
+                    context_authority: None,
+                    context_window: None,
                     agent_delegation_routes: Vec::new(),
                     thread_id: thread_id.clone(),
                     turn_id: turn_id.clone(),
@@ -3247,6 +3299,9 @@ mod tests {
             .turn_start(
                 10,
                 TurnStartParams {
+                    service_mode: None,
+                    context_authority: None,
+                    context_window: None,
                     agent_delegation_routes: Vec::new(),
                     thread_id: thread_id.to_owned(),
                     turn_id: parent_turn_id.to_owned(),
@@ -3275,6 +3330,9 @@ mod tests {
         let child = manager
             .concurrent_agent_turn_start_with_permission_profile(
                 TurnStartParams {
+                    service_mode: None,
+                    context_authority: None,
+                    context_window: None,
                     agent_delegation_routes: Vec::new(),
                     thread_id: thread_id.to_owned(),
                     turn_id: child_turn_id.to_owned(),
@@ -3443,6 +3501,9 @@ mod tests {
             .turn_start(
                 10,
                 TurnStartParams {
+                    service_mode: None,
+                    context_authority: None,
+                    context_window: None,
                     agent_delegation_routes: Vec::new(),
                     thread_id: thread_outcome.response.thread.id.clone(),
                     turn_id: "turn_000000000000000001".to_owned(),
@@ -3500,6 +3561,9 @@ mod tests {
             .turn_start(
                 10,
                 TurnStartParams {
+                    service_mode: None,
+                    context_authority: None,
+                    context_window: None,
                     agent_delegation_routes: Vec::new(),
                     thread_id: thread_outcome.response.thread.id.clone(),
                     turn_id: "turn_000000000000000013".to_owned(),
@@ -3551,6 +3615,9 @@ mod tests {
             .turn_start(
                 10,
                 TurnStartParams {
+                    service_mode: None,
+                    context_authority: None,
+                    context_window: None,
                     agent_delegation_routes: Vec::new(),
                     thread_id: "thr_missing".to_owned(),
                     turn_id: "turn_000000000000000002".to_owned(),
@@ -3594,6 +3661,9 @@ mod tests {
             .turn_start(
                 10,
                 TurnStartParams {
+                    service_mode: None,
+                    context_authority: None,
+                    context_window: None,
                     agent_delegation_routes: Vec::new(),
                     thread_id: thread_outcome.response.thread.id.clone(),
                     turn_id: "turn_000000000000000099".to_owned(),
@@ -3642,6 +3712,9 @@ mod tests {
             .turn_start(
                 10,
                 TurnStartParams {
+                    service_mode: None,
+                    context_authority: None,
+                    context_window: None,
                     agent_delegation_routes: Vec::new(),
                     thread_id: thread_outcome.response.thread.id.clone(),
                     turn_id: "turn_000000000000000100".to_owned(),

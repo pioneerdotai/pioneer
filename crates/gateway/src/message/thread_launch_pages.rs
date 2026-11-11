@@ -289,7 +289,9 @@ mod tests {
         let codec = ThreadReadCursorCodec::new(&[7; 64]).unwrap();
         let source = json!({"identities":(0..140).map(|n| json!({"id":n})).collect::<Vec<_>>(),
             "profiles":(0..300).map(|n| json!({"id":n})).collect::<Vec<_>>(),
-            "targetOptions":(0..205).map(|n| json!({"id":n})).collect::<Vec<_>>(),"generationFingerprint":"fixture"});
+            "targetOptions":(0..205).map(|n| json!({"id":format!("option-{n}"),
+                "label":"Approved routed destination","threadId":format!("thread-{n}"),
+                "title":"Same name","allowedActions":["send_message"]})).collect::<Vec<_>>(),"generationFingerprint":"fixture"});
         let mut cursor = None;
         let mut collected = std::collections::BTreeMap::<String, Vec<Value>>::new();
         let mut first_cursor = None;
@@ -338,12 +340,15 @@ mod tests {
     fn nested_models_and_oversized_record_reconstruct_exactly_with_working_cursors() {
         let codec = ThreadReadCursorCodec::new(&[8; 64]).unwrap();
         let large = json!({"id":"large","displayName":"🌍\\\"\n".repeat(400_000)});
+        let target = json!({"id":"opaque","label":"Approved routed destination",
+            "threadId":"A","title":"🌍".repeat(800_000),"allowedActions":["send_message","start_agent"]});
         let mut models = vec![large.clone()];
         models.extend((0..205).map(|n| json!({"id":format!("model-{n:03}")})));
-        let source = json!({"identityId":"identity","identity":{"id":"identity"},"executors":[
+        let source = json!({"targetOptions":[target.clone()],"identityId":"identity","identity":{"id":"identity"},"executors":[
             {"providerId":"provider","models":models}, {"providerId":"empty","models":[]} ]});
         let mut cursor = None;
         let mut text = String::new();
+        let mut target_text = String::new();
         let mut ids = Vec::new();
         let mut empty_seen = false;
         loop {
@@ -354,8 +359,13 @@ mod tests {
                     < pioneer_protocol::TOOL_RESPONSE_MAX_BYTES
             );
             for fragment in page["fragments"].as_array().unwrap() {
-                assert_eq!(fragment["offset"].as_u64().unwrap() as usize, text.len());
-                text.push_str(fragment["text"].as_str().unwrap());
+                let buffer = if fragment["collection"] == "targetOptions" {
+                    &mut target_text
+                } else {
+                    &mut text
+                };
+                assert_eq!(fragment["offset"].as_u64().unwrap() as usize, buffer.len());
+                buffer.push_str(fragment["text"].as_str().unwrap());
             }
             for executor in page["executors"].as_array().unwrap() {
                 if executor["providerId"] == "empty" {
@@ -375,6 +385,7 @@ mod tests {
             cursor = Some(page["nextCursor"].as_str().unwrap().to_owned());
             assert!(cursor.as_ref().unwrap().len() <= 16384);
         }
+        assert_eq!(serde_json::from_str::<Value>(&target_text).unwrap(), target);
         assert_eq!(
             serde_json::from_str::<Value>(&text).unwrap()["models"],
             json!([large])

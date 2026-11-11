@@ -98,7 +98,7 @@ path = "desktop-settings"
 root = "SettingsView"
 constructor = "SettingsView::new"
 public_modules = []
-edges = ["pioneer-client", "pioneer-desktop-foundation"]
+edges = ["pioneer-client", "pioneer-desktop-foundation", "pioneer-protocol"]
 [[features]]
 package = "pioneer-desktop-onboarding"
 path = "desktop-onboarding"

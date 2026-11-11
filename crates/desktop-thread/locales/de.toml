@@ -345,3 +345,14 @@
 "chat.composer.preparing_send" = "Nachricht wird vorbereitet"
 "plugins.retry" = "Erneut versuchen"
 "plugins.stale" = "Die ausgewählte Version ist nicht mehr aktuell"
+
+"chat.composer.model.context_label" = "Kontextfenster"
+"chat.composer.model.context_auto" = "Automatisch — bis %{tokens} Token"
+"chat.composer.model.context_up_to" = "Bis %{tokens} Token"
+"chat.composer.model.context_invalid" = "Die gespeicherte Kontextauswahl ist nicht verfügbar. Wählen Sie Automatisch oder ein anderes Fenster."
+
+"chat.composer.model.service_label" = "Servicestufe"
+
+"chat.composer.model.service_standard" = "Standard"
+
+"chat.composer.model.service_invalid" = "Die gespeicherte Servicestufe ist nicht verfügbar. Wählen Sie Standard oder einen anderen Modus."

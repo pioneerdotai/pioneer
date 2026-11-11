@@ -51,7 +51,12 @@ impl ToolRegistry {
         let call_id = invocation.call_id.clone();
         let tool_name = invocation.tool_name.clone();
         let payload = invocation.payload.clone();
-        let output = match handler.handle(invocation.clone(), trace.clone()).await {
+        let output = match crate::observation::measure(
+            pioneer_observability::tool_call::Phase::Handler,
+            handler.handle(invocation.clone(), trace.clone()),
+        )
+        .await
+        {
             Ok(output) => {
                 trace.emit_stage(
                     invocation.attempt_id,

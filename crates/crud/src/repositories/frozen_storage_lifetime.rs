@@ -28,6 +28,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[path = "frozen_storage_read_queries.rs"]
+mod read_queries;
+use read_queries::discard_preflight;
+
 const FRAGMENT_BYTES: i64 = 64 * 1024;
 const META_ROWS: u64 = 64;
 // Bound only the added multi-key page, not the legacy TEXT ID domain. A key
@@ -41,6 +45,12 @@ const SCOPE_PAGE_KEY_BYTES: i64 = FRAGMENT_BYTES;
 #[derive(Default)]
 pub struct FrozenStorageLifetimeProgress {
     phase: usize,
+    // None is the recovery inventory; Some is a bounded, acknowledged set of
+    // changed identities. It never substitutes for final writer authority.
+    target_manifests: Option<Vec<String>>,
+    target_checkpoints: Option<Vec<String>>,
+    target_backings: Option<Vec<String>>,
+    retries_only: bool,
     release_only: bool,
     pass_done: [bool; 6],
     // Reconciliation/sealing can release holds discovered earlier this pass.
@@ -61,7 +71,7 @@ pub struct FrozenStorageLifetimeProgress {
     proof: Option<checkpoint_proofs::GraphPreparation>,
     expiry_after: String,
     expiry_upper: Option<String>,
-    expiry_pending: VecDeque<history::Model>,
+    expiry_pending: VecDeque<read_queries::ExpiryHeader>,
     expiry: Option<ExpiryPreparation>,
     sweep: Option<SweepPreparation>,
     sweep_pending: VecDeque<SweepPreparation>,
@@ -72,7 +82,7 @@ pub struct FrozenStorageLifetimeProgress {
     accounting: SweepAccounting,
     discard_after: String,
     discard_upper: Option<String>,
-    discard_pending: VecDeque<Option<String>>,
+    discard_pending: VecDeque<(Option<String>, bool)>,
     discard: Option<DiscardPreparation>,
     pub(super) conversion: Option<super::compaction_frozen_storage::StagedCopyCheck>,
     pub(super) conversion_upper: Option<String>,
@@ -604,17 +614,7 @@ impl ExpiryPreparation {
             // Advisory positive hold only, once per attempt. Release the reader
             // before any preparation; a negative result leaves every final
             // writer guard in place. Ordinary passes revisit released roots.
-            let held = store.connection.query_one_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
-                r#"SELECT 1 WHERE
-EXISTS(SELECT 1 FROM task_run_conversation_snapshot s LEFT JOIN task t ON t.id=s.task_id WHERE s.frozen_manifest_id=?1 AND (t.id IS NULL OR t.status NOT IN ('completed','failed','cancelled')))
-OR EXISTS(SELECT 1 FROM turn_runtime_snapshot s WHERE s.frozen_manifest_id=?1)
-OR EXISTS(SELECT 1 FROM thread_cli_runtime_binding s WHERE s.frozen_manifest_id=?1)
-OR EXISTS(SELECT 1 FROM turn_cli_runtime_binding s WHERE s.frozen_manifest_id=?1)
-OR EXISTS(SELECT 1 FROM compaction_task_output s WHERE s.manifest_id=?1)
-LIMIT 1"#,
-                [self.header.id.clone().into()],
-            )).await?.is_some();
+            let held = read_queries::directly_held(store, &self.header.id).await?;
             self.roots_checked = true;
             if held {
                 accounting.held += 1;
@@ -845,12 +845,11 @@ async fn expire(store: &CrudStore, header: &history::Model) -> Result<bool> {
                 .ok_or_else(|| anyhow::anyhow!("expiry header missing"))?;
             crate::frozen_lifetime::logical_bounds(&h)?;
             ensure!(h.ready == 1 && h == *header, "expiry header changed");
-            if store
-                .frozen_readers
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .contains_key(&h.id)
-            {
+            if crate::frozen_lifetime::cleanup_blocked(
+                &store.frozen_readers,
+                &h.id,
+                &store.connection.work_signal("maintenance.frozen.release"),
+            ) {
                 tx.commit().await?;
                 return Ok(false);
             }
@@ -1142,6 +1141,10 @@ enum SweepStep {
 }
 
 struct SweepPreparation {
+    // A real fanout turn overlapped this visit. Its old preparation may have
+    // observed a fence released by ACK without another Work revision change.
+    // Consumed on successful finish; newly admitted visits start unmarked.
+    invalidated: bool,
     work: Option<frozen_sweep_work::Work>,
     poison: bool,
     manifest: String,
@@ -1164,6 +1167,7 @@ impl SweepPreparation {
     fn new(manifest: String, kind: i64, until: i64) -> Self {
         Self {
             work: None,
+            invalidated: false,
             poison: false,
             checks: VecDeque::from([manifest.clone()]),
             manifest,
@@ -1744,6 +1748,270 @@ AND NOT EXISTS(SELECT 1 FROM compaction_frozen_span s JOIN compaction_frozen_his
 }
 
 impl FrozenStorageLifetimeProgress {
+    /// Reopen finite discovery after a source invalidation or retry. Legacy
+    /// scope validation is a startup prerequisite: supported writers preserve
+    /// it, so a new cleanup pass must not inventory all old metadata again.
+    /// Keep an unfinished scope cursor too; failed steps already discard their
+    /// unacknowledged page and retry from the last checked key.
+    pub fn restart_discovery(&mut self) {
+        let scope = std::mem::take(&mut self.scope);
+        *self = Self {
+            scope,
+            ..Self::default()
+        };
+    }
+
+    /// Expand only addressed operation/checkpoint metadata. A missing scope,
+    /// oversized set or legacy key deliberately requests the original resync.
+    pub async fn restart_for_changes(
+        &mut self,
+        store: &CrudStore,
+        keys: Option<Vec<String>>,
+    ) -> Result<bool> {
+        let Some(keys) = keys else {
+            self.restart_discovery();
+            return Ok(true);
+        };
+        if !self.scope.done {
+            self.restart_discovery();
+            return Ok(true);
+        }
+        let retries_only = keys.is_empty();
+        let mut manifests = BTreeSet::new();
+        let mut checkpoints = BTreeSet::new();
+        let mut operations = BTreeSet::new();
+        let mut tasks = BTreeSet::new();
+        let mut task_sources = Vec::new();
+        for key in keys {
+            match key.split_once(':') {
+                Some(("m", id)) => {
+                    manifests.insert(id.to_owned());
+                }
+                Some(("c", id)) => {
+                    checkpoints.insert(id.to_owned());
+                }
+                Some(("o", id)) => {
+                    operations.insert(id.to_owned());
+                }
+                Some(("t", id)) => {
+                    tasks.insert(id.to_owned());
+                }
+                Some((kind @ ("r" | "e" | "v" | "g" | "y"), id)) => {
+                    task_sources.push((kind.to_owned(), id.to_owned()));
+                }
+                _ => {
+                    self.restart_discovery();
+                    return Ok(true);
+                }
+            }
+        }
+        for (kind, id) in task_sources {
+            let task_id = match kind.as_str() {
+                "r" => {
+                    pioneer_entity::task_run::Entity::find_by_id(id)
+                        .select_only()
+                        .column(pioneer_entity::task_run::Column::TaskId)
+                        .into_tuple::<String>()
+                        .one(&store.connection)
+                        .await?
+                }
+                "e" => {
+                    pioneer_entity::task_run_execution::Entity::find_by_id(id)
+                        .select_only()
+                        .column(pioneer_entity::task_run_execution::Column::TaskId)
+                        .into_tuple::<String>()
+                        .one(&store.connection)
+                        .await?
+                }
+                "v" => {
+                    pioneer_entity::task_run_turn::Entity::find_by_id(id)
+                        .select_only()
+                        .column(pioneer_entity::task_run_turn::Column::TaskId)
+                        .into_tuple::<String>()
+                        .one(&store.connection)
+                        .await?
+                }
+                "g" => {
+                    pioneer_entity::task_trigger::Entity::find_by_id(id)
+                        .select_only()
+                        .column(pioneer_entity::task_trigger::Column::TaskId)
+                        .into_tuple::<String>()
+                        .one(&store.connection)
+                        .await?
+                }
+                _ => {
+                    pioneer_entity::task_run_turn::Entity::find()
+                        .select_only()
+                        .column(pioneer_entity::task_run_turn::Column::TaskId)
+                        .filter(pioneer_entity::task_run_turn::Column::TurnId.eq(id))
+                        .into_tuple::<String>()
+                        .one(&store.connection)
+                        .await?
+                }
+            };
+            let Some(task_id) = task_id else {
+                self.restart_discovery();
+                return Ok(true);
+            };
+            tasks.insert(task_id);
+        }
+        for task_id in tasks {
+            // Run/lease/receipt changes inside a live Task cannot release its
+            // immutable input roots. Capsule/root deletion has its own m: delta.
+            let terminal_task = task::Entity::find_by_id(&task_id)
+                .select_only()
+                .column(task::Column::Id)
+                .filter(task::Column::Status.is_in(["completed", "failed", "cancelled"]))
+                .into_tuple::<String>()
+                .one(&store.connection)
+                .await?;
+            if terminal_task.is_none() {
+                continue;
+            }
+            let roots = task_input::Entity::find()
+                .select_only()
+                .column(task_input::Column::FrozenManifestId)
+                .filter(task_input::Column::TaskId.eq(&task_id))
+                .limit(257)
+                .into_tuple::<Option<String>>()
+                .all(&store.connection)
+                .await?;
+            if roots.len() > 256 || roots.iter().any(|id| id.as_deref() == Some("")) {
+                self.restart_discovery();
+                return Ok(true);
+            }
+            manifests.extend(roots.into_iter().flatten());
+            let outputs = pioneer_entity::compaction_task_output::Entity::find()
+                .select_only()
+                .column(pioneer_entity::compaction_task_output::Column::ManifestId)
+                .filter(pioneer_entity::compaction_task_output::Column::TaskId.eq(&task_id))
+                .limit(257)
+                .into_tuple::<String>()
+                .all(&store.connection)
+                .await?;
+            manifests.extend(outputs);
+            if manifests.len() > 256 {
+                self.restart_discovery();
+                return Ok(true);
+            }
+        }
+        if !manifests.is_empty() {
+            let related = projection::Entity::find()
+                .select_only()
+                .column(projection::Column::OperationId)
+                .filter(projection::Column::ManifestId.is_in(manifests.iter().cloned()))
+                .limit(257)
+                .into_tuple::<String>()
+                .all(&store.connection)
+                .await?;
+            if related.len() > 256 {
+                self.restart_discovery();
+                return Ok(true);
+            }
+            operations.extend(related);
+        }
+        for id in checkpoints.clone() {
+            if let Some(op) = checkpoint::Entity::find_by_id(id)
+                .select_only()
+                .column(checkpoint::Column::OperationId)
+                .into_tuple::<String>()
+                .one(&store.connection)
+                .await?
+            {
+                operations.insert(op);
+            }
+        }
+        for op in operations {
+            let bound = projection::Entity::find_by_id(&op)
+                .select_only()
+                .column(projection::Column::ManifestId)
+                .into_tuple::<String>()
+                .one(&store.connection)
+                .await?;
+            let Some(id) = bound.filter(|id| !id.is_empty()) else {
+                // Unbound legacy operations conservatively hold an entire
+                // workspace. Exact IDs cannot represent their released scope.
+                self.restart_discovery();
+                return Ok(true);
+            };
+            manifests.insert(id);
+            let ids = checkpoint::Entity::find()
+                .select_only()
+                .column(checkpoint::Column::Id)
+                .filter(checkpoint::Column::OperationId.eq(&op))
+                .limit(257)
+                .into_tuple::<String>()
+                .all(&store.connection)
+                .await?;
+            checkpoints.extend(ids);
+            if checkpoints.len() + manifests.len() > 256 {
+                self.restart_discovery();
+                return Ok(true);
+            }
+        }
+        let mut backings = manifests.clone();
+        if !manifests.is_empty() {
+            let sources = span::Entity::find()
+                .select_only()
+                .column(span::Column::SourceManifest)
+                .filter(span::Column::ManifestId.is_in(manifests.iter().cloned()))
+                .distinct()
+                .limit(257)
+                .into_tuple::<String>()
+                .all(&store.connection)
+                .await?;
+            backings.extend(sources);
+            let candidates = layout::Entity::find()
+                .select_only()
+                .column(layout::Column::Candidate)
+                .filter(layout::Column::ManifestId.is_in(manifests.iter().cloned()))
+                .distinct()
+                .limit(257)
+                .into_tuple::<Option<String>>()
+                .all(&store.connection)
+                .await?;
+            backings.extend(candidates.into_iter().flatten());
+            if backings.len() > 256 {
+                self.restart_discovery();
+                return Ok(true);
+            }
+        }
+        let scope = std::mem::take(&mut self.scope);
+        *self = Self {
+            scope,
+            target_manifests: Some(manifests.into_iter().collect()),
+            target_checkpoints: Some(checkpoints.into_iter().collect()),
+            target_backings: if retries_only {
+                None
+            } else {
+                Some(backings.into_iter().collect())
+            },
+            retries_only,
+            ..Self::default()
+        };
+        self.pass_done = self.discovery_phases();
+        Ok(!self.target_manifests.as_ref().unwrap().is_empty())
+    }
+
+    fn discovery_phases(&self) -> [bool; 6] {
+        match (&self.target_manifests, &self.target_checkpoints) {
+            (Some(manifests), Some(checkpoints)) => [
+                true,
+                checkpoints.is_empty(),
+                manifests.is_empty(),
+                false,
+                checkpoints.is_empty(),
+                true,
+            ],
+            _ if self.release_only => [true, true, false, false, false, true],
+            _ => [false; 6],
+        }
+    }
+
+    pub(super) fn target_manifests(&self) -> Option<&[String]> {
+        self.target_manifests.as_deref()
+    }
+
     /// Called only after worker EOF. A hold release changes cleanup eligibility,
     /// not legacy proof/locator validity. Keep scope and conversion knowledge.
     pub fn recheck_released_holds(&mut self) {
@@ -1836,11 +2104,7 @@ impl FrozenStorageLifetimeProgress {
             self.pass_done[phase] = true;
         }
         if self.pass_done.iter().all(|done| *done) {
-            self.pass_done = if self.release_only {
-                [true, true, false, false, false, true]
-            } else {
-                [false; 6]
-            };
+            self.pass_done = self.discovery_phases();
             self.locator_done = [false; 4];
             self.sweep_round = Default::default();
             tracing::debug!(
@@ -2025,6 +2289,13 @@ impl FrozenStorageLifetimeProgress {
             }
             let query = Query::select()
                 .from(checkpoint::Entity)
+                .cond_where(match &self.target_checkpoints {
+                    Some(ids) => Condition::all().add(
+                        Expr::col((checkpoint::Entity, checkpoint::Column::Id))
+                            .is_in(ids.iter().cloned()),
+                    ),
+                    None => Condition::all(),
+                })
                 .columns(
                     [
                         checkpoint::Column::Id,
@@ -2164,14 +2435,38 @@ impl FrozenStorageLifetimeProgress {
 
     async fn expiry_quantum(&mut self, store: &CrudStore) -> Result<bool> {
         if let Some(expiry) = self.expiry.as_mut() {
+            let expired_before = self.accounting.expired;
             if expiry.step(store, &mut self.accounting).await? {
                 self.expiry = None;
             }
+            if self.accounting.expired > expired_before {
+                self.pass_changed = true;
+                self.pass_done[3] = false;
+                self.pass_done[4] = self.target_checkpoints.as_ref().is_some_and(Vec::is_empty);
+            }
             return Ok(true);
         }
-        // Only lightweight headers live in this Entity; payloads remain in
-        // separate tables. Prefetch is advisory: ExpiryPreparation and expire
-        // preserve individual root/hold checks and exact writer revalidation.
+        if let Some(ids) = &self.target_manifests {
+            let Some(id) = ids.iter().find(|id| *id > &self.expiry_after).cloned() else {
+                self.expiry_after.clear();
+                return Ok(false);
+            };
+            let header = history::Entity::find_by_id(&id)
+                .filter(history::Column::Ready.eq(1))
+                .filter(history::Column::Expired.eq(0))
+                .one(&store.connection)
+                .await?;
+            self.expiry_after = id;
+            if let Some(header) = header {
+                ensure!(counter_health(&header), "corrupt expiry counters");
+                self.expiry = Some(ExpiryPreparation::new(header));
+            }
+            return Ok(true);
+        }
+        // One bounded metadata page includes direct-root admission. No separate
+        // query/continuation is needed for each retained history. A page's
+        // negative admission is advisory; expire still checks current roots,
+        // reader holds and the exact header in its serialized writer.
         if self.expiry_pending.is_empty() {
             if self.expiry_upper.is_none() {
                 self.expiry_upper = Some(
@@ -2185,29 +2480,47 @@ impl FrozenStorageLifetimeProgress {
                         .unwrap_or_default(),
                 );
             }
-            self.expiry_pending = history::Entity::find()
-                .filter(history::Column::Expired.eq(0))
-                .filter(history::Column::Ready.eq(1))
-                .filter(history::Column::Id.gt(&self.expiry_after))
-                .filter(history::Column::Id.lte(self.expiry_upper.as_deref().unwrap_or_default()))
-                .order_by_asc(history::Column::Id)
-                .limit(16)
-                .all(&store.connection)
-                .await?
-                .into();
+            self.expiry_pending = read_queries::expiry_page(
+                store,
+                &self.expiry_after,
+                self.expiry_upper.as_deref().unwrap_or_default(),
+            )
+            .await?;
+            if self.expiry_pending.is_empty() {
+                // Only an empty physical page is EOF, never a page of holds.
+                self.expiry_after.clear();
+                self.expiry_upper = None;
+                return Ok(false);
+            }
         }
-        let header = self.expiry_pending.pop_front();
-        if let Some(header) = header {
+        while let Some(read_queries::ExpiryHeader { header, held }) =
+            self.expiry_pending.pop_front()
+        {
             self.expiry_after = header.id.clone();
             ensure!(counter_health(&header), "corrupt expiry counters");
-            self.expiry = Some(ExpiryPreparation::new(header));
-            Ok(true)
-        } else {
-            self.expiry_after.clear();
-            self.expiry_upper = None;
-            Ok(false)
+            if held {
+                self.accounting.held += 1;
+                continue;
+            }
+            let mut preparation = ExpiryPreparation::new(header);
+            preparation.roots_checked = true;
+            self.expiry = Some(preparation);
+            return Ok(true);
+        }
+        // At most the current 16-row page is skipped in one quantum. Root
+        // changes during a pass remain pending in the existing invalidation
+        // protocol and are rediscovered behind the cursor on the next pass.
+        Ok(true)
+    }
+    fn invalidate_sweep(&mut self) {
+        for round in &mut self.sweep_round {
+            round.invalidate();
+        }
+        for sweep in self.sweep.iter_mut().chain(self.sweep_pending.iter_mut()) {
+            sweep.invalidated = true;
         }
     }
+
     async fn sweep_quantum(&mut self, store: &CrudStore) -> Result<bool> {
         let active = self.sweep_pending.len() + usize::from(self.sweep.is_some());
         if active > 0 && (!self.sweep_discover || active >= ACTIVE_CONTAINERS) {
@@ -2236,6 +2549,12 @@ impl FrozenStorageLifetimeProgress {
                         return Err(error);
                     }
                 }
+                if sweep.invalidated {
+                    // Do not consume the overlap obligation on writer error.
+                    // Cursor progress is retained; revisit only this family at
+                    // its next frontier boundary, after the old visit settled.
+                    self.sweep_round[sweep.kind as usize].invalidate();
+                }
             } else {
                 self.sweep_pending.push_back(sweep);
             }
@@ -2255,10 +2574,10 @@ impl FrozenStorageLifetimeProgress {
         let fanout_checked = self.sweep_fanout;
         if fanout_checked {
             self.sweep_fanout = false;
-            if frozen_sweep_work::fanout_step(store).await? {
-                for round in &mut self.sweep_round {
-                    round.invalidate();
-                }
+            if !self.retries_only
+                && frozen_sweep_work::fanout_step(store, self.target_manifests.as_deref()).await?
+            {
+                self.invalidate_sweep();
                 return Ok(true);
             }
         }
@@ -2276,6 +2595,8 @@ impl FrozenStorageLifetimeProgress {
             &active_keys,
             kind,
             &mut self.sweep_round[kind as usize],
+            self.target_backings.as_deref(),
+            self.retries_only,
         )
         .await?;
         let selected = match selected {
@@ -2285,6 +2606,8 @@ impl FrozenStorageLifetimeProgress {
                     &active_keys,
                     1 - kind,
                     &mut self.sweep_round[(1 - kind) as usize],
+                    self.target_backings.as_deref(),
+                    self.retries_only,
                 )
                 .await?
             }
@@ -2295,11 +2618,12 @@ impl FrozenStorageLifetimeProgress {
             frozen_sweep_work::Admission::Continue => return Ok(true),
             frozen_sweep_work::Admission::Idle => {
                 // Empty physical admission is not EOF while propagation continues.
-                let propagated = !fanout_checked && frozen_sweep_work::fanout_step(store).await?;
+                let propagated = !fanout_checked
+                    && (!self.retries_only
+                        && frozen_sweep_work::fanout_step(store, self.target_manifests.as_deref())
+                            .await?);
                 if propagated {
-                    for round in &mut self.sweep_round {
-                        round.invalidate();
-                    }
+                    self.invalidate_sweep();
                 }
                 let more = propagated || active > 0;
                 if !more {
@@ -2374,9 +2698,25 @@ impl FrozenStorageLifetimeProgress {
                 self.discard = None;
                 return Ok(true);
             }
-            discard.cleanup(store).await?;
+            self.pass_changed |= discard.cleanup(store).await?;
             self.discard = None;
             return Ok(true);
+        }
+        if self.discard_pending.is_empty() {
+            if let Some(ids) = &self.target_checkpoints {
+                let page = ids
+                    .iter()
+                    .filter(|id| *id > &self.discard_after)
+                    .take(META_ROWS as usize)
+                    .cloned()
+                    .map(|id| (Some(id), true))
+                    .collect::<VecDeque<_>>();
+                if page.is_empty() {
+                    self.discard_after.clear();
+                    return Ok(false);
+                }
+                self.discard_pending = page;
+            }
         }
         if self.discard_pending.is_empty() {
             if self.discard_upper.is_none() {
@@ -2391,39 +2731,21 @@ impl FrozenStorageLifetimeProgress {
                         .unwrap_or_default(),
                 );
             }
-            // Physical PK seek only: no eligibility predicate/JOIN can make
-            // SQLite search past this page to fill it. Bound actual UTF-8 key
-            // bytes as well as rows, like ScopeDiscovery's metadata pages.
-            let key: SimpleExpr = Expr::case(
-                Expr::cust(format!(
-                    "length(CAST(id AS BLOB)) <= {SCOPE_PAGE_KEY_BYTES}"
-                )),
-                Expr::col(checkpoint::Column::Id),
+            self.discard_pending = read_queries::discard_page(
+                store,
+                &self.discard_after,
+                self.discard_upper.as_deref().unwrap_or_default(),
             )
-            .finally(Expr::val(Option::<String>::None))
-            .into();
-            self.discard_pending = checkpoint::Entity::find()
-                .select_only()
-                .column_as(key, "id")
-                .filter(checkpoint::Column::Id.gt(&self.discard_after))
-                .filter(
-                    checkpoint::Column::Id.lte(self.discard_upper.as_deref().unwrap_or_default()),
-                )
-                .order_by_asc(checkpoint::Column::Id)
-                .limit(META_ROWS)
-                .into_tuple::<Option<String>>()
-                .all(&store.connection)
-                .await?
-                .into();
+            .await?;
         }
-        let id = match self.discard_pending.front() {
-            Some(Some(id)) => Some(id.clone()),
-            Some(None) => {
+        let (id, candidate) = match self.discard_pending.front() {
+            Some((Some(id), candidate)) => (Some(id.clone()), *candidate),
+            Some((None, _)) => {
                 // Preserve the legacy TEXT ID domain without retaining a page
                 // of oversized keys. A fresh single seek also handles deletion
                 // of the sentinel row. Never acknowledge its old cached tail.
                 self.discard_pending.clear();
-                checkpoint::Entity::find()
+                let id = checkpoint::Entity::find()
                     .select_only()
                     .column(checkpoint::Column::Id)
                     .filter(checkpoint::Column::Id.gt(&self.discard_after))
@@ -2434,9 +2756,10 @@ impl FrozenStorageLifetimeProgress {
                     .order_by_asc(checkpoint::Column::Id)
                     .into_tuple::<String>()
                     .one(&store.connection)
-                    .await?
+                    .await?;
+                (id, true)
             }
-            None => None,
+            None => (None, false),
         };
         let Some(id) = id else {
             // Only an empty physical seek is EOF. Rejected eligibility on a
@@ -2446,11 +2769,12 @@ impl FrozenStorageLifetimeProgress {
             self.discard_upper = None;
             return Ok(false);
         };
-        // One exact-key eligibility/preflight read, after physical selection.
-        // A failed read acknowledges nothing; a successful refusal advances the
-        // keyset without allocating a reverse traversal or decoding runner JSON.
-        let admitted = discard_preflight(store, &id).await?;
-        if !admitted {
+        // Most keys have no discard work and need no individual SQL/AST at all.
+        // A cached positive is not authority: recheck current incoming edges
+        // and binding before touching runner payload. A negative can become
+        // eligible later; the existing finite-pass invalidation/revisit keeps
+        // that change pending, including keys behind the cursor.
+        if !candidate || !discard_preflight(store, &id).await? {
             self.discard_after = id;
             self.discard_pending.pop_front();
             return Ok(true);
@@ -2466,10 +2790,10 @@ impl FrozenStorageLifetimeProgress {
     }
 }
 
-// Advisory only: mutable facts are all rechecked by cleanup's serialized writer.
-// Use the same broad incoming-edge predicates as its final guard, including
-// unknown foreign scope/version combinations that must conservatively retain.
-async fn discard_preflight(store: &CrudStore, id: &str) -> Result<bool> {
+// Necessary metadata-only conditions, shared by page admission and fresh
+// preflight. Every subquery is correlated to the physical checkpoint's exact
+// keys; no failed-operation or staging-payload inventory is searched per row.
+fn discard_candidate_filter() -> Condition {
     use pioneer_entity::{
         compaction_checkpoint_event_input as event_input, compaction_checkpoint_import as import,
         compaction_checkpoint_replay_alias as replay_alias,
@@ -2490,7 +2814,11 @@ async fn discard_preflight(store: &CrudStore, id: &str) -> Result<bool> {
                 Expr::col((operation::Entity, operation::Column::Owner))
                     .eq(Expr::col((checkpoint::Entity, checkpoint::Column::Owner))),
             )
-            .filter(operation::Column::Status.is_in(["failed", "cancelled", "stale"]))
+            .filter(
+                Expr::col((operation::Entity, operation::Column::Status)).is_in(
+                    ["failed", "cancelled", "stale"].map(|status| Expr::Constant(status.into())),
+                ),
+            )
             .filter(Expr::exists(
                 projection::Entity::find()
                     .select_only()
@@ -2506,56 +2834,52 @@ async fn discard_preflight(store: &CrudStore, id: &str) -> Result<bool> {
                             .filter(Expr::col((history::Entity, history::Column::Id)).eq(
                                 Expr::col((projection::Entity, projection::Column::ManifestId)),
                             ))
-                            .filter(history::Column::Expired.eq(1))
+                            .filter(
+                                Expr::col((history::Entity, history::Column::Expired))
+                                    .eq(Expr::Constant(1.into())),
+                            )
                             .into_query(),
                     ))
                     .into_query(),
             ))
             .into_query();
-    let previous = checkpoint::Entity::find()
-        .select_only()
-        .column(checkpoint::Column::Id)
-        .filter(checkpoint::Column::Previous.eq(id))
-        .into_query();
-    let incoming = coverage::Entity::find()
-        .select_only()
-        .column(coverage::Column::CheckpointId)
-        .filter(coverage::Column::SourceId.eq(id))
-        .filter(coverage::Column::SourceScope.like("checkpoint:%"))
-        .into_query();
+    let candidate_id = Expr::col((checkpoint::Entity, checkpoint::Column::Id));
     let imports = import::Entity::find()
         .select_only()
         .column(import::Column::CheckpointId)
-        .filter(import::Column::CheckpointId.eq(id))
+        .filter(Expr::col((import::Entity, import::Column::CheckpointId)).eq(candidate_id.clone()))
         .into_query();
     let aliases = replay_alias::Entity::find()
         .select_only()
         .column(replay_alias::Column::CheckpointId)
-        .filter(replay_alias::Column::CheckpointId.eq(id))
+        .filter(
+            Expr::col((replay_alias::Entity, replay_alias::Column::CheckpointId))
+                .eq(candidate_id.clone()),
+        )
         .into_query();
     let events = event_input::Entity::find()
         .select_only()
         .column(event_input::Column::CheckpointId)
-        .filter(event_input::Column::CheckpointId.eq(id))
-        .into_query();
-    Ok(checkpoint::Entity::find_by_id(id)
-        .select_only()
-        .column(checkpoint::Column::ProofVersion)
-        .filter(checkpoint::Column::Status.ne("applied"))
-        .filter(Expr::exists(binding))
-        .filter(Expr::exists(previous).not())
-        .filter(Expr::exists(incoming).not())
         .filter(
+            Expr::col((event_input::Entity, event_input::Column::CheckpointId)).eq(candidate_id),
+        )
+        .into_query();
+    Condition::all()
+        .add(
+            Expr::col((checkpoint::Entity, checkpoint::Column::Status))
+                .ne(Expr::Constant("applied".into())),
+        )
+        .add(Expr::exists(binding))
+        .add(
             Condition::any()
-                .add(checkpoint::Column::ProofVersion.eq(1))
+                .add(
+                    Expr::col((checkpoint::Entity, checkpoint::Column::ProofVersion))
+                        .eq(Expr::Constant(1.into())),
+                )
                 .add(Expr::exists(imports))
                 .add(Expr::exists(aliases))
                 .add(Expr::exists(events)),
         )
-        .into_tuple::<i64>()
-        .one(&store.connection)
-        .await?
-        .is_some())
 }
 
 // Both reads are advisory: cleanup still owns final authorization in its
@@ -2637,7 +2961,7 @@ struct DiscardPreparation {
     thread: String,
 }
 impl DiscardPreparation {
-    async fn cleanup(&self, store: &CrudStore) -> Result<()> {
+    async fn cleanup(&self, store: &CrudStore) -> Result<bool> {
         // Sizes first, no payload decoding or large comparisons in the writer.
         // At most three exact keys and 1 MiB of logical row bytes per quantum.
         let mut keys = Vec::new();
@@ -2681,17 +3005,20 @@ impl DiscardPreparation {
                 }
             }
         }
-        store
+        let change = store
+            .connection
+            .work_signal("maintenance.frozen")
+            .changing();
+        let changed = store
             .run_serialized_write(|| async {
                 let tx = store.connection.begin().await?;
-                if store
-                    .frozen_readers
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .contains_key(&self.manifest)
-                {
+                if crate::frozen_lifetime::cleanup_blocked(
+                    &store.frozen_readers,
+                    &self.manifest,
+                    &store.connection.work_signal("maintenance.frozen.release"),
+                ) {
                     tx.commit().await?;
-                    return Ok(());
+                    return Ok(false);
                 }
                 let incoming_previous = checkpoint::Entity::find()
                     .select_only()
@@ -2816,10 +3143,13 @@ impl DiscardPreparation {
                     }
                 }
                 tx.commit().await?;
-                Ok(())
+                Ok(eligible.is_some() && !keys.is_empty())
             })
             .await?;
-        Ok(())
+        // Deleting legacy import/proof rows can release opaque outgoing roots.
+        // Recover their complete dependency set rather than guessing an ID.
+        change.completed(changed);
+        Ok(changed)
     }
 }
 
@@ -3669,6 +3999,9 @@ mod tests {
                 previous: (i > 0).then(|| ids[0].into()),
                 summary: format!("summary {i}"),
                 selection: ModelSelection {
+                    service_mode: None,
+                    context_authority: None,
+                    context_window: None,
                     transport: Transport::Api,
                     instance: "p".into(),
                     model: "m".into(),
@@ -4624,6 +4957,9 @@ mod tests {
                 previous: None,
                 summary: "summary".into(),
                 selection: ModelSelection {
+                    service_mode: None,
+                    context_authority: None,
+                    context_window: None,
                     transport: Transport::Api,
                     instance: "p".into(),
                     model: "m".into(),
@@ -4946,6 +5282,9 @@ mod tests {
             previous: None,
             summary: "legacy bound candidate".into(),
             selection: ModelSelection {
+                service_mode: None,
+                context_authority: None,
+                context_window: None,
                 transport: Transport::Api,
                 instance: "p".into(),
                 model: "m".into(),
@@ -6825,10 +7164,10 @@ mod tests {
         assert!(restart.discard_after.is_empty());
     }
 
-    // The graph-refusal tests protect retained data; they do not exercise the
-    // release invalidation that used to reopen the same unchanged proof.
+    // The graph-refusal tests protect retained data; ordinary proof reads must
+    // also leave finished cleanup parked when nobody waited on their holds.
     #[tokio::test]
-    async fn refused_proof_release_rechecks_cleanup_without_revalidating_origin() {
+    async fn refused_proof_reads_do_not_wake_cleanup_or_revalidate_origin() {
         use futures_util::FutureExt;
         let (store, _) = fixture(true).await;
         // Model pre-existing damaged legacy input; the production identity
@@ -6863,7 +7202,7 @@ mod tests {
         assert!(idle && progress.accounting.refused > 0);
         assert!(store.frozen_readers.lock().unwrap().is_empty());
         assert!(source.wait(None).now_or_never().is_none());
-        assert!(released.wait(None).now_or_never().is_some());
+        assert!(released.wait(None).now_or_never().is_none());
         // Expiry may have notified HTML for unrelated rows. Acknowledge before
         // the release-only pass whose proof reads must stay parked.
         html.begin_pass(&database).await.unwrap();
@@ -6881,8 +7220,8 @@ mod tests {
         assert!(released.wait(None).now_or_never().is_none());
         assert!(source.wait(None).now_or_never().is_none());
         assert!(html.wait(None).now_or_never().is_none());
-        // An internal reader can be the last holder after an external reader.
-        // Both workers must still observe the final protection release.
+        // Even a mixed internal/external read family stays quiet if neither
+        // cleanup owner actually refused work because of these readers.
         let header = history::Entity::find_by_id("origin")
             .one(&store.connection)
             .await
@@ -6905,7 +7244,7 @@ mod tests {
         drop(external);
         assert!(released.wait(None).now_or_never().is_none());
         drop(internal);
-        assert!(released.wait(None).now_or_never().is_some());
+        assert!(released.wait(None).now_or_never().is_none());
     }
 
     #[tokio::test]

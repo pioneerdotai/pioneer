@@ -115,6 +115,7 @@ async fn drain_shell_readers(
 }
 
 struct ExecSession {
+    process_correlation: pioneer_observability::scenario::Correlation,
     observation: pioneer_observability::resources::ChildRegistration,
     child: Child,
     readers: Vec<tokio::task::JoinHandle<()>>,
@@ -292,8 +293,11 @@ impl ToolHandler for UnifiedExecHandler {
                 self.handle_exec_command(args, invocation, trace).await
             }
             LocalShellPayload::WriteStdin(args) => {
-                self.handle_write_stdin(args, invocation.cancellation, trace)
-                    .await
+                crate::observation::measure(
+                    pioneer_observability::tool_call::Phase::ShellContinuation,
+                    self.handle_write_stdin(args, invocation.cancellation, trace),
+                )
+                .await
             }
         }
     }
@@ -454,15 +458,18 @@ impl UnifiedExecHandler {
         let cancellation = invocation.cancellation.clone();
         let use_tty = args.tty.unwrap_or(false);
         if !use_tty {
-            let result = run_one_shot(
-                args,
-                invocation.workdir.as_path(),
-                &invocation.environment,
-                invocation.execution_security_snapshot.as_ref(),
-                &trace,
-                cancellation,
-                self.one_shot_limits,
-                self,
+            let result = crate::observation::measure(
+                pioneer_observability::tool_call::Phase::ShellProcessWait,
+                run_one_shot(
+                    args,
+                    invocation.workdir.as_path(),
+                    &invocation.environment,
+                    invocation.execution_security_snapshot.as_ref(),
+                    &trace,
+                    cancellation,
+                    self.one_shot_limits,
+                    self,
+                ),
             )
             .await?;
             return Ok(Box::new(result.into_tool_output()));
@@ -527,6 +534,7 @@ impl UnifiedExecHandler {
 
         let session = Arc::new(Mutex::new(ExecSession {
             process_id: child.id(),
+            process_correlation: pioneer_observability::scenario::Correlation::capture(),
             observation,
             child,
             readers,
@@ -690,7 +698,7 @@ impl UnifiedExecHandler {
             return Err(error);
         }
 
-        let (state, command_preview, started_at) = {
+        let (state, command_preview, started_at, process_correlation) = {
             let mut guard = session.lock().await;
             guard.last_touched = Instant::now();
             let status = shell_parent_try_wait(&mut guard.child).map_err(|error| {
@@ -703,9 +711,22 @@ impl UnifiedExecHandler {
                 ProcessState::from_status(status),
                 guard.command.clone(),
                 guard.started_at,
+                guard.process_correlation.clone(),
             )
         };
 
+        let mut process_observation = pioneer_observability::tool_call::Measurement::start_linked(
+            pioneer_observability::tool_call::Phase::ShellProcessState,
+            &pioneer_observability::scenario::Correlation::capture(),
+            &[process_correlation],
+        );
+        process_observation.finish(if !state.finished {
+            pioneer_observability::tool_call::Fact::ProcessRunning
+        } else if state.success {
+            pioneer_observability::tool_call::Fact::ProcessExitedSuccess
+        } else {
+            pioneer_observability::tool_call::Fact::ProcessExitedFailure
+        });
         if state.finished {
             self.close_session_inner(args.session_id, false).await?;
         }
@@ -1363,64 +1384,74 @@ fn apply_shell_sandbox_backend(
     execution_security_snapshot: Option<&TurnExecutionSecuritySnapshot>,
     process_plan: &ProcessSpawnPlan,
 ) -> Result<(), ToolError> {
-    let Some(snapshot) = execution_security_snapshot else {
-        return Err(ToolError::Rejected(
+    crate::observation::measure_sync(
+        pioneer_observability::tool_call::Phase::ShellPreparation,
+        || {
+            let Some(snapshot) = execution_security_snapshot else {
+                return Err(ToolError::Rejected(
             "missing turn execution security snapshot; refusing to spawn shell command without resolved sandbox policy".to_owned(),
         ));
-    };
-    let Some(backend_kind) = snapshot.backend.sandbox_backend else {
-        return Ok(());
-    };
+            };
+            let Some(backend_kind) = snapshot.backend.sandbox_backend else {
+                return Ok(());
+            };
 
-    match backend_kind {
-        SandboxBackendKind::Nono => {
-            let backend = NonoSandboxBackend::new();
-            let request = NativeSandboxRequest {
-                snapshot,
-                process_plan,
-                workspace_roots: &[],
-                execution_label: "shell",
-            };
-            match prepare_native_sandbox_backend(&backend, &request)? {
-                NativeSandboxPrepareOutcome::Ready(_) => {
-                    configure_nono_command(command, snapshot, process_plan)
+            match backend_kind {
+                SandboxBackendKind::Nono => {
+                    let backend = NonoSandboxBackend::new();
+                    let request = NativeSandboxRequest {
+                        snapshot,
+                        process_plan,
+                        workspace_roots: &[],
+                        execution_label: "shell",
+                    };
+                    match prepare_native_sandbox_backend(&backend, &request)? {
+                        NativeSandboxPrepareOutcome::Ready(_) => {
+                            configure_nono_command(command, snapshot, process_plan)
+                        }
+                        NativeSandboxPrepareOutcome::Degraded { reason, .. }
+                        | NativeSandboxPrepareOutcome::Unavailable { reason, .. } => {
+                            tracing::warn!(
+                                reason = %reason,
+                                "optional nono sandbox backend is not active for shell command"
+                            );
+                            Ok(())
+                        }
+                    }
                 }
-                NativeSandboxPrepareOutcome::Degraded { reason, .. }
-                | NativeSandboxPrepareOutcome::Unavailable { reason, .. } => {
-                    tracing::warn!(
-                        reason = %reason,
-                        "optional nono sandbox backend is not active for shell command"
-                    );
-                    Ok(())
+                SandboxBackendKind::WindowsRestrictedToken => {
+                    let backend = WindowsRestrictedTokenBackend::new();
+                    let request = NativeSandboxRequest {
+                        snapshot,
+                        process_plan,
+                        workspace_roots: &[],
+                        execution_label: "shell",
+                    };
+                    match prepare_native_sandbox_backend(&backend, &request)? {
+                        NativeSandboxPrepareOutcome::Ready(_) => {
+                            configure_windows_restricted_token_command(
+                                command,
+                                snapshot,
+                                process_plan,
+                            )
+                        }
+                        NativeSandboxPrepareOutcome::Degraded { reason, .. }
+                        | NativeSandboxPrepareOutcome::Unavailable { reason, .. } => {
+                            tracing::warn!(
+                                reason = %reason,
+                                "optional windows restricted-token sandbox backend is not active for shell command"
+                            );
+                            Ok(())
+                        }
+                    }
                 }
+                SandboxBackendKind::ProviderNative => Err(ToolError::Rejected(
+                    "provider-native sandbox cannot protect Pioneer native shell execution"
+                        .to_owned(),
+                )),
             }
-        }
-        SandboxBackendKind::WindowsRestrictedToken => {
-            let backend = WindowsRestrictedTokenBackend::new();
-            let request = NativeSandboxRequest {
-                snapshot,
-                process_plan,
-                workspace_roots: &[],
-                execution_label: "shell",
-            };
-            match prepare_native_sandbox_backend(&backend, &request)? {
-                NativeSandboxPrepareOutcome::Ready(_) => {
-                    configure_windows_restricted_token_command(command, snapshot, process_plan)
-                }
-                NativeSandboxPrepareOutcome::Degraded { reason, .. }
-                | NativeSandboxPrepareOutcome::Unavailable { reason, .. } => {
-                    tracing::warn!(
-                        reason = %reason,
-                        "optional windows restricted-token sandbox backend is not active for shell command"
-                    );
-                    Ok(())
-                }
-            }
-        }
-        SandboxBackendKind::ProviderNative => Err(ToolError::Rejected(
-            "provider-native sandbox cannot protect Pioneer native shell execution".to_owned(),
-        )),
-    }
+        },
+    )
 }
 
 fn build_command(args: &ExecCommandArgs, cwd: &Path) -> Result<(Vec<String>, Command), ToolError> {

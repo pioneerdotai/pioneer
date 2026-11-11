@@ -345,3 +345,14 @@
 "chat.composer.preparing_send" = "Preparando mensaje"
 "plugins.retry" = "Reintentar"
 "plugins.stale" = "La versión seleccionada ya no es la actual"
+
+"chat.composer.model.context_label" = "Ventana de contexto"
+"chat.composer.model.context_auto" = "Auto — hasta %{tokens} tokens"
+"chat.composer.model.context_up_to" = "Hasta %{tokens} tokens"
+"chat.composer.model.context_invalid" = "La opción guardada no está disponible. Elige Auto u otra ventana."
+
+"chat.composer.model.service_label" = "Nivel de servicio"
+
+"chat.composer.model.service_standard" = "Estándar"
+
+"chat.composer.model.service_invalid" = "El nivel guardado no está disponible. Elige Estándar u otro modo."

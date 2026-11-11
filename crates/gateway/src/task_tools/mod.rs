@@ -2015,6 +2015,14 @@ impl TaskToolHandler {
         }
         create_context.resolved_launch_identity = Some(identity);
         create_context.resolved_launch_profile = Some(profile);
+        crate::compaction::native_budget::freeze_task_context(
+            self.processor.as_ref(),
+            &self.context.workspace_id,
+            Some(&self.context.turn_id),
+            &mut create_context,
+        )
+        .await
+        .map_err(|error| ToolError::execution_failed(format!("Native Task context: {error:#}")))?;
         let target_option_id = requested_target_option_id
             .clone()
             .unwrap_or_else(|| adapter.current_target_option_id());
@@ -5174,7 +5182,7 @@ pub(crate) async fn observed_terminal_task_outcomes(
     // of this logical turn; do not restrict it to the latest session generation.
     let Some(cli_binding) = processor
         .crud_store
-        .get_cli_runtime_turn_binding(&context.turn_id)
+        .get_cli_runtime_turn_binding_control(&context.turn_id)
         .await?
     else {
         return Ok(outcomes);

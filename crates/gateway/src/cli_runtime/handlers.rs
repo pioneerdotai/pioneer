@@ -53,6 +53,7 @@ use pioneer_config::{
     EffectiveGatewayCliAgentRuntimeInstanceConfig, GatewayCliAgentRuntimeKindConfig,
 };
 use pioneer_crud::NewCliRuntimeNativeEvent;
+use pioneer_observability::closing::{Closing, Fact, Phase};
 use pioneer_observability::{
     GatewayCliRuntimeKind, GatewayProviderWarmupStage, GatewayProviderWarmupTrace,
 };
@@ -86,6 +87,7 @@ pub(super) struct CliRuntimeStaleTurnScanSummary {
     pub processed: usize,
     pub has_more: bool,
     pub failed: bool,
+    pub deferred_transitions: Vec<(String, Arc<tokio::sync::Mutex<()>>)>,
 }
 const CLI_RUNTIME_SILENT_TURN_STALE_AFTER_MS: i64 = 150_000;
 const CLI_RUNTIME_EVENTED_TURN_STALE_AFTER_MS: i64 = 15 * 60 * 1_000;
@@ -1630,7 +1632,7 @@ impl MessageProcessor {
 
             let turn_binding = match self
                 .crud_store
-                .get_cli_runtime_turn_binding(params.turn_id.as_str())
+                .get_cli_runtime_turn_binding_control(params.turn_id.as_str())
                 .await
             {
                 Ok(Some(binding)) => binding,
@@ -2538,8 +2540,10 @@ impl MessageProcessor {
             // cleanup. Reconcile the durable binding here as well as expiring
             // the request that was presented by the caller.
             if let Some(turn_id) = pending.turn_id.as_deref()
-                && let Ok(Some(binding)) =
-                    self.crud_store.get_cli_runtime_turn_binding(turn_id).await
+                && let Ok(Some(binding)) = self
+                    .crud_store
+                    .get_cli_runtime_turn_binding_control(turn_id)
+                    .await
                 && !cli_runtime_turn_binding_status_is_active(binding.status.as_str())
             {
                 self.cleanup_cli_runtime_terminal_binding_status(
@@ -3744,7 +3748,7 @@ impl MessageProcessor {
                                         .await
                                     {
                                         match AssertUnwindSafe(
-                                            durable_receiver.pending_work().scope_result(commit_processor.commit_durable_agent_event_with_cli_blocked_guard(event, durable_receiver.cli_blocked_guard().cloned(), durable_receiver.turn_transition().cloned())),
+                                            durable_receiver.pending_work().scope_result(durable_receiver.pending_closing_correlation().scope(commit_processor.commit_durable_agent_event_with_cli_blocked_guard(event, durable_receiver.cli_blocked_guard().cloned(), durable_receiver.turn_transition().cloned()))),
                                         )
                                         .catch_unwind()
                                         .await
@@ -3764,6 +3768,7 @@ impl MessageProcessor {
                                             }
                                         }
                                     } else {
+                                        durable_receiver.supersede_last_observation();
                                         listener_processor.audit_stale_cli_runtime_process_activity(
                                             &listener_instance,
                                             "durable_projection",
@@ -4239,7 +4244,7 @@ impl MessageProcessor {
         let key = instance.key();
         let bindings = match self
             .crud_store
-            .list_cli_runtime_turn_bindings(pioneer_crud::CliRuntimeTurnBindingListFilter {
+            .list_cli_runtime_turn_binding_controls(pioneer_crud::CliRuntimeTurnBindingListFilter {
                 workspace_id: Some(key.workspace_id.clone()),
                 runtime_id: Some(key.runtime_id.clone()),
                 continuation_thread_id: Some(key.thread_id.clone()),
@@ -4484,7 +4489,11 @@ impl MessageProcessor {
             && matches!(event, RuntimeEvent::TurnCompleted(_))
             && let Some(turn_id) = turn_id.as_deref()
         {
-            match self.crud_store.get_cli_runtime_turn_binding(turn_id).await {
+            match self
+                .crud_store
+                .get_cli_runtime_turn_binding_control(turn_id)
+                .await
+            {
                 Ok(Some(binding)) => binding.thread_id,
                 Ok(None) => key.thread_id.clone(),
                 Err(error) => {
@@ -4710,7 +4719,7 @@ impl MessageProcessor {
     ) -> Option<pioneer_crud::CliRuntimeTurnBindingRecord> {
         let bindings = match self
             .crud_store
-            .list_cli_runtime_turn_bindings(pioneer_crud::CliRuntimeTurnBindingListFilter {
+            .list_cli_runtime_turn_binding_controls(pioneer_crud::CliRuntimeTurnBindingListFilter {
                 workspace_id: Some(key.workspace_id.clone()),
                 runtime_id: Some(key.runtime_id.clone()),
                 continuation_thread_id: Some(key.thread_id.clone()),
@@ -4761,7 +4770,7 @@ impl MessageProcessor {
         let native_thread_id = started.native_thread_id.as_deref()?;
         let binding = match self
             .crud_store
-            .resolve_cli_runtime_native_turn_owner(
+            .resolve_cli_runtime_native_turn_control_owner(
                 key.runtime_id.as_str(),
                 started.native_turn_id.as_str(),
             )
@@ -4801,7 +4810,7 @@ impl MessageProcessor {
         }
         let selected = match self
             .crud_store
-            .cli_runtime_turn_terminal_guard_by_id(&binding.turn_id)
+            .cli_runtime_turn_terminal_control_guard_by_id(&binding.turn_id)
             .await
         {
             Ok(Some(selected)) => selected,
@@ -4818,7 +4827,7 @@ impl MessageProcessor {
             .await;
         let current = match self
             .crud_store
-            .cli_runtime_turn_terminal_guard_by_id(&binding.turn_id)
+            .cli_runtime_turn_terminal_control_guard_by_id(&binding.turn_id)
             .await
         {
             Ok(Some(current)) => current,
@@ -4838,7 +4847,7 @@ impl MessageProcessor {
         let binding = current.binding;
         let (binding, _, _) = match self
             .crud_store
-            .register_cli_runtime_execution_segment(
+            .register_cli_runtime_control_execution_segment(
                 binding.turn_id.as_str(),
                 native_thread_id,
                 started.native_turn_id.as_str(),
@@ -4959,7 +4968,7 @@ impl MessageProcessor {
         };
         let selected = match self
             .crud_store
-            .cli_runtime_turn_terminal_guard_by_id(&binding.turn_id)
+            .cli_runtime_turn_terminal_control_guard_by_id(&binding.turn_id)
             .await
         {
             Ok(Some(selected)) => selected,
@@ -4983,7 +4992,7 @@ impl MessageProcessor {
             .await;
         let current = match self
             .crud_store
-            .cli_runtime_turn_terminal_guard_by_id(&binding.turn_id)
+            .cli_runtime_turn_terminal_control_guard_by_id(&binding.turn_id)
             .await
         {
             Ok(Some(current)) => current,
@@ -5001,7 +5010,7 @@ impl MessageProcessor {
         let binding = current.binding.clone();
         let binding = match self
             .crud_store
-            .set_cli_runtime_turn_native_goal_state(
+            .set_cli_runtime_turn_native_goal_control_state(
                 binding.turn_id.as_str(),
                 status,
                 native_goal_turn_id,
@@ -5680,7 +5689,7 @@ impl MessageProcessor {
     ) {
         let attempt = match self
             .crud_store
-            .resolve_cli_runtime_native_turn_owner(key.runtime_id.as_str(), native_turn_id)
+            .resolve_cli_runtime_native_turn_control_owner(key.runtime_id.as_str(), native_turn_id)
             .await
         {
             Ok(Some(owner))
@@ -5743,7 +5752,7 @@ impl MessageProcessor {
             // transfer ownership to recovery for this informational event.
             let Ok(Some(selected)) = self
                 .crud_store
-                .cli_runtime_turn_terminal_guard_by_id(&turn_binding.turn_id)
+                .cli_runtime_turn_terminal_control_guard_by_id(&turn_binding.turn_id)
                 .await
             else {
                 return false;
@@ -5759,7 +5768,7 @@ impl MessageProcessor {
             };
             let Ok(Some(current)) = self
                 .crud_store
-                .cli_runtime_turn_terminal_guard_by_id(&turn_binding.turn_id)
+                .cli_runtime_turn_terminal_control_guard_by_id(&turn_binding.turn_id)
                 .await
             else {
                 return false;
@@ -5812,7 +5821,10 @@ impl MessageProcessor {
             // provenance from the durable native owner before preparing/enqueueing.
             let Some(owner) = self
                 .crud_store
-                .resolve_cli_runtime_native_turn_owner(&turn_binding.runtime_id, &native_turn_id)
+                .resolve_cli_runtime_native_turn_control_owner(
+                    &turn_binding.runtime_id,
+                    &native_turn_id,
+                )
                 .await?
             else {
                 return Ok(false);
@@ -5874,7 +5886,7 @@ impl MessageProcessor {
             };
             let current = self
                 .crud_store
-                .get_cli_runtime_turn_binding(&source.turn_id)
+                .get_cli_runtime_turn_binding_control(&source.turn_id)
                 .await?;
             let Some(binding) = current else {
                 return Ok(false);
@@ -6119,12 +6131,45 @@ impl MessageProcessor {
     async fn process_bound_cli_runtime_event_inner(
         &self,
         instance: &CliSessionInstanceId,
+        turn_binding: pioneer_crud::CliRuntimeTurnBindingRecord,
+        event: RuntimeEvent,
+        turn_transition: Option<&Arc<tokio::sync::OwnedMutexGuard<()>>>,
+        terminal_delivery: Option<&pioneer_protocol::CliRuntimeBlockedTurnGuard>,
+    ) -> bool {
+        if matches!(&event, RuntimeEvent::TurnCompleted(_)) {
+            self.observe_cli_terminal_phase(&turn_binding.turn_id, "terminal_event")
+                .await;
+        }
+        let mut closing = matches!(&event, RuntimeEvent::TurnCompleted(_))
+            .then(|| Closing::current(Phase::CliCandidate));
+        let correlation = closing.as_ref().map(Closing::correlation);
+        let future = self.process_bound_cli_runtime_event_observed(
+            instance,
+            turn_binding,
+            event,
+            turn_transition,
+            terminal_delivery,
+            &mut closing,
+        );
+        match correlation {
+            Some(correlation) => correlation.scope(future).await,
+            None => future.await,
+        }
+    }
+
+    async fn process_bound_cli_runtime_event_observed(
+        &self,
+        instance: &CliSessionInstanceId,
         mut turn_binding: pioneer_crud::CliRuntimeTurnBindingRecord,
         mut event: RuntimeEvent,
         turn_transition: Option<&Arc<tokio::sync::OwnedMutexGuard<()>>>,
         terminal_delivery: Option<&pioneer_protocol::CliRuntimeBlockedTurnGuard>,
+        closing: &mut Option<Closing>,
     ) -> bool {
         if !self.cli_runtime_instance_is_current(instance).await {
+            if let Some(closing) = closing {
+                closing.finish(Fact::Superseded);
+            }
             self.audit_stale_cli_runtime_process_activity(instance, "bound_event");
             return false;
         }
@@ -6156,7 +6201,10 @@ impl MessageProcessor {
         let native_owner = if let Some(native_turn_id) = native_turn_id {
             match self
                 .crud_store
-                .resolve_cli_runtime_native_turn_owner(key.runtime_id.as_str(), native_turn_id)
+                .resolve_cli_runtime_native_turn_control_owner(
+                    key.runtime_id.as_str(),
+                    native_turn_id,
+                )
                 .await
             {
                 Ok(Some(owner)) => {
@@ -6353,7 +6401,7 @@ impl MessageProcessor {
             .await;
             match self
                 .crud_store
-                .terminalize_cli_runtime_execution_segment(
+                .terminalize_cli_runtime_control_execution_segment(
                     key.runtime_id.as_str(),
                     native_turn_id,
                     pioneer_crud::CliRuntimeExecutionSegmentStatus::Completed,
@@ -6386,12 +6434,18 @@ impl MessageProcessor {
                 self.confirm_cli_runtime_recovery_progress(attempt, recovery, event_label.as_str())
                     .await;
             }
+            if let Some(closing) = closing {
+                closing.finish(Fact::Continuation);
+            }
             return true;
         }
         if matches!(&event, RuntimeEvent::TurnCompleted(_)) {
             match self.cli_task_finalization_state(&turn_binding).await {
                 Ok(state) if state.blocks_completion() => {
                     let Some(source) = terminal_delivery else {
+                        if let Some(closing) = closing {
+                            closing.finish(Fact::Blocked);
+                        }
                         return false;
                     };
                     self.publish_cli_runtime_supplemental_timing(
@@ -6422,6 +6476,9 @@ impl MessageProcessor {
                                     "attached_task_continuation",
                                 )
                                 .await;
+                            }
+                            if let Some(closing) = closing {
+                                closing.finish(Fact::Continuation);
                             }
                             return true;
                         }
@@ -6760,6 +6817,24 @@ impl MessageProcessor {
                 return false;
             }
         }
+        // Resolve optional continuity proof before projection changes the
+        // binding revision. A stale/missing mapping or read error must not
+        // suppress the terminal commit, cleanup or saved-delivery ACK. Carry
+        // the error to the nonfatal continuity capture below. Mandatory owner
+        // and execution fences still live in the guarded durable publisher.
+        let completion_mapping = if matches!(&event, RuntimeEvent::TurnCompleted(_)) {
+            Some(
+                self.crud_store
+                    .load_cli_runtime_control_mapping(&turn_binding)
+                    .await
+                    .and_then(|binding| {
+                        binding.context("CLI completion mapping is no longer current")
+                    })
+                    .map(|binding| binding.input_mapping_json),
+            )
+        } else {
+            None
+        };
         let context = crate::cli_runtime::projector::CLIRuntimeProjectorContext {
             workspace_id: key.workspace_id.clone(),
             thread_id: turn_binding.thread_id.clone(),
@@ -6798,7 +6873,12 @@ impl MessageProcessor {
                 return false;
             }
         }
+        if let Some(closing) = closing {
+            closing.finish(Fact::Returned);
+        }
         if matches!(&event, RuntimeEvent::TurnCompleted(_)) {
+            self.observe_cli_terminal_phase(&turn_binding.turn_id, "capture_completed_context")
+                .await;
             let completed_context = async {
                 let (_, completed_turn) = self
                     .crud_store
@@ -6808,9 +6888,11 @@ impl MessageProcessor {
                     )
                     .await?
                     .context("completed CLI turn disappeared before continuity capture")?;
+                let completion_mapping =
+                    completion_mapping.context("CLI completion mapping was not loaded")??;
                 let sent_basis =
                     crate::cli_runtime::thread_binding::sent_context_basis_from_input_mapping(
-                        turn_binding.input_mapping_json.as_str(),
+                        &completion_mapping,
                     )?
                     .context(
                         "completed CLI turn has no proof for the context sent to its provider",
@@ -6843,6 +6925,10 @@ impl MessageProcessor {
                 );
             }
         }
+        if terminal_status.is_some() {
+            self.observe_cli_terminal_phase(&turn_binding.turn_id, "terminal_event_hub")
+                .await;
+        }
         let event_hub = self.ensure_cli_runtime_execution_event_hub(instance).await;
         for snapshot in projected.snapshot {
             if !event_hub.publish_snapshot(snapshot) {
@@ -6869,6 +6955,10 @@ impl MessageProcessor {
         for progress in projected.progress {
             event_hub.publish_progress(progress);
         }
+        if terminal_status.is_some() {
+            self.observe_cli_terminal_phase(&turn_binding.turn_id, "terminal_command_registry")
+                .await;
+        }
         self.update_cli_runtime_command_item_registry(instance, &turn_binding, &event)
             .await;
         if cli_runtime_event_confirms_recovery(&event)
@@ -6878,6 +6968,8 @@ impl MessageProcessor {
                 .await;
         }
         if terminal_status.is_some() {
+            self.observe_cli_terminal_phase(&turn_binding.turn_id, "finalize_cli_attempt")
+                .await;
             if let Some(attempt) = turn_attempt {
                 let attempt_status = match &event {
                     RuntimeEvent::TurnCompleted(_) => {
@@ -7312,6 +7404,7 @@ impl MessageProcessor {
         binding: &pioneer_crud::CliRuntimeTurnBindingRecord,
         generation: i64,
     ) -> anyhow::Result<CLIRuntimeSuccessFinalizationPreparation> {
+        let mut closing = Closing::current(Phase::CliPreparation);
         let task_state = self.cli_task_finalization_state(binding).await?;
         anyhow::ensure!(
             !task_state.blocks_completion(),
@@ -7398,10 +7491,12 @@ impl MessageProcessor {
                 turn_id = binding.turn_id.as_str(),
                 "CLI Turn success has no final AgentMessage; using atomic terminal-only finalization"
             );
+            closing.finish(Fact::Returned);
             return Ok(CLIRuntimeSuccessFinalizationPreparation::WithoutFinalMessage);
         };
-        self.crud_store
-            .prepare_turn_finalization(
+        closing
+            .correlation()
+            .scope(self.crud_store.prepare_turn_finalization(
                 &ItemCompletedNotification {
                     workspace_id: binding.workspace_id.clone(),
                     thread_id: binding.thread_id.clone(),
@@ -7411,8 +7506,9 @@ impl MessageProcessor {
                 generation.max(1),
                 Some(task_state.snapshot.revision.as_str()),
                 now_timestamp_secs(),
-            )
+            ))
             .await?;
+        closing.finish(Fact::Confirmed);
         Ok(CLIRuntimeSuccessFinalizationPreparation::WithFinalMessage)
     }
 
@@ -8170,8 +8266,22 @@ impl MessageProcessor {
         &self,
         now: i64,
     ) -> anyhow::Result<Option<i64>> {
+        let (_, next, _) = self.capture_cli_background_deadlines(now).await?;
+        Ok(next
+            .into_iter()
+            .chain(self.next_cli_buffer_deadline(now).await)
+            .chain(self.cli_runtime_command_heartbeats.next_deadline().await)
+            .min())
+    }
+
+    pub(super) async fn capture_cli_background_deadlines(
+        &self,
+        now: i64,
+    ) -> anyhow::Result<(std::collections::BTreeMap<String, i64>, Option<i64>, bool)> {
         use pioneer_crud::CliRuntimeActiveTurnBindingStatus::{Running, Starting};
         let discovery = self.crud_store.with_maintenance_access();
+        let mut per_turn = std::collections::BTreeMap::new();
+        let mut overflow = false;
         let mut next_ms = None::<i64>;
         let mut include = |deadline: i64| {
             next_ms = Some(next_ms.map_or(deadline, |current| current.min(deadline)));
@@ -8186,7 +8296,7 @@ impl MessageProcessor {
             let mut after = None;
             loop {
                 let bindings = discovery
-                    .list_active_cli_runtime_turn_binding_page_through(
+                    .list_active_cli_runtime_turn_binding_control_page_through(
                         status,
                         after.as_ref(),
                         &through,
@@ -8198,81 +8308,15 @@ impl MessageProcessor {
                     .last()
                     .map(|binding| (binding.created_at, binding.turn_id.clone()));
                 for binding in bindings {
-                    let request_through = discovery
-                        .cli_runtime_pending_request_frontier_for_turn(&binding.turn_id)
-                        .await?;
-                    let mut request_after = None;
-                    let mut human_wait = false;
-                    while request_through.is_some() {
-                        let requests = discovery
-                            .list_cli_runtime_pending_requests(
-                                pioneer_crud::CliRuntimePendingRequestListFilter {
-                                    turn_id: Some(binding.turn_id.clone()),
-                                    open_only: true,
-                                    after: request_after.clone(),
-                                    through: request_through.clone(),
-                                    ..Default::default()
-                                },
-                            )
-                            .await?;
-                        let full = requests.len()
-                            == pioneer_crud::CLI_RUNTIME_PENDING_REQUEST_PAGE_MAX as usize;
-                        request_after = requests
-                            .last()
-                            .map(|request| (request.created_at, request.request_id.clone()));
-                        for request in requests {
-                            if request.workspace_id == binding.workspace_id
-                                && request.runtime_id == binding.runtime_id
-                                && request.thread_id == binding.thread_id
-                                && cli_runtime_pending_request_is_human_wait(&request.request_kind)
-                            {
-                                human_wait = true;
-                                include(
-                                    request
-                                        .created_at
-                                        .timestamp_millis()
-                                        .saturating_add(CLI_RUNTIME_HUMAN_RESPONSE_TIMEOUT_MS),
-                                );
-                                if matches!(
-                                    request.status,
-                                    StoredCliRuntimePendingRequestStatus::ResponseAccepted
-                                        | StoredCliRuntimePendingRequestStatus::Delivering
-                                ) {
-                                    include(
-                                        request
-                                            .updated_at
-                                            .timestamp_millis()
-                                            .saturating_add(30_000),
-                                    );
-                                }
+                    if let Some(at) = self.next_cli_binding_deadline(&binding, now).await? {
+                        include(at.saturating_mul(1000));
+                        if !overflow {
+                            per_turn.insert(binding.turn_id, at);
+                            if per_turn.len() > 4096 {
+                                per_turn.clear();
+                                overflow = true;
                             }
                         }
-                        if !full {
-                            break;
-                        }
-                    }
-                    // Reconciliation defers stale runtime observation while a
-                    // human response is pending; its own deadline owns the wake.
-                    if !human_wait {
-                        let observed =
-                            self.latest_cli_runtime_native_event_timestamp_ms(&binding)
-                                .await?
-                                .into_iter()
-                                .chain(
-                                    discovery.get_turn_liveness(&binding.turn_id).await?.map(
-                                        |value| value.last_activity_at_unix.saturating_mul(1000),
-                                    ),
-                                )
-                                .max();
-                        include(
-                            observed
-                                .unwrap_or(binding.updated_at.timestamp_millis())
-                                .saturating_add(if observed.is_some() {
-                                    CLI_RUNTIME_EVENTED_TURN_STALE_AFTER_MS
-                                } else {
-                                    CLI_RUNTIME_SILENT_TURN_STALE_AFTER_MS
-                                }),
-                        );
                     }
                 }
                 if !full {
@@ -8280,6 +8324,110 @@ impl MessageProcessor {
                 }
             }
         }
+        let next = next_ms.map(|ms| ms.saturating_add(999).div_euclid(1000));
+        Ok((per_turn, next, overflow))
+    }
+
+    async fn next_cli_binding_deadline(
+        &self,
+        binding: &pioneer_crud::CliRuntimeTurnBindingRecord,
+        now: i64,
+    ) -> anyhow::Result<Option<i64>> {
+        Ok(self
+            .next_cli_binding_deadline_raw(binding)
+            .await?
+            .map(|at| if at <= now { now.saturating_add(2) } else { at }))
+    }
+
+    async fn next_cli_binding_deadline_raw(
+        &self,
+        binding: &pioneer_crud::CliRuntimeTurnBindingRecord,
+    ) -> anyhow::Result<Option<i64>> {
+        let discovery = self.crud_store.with_maintenance_access();
+        let mut next_ms = None::<i64>;
+        let mut include = |at: i64| {
+            next_ms = Some(next_ms.map_or(at, |old| old.min(at)));
+        };
+        let request_through = discovery
+            .cli_runtime_pending_request_frontier_for_turn(&binding.turn_id)
+            .await?;
+        let mut request_after = None;
+        let mut human_wait = false;
+        while request_through.is_some() {
+            let requests = discovery
+                .list_cli_runtime_pending_requests(
+                    pioneer_crud::CliRuntimePendingRequestListFilter {
+                        turn_id: Some(binding.turn_id.clone()),
+                        open_only: true,
+                        after: request_after.clone(),
+                        through: request_through.clone(),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            let full =
+                requests.len() == pioneer_crud::CLI_RUNTIME_PENDING_REQUEST_PAGE_MAX as usize;
+            request_after = requests
+                .last()
+                .map(|request| (request.created_at, request.request_id.clone()));
+            for request in requests {
+                if request.workspace_id == binding.workspace_id
+                    && request.runtime_id == binding.runtime_id
+                    && request.thread_id == binding.thread_id
+                    && cli_runtime_pending_request_is_human_wait(&request.request_kind)
+                {
+                    human_wait = true;
+                    include(
+                        request
+                            .created_at
+                            .timestamp_millis()
+                            .saturating_add(CLI_RUNTIME_HUMAN_RESPONSE_TIMEOUT_MS),
+                    );
+                    if matches!(
+                        request.status,
+                        StoredCliRuntimePendingRequestStatus::ResponseAccepted
+                            | StoredCliRuntimePendingRequestStatus::Delivering
+                    ) {
+                        include(request.updated_at.timestamp_millis().saturating_add(30_000));
+                    }
+                }
+            }
+            if !full {
+                break;
+            }
+        }
+        // Reconciliation defers stale runtime observation while a
+        // human response is pending; its own deadline owns the wake.
+        if !human_wait {
+            let observed = self
+                .latest_cli_runtime_native_event_timestamp_ms(&binding)
+                .await?
+                .into_iter()
+                .chain(
+                    discovery
+                        .get_turn_liveness(&binding.turn_id)
+                        .await?
+                        .map(|value| value.last_activity_at_unix.saturating_mul(1000)),
+                )
+                .max();
+            include(
+                observed
+                    .unwrap_or(binding.updated_at.timestamp_millis())
+                    .saturating_add(if observed.is_some() {
+                        CLI_RUNTIME_EVENTED_TURN_STALE_AFTER_MS
+                    } else {
+                        CLI_RUNTIME_SILENT_TURN_STALE_AFTER_MS
+                    }),
+            );
+        }
+        Ok(next_ms.map(|ms| ms.saturating_add(999).div_euclid(1000)))
+    }
+
+    pub(super) async fn next_cli_buffer_deadline(&self, now: i64) -> Option<i64> {
+        let mut next_ms = None::<i64>;
+        let mut include = |at: i64| {
+            next_ms = Some(next_ms.map_or(at, |old| old.min(at)));
+        };
         for events in self.cli_runtime_pending_turn_events.lock().await.values() {
             if let Some(last) = events.iter().map(|event| event.received_at_unix_ms).max() {
                 include(last.saturating_add(CLI_RUNTIME_PENDING_UNBOUND_EVENT_TTL_MS));
@@ -8299,22 +8447,60 @@ impl MessageProcessor {
                 include(last.saturating_add(CLI_RUNTIME_PENDING_UNBOUND_EVENT_TTL_MS));
             }
         }
-        // A due obligation that remains after reconciliation needs a bounded
-        // retry (observation unavailable, transition lock busy, etc.). It is
-        // active work, never an empty-catalog fallback.
-        let durable = next_ms
+        next_ms
             .map(|ms| ms.saturating_add(999).div_euclid(1000))
-            .map(|deadline| {
-                if deadline <= now {
-                    now.saturating_add(2)
-                } else {
-                    deadline
-                }
-            });
-        Ok(durable
-            .into_iter()
-            .chain(self.cli_runtime_command_heartbeats.next_deadline().await)
-            .min())
+            .map(|at| if at <= now { now.saturating_add(2) } else { at })
+    }
+
+    pub(super) async fn prune_cli_control_buffers(&self, now: i64) {
+        self.prune_stale_cli_runtime_pending_turn_events(now.saturating_mul(1000))
+            .await;
+        self.prune_stale_cli_runtime_pending_turn_server_requests(now.saturating_mul(1000))
+            .await;
+    }
+
+    pub(super) async fn refresh_cli_control_turn(
+        &self,
+        turn_id: &str,
+        now: i64,
+        check_state: bool,
+    ) -> anyhow::Result<super::control_work::CliTurnReadiness> {
+        use super::control_work::CliTurnReadiness::{Ready, Waiting};
+        let Some(binding) = self
+            .crud_store
+            .get_cli_runtime_turn_binding_control(turn_id)
+            .await?
+        else {
+            return Ok(Ready(None));
+        };
+        if !cli_runtime_turn_binding_status_is_active(&binding.status) {
+            return Ok(Ready(None));
+        }
+        if !check_state {
+            let next = self.next_cli_binding_deadline_raw(&binding).await?;
+            if next.is_none_or(|at| at > now) {
+                return Ok(Ready(next));
+            }
+        }
+        if let Some(transition) = self
+            .fail_stale_cli_runtime_turn_binding(binding, now.saturating_mul(1000))
+            .await?
+        {
+            return Ok(Waiting(transition));
+        }
+        let Some(binding) = self
+            .crud_store
+            .get_cli_runtime_turn_binding_control(turn_id)
+            .await?
+        else {
+            return Ok(Ready(None));
+        };
+        if !cli_runtime_turn_binding_status_is_active(&binding.status) {
+            return Ok(Ready(None));
+        }
+        self.next_cli_binding_deadline(&binding, now)
+            .await
+            .map(Ready)
     }
 
     pub(super) async fn fail_stale_cli_runtime_turns(
@@ -8364,7 +8550,7 @@ impl MessageProcessor {
                 continue;
             };
             let bindings = match discovery
-                .list_active_cli_runtime_turn_binding_page_through(
+                .list_active_cli_runtime_turn_binding_control_page_through(
                     status,
                     scan.after[slot].as_ref(),
                     through,
@@ -8401,11 +8587,15 @@ impl MessageProcessor {
             };
             scan.complete[slot] = scan.after[slot].is_none();
             for binding in bindings {
+                let turn_id = binding.turn_id.clone();
                 match self
                     .fail_stale_cli_runtime_turn_binding(binding, now_unix_ms)
                     .await
                 {
-                    Ok(()) => {
+                    Ok(Some(transition)) => {
+                        summary.deferred_transitions.push((turn_id, transition));
+                    }
+                    Ok(None) => {
                         summary.processed += 1;
                         trace.record_items(
                             GatewayOperationItemKind::CliRuntimeStaleTurnProcessed,
@@ -8452,14 +8642,14 @@ impl MessageProcessor {
     ) -> anyhow::Result<bool> {
         let Some(binding) = self
             .crud_store
-            .get_cli_runtime_turn_binding(turn_id)
+            .get_cli_runtime_turn_binding_control(turn_id)
             .await?
         else {
             return Ok(false);
         };
         let Some(expected) = self
             .crud_store
-            .cli_runtime_turn_terminal_guard(&binding)
+            .cli_runtime_turn_terminal_control_guard(&binding)
             .await?
         else {
             return Ok(true);
@@ -8469,7 +8659,7 @@ impl MessageProcessor {
         };
         if self
             .crud_store
-            .cli_runtime_turn_terminal_guard(&binding)
+            .cli_runtime_turn_terminal_control_guard(&binding)
             .await?
             .as_ref()
             != Some(&expected)
@@ -8548,7 +8738,7 @@ impl MessageProcessor {
 
         let Some(binding) = self
             .crud_store
-            .get_cli_runtime_turn_binding(turn_id)
+            .get_cli_runtime_turn_binding_control(turn_id)
             .await
             .with_context(|| {
                 format!(
@@ -8639,7 +8829,7 @@ impl MessageProcessor {
     ) -> anyhow::Result<crate::resilience::RuntimeTimeoutObservation> {
         let Some(binding) = self
             .crud_store
-            .get_cli_runtime_turn_binding(turn_id)
+            .get_cli_runtime_turn_binding_control(turn_id)
             .await?
         else {
             return Ok(crate::resilience::RuntimeTimeoutObservation::NotApplicable);
@@ -8713,23 +8903,23 @@ impl MessageProcessor {
         &self,
         binding: pioneer_crud::CliRuntimeTurnBindingRecord,
         now_unix_ms: i64,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Option<Arc<tokio::sync::Mutex<()>>>> {
         let Some(expected) = self
             .crud_store
-            .cli_runtime_turn_terminal_guard(&binding)
+            .cli_runtime_turn_terminal_control_guard(&binding)
             .await?
         else {
-            return Ok(());
+            return Ok(None);
         };
         let Some((workspace_id, turn)) = self
             .crud_store
             .get_turn(binding.thread_id.as_str(), binding.turn_id.as_str())
             .await?
         else {
-            return Ok(());
+            return Ok(None);
         };
         if turn.status != expected.turn_status {
-            return Ok(());
+            return Ok(None);
         }
         if turn.status != TurnStatus::InProgress {
             let key = CLIAgentRuntimeSessionKey::new(
@@ -8745,12 +8935,12 @@ impl MessageProcessor {
                 )
                 .await;
             let transition = self.cli_runtime_session_transition_mutex(&key).await;
-            let Ok(_transition) = transition.try_lock() else {
-                return Ok(());
+            let Ok(_transition) = transition.clone().try_lock_owned() else {
+                return Ok(Some(transition));
             };
             self.cleanup_cli_runtime_terminal_turn_guard(&expected, "stale CLI runtime turn scan")
                 .await?;
-            return Ok(());
+            return Ok(None);
         }
 
         // Human-wait reconciliation can reach terminal cleanup too. Fence that
@@ -8761,25 +8951,25 @@ impl MessageProcessor {
             binding.continuation_thread_id.clone(),
         )?;
         let transition = self.cli_runtime_session_transition_mutex(&key).await;
-        let Ok(turn_transition) = transition.try_lock_owned() else {
-            return Ok(());
+        let Ok(turn_transition) = transition.clone().try_lock_owned() else {
+            return Ok(Some(transition));
         };
         let turn_transition = Arc::new(turn_transition);
         if self
             .crud_store
-            .cli_runtime_turn_terminal_guard(&binding)
+            .cli_runtime_turn_terminal_control_guard(&binding)
             .await?
             .as_ref()
             != Some(&expected)
         {
-            return Ok(());
+            return Ok(None);
         }
 
         if self
             .replay_cli_runtime_terminal_event(&expected, &turn_transition)
             .await?
         {
-            return Ok(());
+            return Ok(None);
         }
 
         if self
@@ -8791,7 +8981,7 @@ impl MessageProcessor {
             )
             .await?
         {
-            return Ok(());
+            return Ok(None);
         }
 
         let latest_native_event_ms = self
@@ -8814,7 +9004,7 @@ impl MessageProcessor {
             CLI_RUNTIME_SILENT_TURN_STALE_AFTER_MS
         };
         if now_unix_ms.saturating_sub(last_activity_ms) < stale_after_ms {
-            return Ok(());
+            return Ok(None);
         }
 
         match self
@@ -8834,11 +9024,11 @@ impl MessageProcessor {
                         evidence.activity_kind(),
                     )
                     .await?;
-                return Ok(());
+                return Ok(None);
             }
             CLIRuntimeAuthoritativeTurnState::Terminal
             | CLIRuntimeAuthoritativeTurnState::Superseded
-            | CLIRuntimeAuthoritativeTurnState::Deferred => return Ok(()),
+            | CLIRuntimeAuthoritativeTurnState::Deferred => return Ok(None),
             CLIRuntimeAuthoritativeTurnState::Unavailable => {
                 let reason = format!(
                     "CLI runtime observation is unavailable for stale turn `{}`; authoritative state rehydration is required",
@@ -8852,7 +9042,7 @@ impl MessageProcessor {
                     None,
                 )
                 .await?;
-                return Ok(());
+                return Ok(None);
             }
         }
     }
@@ -8865,7 +9055,7 @@ impl MessageProcessor {
     ) -> anyhow::Result<CLIRuntimeAuthoritativeTurnState> {
         let Some(expected) = self
             .crud_store
-            .cli_runtime_turn_terminal_guard(binding)
+            .cli_runtime_turn_terminal_control_guard(binding)
             .await?
         else {
             return Ok(CLIRuntimeAuthoritativeTurnState::Superseded);
@@ -8876,7 +9066,7 @@ impl MessageProcessor {
         if expected.turn_status != turn.status
             || self
                 .crud_store
-                .cli_runtime_turn_terminal_guard(binding)
+                .cli_runtime_turn_terminal_control_guard(binding)
                 .await?
                 .as_ref()
                 != Some(&expected)
@@ -8896,7 +9086,7 @@ impl MessageProcessor {
     ) -> anyhow::Result<CLIRuntimeAuthoritativeTurnState> {
         let Some(expected) = self
             .crud_store
-            .cli_runtime_turn_terminal_guard(binding)
+            .cli_runtime_turn_terminal_control_guard(binding)
             .await?
         else {
             return Ok(CLIRuntimeAuthoritativeTurnState::Superseded);
@@ -9164,7 +9354,7 @@ impl MessageProcessor {
                     .unwrap_or_else(|| "CLI runtime reported a blocked turn".to_owned());
                 let Some(owner) = self
                     .crud_store
-                    .resolve_cli_runtime_native_turn_owner(
+                    .resolve_cli_runtime_native_turn_control_owner(
                         binding.runtime_id.as_str(),
                         native_turn_id.as_str(),
                     )
@@ -9431,7 +9621,7 @@ impl MessageProcessor {
         self.crud_store
             .database_connection()
             .work_signal("gateway.control")
-            .notify();
+            .notify_keys(&[pioneer_crud::GatewayControlWake::Buffers.key()]);
     }
 
     async fn buffer_cli_runtime_codex_server_request_until_turn_binding(
@@ -9477,7 +9667,7 @@ impl MessageProcessor {
         self.crud_store
             .database_connection()
             .work_signal("gateway.control")
-            .notify();
+            .notify_keys(&[pioneer_crud::GatewayControlWake::Buffers.key()]);
         for request in evicted {
             self.fail_codex_machine_request(
                 &request.responder,
@@ -10122,7 +10312,7 @@ impl MessageProcessor {
     ) -> bool {
         match self
             .crud_store
-            .list_cli_runtime_turn_bindings(pioneer_crud::CliRuntimeTurnBindingListFilter {
+            .list_cli_runtime_turn_binding_controls(pioneer_crud::CliRuntimeTurnBindingListFilter {
                 workspace_id: Some(key.workspace_id.clone()),
                 runtime_id: Some(key.runtime_id.clone()),
                 continuation_thread_id: Some(key.thread_id.clone()),
@@ -10347,13 +10537,14 @@ impl MessageProcessor {
             native_thread_id: native_thread_id.to_owned(),
             native_turn_id: native_turn_id.to_owned(),
         };
-        if let Some(binding) = self
-            .cli_runtime_turn_binding_cache
-            .lock()
-            .await
-            .get(&cache_key)
-            .cloned()
-        {
+        // End the global cache guard's scope before DB activity validation.
+        // An if-let scrutinee would retain it across that await and block
+        // terminal cache invalidation (and lease release) in other sessions.
+        let cached_binding = {
+            let cache = self.cli_runtime_turn_binding_cache.lock().await;
+            cache.get(&cache_key).cloned()
+        };
+        if let Some(binding) = cached_binding {
             return self
                 .cli_runtime_attempt_accepts_native_activity(
                     key,
@@ -10366,7 +10557,7 @@ impl MessageProcessor {
 
         match self
             .crud_store
-            .resolve_cli_runtime_native_turn_owner(key.runtime_id.as_str(), native_turn_id)
+            .resolve_cli_runtime_native_turn_control_owner(key.runtime_id.as_str(), native_turn_id)
             .await
         {
             Ok(Some(owner)) => {
@@ -10389,12 +10580,14 @@ impl MessageProcessor {
             }
             Ok(None) => match self
                 .crud_store
-                .list_cli_runtime_turn_bindings(pioneer_crud::CliRuntimeTurnBindingListFilter {
-                    workspace_id: Some(key.workspace_id.clone()),
-                    runtime_id: Some(key.runtime_id.clone()),
-                    continuation_thread_id: Some(key.thread_id.clone()),
-                    ..Default::default()
-                })
+                .list_cli_runtime_turn_binding_controls(
+                    pioneer_crud::CliRuntimeTurnBindingListFilter {
+                        workspace_id: Some(key.workspace_id.clone()),
+                        runtime_id: Some(key.runtime_id.clone()),
+                        continuation_thread_id: Some(key.thread_id.clone()),
+                        ..Default::default()
+                    },
+                )
                 .await
             {
                 Ok(bindings) => bindings.into_iter().find(|binding| {
@@ -10437,7 +10630,7 @@ impl MessageProcessor {
     ) -> bool {
         match self
             .crud_store
-            .resolve_cli_runtime_native_turn_owner(key.runtime_id.as_str(), native_turn_id)
+            .resolve_cli_runtime_native_turn_control_owner(key.runtime_id.as_str(), native_turn_id)
             .await
         {
             Ok(Some(owner))
@@ -10505,7 +10698,7 @@ impl MessageProcessor {
         };
         match self
             .crud_store
-            .list_cli_runtime_turn_bindings(pioneer_crud::CliRuntimeTurnBindingListFilter {
+            .list_cli_runtime_turn_binding_controls(pioneer_crud::CliRuntimeTurnBindingListFilter {
                 workspace_id: Some(key.workspace_id.clone()),
                 runtime_id: Some(key.runtime_id.clone()),
                 continuation_thread_id: Some(key.thread_id.clone()),
@@ -10706,7 +10899,7 @@ impl MessageProcessor {
         };
         let binding = self
             .crud_store
-            .get_cli_runtime_turn_binding(turn_id)
+            .get_cli_runtime_turn_binding_control(turn_id)
             .await
             .with_context(|| {
                 format!("failed to load CLI runtime turn binding for turn `{turn_id}`")
@@ -10767,7 +10960,10 @@ impl MessageProcessor {
             }
             let owner = self
                 .crud_store
-                .resolve_cli_runtime_native_turn_owner(binding.runtime_id.as_str(), native_turn_id)
+                .resolve_cli_runtime_native_turn_control_owner(
+                    binding.runtime_id.as_str(),
+                    native_turn_id,
+                )
                 .await?;
             match owner {
                 Some(owner)
@@ -10827,7 +11023,7 @@ impl MessageProcessor {
     pub(crate) async fn cleanup_completed_cli_task_fixture(&self, turn_id: &str) {
         let binding = self
             .crud_store
-            .get_cli_runtime_turn_binding(turn_id)
+            .get_cli_runtime_turn_binding_control(turn_id)
             .await
             .unwrap()
             .expect("completed CLI fixture must have a native binding");
@@ -10859,7 +11055,7 @@ impl MessageProcessor {
         let result = async {
             let Some(expected) = self
                 .crud_store
-                .cli_runtime_turn_terminal_guard(binding)
+                .cli_runtime_turn_terminal_control_guard(binding)
                 .await?
             else {
                 return Ok(false);
@@ -10914,7 +11110,7 @@ impl MessageProcessor {
         let session = self.cli_runtime_terminal_session(&expected.binding).await;
         let Some(binding) = self
             .crud_store
-            .terminalize_cli_runtime_turn_binding_guarded(
+            .terminalize_cli_runtime_turn_control_binding_guarded(
                 &expected.binding.turn_id,
                 cli_runtime_turn_status_label(expected.turn_status),
                 attempt_status,
@@ -10977,6 +11173,8 @@ impl MessageProcessor {
         native_turn_id: Option<&str>,
         session: Option<&CLIAgentRuntimeSessionHandle>,
     ) {
+        self.observe_cli_terminal_phase(&binding.turn_id, "finalize_cli_history")
+            .await;
         if !self.finalize_codex_history(binding).await {
             warn!(
                 thread_id = binding.thread_id.as_str(),
@@ -10986,6 +11184,8 @@ impl MessageProcessor {
         }
         self.mcp_service
             .cancel_turn_mcp_invocations(binding.turn_id.as_str());
+        self.observe_cli_terminal_phase(&binding.turn_id, "terminal_mcp")
+            .await;
         if let Some(handle) = session
             && let Err(error) = handle
                 .session()
@@ -10995,6 +11195,8 @@ impl MessageProcessor {
             warn!(turn_id = binding.turn_id.as_str(), error = %error,
                 "failed to terminalize CLI MCP turn lease");
         }
+        self.observe_cli_terminal_phase(&binding.turn_id, "expire_pending_requests")
+            .await;
         self.expire_cli_runtime_pending_requests_for_turn(binding.turn_id.as_str())
             .await;
         if matches!(
@@ -11009,6 +11211,8 @@ impl MessageProcessor {
             )
             .await;
         }
+        self.observe_cli_terminal_phase(&binding.turn_id, "invalidate_binding_cache")
+            .await;
         self.invalidate_cli_runtime_turn_binding_cache(binding)
             .await;
         // Last: new native admission cannot run until the transition gate drops.
@@ -11681,7 +11885,7 @@ impl MessageProcessor {
     ) -> bool {
         match self
             .crud_store
-            .list_cli_runtime_turn_bindings(pioneer_crud::CliRuntimeTurnBindingListFilter {
+            .list_cli_runtime_turn_binding_controls(pioneer_crud::CliRuntimeTurnBindingListFilter {
                 workspace_id: Some(key.workspace_id.clone()),
                 runtime_id: Some(key.runtime_id.clone()),
                 continuation_thread_id: Some(key.thread_id.clone()),
@@ -11747,7 +11951,7 @@ impl MessageProcessor {
         };
         let continuation_thread_id = if let Some(turn_id) = request.turn_id.as_deref() {
             self.crud_store
-                .get_cli_runtime_turn_binding(turn_id)
+                .get_cli_runtime_turn_binding_control(turn_id)
                 .await?
                 .map(|binding| binding.continuation_thread_id)
                 .unwrap_or_else(|| request.thread_id.clone())

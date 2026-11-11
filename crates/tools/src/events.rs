@@ -252,6 +252,7 @@ impl ToolEvent {
 
 #[derive(Debug)]
 pub struct DurableToolEventEnvelope {
+    pub correlation: pioneer_observability::scenario::Correlation,
     pub event: ToolEvent,
     committed_tx: Option<oneshot::Sender<Result<(), String>>>,
 }
@@ -697,54 +698,95 @@ impl ToolEventBus {
         pipeline_stage: &str,
         payload: ToolEventPayload,
     ) -> Result<(), ToolError> {
-        debug_assert_eq!(payload.event_class(), ProtocolEventClass::Durable);
-        let event = self.build_event(trace, attempt_id, pipeline_stage, payload);
-        let durable_tx = self
-            .durable_tx
-            .lock()
-            .map_err(|_| ToolError::execution_failed("tool durable event lane lock poisoned"))?
-            .clone();
-        match (self.durable_installed.load(Ordering::SeqCst), durable_tx) {
-            (true, Some(durable_tx)) => {
-                let (committed_tx, committed_rx) = oneshot::channel();
-                durable_tx
-                    .send(DurableToolEventEnvelope {
-                        event: event.clone(),
-                        committed_tx: Some(committed_tx),
-                    })
-                    .await
+        use pioneer_observability::{
+            scenario::Correlation,
+            tool_call::{Fact, Measurement, Phase},
+        };
+        let installed = self.durable_installed.load(Ordering::SeqCst);
+        let phase = match (pipeline_stage, installed) {
+            ("runtime.call.started", true) => Phase::LifecycleStartAck,
+            ("runtime.call.completed" | "runtime.call.failed", true) => Phase::LifecycleTerminalAck,
+            (_, true) => Phase::LifecycleOtherAck,
+            ("runtime.call.started", false) => Phase::BusStart,
+            ("runtime.call.completed" | "runtime.call.failed", false) => Phase::BusTerminal,
+            (_, false) => Phase::BusOther,
+        };
+        // Streaming deltas already have bounded lane/queue observations. Only
+        // coarse lifecycle/audit boundaries add domain spans, never each chunk.
+        let mut measurement = matches!(
+            pipeline_stage,
+            "runtime.call.started"
+                | "runtime.call.completed"
+                | "runtime.call.failed"
+                | "permission.audit"
+        )
+        .then(|| Measurement::start(phase, &Correlation::capture()));
+        let correlation = measurement
+            .as_ref()
+            .map_or_else(Correlation::capture, Measurement::correlation);
+        let result = correlation
+            .scope(async {
+                debug_assert_eq!(payload.event_class(), ProtocolEventClass::Durable);
+                let event = self.build_event(trace, attempt_id, pipeline_stage, payload);
+                let durable_tx = self
+                    .durable_tx
+                    .lock()
                     .map_err(|_| {
-                        ToolError::execution_failed(
-                            "tool durable event lane closed before lifecycle event commit",
-                        )
-                    })?;
-                committed_rx
-                    .await
-                    .map_err(|_| {
-                        ToolError::execution_failed(
-                            "tool durable event commit acknowledgement was dropped",
-                        )
+                        ToolError::execution_failed("tool durable event lane lock poisoned")
                     })?
-                    .map_err(|reason| {
-                        ToolError::execution_failed(format!(
-                            "tool durable event commit was rejected: {reason}"
-                        ))
-                    })?;
-            }
-            (true, None) => {
-                return Err(ToolError::execution_failed(
-                    "tool durable event emitted after the producer watermark",
-                ));
-            }
-            (false, None) => {}
-            (false, Some(_)) => {
-                return Err(ToolError::execution_failed(
-                    "tool durable event lane entered an invalid installation state",
-                ));
-            }
+                    .clone();
+                match (self.durable_installed.load(Ordering::SeqCst), durable_tx) {
+                    (true, Some(durable_tx)) => {
+                        let (committed_tx, committed_rx) = oneshot::channel();
+                        durable_tx
+                            .send(DurableToolEventEnvelope {
+                                correlation: correlation.clone(),
+                                event: event.clone(),
+                                committed_tx: Some(committed_tx),
+                            })
+                            .await
+                            .map_err(|_| {
+                                ToolError::execution_failed(
+                                    "tool durable event lane closed before lifecycle event commit",
+                                )
+                            })?;
+                        committed_rx
+                            .await
+                            .map_err(|_| {
+                                ToolError::execution_failed(
+                                    "tool durable event commit acknowledgement was dropped",
+                                )
+                            })?
+                            .map_err(|reason| {
+                                ToolError::execution_failed(format!(
+                                    "tool durable event commit was rejected: {reason}"
+                                ))
+                            })?;
+                    }
+                    (true, None) => {
+                        return Err(ToolError::execution_failed(
+                            "tool durable event emitted after the producer watermark",
+                        ));
+                    }
+                    (false, None) => {}
+                    (false, Some(_)) => {
+                        return Err(ToolError::execution_failed(
+                            "tool durable event lane entered an invalid installation state",
+                        ));
+                    }
+                }
+                let _ = self.tx.send(event);
+                Ok(())
+            })
+            .await;
+        if let Some(measurement) = &mut measurement {
+            measurement.finish(match &result {
+                Ok(()) if installed => Fact::Committed,
+                Ok(()) => Fact::BusOnly,
+                Err(error) => crate::observation::error_fact(error),
+            });
         }
-        let _ = self.tx.send(event);
-        Ok(())
+        result
     }
 
     pub fn finish_trace(&self, trace_id: &str) {

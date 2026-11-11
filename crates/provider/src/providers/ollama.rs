@@ -1003,6 +1003,9 @@ impl crate::traits::Provider for OllamaProvider {
                 });
 
                 ProviderModelInfo {
+                    service_modes: None,
+                    context_authority: None,
+                    context_tiers: None,
                     id: id.clone(),
                     name: m.name,
                     description,
@@ -1522,6 +1525,7 @@ mod tests {
     #[test]
     fn build_options_none_when_no_temperature() {
         let request = ChatRequest {
+            service_mode: None,
             model: "llama3".into(),
             messages: vec![ChatMessage::user("hi")],
             temperature: None,
@@ -1538,6 +1542,7 @@ mod tests {
     #[test]
     fn build_options_some_when_temperature_set() {
         let request = ChatRequest {
+            service_mode: None,
             model: "llama3".into(),
             messages: vec![ChatMessage::user("hi")],
             temperature: Some(0.5),

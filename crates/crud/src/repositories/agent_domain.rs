@@ -57,8 +57,11 @@ const AGENT_ACTION_OUTBOX_BATCH_LIMIT: u64 = 64;
 const AGENT_ACTION_OUTBOX_RANGE_LIMIT: u64 = 32;
 // Keep the existing partial-index predicate intact; the additional exclusion
 // closes corrupt detached bindings without ACKing or retrying them forever.
-const AGENT_ACTION_OUTBOX_IMMEDIATE_SQL: &str = "SELECT id FROM agent_action_outbox WHERE next_attempt_at IS NULL AND status IN ('pending','failed') AND attempts<8 AND (status='pending' OR last_error IS NULL OR last_error NOT IN ('outbox_start_integrity_rejected','outbox_start_authority_denied','outbox_start_runtime_unavailable','outbox_foreground_conflict','outbox_start_outcome_unknown')) AND (status!='failed' OR COALESCE(last_error,'')!='outbox_detached_binding_rejected') ORDER BY created_at,id LIMIT ?";
-const AGENT_ACTION_OUTBOX_TIMED_SQL: &str = "SELECT id FROM agent_action_outbox WHERE next_attempt_at IS NOT NULL AND (status='pending' OR (status='failed' AND attempts<8)) AND next_attempt_at<=? ORDER BY next_attempt_at,created_at,id LIMIT ?";
+// Pin these existing ordered ranges so the retention status index cannot
+// replace them with a broad status scan and temporary sort. SeaQuery does not
+// expose SQLite INDEXED BY; these statements keep values bound as parameters.
+const AGENT_ACTION_OUTBOX_IMMEDIATE_SQL: &str = "SELECT id FROM agent_action_outbox INDEXED BY idx_agent_action_outbox_immediate WHERE next_attempt_at IS NULL AND status IN ('pending','failed') AND attempts<8 AND (status='pending' OR last_error IS NULL OR last_error NOT IN ('outbox_start_integrity_rejected','outbox_start_authority_denied','outbox_start_runtime_unavailable','outbox_foreground_conflict','outbox_start_outcome_unknown')) AND (status!='failed' OR COALESCE(last_error,'')!='outbox_detached_binding_rejected') ORDER BY created_at,id LIMIT ?";
+const AGENT_ACTION_OUTBOX_TIMED_SQL: &str = "SELECT id FROM agent_action_outbox INDEXED BY idx_agent_action_outbox_timed WHERE next_attempt_at IS NOT NULL AND (status='pending' OR (status='failed' AND attempts<8)) AND next_attempt_at<=? ORDER BY next_attempt_at,created_at,id LIMIT ?";
 const AGENT_ACTION_OUTBOX_FAILURE_CLASS: &str = "outbox_delivery_failed";
 // An exhausted StartAgent still owes outcome reconciliation, never delivery.
 pub const AGENT_START_RECONCILIATION_REQUIRED: &str = "outbox_start_reconciliation_required";
@@ -2845,7 +2848,7 @@ pub async fn enqueue_agent_execution<C: GatewayControlConnection>(
     db: &C,
     input: &AgentQueueEntryInput,
 ) -> Result<agent_work_queue::Model> {
-    let change = db.gateway_control_change();
+    let change = db.gateway_control_change_for(&[crate::GatewayControlWake::Resources]);
     let mut changed = false;
     let result = async {
         ensure_agent_branch_schedule(
@@ -4918,22 +4921,41 @@ pub async fn next_agent_ledger_retention_at<C: ConnectionTrait>(
     now: DateTimeWithTimeZone,
 ) -> Result<Option<i64>> {
     let cutoff = now - Duration::days(AGENT_ACTION_LEDGER_PAYLOAD_RETENTION_DAYS);
-    Ok(agent_action_outbox::Entity::find()
-        .select_only()
-        .column(agent_action_outbox::Column::CreatedAt)
-        .filter(terminal_ledger_condition())
-        .filter(agent_action_outbox::Column::PayloadJson.not_like("%\"_pioneer_compacted\"%"))
-        .filter(agent_action_outbox::Column::CreatedAt.gt(cutoff))
-        .order_by_asc(agent_action_outbox::Column::CreatedAt)
-        .limit(1)
-        .into_tuple::<DateTimeWithTimeZone>()
-        .one(db)
-        .await?
-        .map(|at| {
-            crate::util::deadline_unix_seconds(
-                at + Duration::days(AGENT_ACTION_LEDGER_PAYLOAD_RETENTION_DAYS),
-            )
-        }))
+    let mut head: Option<(String, DateTimeWithTimeZone)> = None;
+    // Equality on the leading status key gives each lane its own created_at
+    // range/order. Retain the shared terminal policy (also used by compaction)
+    // and the exact legacy LIKE predicate, before LIMIT.
+    for status in ["delivered", "failed"] {
+        let candidate = agent_action_outbox::Entity::find()
+            .select_only()
+            // Compare original stored text across lanes, just as SQLite's
+            // original ORDER BY did, including legacy offset spellings.
+            .column_as(agent_action_outbox::Column::CreatedAt, "clock_key")
+            .column(agent_action_outbox::Column::CreatedAt)
+            .filter(agent_action_outbox::Column::Status.eq(status))
+            .filter(terminal_ledger_condition())
+            .filter(agent_action_outbox::Column::PayloadJson.not_like("%\"_pioneer_compacted\"%"))
+            .filter(agent_action_outbox::Column::CreatedAt.gt(cutoff))
+            .order_by_asc(agent_action_outbox::Column::CreatedAt)
+            .order_by_asc(agent_action_outbox::Column::Id)
+            .limit(1)
+            .into_tuple::<(String, DateTimeWithTimeZone)>()
+            .one(db)
+            .await?;
+        if let Some(candidate) = candidate {
+            if head
+                .as_ref()
+                .is_none_or(|previous| candidate.0 < previous.0)
+            {
+                head = Some(candidate);
+            }
+        }
+    }
+    Ok(head.map(|(_, at)| {
+        crate::util::deadline_unix_seconds(
+            at + Duration::days(AGENT_ACTION_LEDGER_PAYLOAD_RETENTION_DAYS),
+        )
+    }))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5371,6 +5393,42 @@ fn is_sha256_hex(value: &str) -> bool {
 }
 
 #[derive(FromQueryResult)]
+struct AgentActionOutboxDeadline {
+    next_attempt_at: DateTimeWithTimeZone,
+}
+
+/// Future hints only; claims and delivery/reconciliation stay authoritative.
+/// SeaQuery 1.0.2 exposes MySQL index hints but no SQLite INDEXED BY
+/// (query/select.rs, extension/mysql/select.rs, backend/sqlite/query.rs).
+/// Keep this exception limited to two scalar repository reads on the supplied
+/// connection. Literal predicates match the installed partial indexes exactly;
+/// only the full-precision clock is bound. No JSON evaluation over delivered
+/// history, canonical lookup only within the exhausted future range.
+pub async fn next_agent_action_outbox_deadline<C: ConnectionTrait>(
+    db: &C,
+    now: DateTimeWithTimeZone,
+) -> Result<Option<i64>> {
+    const ORDINARY: &str = "SELECT next_attempt_at FROM agent_action_outbox INDEXED BY idx_agent_action_outbox_timed WHERE next_attempt_at IS NOT NULL AND (status='pending' OR (status='failed' AND attempts<8)) AND next_attempt_at>? ORDER BY next_attempt_at,created_at,id LIMIT 1";
+    const EXHAUSTED: &str = "SELECT o.next_attempt_at FROM agent_action_outbox o INDEXED BY idx_agent_action_outbox_exhausted WHERE o.status IN ('pending','failed') AND o.attempts=8 AND COALESCE(CASE WHEN json_valid(payload_json) THEN json_extract(payload_json,'$.kind') END,'start_agent')='start_agent' AND COALESCE(o.next_attempt_at,'')>? AND EXISTS (SELECT 1 FROM agent_action a WHERE a.id=o.action_id AND a.action_kind='start_agent') ORDER BY COALESCE(o.next_attempt_at,''),o.created_at,o.id LIMIT 1";
+    // Merge at most two heads using SQLite's original stored-clock order.
+    // This tiny outer sort is independent of journal size. A Rust DateTime min
+    // would change legacy timestamp ordering when offsets/spellings differ.
+    let sql = format!(
+        "SELECT next_attempt_at FROM (SELECT next_attempt_at FROM ({ORDINARY}) UNION ALL SELECT next_attempt_at FROM ({EXHAUSTED})) ORDER BY next_attempt_at LIMIT 1"
+    );
+    Ok(
+        AgentActionOutboxDeadline::find_by_statement(Statement::from_sql_and_values(
+            db.get_database_backend(),
+            sql,
+            [now.into(), now.into()],
+        ))
+        .one(db)
+        .await?
+        .map(|row| crate::util::deadline_unix_seconds(row.next_attempt_at)),
+    )
+}
+
+#[derive(FromQueryResult)]
 struct AgentActionOutboxId {
     id: String,
 }
@@ -5458,7 +5516,7 @@ pub async fn claim_agent_action_outbox<C: GatewayControlConnection + Transaction
     db: &C,
     limit: u64,
 ) -> Result<AgentActionOutboxClaimBatch> {
-    let change = db.gateway_control_change();
+    let change = db.gateway_control_change_for(&[crate::GatewayControlWake::Actions]);
     let result = claim_agent_action_outbox_with_clock(db, limit, &utc_now).await;
     if let Ok(batch) = &result {
         if batch.errors.is_empty() {
@@ -5728,7 +5786,7 @@ pub async fn mark_agent_action_outbox_delivered<C: GatewayControlConnection>(
     expected_attempts: i64,
     delivered_at: DateTimeWithTimeZone,
 ) -> Result<bool> {
-    let change = db.gateway_control_change();
+    let change = db.gateway_control_change_for(&[crate::GatewayControlWake::Actions]);
     let result = async {
         let result = agent_action_outbox::Entity::update_many()
             .col_expr(
@@ -5822,7 +5880,7 @@ pub async fn mark_agent_action_outbox_failed_with_cause<C: GatewayControlConnect
     failure: AgentActionOutboxFailure,
     terminal: bool,
 ) -> Result<bool> {
-    let change = db.gateway_control_change();
+    let change = db.gateway_control_change_for(&[crate::GatewayControlWake::Actions]);
     let result = async {
         let exhausted_start = if !terminal && expected_attempts == AGENT_ACTION_OUTBOX_MAX_ATTEMPTS
         {
@@ -5897,7 +5955,7 @@ pub async fn defer_agent_action_outbox_for_permit<C: GatewayControlConnection>(
     expected_attempts: i64,
     deferred_at: DateTimeWithTimeZone,
 ) -> Result<bool> {
-    let change = db.gateway_control_change();
+    let change = db.gateway_control_change_for(&[crate::GatewayControlWake::Actions]);
     let result = async {
         let restored_attempts = expected_attempts
             .checked_sub(1)
@@ -5951,7 +6009,7 @@ pub async fn defer_agent_action_outbox_for_runtime<C: GatewayControlConnection>(
     expected_attempts: i64,
     deferred_at: DateTimeWithTimeZone,
 ) -> Result<bool> {
-    let change = db.gateway_control_change();
+    let change = db.gateway_control_change_for(&[crate::GatewayControlWake::Actions]);
     let result = async {
         let restored_attempts = expected_attempts
             .checked_sub(1)
@@ -6001,7 +6059,7 @@ pub async fn wake_agent_action_outbox_for_execution<C: GatewayControlConnection>
     execution_id: &str,
     now: DateTimeWithTimeZone,
 ) -> Result<u64> {
-    let change = db.gateway_control_change();
+    let change = db.gateway_control_change_for(&[crate::GatewayControlWake::Actions]);
     let result = async {
         let execution = agent_execution::Entity::find_by_id(execution_id.to_owned())
             .one(db)
@@ -7927,7 +7985,7 @@ pub async fn record_agent_execution_progress<C: GatewayControlConnection>(
     progress_at: DateTimeWithTimeZone,
     idle_deadline: Option<DateTimeWithTimeZone>,
 ) -> Result<bool> {
-    let change = db.gateway_control_change();
+    let change = db.gateway_control_change_for(&[crate::GatewayControlWake::Resources]);
     let result = async {
         if progress_frontier_json.len() > 16 * 1024 {
             bail!("agent execution progress frontier is too large");

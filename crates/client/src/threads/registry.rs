@@ -2,6 +2,8 @@
 
 #[path = "cold_open.rs"]
 mod cold_open;
+#[path = "opening.rs"]
+pub mod opening;
 #[path = "retirement.rs"]
 mod retirement;
 
@@ -17,6 +19,15 @@ use crate::{
         SemanticTimelineRequestAction, SemanticTimelineRequestKey, SemanticTimelineState,
     },
 };
+use pioneer_observability::opening::{
+    Consent as OpeningConsent, Fact as OpeningFact, Measure as OpeningMeasure,
+    Phase as OpeningPhase, Result as OpeningResult,
+};
+use pioneer_observability::scenario::Correlation;
+#[cfg(test)]
+use pioneer_observability::scenario::{
+    Boundary as ScenarioBoundary, Observation, Outcome, Scenario,
+};
 use pioneer_protocol::{CLIRuntimeThreadBinding, GatewayNotification, Thread};
 use serde::Serialize;
 use std::{
@@ -29,6 +40,7 @@ const INACTIVE_THREAD_LIMIT: usize = 32;
 
 /// Immutable source snapshot; the contained coordinator has no mutable shell handle.
 pub struct ThreadDomainSnapshot {
+    update: Option<pioneer_observability::updates::UpdateContext>,
     thread_id: String,
     draft_thread_id: Option<String>,
     coordinator: Arc<ThreadCoordinator>,
@@ -195,6 +207,8 @@ struct ThreadSubscriptionBaseline {
 }
 
 struct ThreadDomainStore {
+    opening_history: Option<opening::HistoryEvidence>,
+    opening_history_flight: Option<(u64, Correlation)>,
     retirement: Option<Arc<retirement::ThreadRetirement>>,
     resume_attempt: u64,
     coordinator: ThreadCoordinator,
@@ -437,6 +451,8 @@ impl ThreadDomainStore {
             subscriptions: 0,
             last_used: 0,
             generation: 0,
+            opening_history: None,
+            opening_history_flight: None,
             subscription_failed: false,
             subscription_receipt: None,
             subscription_request: None,
@@ -448,6 +464,7 @@ impl ThreadDomainStore {
 /// One owner for thread lifecycle, navigation mappings, and per-thread stores.
 #[derive(Default)]
 pub struct ThreadRegistry {
+    pub(crate) opening: Option<opening::Selection>,
     pub(crate) timeline: crate::timeline::controller::ThreadTimelineController,
     current_principal_id: Option<String>,
     stores: HashMap<String, ThreadDomainStore>,
@@ -632,10 +649,18 @@ impl ThreadRegistry {
             {
                 let mut flight = request.flight.lock().expect("subscription flight poisoned");
                 if let Some(staged) = &mut flight.cold_staging {
+                    let overflow = staged.overflow;
                     staged.push(
                         cold_open::ColdIngress::Metadata(patch.clone()),
                         encoded_bytes.get(index).copied().unwrap_or(usize::MAX),
                     );
+                    request.consent.fact(if overflow {
+                        OpeningFact::ColdDropped
+                    } else if staged.overflow {
+                        OpeningFact::ColdOverflow
+                    } else {
+                        OpeningFact::ColdStaged
+                    });
                 }
             }
             let summary = &patch.thread;
@@ -735,7 +760,32 @@ impl ThreadRegistry {
                 p.coordinator.thread().map(|t| &t.turns)
                     != store.coordinator.thread().map(|t| &t.turns)
             });
+        let update = if timeline_changed {
+            let next = pioneer_observability::updates::carried().or_else(|| {
+                pioneer_observability::updates::UpdateContext::source(
+                    pioneer_observability::updates::ContentHint::new(
+                        id,
+                        None,
+                        pioneer_observability::updates::Change::Recovery,
+                        0,
+                    ),
+                )
+            });
+            let pending = previous.filter(|previous| {
+                store.presentation.as_ref().is_none_or(|painted| {
+                    painted.timeline().source_revision() != previous.timeline_revision
+                })
+            });
+            match (pending.and_then(|previous| previous.update.as_ref()), next) {
+                (Some(old), Some(next)) => Some(old.merged(&next)),
+                (Some(old), None) => Some(old.mixed_missing()),
+                (None, next) => next,
+            }
+        } else {
+            previous.and_then(|previous| previous.update.clone())
+        };
         let mut snapshot = ThreadDomainSnapshot {
+            update,
             thread_id: id.to_owned(),
             draft_thread_id: self
                 .navigation
@@ -1564,6 +1614,10 @@ impl ClientCore {
         drafts
     }
     pub fn clear_thread_stores(&self) {
+        self.thread_registry
+            .lock()
+            .expect("thread registry poisoned")
+            .retire_opening(OpeningResult::Superseded);
         self.cancel_artifact_downloads(None);
         self.cancel_composer_requests();
         self.invalidate_task_reviews(None);
@@ -1752,20 +1806,26 @@ impl ClientCore {
         update: crate::timeline::semantic::SemanticTimelineLiveUpdate,
     ) -> bool {
         self.reduce_thread_semantic_live_update(update)
-            .map_or(false, |r| r.0)
+            .map_or(false, |result| result.0)
     }
 
     fn reduce_thread_semantic_live_update(
         &self,
         update: crate::timeline::semantic::SemanticTimelineLiveUpdate,
     ) -> Option<(bool, u64, Vec<SemanticTimelineRequestAction>)> {
+        let mut observed = pioneer_observability::updates::StageObservation::start(
+            pioneer_observability::updates::Stage::SemanticApply,
+        );
         use crate::timeline::semantic::SemanticTimelineLiveUpdate::*;
         let (id, workspace) = match &update {
             ThreadTimelineBlocksChanged(n) => (&n.thread_id, &n.workspace_id),
             TurnWorkItemsChanged(n) => (&n.thread_id, &n.workspace_id),
             TurnWorkStateChanged(n) => (&n.thread_id, &n.workspace_id),
         };
-        let mut state = self.thread_timeline_mutation(id, workspace)?;
+        let Some(mut state) = self.thread_timeline_mutation(id, workspace) else {
+            observed.finish(pioneer_observability::updates::Fact::Rejected);
+            return None;
+        };
         let generation = state.registry.stores[id].generation;
         // Record accepted-scope removals even when removing an absent value
         // leaves semantic state unchanged. Preserve the reducer's turn guards.
@@ -1811,6 +1871,11 @@ impl ClientCore {
             // Preserve the wake even when admission below returns no request.
             self.wake_thread_timeline_requests();
         }
+        observed.finish(if changed {
+            pioneer_observability::updates::Fact::Accepted
+        } else {
+            pioneer_observability::updates::Fact::NoChange
+        });
         Some((changed, generation, requests))
     }
     pub fn thread_semantic_in_flight(&self, id: &str) -> HashSet<SemanticTimelineRequestKey> {
@@ -1849,6 +1914,7 @@ impl ClientCore {
             .expect("thread registry poisoned");
         registry.clock = registry.clock.saturating_add(1);
         let generation = registry.clock;
+        registry.retire_opening(OpeningResult::TransportLost);
         registry.ready_resume.clear();
         registry.ready_resume_set.clear();
         let mut changed = Vec::new();
@@ -2026,11 +2092,16 @@ impl ClientCore {
         event: crate::conversation::ConversationEvent,
         mode: Option<pioneer_protocol::ThreadComposerExecutionMode>,
     ) -> crate::timeline::semantic::SemanticTimelineCachePatch {
+        let mut observed = pioneer_observability::updates::StageObservation::start(
+            pioneer_observability::updates::Stage::SemanticApply,
+        );
         if matches!(&event, crate::conversation::ConversationEvent::ItemDelta {delta,payload,markdown,..} if delta.is_empty() && payload.is_none() && markdown.is_none())
         {
+            observed.finish(pioneer_observability::updates::Fact::NoChange);
             return Default::default();
         }
         let Some(id) = event.thread_id().map(str::to_owned) else {
+            observed.finish(pioneer_observability::updates::Fact::Rejected);
             return Default::default();
         };
         let mut registry = self
@@ -2038,12 +2109,15 @@ impl ClientCore {
             .lock()
             .expect("thread registry poisoned");
         if self.is_stopped() || !registry.require(&id, workspace) {
+            observed.finish(pioneer_observability::updates::Fact::Rejected);
             return Default::default();
         }
         let store = registry.stores.get_mut(&id).expect("retained thread");
         let Some(patch) = store.apply_conversation_event(workspace, event, mode) else {
+            observed.finish(pioneer_observability::updates::Fact::Suppressed);
             return Default::default();
         };
+        observed.finish(pioneer_observability::updates::Fact::Accepted);
         let drafts = registry.publish(&id);
         self.transition_directory(
             &mut registry,
@@ -2092,7 +2166,15 @@ impl ClientCore {
         {
             return Default::default();
         }
-        self.activate_thread(Some(id), Some(workspace));
+        // Submission continuation is not a new selection intent.
+        self.navigate_observed(
+            crate::navigation::NavigationIntent::SelectThread {
+                workspace_id: Some(workspace.to_owned()),
+                thread_id: Some(id.to_owned()),
+            },
+            None,
+            None,
+        );
         self.promote_thread(id);
         {
             let Some(mut coordinator) = self.existing_thread_mutation(id) else {
@@ -2102,6 +2184,11 @@ impl ClientCore {
                 return Default::default();
             }
             if let Some(thread) = coordinator.thread_mut() {
+                if mode != pioneer_protocol::ThreadMode::Message {
+                    thread.context_window = update.selected_context_window;
+                    thread.service_mode = update.selected_service_mode.clone();
+                    thread.context_authority = update.selected_context_authority.clone();
+                }
                 crate::turns::start::apply_prepared_turn_to_thread_snapshot(
                     thread,
                     mode,
@@ -2528,7 +2615,15 @@ impl ClientCore {
                     self.remember_thread_draft(&r.workspace_id, Some(id));
                 }
                 if let Some(id) = r.set_active_thread_id {
-                    self.activate_thread(Some(&id), Some(&r.workspace_id));
+                    // A start notification continues the existing creation flow.
+                    self.navigate_observed(
+                        crate::navigation::NavigationIntent::SelectThread {
+                            workspace_id: Some(r.workspace_id.clone()),
+                            thread_id: Some(id),
+                        },
+                        None,
+                        None,
+                    );
                 }
                 if r.reset_thread_start {
                     *self.thread_start_mutation() = Default::default();
@@ -2672,6 +2767,7 @@ impl ThreadRegistry {
         )]
     }
     fn retire(&mut self, id: &str) -> Vec<ClientPublicationDraft> {
+        self.opening_target_retired(id);
         if !self.revisions.contains_key(id) || !self.retired.insert(id.to_owned()) {
             return Vec::new();
         }
@@ -2940,6 +3036,86 @@ impl ClientCore {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn applied_timeline_publication_and_subscription_preserve_the_snapshot_source_sidecar() {
+        let _lock = crate::OBSERVABILITY_TEST_LOCK.lock().unwrap();
+        let old = pioneer_observability::telemetry_enabled();
+        pioneer_observability::set_telemetry_enabled(true);
+        let core = core();
+        core.upsert_thread(thread("a", "ws"));
+        let scope = crate::core::ClientScope::Timeline {
+            thread_id: "a".into(),
+        };
+        let mut subscription =
+            core.subscribe(scope.clone(), std::num::NonZeroUsize::new(8).unwrap());
+        while subscription.try_next().is_some() {}
+        let page = reconciliation_page(reconciliation_history()[0..=1].to_vec(), false, true);
+        let bytes = serde_json::to_vec(&page).unwrap().len();
+        let source = pioneer_observability::updates::UpdateContext::source(
+            pioneer_observability::updates::ContentHint::new(
+                "a",
+                None,
+                pioneer_observability::updates::Change::Snapshot,
+                bytes,
+            ),
+        )
+        .unwrap();
+        // Fill the real wake envelope with an unrelated source. The selected
+        // apply then hits Full, so only its immutable source snapshot can carry
+        // the correct contributors into later materialization.
+        let (wake_tx, wake_rx) = std::sync::mpsc::sync_channel(1);
+        *core.presentation_sender.lock().unwrap() = Some(wake_tx);
+        let unrelated = pioneer_observability::updates::UpdateContext::source(
+            pioneer_observability::updates::ContentHint::new(
+                "other",
+                Some("other"),
+                pioneer_observability::updates::Change::Snapshot,
+                1,
+            ),
+        )
+        .unwrap();
+        unrelated.run(|| core.wake_thread_presentation());
+        source.run(|| {
+            core.apply_thread_timeline_page(
+                page,
+                crate::timeline::semantic::TopLevelPageMergeMode::Reset,
+            )
+        });
+        assert!(wake_rx.try_recv().is_ok());
+        unrelated.run(|| core.materialize_thread_timeline("a"));
+        let snapshot = core
+            .snapshot(&scope)
+            .expect("actual timeline owner published");
+        assert!(
+            !snapshot
+                .typed::<crate::timeline::presentation::TimelineSnapshot>()
+                .unwrap()
+                .payload()
+                .rows()
+                .is_empty()
+        );
+        let context = snapshot
+            .update_context()
+            .expect("applied source carried by snapshot");
+        assert_eq!(
+            context.hint().unwrap().change,
+            pioneer_observability::updates::Change::Snapshot
+        );
+        assert_eq!(context.hint().unwrap().bytes, bytes as u64);
+        let crate::core::ClientSubscriptionEvent::Publication { publication, .. } =
+            subscription.try_next().unwrap()
+        else {
+            panic!("finite queue should deliver the actual transaction");
+        };
+        assert_eq!(
+            publication.snapshot().sequence(),
+            snapshot.snapshot().sequence()
+        );
+        assert_eq!(publication.update_context().unwrap().hint(), context.hint());
+        core.shutdown();
+        pioneer_observability::set_telemetry_enabled(old);
+    }
     // Deterministic owner handoff cuts, absent from production.
     thread_local! {
         pub(super) static RESUME_CAPTURE_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = Default::default();
@@ -5868,6 +6044,9 @@ mod tests {
 
     fn thread(thread_id: &str, workspace_id: &str) -> Thread {
         Thread {
+            context_window: None,
+            service_mode: None,
+            context_authority: None,
             workspace_id: workspace_id.to_owned(),
             id: thread_id.to_owned(),
             name: None,
@@ -6153,6 +6332,547 @@ mod tests {
                 Err(error) => panic!("history owner did not exit: {error}"),
             }
         }
+    }
+
+    #[test]
+    fn history_controller_correlates_selected_rpc_before_handoff() {
+        crate::scenario_test_support::isolated(
+            "threads::registry::tests::history_controller_correlates_selected_rpc_before_handoff",
+            |capture| {
+                let (core, requests, waiting) = history_owner_fixture();
+                let watchdog = std::time::Duration::from_secs(5);
+                queue_history(&core, "a");
+                let (request, response) = requests.recv_timeout(watchdog).unwrap();
+                assert_eq!(request["method"], "thread/timeline/page");
+                let wire = request["params"]["_pioneer_correlation"].clone();
+                let (context, _) = response
+                    .observation_context()
+                    .expect("actual response owner carries correlation to writer");
+                let carried_wire = context.run(|| {
+                    let mut params = serde_json::json!({});
+                    pioneer_observability::scenario::inject_params(
+                        "thread/timeline/page",
+                        &mut params,
+                    );
+                    params["_pioneer_correlation"].clone()
+                });
+                assert_eq!(wire["v"], 1);
+                assert_eq!(wire["trace"].as_str().unwrap().len(), 32);
+                assert_eq!(wire["span"].as_str().unwrap().len(), 16);
+                assert_eq!(wire, carried_wire);
+                response.send(Ok(empty_history("a"))).unwrap();
+                // Worker wake boundaries synchronize reducer completion without sleeps.
+                while !core.thread_semantic_in_flight("a").is_empty() {
+                    waiting.recv_timeout(watchdog).unwrap();
+                }
+                let spans = capture.spans();
+                let spans: Vec<_> = spans
+                    .into_iter()
+                    .filter(|span| span.attributes["boundary"] == "RpcTimelinePage")
+                    .collect();
+                assert_eq!(spans.len(), 1, "one underlying RPC and terminal result");
+                assert_eq!(spans[0].attributes["boundary"], "RpcTimelinePage");
+                assert_eq!(spans[0].attributes["outcome"], "Confirmed");
+                assert_eq!(Some(spans[0].trace.as_str()), wire["trace"].as_str());
+                assert_eq!(Some(spans[0].id.as_str()), wire["span"].as_str());
+                // Shutdown retirement cannot produce a second terminal result.
+                core.shutdown();
+                wait_history_owner_exit(&waiting);
+                assert!(
+                    capture
+                        .spans()
+                        .iter()
+                        .all(|span| span.attributes["boundary"] != "RpcTimelinePage")
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn history_job_retains_producer_cause_and_does_not_revive_after_consent_rotation() {
+        crate::scenario_test_support::isolated(
+            "threads::registry::tests::history_job_retains_producer_cause_and_does_not_revive_after_consent_rotation",
+            |capture| {
+                let (core, requests, waiting) = history_owner_fixture();
+                let watchdog = std::time::Duration::from_secs(5);
+                let mut parent = Observation::start(
+                    Scenario::Opening,
+                    ScenarioBoundary::Episode,
+                    &Correlation::default(),
+                    &[],
+                );
+                let cause = parent.correlation();
+                let expected = cause.run(|| {
+                    let mut params = serde_json::json!({});
+                    pioneer_observability::scenario::inject_params(
+                        "thread/timeline/page",
+                        &mut params,
+                    );
+                    params["_pioneer_correlation"]["trace"].clone()
+                });
+                cause.run(|| queue_history(&core, "a"));
+                parent.finish(Outcome::Returned);
+                let (request, response) = requests.recv_timeout(watchdog).unwrap();
+                let wire = request["params"]["_pioneer_correlation"].clone();
+                response.send(Ok(empty_history("a"))).unwrap();
+                while !core.thread_semantic_in_flight("a").is_empty() {
+                    waiting.recv_timeout(watchdog).unwrap();
+                }
+                let spans = capture.spans();
+                let flight = spans
+                    .iter()
+                    .find(|span| {
+                        span.attributes.get("opening.phase").map(String::as_str)
+                            == Some("NewestHistoryFlight")
+                    })
+                    .unwrap();
+                assert!(
+                    flight
+                        .links
+                        .iter()
+                        .any(|(trace, _)| Some(trace.as_str()) == expected.as_str())
+                );
+                let rpc = spans
+                    .iter()
+                    .find(|span| span.attributes["boundary"] == "RpcTimelinePage")
+                    .unwrap();
+                assert_eq!(Some(rpc.trace.as_str()), wire["trace"].as_str());
+                assert_eq!(rpc.trace, flight.trace);
+                assert_eq!(rpc.parent, flight.id);
+
+                assert_eq!(
+                    spans
+                        .iter()
+                        .filter(|span| span.attributes["boundary"] == "RpcTimelinePage")
+                        .count(),
+                    1
+                );
+
+                // Admission is the producer boundary. Delay only handoff, using
+                // the real accepted job rather than a test-only context hook.
+                let job = cause
+                    .run(|| {
+                        core.begin_thread_semantic_request(
+                            SemanticTimelineRequestAction::ThreadTimelinePage {
+                                key: SemanticTimelineRequestKey::ThreadNewest {
+                                    thread_id: "b".into(),
+                                },
+                                params: pioneer_protocol::ThreadTimelinePageParams {
+                                    thread_id: "b".into(),
+                                    anchor: pioneer_protocol::TimelinePageAnchor::Newest,
+                                    limit: Some(100),
+                                },
+                            },
+                        )
+                    })
+                    .unwrap()
+                    .unwrap();
+                pioneer_observability::set_telemetry_enabled(false);
+                pioneer_observability::set_telemetry_enabled(true);
+                core.send_timeline_request(job).unwrap();
+                let (request, response) = requests.recv_timeout(watchdog).unwrap();
+                assert!(request["params"].get("_pioneer_correlation").is_none());
+                response.send(Ok(empty_history("b"))).unwrap();
+                while !core.thread_semantic_in_flight("b").is_empty() {
+                    waiting.recv_timeout(watchdog).unwrap();
+                }
+                // Re-admission within an attached old producer scope must
+                // preserve retired provenance even in the new consent epoch.
+                cause.run(|| queue_history(&core, "c"));
+                let (request, response) = requests.recv_timeout(watchdog).unwrap();
+                assert!(request["params"].get("_pioneer_correlation").is_none());
+                response.send(Ok(empty_history("c"))).unwrap();
+                while !core.thread_semantic_in_flight("c").is_empty() {
+                    waiting.recv_timeout(watchdog).unwrap();
+                }
+                core.shutdown();
+                wait_history_owner_exit(&waiting);
+                assert!(
+                    capture
+                        .spans()
+                        .iter()
+                        .all(|span| span.attributes["boundary"] != "RpcTimelinePage")
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn opening_early_intents_and_direct_navigation_have_one_episode_each() {
+        crate::scenario_test_support::isolated(
+            "threads::registry::tests::opening_early_intents_and_direct_navigation_have_one_episode_each",
+            |capture| {
+                let core = core();
+                assert!(core.open_thread_by_id("").is_err());
+                assert!(core.open_thread(thread("", "ws")).is_err());
+                assert!(
+                    core.execute_workspace_intent(
+                        crate::workspaces::intents::WorkspaceIntent::SelectThread {
+                            workspace_id: "ws".into(),
+                            thread_id: "a".into()
+                        }
+                    )
+                    .is_err()
+                );
+                core.upsert_thread(thread("a", "ws"));
+                let select = crate::navigation::NavigationIntent::SelectThread {
+                    workspace_id: Some("ws".into()),
+                    thread_id: Some("a".into()),
+                };
+                assert_eq!(
+                    core.navigate(select.clone(), None).outcome(),
+                    crate::core::ClientTransitionOutcome::Changed
+                );
+                let evidence = core.opening_evidence("a").unwrap();
+                assert!(!evidence.subscription_acknowledged);
+                assert_eq!(
+                    evidence.initial_history, None,
+                    "cached metadata is not loaded history"
+                );
+                assert_eq!(evidence.composer_core, None);
+                assert_eq!(evidence.native_inputs, None);
+                assert_eq!(
+                    core.navigate(select, None).outcome(),
+                    crate::core::ClientTransitionOutcome::Noop
+                );
+                core.shutdown();
+                assert_eq!(
+                    core.dispatch(crate::core::ClientIntent::Navigation {
+                        intent: crate::navigation::NavigationIntent::SelectThread {
+                            workspace_id: Some("ws".into()),
+                            thread_id: Some("a".into())
+                        },
+                        expected_revision: None
+                    })
+                    .outcome(),
+                    crate::core::ClientTransitionOutcome::Rejected
+                );
+                let episodes: Vec<_> = capture
+                    .spans()
+                    .into_iter()
+                    .filter(|span| {
+                        span.attributes.get("opening.phase").map(String::as_str) == Some("Intent")
+                    })
+                    .collect();
+                assert_eq!(episodes.len(), 6);
+                assert_eq!(
+                    episodes
+                        .iter()
+                        .filter(|span| span.attributes["opening.result"] == "Rejected")
+                        .count(),
+                    4
+                );
+                assert_eq!(
+                    episodes
+                        .iter()
+                        .filter(|span| span.attributes["opening.result"] == "Noop")
+                        .count(),
+                    1
+                );
+                assert_eq!(
+                    episodes
+                        .iter()
+                        .filter(|span| span.attributes["opening.result"] == "Superseded")
+                        .count(),
+                    1
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn opening_initial_empty_core_and_native_evidence_have_independent_fences() {
+        crate::scenario_test_support::isolated(
+            "threads::registry::tests::opening_initial_empty_core_and_native_evidence_have_independent_fences",
+            |capture| {
+                use crate::composer::{
+                    state_machine::{ComposerDomainAction, ComposerDomainState},
+                    store::ComposerIntent,
+                };
+                use crate::threads::opening::{ComposerReadiness, InitialHistory};
+                let (core, requests, waiting) = history_owner_fixture();
+                let mut policy = core.authorization_snapshot(None, None).unwrap();
+                let resources = pioneer_protocol::AuthorizationOperationalResourceProjection {
+                    fingerprint: "opening-policy".into(),
+                    ..Default::default()
+                };
+                policy.workspace =
+                    Some(pioneer_protocol::AuthorizationWorkspaceCapabilitySnapshot {
+                        workspace_id: "ws".into(),
+                        capabilities: Default::default(),
+                        operational_resources: resources.clone(),
+                        execution_draft_policy:
+                            pioneer_protocol::AuthorizationExecutionDraftPolicyProjection {
+                                fingerprint: "opening-policy".into(),
+                                resources,
+                                permission_options: vec![],
+                                can_attach_artifacts: false,
+                                mcp_invocation_limits: Default::default(),
+                            },
+                    });
+                policy.thread = Some(pioneer_protocol::AuthorizationThreadCapabilitySnapshot {
+                    workspace_id: "ws".into(),
+                    thread_id: "a".into(),
+                    capabilities: pioneer_protocol::AuthorizationThreadCapabilities {
+                        can_read: true,
+                        can_write: true,
+                        can_start_turn: true,
+                        ..Default::default()
+                    },
+                });
+                ClientMutationAuthority { _private: () }
+                    .accept_thread_capabilities_for_test(&core, policy);
+                core.composer_intent(ComposerIntent::Open {
+                    thread_id: "a".into(),
+                    defaults: ComposerDomainState {
+                        selected_mode: ThreadMode::Message,
+                        mode_manually_selected: true,
+                        ..Default::default()
+                    },
+                });
+                core.navigate(
+                    crate::navigation::NavigationIntent::SelectThread {
+                        workspace_id: Some("ws".into()),
+                        thread_id: Some("a".into()),
+                    },
+                    None,
+                );
+                let initial = core.opening_evidence("a").unwrap();
+                assert_eq!(initial.initial_history, None);
+                assert_eq!(
+                    initial.composer_core,
+                    Some(ComposerReadiness::Ready),
+                    "Message does not wait for a model or a catalog"
+                );
+                assert_eq!(initial.native_inputs, None);
+                acknowledge_subscription(&core, "a", "ws");
+                queue_history(&core, "a");
+                let watchdog = Duration::from_secs(5);
+                let (_, response) = requests.recv_timeout(watchdog).unwrap();
+                core.navigate(
+                    crate::navigation::NavigationIntent::SelectWorkspace {
+                        workspace_id: Some("other".into()),
+                    },
+                    None,
+                );
+                core.navigate(
+                    crate::navigation::NavigationIntent::SelectThread {
+                        workspace_id: Some("ws".into()),
+                        thread_id: Some("a".into()),
+                    },
+                    None,
+                );
+                let joined = core.opening_evidence("a").unwrap();
+                assert_ne!(initial.ticket, joined.ticket);
+                assert!(joined.subscription_acknowledged);
+                assert!(joined.initial_history_request_generation.is_some());
+                assert_eq!(joined.initial_history, None);
+                assert!(
+                    requests.try_recv().is_err(),
+                    "joining initial history is only an observation dependency"
+                );
+                response.send(Ok(empty_history("a"))).unwrap();
+                while !core.thread_semantic_in_flight("a").is_empty() {
+                    waiting.recv_timeout(watchdog).unwrap();
+                }
+                let loaded = core.opening_evidence("a").unwrap();
+                assert!(loaded.subscription_acknowledged);
+                assert_eq!(loaded.initial_history, Some(InitialHistory::Empty));
+                assert_eq!(
+                    loaded.native_inputs, None,
+                    "core and history cannot acknowledge native application"
+                );
+                // A visible timeline consumer owns presentation demand.
+                let _timeline_subscription = core.subscribe(
+                    ClientScope::Timeline {
+                        thread_id: "a".into(),
+                    },
+                    NonZeroUsize::new(8).unwrap(),
+                );
+                core.materialize_thread_timeline("a");
+                let content_publication = core
+                    .snapshot(&ClientScope::Timeline {
+                        thread_id: "a".into(),
+                    })
+                    .unwrap();
+                let content_snapshot = content_publication
+                    .typed::<crate::timeline::presentation::TimelineSnapshot>()
+                    .unwrap()
+                    .payload();
+                let content = content_publication.update_context().unwrap().correlation();
+                core.observe_opening_content_structure(
+                    "a",
+                    content_snapshot.generation(),
+                    content_snapshot.revision(),
+                    &content,
+                );
+                assert_eq!(
+                    core.opening_evidence("a")
+                        .unwrap()
+                        .content_structure_observed,
+                    None,
+                    "matching content without already applied native inputs is insufficient"
+                );
+                let input = core.composer_snapshot("a").unwrap();
+                let identity = core.snapshot(&ClientScope::Administration { workspace_id: None }).unwrap().typed::<crate::gateway::identity_authorization::IdentityAuthorizationPublication>().unwrap().payload();
+                let capability = core.thread_capability_snapshot("a").unwrap();
+                for _ in 0..2 {
+                    core.observe_opening_native(
+                        "a",
+                        &loaded.ticket,
+                        &input,
+                        &identity,
+                        Some(&capability),
+                        &core.gateway_session(),
+                        ComposerReadiness::Ready,
+                    );
+                }
+                let native = core.opening_evidence("a").unwrap();
+                assert_eq!(native.native_inputs, Some(ComposerReadiness::Ready));
+                assert_eq!(native.presentation_observed, None);
+                core.observe_opening_content_structure(
+                    "a",
+                    content_snapshot.generation(),
+                    content_snapshot.revision().wrapping_add(1),
+                    &content,
+                );
+                assert_eq!(
+                    core.opening_evidence("a")
+                        .unwrap()
+                        .content_structure_observed,
+                    None
+                );
+                for _ in 0..2 {
+                    core.observe_opening_content_structure(
+                        "a",
+                        content_snapshot.generation(),
+                        content_snapshot.revision(),
+                        &content,
+                    );
+                }
+                let matched = core.opening_evidence("a").unwrap();
+                assert_eq!(
+                    matched.content_structure_observed,
+                    Some((content_snapshot.generation(), content_snapshot.revision()))
+                );
+                assert_eq!(
+                    matched.presentation_observed, None,
+                    "structure is not whole-screen readiness"
+                );
+
+                for state in [ComposerReadiness::Busy, ComposerReadiness::Ready] {
+                    core.observe_opening_native(
+                        "a",
+                        &loaded.ticket,
+                        &input,
+                        &identity,
+                        Some(&capability),
+                        &core.gateway_session(),
+                        state,
+                    );
+                    assert_eq!(
+                        core.opening_evidence("a").unwrap().native_inputs,
+                        Some(state),
+                        "current native state may change without repeating its initial terminal"
+                    );
+                }
+                core.composer_intent(ComposerIntent::Domain {
+                    thread_id: "a".into(),
+                    draft_id: input.draft_id(),
+                    action: ComposerDomainAction::SetModeFromUser {
+                        mode: ThreadMode::Agent,
+                    },
+                });
+                core.observe_opening_native(
+                    "a",
+                    &loaded.ticket,
+                    &input,
+                    &identity,
+                    Some(&capability),
+                    &core.gateway_session(),
+                    ComposerReadiness::Ready,
+                );
+                assert_eq!(
+                    core.opening_evidence("a").unwrap().native_inputs,
+                    None,
+                    "old applied inputs cannot acknowledge a changed selection"
+                );
+                core.composer_intent(ComposerIntent::Domain {
+                    thread_id: "a".into(),
+                    draft_id: input.draft_id(),
+                    action: ComposerDomainAction::SetModeFromUser {
+                        mode: ThreadMode::Message,
+                    },
+                });
+                core.navigate(
+                    crate::navigation::NavigationIntent::SelectWorkspace {
+                        workspace_id: Some("other".into()),
+                    },
+                    None,
+                );
+                core.navigate(
+                    crate::navigation::NavigationIntent::SelectThread {
+                        workspace_id: Some("ws".into()),
+                        thread_id: Some("a".into()),
+                    },
+                    None,
+                );
+                let replacement = core.opening_evidence("a").unwrap();
+                assert_ne!(loaded.ticket, replacement.ticket);
+                assert!(replacement.subscription_acknowledged);
+                assert_eq!(replacement.initial_history, Some(InitialHistory::Empty));
+                let budget = crate::rpc::RequestBudget::new(Instant::now() + watchdog);
+                core.ensure_thread_subscription("a", "ws", &budget).unwrap();
+                assert!(
+                    requests.try_recv().is_err(),
+                    "current receipt reuse does not issue another RPC"
+                );
+                let current = core.composer_snapshot("a").unwrap();
+                core.observe_opening_native(
+                    "a",
+                    &loaded.ticket,
+                    &current,
+                    &identity,
+                    Some(&capability),
+                    &core.gateway_session(),
+                    ComposerReadiness::Ready,
+                );
+                assert_eq!(
+                    core.opening_evidence("a").unwrap().native_inputs,
+                    None,
+                    "a same-ID ABA selection has a different opening ticket"
+                );
+                queue_history(&core, "a");
+                let (_, late) = requests.recv_timeout(watchdog).unwrap();
+                core.begin_authorization_epoch(None);
+                let _ = late.send(Ok(empty_history("a")));
+                assert!(core.opening_evidence("a").is_none());
+                core.shutdown();
+                wait_history_owner_exit(&waiting);
+                let spans = capture.spans();
+                assert_eq!(
+                    spans
+                        .iter()
+                        .filter(
+                            |span| span.attributes.get("opening.phase").map(String::as_str)
+                                == Some("Native")
+                                && span.attributes.get("opening.result").map(String::as_str)
+                                    == Some("Confirmed")
+                        )
+                        .count(),
+                    1
+                );
+                assert!(
+                    spans
+                        .iter()
+                        .filter(
+                            |span| span.attributes.get("opening.phase").map(String::as_str)
+                                == Some("Intent")
+                        )
+                        .all(|span| span.attributes["outcome"] != "Confirmed")
+                );
+            },
+        );
     }
 
     #[test]
@@ -8611,6 +9331,9 @@ mod tests {
             let mut request = reconciliation_request(&receiver);
             let request_store_generation = request.generation;
             let retired = ThreadSemanticRequest {
+                history_observation: None,
+                correlation: request.correlation.clone(),
+                consent: request.consent,
                 id: request.id.clone(),
                 generation: request.generation,
                 request_generation: request.request_generation,
@@ -9516,6 +10239,9 @@ mod tests {
                             selected_model: Some("local-model".into()),
                             selected_provider: Some("local-provider".into()),
                             selected_reasoning_effort: Some("high".into()),
+                            selected_context_window: None,
+                            selected_service_mode: None,
+                            selected_context_authority: None,
                             user_text: "First local message".into(),
                             updated_at_unix: 2,
                         },
@@ -11388,6 +12114,9 @@ mod tests {
             let fresh_request = std::cell::RefCell::new(None);
             let fresh_loading = std::cell::RefCell::new(None);
             let late_old = reauthorized_before_completion.then(|| ThreadSemanticRequest {
+                history_observation: None,
+                correlation: request.correlation.clone(),
+                consent: request.consent,
                 id: request.id.clone(),
                 generation: request.generation,
                 request_generation: request.request_generation,
@@ -15260,42 +15989,157 @@ mod tests {
     }
 
     #[test]
+    fn fresh_waiter_can_join_a_flight_retired_only_for_observation() {
+        crate::scenario_test_support::isolated(
+            "threads::registry::tests::fresh_waiter_can_join_a_flight_retired_only_for_observation",
+            |capture| {
+                let (core, transport, responses, _requests) = shared_subscription_core();
+                let (request, _) = core
+                    .admit_thread_subscription("a", "ws", None, false, None)
+                    .unwrap();
+                core.execute_thread_subscription_request(request.clone());
+                let response = responses.recv_timeout(Duration::from_secs(2)).unwrap();
+                pioneer_observability::set_telemetry_enabled(false);
+                pioneer_observability::set_telemetry_enabled(true);
+                // Opt-in reopens only after the real SDK buffers are drained.
+                let consent_deadline = Instant::now() + Duration::from_secs(5);
+                while !pioneer_observability::telemetry_enabled() {
+                    assert!(
+                        Instant::now() < consent_deadline,
+                        "telemetry opt-in timed out"
+                    );
+                    std::thread::yield_now();
+                }
+                let (joined, ready) = core
+                    .admit_thread_subscription("a", "ws", None, false, None)
+                    .unwrap();
+                assert!(!ready);
+                assert_eq!(joined, request);
+                let waiter = spawn_admitted_subscription_waiter(
+                    &core,
+                    joined,
+                    crate::rpc::RequestBudget::new(Instant::now() + Duration::from_secs(2)),
+                );
+                subscription_reply(&response);
+                assert!(waiter.join().unwrap().unwrap().is_current());
+                assert_eq!(transport.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+                core.shutdown();
+                let spans = capture.spans();
+                let waits: Vec<_> = spans
+                    .iter()
+                    .filter(|span| {
+                        span.attributes.get("opening.phase").map(String::as_str)
+                            == Some("SubscriptionWait")
+                    })
+                    .collect();
+                assert_eq!(waits.len(), 1);
+                assert_eq!(waits[0].attributes["opening.result"], "Confirmed");
+                assert!(
+                    waits[0].links.is_empty(),
+                    "retired causal link cannot be reattached to fresh work"
+                );
+                assert!(
+                    spans.iter().all(|span| span
+                        .attributes
+                        .get("opening.phase")
+                        .map(String::as_str)
+                        != Some("SubscriptionFlight")),
+                    "old shared observer must stay retired while business work completes"
+                );
+            },
+        );
+    }
+
+    #[test]
     fn subscription_waiter_cancel_and_timeout_leave_other_consumer_alive() {
-        for cancel in [false, true] {
-            let (core, transport, responses, _requests) = shared_subscription_core();
-            let first_budget = crate::rpc::RequestBudget::new(
-                Instant::now()
-                    + if cancel {
-                        Duration::from_secs(2)
-                    } else {
-                        Duration::from_millis(20)
-                    },
-            );
-            let (request, _) = core
-                .admit_thread_subscription("a", "ws", None, false, None)
-                .unwrap();
-            core.execute_thread_subscription_request(request.clone());
-            let first =
-                spawn_admitted_subscription_waiter(&core, request.clone(), first_budget.clone());
-            let response = responses.recv_timeout(Duration::from_secs(2)).unwrap();
-            let other = spawn_admitted_subscription_waiter(
-                &core,
-                request,
-                crate::rpc::RequestBudget::new(Instant::now() + Duration::from_secs(2)),
-            );
-            if cancel {
-                first_budget.cancel();
-            }
-            assert!(first.join().unwrap().is_err());
-            assert!(
-                response.is_active(),
-                "individual departure must not retire shared subscription RPC"
-            );
-            subscription_reply(&response);
-            assert!(other.join().unwrap().unwrap().is_current());
-            assert_eq!(transport.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
-            core.shutdown();
-        }
+        crate::scenario_test_support::isolated(
+            "threads::registry::tests::subscription_waiter_cancel_and_timeout_leave_other_consumer_alive",
+            |capture| {
+                for cancel in [false, true] {
+                    let (core, transport, responses, _requests) = shared_subscription_core();
+                    let first_budget = crate::rpc::RequestBudget::new(
+                        Instant::now()
+                            + if cancel {
+                                Duration::from_secs(2)
+                            } else {
+                                Duration::from_millis(20)
+                            },
+                    );
+                    let (request, _) = core
+                        .admit_thread_subscription("a", "ws", None, false, None)
+                        .unwrap();
+                    core.execute_thread_subscription_request(request.clone());
+                    let first = spawn_admitted_subscription_waiter(
+                        &core,
+                        request.clone(),
+                        first_budget.clone(),
+                    );
+                    let response = responses.recv_timeout(Duration::from_secs(2)).unwrap();
+                    let other = spawn_admitted_subscription_waiter(
+                        &core,
+                        request,
+                        crate::rpc::RequestBudget::new(Instant::now() + Duration::from_secs(2)),
+                    );
+                    if cancel {
+                        first_budget.cancel();
+                    }
+                    assert!(first.join().unwrap().is_err());
+                    assert!(
+                        response.is_active(),
+                        "individual departure must not retire shared subscription RPC"
+                    );
+                    subscription_reply(&response);
+                    assert!(other.join().unwrap().unwrap().is_current());
+                    assert_eq!(transport.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+                    core.ensure_thread_subscription(
+                        "a",
+                        "ws",
+                        &crate::rpc::RequestBudget::new(Instant::now() + Duration::from_secs(2)),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        transport.calls.load(std::sync::atomic::Ordering::SeqCst),
+                        1,
+                        "ready receipt reuses the same flight result"
+                    );
+                    core.shutdown();
+                }
+
+                let spans = capture.spans();
+                let waits: Vec<_> = spans
+                    .iter()
+                    .filter(|span| {
+                        span.attributes.get("opening.phase").map(String::as_str)
+                            == Some("SubscriptionWait")
+                    })
+                    .collect();
+                assert_eq!(waits.len(), 6);
+                assert_eq!(
+                    waits
+                        .iter()
+                        .filter(|span| span.attributes["opening.result"] == "Cancelled")
+                        .count(),
+                    1
+                );
+                assert_eq!(
+                    waits
+                        .iter()
+                        .filter(|span| span.attributes["opening.result"] == "Deadline")
+                        .count(),
+                    1
+                );
+                assert_eq!(
+                    spans
+                        .iter()
+                        .filter(
+                            |span| span.attributes.get("opening.phase").map(String::as_str)
+                                == Some("SubscriptionFlight")
+                        )
+                        .count(),
+                    2
+                );
+            },
+        );
     }
 
     #[test]
@@ -15685,6 +16529,9 @@ pub(crate) struct PreparedSemanticRequest {
 
 /// An accepted request is tied to the incarnation of its source store.
 pub struct ThreadSemanticRequest {
+    history_observation: Option<OpeningMeasure>,
+    correlation: Correlation,
+    consent: OpeningConsent,
     id: String,
     generation: u64,
     request_generation: u64,
@@ -15939,6 +16786,8 @@ impl ClientCore {
         notification: bool,
         automatic_hydration: bool,
     ) -> anyhow::Result<Option<ThreadSemanticRequest>> {
+        let mut correlation = Correlation::capture();
+        let consent = OpeningConsent::capture(&correlation);
         let explicit_intent = reserved.is_none() && !notification && !automatic_hydration;
         if self.is_stopped() {
             return Ok(None);
@@ -16024,6 +16873,7 @@ impl ClientCore {
         {
             return Ok(None);
         }
+        let opening_initial = is_newest_refresh(&action);
         let action = if let Some(generation) = reserved {
             if !registry.timeline.accepts(
                 crate::timeline::semantic::semantic_timeline_request_key(&action),
@@ -16053,11 +16903,19 @@ impl ClientCore {
                     if explicit_intent {
                         registry.timeline.mark_pending_explicit(&key);
                     }
+                    if opening_initial {
+                        let generation = registry.stores[&id].generation;
+                        let request_generation = registry.timeline.request_generation(&key);
+                        registry.opening_history_request(&id, generation, request_generation, true);
+                    }
                     return Ok(None);
                 }
                 Err(action) => {
                     let expected_store = registry.stores[&id].generation;
                     let expected_request = registry.timeline.request_generation(&key);
+                    if opening_initial {
+                        registry.opening_initial_rejected(&id, expected_store);
+                    }
                     drop(registry);
                     self.fail_timeline_admission(&action, expected_store, expected_request);
                     anyhow::bail!("History pending capacity exceeded");
@@ -16093,6 +16951,27 @@ impl ClientCore {
                 },
             );
         }
+        let history_observation = opening_initial.then(|| {
+            OpeningMeasure::start_with_consent(
+                OpeningPhase::NewestHistoryFlight,
+                &Correlation::default(),
+                &[correlation.clone()],
+                consent,
+            )
+        });
+        let mut history_observation = history_observation;
+        if let Some(observation) = &mut history_observation {
+            observation.wait_for(pioneer_observability::live::WaitKind::QueueItem);
+            correlation = observation.correlation();
+            registry
+                .stores
+                .get_mut(&id)
+                .expect("accepted history store")
+                .opening_history_flight = Some((request_generation, correlation.clone()));
+        }
+        if opening_initial {
+            registry.opening_history_request(&id, generation, request_generation, false);
+        }
         let drafts = registry.publish(&id);
         self.transition_directory(
             &mut registry,
@@ -16101,6 +16980,9 @@ impl ClientCore {
             vec![],
         );
         Ok(Some(ThreadSemanticRequest {
+            history_observation,
+            correlation,
+            consent,
             id,
             generation,
             request_generation,
@@ -16177,7 +17059,8 @@ impl ClientCore {
         self.retire_thread_controller_jobs();
         let mut full = false;
         let request = if let Some(sender) = sender {
-            match sender.send(ThreadControllerRequest::Semantic(request)) {
+            let correlation = request.correlation.clone();
+            match correlation.run(|| sender.send(ThreadControllerRequest::Semantic(request))) {
                 Ok(()) => return Ok(()),
                 Err(error) => {
                     full = !sender.is_closed();
@@ -16335,6 +17218,14 @@ impl ClientCore {
                 },
             );
         }
+        if is_newest_refresh(&request.action) {
+            registry.opening_history_failed(
+                &request.id,
+                request.generation,
+                request.request_generation,
+                OpeningResult::Rejected,
+            );
+        }
         let drafts = registry.publish(&request.id);
         self.transition_directory(
             &mut registry,
@@ -16366,7 +17257,7 @@ impl ClientCore {
 
     pub(crate) fn prepare_thread_semantic_request(
         &self,
-        request: ThreadSemanticRequest,
+        mut request: ThreadSemanticRequest,
     ) -> Option<PreparedSemanticRequest> {
         use crate::timeline::semantic::*;
         if self.is_stopped() {
@@ -16448,6 +17339,9 @@ impl ClientCore {
         } else {
             rpc
         };
+        if let Some(observation) = &mut request.history_observation {
+            observation.wait_for(pioneer_observability::live::WaitKind::Reply);
+        }
         Some(PreparedSemanticRequest {
             rpc,
             request,
@@ -16470,6 +17364,9 @@ impl ClientCore {
             expected_turn,
             ..
         } = prepared;
+        if let Some(observation) = &mut request.history_observation {
+            observation.working();
+        }
         enum Page {
             Thread(
                 pioneer_protocol::ThreadTimelinePageResponse,
@@ -16594,9 +17491,22 @@ impl ClientCore {
         let valid_scope = |workspace: &str, id: &str| {
             workspace == store.coordinator.workspace_id && id == request.id
         };
+        let observation_failure = if authority_guard.as_ref().is_some_and(|guard| !guard.1)
+            || transport_guard.as_ref().is_some_and(|guard| !guard.1)
+        {
+            OpeningResult::Superseded
+        } else {
+            result
+                .as_ref()
+                .err()
+                .filter(|error| crate::rpc::json_rpc_response_error(error).is_some())
+                .map(opening::failure)
+                .unwrap_or(OpeningResult::Failed)
+        };
         let mut retryable = result.as_ref().err().is_some_and(timeline_error_retryable);
         let mut succeeded = result.is_ok();
         let mut continue_reconciliation = false;
+        let mut opening_page = None;
         match result {
             Ok(Page::Thread(mut page, mode))
                 if valid_scope(&page.workspace_id, &page.thread_id) =>
@@ -16648,6 +17558,19 @@ impl ClientCore {
                 });
                 confirm_admission_page(&mut store.coordinator.conversation, &page);
                 apply_thread_timeline_page(&mut store.semantic, page, mode);
+                if is_refresh {
+                    opening_page = store
+                        .semantic
+                        .thread(&request.id)
+                        .filter(|thread| thread.top_level.has_loaded_page)
+                        .map(|thread| {
+                            if thread.top_level.is_empty() {
+                                opening::InitialHistory::Empty
+                            } else {
+                                opening::InitialHistory::Nonempty
+                            }
+                        });
+                }
                 if let Some(status) = refresh_status {
                     set_request_status(&mut store.semantic, &refresh_key, status);
                 }
@@ -16761,6 +17684,43 @@ impl ClientCore {
             ),
             Err(_) => {}
         }
+        if opening_page.is_some() {
+            if let Some(mut observation) = request.history_observation.take() {
+                observation.finish(if authority.is_some() {
+                    OpeningResult::Confirmed
+                } else {
+                    OpeningResult::Returned
+                });
+            }
+        } else if !succeeded {
+            if let Some(mut observation) = request.history_observation.take() {
+                observation.finish(observation_failure);
+            }
+        }
+        if let (Some(history), Some(authority)) = (opening_page, authority) {
+            let (auth, socket) = authority.observation_scope();
+            let scope = registry
+                .stores
+                .get(&request.id)
+                .and_then(|store| store.subscription_receipt.as_ref())
+                .filter(|receipt| {
+                    receipt.scope.auth == auth
+                        && Some(receipt.scope.socket) == socket
+                        && *receipt.live.lock().expect("subscription receipt poisoned")
+                })
+                .map(|receipt| receipt.scope.authority);
+            if let Some(scope) = scope {
+                registry.opening_history_applied(
+                    &request.id,
+                    request.generation,
+                    request.request_generation,
+                    history,
+                    auth,
+                    scope,
+                    socket,
+                );
+            }
+        }
         let retired = registry.retire_unauthorized_targeted_requests(&request.id);
         drop(transport_guard);
         drop(authority_guard);
@@ -16784,6 +17744,21 @@ impl ClientCore {
             registry
                 .timeline
                 .finish_with_retry(&key, succeeded, retryable, self.timeline_now_ms());
+        if !succeeded
+            && is_refresh
+            && next.is_none()
+            && registry
+                .timeline
+                .next_refresh_deadline_where(|id| id == request.id)
+                .is_none()
+        {
+            registry.opening_history_failed(
+                &request.id,
+                request.generation,
+                request.request_generation,
+                observation_failure,
+            );
+        }
         let mut rejected = None;
         let next = match next.map(|action| registry.timeline.begin(action)) {
             Some(Ok(next)) => next,
@@ -17319,6 +18294,7 @@ impl ThreadSubscriptionReceipt {
     }
 }
 struct ThreadSubscriptionFlight {
+    observation: Option<OpeningMeasure>,
     queued: bool,
     completing: bool,
     deadline: std::time::Instant,
@@ -17359,6 +18335,8 @@ impl ThreadSubscriptionFailure {
 }
 #[derive(Clone)]
 pub(crate) struct ThreadSubscriptionRequest {
+    consent: OpeningConsent,
+    correlation: Correlation,
     open_existing: bool,
     pub(crate) id: String,
     pub(crate) workspace: String,
@@ -17405,6 +18383,9 @@ impl ThreadSubscriptionRequest {
         let response = {
             let mut flight = self.flight.lock().expect("subscription flight poisoned");
             if flight.result.is_none() {
+                if let Some(mut observation) = flight.observation.take() {
+                    observation.finish(OpeningResult::Superseded);
+                }
                 flight.result = Some(Err(ThreadSubscriptionFailure {
                     message: "Thread subscription retired".into(),
                     rpc: None,
@@ -17519,6 +18500,20 @@ impl HistoryIdentity {
 }
 
 impl ThreadControllerRequest {
+    pub(crate) fn observation_current(&self) -> bool {
+        match self {
+            Self::Semantic(request) => request.consent.current(),
+            Self::Subscribe(request) => request.consent.current(),
+            _ => true,
+        }
+    }
+    pub(crate) fn correlation(&self) -> Correlation {
+        match self {
+            Self::Semantic(request) => request.correlation.clone(),
+            Self::Subscribe(request) => request.correlation.clone(),
+            _ => Correlation::default(),
+        }
+    }
     pub(crate) fn history_identity(&self) -> HistoryIdentity {
         match self {
             Self::Semantic(r) => HistoryIdentity::Semantic {
@@ -18430,7 +19425,11 @@ impl ClientCore {
     // Same-target opens share the RPC/receipt. Each waiter retains its captured
     // navigation revision; the first selection retires competing UI selections,
     // while independent subscription waiters remain valid.
-    pub(crate) fn open_existing_thread_subscription(&self, id: &str) -> anyhow::Result<()> {
+    pub(crate) fn open_existing_thread_subscription(
+        &self,
+        id: &str,
+        opening: &opening::Handle,
+    ) -> anyhow::Result<()> {
         let (revision, intent) = {
             let mut registry = self
                 .thread_registry
@@ -18461,8 +19460,14 @@ impl ClientCore {
             self.execute_thread_subscription_request(request.clone());
         }
         self.wait_thread_subscription(&request, false, &budget)?;
+        let current = |valid: bool| {
+            if !valid {
+                opening.finish(OpeningResult::Superseded);
+            }
+            valid
+        };
         anyhow::ensure!(
-            self.subscription_scope_current(&request),
+            current(self.subscription_scope_current(&request)),
             "thread_open_stale"
         );
         let identity = self
@@ -18470,9 +19475,11 @@ impl ClientCore {
             .lock()
             .expect("identity owner poisoned");
         anyhow::ensure!(
-            identity.authorization_epoch() == request.authority
-                && identity.history_ticket_matches(request.auth.0)
-                && request.transport.is_current(),
+            current(
+                identity.authorization_epoch() == request.authority
+                    && identity.history_ticket_matches(request.auth.0)
+                    && request.transport.is_current()
+            ),
             "thread_open_stale"
         );
         let mut registry = self
@@ -18480,29 +19487,51 @@ impl ClientCore {
             .lock()
             .expect("thread registry poisoned");
         anyhow::ensure!(
-            registry.navigation_revision == revision
-                && registry
-                    .open_intent
-                    .as_ref()
-                    .is_some_and(|(_, generation)| *generation == intent),
+            current(
+                registry.navigation_revision == revision
+                    && registry
+                        .open_intent
+                        .as_ref()
+                        .is_some_and(|(_, generation)| *generation == intent)
+            ),
             "thread_open_stale"
         );
         let (transport_guard, transport_current) =
             request.transport.history_apply_fence(request.auth.1);
-        anyhow::ensure!(transport_current && !self.is_stopped(), "thread_open_stale");
+        anyhow::ensure!(
+            current(transport_current && !self.is_stopped()),
+            "thread_open_stale"
+        );
         let store = registry
             .stores
             .get(id)
             .filter(|store| store.retirement.is_none() && store.generation == request.generation)
-            .ok_or_else(|| anyhow::anyhow!("thread_open_stale"))?;
+            .ok_or_else(|| {
+                opening.finish(OpeningResult::Superseded);
+                anyhow::anyhow!("thread_open_stale")
+            })?;
         let workspace = store.coordinator.workspace_id.clone();
-        registry
-            .navigation
-            .apply(crate::navigation::NavigationIntent::SelectThread {
-                workspace_id: Some(workspace),
-                thread_id: Some(id.to_owned()),
-            });
-        let drafts = registry.navigation_change().into_iter().collect();
+        let selection =
+            registry
+                .navigation
+                .apply(crate::navigation::NavigationIntent::SelectThread {
+                    workspace_id: Some(workspace),
+                    thread_id: Some(id.to_owned()),
+                });
+        let drafts = registry
+            .navigation_change_observed(Some(opening))
+            .into_iter()
+            .collect();
+        if selection == crate::core::ClientTransitionOutcome::Noop {
+            opening.finish(pioneer_observability::opening::Result::Noop);
+        } else {
+            registry.accept_opening(opening);
+            registry.opening_subscription(
+                &request,
+                true,
+                pioneer_observability::opening::Fact::SubscriptionAcknowledged,
+            );
+        }
         drop(transport_guard);
         self.transition_directory(
             &mut registry,
@@ -18633,6 +19662,8 @@ impl ClientCore {
         hydrate: bool,
         expected_navigation_revision: Option<(u64, u64)>,
     ) -> anyhow::Result<(ThreadSubscriptionRequest, bool)> {
+        let producer = Correlation::capture();
+        let consent = OpeningConsent::capture(&producer);
         anyhow::ensure!(
             self.finish_pending_thread_retirement(id),
             "Thread retirement in progress"
@@ -18784,7 +19815,22 @@ impl ClientCore {
                 .lock()
                 .expect("subscription flight poisoned")
                 .hydrate |= hydrate;
-            return Ok((request.clone(), ready));
+            let request = request.clone();
+            consent.fact(if ready {
+                OpeningFact::ReadyReceipt
+            } else {
+                OpeningFact::Join
+            });
+            registry.opening_subscription(
+                &request,
+                ready,
+                if ready {
+                    OpeningFact::ReadyReceipt
+                } else {
+                    OpeningFact::Join
+                },
+            );
+            return Ok((request, ready));
         }
         if let Some(previous) = store.subscription_request.take() {
             previous.retire();
@@ -18801,7 +19847,25 @@ impl ClientCore {
         };
         let transport = transport.with_subscription_scope(live.clone());
         let store = registry.stores.get_mut(id).expect("retained thread");
+        let observation = (!ready).then(|| {
+            OpeningMeasure::start_with_consent(
+                OpeningPhase::SubscriptionFlight,
+                &Correlation::default(),
+                &[producer.clone()],
+                consent,
+            )
+        });
+        let mut observation = observation;
+        if let Some(observation) = &mut observation {
+            observation.wait_for(pioneer_observability::live::WaitKind::QueueItem);
+        }
+        let correlation = observation
+            .as_ref()
+            .map(OpeningMeasure::correlation)
+            .unwrap_or_else(|| producer.clone());
         let request = ThreadSubscriptionRequest {
+            consent,
+            correlation,
             open_existing,
             id: id.into(),
             workspace: workspace.clone(),
@@ -18812,6 +19876,7 @@ impl ClientCore {
             transport,
             live,
             flight: Arc::new(std::sync::Mutex::new(ThreadSubscriptionFlight {
+                observation,
                 queued: false,
                 completing: false,
                 deadline: std::time::Instant::now() + crate::rpc::RPC_REQUEST_TIMEOUT,
@@ -18845,6 +19910,20 @@ impl ClientCore {
                 vec![],
             );
         }
+        consent.fact(if ready {
+            OpeningFact::ReadyReceipt
+        } else {
+            OpeningFact::NewFlight
+        });
+        registry.opening_subscription(
+            &request,
+            ready,
+            if ready {
+                OpeningFact::ReadyReceipt
+            } else {
+                OpeningFact::NewFlight
+            },
+        );
         drop(registry);
         self.notify_send_readiness();
         Ok((request, ready))
@@ -18896,6 +19975,31 @@ impl ClientCore {
     }
 
     fn wait_thread_subscription(
+        &self,
+        request: &ThreadSubscriptionRequest,
+        hydrate: bool,
+        budget: &crate::rpc::RequestBudget,
+    ) -> anyhow::Result<crate::transport::ws::runtime::ConnectionRequestTransport> {
+        let mut waiter = OpeningMeasure::start(
+            OpeningPhase::SubscriptionWait,
+            &Correlation::capture(),
+            &[request.correlation.clone()],
+        );
+        waiter.wait_for(pioneer_observability::live::WaitKind::Reply);
+        let result = self.wait_thread_subscription_inner(request, hydrate, budget);
+        waiter.finish(match &result {
+            Ok(_) => OpeningResult::Confirmed,
+            Err(_) if budget.is_cancelled() => OpeningResult::Cancelled,
+            Err(_) if std::time::Instant::now() >= budget.deadline() => OpeningResult::Deadline,
+            Err(error) if crate::rpc::json_rpc_response_error(error).is_some() => {
+                opening::failure(error)
+            }
+            Err(_) if !self.subscription_scope_current(request) => OpeningResult::Superseded,
+            Err(error) => opening::failure(error),
+        });
+        result
+    }
+    fn wait_thread_subscription_inner(
         &self,
         request: &ThreadSubscriptionRequest,
         hydrate: bool,
@@ -19102,6 +20206,9 @@ impl ClientCore {
             flight.baseline = Some(baseline);
             flight.receiver = Some(rx);
             flight.response = Some(response.clone());
+            if let Some(observation) = &mut flight.observation {
+                observation.wait_for(pioneer_observability::live::WaitKind::Reply);
+            }
             response
         };
         let result = (|| -> anyhow::Result<()> {
@@ -19121,10 +20228,21 @@ impl ClientCore {
                     ))?,
                 )
             };
-            let payload = crate::rpc::build_json_rpc_request_payload(method, params)?;
-            transport
-                .send_json_rpc_request(payload.request_id, payload.payload, response.clone())
-                .map_err(anyhow::Error::msg)
+            let correlation = request
+                .consent
+                .current()
+                .then(|| request.correlation.run(|| response.observe_rpc(method)));
+            let send = || {
+                let payload = crate::rpc::build_json_rpc_request_payload(method, params)?;
+                transport
+                    .send_json_rpc_request(payload.request_id, payload.payload, response.clone())
+                    .map_err(anyhow::Error::msg)
+            };
+            if let Some(correlation) = correlation.filter(|_| request.open_existing) {
+                correlation.run(send)
+            } else {
+                request.correlation.run(send)
+            }
         })();
         if let Err(error) = result {
             let _ = response.send(Err(crate::rpc::JsonRpcResponseError::transport(format!(
@@ -19155,6 +20273,9 @@ impl ClientCore {
             if response.is_some() {
                 flight.completing = true;
                 flight.receiver = None;
+                if let Some(observation) = &mut flight.observation {
+                    observation.working();
+                }
             }
             response
         };
@@ -19162,6 +20283,7 @@ impl ClientCore {
             return;
         };
         let mut cold_actions = vec![];
+        let mut completed_update = None;
         let result = response.map_err(anyhow::Error::new).and_then(|value| {
             let response: pioneer_protocol::ThreadStartResponse =
                 crate::rpc::deserialize_json_rpc_result(
@@ -19215,6 +20337,12 @@ impl ClientCore {
             anyhow::ensure!(flight.result.is_none(), "Thread subscription retired");
             let workspace = response.thread.workspace_id.clone();
             let staged = flight.cold_staging.take();
+            // The response snapshot is another contributor besides staged ingress.
+            let update = staged
+                .as_ref()
+                .and_then(|staged| staged.update.as_ref())
+                .map(|update| update.mixed_missing());
+            completed_update = update.clone();
             anyhow::ensure!(
                 staged.as_ref().is_none_or(|staged| !staged.overflow),
                 "Cold thread open ingress capacity exhausted"
@@ -19249,10 +20377,13 @@ impl ClientCore {
                     .expect("subscription flight poisoned")
                     .hydrate = true;
             }
-            staged_drafts.extend(
-                self.apply_pending_requests_batch_locked(&mut registry, pending_reductions)
-                    .1,
-            );
+            staged_drafts.extend(pioneer_observability::updates::with_context(
+                update.clone(),
+                || {
+                    self.apply_pending_requests_batch_locked(&mut registry, pending_reductions)
+                        .1
+                },
+            ));
             let store = registry
                 .stores
                 .get_mut(&request.id)
@@ -19265,24 +20396,39 @@ impl ClientCore {
                 }
             });
             drop(_transport_guard);
-            self.transition_directory(
-                &mut registry,
-                &ClientMutationAuthority { _private: () },
-                staged_drafts,
-                vec![],
-            );
+            let publish = || {
+                self.transition_directory(
+                    &mut registry,
+                    &ClientMutationAuthority { _private: () },
+                    staged_drafts,
+                    vec![],
+                )
+            };
+            if let Some(update) = update {
+                update.run(publish);
+            } else {
+                publish();
+            }
             Ok(())
         });
         let applied = result.is_ok();
-        self.finish_thread_subscription_request(request, result);
+        let finish = || self.finish_thread_subscription_request(request, result);
+        if let Some(update) = &completed_update {
+            update.run(finish);
+        } else {
+            finish();
+        }
         if applied {
             for action in cold_actions {
-                let _ = self.schedule_thread_semantic_request_inner(
-                    action,
-                    Some(request.generation),
-                    true,
-                    false,
-                );
+                let _ =
+                    pioneer_observability::updates::with_context(completed_update.clone(), || {
+                        self.schedule_thread_semantic_request_inner(
+                            action,
+                            Some(request.generation),
+                            true,
+                            false,
+                        )
+                    });
             }
             self.retire_thread_controller_jobs();
             self.refresh_approval_actions();
@@ -19321,6 +20467,24 @@ impl ClientCore {
             if result.is_err() {
                 flight.cold_staging = None;
             }
+            if let Some(mut observation) = flight.observation.take() {
+                observation.finish(match &result {
+                    Ok(()) => OpeningResult::Confirmed,
+                    Err(_) if !current => OpeningResult::Superseded,
+                    Err(error) => match crate::rpc::json_rpc_response_error(error) {
+                        Some(crate::rpc::JsonRpcResponseError::DeadlineExceeded) => {
+                            OpeningResult::Deadline
+                        }
+                        Some(crate::rpc::JsonRpcResponseError::Transport { .. }) => {
+                            OpeningResult::TransportLost
+                        }
+                        Some(error) if error.authorization_failure().is_some() => {
+                            OpeningResult::AuthorizationDenied
+                        }
+                        _ => OpeningResult::Failed,
+                    },
+                });
+            }
             flight.result = Some(
                 result
                     .as_ref()
@@ -19346,6 +20510,12 @@ impl ClientCore {
             .thread_registry
             .lock()
             .expect("thread registry poisoned");
+        if current && result.is_ok() {
+            registry.opening_subscription(request, true, OpeningFact::SubscriptionAcknowledged);
+        }
+        if !current && request.open_existing && request.workspace.is_empty() {
+            request.consent.fact(OpeningFact::ColdRetired);
+        }
         // Rollback belongs to this exact request, not just the store generation.
         let mut rollback_reservation = false;
         if let Some(store) = registry.stores.get_mut(&request.id).filter(|store| {
@@ -19370,7 +20540,16 @@ impl ClientCore {
                 next.attempt += 1;
                 next.live = Arc::new(std::sync::Mutex::new(true));
                 next.transport = next.transport.with_subscription_scope(next.live.clone());
+                request.consent.fact(OpeningFact::Retry);
+                let observation = OpeningMeasure::start_with_consent(
+                    OpeningPhase::SubscriptionFlight,
+                    &request.correlation,
+                    &[],
+                    request.consent,
+                );
+                next.correlation = observation.correlation();
                 next.flight = Arc::new(std::sync::Mutex::new(ThreadSubscriptionFlight {
+                    observation: Some(observation),
                     queued: false,
                     completing: false,
                     deadline: std::time::Instant::now() + crate::rpc::RPC_REQUEST_TIMEOUT,
@@ -19402,6 +20581,25 @@ impl ClientCore {
                 &ClientMutationAuthority { _private: () },
                 drafts,
                 vec![],
+            );
+        }
+        if result.is_err()
+            && registry
+                .stores
+                .get(&request.id)
+                .is_none_or(|store| store.subscription_retry_at.is_none())
+        {
+            registry.opening_subscription_failed(
+                request,
+                if current {
+                    result
+                        .as_ref()
+                        .err()
+                        .map(opening::failure)
+                        .unwrap_or(OpeningResult::Unconfirmed)
+                } else {
+                    OpeningResult::Superseded
+                },
             );
         }
         if rollback_reservation {
@@ -19437,7 +20635,16 @@ impl ClientCore {
             }
         };
         if hydrate {
-            self.refresh_thread_timeline_generation(&request.id, Some(request.generation));
+            let mut hydration = OpeningMeasure::start_with_consent(
+                OpeningPhase::Hydration,
+                &request.correlation,
+                &[],
+                request.consent,
+            );
+            hydration.correlation().run(|| {
+                self.refresh_thread_timeline_generation(&request.id, Some(request.generation))
+            });
+            hydration.finish(OpeningResult::Returned);
         }
     }
 
@@ -19813,14 +21020,18 @@ impl ClientCore {
             revision,
             now,
         );
-        self.accept_thread_timeline(
-            id,
-            source.timeline_revision(),
-            generation,
-            revision,
-            snapshot,
-            changes,
-        );
+        // Wakeups can coalesce or be Full. Only this exact source snapshot
+        // carries the contributors to the content just projected above.
+        pioneer_observability::updates::with_context(source.update.clone(), || {
+            self.accept_thread_timeline(
+                id,
+                source.timeline_revision(),
+                generation,
+                revision,
+                snapshot,
+                changes,
+            )
+        });
     }
 
     fn accept_thread_timeline(
@@ -20221,6 +21432,7 @@ impl ClientCore {
 
 impl ThreadRegistry {
     pub(crate) fn fence_presentations(&mut self, principal: Option<String>) {
+        self.retire_opening(OpeningResult::Superseded);
         super::start::finish_thread_start_attempt(&mut self.start);
         self.start.next_attempt_at = None;
         self.timeline.invalidate(None);

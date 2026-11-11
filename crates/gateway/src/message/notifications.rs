@@ -2126,6 +2126,9 @@ impl MessageProcessor {
         method: &str,
         payload: &T,
     ) -> Option<String> {
+        let mut encode = pioneer_observability::updates::StageObservation::start(
+            pioneer_observability::updates::Stage::NotificationEncode,
+        );
         let markdown_stream = markdown_notification_stream(method);
         let encode_started = markdown_stream.map(|_| Instant::now());
         let mut notification = match JsonRpcNotification::from_params(method, payload) {
@@ -2157,12 +2160,14 @@ impl MessageProcessor {
                 );
                 crate::thread::replay::fail_current();
                 error!(method, error = %error, "failed to encode notification");
+                encode.finish(pioneer_observability::updates::Fact::Rejected);
                 return None;
             }
         };
 
         if let Some(params) = notification.params.as_mut() {
             pioneer_observability::turn_startup::decorate_notification(params);
+            pioneer_observability::updates::decorate(method, params);
         }
         let serialize_started = markdown_stream.map(|_| Instant::now());
         match serde_json::to_string(&notification) {
@@ -2177,6 +2182,7 @@ impl MessageProcessor {
                         Some(payload.len()),
                     );
                 }
+                encode.finish(pioneer_observability::updates::Fact::Returned);
                 Some(payload)
             }
             Err(error) => {
@@ -2196,6 +2202,7 @@ impl MessageProcessor {
                 );
                 crate::thread::replay::fail_current();
                 error!(method, error = %error, "failed to serialize notification");
+                encode.finish(pioneer_observability::updates::Fact::Rejected);
                 None
             }
         }
@@ -2208,8 +2215,15 @@ impl MessageProcessor {
         connection_ids: Vec<ConnectionId>,
     ) -> usize {
         let startup_key = pioneer_observability::turn_startup::outgoing_key(serialized);
+        let update = pioneer_observability::updates::outgoing(serialized);
         let mut accepted = 0usize;
         for target_connection_id in connection_ids {
+            let mut admission = pioneer_observability::updates::StageObservation::start(
+                pioneer_observability::updates::Stage::FanoutAdmission,
+            );
+            let mut delivery = update.as_ref().map(|context| {
+                context.boundary(pioneer_observability::scenario::Boundary::Delivery)
+            });
             if let Some(key) = startup_key.as_deref() {
                 pioneer_observability::turn_startup::queued_on_connection(
                     key,
@@ -2224,6 +2238,31 @@ impl MessageProcessor {
                     method,
                 )
                 .await;
+            if let Some(delivery) = delivery.as_mut() {
+                use pioneer_observability::updates::DeliveryOutcome;
+                pioneer_observability::updates::finish_delivery(
+                    delivery,
+                    match &outcome {
+                        Ok(crate::session::NotificationDelivery::Enqueued) => {
+                            DeliveryOutcome::Admitted
+                        }
+                        Ok(crate::session::NotificationDelivery::Discarded) => {
+                            DeliveryOutcome::Discarded
+                        }
+                        Ok(crate::session::NotificationDelivery::Reauthorize) => {
+                            DeliveryOutcome::Reauthorize
+                        }
+                        Err(_) => DeliveryOutcome::Unavailable,
+                    },
+                );
+            }
+            admission.finish(
+                if matches!(&outcome, Ok(crate::session::NotificationDelivery::Enqueued)) {
+                    pioneer_observability::updates::Fact::Accepted
+                } else {
+                    pioneer_observability::updates::Fact::Suppressed
+                },
+            );
             if let Err(error) = &outcome {
                 crate::epic5_observability::record_outcome(
                     crate::epic5_observability::Epic5Operation::Notification,

@@ -1,5 +1,6 @@
 use super::*;
 use crate::authorization::ResourceAction;
+use pioneer_observability::closing::{Closing, Fact, Phase};
 
 struct TaskObservationAdmission {
     budget: pioneer_protocol::TaskResourceBudget,
@@ -1156,6 +1157,25 @@ impl MessageProcessor {
             context.resolved_launch_identity = Some(identity);
             context.resolved_launch_profile = Some(profile);
         }
+        if let Err(error) = crate::compaction::native_budget::freeze_task_context(
+            self,
+            &params.workspace_id,
+            None,
+            &mut context,
+        )
+        .await
+        {
+            self.send_error(
+                connection_id,
+                task_public_error(
+                    Some(request_id),
+                    pioneer_protocol::PublicErrorStage::Preparation,
+                    format!("Native Task context: {error:#}"),
+                ),
+            )
+            .await;
+            return;
+        }
         context.agent_authorization_grant = task_agent_authorization_grant;
         context.execution_admission = task_execution_admission;
         if let Some(seed) = context.execution_admission.as_ref()
@@ -1707,6 +1727,7 @@ impl MessageProcessor {
         request_id: RequestId,
         params: TaskAcceptParams,
     ) {
+        let mut closing = Closing::current(Phase::ReviewRequest);
         if !self
             .require_scoped_task_proof(
                 request_context,
@@ -1717,18 +1738,22 @@ impl MessageProcessor {
             )
             .await
         {
+            closing.finish(Fact::Rejected);
             return;
         }
         let connection_id = request_context.connection_id();
         let context = Self::task_mutation_context(request_context);
-        match message_future(
-            self.task_runtime
-                .service()
-                .accept_task_result_candidate(context, params),
-        )
-        .await
+        match closing
+            .correlation()
+            .scope(message_future(
+                self.task_runtime
+                    .service()
+                    .accept_task_result_candidate(context, params),
+            ))
+            .await
         {
             Ok(response_payload) => {
+                closing.finish(Fact::Returned); // RPC service result alone is not destination delivery
                 self.send_task_response(connection_id, request_id, &response_payload)
                     .await
             }

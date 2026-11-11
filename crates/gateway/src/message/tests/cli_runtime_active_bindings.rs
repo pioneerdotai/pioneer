@@ -1,4 +1,6 @@
 use super::*;
+use crate::cli_runtime::session_instance::CliSessionInstanceOrigin;
+use crate::message::CLIRuntimeNativeTurnKey;
 use crate::message::cli_runtime::CliRuntimeStaleTurnScan;
 use crate::message::turn_handlers::CliRuntimeLaunchSpecRestore;
 use pioneer_entity::{turn, turn_cli_runtime_binding as binding, turn_liveness};
@@ -120,6 +122,50 @@ async fn control_owner_keeps_deadline_that_matures_between_portions() {
     )
     .await
     .unwrap();
+    // Persist invalid detached envelopes: dispatch rejects them locally,
+    // with no provider or runtime needed. Twelve raw claim quanta keep the
+    // real outbox runnable throughout the observations below.
+    let change = database
+        .work_signal("gateway.control")
+        .changing()
+        .with_keys(&[pioneer_crud::GatewayControlWake::Actions.key()]);
+    for batch in 0..12 {
+        agent_action::Entity::insert_many((0..32).map(|row| {
+            let id = format!("A{:020}", batch * 32 + row);
+            agent_action::ActiveModel {
+                id: Set(id.clone()),
+                execution_id: Set(owner.into()),
+                action_kind: Set("send_message".into()),
+                idempotency_key: Set(id),
+                request_fingerprint: Set("fixture".into()),
+                status: Set("committed".into()),
+                created_at: Set(at),
+                committed_at: Set(Some(at)),
+                response_json: Set(Some("{}".into())),
+            }
+        }))
+        .exec(&database)
+        .await
+        .unwrap();
+        outbox::Entity::insert_many((0..32).map(|row| outbox::ActiveModel {
+            id: Set(format!("O{:020}", batch * 32 + row)),
+            action_id: Set(format!("A{:020}", batch * 32 + row)),
+            owner_execution_id: Set(owner.into()),
+            payload_json: Set(r#"{"execution_mode":"detached_task","kind":"invalid"}"#.into()),
+            status: Set("pending".into()),
+            attempts: Set(0),
+            next_attempt_at: Set(None),
+            delivered_at: Set(None),
+            last_error: Set(None),
+            created_at: Set(at),
+        }))
+        .exec(&database)
+        .await
+        .unwrap();
+    }
+    // These fixture SQL writes stand in for the normal producer, whose
+    // commit invalidates the addressed outbox family.
+    change.completed(true);
     let target = "cutoff_deadline_target";
     materialize_cli_runtime_turn_with_text(&store, &workspace, target, target, "timeout").await;
     let now = now_timestamp_secs();
@@ -152,47 +198,11 @@ async fn control_owner_keeps_deadline_that_matures_between_portions() {
             now_timestamp_secs() < due,
             "the first timeout phase must precede the deadline"
         );
-        // Persist invalid detached envelopes: dispatch rejects them locally,
-        // with no provider or runtime needed. Twelve raw claim quanta keep the
-        // real outbox runnable throughout the observations below.
-        for batch in 0..12 {
-            agent_action::Entity::insert_many((0..32).map(|row| {
-                let id = format!("A{:020}", batch * 32 + row);
-                agent_action::ActiveModel {
-                    id: Set(id.clone()),
-                    execution_id: Set(owner.into()),
-                    action_kind: Set("send_message".into()),
-                    idempotency_key: Set(id),
-                    request_fingerprint: Set("fixture".into()),
-                    status: Set("committed".into()),
-                    created_at: Set(at),
-                    committed_at: Set(Some(at)),
-                    response_json: Set(Some("{}".into())),
-                }
-            }))
-            .exec(&database)
-            .await
-            .unwrap();
-            outbox::Entity::insert_many((0..32).map(|row| outbox::ActiveModel {
-                id: Set(format!("O{:020}", batch * 32 + row)),
-                action_id: Set(format!("A{:020}", batch * 32 + row)),
-                owner_execution_id: Set(owner.into()),
-                payload_json: Set(r#"{"execution_mode":"detached_task","kind":"invalid"}"#.into()),
-                status: Set("pending".into()),
-                attempts: Set(0),
-                next_attempt_at: Set(None),
-                delivered_at: Set(None),
-                last_error: Set(None),
-                created_at: Set(at),
-            }))
-            .exec(&database)
-            .await
-            .unwrap();
-        }
         while now_timestamp_secs() <= due {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        // No producer writes or signal injection after release. Observe up to
+        // The startup round already dispatched one action quantum. No producer
+        // writes or signal injection after release. Observe up to
         // eight real quanta, keeping the existing phase barrier armed so the
         // backlog cannot drain before we inspect durable recovery.
         for quantum in 0..8u64 {
@@ -216,7 +226,7 @@ async fn control_owner_keeps_deadline_that_matures_between_portions() {
                     .count(&database)
                     .await
                     .unwrap(),
-                32 * (quantum + 1),
+                32 * (quantum + 2),
                 "a full claim quantum must be rejected as InvalidBinding without retry"
             );
             assert!(
@@ -1171,7 +1181,15 @@ async fn cli_active_scan_defers_busy_session_without_waiting_or_refetching_pages
     )
     .await
     .expect("a busy gate must not hold the resilience worker");
-    assert_eq!((result.selected, result.processed), (128, 128));
+    assert_eq!(result.selected, 128);
+    assert_eq!(result.processed, 126);
+    let mut deferred = result
+        .deferred_transitions
+        .iter()
+        .map(|(turn, _)| turn.as_str())
+        .collect::<Vec<_>>();
+    deferred.sort_unstable();
+    assert_eq!(deferred, ["busy_running_gate", GUARDED_TURN]);
     assert!(has_recovery(&store, "busy_starting_stale").await);
     assert!(has_recovery(&store, "busy_running_stale").await);
     assert!(!has_recovery(&store, "busy_running_gate").await);
@@ -5177,4 +5195,624 @@ async fn cli_statistics_materialization_failure_rejects_ack_without_opening_reco
             assert!(!has_recovery(&store, BLOCKED_TURN).await);
         }
     }
+}
+
+#[test]
+fn control_readiness_preserves_independent_deadlines_and_isolates_failed_turns() {
+    use crate::message::control_work::{ControlWork, Family, TurnPass};
+    use pioneer_crud::GatewayControlWake as Wake;
+    let mut work = ControlWork::default();
+    work.finish(Family::Skills, Some(1000));
+    work.finish(Family::Ledger, Some(2000));
+    work.cli_snapshot(
+        [("cli-due".into(), 10), ("cli-later".into(), 100)]
+            .into_iter()
+            .collect(),
+        Some(10),
+        false,
+    );
+    work.wake(Wake::Activity("api-active".into()));
+    assert!(!work.turns["api-active"].check_state);
+    assert!(!work.ready(Family::Skills));
+    assert!(!work.ready(Family::Ledger));
+    assert!(!work.ready(Family::Cli));
+    work.due(10);
+    assert!(work.turns.contains_key("api-active"));
+    assert!(work.turns.contains_key("cli-due"));
+    assert!(!work.turns.contains_key("cli-later"));
+    assert!(!work.ready(Family::Cli));
+    work.turns.clear();
+    work.cli_turn("cli-due".into(), Some(50));
+    assert_eq!(work.deadline(), Some(50));
+    work.retry_turn("failed".into(), TurnPass::default(), 20);
+    assert!(
+        !work.has_work(),
+        "a future retry must park instead of spinning"
+    );
+    assert_eq!(work.deadline(), Some(20));
+    work.wake(Wake::Turn("new-api".into()));
+    assert_eq!(work.take_turn_ids(16), ["new-api"]);
+    work.turns.clear();
+    work.due(20);
+    assert!(work.turns.contains_key("failed"));
+    work.turns.clear();
+    work.due(50);
+    assert!(work.turns.contains_key("cli-due"));
+    assert!(!work.ready(Family::Skills));
+    assert!(!work.ready(Family::Ledger));
+    work.turns.clear();
+    work.cli_turn("cli-due".into(), None);
+    work.cli_turn("cli-later".into(), None);
+    assert_eq!(work.deadline(), Some(1000));
+    work.due(1000);
+    assert!(work.ready(Family::Skills));
+    assert!(!work.ready(Family::Ledger));
+    work.finish(Family::Skills, None);
+    work.retry(Family::Cli, 1002);
+    work.due(1002);
+    assert!(
+        work.ready(Family::Cli),
+        "a failed full source must be rediscovered even with no cached Turn heads"
+    );
+    assert!(!work.ready(Family::Ledger));
+    let mut pending = ControlWork::default();
+    pending.retry_turn(
+        "mandatory".into(),
+        TurnPass {
+            commands: true,
+            ..Default::default()
+        },
+        2000,
+    );
+    pending.wake(Wake::Activity("mandatory".into()));
+    assert!(
+        pending.turns["mandatory"].check_state,
+        "new progress cannot erase an owed lifecycle retry"
+    );
+    assert!(
+        pending.turns["mandatory"].commands,
+        "new progress cannot cancel a failed command restoration"
+    );
+    let mut pass = pending.turns.remove("mandatory").unwrap();
+    pass.command_after = Some("already-restored-prefix".into());
+    pass.command_upper = Some("captured-ceiling".into());
+    pass.command_failed = true;
+    pending.retry_turn("mandatory".into(), pass, 2000);
+    pending.wake(Wake::Turn("mandatory".into()));
+    let pass = &pending.turns["mandatory"];
+    assert!(pass.commands && pass.command_failed);
+    assert_eq!(
+        pass.command_after.as_deref(),
+        Some("already-restored-prefix")
+    );
+    assert_eq!(pass.command_upper.as_deref(), Some("captured-ceiling"));
+}
+
+// Cross the actual worker's error/backoff boundary: one failing watchdog in
+// the first page must not strand an expired watchdog on a later page. Healthy
+// rows emit no events, so partial-success masking cannot make this pass by luck.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn control_owner_reaches_later_supervision_page_after_persistent_row_failure() {
+    use crate::resilience::ProviderFailureCandidate;
+    use pioneer_entity::recovery_job;
+    use sea_orm::{ActiveModelTrait, Set};
+
+    let (processor, _, _rx, _, store, _session) = cli_runtime_approval_processor().await;
+    let database = store.database_connection();
+    database
+        .execute_unprepared("PRAGMA foreign_keys=OFF")
+        .await
+        .unwrap();
+    let processor = Arc::new(processor);
+    let outcome = tokio::time::timeout(Duration::from_secs(30), async {
+        let now = now_timestamp_secs();
+        let coordinator = &processor.recovery_coordinator;
+        let mut jobs = Vec::new();
+        for index in 0..65 {
+            let job = coordinator.enqueue_provider_failure_job(
+                &ProviderFailureCandidate {
+                    turn_id: format!("supervision_page_{index}"),
+                    item_id: "reasoning".into(),
+                    item_type: TurnItemType::Reasoning,
+                    failure: ProviderFailureDetails {
+                        raw_response: None,
+                        error_reason: None,
+                        request_id: None,
+                        provider: "openai".into(),
+                        model: "fixture".into(),
+                        transport: ProviderTransportKind::Stream,
+                        class: ProviderFailureClass::NetworkTransient,
+                        stage: ProviderFailureStage::MidStream,
+                        http_status: None,
+                        provider_code: None,
+                        retry_after_ms: None,
+                        is_recoverable_hint: true,
+                        message: Some("watchdog fixture".into()),
+                    },
+                }, now - 1000,
+            ).await.unwrap().into_job();
+            let claimed = store.claim_due_recovery_jobs(now - 999, 45, 1).await.unwrap();
+            assert_eq!(claimed.len(), 1);
+            assert_eq!(claimed[0].id, job.id);
+            assert!(matches!(store.mark_claimed_recovery_job_active(
+                &job.id,
+                claimed[0].claim_token.as_deref().unwrap(),
+                &format!("attempt_{index}"),
+                now - 999,
+            ).await.unwrap(), pioneer_crud::ClaimedRecoveryActivation::Activated));
+            jobs.push(job);
+        }
+        jobs.sort_by(|a, b| a.id.cmp(&b.id));
+        let poison = &jobs[0];
+        let tail = &jobs[64];
+        for job in &jobs[1..64] {
+            let row = recovery_job::Entity::find_by_id(job.id.clone()).one(&database).await.unwrap().unwrap();
+            let mut policy = job.policy_snapshot.clone();
+            policy["max_wall_clock_secs"] = serde_json::json!(3600);
+            let mut row: recovery_job::ActiveModel = row.into();
+            row.policy_snapshot = Set(policy.to_string());
+            row.active_attempt_started_at = Set(Some(chrono::DateTime::from_timestamp(now, 0).unwrap().fixed_offset()));
+            row.update(&database).await.unwrap();
+        }
+        database.execute_unprepared(&format!(
+            "CREATE TRIGGER reject_first_watchdog BEFORE UPDATE OF status ON recovery_job WHEN OLD.id='{}' AND NEW.status <> 'active' BEGIN SELECT RAISE(ABORT, 'persistent watchdog fixture'); END",
+            poison.id.replace('\'', "''"),
+        )).await.unwrap();
+
+        // Activate every fixture before starting the independent recovery-due
+        // owner; it must not consume the claims while they are being seeded.
+        processor.arm_completed_history_preparation_barrier("__control_after_timeout_phase__");
+        processor.start_resilience_workers().await.unwrap();
+        processor.wait_for_completed_history_preparation_barrier().await;
+        for _ in 0..3 {
+            processor.arm_completed_history_preparation_barrier("__control_after_timeout_phase__");
+            processor.release_completed_history_preparation_barrier();
+            processor.wait_for_completed_history_preparation_barrier().await;
+            if store.get_recovery_job(&tail.id).await.unwrap().unwrap().status == RecoveryJobStatus::Exhausted {
+                assert_eq!(store.get_recovery_job(&poison.id).await.unwrap().unwrap().status, RecoveryJobStatus::Active);
+                assert_eq!(store.get_recovery_job(&jobs[1].id).await.unwrap().unwrap().status, RecoveryJobStatus::Active);
+                return;
+            }
+        }
+        panic!("the later expired watchdog was stranded behind a persistent first-page error");
+    }).await;
+    processor.release_completed_history_preparation_barrier();
+    processor.shutdown_resilience_workers().await;
+    outcome.unwrap();
+}
+
+#[tokio::test]
+async fn control_activity_is_addressed_for_cli_and_api_without_repairing_foreign_binding() {
+    use crate::message::control_work::{ControlWork, Family};
+    use pioneer_crud::GatewayControlWake as Wake;
+    let (processor, _, _rx, workspace, store, session) = cli_runtime_approval_processor().await;
+    store
+        .database_connection()
+        .execute_unprepared("PRAGMA foreign_keys=OFF")
+        .await
+        .unwrap();
+    *session.turn_liveness_probe.lock().await =
+        Some(CLIAgentRuntimeTurnLivenessProbe::ConfirmedActive);
+    ensure_test_superuser_execution_turn(
+        &processor,
+        &workspace,
+        "api-control-thread",
+        "api-control-turn",
+    )
+    .await;
+    assert!(
+        store
+            .get_cli_runtime_turn_binding_control("api-control-turn")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let at = chrono::Utc::now().fixed_offset();
+    insert_turn(
+        &store,
+        &workspace,
+        "foreign-terminal-control",
+        "running",
+        at,
+        at,
+    )
+    .await;
+    store
+        .update_turn_status(
+            "foreign-terminal-control",
+            "foreign-terminal-control",
+            TurnStatus::Completed,
+            None,
+            at.timestamp(),
+        )
+        .await
+        .unwrap();
+    let database = store.database_connection();
+    let signal = database.work_signal("gateway.control");
+    let mut changes = signal.subscribe();
+    changes.begin_keyed_pass(&database).await.unwrap();
+    for turn_id in ["codex-turn-command", "api-control-turn"] {
+        // Runtime activity timestamps have second precision. Advance past the
+        // fixture's materialized activity rather than submitting a stale CAS.
+        let observed_at = store
+            .get_turn_liveness(turn_id)
+            .await
+            .unwrap()
+            .map_or(at.timestamp(), |activity| {
+                std::cmp::max(activity.last_activity_at_unix, at.timestamp())
+            })
+            + 1;
+        assert!(
+            store
+                .observe_turn_runtime_activity(turn_id, "provider/delta", observed_at)
+                .await
+                .unwrap()
+        );
+        let keys = changes.begin_keyed_pass(&database).await.unwrap().unwrap();
+        assert_eq!(keys, [Wake::Activity(turn_id.into()).key()]);
+        let mut work = ControlWork::default();
+        processor
+            .absorb_control_hints(&mut work, Some(keys))
+            .await
+            .unwrap();
+        assert_eq!(work.take_turn_ids(16), [turn_id]);
+        assert!(!work.ready(Family::Cli));
+        assert!(!work.ready(Family::Skills));
+        assert!(!work.ready(Family::Ledger));
+        let mut pass = work.turns.remove(turn_id).unwrap();
+        assert!(
+            !pass.check_state,
+            "healthy progress only refreshes this Turn's deadline"
+        );
+        let (done, _) = processor
+            .process_control_turn(turn_id, &mut pass, observed_at)
+            .await
+            .unwrap();
+        assert!(done);
+        assert_eq!(
+            store
+                .get_cli_runtime_turn_binding_control("foreign-terminal-control")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "running",
+            "addressed activity must not execute another binding's terminal repair"
+        );
+        changes.begin_keyed_pass(&database).await.unwrap();
+    }
+    // The foreign row really needs repair: a global source pass changes it.
+    let mut scan = CliRuntimeStaleTurnScan::default();
+    loop {
+        let result = processor
+            .fail_stale_cli_runtime_turns(at.timestamp_millis(), &mut scan)
+            .await;
+        if !result.has_more {
+            break;
+        }
+    }
+    assert_eq!(
+        store
+            .get_cli_runtime_turn_binding_control("foreign-terminal-control")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "completed"
+    );
+    let mut unknown = ControlWork::default();
+    processor
+        .absorb_control_hints(&mut unknown, None)
+        .await
+        .unwrap();
+    assert!(unknown.ready(Family::Cli));
+    assert!(unknown.ready(Family::Skills));
+    assert!(unknown.ready(Family::Ledger));
+}
+
+// A failed content read must not leave an accepted native completion unACKed,
+// its attempt running, or its retained admission lease occupied.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_completion_finishes_and_acks_when_optional_mapping_cannot_be_hydrated() {
+    use pioneer_entity::portable_payload;
+    use sea_orm::Set;
+
+    let temp = tempfile::tempdir().unwrap();
+    let (processor, store, _, workspace) = blocked_observation_fixture_with_receipt(
+        &temp.path().join("optional-mapping.sqlite"),
+        "codex",
+        true,
+        true,
+    )
+    .await;
+    let key = CLIAgentRuntimeSessionKey::new(&workspace, "codex", BLOCKED_THREAD).unwrap();
+    let handle = processor
+        .cli_runtime_manager
+        .as_ref()
+        .unwrap()
+        .existing_session(&key)
+        .await
+        .unwrap();
+    let lease = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
+    processor
+        .cli_runtime_session_turn_leases
+        .lock()
+        .await
+        .insert(BLOCKED_TURN.into(), (lease, handle.clone()));
+
+    // Deliberately damaged content, with valid control/attempt authority. The
+    // invalid length/digest fail the real hydration path, not an unrelated
+    // owner fence or a test replacement for the completion handler.
+    portable_payload::Entity::insert(portable_payload::ActiveModel {
+        id: Set("damaged-cli-mapping".into()),
+        family: Set("cli.mapping".into()),
+        original_bytes: Set(2),
+        original_chars: Set(2),
+        sha256: Set(vec![0; 32]),
+        raw: Set(1),
+        retired: Set(0),
+        dictionary_id: Set(None),
+    })
+    .exec(&store.database_connection())
+    .await
+    .unwrap();
+    binding::Entity::update_many()
+        .col_expr(
+            binding::Column::InputMappingJsonPayloadId,
+            Expr::value(Some("damaged-cli-mapping".to_owned())),
+        )
+        .col_expr(
+            binding::Column::InputMappingJson,
+            Expr::value(String::new()),
+        )
+        .filter(binding::Column::TurnId.eq(BLOCKED_TURN))
+        .exec(&store.database_connection())
+        .await
+        .unwrap();
+    let control = store
+        .get_cli_runtime_turn_binding_control(BLOCKED_TURN)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        store
+            .load_cli_runtime_control_mapping(&control)
+            .await
+            .is_err()
+    );
+
+    timeout(
+        Duration::from_secs(10),
+        processor.handle_cli_runtime_timeline_event(
+            handle.instance(),
+            RuntimeEvent::TurnCompleted(RuntimeTurnCompleted {
+                native_thread_id: Some(BLOCKED_NATIVE_THREAD.into()),
+                native_turn_id: BLOCKED_TURN.into(),
+                status: "completed".into(),
+                native: None,
+            }),
+        ),
+    )
+    .await
+    .expect("optional mapping failure must not interrupt terminal delivery");
+    assert_eq!(
+        store
+            .get_turn(BLOCKED_THREAD, BLOCKED_TURN)
+            .await
+            .unwrap()
+            .unwrap()
+            .1
+            .status,
+        TurnStatus::Completed
+    );
+    assert_eq!(
+        store
+            .latest_cli_runtime_turn_attempt(BLOCKED_TURN)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        pioneer_crud::CliRuntimeTurnAttemptStatus::Completed
+    );
+    assert!(
+        !store
+            .has_pending_cli_runtime_terminal_event(BLOCKED_TURN)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !processor
+            .cli_runtime_session_turn_leases
+            .lock()
+            .await
+            .contains_key(BLOCKED_TURN)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_cached_activity_waiting_for_database_does_not_block_other_session_cache_access() {
+    use futures_util::FutureExt;
+    let temp = tempfile::tempdir().unwrap();
+    let (processor, store, _, workspace) = blocked_observation_fixture_with_receipt(
+        &temp.path().join("cache-reader-wait.sqlite"),
+        "codex",
+        true,
+        true,
+    )
+    .await;
+    let key = CLIAgentRuntimeSessionKey::new(&workspace, "codex", BLOCKED_THREAD).unwrap();
+    let handle = processor
+        .cli_runtime_manager
+        .as_ref()
+        .unwrap()
+        .existing_session(&key)
+        .await
+        .unwrap();
+    let binding = store
+        .get_cli_runtime_turn_binding_control(BLOCKED_TURN)
+        .await
+        .unwrap()
+        .unwrap();
+    processor
+        .cli_runtime_turn_binding_cache
+        .lock()
+        .await
+        .insert(
+            CLIRuntimeNativeTurnKey {
+                workspace_id: workspace,
+                runtime_id: "codex".into(),
+                thread_id: BLOCKED_THREAD.into(),
+                session_generation: handle.instance().generation(),
+                native_thread_id: BLOCKED_NATIVE_THREAD.into(),
+                native_turn_id: BLOCKED_TURN.into(),
+            },
+            binding,
+        );
+
+    // Exhaust the existing Maintenance reader capacity. The scoped processor's
+    // next native activity validation must wait, without retaining the cache.
+    let maintenance = store.database_connection().maintenance();
+    let reader = maintenance.begin_read().await.unwrap();
+    let mut event = Box::pin(processor.handle_cli_runtime_timeline_event(
+        handle.instance(),
+        ordinary_native_failure(BLOCKED_NATIVE_THREAD, BLOCKED_TURN),
+    ));
+    assert!(event.as_mut().now_or_never().is_none());
+    let cache = processor
+        .cli_runtime_turn_binding_cache
+        .try_lock()
+        .expect("another session's terminal invalidation must not wait for this DB read");
+    assert_eq!(cache.len(), 1);
+    drop(cache);
+    drop(event);
+    reader.rollback().await.unwrap();
+    assert!(processor.cli_runtime_turn_binding_cache.try_lock().is_ok());
+    assert!(
+        store
+            .latest_cli_runtime_turn_attempt(BLOCKED_TURN)
+            .await
+            .unwrap()
+            .unwrap()
+            .status
+            .is_active()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_control_owner_retries_terminal_cleanup_on_gate_release_without_another_event() {
+    let temp = tempfile::tempdir().unwrap();
+    let (processor, store, _, workspace) = blocked_observation_fixture_with_receipt(
+        &temp.path().join("terminal-gate-release.sqlite"),
+        "codex",
+        true,
+        true,
+    )
+    .await;
+    let processor = Arc::new(processor);
+    let key = CLIAgentRuntimeSessionKey::new(&workspace, "codex", BLOCKED_THREAD).unwrap();
+    let handle = processor
+        .cli_runtime_manager
+        .as_ref()
+        .unwrap()
+        .existing_session(&key)
+        .await
+        .unwrap();
+    let lease = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
+    processor
+        .cli_runtime_session_turn_leases
+        .lock()
+        .await
+        .insert(BLOCKED_TURN.into(), (lease, handle));
+    processor.arm_completed_history_preparation_barrier("__control_before_wait__");
+    processor.start_resilience_workers().await.unwrap();
+    let result = timeout(Duration::from_secs(10), async {
+        // Finish startup on a consistent active Turn, then exercise an addressed
+        // terminal mutation after initial discovery has reached EOF.
+        processor
+            .wait_for_completed_history_preparation_barrier()
+            .await;
+        let gate = processor
+            .cli_runtime_session_transition_mutex(&key)
+            .await
+            .lock_owned()
+            .await;
+        store
+            .update_turn_status(
+                BLOCKED_THREAD,
+                BLOCKED_TURN,
+                TurnStatus::Completed,
+                None,
+                chrono::Utc::now().timestamp(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                processor
+                    .refresh_cli_control_turn(BLOCKED_TURN, chrono::Utc::now().timestamp(), true)
+                    .await
+                    .unwrap(),
+                crate::message::control_work::CliTurnReadiness::Waiting(_)
+            ),
+            "contention is owed work, not a healthy liveness deadline"
+        );
+        processor.arm_completed_history_preparation_barrier("__control_before_wait__");
+        processor.release_completed_history_preparation_barrier();
+        processor
+            .wait_for_completed_history_preparation_barrier()
+            .await;
+        assert!(
+            store
+                .latest_cli_runtime_turn_attempt(BLOCKED_TURN)
+                .await
+                .unwrap()
+                .unwrap()
+                .status
+                .is_active()
+        );
+        assert!(
+            processor
+                .cli_runtime_session_turn_leases
+                .lock()
+                .await
+                .contains_key(BLOCKED_TURN)
+        );
+        // Release before the owner enters select: no producer or DB mutation
+        // follows this. Gate availability alone must retain the owed retry.
+        drop(gate);
+        processor.release_completed_history_preparation_barrier();
+        loop {
+            if !processor
+                .cli_runtime_session_turn_leases
+                .lock()
+                .await
+                .contains_key(BLOCKED_TURN)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            store
+                .latest_cli_runtime_turn_attempt(BLOCKED_TURN)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            pioneer_crud::CliRuntimeTurnAttemptStatus::Completed
+        );
+        assert_eq!(
+            store
+                .get_cli_runtime_turn_binding_control(BLOCKED_TURN)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "completed"
+        );
+    })
+    .await;
+    processor.release_completed_history_preparation_barrier();
+    processor.shutdown_resilience_workers().await;
+    result.expect("gate release must wake terminal cleanup without waiting for the stale deadline");
 }

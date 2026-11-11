@@ -956,6 +956,8 @@ pub(super) struct DetachedAgentThreadAdmission {
 // The final serialized request is prepared and budget-checked before the parent
 // is durable. Only the separate authorization context is built after admission.
 struct ComposerDetachedTaskPlan {
+    native_context: Option<pioneer_protocol::NativeContextBudget>,
+    native_summary: Option<pioneer_protocol::NativeSummaryContext>,
     prepared: pioneer_tasks::PreparedComposerTask,
     resolved_launch: Option<(
         pioneer_protocol::AgentIdentityProjection,
@@ -1156,6 +1158,7 @@ fn execution_backend_allows_agent_skill_overlay(
 pub(super) struct CliRuntimeSessionTurnLocks {
     lease: Arc<tokio::sync::Mutex<()>>,
     transition: Arc<tokio::sync::Mutex<()>>,
+    terminal_phase: Option<(String, &'static str, std::time::Instant)>,
 }
 
 impl MessageProcessor {
@@ -2425,7 +2428,48 @@ impl MessageProcessor {
                         "invalid Composer Task request: {error:#}"
                     ))
                 })?;
+            let native_context = if security_snapshot.backend.execution_backend
+                == pioneer_protocol::TurnSecurityExecutionBackendKind::Native
+            {
+                let provider = self
+                    .provider_registry
+                    .get_or_create_for_workspace(&thread.workspace_id, &task_model_provider)
+                    .map_err(|e| TurnStartFailure::unavailable(e.to_string()))?;
+                crate::compaction::native_budget::validate_manual_authority(
+                    provider.as_ref(),
+                    &outcome.materialization.thread.model,
+                    launch.context_window,
+                    launch.context_authority.as_deref(),
+                )
+                .map_err(|error| TurnStartFailure::policy_denied(error.to_string()))?;
+                Some(
+                    crate::compaction::native_budget::capture_with_mode(
+                        provider.as_ref(),
+                        &task_model_provider,
+                        &outcome.materialization.thread.model,
+                        launch.context_window,
+                        launch.service_mode.as_ref(),
+                    )
+                    .await
+                    .map_err(|e| TurnStartFailure::policy_denied(e.to_string()))?,
+                )
+            } else {
+                None
+            };
+            let native_summary = if let Some(budget) = &native_context {
+                crate::compaction::native_budget::capture_summary(
+                    self,
+                    &thread.workspace_id,
+                    budget,
+                )
+                .await
+                .map_err(|e| TurnStartFailure::unavailable(e.to_string()))?
+            } else {
+                None
+            };
             Ok(ComposerDetachedTaskPlan {
+                native_context,
+                native_summary,
                 prepared,
                 resolved_launch,
             })
@@ -2889,6 +2933,8 @@ impl MessageProcessor {
             .await;
         let task_created = message_future(async {
             let ComposerDetachedTaskPlan {
+                native_context,
+                native_summary,
                 prepared,
                 resolved_launch,
             } = task_plan;
@@ -2982,6 +3028,8 @@ impl MessageProcessor {
                     ..Default::default()
                 }
             };
+            create_context.native_context = native_context;
+            create_context.native_summary = native_summary;
             create_context.execution_admission = Some(pioneer_tasks::TaskExecutionAdmissionSeed {
                 workspace_id: task_execution_context.workspace_id().to_owned(),
                 root_thread_id: task_execution_context.root_thread_id().to_owned(),
@@ -5714,6 +5762,7 @@ impl MessageProcessor {
                             {
                                 Ok(true) => {}
                                 Ok(false) => {
+                                    self.report_cli_admission_wait_owner(&session_key, &response_turn_id).await;
                                     send_turn_start_failure!(
                                         "task run ended while waiting for its CLI runtime continuation"
                                             .to_owned()
@@ -5762,6 +5811,7 @@ impl MessageProcessor {
                             {
                                 Ok(true) => {}
                                 Ok(false) => {
+                                    self.report_cli_admission_wait_owner(&session_key, &response_turn_id).await;
                                     send_turn_start_failure!(
                                         "task run ended while waiting for its CLI runtime continuation"
                                             .to_owned()
@@ -5844,7 +5894,7 @@ impl MessageProcessor {
                         "pending CLI fork belongs to a different runtime or workspace");
                     let intent = crate::cli_runtime::thread_binding::pending_codex_fork_intent(pending)?
                         .context("pending Codex fork has no recoverable marker")?;
-                    let source = self.crud_store.get_cli_runtime_turn_binding(intent.source_turn_id.as_str()).await?
+                    let source = self.crud_store.get_cli_runtime_turn_binding_control(intent.source_turn_id.as_str()).await?
                         .context("pending Codex fork source turn is missing")?;
                     anyhow::ensure!(source.status == "completed"
                         && source.native_thread_id == pending.native_thread_id
@@ -6128,7 +6178,7 @@ impl MessageProcessor {
                             return None;
                         }
                     };
-                    let turn_binding = match self.crud_store.get_cli_runtime_turn_binding(attempt.id.as_str()).await {
+                    let turn_binding = match self.crud_store.get_cli_runtime_turn_binding_control(attempt.id.as_str()).await {
                         Ok(binding) => binding,
                         Err(error) => {
                             send_turn_start_failure!(format!("failed to inspect prepared fork attempt: {error:#}"));
@@ -9654,7 +9704,7 @@ impl MessageProcessor {
         }
         let terminal_source = self
             .crud_store
-            .cli_runtime_turn_terminal_guard_by_id(&binding.turn_id)
+            .cli_runtime_turn_terminal_control_guard_by_id(&binding.turn_id)
             .await?
             .and_then(|snapshot| snapshot.terminal_event_source())
             .map(|source| {
@@ -10222,7 +10272,7 @@ impl MessageProcessor {
     ) -> anyhow::Result<Option<String>> {
         let bindings = self
             .crud_store
-            .list_cli_runtime_turn_bindings(pioneer_crud::CliRuntimeTurnBindingListFilter {
+            .list_cli_runtime_turn_binding_controls(pioneer_crud::CliRuntimeTurnBindingListFilter {
                 workspace_id: Some(key.workspace_id.clone()),
                 runtime_id: Some(key.runtime_id.clone()),
                 continuation_thread_id: Some(key.thread_id.clone()),
@@ -10379,7 +10429,7 @@ impl MessageProcessor {
             let activity = tokio::select! {
                 biased;
                 _ = cancellation.cancelled() => break,
-                result = store.list_cli_runtime_turn_bindings(pioneer_crud::CliRuntimeTurnBindingListFilter {
+                result = store.list_cli_runtime_turn_binding_controls(pioneer_crud::CliRuntimeTurnBindingListFilter {
                     workspace_id: Some(key.workspace_id.clone()),
                     runtime_id: Some(key.runtime_id.clone()),
                     continuation_thread_id: Some(key.thread_id.clone()),
@@ -10474,7 +10524,7 @@ impl MessageProcessor {
     ) -> anyhow::Result<Option<tokio::sync::OwnedMutexGuard<()>>> {
         let Some(binding) = self
             .crud_store
-            .get_cli_runtime_turn_binding(turn_id)
+            .get_cli_runtime_turn_binding_control(turn_id)
             .await?
         else {
             return Ok(None);
@@ -10540,6 +10590,62 @@ impl MessageProcessor {
             .lock()
             .await
             .insert(turn_id.to_owned(), (lease, session));
+    }
+
+    // Advisory phase state lives in the existing session gate, not a new
+    // worker/map. Never hold the lease registry while awaiting the gate registry.
+    pub(crate) async fn observe_cli_terminal_phase(&self, turn_id: &str, phase: &'static str) {
+        let key = {
+            let leases = self.cli_runtime_session_turn_leases.lock().await;
+            leases
+                .get(turn_id)
+                .map(|(_, session)| session.instance().key().clone())
+        };
+        if let Some(key) = key {
+            let mut gates = self.cli_runtime_session_turn_mutexes.lock().await;
+            if let Some(gate) = gates.get_mut(&key) {
+                gate.terminal_phase = Some((turn_id.to_owned(), phase, std::time::Instant::now()));
+            }
+        }
+    }
+
+    async fn report_cli_admission_wait_owner(
+        &self,
+        key: &crate::cli_runtime::manager::CLIAgentRuntimeSessionKey,
+        waiting_turn_id: &str,
+    ) {
+        let owner = {
+            let leases = self.cli_runtime_session_turn_leases.lock().await;
+            leases
+                .iter()
+                .find(|(_, (_, session))| session.instance().key() == key)
+                .map(|(turn, (_, session))| (turn.clone(), session.instance().generation()))
+        };
+        if let Some((blocking_turn_id, session_generation)) = owner {
+            let progress = {
+                let gates = self.cli_runtime_session_turn_mutexes.lock().await;
+                gates
+                    .get(key)
+                    .and_then(|g| g.terminal_phase.as_ref())
+                    .filter(|(turn, _, _)| turn == &blocking_turn_id)
+                    .map(|(_, phase, since)| (*phase, since.elapsed().as_millis() as u64))
+            };
+            let (last_phase, phase_elapsed_ms) = progress.unwrap_or(("native_turn", 0));
+            warn!(
+                waiting_turn_id,
+                blocking_turn_id,
+                session_generation,
+                last_phase,
+                phase_elapsed_ms,
+                "CLI admission stopped while waiting for retained turn ownership"
+            );
+        } else {
+            warn!(
+                waiting_turn_id,
+                last_phase = "owner_not_retained",
+                "CLI admission stopped without a retained turn owner"
+            );
+        }
     }
 
     pub(crate) async fn release_cli_runtime_session_turn_lease(&self, turn_id: &str) {
@@ -10610,6 +10716,54 @@ impl MessageProcessor {
                     },
                 )?
             };
+            if outcome.materialization.turn.mode != pioneer_protocol::ThreadMode::Message
+                && snapshot.backend.execution_backend
+                    == pioneer_protocol::TurnSecurityExecutionBackendKind::Native
+                && snapshot.native_context.is_none()
+            {
+                let thread = &outcome.materialization.thread;
+                let provider = self
+                    .provider_registry
+                    .get_or_create_for_workspace(&thread.workspace_id, &thread.model_provider)
+                    .map_err(|e| {
+                        TurnStartFailure::unavailable(format!(
+                            "Native context provider unavailable: {e:#}"
+                        ))
+                    })?;
+                crate::compaction::native_budget::validate_manual_authority(
+                    provider.as_ref(),
+                    &thread.model,
+                    params.context_window,
+                    params.context_authority.as_deref(),
+                )
+                .map_err(|error| TurnStartFailure::policy_denied(error.to_string()))?;
+                snapshot.native_context = Some(
+                    crate::compaction::native_budget::capture_with_mode(
+                        provider.as_ref(),
+                        &thread.model_provider,
+                        &thread.model,
+                        params.context_window,
+                        params.service_mode.as_ref(),
+                    )
+                    .await
+                    .map_err(|e| {
+                        TurnStartFailure::policy_denied(format!("Native context selection: {e:#}"))
+                    })?,
+                );
+            }
+            if let Some(working) = &snapshot.native_context {
+                if snapshot.native_summary.is_none() {
+                    snapshot.native_summary = crate::compaction::native_budget::capture_summary(
+                        self,
+                        &outcome.materialization.thread.workspace_id,
+                        working,
+                    )
+                    .await
+                    .map_err(|e| {
+                        TurnStartFailure::unavailable(format!("Native summary context: {e:#}"))
+                    })?;
+                }
+            }
             snapshot.authority_cap.resource_binding_revision =
                 execution_authority.policy_revision();
             self.add_native_turn_runtime_sandbox_roots(
@@ -11034,6 +11188,9 @@ impl MessageProcessor {
                 CLIAgentRuntimeKind::OpenCode => pioneer_compaction::Transport::OpenCode,
             };
             let current = pioneer_compaction::ModelSelection {
+                context_window: None,
+                service_mode: None,
+                context_authority: None,
                 transport,
                 instance: runtime_id.to_owned(),
                 model: model.to_owned(),
@@ -12118,7 +12275,7 @@ impl MessageProcessor {
 
         let cli_turn_binding = match self
             .crud_store
-            .get_cli_runtime_turn_binding(turn_id.as_str())
+            .get_cli_runtime_turn_binding_control(turn_id.as_str())
             .await
         {
             Ok(binding) => binding,
@@ -12334,7 +12491,7 @@ impl MessageProcessor {
     ) -> anyhow::Result<bool> {
         let Some(binding) = self
             .crud_store
-            .get_cli_runtime_turn_binding(turn_id)
+            .get_cli_runtime_turn_binding_control(turn_id)
             .await?
         else {
             return Ok(false);
@@ -12347,7 +12504,7 @@ impl MessageProcessor {
         }
         let expected = self
             .crud_store
-            .cli_runtime_turn_terminal_guard(&binding)
+            .cli_runtime_turn_terminal_control_guard(&binding)
             .await?;
         let transition = self
             .try_cli_runtime_turn_transition(&binding)
@@ -12357,7 +12514,7 @@ impl MessageProcessor {
             expected.is_some()
                 && self
                     .crud_store
-                    .cli_runtime_turn_terminal_guard(&binding)
+                    .cli_runtime_turn_terminal_control_guard(&binding)
                     .await?
                     == expected,
             "CLI cancellation source changed"
@@ -13567,6 +13724,9 @@ pub(super) fn provider_model_from_runtime_model_for_reasoning_lookup(
     });
 
     ProviderModelInfo {
+        service_modes: None,
+        context_authority: None,
+        context_tiers: None,
         id: model.id,
         name: model.name,
         description: model.description,
@@ -14168,6 +14328,9 @@ mod tests {
             mode: pioneer_protocol::TurnPermissionMode::Supervised,
         };
         TurnStartParams {
+            service_mode: None,
+            context_authority: None,
+            context_window: None,
             agent_delegation_routes: Vec::new(),
             thread_id: "thread-root".to_owned(),
             turn_id: "turn-root".to_owned(),
@@ -14288,6 +14451,9 @@ mod tests {
         reasoning: Option<ProviderModelReasoningCapabilities>,
     ) -> ProviderModelInfo {
         ProviderModelInfo {
+            service_modes: None,
+            context_authority: None,
+            context_tiers: None,
             id: "model-a".to_owned(),
             name: None,
             description: None,

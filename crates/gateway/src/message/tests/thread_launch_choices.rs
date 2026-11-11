@@ -786,21 +786,34 @@ async fn inherited_configuration_survives_visible_thread_creation_message_and_st
         pioneer_protocol::PersistedActorRef::AgentExecution(facts.execution_id.clone())
     );
     let arguments = json!({"targetOptionId": target.id, "input": [{"type":"text","text":"Child task"}], "launch":{"permissionProfile":{"mode":"full_access"}}});
-    let (first, simultaneous) = tokio::join!(
-        call(
-            &tools,
-            "threads_turn_start",
-            "start-visible",
-            arguments.clone()
-        ),
-        call(
-            &tools,
-            "threads_turn_start",
-            "start-visible",
-            arguments.clone()
-        ),
-    );
+    let (first, simultaneous) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(
+            call(
+                &tools,
+                "threads_turn_start",
+                "start-visible",
+                arguments.clone()
+            ),
+            call(
+                &tools,
+                "threads_turn_start",
+                "start-visible",
+                arguments.clone()
+            ),
+        )
+    })
+    .await
+    .expect("concurrent detached admission/replay must finish with refreshed targets");
     assert_eq!(first["receiptId"], simultaneous["receiptId"]);
+    for response in [&first, &simultaneous] {
+        assert!(
+            response["targetOptions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|o| o["threadId"] == thread_id && o["id"] == target.id)
+        );
+    }
     let outbox = pioneer_crud::load_agent_action_outbox(
         &db,
         crate::authorization::action_id_for_call("start-visible").as_str(),
@@ -1705,6 +1718,8 @@ async fn cli_parent_selects_only_unambiguous_api_choices_for_threads_and_tasks()
             let pioneer_protocol::TaskDerivedChildLaunchGrant::ResolvedTaskLaunch {
                 identity,
                 profile,
+                native_context,
+                native_summary,
                 ..
             } = serde_json::from_str(actor.derived_child_launch_grant_json.as_deref().unwrap())
                 .unwrap();
@@ -1717,6 +1732,34 @@ async fn cli_parent_selects_only_unambiguous_api_choices_for_threads_and_tasks()
             assert_eq!(
                 profile.backend,
                 pioneer_protocol::AgentExecutionProfileBackend::ApiProvider
+            );
+            let budget = native_context.expect("API Task grant freezes its context before commit");
+            assert_eq!(
+                (&budget.instance, &budget.model),
+                (&profile.provider_id, &profile.model_id)
+            );
+            assert_eq!(
+                budget.manual_window, None,
+                "a model-authored API switch cannot inherit CLI financial choices"
+            );
+            assert!(budget.context_window > 0);
+            assert_eq!(
+                budget.service_mode.as_ref().map(|mode| mode.id.as_str()),
+                Some("standard"),
+                "CLI-to-API model-authored launch has no paid Native consent"
+            );
+            if let Some(summary) = native_summary.filter(|summary| summary.inherits_working) {
+                assert_eq!(summary.budget, budget);
+            }
+            let restored = processor
+                .crud_store
+                .get_task_actor_contract(&actor.task_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                restored.derived_child_launch_grant_json,
+                actor.derived_child_launch_grant_json
             );
         } else {
             assert!(matches!(
@@ -2023,6 +2066,65 @@ async fn large_later_catalog_stays_out_of_task_and_execution_grants_and_replay()
         bundles: task_tools.bundles,
         ..Default::default()
     };
+    // Trusted persisted fixture represents an earlier user-admitted Pro turn.
+    // The tool cannot supply these fields; inheritance must use the bound turn.
+    let provider = processor
+        .provider_registry
+        .get_or_create_for_workspace(&context.workspace_id, "openai")
+        .unwrap();
+    let mut parent_snapshot = processor
+        .crud_store
+        .get_turn_execution_security_snapshot(&context.turn_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .snapshot;
+    let admitted = pioneer_protocol::NativeContextBudget {
+        instance: "openai".into(),
+        authority: provider.authority_fingerprint().map(str::to_owned),
+        model: "gpt-5.4".into(),
+        manual_window: None,
+        context_window: 272000,
+        max_input: None,
+        max_output: Some(16000),
+        service_mode: Some(pioneer_protocol::NativeServiceModePlan {
+            id: "pro".into(),
+            parameters: pioneer_protocol::ServiceModeParameters::OpenAiPro,
+        }),
+    };
+    parent_snapshot.native_context = Some(admitted.clone());
+    parent_snapshot.native_summary = Some(pioneer_protocol::NativeSummaryContext {
+        budget: admitted.clone(),
+        effort: Some("high".into()),
+        inherits_working: false,
+    });
+    processor
+        .crud_store
+        .set_turn_execution_security_snapshot(&context.turn_id, &parent_snapshot)
+        .await
+        .unwrap();
+    let same = call(
+        &task_tools,
+        "task_create",
+        "same-service-scope",
+        json!({"title":"Same scope", "goal":"Use the admitted model"}),
+    )
+    .await;
+    let same_actor = processor
+        .crud_store
+        .get_task_actor_contract(same["taskId"].as_str().unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    let same_grant: serde_json::Value = serde_json::from_str(
+        same_actor
+            .derived_child_launch_grant_json
+            .as_deref()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(same_grant["native_context"]["service_mode"]["id"], "pro");
+    assert_eq!(same_grant["native_context"]["context_window"], 272000);
     let launch = json!({"profile":{"kind":"model","providerId":"openai","modelId":"gpt-5.4-later-4096"},"useDefaultReasoning":true});
     let task = call(
         &task_tools,
@@ -2044,6 +2146,17 @@ async fn large_later_catalog_stays_out_of_task_and_execution_grants_and_replay()
     assert!(saved_task_grant.len() < 131_072);
     let saved_task: serde_json::Value = serde_json::from_str(saved_task_grant).unwrap();
     assert_eq!(saved_task["profile"]["modelId"], "gpt-5.4-later-4096");
+    assert_eq!(
+        saved_task["native_context"]["service_mode"]["id"],
+        "standard"
+    );
+    assert_eq!(saved_task["native_summary"]["budget"]["model"], "gpt-5.4");
+    assert_eq!(
+        saved_task["native_summary"]["budget"]["service_mode"]["id"],
+        "pro"
+    );
+    assert_eq!(saved_task["native_summary"]["inherits_working"], false);
+
     assert!(saved_task["child_launch_grant"].get("profiles").is_none());
     assert!(
         saved_task["child_launch_grant"]
@@ -3003,22 +3116,26 @@ async fn delegated_root_foreground_admission_rejects_competing_start_without_per
             target
         };
         let arguments = json!({"targetOptionId":target.id,"input":[{"type":"text","text":"One foreground owner"}]});
-        let (first, second) = tokio::join!(
-            invoke_with_mutation(
-                &tools,
-                "threads_turn_start",
-                "foreground-a",
-                arguments.clone(),
-                None
-            ),
-            invoke_with_mutation(
-                &tools,
-                "threads_turn_start",
-                "foreground-b",
-                arguments,
-                None
-            ),
-        );
+        let (first, second) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                invoke_with_mutation(
+                    &tools,
+                    "threads_turn_start",
+                    "foreground-a",
+                    arguments.clone(),
+                    None
+                ),
+                invoke_with_mutation(
+                    &tools,
+                    "threads_turn_start",
+                    "foreground-b",
+                    arguments,
+                    None
+                ),
+            )
+        })
+        .await
+        .expect("foreground admission/refusal must return without an adapter lock cycle");
         assert_ne!(
             first.is_ok(),
             second.is_ok(),
@@ -3053,6 +3170,18 @@ async fn delegated_root_foreground_admission_rejects_competing_start_without_per
         let payload: serde_json::Value = serde_json::from_str(&accepted[0].payload_json).unwrap();
         let params: TurnStartParams =
             serde_json::from_value(payload["dispatch"]["params"].clone()).unwrap();
+        let response = first
+            .as_ref()
+            .ok()
+            .or_else(|| second.as_ref().ok())
+            .unwrap();
+        assert!(
+            response["targetOptions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|o| o["threadId"] == params.thread_id && o["id"] == target.id)
+        );
         assert_eq!(
             pioneer_entity::turn::Entity::find()
                 .filter(pioneer_entity::turn::Column::ThreadId.eq(params.thread_id.clone()))
@@ -3202,13 +3331,26 @@ async fn queued_internal_thread_stop_releases_only_its_child_resources_before_di
         })
         .unwrap()["id"]
         .clone();
-    call(
-        &tools,
-        "threads_turn_start",
-        "queued-child",
-        json!({"targetOptionId":target,"input":[{"type":"text","text":"Wait for capacity"}]}),
+    let queued = tokio::time::timeout(
+        Duration::from_secs(5),
+        call(
+            &tools,
+            "threads_turn_start",
+            "queued-child",
+            json!({"targetOptionId":target,"input":[{"type":"text","text":"Wait for capacity"}]}),
+        ),
     )
-    .await;
+    .await
+    .expect("queued admission must return its refreshed targets");
+    assert_eq!(queued["status"], "queued");
+    assert!(
+        queued["targetOptions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|o| o["threadId"] == created["threadResult"]["threadId"] && o["id"] == target)
+    );
+
     let row = pioneer_crud::load_agent_action_outbox(
         &db,
         crate::authorization::action_id_for_call("queued-child").as_str(),
@@ -3545,6 +3687,7 @@ async fn member_creation_uses_both_workspace_variants_and_revocation_fences_the_
         .load_turn_execution_authorization_context(&context.turn_id)
         .await
         .unwrap();
+    let mut created_threads = Vec::new();
     for (index, label) in ["Current collaboration", "New delegated root"]
         .into_iter()
         .enumerate()
@@ -3640,6 +3783,7 @@ async fn member_creation_uses_both_workspace_variants_and_revocation_fences_the_
         assert_eq!(result["receiptId"], receipt.id);
         assert_eq!(result["outboxId"], outbox.id);
         let payload: serde_json::Value = serde_json::from_str(&outbox.payload_json).unwrap();
+        created_threads.push(payload["created_thread_id"].as_str().unwrap().to_owned());
         assert!(
             processor
                 .crud_store
@@ -3661,6 +3805,286 @@ async fn member_creation_uses_both_workspace_variants_and_revocation_fences_the_
         .register_execution_lease(&context.turn_id)
         .await
         .unwrap();
+    // Exercise the real catalog refresh, with two live routed destinations
+    // and a same-capsule child. No metadata map or read decision is injected.
+    use crate::authorization::{ResourceAction, RoleDefinitionRegistry};
+    use sea_orm::{ActiveModelTrait, EntityTrait, Set};
+    let database = processor.crud_store.database_connection();
+    let child_id = &created_threads[0];
+    let hidden_id = &created_threads[1];
+    let creation = binding
+        .options
+        .thread_creation_options
+        .iter()
+        .find(|o| o.label == "New delegated root")
+        .unwrap();
+    let neighbor = call(
+        &tools,
+        "thread_create",
+        "disclosure-neighbor",
+        json!({"optionId":creation.id}),
+    )
+    .await;
+    let neighbor_id = neighbor["threadResult"]["threadId"].as_str().unwrap();
+    let secret_title = "Only the inaccessible destination has this title";
+    for (id, title) in [
+        (hidden_id.as_str(), secret_title),
+        (child_id.as_str(), "Internal metadata"),
+    ] {
+        let row = pioneer_entity::thread::Entity::find_by_id(id)
+            .one(&database)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut row: pioneer_entity::thread::ActiveModel = row.into();
+        row.name = Set(Some(title.to_owned()));
+        row.update(&database).await.unwrap();
+    }
+    let baseline = call(
+        &tools,
+        "threads_start_options",
+        "disclosure-baseline",
+        json!({}),
+    )
+    .await;
+    let baseline_targets = baseline["targetOptions"].as_array().unwrap();
+    assert!(
+        baseline_targets
+            .iter()
+            .any(|o| o["threadId"] == hidden_id.as_str() && o["title"] == secret_title)
+    );
+    assert!(
+        baseline_targets
+            .iter()
+            .any(|o| o["threadId"] == child_id.as_str() && o["label"] == "Internal metadata")
+    );
+    assert!(
+        baseline_targets
+            .iter()
+            .any(|o| o["threadId"] == neighbor_id)
+    );
+    let facts = binding.adapter.lock().await.persistence_facts();
+    let routes_before = pioneer_crud::list_agent_delegation_routes_for_source(
+        &database,
+        facts.execution_id.as_str(),
+        facts.identity.id.as_str(),
+    )
+    .await
+    .unwrap();
+    let hidden_route = routes_before
+        .iter()
+        .find(|r| r.destination_thread_id == *hidden_id)
+        .unwrap();
+
+    // Ordinary admission grants runtime actions, without semantic Agent
+    // action strings. All four destinations still permit send and start.
+    assert!(!authority.grants_action(ResourceAction::ChildStart));
+    assert!(!authority.grants_action(ResourceAction::AgentSourceExport));
+    for id in [
+        context.thread_id.as_str(),
+        child_id.as_str(),
+        hidden_id.as_str(),
+        neighbor_id,
+    ] {
+        assert!(baseline_targets.iter().any(|o| o["threadId"] == id
+            && o["allowedActions"] == json!(["send_message", "start_agent"])));
+    }
+    // Independently narrow each real runtime ceiling and workspace discovery.
+    for excluded in [
+        ResourceAction::MessageCreate,
+        ResourceAction::AgentTurnStart,
+        ResourceAction::ThreadObserveWorkspace,
+    ] {
+        let mut limited: serde_json::Value =
+            serde_json::from_str(&authority.to_persisted_json().unwrap()).unwrap();
+        limited["grant_manifest"]["actions"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|a| a.as_str() != Some(excluded.safe_name()));
+        processor
+            .crud_store
+            .set_turn_execution_authorization_context(&context.turn_id, &limited.to_string())
+            .await
+            .unwrap();
+        processor
+            .register_execution_lease(&context.turn_id)
+            .await
+            .unwrap();
+        let limited = call(
+            &tools,
+            "threads_start_options",
+            &format!("catalog-without-{}", excluded.safe_name()),
+            json!({}),
+        )
+        .await;
+        let targets = limited["targetOptions"].as_array().unwrap();
+        let expected = match excluded {
+            ResourceAction::MessageCreate => json!(["start_agent"]),
+            ResourceAction::AgentTurnStart => json!(["send_message"]),
+            _ => json!(["send_message", "start_agent"]),
+        };
+        for id in [
+            context.thread_id.as_str(),
+            child_id.as_str(),
+            hidden_id.as_str(),
+            neighbor_id,
+        ] {
+            if excluded == ResourceAction::ThreadObserveWorkspace
+                && (id == hidden_id.as_str() || id == neighbor_id)
+            {
+                assert!(!targets.iter().any(|o| o["threadId"] == id));
+            } else {
+                assert!(
+                    targets
+                        .iter()
+                        .any(|o| o["threadId"] == id && o["allowedActions"] == expected)
+                );
+            }
+        }
+    }
+    processor
+        .crud_store
+        .set_turn_execution_authorization_context(
+            &context.turn_id,
+            &authority.to_persisted_json().unwrap(),
+        )
+        .await
+        .unwrap();
+    processor
+        .register_execution_lease(&context.turn_id)
+        .await
+        .unwrap();
+
+    // Remove only disclosure access to A. Its route remains live; B and the
+    // internal child must survive filtering, including in refreshed results.
+    let row = pioneer_entity::thread::Entity::find_by_id(hidden_id.clone())
+        .one(&database)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut row: pioneer_entity::thread::ActiveModel = row.into();
+    row.access_class = Set("private".into());
+    row.update(&database).await.unwrap();
+    pioneer_entity::thread_membership::Entity::delete_by_id((
+        hidden_id.clone(),
+        "P0000000000000000000M".to_owned(),
+    ))
+    .exec(&database)
+    .await
+    .unwrap();
+    let filtered = call(
+        &tools,
+        "threads_start_options",
+        "catalog-with-private-target",
+        json!({}),
+    )
+    .await;
+    let sent = call(
+        &tools,
+        "thread_message_send",
+        "disclosure-allowed-neighbor",
+        json!({"targetOptionId":neighbor["targetOptions"].as_array().unwrap().iter()
+            .find(|o| o["threadId"] == neighbor_id).unwrap()["id"],
+            "input":[{"type":"text","text":"Visible neighbor"}]}),
+    )
+    .await;
+    for result in [&filtered, &sent] {
+        let targets = &result["targetOptions"];
+        assert!(!targets.to_string().contains(hidden_id.as_str()));
+        assert!(!targets.to_string().contains(secret_title));
+        assert!(
+            targets
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|o| o["threadId"] == neighbor_id)
+        );
+        assert!(
+            targets
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|o| o["threadId"] == child_id.as_str())
+        );
+    }
+    let routes_after = pioneer_crud::list_agent_delegation_routes_for_source(
+        &database,
+        facts.execution_id.as_str(),
+        facts.identity.id.as_str(),
+    )
+    .await
+    .unwrap();
+    let retained = routes_after
+        .iter()
+        .find(|r| r.id == hidden_route.id)
+        .unwrap();
+    assert_eq!(retained, hidden_route);
+
+    // An admitted messenger Agent has read/send but no ChildObserve or
+    // workspace observation. Materialize that existing role's grant through
+    // the normal adapter factory; the broad human ACL cannot supply either.
+    let messenger = crate::authorization::AgentAuthorizationFacts {
+        identity_id: facts.identity.id.clone(),
+        identity_status: pioneer_protocol::AgentIdentityStatus::Active,
+        role_key: "agent_messenger".into(),
+        root_capsule_id: facts.home_root_thread_id.clone(),
+        parent_envelope: None,
+        policy_generation: facts.agent_authorization_policy_generation,
+    }
+    .derive_envelope(RoleDefinitionRegistry::new())
+    .unwrap();
+    let (adapter, options, capabilities) =
+        crate::authorization::materialize_persisted_task_agent_action_binding(
+            facts.execution_id.clone(),
+            &facts.home_root_thread_id,
+            facts.root_execution_id.clone(),
+            facts.identity.clone(),
+            facts.profile.clone(),
+            facts.execution_generation,
+            1,
+            0,
+            "catalog-messenger",
+            &messenger.role_key,
+            messenger.policy_generation,
+            messenger.policy_generation,
+            &messenger.fingerprint,
+            &messenger.allowed_action_names(),
+        )
+        .unwrap();
+    let messenger_binding = crate::message::agent_action_tools::AgentActionRuntimeBinding::new(
+        adapter,
+        options,
+        capabilities,
+    );
+    let messenger_binding = processor
+        .prepare_agent_action_binding(context.turn_id.clone(), messenger_binding)
+        .await
+        .unwrap();
+    processor
+        .register_agent_action_binding(context.turn_id.clone(), messenger_binding)
+        .await;
+    let local = call(
+        &tools,
+        "threads_start_options",
+        "catalog-without-child-observation",
+        json!({}),
+    )
+    .await;
+    let targets = local["targetOptions"].as_array().unwrap();
+    assert!(
+        !targets
+            .iter()
+            .any(|o| o["threadId"] == child_id.as_str() || o["threadId"] == neighbor_id)
+    );
+    assert!(
+        !local["targetOptions"]
+            .to_string()
+            .contains("Internal metadata")
+    );
+    assert!(targets.iter().any(|o| o["threadId"] == context.thread_id));
+    processor
+        .register_agent_action_binding(context.turn_id.clone(), binding.clone())
+        .await;
     assert!(
         invoke_with_mutation(
             &tools,
@@ -5677,7 +6101,19 @@ async fn detached_threads_action_recovers_after_commit_without_recreating_or_dis
         wait_for_task_status(recovered.crud_store.clone(), task_id, TaskStatus::Completed).await,
         TaskStatus::Completed
     );
-    let replay = call(&tools, "threads_turn_start", "crash-start", arguments).await;
+    let replay = tokio::time::timeout(
+        Duration::from_secs(5),
+        call(&tools, "threads_turn_start", "crash-start", arguments),
+    )
+    .await
+    .expect("recovered action replay must return refreshed targets");
+    assert!(
+        replay["targetOptions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|o| o["threadId"] == thread_id && o["id"] == target.id)
+    );
     let receipt = pioneer_crud::load_agent_action_receipt(&database, action.as_str())
         .await
         .unwrap()

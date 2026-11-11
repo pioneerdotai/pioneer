@@ -1237,6 +1237,9 @@ mod tests {
                 provider: Some("vercel-ai-gateway".into()),
                 model: Some("private/team-embedding".into()),
                 selected_reasoning_effort: None,
+                selected_context_window: None,
+                selected_service_mode: None,
+                selected_context_authority: None,
             },
         }
         .update(&snapshot)

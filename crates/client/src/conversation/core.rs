@@ -1,4 +1,5 @@
 use super::*;
+use pioneer_observability::closing::{Closing, Fact, Phase};
 use pioneer_protocol::{Thread, TurnKind, TurnStatus};
 
 impl Conversation {
@@ -22,6 +23,7 @@ impl Conversation {
             next_sequence: 0,
             event_log: VecDeque::new(),
             pending_completion_turn_id: None,
+            pending_closing: None,
             projector: ConversationProjector::default(),
             state_machine: TurnStateMachine::default(),
             item_handlers: TurnItemHandlerRegistry::default(),
@@ -75,6 +77,13 @@ impl Conversation {
                 .finalize_turn_completed(turn_id.as_str(), now_unix_ms());
             self.projector.sync_flow_state(&self.state_machine);
             self.projector.bump_revision();
+        }
+        if let Some(mut closing) = self.pending_closing.take() {
+            closing.finish(if finalized {
+                Fact::Confirmed
+            } else {
+                Fact::Superseded
+            });
         }
         finalized
     }
@@ -194,9 +203,22 @@ impl Conversation {
                 self.projector.apply_turn_started(&turn, ts_unix_ms);
             }
             ConversationEvent::TurnCompleted { turn, .. } => {
+                let duplicate = self
+                    .projector
+                    .turn_phase_marker(&turn.id)
+                    .is_some_and(|phase| {
+                        matches!(phase.as_ref(), super::reducer::TurnPhase::Completed)
+                    });
+                let mut projection = Closing::current(Phase::ClientProjectionSettlement);
                 if !self.state_machine.is_blocked_turn(turn.id.as_str()) {
                     self.projector.apply_turn_completed(&turn, ts_unix_ms);
                     if in_flight_turn_id_before_event.as_deref() == Some(turn.id.as_str()) {
+                        if self.pending_completion_turn_id.as_deref() != Some(turn.id.as_str()) {
+                            self.pending_closing = Some(Closing::start(
+                                Phase::ClientSettlement,
+                                &projection.correlation(),
+                            ));
+                        }
                         self.pending_completion_turn_id = Some(turn.id);
                     } else {
                         let _ = self
@@ -205,22 +227,39 @@ impl Conversation {
                         self.projector
                             .finalize_turn_completed(turn.id.as_str(), ts_unix_ms);
                     }
+                    projection.finish(if duplicate {
+                        Fact::Duplicate
+                    } else {
+                        Fact::Confirmed
+                    });
+                } else {
+                    projection.finish(Fact::Superseded);
                 }
             }
             ConversationEvent::TurnFailed { turn, .. } => {
+                let mut projection = Closing::current(Phase::ClientProjectionSettlement);
                 if turn.turn_kind == TurnKind::Conversation {
                     self.pending_completion_turn_id = None;
                 }
                 if !self.state_machine.is_blocked_turn(turn.id.as_str()) {
                     self.projector.apply_turn_failed(&turn, ts_unix_ms);
+                    projection.finish(if turn.status == TurnStatus::Interrupted {
+                        Fact::Cancelled
+                    } else {
+                        Fact::ExecutionFailed
+                    });
+                } else {
+                    projection.finish(Fact::Superseded);
                 }
             }
             ConversationEvent::TurnBlocked { turn, resume, .. } => {
+                let mut projection = Closing::current(Phase::ClientProjectionSettlement);
                 if turn.turn_kind == TurnKind::Conversation {
                     self.pending_completion_turn_id = None;
                 }
                 self.projector
                     .apply_turn_blocked(&turn, resume.as_ref(), ts_unix_ms);
+                projection.finish(Fact::Blocked);
             }
             ConversationEvent::ItemStarted { turn_id, item, .. } => {
                 self.item_handlers.apply_started(
@@ -546,6 +585,11 @@ impl Conversation {
             }
         }
 
+        if self.pending_completion_turn_id.is_none() {
+            if let Some(mut closing) = self.pending_closing.take() {
+                closing.finish(Fact::Superseded);
+            }
+        }
         self.projector.sync_flow_state(&self.state_machine);
         self.projector.bump_revision();
     }
@@ -667,8 +711,43 @@ impl Conversation {
             return;
         }
 
+        let duplicate = self
+            .projector
+            .turn_phase_marker(&turn.id)
+            .is_some_and(|phase| matches!(phase.as_ref(), super::reducer::TurnPhase::Completed));
+        let pending = self
+            .pending_closing
+            .as_ref()
+            .filter(|_| self.pending_completion_turn_id.as_deref() == Some(turn.id.as_str()))
+            .map(Closing::correlation);
+        let mut settlement = (turn.status != TurnStatus::InProgress).then(|| {
+            Closing::start_linked(
+                Phase::ClientSnapshotSettlement,
+                &Closing::capture(),
+                pending.as_slice(),
+            )
+        });
         self.state_machine.sync_snapshot_turn(turn);
         self.projector.upsert_turn_snapshot_metadata(turn);
+        if let Some(settlement) = &mut settlement {
+            settlement.finish(match turn.status {
+                TurnStatus::Completed if duplicate => Fact::Duplicate,
+                TurnStatus::Completed => Fact::Confirmed,
+                TurnStatus::Failed => Fact::ExecutionFailed,
+                TurnStatus::Interrupted => Fact::Cancelled,
+                TurnStatus::Blocked => Fact::Blocked,
+                TurnStatus::InProgress => Fact::Unconfirmed,
+            });
+            if self.pending_completion_turn_id.as_deref() == Some(turn.id.as_str()) {
+                if let Some(mut closing) = self.pending_closing.take() {
+                    closing.finish(if turn.status == TurnStatus::Completed {
+                        Fact::Confirmed
+                    } else {
+                        Fact::Superseded
+                    });
+                }
+            }
+        }
         // Finishing the current Turn must retain its terminal metadata while
         // restoring control of any concurrent execution in this same snapshot.
         if turn.status != TurnStatus::InProgress {
@@ -684,6 +763,7 @@ impl Conversation {
     }
 
     pub fn reset(&mut self) {
+        self.pending_closing = None;
         self.next_sequence = 0;
         self.event_log.clear();
         self.pending_completion_turn_id = None;
