@@ -18,6 +18,8 @@ pub enum PluginIntent {
         plugin_id: String,
         expected_revision: i64,
         enabled: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        allow_implicit_invocation: Option<bool>,
     },
     Mutate {
         plugin_id: String,
@@ -1128,7 +1130,7 @@ impl ClientCore {
                 let mut id=core.plugin_work_parent(&work).ok_or_else(||anyhow::anyhow!("plugin_catalog_stale"))?;
                 let mut mutation_result = None;
                 match &work.intent {
-                    PluginIntent::SetEnabled{plugin_id,expected_revision,enabled}=>{mutation_dispatched=true;let item=crate::transport::ws::command_sender::plugins_set_enabled(&bound,PluginsSetEnabledParams{workspace_id:work.workspace.clone(),plugin_id:plugin_id.clone(),expected_revision:*expected_revision,enabled:*enabled})?;mutation_result=Some(PluginsMutationResponse{plugin:Some(item),removed:false});},
+                    PluginIntent::SetEnabled{plugin_id,expected_revision,enabled,allow_implicit_invocation}=>{mutation_dispatched=true;let item=crate::transport::ws::command_sender::plugins_set_enabled(&bound,PluginsSetEnabledParams{workspace_id:work.workspace.clone(),plugin_id:plugin_id.clone(),expected_revision:*expected_revision,enabled:*enabled,allow_implicit_invocation:*allow_implicit_invocation})?;mutation_result=Some(PluginsMutationResponse{plugin:Some(item),removed:false});},
                     PluginIntent::Mutate{plugin_id,expected_revision,intent}=>{mutation_dispatched=true;mutation_result=Some(crate::transport::ws::command_sender::plugins_mutate(&bound,PluginsMutateParams{workspace_id:work.workspace.clone(),plugin_id:plugin_id.clone(),expected_revision:*expected_revision,intent:intent.clone()})?);},
                     PluginIntent::Install{upload_operation}=>{
                         anyhow::ensure!(matches!(preview_target(&core,&work.workspace,*upload_operation)?, crate::package_delivery::operations::SkillUploadTarget::PluginPreview | crate::package_delivery::operations::SkillUploadTarget::PluginInstall),"plugin_install_preview_required");
@@ -1311,7 +1313,8 @@ pub(crate) mod tests {
             let result = |work: &Work| Ok(PluginPublication {
                 loaded: true, connection_id: work.epoch.2, generation: work.generation,
                 plugins: vec![PluginItem { id: "P".repeat(21), name: "response".into(), version: None,
-                    description: None, enabled: true, state: "installed".into(), revision: 1,
+                    description: None,
+            metadata: Default::default(), enabled: true, allow_implicit_invocation: false, state: "installed".into(), revision: 1,
                     status: "installed".into(), components: vec![], diagnostics: vec![] }],
                 ..Default::default()
             });
@@ -1349,7 +1352,8 @@ pub(crate) mod tests {
         core.settle_plugin_work(&fresh, Ok(PluginPublication {
             loaded: true, connection_id: fresh.epoch.2, generation: fresh.generation,
             plugins: vec![PluginItem { id: "F".repeat(21), name: "fresh".into(), version: None,
-                description: None, enabled: true, state: "installed".into(), revision: 1,
+                description: None,
+            metadata: Default::default(), enabled: true, allow_implicit_invocation: false, state: "installed".into(), revision: 1,
                 status: "installed".into(), components: vec![], diagnostics: vec![] }],
             ..Default::default()
         }), false, Some(true));
@@ -1362,7 +1366,7 @@ pub(crate) mod tests {
         let params = PluginIntent::SetEnabled {
             plugin_id: "P".repeat(21),
             expected_revision: 7,
-            enabled: false,
+            enabled: false, allow_implicit_invocation: None,
         };
         assert_eq!(
             core.plugin_intent("workspace", params.clone()).outcome(),
@@ -1513,7 +1517,8 @@ pub(crate) mod tests {
             name: "Plugin".into(),
             version: None,
             description: None,
-            enabled: true,
+            metadata: Default::default(),
+            enabled: true, allow_implicit_invocation: false,
             state: "installed".into(),
             revision: 3,
             status: "installed".into(),
@@ -1630,7 +1635,7 @@ pub(crate) mod tests {
             let origin = core.plugin_command_origin();
             for (index, parent) in [&plugin, &other].into_iter().enumerate() {
                 core.submit_plugin_command("X", &parent.id, PluginIntent::SetEnabled {
-                    plugin_id: parent.id.clone(), expected_revision: parent.revision, enabled: false,
+                    plugin_id: parent.id.clone(), expected_revision: parent.revision, enabled: false, allow_implicit_invocation: None,
                 }, &origin).unwrap();
                 if index == 0 {
                     let active = receiver.try_recv().unwrap();
@@ -1749,7 +1754,8 @@ pub(crate) mod tests {
             name: letter.to_string(),
             version: None,
             description: None,
-            enabled: true,
+            metadata: Default::default(),
+            enabled: true, allow_implicit_invocation: false,
             state: "installed".into(),
             revision: 7,
             status: "installed".into(),
@@ -1786,7 +1792,7 @@ pub(crate) mod tests {
                 PluginIntent::SetEnabled {
                     plugin_id: a.id.clone(),
                     expected_revision: 7,
-                    enabled: false,
+                    enabled: false, allow_implicit_invocation: None,
                 },
                 &foreign
             )
@@ -1820,7 +1826,7 @@ pub(crate) mod tests {
                 PluginIntent::SetEnabled {
                     plugin_id: parent.id.clone(),
                     expected_revision: 7,
-                    enabled: false,
+                    enabled: false, allow_implicit_invocation: None,
                 },
                 &origin,
             )
@@ -2009,7 +2015,7 @@ pub(crate) mod tests {
             );
         }
         let set_enabled = |revision| PluginIntent::SetEnabled {
-            plugin_id: a.id.clone(), expected_revision: revision, enabled: false,
+            plugin_id: a.id.clone(), expected_revision: revision, enabled: false, allow_implicit_invocation: None,
         };
         assert!(!core.plugin_parent_recovery_available("workspace", &a.id));
         rejected_without_replacement(set_enabled(7));
@@ -2080,7 +2086,7 @@ pub(crate) mod tests {
         let (bounded_sender, bounded_receiver) = mpsc::sync_channel(1);
         let previous_sender = core.plugins_controller.lock().unwrap().sender.replace(bounded_sender).unwrap();
         let blocker = core.submit_plugin_command("workspace", &b.id, PluginIntent::SetEnabled {
-            plugin_id: b.id.clone(), expected_revision: 7, enabled: false,
+            plugin_id: b.id.clone(), expected_revision: 7, enabled: false, allow_implicit_invocation: None,
         }, &origin).unwrap();
         assert!(core.plugin_parent_recovery_available("workspace", &a.id));
         let prior_generation = core.plugins_controller.lock().unwrap().requests[&("workspace".into(), a.id.clone())].latest_generation().get();

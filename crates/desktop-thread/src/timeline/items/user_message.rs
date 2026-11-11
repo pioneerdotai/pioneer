@@ -411,6 +411,7 @@ impl RowPresentation {
                     .child(self.render_user_message_attachment_preview(
                         preview_image_path,
                         attachment.kind,
+                        attachment.plugin_icon.as_ref(),
                         cx,
                     ))
                     .child(
@@ -437,8 +438,19 @@ impl RowPresentation {
         &self,
         preview_image_path: Option<PathBuf>,
         kind: ParsedUserAttachmentKind,
+        plugin_icon: Option<&pioneer_client::plugins::PluginIcon>,
         cx: &mut App,
     ) -> AnyElement {
+        if kind == ParsedUserAttachmentKind::Plugin {
+            return div()
+                .flex_none()
+                .size(px(20.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(self.plugin_images.element(plugin_icon).size_3())
+                .into_any_element();
+        }
         if matches!(
             kind,
             ParsedUserAttachmentKind::Plugin

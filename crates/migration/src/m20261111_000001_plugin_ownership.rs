@@ -21,11 +21,33 @@ impl MigrationTrait for Migration {
                     .col(text("workspace_id"))
                     .col(text("name"))
                     .col(text("version").null())
+                    .col(text("display_name").null())
+                    .col(text("short_description").null())
+                    .col(text("description").null())
+                    .col(text("long_description").null())
+                    .col(text("developer_name").null())
+                    .col(text("author_name").null())
+                    .col(text("author_email").null())
+                    .col(text("author_url").null())
+                    .col(text("homepage").null())
+                    .col(text("repository").null())
+                    .col(text("documentation_url").null())
+                    .col(text("support_url").null())
+                    .col(text("privacy_policy_url").null())
+                    .col(text("terms_of_service_url").null())
+                    .col(text("license").null())
+                    .col(text("category").null())
+                    .col(text("brand_color").null())
+                    .col(text("logo_path").null())
+                    .col(text("logo_revision").null())
+                    .col(text("composer_icon_path").null())
+                    .col(text("composer_icon_revision").null())
                     .col(text("source_upload_id").unique_key())
                     .col(text("package_path"))
                     .col(text("data_path"))
                     .col(text("package_fingerprint"))
-                    .col(boolean("enabled"))
+                    .col(boolean("enabled").default(true))
+                    .col(boolean("allow_implicit_invocation").default(false))
                     .col(text("state").check(Expr::col("state").is_in([
                         "installing",
                         "installed",
@@ -55,6 +77,44 @@ impl MigrationTrait for Migration {
                     .name("ix_plugin_workspace")
                     .table(INSTALLATION)
                     .col("workspace_id")
+                    .to_owned(),
+            )
+            .await?;
+        // Multi-valued presentation fields remain queryable rows. Position preserves
+        // authored order; keyword lookup has one narrow value/owner index.
+        for (table, value) in [
+            ("plugin_keyword", "keyword"),
+            ("plugin_default_prompt", "prompt"),
+        ] {
+            manager
+                .create_table(
+                    Table::create()
+                        .table(table)
+                        .col(text("plugin_id"))
+                        .col(
+                            big_integer("position").check(Expr::col("position").gte(0).and(
+                                Expr::col("position").lt(if value == "keyword" { 64 } else { 12 }),
+                            )),
+                        )
+                        .col(text(value))
+                        .primary_key(Index::create().col("plugin_id").col("position"))
+                        .foreign_key(
+                            ForeignKey::create()
+                                .from(table, "plugin_id")
+                                .to(INSTALLATION, "id")
+                                .on_delete(ForeignKeyAction::Restrict),
+                        )
+                        .to_owned(),
+                )
+                .await?;
+        }
+        manager
+            .create_index(
+                Index::create()
+                    .name("ix_plugin_keyword_value")
+                    .table("plugin_keyword")
+                    .col("keyword")
+                    .col("plugin_id")
                     .to_owned(),
             )
             .await?;
@@ -224,7 +284,12 @@ BEGIN SELECT RAISE(ABORT,'plugin component limit'); END;
                     .await?;
             }
         }
-        for table in [COMPONENT, INSTALLATION] {
+        for table in [
+            "plugin_keyword",
+            "plugin_default_prompt",
+            COMPONENT,
+            INSTALLATION,
+        ] {
             manager
                 .drop_table(Table::drop().table(table).to_owned())
                 .await?;

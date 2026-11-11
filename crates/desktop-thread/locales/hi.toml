@@ -335,7 +335,7 @@
 "timeline.web_search.running" = "वेब पर खोज रहा है"
 "timeline.work_group.completed" = "काम किया"
 
-"chat.composer.add_menu.plugins" = "प्लगइन"
+"chat.composer.add_menu.plugins" = "प्लगइन जोड़ें"
 "plugins.empty" = "कोई प्लगइन इंस्टॉल नहीं है"
 "plugins.error" = "प्लगइन लोड नहीं हो सके। फिर से कोशिश करें।"
 "plugins.loading" = "प्लगइन लोड हो रहे हैं…"

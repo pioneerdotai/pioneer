@@ -159,6 +159,8 @@ pub struct ParsedUserAttachment {
     pub display_name: String,
     pub kind: ParsedUserAttachmentKind,
     pub artifact: Option<ArtifactRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin_icon: Option<pioneer_protocol::PluginIcon>,
 }
 
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
@@ -178,6 +180,10 @@ pub fn parse_user_attachments(attachments: &[UserMessageAttachment]) -> Vec<Pars
             display_name: display_name_from_attachment(attachment),
             kind: attachment_kind(attachment),
             artifact: artifact_from_attachment(attachment),
+            plugin_icon: match attachment {
+                UserMessageAttachment::Plugin { capability } => capability.icon.clone(),
+                _ => None,
+            },
         })
         .collect()
 }

@@ -9,6 +9,7 @@ authors.workspace = true
 gpui-kit = { workspace = true, features = ["component"] }
 pioneer-client.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 
 [dev-dependencies]
 gpui-kit = { workspace = true, features = ["test-support"] }

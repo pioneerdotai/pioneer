@@ -333,7 +333,7 @@
 "timeline.web_search.running" = "Ищу в интернете"
 "timeline.work_group.completed" = "Работал"
 
-"chat.composer.add_menu.plugins" = "Плагины"
+"chat.composer.add_menu.plugins" = "Добавить плагины"
 
 "plugins.empty" = "Плагины ещё не установлены"
 "plugins.error" = "Не удалось загрузить плагины. Попробуйте снова."

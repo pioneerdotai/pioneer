@@ -26,7 +26,15 @@ pub struct LoadedPluginPlan {
 }
 
 pub fn load(snapshot: &Snapshot) -> Result<LoadedPluginPlan, Diagnostic> {
-    let (manifest, mut diagnostics, imported) = crate::source::manifest(snapshot)?;
+    let (mut manifest, mut diagnostics, imported) = crate::source::manifest(snapshot)?;
+    let (metadata, version) = crate::metadata::resolve(snapshot, &manifest.name);
+    manifest.metadata = metadata;
+    manifest.version = manifest
+        .version
+        .filter(|value| !value.trim().is_empty())
+        .or(version)
+        .map(|value| value.trim().chars().take(128).collect());
+    manifest.description = manifest.metadata.description.clone();
     let mut components = Vec::new();
     let mut examined = 0;
     match snapshot.entries().get("skills") {
@@ -79,10 +87,7 @@ pub fn load(snapshot: &Snapshot) -> Result<LoadedPluginPlan, Diagnostic> {
         Ok(Some(bytes)) => {
             match parse_mcp(
                 &bytes,
-                snapshot
-                    .limits()
-                    .components
-                    .saturating_sub(examined),
+                snapshot.limits().components.saturating_sub(examined),
             ) {
                 Ok(servers) => {
                     for (member_key, server) in servers {

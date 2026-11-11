@@ -331,6 +331,12 @@ impl DesktopShellView {
             let runtime = cx.global::<crate::client_runtime::DesktopRuntimeCoordinator>();
             (runtime.core(), runtime.registrar())
         };
+        if !cx.has_global::<pioneer_desktop_foundation::ImageViewConfig>() {
+            cx.set_global(pioneer_desktop_foundation::ImageViewConfig::new(
+                client.clone(), registrar.clone(),
+                Arc::new(crate::platform::images::DesktopImageViews(client.clone())),
+            ));
+        }
         let onboarding = pioneer_desktop_onboarding::OnboardingView::new(
             pioneer_desktop_onboarding::OnboardingConfig {
                 client: client.clone(),

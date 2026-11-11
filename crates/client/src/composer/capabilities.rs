@@ -54,6 +54,8 @@ pub enum ComposerCapabilityKind {
     Plugin {
         plugin_id: String,
         expected_revision: i64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        icon: Option<pioneer_protocol::PluginIcon>,
     },
     Skill {
         skill_id: SkillId,
@@ -601,6 +603,7 @@ impl ComposerCapability {
                 ComposerCapabilityKind::Plugin {
                     plugin_id,
                     expected_revision,
+                    ..
                 } => TurnCapabilityKind::Plugin {
                     plugin_id: plugin_id.clone(),
                     expected_revision: *expected_revision,
@@ -634,11 +637,13 @@ impl ComposerCapability {
             ComposerCapabilityKind::Plugin {
                 plugin_id,
                 expected_revision,
+                icon,
             } => UserMessageAttachment::Plugin {
                 capability: pioneer_protocol::TurnPluginCapabilitySummary {
                     plugin_id: plugin_id.clone(),
                     expected_revision: *expected_revision,
                     label: self.label.clone(),
+                    icon: icon.clone(),
                 },
             },
             ComposerCapabilityKind::Skill {

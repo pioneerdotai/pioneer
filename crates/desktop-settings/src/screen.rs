@@ -49,12 +49,12 @@ impl SettingsConfig {
         let revision = auth.principal.avatar_revision.as_deref()?;
         let publication = self
             .client
-            .snapshot(&ClientScope::Avatar {
-                principal_id: avatar_identity_key(principal, revision),
+            .snapshot(&ClientScope::Image {
+                key: avatar_identity_key(principal, revision),
             })?
             .typed::<AvatarPublication>()?;
         let avatar = publication.payload();
-        if avatar.principal_id() != principal || avatar.avatar_revision() != revision {
+        if avatar.resource_id() != principal || avatar.revision() != revision {
             return None;
         }
         avatar.local_path().map(|path| path.as_path().to_path_buf())

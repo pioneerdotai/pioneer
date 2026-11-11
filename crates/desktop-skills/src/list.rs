@@ -1,5 +1,5 @@
 use crate::catalog::GatewayConnectionState;
-use crate::{assets::PioneerIconName, catalog::SkillsCatalogView};
+use crate::catalog::SkillsCatalogView;
 use gpui_kit::component::{
     button::{Button, ButtonVariants},
     menu::{ContextMenuExt, PopupMenu, PopupMenuItem},
@@ -17,7 +17,7 @@ use pioneer_client::skills::{
 use std::collections::HashSet;
 use std::rc::Rc;
 
-const INSTALLED_SKILL_CARD_HEIGHT: f32 = 112.0;
+const INSTALLED_SKILL_CARD_HEIGHT: f32 = crate::SkillCard::HEIGHT;
 const INSTALLED_SKILL_ROW_GAP: f32 = 10.0;
 const INSTALLED_SKILL_ROW_HEIGHT: f32 = INSTALLED_SKILL_CARD_HEIGHT + INSTALLED_SKILL_ROW_GAP;
 
@@ -168,29 +168,16 @@ impl SkillsCatalogView {
         v_flex()
             .size_full()
             .bg(cx.theme().background)
-            .child(
-                v_flex()
-                    .pt_3()
-                    .px_6()
-                    .pb_3()
-                    .gap_2()
-                    .border_b_1()
-                    .border_color(cx.theme().border)
-                    .child(
-                        pioneer_desktop_foundation::catalog_heading(
-                            t!("skills.screen.title").to_string(),
-                            t!("skills.screen.description").to_string(),
-                            cx,
-                        ),
-                    )
-                    .child(h_flex().items_center().gap_2().child(
-                        div().text_xs().opacity(0.6).child(format!(
-                            "{} {}",
-                            t!("skills.screen.installed_count"),
-                            installed_count
-                        )),
-                    )),
-            )
+            .child(pioneer_desktop_foundation::catalog_list_header(
+                t!("skills.screen.title").to_string(),
+                t!("skills.screen.description").to_string(),
+                format!(
+                    "{} {}",
+                    t!("skills.screen.installed_count"),
+                    installed_count
+                ),
+                cx,
+            ))
             .child(
                 v_flex()
                     .id("skills-scroll")
@@ -364,12 +351,6 @@ impl SkillsCatalogView {
         desktop_entity: WeakEntity<Self>,
         cx: &mut App,
     ) -> AnyElement {
-        let summary = skill_presentation::skill_summary_presentation(skill);
-        let owner = summary.slug.owner.as_deref();
-        let status_color = Self::status_color(summary.status_tone, cx);
-        let status_label = Self::status_label(&summary.status);
-        let version_label = summary.version.as_deref().unwrap_or("-");
-
         v_flex()
             .id(identity)
             .w_full()
@@ -386,123 +367,7 @@ impl SkillsCatalogView {
                     });
                 }
             })
-            .child(
-                h_flex()
-                    .w_full()
-                    .min_w_0()
-                    .h(px(INSTALLED_SKILL_CARD_HEIGHT))
-                    .pt_3()
-                    .px_4()
-                    .pb_3()
-                    .rounded_lg()
-                    .overflow_hidden()
-                    .bg(cx.theme().background)
-                    .border_1()
-                    .border_color(cx.theme().border)
-                    .gap_4()
-                    .items_start()
-                    .hover(|this| this.bg(cx.theme().secondary.opacity(0.45)))
-                    .child(
-                        v_flex()
-                            .flex_1()
-                            .min_w_0()
-                            .h_full()
-                            .gap_1()
-                            .child(
-                                h_flex()
-                                    .w_full()
-                                    .min_w_0()
-                                    .justify_between()
-                                    .items_center()
-                                    .gap_2()
-                                    .child(
-                                        h_flex()
-                                            .min_w_0()
-                                            .items_center()
-                                            .gap_1()
-                                            .when_some(owner, |this, owner| {
-                                                this.child(
-                                                    div()
-                                                        .flex_none()
-                                                        .text_sm()
-                                                        .opacity(0.6)
-                                                        .child(owner.to_owned()),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .flex_none()
-                                                        .text_sm()
-                                                        .opacity(0.6)
-                                                        .child("/"),
-                                                )
-                                            })
-                                            .child(
-                                                div()
-                                                    .min_w_0()
-                                                    .text_sm()
-                                                    .font_semibold()
-                                                    .overflow_hidden()
-                                                    .whitespace_nowrap()
-                                                    .text_ellipsis()
-                                                    .child(skill.slug.clone()),
-                                            ),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .w_full()
-                                    .min_w_0()
-                                    .flex_1()
-                                    .text_xs()
-                                    .line_height(relative(1.3))
-                                    .opacity(0.6)
-                                    .overflow_hidden()
-                                    .whitespace_normal()
-                                    .line_clamp(2)
-                                    .child(skill.description.clone()),
-                            )
-                            .child(
-                                h_flex()
-                                    .w_full()
-                                    .min_w_0()
-                                    .justify_between()
-                                    .items_center()
-                                    .gap_2()
-                                    .child(
-                                        h_flex()
-                                            .min_w_0()
-                                            .items_center()
-                                            .gap_2()
-                                            .child(
-                                                div()
-                                                    .min_w_0()
-                                                    .text_xs()
-                                                    .opacity(0.6)
-                                                    .overflow_hidden()
-                                                    .whitespace_nowrap()
-                                                    .text_ellipsis()
-                                                    .child(format!(
-                                                        "{} {}",
-                                                        t!("skills.card.version"),
-                                                        version_label
-                                                    )),
-                                            )
-                                            .when(is_pending, |this| {
-                                                this.child(
-                                                    Icon::new(PioneerIconName::RefreshCw)
-                                                        .size_3()
-                                                        .text_color(cx.theme().warning),
-                                                )
-                                            }),
-                                    ),
-                            ),
-                    )
-                    .child(
-                        pioneer_desktop_foundation::catalog_status_badge(status_label, status_color)
-                            .flex_none()
-                            .mt_1p5(),
-                    ),
-            )
+            .child(crate::SkillCard::new(skill, cx).pending(is_pending))
             .into_any_element()
     }
 
@@ -630,23 +495,14 @@ impl SkillsCatalogView {
     }
 
     pub(crate) fn status_label(status: &skill_presentation::SkillStatus) -> String {
-        match status {
-            skill_presentation::SkillStatus::Active => t!("skills.status.active").to_string(),
-            skill_presentation::SkillStatus::Blocked => t!("skills.status.blocked").to_string(),
-            skill_presentation::SkillStatus::Disabled => t!("skills.status.disabled").to_string(),
-            skill_presentation::SkillStatus::Other(value) => value.clone(),
-        }
+        crate::SkillCard::status_label(status)
     }
 
     pub(crate) fn status_color(
         tone: skill_presentation::SkillDiagnosticsTone,
         cx: &mut App,
     ) -> Hsla {
-        match tone {
-            skill_presentation::SkillDiagnosticsTone::Success => cx.theme().success,
-            skill_presentation::SkillDiagnosticsTone::Warning => cx.theme().warning,
-            _ => cx.theme().foreground.opacity(1.),
-        }
+        crate::SkillCard::status_color(tone, cx)
     }
 }
 

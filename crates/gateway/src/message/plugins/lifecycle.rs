@@ -787,13 +787,14 @@ impl MessageProcessor {
                     }
                 }
                 self.crud_store
-                    .publish_plugin_package(
+                    .publish_plugin_package_with_metadata(
                         &guard.parent.id,
                         guard.parent.revision,
                         &plan.manifest.name,
                         plan.manifest.version.as_deref(),
                         &action.target_fingerprint,
                         action.source_upload_id.as_deref(),
+                        Some(&plan.manifest.metadata),
                     )
                     .await?;
             }

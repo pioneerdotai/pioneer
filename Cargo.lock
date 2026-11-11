@@ -10968,6 +10968,7 @@ dependencies = [
  "gpui-kit",
  "pioneer-client",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]
@@ -11002,6 +11003,8 @@ dependencies = [
  "gpui-kit",
  "pioneer-client",
  "pioneer-desktop-foundation",
+ "pioneer-desktop-mcp",
+ "pioneer-desktop-skills",
  "pioneer-protocol",
  "rust-i18n",
 ]
@@ -11362,6 +11365,7 @@ dependencies = [
  "anyhow",
  "hex",
  "http",
+ "pioneer-protocol",
  "pioneer-skills",
  "serde",
  "serde_json",

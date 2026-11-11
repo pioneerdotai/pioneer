@@ -1,17 +1,14 @@
 use super::*;
 
-pub(super) fn status_badge(status: &str, cx: &App) -> AnyElement {
-    let color = match status {
+pub(super) fn status_color(status: &str, cx: &App) -> Hsla {
+    match status {
         "active" | "ready" => cx.theme().success,
         "failed" | "error" => cx.theme().danger,
         "degraded" | "partial" | "interrupted" | "auth_required" | "authrequired" | "blocked" => {
             cx.theme().warning
         }
         _ => cx.theme().muted_foreground,
-    };
-    pioneer_desktop_foundation::catalog_status_badge(status_label(status), color)
-        .flex_shrink_0()
-        .into_any_element()
+    }
 }
 
 #[cfg(test)]
@@ -56,6 +53,41 @@ fn component_status(component: &PluginComponentItem) -> &str {
     }
 }
 
+// Parent operations take precedence over component runtime state. A healthy
+// plugin has no header badge; component lifecycle failures retain precedence
+// over a stale successful runtime status through `component_status`.
+pub(super) fn summary_status(plugin: &PluginItem) -> Option<&str> {
+    if plugin.state != "installed" {
+        return Some(&plugin.state);
+    }
+    if matches!(
+        plugin.status.as_str(),
+        "updating" | "removing" | "installing" | "interrupted" | "retained"
+    ) {
+        return Some(&plugin.status);
+    }
+    if !plugin.enabled {
+        return Some("disabled");
+    }
+
+    std::iter::once(plugin.status.as_str())
+        .chain(plugin.components.iter().map(component_status))
+        .filter(|status| !matches!(*status, "installed" | "active" | "ready"))
+        .map(|status| match status {
+            "disabled" | "removed_by_user" | "invalid" => "partial",
+            _ => status,
+        })
+        .min_by_key(|status| match *status {
+            "failed" | "error" => 0,
+            "auth_required" | "authrequired" => 1,
+            "blocked" => 2,
+            "partial" | "degraded" => 3,
+            "unavailable" | "offline" | "stopped" | "notstarted" | "not_started" => 4,
+            "starting" | "restarting" | "stopping" => 6,
+            _ => 5,
+        })
+}
+
 impl PluginsView {
     pub(super) fn render_details(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let Some(plugin) = self.selected_plugin() else {
@@ -66,64 +98,63 @@ impl PluginsView {
                 .child(self.missing_parent_label())
                 .into_any_element();
         };
+
         let manage = self
             .workspace
             .as_deref()
             .is_some_and(|workspace| self.client.plugins_management_allowed(workspace));
+
         let busy = self.busy(cx);
-        let metadata = if let Some(version) = &plugin.version {
-            t!(
-                "plugins.details_metadata",
-                version = version.as_str(),
-                count = plugin.components.len()
+
+        let header = pioneer_desktop_foundation::CatalogDetailsHeader::new(plugin.name.clone())
+            .icon(
+                self.plugin_images
+                    .element(plugin.metadata.logo.as_ref())
+                    .size_10(),
             )
-            .to_string()
-        } else {
-            t!(
-                "plugins.details_metadata_no_version",
-                count = plugin.components.len()
-            )
-            .to_string()
-        };
-        let header = v_flex()
-            .pt_3()
-            .px_6()
-            .pb_5()
-            .gap_2()
-            .when_some(plugin.description.clone(), |view, description| {
-                view.child(div().text_sm().text_color(cx.theme().muted_foreground).child(description))
+            .when_some(summary_status(plugin), |header, status| {
+                header.status(status_label(status), status_color(status, cx))
             })
-            .border_b_1()
-            .border_color(cx.theme().border)
-            .child(
-                h_flex()
-                    .w_full()
-                    .min_w_0()
-                    .items_start()
-                    .gap_10()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .text_base()
-                            .font_semibold()
-                            .child(plugin.name.clone()),
-                    )
-                    .child(status_badge(
-                        if plugin.enabled || plugin.state != "installed" {
-                            &plugin.status
-                        } else {
-                            "disabled"
-                        },
-                        cx,
-                    )),
-            )
-            .child(
-                div()
-                    .text_sm()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(metadata),
-            );
+            .when_some(plugin.description.clone(), |header, description| {
+                header.description(description)
+            })
+            .when(manage, |header| {
+                header.actions(
+                    h_flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            Button::new("plugin-header-enabled")
+                                .xsmall()
+                                .compact()
+                                .h_6()
+                                .px_3()
+                                .when(plugin.enabled, |button| button.primary())
+                                .when(!plugin.enabled, |button| button.outline())
+                                .disabled(busy || plugin.state != "installed")
+                                .label(t!("plugins.enabled").to_string())
+                                .on_click(cx.listener({
+                                    let plugin = plugin.clone();
+                                    move |view, _, _, cx| view.set_enabled(plugin.clone(), cx)
+                                })),
+                        )
+                        .child(
+                            Button::new("plugin-header-implicit")
+                                .xsmall()
+                                .compact()
+                                .h_6()
+                                .px_3()
+                                .when(plugin.allow_implicit_invocation, |button| button.primary())
+                                .when(!plugin.allow_implicit_invocation, |button| button.outline())
+                                .disabled(busy || plugin.state != "installed")
+                                .label(t!("plugins.implicit").to_string())
+                                .on_click(cx.listener({
+                                    let plugin = plugin.clone();
+                                    move |view, _, _, cx| view.set_implicit(plugin.clone(), cx)
+                                })),
+                        ),
+                )
+            });
         let content = v_flex()
             .p_6()
             .gap_6()
@@ -156,22 +187,6 @@ impl PluginsView {
                 )
             })
             .children(self.management_controls(plugin, manage, busy, window, cx))
-            .when(
-                plugin.components.iter().any(|component| {
-                    matches!(
-                        component_status(component),
-                        "blocked" | "auth_required" | "authrequired"
-                    )
-                }),
-                |view| {
-                    view.child(
-                        div()
-                            .text_sm()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(t!("plugins.setup_required").to_string()),
-                    )
-                },
-            )
             .children(self.component_group(
                 plugin,
                 "mcp",
@@ -233,46 +248,100 @@ impl PluginsView {
                         .filter(|component| component.kind == kind)
                         .map(|component| {
                             let status = component_status(component);
+                            let card = match component.kind.as_str() {
+                                "skill" => {
+                                    let card = self
+                                        .input
+                                        .skills
+                                        .iter()
+                                        .find(|skill| {
+                                            component.skill_id.as_ref() == Some(&skill.skill_id)
+                                        })
+                                        .map(|skill| {
+                                            pioneer_desktop_skills::SkillCard::new(skill, cx)
+                                        })
+                                        .unwrap_or_else(|| {
+                                            pioneer_desktop_skills::SkillCard::missing(
+                                                component.member_key.clone(),
+                                                status_label(status),
+                                                status_color(status, cx),
+                                            )
+                                        });
+                                    card.pending(busy)
+                                        .when(component.status != "installed", |card| {
+                                            card.status(
+                                                status_label(status),
+                                                status_color(status, cx),
+                                            )
+                                        })
+                                        .into_any_element()
+                                }
+                                "mcp" => {
+                                    let card = self
+                                        .input
+                                        .mcp
+                                        .iter()
+                                        .find(|server| {
+                                            component.mcp_installation_id.as_ref()
+                                                == Some(&server.id)
+                                        })
+                                        .map(|server| {
+                                            pioneer_desktop_mcp::McpServerCard::new(server, cx)
+                                        })
+                                        .unwrap_or_else(|| {
+                                            pioneer_desktop_mcp::McpServerCard::missing(
+                                                component.member_key.clone(),
+                                                status_label(status),
+                                                status_color(status, cx),
+                                            )
+                                        });
+                                    card.pending(busy)
+                                        .when(component.status != "installed", |card| {
+                                            card.status(
+                                                status_label(status),
+                                                status_color(status, cx),
+                                            )
+                                        })
+                                        .into_any_element()
+                                }
+                                _ => unreachable!("component groups contain only skills and MCP"),
+                            };
+                            let can_open = component.skill_id.is_some()
+                                || component.mcp_installation_id.is_some();
+                            let card = div()
+                                .id(SharedString::from(format!(
+                                    "plugin-card-{}-{}-{}",
+                                    plugin.id, component.kind, component.member_key
+                                )))
+                                .w_full()
+                                .when(can_open, |card| {
+                                    let parent = plugin.clone();
+                                    let component = component.clone();
+                                    card.cursor_pointer().on_click(cx.listener(
+                                        move |view, _, window, cx| {
+                                            view.open_component(&parent, &component, window, cx)
+                                        },
+                                    ))
+                                })
+                                .child(card);
                             v_flex()
                                 .gap_2()
-                                .py_3()
-                                .border_b_1()
-                                .border_color(cx.theme().border)
-                                .child(
-                                    h_flex()
-                                        .min_w_0()
-                                        .gap_3()
-                                        .items_center()
-                                        .flex_wrap()
-                                        .child(
-                                            div()
-                                                .flex_1()
-                                                .min_w_0()
-                                                .text_sm()
-                                                .font_medium()
-                                                .child(component.member_key.clone()),
+                                .child(card)
+                                .when(
+                                    manage
+                                        && matches!(
+                                            component.status.as_str(),
+                                            "failed" | "removed_by_user"
                                         )
-                                        .child(status_badge(status, cx))
-                                        .child(self.component_controls(
+                                        && plugin.state == "installed"
+                                        && component.diagnostic.as_deref()
+                                            != Some("component_path_denied"),
+                                    |row| {
+                                        row.child(self.component_controls(
                                             plugin, component, manage, busy, cx,
-                                        )),
+                                        ))
+                                    },
                                 )
-                                .when(matches!(status, "auth_required" | "authrequired"), |row| {
-                                    row.child(
-                                        div()
-                                            .text_sm()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child(t!("plugins.sign_in_help").to_string()),
-                                    )
-                                })
-                                .when(status == "blocked" && component.kind == "skill", |row| {
-                                    row.child(
-                                        div()
-                                            .text_sm()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child(t!("plugins.skill_access_help").to_string()),
-                                    )
-                                })
                                 .when_some(component.diagnostic.as_deref(), |row, code| {
                                     row.child(
                                         div()

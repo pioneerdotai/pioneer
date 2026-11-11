@@ -335,7 +335,7 @@
 "timeline.web_search.running" = "Buscando en la web"
 "timeline.work_group.completed" = "Trabajó"
 
-"chat.composer.add_menu.plugins" = "Plugins"
+"chat.composer.add_menu.plugins" = "Añadir plugins"
 "plugins.empty" = "No hay plugins instalados"
 "plugins.error" = "No se pudieron cargar los plugins. Inténtalo de nuevo."
 "plugins.loading" = "Cargando plugins…"

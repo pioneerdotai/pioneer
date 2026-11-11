@@ -13,6 +13,8 @@ pub struct Manifest {
     pub name: String,
     pub version: Option<String>,
     pub description: Option<String>,
+    #[serde(default)]
+    pub metadata: pioneer_protocol::PluginMetadata,
     /// Immutable provenance, never interpreted as execution configuration.
     pub raw: Value,
 }
@@ -152,6 +154,7 @@ pub fn parse_manifest(bytes: &[u8]) -> Result<(Manifest, Vec<Diagnostic>), Diagn
             name,
             version,
             description,
+            metadata: Default::default(),
             raw,
         },
         diagnostics,

@@ -177,7 +177,7 @@ pub fn client_schema_documents() -> Vec<SchemaDocument> {
             "gateway_session_publication.json",
             crate::gateway::session_controller::GatewaySessionPublication
         ),
-        schema_doc!("avatar_publication.json", crate::avatars::AvatarPublication),
+        schema_doc!("image_publication.json", crate::images::ImagePublication),
         schema_doc!(
             "turn_cancellation_publication.json",
             crate::turns::cancellation::TurnCancellationPublication

@@ -43,6 +43,7 @@ mod patch_history_observer;
 mod permissions;
 mod post_startup;
 mod profile_avatar;
+mod images;
 mod prompt_hooks;
 mod public_error;
 mod request_context;

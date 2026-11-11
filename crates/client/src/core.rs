@@ -188,8 +188,11 @@ pub enum ClientScope {
     Artifact {
         thread_id: String,
     },
-    Avatar {
-        principal_id: String,
+    // Keep the established wire shape; this scope now carries any native image.
+    #[serde(rename = "avatar")]
+    Image {
+        #[serde(rename = "principal_id")]
+        key: String,
     },
     AdministrationOperation,
     AdministrationPage {
@@ -947,7 +950,7 @@ impl Drop for ClientSubscription {
                 .remove(&self.id);
             core.thread_subscription_changed(&self.queue.scope, false);
             core.composer_subscription_changed(&self.queue.scope, false);
-            core.avatar_subscription_changed(&self.queue.scope, false);
+            core.image_subscription_changed(&self.queue.scope, false);
             core.task_inbox_subscription_changed(&self.queue.scope, false);
             core.task_review_subscription_changed(&self.queue.scope, false);
             core.approval_action_subscription_changed(&self.queue.scope, false);
@@ -1099,7 +1102,7 @@ pub struct ClientCore {
     pub(crate) approval_actions:
         Mutex<crate::cli_runtime::approval_actions::ApprovalActionController>,
     pub(crate) task_reviews: Mutex<crate::tasks::review_controller::TaskReviewActionController>,
-    pub(crate) avatar_store: Mutex<crate::avatars::AvatarStore>,
+    pub(crate) image_store: Mutex<crate::images::ImageStore>,
     pub(crate) workspace_catalog: Mutex<crate::workspaces::catalog::WorkspaceCatalogStore>,
     pub(crate) workspace_controller: Mutex<crate::workspaces::controller::WorkspaceController>,
     pub(crate) task_notifications: Mutex<crate::tasks::notifications::TaskNotificationController>,
@@ -1383,7 +1386,7 @@ impl ClientCore {
             composer_catalog_requests: Mutex::default(),
             approval_actions: Mutex::default(),
             task_reviews: Mutex::default(),
-            avatar_store: Mutex::default(),
+            image_store: Mutex::default(),
             workspace_catalog: Mutex::default(),
             workspace_controller: Mutex::default(),
             task_notifications: Mutex::default(),
@@ -1885,7 +1888,7 @@ impl ClientCore {
             .lock()
             .expect("composer store poisoned")
             .clear();
-        self.avatar_store
+        self.image_store
             .lock()
             .expect("avatar store poisoned")
             .invalidate();
@@ -2625,7 +2628,7 @@ impl ClientCore {
     ) -> ClientSubscription {
         self.thread_subscription_changed(&scope, true);
         self.composer_subscription_changed(&scope, true);
-        self.avatar_subscription_changed(&scope, true);
+        self.image_subscription_changed(&scope, true);
         self.task_inbox_subscription_changed(&scope, true);
         self.task_review_subscription_changed(&scope, true);
         self.approval_action_subscription_changed(&scope, true);
@@ -2905,7 +2908,7 @@ impl ClientCore {
         if outcome == ClientTransitionOutcome::Changed {
             self.thread_demand_changed(&thread_scope, thread_demand);
             self.composer_demand_changed(&thread_scope, thread_demand);
-            self.avatar_demand_changed(&thread_scope, thread_demand);
+            self.image_demand_changed(&thread_scope, thread_demand);
             self.task_inbox_demand_changed(&thread_scope, thread_demand);
             self.task_review_demand_changed(&thread_scope, thread_demand);
             self.approval_action_demand_changed(&thread_scope, thread_demand);
@@ -3405,7 +3408,7 @@ impl ClientCore {
                 .lock()
                 .expect("activation owner poisoned")
                 .invalidate();
-            self.avatar_store
+            self.image_store
                 .lock()
                 .expect("avatar store poisoned")
                 .invalidate_access();
@@ -4787,8 +4790,8 @@ mod tests {
         let operation = ClientOperationId::new("avatar-read").unwrap();
         core.publish(
             &authority(),
-            ClientScope::Avatar {
-                principal_id: "principal-a".to_owned(),
+            ClientScope::Image {
+                key: "principal-a".to_owned(),
             },
             revisions(1),
             Arc::new("ready"),

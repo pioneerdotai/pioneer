@@ -15,8 +15,30 @@ fn parent(id: &str, workspace: &str) -> plugin_installation::Model {
         data_path: format!("/managed/plugins/{id}/data"),
         package_fingerprint: "tree".into(),
         enabled: true,
+        allow_implicit_invocation: false,
         state: "installing".into(),
         revision: 1,
+        display_name: None,
+        short_description: None,
+        description: None,
+        long_description: None,
+        developer_name: None,
+        author_name: None,
+        author_email: None,
+        author_url: None,
+        homepage: None,
+        repository: None,
+        documentation_url: None,
+        support_url: None,
+        privacy_policy_url: None,
+        terms_of_service_url: None,
+        license: None,
+        category: None,
+        brand_color: None,
+        logo_path: None,
+        logo_revision: None,
+        composer_icon_path: None,
+        composer_icon_revision: None,
         pending_json: None,
         last_error: None,
         created_at: util::unix_to_datetime(1),
@@ -992,7 +1014,7 @@ async fn concurrent_interactive_and_maintenance_publication_cannot_share_child()
     store.insert_plugin_installation(&parent("cas-parent", "ws")).await.unwrap();
     store.settle_plugin_installation("cas-parent", 1, "installed", None).await.unwrap();
     let db = store.database_connection().begin().await.unwrap();
-    let first = repositories::plugins::begin_mutation(&db, "ws", "cas-parent", 1, "updating", true, "{\"owner\":\"A\"}".into()).await.unwrap();
+    let first = repositories::plugins::begin_mutation(&db, "ws", "cas-parent", 1, "updating", true, "{\"owner\":\"A\"}".into(), None).await.unwrap();
     assert_eq!(first.revision, 2);
     // A owns a dispatched transition whose commit is still outstanding.
     assert_eq!(store.find_plugin_installation("cas-parent").await.unwrap().unwrap().revision, 1);

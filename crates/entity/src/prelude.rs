@@ -222,3 +222,5 @@ pub use super::portable_payload_block::Entity as PortablePayloadBlock;
 
 pub use super::task_child_reconcile_pending::Entity as TaskChildReconcilePending;
 pub use super::task_child_reconcile_scope::Entity as TaskChildReconcileScope;
+pub use super::plugin_default_prompt::Entity as PluginDefaultPrompt;
+pub use super::plugin_keyword::Entity as PluginKeyword;

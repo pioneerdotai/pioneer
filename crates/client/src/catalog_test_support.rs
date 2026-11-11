@@ -359,8 +359,8 @@ pub fn set_current_avatar_revision(core: &ClientCore, revision: Option<&str>) {
 /// Supplies the immutable result of the authenticated avatar cache in boundary tests.
 pub fn publish_cached_avatar(core: &ClientCore, revision: &str, path: &str) {
     let principal = core.current_auth().unwrap().principal.id;
-    let scope = ClientScope::Avatar {
-        principal_id: crate::avatars::avatar_identity_key(principal.as_str(), revision),
+    let scope = ClientScope::Image {
+        key: crate::avatars::avatar_identity_key(principal.as_str(), revision),
     };
     let next = core
         .snapshot(&scope)

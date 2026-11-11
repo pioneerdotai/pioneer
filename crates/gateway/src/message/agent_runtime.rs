@@ -12499,6 +12499,39 @@ impl MessageProcessor {
             .context("failed to materialize artifact-aware user message payload")?;
         let (text, mut attachments) = payload.unwrap_or_default();
         attachments.extend_from_slice(capability_attachments);
+        // Freeze the authored image reference with the user message. Only the Gateway's
+        // matching installed revision may supply it; client image references are ignored.
+        for attachment in &mut attachments {
+            if let pioneer_protocol::UserMessageAttachment::Plugin { capability } = attachment {
+                capability.icon = None;
+                if let Ok(Some(parent)) = self
+                    .crud_store
+                    .find_plugin_installation(&capability.plugin_id)
+                    .await
+                {
+                    if parent.workspace_id == workspace_id
+                        && parent.revision == capability.expected_revision
+                        && parent.state == "installed"
+                        && parent.pending_json.is_none()
+                    {
+                        capability.icon = parent
+                            .composer_icon_path
+                            .as_ref()
+                            .zip(parent.composer_icon_revision.as_ref())
+                            .or_else(|| {
+                                parent.logo_path.as_ref().zip(parent.logo_revision.as_ref())
+                            })
+                            .map(|(_, revision)| {
+                                pioneer_protocol::ImageReference::plugin_icon(
+                                    &parent.workspace_id,
+                                    &parent.id,
+                                    revision.clone(),
+                                )
+                            });
+                    }
+                }
+            }
+        }
 
         if text.is_empty() && attachments.is_empty() {
             return Ok(());
@@ -13020,7 +13053,7 @@ fn user_message_attachments_from_capabilities_with_lookup<'a>(
                         },
                     }
                 }
-                pioneer_protocol::TurnCapabilityKind::Plugin { plugin_id, expected_revision } => pioneer_protocol::UserMessageAttachment::Plugin { capability: pioneer_protocol::TurnPluginCapabilitySummary { plugin_id: plugin_id.clone(), expected_revision: *expected_revision, label: capability.label.clone().ok_or_else(|| anyhow::anyhow!("plugin presentation missing"))? } },
+                pioneer_protocol::TurnCapabilityKind::Plugin { plugin_id, expected_revision } => pioneer_protocol::UserMessageAttachment::Plugin { capability: pioneer_protocol::TurnPluginCapabilitySummary { plugin_id: plugin_id.clone(), expected_revision: *expected_revision, label: capability.label.clone().ok_or_else(|| anyhow::anyhow!("plugin presentation missing"))?, icon: None } },
                 pioneer_protocol::TurnCapabilityKind::SkillPack { pack_id } => {
                     let name = pack_names.get(pack_id).ok_or_else(|| {
                         anyhow::anyhow!(

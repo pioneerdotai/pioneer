@@ -36,11 +36,15 @@ impl PluginsView {
                 client,
                 binding,
                 input: Arc::new(PluginPublication::default()),
+                plugin_images: pioneer_desktop_foundation::ImageViews::new()
+                    .placeholder("icons/box.svg"),
                 workspace: None,
                 connection: 0,
                 authorization: None,
                 window_active: false,
                 demand: None,
+                skills_demand: None,
+                mcp_demand: None,
                 demand_key: None,
                 selected: None,
                 source_picker: None,
@@ -101,14 +105,23 @@ impl PluginsView {
                     self.selected.clone(),
                     self.connection,
                     self.client.plugins_management_allowed(workspace),
+                    self.selected.is_some() && self.route_child.is_none(),
                 )
             })
         })
         .flatten();
         if self.demand_key != wanted {
             self.demand = None;
+            self.skills_demand = None;
+            self.mcp_demand = None;
             self.demand_key = wanted.clone();
-            if let Some((workspace, selected, _, _)) = wanted {
+            if let Some((workspace, selected, _, _, overview)) = wanted {
+                // The visible overview owns catalog leases for its native cards.
+                // A child page retains its own detail demand instead.
+                if overview {
+                    self.skills_demand = Some(self.client.acquire_skills_demand(&workspace, None));
+                    self.mcp_demand = Some(self.client.acquire_mcp_demand(&workspace, None));
+                }
                 self.demand = Some(
                     self.client
                         .acquire_plugin_demand(&workspace, selected.as_deref()),
@@ -130,6 +143,8 @@ impl PluginsView {
             || self.authorization != authorization
         {
             self.demand = None;
+            self.skills_demand = None;
+            self.mcp_demand = None;
             self.demand_key = None;
             self.workspace = workspace;
             self.connection = connection;
@@ -159,6 +174,22 @@ impl PluginsView {
             scopes.push(ClientScope::Plugins {
                 workspace_id: workspace.clone(),
             });
+            if self.window_active
+                && matches!(
+                    self.client.navigation_snapshot().destination(),
+                    SemanticDestination::Plugin {
+                        component: None,
+                        ..
+                    }
+                )
+            {
+                scopes.push(ClientScope::Skills {
+                    workspace_id: Some(workspace.clone()),
+                });
+                scopes.push(ClientScope::Mcp {
+                    workspace_id: Some(workspace.clone()),
+                });
+            }
         }
         self.binding.set_scopes(&scopes);
         let navigation = self.client.navigation_snapshot();
@@ -214,12 +245,26 @@ impl PluginsView {
             || self.input.plugin_id != next.plugin_id
             || self.input.plugins != next.plugins
             || self.input.details != next.details
+            || self.input.skills != next.skills
+            || self.input.mcp != next.mcp
             || self.input.loaded != next.loaded
             || self.input.busy != next.busy
             || self.input.managing != next.managing
             || self.input.error != next.error
             || self.input.operations != next.operations;
         self.input = next;
+        let icons = self.input.plugins.iter().chain(self.input.details.iter())
+            .filter(|_| self.demand.is_some() && self.route_child.is_none())
+            .filter_map(|plugin| plugin.metadata.logo.clone()).collect::<Vec<_>>();
+        self.plugin_images.reconcile(icons, cx);
+        // Navigate only after the selected parent's acknowledged removal. A
+        // missing row during a refresh is not proof that deletion completed.
+        if self.operation().is_some_and(|operation| {
+            !operation.busy && operation.result.as_ref().is_some_and(|result| result.removed)
+        }) {
+            self.select_plugin(None, cx);
+            return;
+        }
         self.sync_update_upload(cx);
         self.schedule_child_sync(cx);
         if changed {
@@ -376,7 +421,7 @@ impl PluginsView {
                 || self.authorization != self.client.authorization_permissions_epoch()
                 || !self.connected()
             {
-                self.presentation_error = Some(t!("plugins.change_failed").to_string());
+                self.set_presentation_error(Some(t!("plugins.change_failed").to_string()));
                 cx.notify();
                 return;
             }
@@ -403,12 +448,14 @@ impl PluginsView {
             } else {
                 self.client.plugin_intent(workspace, intent)
             };
-            self.presentation_error = matches!(
-                transition.outcome(),
-                pioneer_client::core::ClientTransitionOutcome::Rejected
-                    | pioneer_client::core::ClientTransitionOutcome::Stale
-            )
-            .then(|| t!("plugins.change_failed").to_string());
+            self.set_presentation_error(
+                matches!(
+                    transition.outcome(),
+                    pioneer_client::core::ClientTransitionOutcome::Rejected
+                        | pioneer_client::core::ClientTransitionOutcome::Stale
+                )
+                .then(|| t!("plugins.change_failed").to_string()),
+            );
             cx.notify();
             if applying_update.is_some()
                 && transition.outcome() == pioneer_client::core::ClientTransitionOutcome::Changed
@@ -487,7 +534,18 @@ impl PluginsView {
     }
     pub(super) fn busy(&self, cx: &App) -> bool {
         !self.connected()
-            || self.operation().is_some_and(|o| o.busy || (o.uncertain && !self.workspace.as_deref().zip(self.selected.as_deref()).is_some_and(|(workspace, parent)| self.client.plugin_parent_recovery_available(workspace, parent))))
+            || self.operation().is_some_and(|o| {
+                o.busy
+                    || (o.uncertain
+                        && !self
+                            .workspace
+                            .as_deref()
+                            .zip(self.selected.as_deref())
+                            .is_some_and(|(workspace, parent)| {
+                                self.client
+                                    .plugin_parent_recovery_available(workspace, parent)
+                            }))
+            })
             || self.upload.read(cx).active()
             || self
                 .upload
@@ -501,6 +559,10 @@ impl PluginsView {
                 .as_ref()
                 .is_some_and(|id| self.selected_plugin().is_none_or(|p| &p.id != id))
     }
+    pub(super) fn set_presentation_error(&mut self, error: Option<String>) {
+        self.presentation_error = error.map(|error| (self.selected.clone(), error));
+    }
+
     pub(super) fn installation_error(&self, cx: &App) -> Option<String> {
         if self
             .upload
@@ -511,7 +573,9 @@ impl PluginsView {
             return Some(t!("plugins.uncertain").to_string());
         }
         self.presentation_error
-            .clone()
+            .as_ref()
+            .filter(|(parent, _)| parent == &self.selected)
+            .map(|(_, error)| error.clone())
             .or_else(|| {
                 self.operation().and_then(|o| {
                     if o.uncertain {
@@ -560,8 +624,9 @@ impl PluginsView {
                     Ok(Ok(Some(mut paths))) => paths.pop(),
                     Ok(Ok(None)) => None,
                     _ => {
-                        view.presentation_error =
-                            Some(t!("plugins.upload_source_unavailable").to_string());
+                        view.set_presentation_error(Some(
+                            t!("plugins.upload_source_unavailable").to_string(),
+                        ));
                         None
                     }
                 };
@@ -575,7 +640,7 @@ impl PluginsView {
                 let result = view
                     .upload
                     .update(cx, |upload, cx| upload.start(workspace, target, path, cx));
-                view.presentation_error = result.err().map(PluginUploadView::failure_message);
+                view.set_presentation_error(result.err().map(PluginUploadView::failure_message));
             });
         }));
         cx.notify();

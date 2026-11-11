@@ -40,7 +40,7 @@ impl Default for AvatarBinding {
 }
 impl ClientPublicationSink for AvatarBinding {
     fn publish(&self, publication: ClientPublicationReference) {
-        let ClientScope::Avatar { principal_id } = publication.scope() else {
+        let ClientScope::Image { key: principal_id } = publication.scope() else {
             return;
         };
         let mut inputs = self.publications.borrow_mut();
@@ -143,8 +143,8 @@ impl DesktopMemberAvatarState {
         self.registrations.insert(
             key.to_owned(),
             registrar.register(
-                ClientScope::Avatar {
-                    principal_id: key.to_owned(),
+                ClientScope::Image {
+                    key: key.to_owned(),
                 },
                 Arc::downgrade(&sink),
             ),
@@ -194,7 +194,7 @@ impl DesktopMemberAvatarState {
                 changed |= before != *entry;
             }
             if let Some(publication) = publication {
-                if let Some(revision) = publication.principal_id().strip_prefix("agent:") {
+                if let Some(revision) = publication.resource_id().strip_prefix("agent:") {
                     let previous = self.agent_cached_image_paths.remove(revision);
                     let next = publication
                         .local_path()
@@ -409,8 +409,8 @@ impl DesktopMemberAvatarState {
             return cfg!(test);
         };
         client
-            .snapshot(&ClientScope::Avatar {
-                principal_id: key.to_owned(),
+            .snapshot(&ClientScope::Image {
+                key: key.to_owned(),
             })
             .and_then(|snapshot| snapshot.snapshot().payload::<AvatarPublication>())
             .is_some_and(|publication| {
@@ -574,7 +574,7 @@ impl Drop for DesktopMemberAvatarState {
 #[derive(Clone)]
 pub(crate) struct ThreadAvatarClient {
     client: Arc<pioneer_client::core::ClientCore>,
-    service: pioneer_client::avatars::AvatarCacheService,
+    service: pioneer_client::images::ImageCacheService,
     runtime: Arc<pioneer_observability::runtime::ObservedRuntime>,
 }
 impl ThreadAvatarClient {
@@ -582,7 +582,7 @@ impl ThreadAvatarClient {
         client: Arc<pioneer_client::core::ClientCore>,
         runtime_home: PathBuf,
     ) -> Result<Self, AvatarCacheError> {
-        let service = client.avatar_cache_service(runtime_home)?;
+        let service = client.image_cache_service(runtime_home)?;
         let runtime = Arc::new(pioneer_observability::runtime::ObservedRuntime::new(
             tokio::runtime::Runtime::new().map_err(|_| AvatarCacheError::Offline)?,
             pioneer_observability::runtime::RuntimeRole::DesktopHelper,

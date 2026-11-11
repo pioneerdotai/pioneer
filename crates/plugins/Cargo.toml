@@ -14,6 +14,7 @@ hex.workspace = true
 http.workspace = true
 url.workspace = true
 pioneer-skills.workspace = true
+pioneer-protocol.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

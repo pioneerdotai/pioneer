@@ -41,7 +41,9 @@ mod restore_tests {
             name: "fixture".into(),
             version: None,
             description: None,
+            metadata: Default::default(),
             enabled: true,
+            allow_implicit_invocation: false,
             state: "installed".into(),
             revision: 4,
             status: "partial".into(),
@@ -124,11 +126,26 @@ impl PluginsView {
                 plugin_id: plugin.id,
                 expected_revision: plugin.revision,
                 enabled: !plugin.enabled,
+                allow_implicit_invocation: None,
             },
             cx,
         );
     }
-    fn open_component(
+    pub(super) fn set_implicit(&mut self, plugin: PluginItem, cx: &mut Context<Self>) {
+        if self.busy(cx) {
+            return;
+        }
+        self.send_intent(
+            PluginIntent::SetEnabled {
+                plugin_id: plugin.id,
+                expected_revision: plugin.revision,
+                enabled: plugin.enabled,
+                allow_implicit_invocation: Some(!plugin.allow_implicit_invocation),
+            },
+            cx,
+        );
+    }
+    pub(super) fn open_component(
         &mut self,
         plugin: &PluginItem,
         component: &PluginComponentItem,
@@ -162,35 +179,8 @@ impl PluginsView {
         busy: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let parent = plugin.clone();
-        let child = component.clone();
         h_flex()
             .gap_2()
-            .when(
-                component.skill_id.is_some() || component.mcp_installation_id.is_some(),
-                |row| {
-                    row.child(
-                        Button::new(SharedString::from(format!(
-                            "plugin-component-settings-{}-{}-{}",
-                            plugin.id, component.kind, component.member_key
-                        )))
-                        .ghost()
-                        .label(
-                            t!(match component.kind.as_str() {
-                                "mcp" => "plugins.open_mcp",
-                                "skill" => "plugins.open_skill",
-                                _ => "plugins.settings",
-                            })
-                            .to_string(),
-                        )
-                        .on_click(cx.listener(
-                            move |view, _, window, cx| {
-                                view.open_component(&parent, &child, window, cx)
-                            },
-                        )),
-                    )
-                },
-            )
             .when(
                 manage
                     && matches!(component.status.as_str(), "failed" | "removed_by_user")
@@ -249,6 +239,13 @@ impl PluginsView {
         if self.busy(cx) {
             return;
         }
+        // A native prompt can deactivate its parent window. Retain an explicit
+        // consumer until the confirmed command is admitted, so focus loss does
+        // not suspend the plugin controller underneath this confirmation.
+        let confirmation_demand = self.workspace.as_deref().map(|workspace| {
+            self.client
+                .acquire_plugin_demand(workspace, Some(&parent.id))
+        });
         let answer = window.prompt(
             PromptLevel::Warning,
             &t!(
@@ -276,6 +273,7 @@ impl PluginsView {
         let connection = self.connection;
         let authorization = self.authorization;
         self.restore_confirmation = Some(cx.spawn(async move |view: WeakEntity<Self>, cx| {
+            let _confirmation_demand = confirmation_demand;
             let confirmed = answer.await == Ok(0);
             let _ = view.update(cx, |view, cx| {
                 if view.workspace != workspace
@@ -311,6 +309,13 @@ impl PluginsView {
         if self.busy(cx) {
             return;
         }
+        // A native prompt can deactivate its parent window. Retain an explicit
+        // consumer until the confirmed command is admitted, so focus loss does
+        // not suspend the plugin controller underneath this confirmation.
+        let confirmation_demand = self.workspace.as_deref().map(|workspace| {
+            self.client
+                .acquire_plugin_demand(workspace, Some(&parent.id))
+        });
         let answer = window.prompt(
             PromptLevel::Warning,
             &t!("plugins.remove_title", name = parent.name.as_str()).to_string(),
@@ -326,6 +331,7 @@ impl PluginsView {
         let connection = self.connection;
         let authorization = self.authorization;
         self.restore_confirmation = Some(cx.spawn(async move |view: WeakEntity<Self>, cx| {
+            let _confirmation_demand = confirmation_demand;
             let answer = answer.await;
             let _ = view.update(cx, |view, cx| {
                 if view.workspace != workspace
@@ -347,8 +353,8 @@ impl PluginsView {
                             },
                             cx,
                         );
-                    } else {
-                        view.presentation_error = Some(t!("plugins.change_failed").to_string());
+                    } else if view.selected.as_deref() == Some(parent.id.as_str()) {
+                        view.set_presentation_error(Some(t!("plugins.change_failed").to_string()));
                     }
                 }
                 cx.notify();
@@ -448,7 +454,11 @@ impl PluginsView {
                                     view.child(div().text_sm().child(description))
                                 })
                                 .when(preview.supporting_files_changed, |view| {
-                                    view.child(div().text_sm().child(t!("plugins.supporting_files_changed").to_string()))
+                                    view.child(
+                                        div().text_sm().child(
+                                            t!("plugins.supporting_files_changed").to_string(),
+                                        ),
+                                    )
                                 })
                                 .children(preview.added.iter().map(|component| {
                                     div().text_sm().child(

@@ -12,6 +12,8 @@
 #![forbid(unsafe_code)]
 
 mod avatar;
+mod image_surface;
+pub use image_surface::ImageSurface;
 mod binding;
 mod catalog_binding;
 mod identity;
@@ -36,3 +38,13 @@ pub use catalog_presentation::{
     catalog_heading, catalog_sidebar_icon, catalog_sidebar_label, catalog_sidebar_menu_icon,
     catalog_status_badge,
 };
+
+mod catalog_details_header;
+pub use catalog_details_header::CatalogDetailsHeader;
+
+mod catalog_card;
+pub use catalog_card::CatalogCard;
+pub use catalog_presentation::{catalog_empty_state, catalog_list_header};
+
+mod image_views;
+pub use image_views::{ImageViewConfig, ImageViewPort, ImageViews};

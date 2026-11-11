@@ -1252,7 +1252,8 @@ mod tests {
                 name: "Mixed".into(),
                 version: None,
                 description: None,
-                enabled: true,
+            metadata: Default::default(),
+                enabled: true, allow_implicit_invocation: false,
                 state: "installed".into(),
                 revision,
                 status: "partial".into(),
@@ -1349,7 +1350,7 @@ mod tests {
                 label: "Pinned parent".into(),
                 kind: capabilities::ComposerCapabilityKind::Plugin {
                     plugin_id: "P".repeat(21),
-                    expected_revision: 7,
+                    expected_revision: 7, icon: None,
                 },
             };
             core.composer_intent(ComposerIntent::Domain {
@@ -1367,7 +1368,8 @@ mod tests {
                     name: "New parent".into(),
                     version: None,
                     description: None,
-                    enabled: true,
+            metadata: Default::default(),
+                    enabled: true, allow_implicit_invocation: false,
                     state: "installed".into(),
                     revision: 1,
                     status: "partial".into(),

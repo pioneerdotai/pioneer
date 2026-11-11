@@ -2686,6 +2686,17 @@
                 },
                 "plugin_id": {
                   "type": "string"
+                },
+                "icon": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/$defs/ImageReference"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null
                 }
               },
               "required": [
@@ -7201,7 +7212,7 @@
           "minLength": 1
         },
         "media_type": {
-          "$ref": "#/$defs/ProfileAvatarMediaType"
+          "$ref": "#/$defs/ImageMediaType"
         }
       },
       "additionalProperties": false,
@@ -7210,7 +7221,7 @@
         "content_base64"
       ]
     },
-    "ProfileAvatarMediaType": {
+    "ImageMediaType": {
       "type": "string",
       "enum": [
         "image/png",
@@ -10497,6 +10508,22 @@
         "workspace_id",
         "principal_id"
       ]
+    },
+    "ImageReference": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "revision": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "revision"
+      ],
+      "description": "Immutable image reference. Gateway inventory exposes a native storage link, never image bytes."
     }
   }
 }

@@ -1446,7 +1446,7 @@ impl MessageProcessor {
     ) -> anyhow::Result<NormalizedTurnCapabilities> {
         let requested = super::agent_action_tools::task_launch_selection_capabilities(selection)?;
         let mut normalized = self
-            .normalize_turn_skill_capabilities(workspace, &requested)
+            .normalize_selected_turn_capabilities(workspace, &requested)
             .await
             .map_err(|error| anyhow::anyhow!(error))?;
         if normalized.plugin_selection.is_some() {
@@ -1578,7 +1578,38 @@ impl MessageProcessor {
         Ok(presentation)
     }
 
+    /// Include workspace opt-in plugins for new turns through the same native
+    /// resolver, ownership snapshot and launch admission as explicit selection.
     pub(crate) async fn normalize_turn_skill_capabilities(
+        &self,
+        workspace_id: &str,
+        capabilities: &[pioneer_protocol::TurnCapability],
+    ) -> Result<NormalizedTurnCapabilities, TurnStartFailure> {
+        let mut selected = capabilities.to_vec();
+        for parent in self
+            .crud_store
+            .list_plugin_installations(workspace_id)
+            .await
+            .map_err(|_| TurnStartFailure::unavailable("plugin inventory unavailable"))?
+        {
+            if parent.enabled && parent.allow_implicit_invocation && parent.state == "installed"
+                && parent.pending_json.is_none()
+                && !selected.iter().any(|cap| matches!(&cap.kind,
+                    pioneer_protocol::TurnCapabilityKind::Plugin { plugin_id, .. } if plugin_id == &parent.id)) {
+                selected.push(pioneer_protocol::TurnCapability {
+                    id: pioneer_protocol::plugin_capability_key(&parent.id),
+                    label: None,
+                    kind: pioneer_protocol::TurnCapabilityKind::Plugin {
+                        plugin_id: parent.id, expected_revision: parent.revision,
+                    },
+                });
+            }
+        }
+        self.normalize_selected_turn_capabilities(workspace_id, &selected)
+            .await
+    }
+
+    async fn normalize_selected_turn_capabilities(
         &self,
         workspace_id: &str,
         capabilities: &[pioneer_protocol::TurnCapability],

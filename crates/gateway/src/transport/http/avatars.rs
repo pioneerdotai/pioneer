@@ -1,9 +1,13 @@
 use std::net::SocketAddr;
 
-use axum::body::Body;
 use axum::extract::{ConnectInfo, Path, State};
-use axum::http::header::{CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, ETAG, IF_NONE_MATCH};
-use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
+#[cfg(test)]
+use axum::http::header::{
+    CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, IF_NONE_MATCH, X_CONTENT_TYPE_OPTIONS,
+};
+use axum::http::{HeaderMap, Method};
+#[cfg(test)]
+use axum::http::{HeaderValue, StatusCode};
 use axum::response::Response;
 use pioneer_protocol::{
     CLAUDE_AGENT_AVATAR_REVISION, CODEX_AGENT_AVATAR_REVISION, OPENCODE_AGENT_AVATAR_DARK_REVISION,
@@ -19,7 +23,11 @@ use super::auth::authenticate_native_storage_request;
 use super::errors::{HttpError, HttpErrorKind};
 use super::state::GatewayHttpState;
 
-const AVATAR_CACHE_CONTROL: &str = "private, max-age=31536000, immutable";
+#[cfg(test)]
+use super::images::IMAGE_CACHE_CONTROL as AVATAR_CACHE_CONTROL;
+use super::images::{
+    image_representation_response as avatar_representation_response, valid_revision,
+};
 const PIONEER_AGENT_AVATAR_BYTES: &[u8] = include_bytes!("../../../assets/pioneer-avatar.png");
 const CODEX_AGENT_AVATAR_BYTES: &[u8] = include_bytes!("../../../assets/codex-avatar.png");
 const CLAUDE_AGENT_AVATAR_BYTES: &[u8] = include_bytes!("../../../assets/claude-avatar.png");
@@ -27,8 +35,6 @@ const OPENCODE_AGENT_AVATAR_LIGHT_BYTES: &[u8] =
     include_bytes!("../../../assets/opencode-avatar-light.png");
 const OPENCODE_AGENT_AVATAR_DARK_BYTES: &[u8] =
     include_bytes!("../../../assets/opencode-avatar-dark.png");
-const REQUEST_ID_HEADER: HeaderName = HeaderName::from_static("pioneer-request-id");
-const X_CONTENT_TYPE_OPTIONS: HeaderName = HeaderName::from_static("x-content-type-options");
 
 #[derive(Debug, Deserialize)]
 pub(super) struct MemberAvatarPath {
@@ -113,13 +119,6 @@ pub(super) async fn agent_avatar_route(
     )
 }
 
-fn valid_revision(revision: &str) -> bool {
-    revision.len() == 64
-        && revision
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
-
 fn avatar_response(
     snapshot: MemberAvatarSnapshot,
     method: Method,
@@ -134,84 +133,6 @@ fn avatar_response(
         request_headers,
         request_id,
     )
-}
-
-fn avatar_representation_response(
-    content: &[u8],
-    media_type: ProfileAvatarMediaType,
-    revision: &str,
-    method: Method,
-    request_headers: &HeaderMap,
-    request_id: &RequestId,
-) -> Result<Response, HttpError> {
-    let etag = format!("\"{revision}\"");
-    let not_modified = if_none_match_matches(request_headers, etag.as_str());
-    let status = if not_modified {
-        StatusCode::NOT_MODIFIED
-    } else {
-        StatusCode::OK
-    };
-    let send_body = !not_modified && method == Method::GET;
-    let body = if send_body {
-        Body::from(content.to_vec())
-    } else {
-        Body::empty()
-    };
-    let mut response = Response::builder()
-        .status(status)
-        .body(body)
-        .map_err(|_| HttpError::new(HttpErrorKind::Internal, request_id.clone()))?;
-    let headers = response.headers_mut();
-    insert_header(headers, ETAG, etag.as_str(), request_id)?;
-    headers.insert(
-        CACHE_CONTROL,
-        HeaderValue::from_static(AVATAR_CACHE_CONTROL),
-    );
-    headers.insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
-    insert_header(headers, REQUEST_ID_HEADER, request_id.as_str(), request_id)?;
-
-    if !not_modified {
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static(media_type.as_str()));
-        insert_header(
-            headers,
-            CONTENT_LENGTH,
-            content.len().to_string().as_str(),
-            request_id,
-        )?;
-    }
-    tracing::debug!(
-        event = "avatar_http_response",
-        outcome = if not_modified { "304" } else { "200" },
-        request_id = request_id.as_str(),
-    );
-    Ok(response)
-}
-
-fn if_none_match_matches(headers: &HeaderMap, current_etag: &str) -> bool {
-    headers.get_all(IF_NONE_MATCH).iter().any(|value| {
-        value.to_str().is_ok_and(|value| {
-            value.split(',').any(|candidate| {
-                let candidate = candidate.trim();
-                candidate == "*"
-                    || candidate == current_etag
-                    || candidate
-                        .strip_prefix("W/")
-                        .is_some_and(|weak| weak == current_etag)
-            })
-        })
-    })
-}
-
-fn insert_header(
-    headers: &mut HeaderMap,
-    name: HeaderName,
-    value: &str,
-    request_id: &RequestId,
-) -> Result<(), HttpError> {
-    let value = HeaderValue::from_str(value)
-        .map_err(|_| HttpError::new(HttpErrorKind::Internal, request_id.clone()))?;
-    headers.insert(name, value);
-    Ok(())
 }
 
 fn map_avatar_error(error: MemberServiceError, request_id: RequestId) -> HttpError {

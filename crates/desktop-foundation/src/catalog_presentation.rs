@@ -18,10 +18,7 @@ pub fn catalog_sidebar_icon(icon: impl Into<Icon>, filled: bool, cx: &App) -> Di
         .when(filled, |view| view.bg(cx.theme().foreground.opacity(0.075)))
 }
 pub fn catalog_sidebar_label(label: String) -> Div {
-    div()
-        .line_height(relative(1.))
-        .opacity(0.8)
-        .child(label)
+    div().line_height(relative(1.)).opacity(0.8).child(label)
 }
 
 pub fn catalog_heading(title: String, description: String, cx: &App) -> AnyElement {
@@ -49,4 +46,69 @@ pub fn catalog_status_badge(label: String, color: Hsla) -> Div {
         .text_color(color)
         .font_medium()
         .child(label)
+}
+
+/// Shared list heading and summary band, with the original Skills catalogue styles.
+pub fn catalog_list_header(
+    title: String,
+    description: String,
+    count: String,
+    cx: &App,
+) -> AnyElement {
+    v_flex()
+        .pt_3()
+        .px_6()
+        .pb_3()
+        .gap_2()
+        .border_b_1()
+        .border_color(cx.theme().border)
+        .child(catalog_heading(title, description, cx))
+        .child(
+            h_flex()
+                .items_center()
+                .gap_2()
+                .child(div().text_xs().opacity(0.6).child(count)),
+        )
+        .into_any_element()
+}
+
+/// Shared MCP-style empty catalogue. The caller owns permissions and the install command.
+pub fn catalog_empty_state(
+    title: String,
+    description: String,
+    install: Option<gpui_kit::component::button::Button>,
+    cx: &App,
+) -> AnyElement {
+    v_flex()
+        .w_full()
+        .h_full()
+        .items_center()
+        .justify_center()
+        .gap_4()
+        .p_8()
+        .bg(cx.theme().background)
+        .when_some(install, |view, install| {
+            view.child(
+                install.child(
+                    div()
+                        .size_10()
+                        .rounded_full()
+                        .bg(cx.theme().foreground)
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_color(cx.theme().primary_foreground)
+                        .child(Icon::new(IconName::Plus).size_6()),
+                ),
+            )
+        })
+        .child(
+            v_flex()
+                .items_center()
+                .justify_center()
+                .gap_1()
+                .child(div().text_base().font_semibold().child(title))
+                .child(div().text_sm().opacity(0.6).child(description)),
+        )
+        .into_any_element()
 }

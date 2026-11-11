@@ -36,6 +36,8 @@ mod jsonrpc;
 mod markdown;
 mod mcp;
 mod member;
+mod images;
+pub use images::{ImageMediaType, ImageReference, IMAGE_MAX_BYTES, IMAGE_MAX_DIMENSION};
 mod memory;
 mod notification;
 mod patch_history;

@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "AvatarPublication",
+  "title": "ImagePublication",
   "type": "object",
   "properties": {
     "avatar_revision": {
@@ -9,7 +9,7 @@
     "error": {
       "anyOf": [
         {
-          "$ref": "#/$defs/AvatarCacheError"
+          "$ref": "#/$defs/ImageCacheError"
         },
         {
           "type": "null"
@@ -29,7 +29,7 @@
     "media_type": {
       "anyOf": [
         {
-          "$ref": "#/$defs/ProfileAvatarMediaType"
+          "$ref": "#/$defs/ImageMediaType"
         },
         {
           "type": "null"
@@ -42,7 +42,7 @@
     "source": {
       "anyOf": [
         {
-          "$ref": "#/$defs/AvatarCacheSource"
+          "$ref": "#/$defs/ImageCacheSource"
         },
         {
           "type": "null"
@@ -55,7 +55,7 @@
     "avatar_revision"
   ],
   "$defs": {
-    "AvatarCacheError": {
+    "ImageCacheError": {
       "type": "string",
       "enum": [
         "invalid_request",
@@ -68,7 +68,7 @@
         "cancelled"
       ]
     },
-    "AvatarCacheSource": {
+    "ImageCacheSource": {
       "type": "string",
       "enum": [
         "downloaded",
@@ -79,7 +79,7 @@
     "ClientPath": {
       "type": "string"
     },
-    "ProfileAvatarMediaType": {
+    "ImageMediaType": {
       "type": "string",
       "enum": [
         "image/png",

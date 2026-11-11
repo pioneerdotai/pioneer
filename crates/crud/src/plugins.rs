@@ -166,6 +166,16 @@ impl CrudStore {
         connection_id: u64,
         now: i64,
     ) -> Result<()> {
+        self.reserve_plugin_installation_with_metadata(parent, connection_id, now, None)
+            .await
+    }
+    pub async fn reserve_plugin_installation_with_metadata(
+        &self,
+        parent: &plugin_installation::Model,
+        connection_id: u64,
+        now: i64,
+        metadata: Option<&pioneer_protocol::PluginMetadata>,
+    ) -> Result<()> {
         if parent.state != "installing"
             || parent.revision != 1
             || parent.pending_json.as_ref().is_none_or(|v| v.len() > 65536)
@@ -173,9 +183,16 @@ impl CrudStore {
             bail!("invalid plugin reservation");
         }
         let _: serde_json::Value = serde_json::from_str(parent.pending_json.as_deref().unwrap())?;
-        let row: plugin_installation::ActiveModel = parent.clone().into();
+        let prepared = metadata
+            .map(|metadata| crate::repositories::plugin_metadata::prepare(&parent.id, metadata))
+            .transpose()?;
+        let mut row: plugin_installation::ActiveModel = parent.clone().into();
+        if let Some(prepared) = &prepared {
+            crate::repositories::plugin_metadata::apply_columns(&mut row, prepared.columns.clone());
+        }
         self.run_serialized_write(|| {
             let row = row.clone();
+            let prepared = prepared.clone();
             async move {
                 let db = self.connection.begin().await?;
                 let upload = crate::repositories::skill_upload_session::find_skill_upload_session(
@@ -195,6 +212,15 @@ impl CrudStore {
                     bail!("upload unavailable");
                 }
                 plugins::insert_parent(&db, row).await?;
+                if let Some(prepared) = prepared {
+                    crate::repositories::plugin_metadata::replace_lists(
+                        &db,
+                        &parent.id,
+                        prepared.keywords,
+                        prepared.prompts,
+                    )
+                    .await?;
+                }
                 crate::repositories::skill_upload_session::transition_skill_upload_status(
                     &db,
                     &parent.source_upload_id,
@@ -320,6 +346,35 @@ impl CrudStore {
             async move { plugins::insert_parent(&self.connection, row).await }
         })
         .await
+    }
+    /// Scalars and ordered lists are read from one bounded physical reader snapshot.
+    /// Mapping runs after release; writers cannot expose mixed metadata generations.
+    pub async fn plugin_metadata_inventory(
+        &self,
+        ids: &[String],
+    ) -> Result<std::collections::HashMap<String, (i64, pioneer_protocol::PluginMetadata)>> {
+        let mut result = std::collections::HashMap::new();
+        for chunk in ids.chunks(64) {
+            let snapshot = self.connection.begin_read().await?;
+            let (parents, keywords, prompts) =
+                crate::repositories::plugin_metadata::load(&snapshot, chunk).await?;
+            snapshot.commit().await?;
+            result.extend(crate::repositories::plugin_metadata::project(
+                parents, keywords, prompts,
+            ));
+        }
+        Ok(result)
+    }
+    pub async fn plugin_metadata(
+        &self,
+        parent: &plugin_installation::Model,
+    ) -> Result<Option<pioneer_protocol::PluginMetadata>> {
+        Ok(self
+            .plugin_metadata_inventory(std::slice::from_ref(&parent.id))
+            .await?
+            .remove(&parent.id)
+            .filter(|(revision, _)| *revision == parent.revision)
+            .map(|(_, metadata)| metadata))
     }
     pub async fn find_plugin_installation(
         &self,
@@ -447,6 +502,21 @@ impl CrudStore {
         enabled: bool,
         pending: &str,
     ) -> Result<plugin_installation::Model> {
+        self.begin_plugin_mutation_with_policy(
+            workspace, id, revision, state, enabled, pending, None,
+        )
+        .await
+    }
+    pub async fn begin_plugin_mutation_with_policy(
+        &self,
+        workspace: &str,
+        id: &str,
+        revision: i64,
+        state: &str,
+        enabled: bool,
+        pending: &str,
+        allow_implicit_invocation: Option<bool>,
+    ) -> Result<plugin_installation::Model> {
         if !matches!(state, "updating" | "removing") || pending.len() > 65536 {
             bail!("invalid plugin mutation");
         }
@@ -461,6 +531,7 @@ impl CrudStore {
                 state,
                 enabled,
                 pending.into(),
+                allow_implicit_invocation,
             )
             .await?;
             db.commit().await?;
@@ -722,6 +793,7 @@ impl CrudStore {
                     "updating",
                     parent.enabled,
                     pending.into(),
+                    None,
                 )
                 .await?
             };
@@ -753,20 +825,48 @@ impl CrudStore {
         fingerprint: &str,
         upload_id: Option<&str>,
     ) -> Result<()> {
-        self.run_serialized_write(|| async move {
-            let db = self.connection.begin().await?;
-            plugins::publish_package(
-                &db,
-                id,
-                revision,
-                name,
-                version,
-                fingerprint,
-                upload_id,
-            )
-            .await?;
-            db.commit().await?;
-            Ok(())
+        self.publish_plugin_package_with_metadata(
+            id,
+            revision,
+            name,
+            version,
+            fingerprint,
+            upload_id,
+            None,
+        )
+        .await
+    }
+    pub async fn publish_plugin_package_with_metadata(
+        &self,
+        id: &str,
+        revision: i64,
+        name: &str,
+        version: Option<&str>,
+        fingerprint: &str,
+        upload_id: Option<&str>,
+        metadata: Option<&pioneer_protocol::PluginMetadata>,
+    ) -> Result<()> {
+        let prepared = metadata
+            .map(|metadata| crate::repositories::plugin_metadata::prepare(id, metadata))
+            .transpose()?;
+        self.run_serialized_write(|| {
+            let prepared = prepared.clone();
+            async move {
+                let db = self.connection.begin().await?;
+                plugins::publish_package(
+                    &db,
+                    id,
+                    revision,
+                    name,
+                    version,
+                    fingerprint,
+                    upload_id,
+                    prepared,
+                )
+                .await?;
+                db.commit().await?;
+                Ok(())
+            }
         })
         .await
     }

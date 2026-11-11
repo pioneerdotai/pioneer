@@ -5,10 +5,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use pioneer_client::{
-    avatars::{
-        AgentAvatarCacheResult, AvatarCacheError, AvatarCacheRequest, AvatarCacheService,
-        AvatarCacheSource,
-    },
+    avatars::{AgentAvatarCacheResult, AvatarCacheError, AvatarCacheRequest, AvatarCacheSource},
+    images::ImageCacheService,
     transport::{
         http::{
             GatewayHttpAccess, GatewayHttpAuthorityError, GatewayHttpSession,
@@ -114,7 +112,7 @@ impl ClientFfiAvatarCache {
 fn avatar_cache_service(
     sender: &GatewayWsCommandSender,
     runtime_home: PathBuf,
-) -> Result<(AvatarCacheService, Runtime), ClientFfiError> {
+) -> Result<(ImageCacheService, Runtime), ClientFfiError> {
     let access = sender
         .current_gateway_http_access()
         .map_err(map_authority_error)?;
@@ -128,7 +126,7 @@ fn avatar_cache_service(
         )
     })?;
     let service =
-        AvatarCacheService::new(session, runtime_home, access.gateway_id, access.session_id);
+        ImageCacheService::new(session, runtime_home, access.gateway_id, access.session_id);
     let runtime = Runtime::new().map_err(|_| {
         ClientFfiError::new(
             "avatar cache runtime is unavailable",

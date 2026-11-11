@@ -14,6 +14,7 @@ use std::path::Path;
 // same projector; a list prepares each native inventory at most once.
 #[derive(Default)]
 struct PluginNativeInventory {
+    metadata: Option<std::collections::HashMap<String, (i64, PluginMetadata)>>,
     links: Option<std::collections::HashMap<String, Vec<pioneer_entity::plugin_component::Model>>>,
     skills: Option<std::collections::HashMap<String, (bool, String)>>,
     mcp: Option<std::collections::HashMap<String, (bool, Option<String>)>>,
@@ -79,6 +80,107 @@ fn diagnostic_affects_status(diagnostic: &PluginDiagnostic) -> bool {
             | "ignored_vendor_manifest"
             | "ignored_vendor_feature"
     )
+}
+
+/// Resolve authored package paths into the same authenticated storage namespace as avatars.
+pub(super) fn plugin_icon_links(
+    metadata: &mut PluginMetadata,
+    parent: &pioneer_entity::plugin_installation::Model,
+) {
+    for icon in [&mut metadata.logo, &mut metadata.composer_icon]
+        .into_iter()
+        .flatten()
+    {
+        *icon = ImageReference::plugin_icon(&parent.workspace_id, &parent.id, icon.revision.clone());
+    }
+}
+
+impl MessageProcessor {
+    async fn admit_plugin_image(
+        &self,
+        context: &crate::request_context::AuthenticatedRequestContext,
+        workspace: &str,
+    ) -> anyhow::Result<()> {
+        use crate::authorization::{
+            AuthorizationResolver, AuthorizationService, ProofResolution, ResourceAction,
+        };
+        let resolver = AuthorizationResolver::new((*self.crud_store).clone());
+        for action in [ResourceAction::SkillDiscover, ResourceAction::McpDiscover] {
+            let gate = AuthorizationService::new().authorize_action(
+                context.principal().kind,
+                context.role_key(),
+                action,
+            );
+            anyhow::ensure!(
+                matches!(
+                    resolver
+                        .authorize_workspace(context.principal(), &gate, action, workspace)
+                        .await?,
+                    ProofResolution::Authorized(_)
+                ),
+                "plugins.not_found"
+            );
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn plugin_icon_snapshot(
+        &self,
+        context: &crate::request_context::AuthenticatedRequestContext,
+        workspace: &str,
+        plugin_id: &str,
+        revision: &str,
+    ) -> anyhow::Result<crate::images::PreparedImage> {
+        use sha2::{Digest, Sha256};
+        self.admit_plugin_image(context, workspace).await?;
+        let parent = self
+            .crud_store
+            .find_plugin_installation(plugin_id)
+            .await?
+            .filter(|parent| parent.workspace_id == workspace)
+            .context("plugins.not_found")?;
+        let guard = self
+            .acquire_plugin_mutation(workspace, plugin_id, parent.revision)
+            .await?;
+        anyhow::ensure!(
+            guard.parent.state == "installed" && guard.parent.pending_json.is_none(),
+            "plugins.not_found"
+        );
+        let metadata = self
+            .crud_store
+            .plugin_metadata(&guard.parent)
+            .await?
+            .context("plugins.metadata_unavailable")?;
+        let icon = metadata
+            .logo
+            .into_iter()
+            .chain(metadata.composer_icon)
+            .find(|icon| icon.revision == revision)
+            .context("plugins.not_found")?;
+        let limits = guard.limits;
+        let result = guard
+            .fs_prepare(move |parent, cancellation| {
+                let (snapshot, _) = lifecycle::verified_package(parent, cancellation, limits)?;
+                let bytes = snapshot.file(&icon.path).context("plugins.not_found")?;
+                anyhow::ensure!(
+                    hex::encode(Sha256::digest(bytes)) == icon.revision,
+                    "plugins.package_changed"
+                );
+                let media_type = if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+                    ImageMediaType::Png
+                } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+                    ImageMediaType::Jpeg
+                } else {
+                    ImageMediaType::Webp
+                };
+                crate::images::prepare_image(media_type, bytes.to_vec())
+                    .map_err(|_| anyhow::anyhow!("plugins.invalid_icon"))
+            })
+            .await?;
+        // Authorization can change while filesystem work is running.
+        self.admit_plugin_image(context, workspace).await?;
+        Ok(result)
+    }
 }
 
 fn component_preview(component: &ComponentPlan) -> PluginComponentItem {
@@ -291,6 +393,12 @@ impl MessageProcessor {
                     links.entry(link.plugin_id.clone()).or_default().push(link);
                 }
                 let mut inventory = PluginNativeInventory {
+                    metadata: Some(
+                        self.crud_store
+                            .plugin_metadata_inventory(&ids)
+                            .await
+                            .map_err(|_| plugin_error(id, "plugins.inventory_failed"))?,
+                    ),
                     links: Some(links),
                     ..Default::default()
                 };
@@ -584,9 +692,30 @@ impl MessageProcessor {
             package_path: package.to_string_lossy().into(),
             data_path: data.to_string_lossy().into(),
             package_fingerprint: plan.tree_digest.clone(),
-            enabled: true,
+            enabled: true, allow_implicit_invocation: false,
             state: "installing".into(),
             revision: 1,
+            display_name: plan.manifest.metadata.display_name.clone(),
+            short_description: plan.manifest.metadata.short_description.clone(),
+            description: plan.manifest.metadata.description.clone(),
+            long_description: plan.manifest.metadata.long_description.clone(),
+            developer_name: plan.manifest.metadata.developer_name.clone(),
+            author_name: plan.manifest.metadata.author.name.clone(),
+            author_email: plan.manifest.metadata.author.email.clone(),
+            author_url: plan.manifest.metadata.author.url.clone(),
+            homepage: plan.manifest.metadata.homepage.clone(),
+            repository: plan.manifest.metadata.repository.clone(),
+            documentation_url: plan.manifest.metadata.documentation_url.clone(),
+            support_url: plan.manifest.metadata.support_url.clone(),
+            privacy_policy_url: plan.manifest.metadata.privacy_policy_url.clone(),
+            terms_of_service_url: plan.manifest.metadata.terms_of_service_url.clone(),
+            license: plan.manifest.metadata.license.clone(),
+            category: plan.manifest.metadata.category.clone(),
+            brand_color: plan.manifest.metadata.brand_color.clone(),
+            logo_path: plan.manifest.metadata.logo.as_ref().map(|icon| icon.path.clone()),
+            logo_revision: plan.manifest.metadata.logo.as_ref().map(|icon| icon.revision.clone()),
+            composer_icon_path: plan.manifest.metadata.composer_icon.as_ref().map(|icon| icon.path.clone()),
+            composer_icon_revision: plan.manifest.metadata.composer_icon.as_ref().map(|icon| icon.revision.clone()),
             pending_json: Some(pending_json),
             last_error: None,
             created_at: now,
@@ -605,7 +734,12 @@ impl MessageProcessor {
         staging.preserve();
         if self
             .crud_store
-            .reserve_plugin_installation(&parent, context.connection_id(), now.timestamp())
+            .reserve_plugin_installation_with_metadata(
+                &parent,
+                context.connection_id(),
+                now.timestamp(),
+                Some(&plan.manifest.metadata),
+            )
             .await
             .is_err()
         {
@@ -757,34 +891,6 @@ impl MessageProcessor {
         Ok(item)
     }
 
-    async fn plugin_description(
-        &self,
-        parent: &pioneer_entity::plugin_installation::Model,
-    ) -> Option<String> {
-        // Metadata is optional. Never disclose a candidate while publication is
-        // pending, or fail an otherwise useful inventory on unavailable bytes.
-        if parent.pending_json.is_some() || parent.state != "installed" {
-            return None;
-        }
-        let captured = parent.clone();
-        let limits = self.package_delivery_context().plugin_limits();
-        let description = super::package_delivery::prepare_cancellable(move |cancellation| {
-            let (_, plan) = lifecycle::verified_package(&captured, cancellation, limits)?;
-            Ok(public_description(&plan))
-        })
-        .await
-        .ok()
-        .flatten()?;
-        // A concurrent publication cannot attach candidate metadata to an older
-        // inventory revision. This is a read, with no retained DB capacity.
-        let current = self
-            .crud_store
-            .find_plugin_installation(&parent.id)
-            .await
-            .ok()??;
-        (current.revision == parent.revision && current.pending_json.is_none())
-            .then_some(description)
-    }
     async fn plugin_item(
         &self,
         context: &RequestContext,
@@ -982,12 +1088,32 @@ impl MessageProcessor {
         }
         let partial = diagnostics.iter().any(diagnostic_affects_status)
             || components.iter().any(|c| c.status != "installed");
+        let mut metadata: PluginMetadata =
+            if parent.state == "installed" && parent.pending_json.is_none() {
+                match &inventory.metadata {
+                    Some(metadata) => metadata
+                        .get(&parent.id)
+                        .filter(|(revision, _)| *revision == parent.revision)
+                        .map(|(_, metadata)| metadata.clone())
+                        .unwrap_or_default(),
+                    None => self
+                        .crud_store
+                        .plugin_metadata(parent)
+                        .await?
+                        .unwrap_or_default(),
+                }
+            } else {
+                Default::default()
+            };
+        plugin_icon_links(&mut metadata, parent);
         Ok(PluginItem {
             id: parent.id.clone(),
             name: parent.name.clone(),
             version: parent.version.clone(),
-            description: self.plugin_description(parent).await,
+            description: metadata.description.clone(),
+            metadata,
             enabled: parent.enabled,
+            allow_implicit_invocation: parent.allow_implicit_invocation,
             state: if parent.last_error.as_deref() == Some("plugins.data_retained") {
                 "retained".into()
             } else if parent.pending_json.is_some() && parent.state == "installed" {
@@ -1410,7 +1536,8 @@ impl MessageProcessor {
         if guard.parent.state != "installed" || guard.parent.pending_json.is_some() {
             return Err(plugin_error(request, "plugins.interrupted"));
         }
-        if guard.parent.enabled == params.enabled {
+        if guard.parent.enabled == params.enabled
+            && params.allow_implicit_invocation.is_none_or(|implicit| implicit == guard.parent.allow_implicit_invocation) {
             return self
                 .plugin_item(context, &guard.parent)
                 .await
@@ -1422,13 +1549,14 @@ impl MessageProcessor {
         .map_err(|_| plugin_error(request, "plugins.invalid_request"))?;
         guard.parent = self
             .crud_store
-            .begin_plugin_mutation(
+            .begin_plugin_mutation_with_policy(
                 &params.workspace_id,
                 &params.plugin_id,
                 params.expected_revision,
                 "updating",
                 params.enabled,
                 &pending,
+                params.allow_implicit_invocation,
             )
             .await
             .map_err(|_| plugin_error(request, "plugins.stale"))?;

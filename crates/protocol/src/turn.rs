@@ -5073,6 +5073,8 @@ pub struct TurnPluginCapabilitySummary {
     pub plugin_id: String,
     pub expected_revision: i64,
     pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<crate::PluginIcon>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]

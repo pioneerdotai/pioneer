@@ -351,6 +351,7 @@ pub async fn begin_mutation(
     state: &str,
     enabled: bool,
     pending: String,
+    allow_implicit_invocation: Option<bool>,
 ) -> Result<plugin_installation::Model> {
     let parent = find(db, id).await?.context("plugins.not_found")?;
     if parent.workspace_id != workspace || parent.revision != revision {
@@ -365,6 +366,9 @@ pub async fn begin_mutation(
     let mut row: plugin_installation::ActiveModel = parent.into();
     row.state = Set(state.into());
     row.enabled = Set(enabled);
+    if let Some(implicit) = allow_implicit_invocation {
+        row.allow_implicit_invocation = Set(implicit);
+    }
     row.revision = Set(next);
     row.pending_json = Set(Some(pending));
     row.last_error = Set(None);
@@ -426,6 +430,7 @@ pub async fn delete_parent(db: &pioneer_sqlite::SqliteTransaction, id: &str, rev
         .filter(plugin_component::Column::PluginId.eq(id))
         .exec(db)
         .await?;
+    super::plugin_metadata::replace_lists(db, id, Vec::new(), Vec::new()).await?;
     plugin_installation::Entity::delete_by_id(id.to_owned())
         .exec(db)
         .await?;
@@ -752,7 +757,7 @@ pub async fn resume_mutation(
     row.updated_at = Set(chrono::Utc::now().fixed_offset());
     Ok(row.update(db).await?)
 }
-pub async fn publish_package(
+pub(crate) async fn publish_package(
     db: &pioneer_sqlite::SqliteTransaction,
     id: &str,
     revision: i64,
@@ -760,6 +765,7 @@ pub async fn publish_package(
     version: Option<&str>,
     fingerprint: &str,
     upload_id: Option<&str>,
+    metadata: Option<super::plugin_metadata::PreparedMetadata>,
 ) -> Result<()> {
     let parent = find(db, id).await?.context("plugins.not_found")?;
     if parent.revision != revision || parent.pending_json.is_none() || parent.state != "updating" {
@@ -768,6 +774,10 @@ pub async fn publish_package(
     let mut row: plugin_installation::ActiveModel = parent.into();
     if let Some(upload) = upload_id {
         row.source_upload_id = Set(upload.into());
+    }
+    if let Some(metadata) = metadata {
+        super::plugin_metadata::apply_columns(&mut row, metadata.columns);
+        super::plugin_metadata::replace_lists(db, id, metadata.keywords, metadata.prompts).await?;
     }
     row.name = Set(name.into());
     row.version = Set(version.map(str::to_owned));

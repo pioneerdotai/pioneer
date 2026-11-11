@@ -29,9 +29,30 @@ async fn seed_owned_c2_skill(
             package_path: root.to_string_lossy().into(),
             data_path: root.with_extension("data").to_string_lossy().into(),
             package_fingerprint: "context".into(),
-            enabled: true,
+            enabled: true, allow_implicit_invocation: false,
             state: "installing".into(),
             revision: 1,
+        display_name: None,
+        short_description: None,
+        description: None,
+        long_description: None,
+        developer_name: None,
+        author_name: None,
+        author_email: None,
+        author_url: None,
+        homepage: None,
+        repository: None,
+        documentation_url: None,
+        support_url: None,
+        privacy_policy_url: None,
+        terms_of_service_url: None,
+        license: None,
+        category: None,
+        brand_color: None,
+        logo_path: None,
+        logo_revision: None,
+        composer_icon_path: None,
+        composer_icon_revision: None,
             pending_json: None,
             last_error: None,
             created_at: now,
@@ -523,8 +544,29 @@ async fn plugin_previews_and_update_require_the_full_authenticated_transfer_owne
     harness.crud_store.insert_plugin_installation(&pioneer_entity::plugin_installation::Model {
         id: parent.clone(), workspace_id: harness.workspace_id.clone(), name: plan.manifest.name.clone(), version: None,
         source_upload_id: "old-source".into(), package_path: package.to_string_lossy().into(),
-        data_path: root.join("parent/data").to_string_lossy().into(), package_fingerprint: plan.tree_digest.clone(), enabled: true,
-        state: "installing".into(), revision: 1, pending_json: None, last_error: None, created_at: timestamp, updated_at: timestamp,
+        data_path: root.join("parent/data").to_string_lossy().into(), package_fingerprint: plan.tree_digest.clone(), enabled: true, allow_implicit_invocation: false,
+        state: "installing".into(), revision: 1,
+        display_name: None,
+        short_description: None,
+        description: None,
+        long_description: None,
+        developer_name: None,
+        author_name: None,
+        author_email: None,
+        author_url: None,
+        homepage: None,
+        repository: None,
+        documentation_url: None,
+        support_url: None,
+        privacy_policy_url: None,
+        terms_of_service_url: None,
+        license: None,
+        category: None,
+        brand_color: None,
+        logo_path: None,
+        logo_revision: None,
+        composer_icon_path: None,
+        composer_icon_revision: None, pending_json: None, last_error: None, created_at: timestamp, updated_at: timestamp,
     }).await.unwrap();
     harness.crud_store.settle_plugin_installation(&parent, 1, "installed", None).await.unwrap();
     let context = registered_request_context(&harness.processor, harness.connection_id, methods::PLUGINS_PREVIEW).await;
@@ -591,5 +633,72 @@ async fn plugin_previews_and_update_require_the_full_authenticated_transfer_owne
     // its own invalid bytes; no competing transfer is touched.
     assert!(harness.processor.materialize_uploaded_archive_source(&owner, &harness.workspace_id, &bad_id, &runtime, &request_id, "plugin").await.is_err());
     assert_eq!(harness.crud_store.find_skill_upload_session(&bad_id).await.unwrap().unwrap().status, "aborted");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn plugin_policy_rpc_preserves_independent_toggles_and_frozen_task_grants() {
+    let mut harness = setup_cli_runtime_security_harness(None).await;
+    let root = unique_temp_dir("plugin-implicit-policy");
+    let (parent, skill, selected) =
+        seed_owned_c2_skill(&harness.crud_store, &harness.workspace_id, &root).await;
+    let mut frozen = task_parent_launch(selected.clone()).execution;
+    frozen.skill_ids.clear();
+    frozen.selected_capabilities.clear();
+    let initial = harness.processor
+        .normalize_turn_skill_capabilities(&harness.workspace_id, &[]).await.unwrap();
+    assert!(initial.execution.is_empty());
+    // These are the same RPC payloads as the two header buttons. The enabled
+    // button deliberately omits implicit to preserve that independent setting.
+    for (revision, enabled, implicit) in [
+        (1, true, Some(true)),
+        (2, false, None),
+        (3, true, None),
+        (4, true, Some(false)),
+    ] {
+        let id = generate_test_request_id("plugin-policy", &revision.to_string());
+        let mut params = json!({
+            "workspace_id":harness.workspace_id, "plugin_id":parent,
+            "expected_revision":revision, "enabled":enabled,
+        });
+        if let Some(implicit) = implicit {
+            params["allow_implicit_invocation"] = json!(implicit);
+        }
+        harness.processor.process_request_for_connection(harness.connection_id,
+            &json!({"jsonrpc":"2.0","id":id,"method":methods::PLUGINS_SET_ENABLED,"params":params}).to_string(),
+        ).await;
+        let response = recv_response_by_id(&mut harness.rx, &id).await;
+        let item: pioneer_protocol::PluginItem = serde_json::from_value(response.result).unwrap();
+        assert_eq!(item.enabled, enabled);
+        assert_eq!(item.allow_implicit_invocation, revision != 4);
+        assert_eq!(item.revision, revision + 1);
+        let stored = harness.crud_store.find_plugin_installation(&parent).await.unwrap().unwrap();
+        assert_eq!(stored.enabled, enabled);
+        assert_eq!(stored.allow_implicit_invocation, revision != 4);
+        let automatic = harness.processor
+            .normalize_turn_skill_capabilities(&harness.workspace_id, &[]).await.unwrap();
+        if enabled && revision != 4 {
+            assert!(automatic.execution.iter().any(|cap| matches!(&cap.kind,
+                TurnCapabilityKind::Skill { skill_id, .. } if skill_id == &skill)));
+            assert_eq!(automatic.plugin_selection.unwrap().parents[0].revision, revision + 1);
+        } else {
+            assert!(automatic.execution.is_empty());
+            assert!(automatic.plugin_selection.is_none());
+        }
+        // Opting into a plugin cannot widen an already persisted task ceiling.
+        let restored = harness.processor
+            .normalize_task_launch_capabilities(&harness.workspace_id, &frozen).await.unwrap();
+        assert!(restored.execution.is_empty());
+        assert!(restored.plugin_selection.is_none());
+    }
+    // Turning implicit off keeps explicit selection available.
+    let mut current = selected;
+    if let TurnCapabilityKind::Plugin { expected_revision, .. } = &mut current.kind {
+        *expected_revision = 5;
+    }
+    let explicit = harness.processor
+        .normalize_turn_skill_capabilities(&harness.workspace_id, &[current]).await.unwrap();
+    assert!(explicit.execution.iter().any(|cap| matches!(&cap.kind,
+        TurnCapabilityKind::Skill { skill_id, .. } if skill_id == &skill)));
     std::fs::remove_dir_all(root).unwrap();
 }

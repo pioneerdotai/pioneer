@@ -712,6 +712,29 @@ fn picker_leaf_frame(id: impl Into<ElementId>, selected: bool, cx: &App) -> Stat
         .p_2()
 }
 
+fn picker_leaf_content(
+    label: String,
+    description: String,
+    disabled_reason: Option<String>,
+    cx: &App,
+) -> Div {
+    v_flex()
+        .flex_1()
+        .min_w_0()
+        .gap_1()
+        .child(div().text_sm().font_medium().child(label))
+        .child(
+            div()
+                .text_xs()
+                .opacity(0.6)
+                .line_height(relative(1.45))
+                .child(description),
+        )
+        .when_some(disabled_reason, |content, reason| {
+            content.child(div().text_xs().text_color(cx.theme().danger).child(reason))
+        })
+}
+
 fn render_skill_picker_leaf_row(
     row: SelectableSkillCapability,
     selection: ComposerSkillSelection,
@@ -739,27 +762,12 @@ fn render_skill_picker_leaf_row(
                 });
             })
         })
-        .child(
-            v_flex()
-                .flex_1()
-                .min_w_0()
-                .gap_1()
-                .child(div().text_sm().font_medium().child(row.label))
-                .child(
-                    div()
-                        .text_xs()
-                        .opacity(0.6)
-                        .line_height(relative(1.45))
-                        .child(if row.description.trim().is_empty() {
-                            row.slug
-                        } else {
-                            row.description
-                        }),
-                )
-                .when_some(disabled_reason, |this, reason| {
-                    this.child(div().text_xs().text_color(cx.theme().danger).child(reason))
-                }),
-        )
+        .child(picker_leaf_content(
+            row.label,
+            if row.description.trim().is_empty() { row.slug } else { row.description },
+            disabled_reason,
+            cx,
+        ))
         .child(render_picker_select_control(
             ("composer-skill-picker-toggle", key_id),
             is_selected,
@@ -1497,54 +1505,44 @@ fn render_plugin_picker_row(
     let toggle = picker.clone();
     let plugin_id = row.plugin_id.clone();
     let disabled = !row.selected && !row.selectable;
-    Button::new(SharedString::from(format!("composer-plugin-{}", row.plugin_id)))
-        .ghost()
-        .w_full()
-        .h_auto()
-        .justify_start()
-        .p_0()
-        .disabled(disabled)
-        .accessibility_label(row.label.clone())
-        .child(
-            picker_leaf_frame(
-                ("composer-plugin-row", stable_picker_row_id(&row.key)),
-                row.selected,
-                cx,
-            )
-            .min_w_0()
-            .child(Icon::new(crate::assets::PioneerIconName::Plugin).size_4())
-            .child(
-                v_flex()
-                    .flex_1()
-                    .min_w_0()
-                    .child(div().text_sm().font_medium().child(row.label))
-                    .when_some(row.description, |view, description| {
-                        view.child(div().text_xs().text_color(cx.theme().muted_foreground).child(description))
-                    })
-                    .when(row.stale, |view| {
-                        view.child(div().text_xs().text_color(cx.theme().muted_foreground)
-                            .child(t!("plugins.stale").to_string()))
-                    })
-                    .when(!row.selectable, |view| {
-                        view.child(div().text_xs().text_color(cx.theme().muted_foreground)
-                            .child(t!("plugins.unavailable").to_string()))
-                    }),
-            )
-            .child(render_picker_select_control(
-                ("composer-plugin-toggle", stable_picker_row_id(&row.key)),
-                row.selected,
-                disabled,
-                move |_, _, cx| {
-                    let _ = toggle.update(cx, |state, cx| state.toggle_plugin(&plugin_id, cx));
-                },
-                cx,
-            )),
-        )
-        .on_click(move |_, _, cx| {
-            let _ = picker.update(cx, |state, cx| state.toggle_plugin(&row.plugin_id, cx));
+    let key = stable_picker_row_id(&row.key);
+    let description = row
+        .description
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| row.label.clone());
+    let disabled_reason = if row.stale {
+        Some(t!("plugins.stale").to_string())
+    } else if !row.selectable {
+        Some(t!("plugins.unavailable").to_string())
+    } else {
+        None
+    };
+
+    picker_leaf_frame(("composer-plugin-row", key), row.selected, cx)
+        .when(!disabled, |frame| {
+            frame.cursor_pointer().on_click(move |_, _, cx| {
+                cx.stop_propagation();
+                let _ = picker.update(cx, |state, cx| state.toggle_plugin(&row.plugin_id, cx));
+            })
         })
+        .child(picker_leaf_content(
+            row.label,
+            description,
+            disabled_reason,
+            cx,
+        ))
+        .child(render_picker_select_control(
+            ("composer-plugin-toggle", key),
+            row.selected,
+            disabled,
+            move |_, _, cx| {
+                let _ = toggle.update(cx, |state, cx| state.toggle_plugin(&plugin_id, cx));
+            },
+            cx,
+        ))
         .into_any_element()
 }
+
 
 impl ComposerView {
     pub(super) fn open_composer_plugins_picker(
@@ -1575,12 +1573,7 @@ impl ComposerView {
             let failed = input.as_ref().is_some_and(|p| {
                 matches!(p.plugin_request.state, ComposerCatalogRequestState::Failed { .. })
             });
-            let mut list = v_flex()
-                .w_full()
-                .min_h_0()
-                .max_h(rems(22.))
-                .gap_1p5()
-                .overflow_y_scrollbar();
+            let mut list = v_flex().max_h(px(360.)).overflow_y_scrollbar();
             if loading {
                 list = list.child(picker_status_banner(t!("plugins.loading").to_string(), cx));
             }
@@ -1603,13 +1596,16 @@ impl ComposerView {
             if rows.is_empty() && !loading && !failed {
                 list = list.child(empty_picker_state(t!("plugins.empty").to_string(), cx));
             }
-            list = list.children(rows.into_iter().map(|row| {
-                render_plugin_picker_row(row, picker.downgrade(), cx)
+            let row_count = rows.len();
+            list = list.children(rows.into_iter().enumerate().map(|(index, row)| {
+                div().w_full()
+                    .when(index + 1 < row_count, |container| container.pb_2())
+                    .child(render_plugin_picker_row(row, picker.downgrade(), cx))
             }));
             capability_picker_dialog(
                 dialog,
                 window.rem_size() * 32.5,
-                t!("plugins.select").to_string(),
+                t!("chat.composer.add_menu.plugins").to_string(),
                 picker.downgrade(),
             )
             .on_ok({

@@ -42,7 +42,7 @@ impl IconNamed for PioneerIconName {
             Self::Infinity => "icons/infinity.svg",
             Self::Lightbulb => "icons/lightbulb.svg",
             Self::Mcp => "icons/mcp.svg",
-            Self::Plugin => "icons/plugin.svg",
+            Self::Plugin => "icons/box.svg",
             Self::MessageCircle => "icons/message-circle.svg",
             Self::Microphone => "icons/microphone.svg",
             Self::Paperclip => "icons/paperclip.svg",

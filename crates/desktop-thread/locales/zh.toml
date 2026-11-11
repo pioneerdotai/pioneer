@@ -335,7 +335,7 @@
 "timeline.web_search.running" = "正在搜索网页"
 "timeline.work_group.completed" = "已工作"
 
-"chat.composer.add_menu.plugins" = "插件"
+"chat.composer.add_menu.plugins" = "添加插件"
 "plugins.empty" = "尚未安装插件"
 "plugins.error" = "无法加载插件，请重试。"
 "plugins.loading" = "正在加载插件…"

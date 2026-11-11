@@ -807,6 +807,10 @@ impl ComposerView {
     ) -> AnyElement {
         let identity = capability.id.clone();
         let group_id = format!("composer-capability-chip-{identity}");
+        let plugin_icon = match &capability.kind {
+            ComposerCapabilityKind::Plugin { icon, .. } => Some(icon.clone()),
+            _ => None,
+        };
         let icon = match capability.kind {
             ComposerCapabilityKind::Plugin { .. } => PioneerIconName::Plugin,
             ComposerCapabilityKind::Skill { .. } => PioneerIconName::Zap,
@@ -839,10 +843,19 @@ impl ComposerView {
                     .items_center()
                     .justify_center()
                     .child(
-                        Icon::new(icon)
-                            .size_3()
-                            .opacity(0.8)
-                            .text_color(cx.theme().foreground),
+                        match plugin_icon {
+                            Some(icon) => {
+                                self.plugin_images
+                                    .element(icon.as_ref())
+                                    .size_3()
+                                    .into_any_element()
+                            }
+                            None => Icon::new(icon)
+                                .size_3()
+                                .opacity(0.8)
+                                .text_color(cx.theme().foreground)
+                                .into_any_element(),
+                        },
                     ),
             )
             .child(

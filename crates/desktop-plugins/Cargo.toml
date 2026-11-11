@@ -9,6 +9,8 @@ gpui-kit = { workspace = true, features = ["component", "assets"] }
 pioneer-client.workspace = true
 rust-i18n.workspace = true
 pioneer-desktop-foundation.workspace = true
+pioneer-desktop-skills.workspace = true
+pioneer-desktop-mcp.workspace = true
 
 [dev-dependencies]
 pioneer-protocol.workspace = true

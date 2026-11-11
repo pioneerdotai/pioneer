@@ -16,3 +16,6 @@ mod upload;
 pub use upload::{UploadView as SkillsUploadView, UploadVisibility as SkillsUploadVisibility};
 
 mod identity;
+
+mod card;
+pub use card::SkillCard;

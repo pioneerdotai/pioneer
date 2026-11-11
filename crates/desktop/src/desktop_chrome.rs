@@ -73,27 +73,6 @@ pub(crate) fn bottom_bar(
                 )
                 .when(can_manage_capabilities, |this| {
                     this.child(
-                        Button::new("bottom-bar-open-mcp")
-                            .debug_selector(|| "bottom-bar-open-mcp".into())
-                            .ghost()
-                            .small()
-                            .compact()
-                            .child(
-                                Icon::new(PioneerIconName::Mcp)
-                                    .size_3p5()
-                                    .opacity(0.6)
-                                    .when(is_mcp_view_active, |this| {
-                                        this.opacity(1.0).text_color(cx.theme().blue)
-                                    }),
-                            )
-                            .on_click({
-                                let target = action_region.clone();
-                                move |_, window, cx| target.dispatch_action(&OpenMcp, window, cx)
-                            }),
-                    )
-                })
-                .when(can_manage_capabilities, |this| {
-                    this.child(
                         Button::new("bottom-bar-open-plugins")
                             .debug_selector(|| "bottom-bar-open-plugins".into())
                             .accessibility_label(t!("plugins.title").to_string())
@@ -114,6 +93,27 @@ pub(crate) fn bottom_bar(
                                 move |_, window, cx| {
                                     target.dispatch_action(&OpenPlugins, window, cx)
                                 }
+                            }),
+                    )
+                })
+                .when(can_manage_capabilities, |this| {
+                    this.child(
+                        Button::new("bottom-bar-open-mcp")
+                            .debug_selector(|| "bottom-bar-open-mcp".into())
+                            .ghost()
+                            .small()
+                            .compact()
+                            .child(
+                                Icon::new(PioneerIconName::Mcp)
+                                    .size_3p5()
+                                    .opacity(0.6)
+                                    .when(is_mcp_view_active, |this| {
+                                        this.opacity(1.0).text_color(cx.theme().blue)
+                                    }),
+                            )
+                            .on_click({
+                                let target = action_region.clone();
+                                move |_, window, cx| target.dispatch_action(&OpenMcp, window, cx)
                             }),
                     )
                 })

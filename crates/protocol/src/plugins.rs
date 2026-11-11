@@ -2,6 +2,40 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+/// Authored presentation only. None of these fields grant execution authority.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct PluginAuthor {
+    pub name: Option<String>,
+    pub email: Option<String>,
+    pub url: Option<String>,
+}
+
+pub use crate::images::ImageReference as PluginIcon;
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(default)]
+pub struct PluginMetadata {
+    pub display_name: Option<String>,
+    pub short_description: Option<String>,
+    pub description: Option<String>,
+    pub long_description: Option<String>,
+    pub developer_name: Option<String>,
+    pub author: PluginAuthor,
+    pub homepage: Option<String>,
+    pub repository: Option<String>,
+    pub documentation_url: Option<String>,
+    pub support_url: Option<String>,
+    pub privacy_policy_url: Option<String>,
+    pub terms_of_service_url: Option<String>,
+    pub license: Option<String>,
+    pub keywords: Vec<String>,
+    pub category: Option<String>,
+    pub default_prompts: Vec<String>,
+    pub brand_color: Option<String>,
+    pub logo: Option<PluginIcon>,
+    pub composer_icon: Option<PluginIcon>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct PluginOwner {
     pub plugin_id: String,
@@ -64,7 +98,11 @@ pub struct PluginItem {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(max = 2048))]
     pub description: Option<String>,
+    #[serde(default)]
+    pub metadata: PluginMetadata,
     pub enabled: bool,
+    #[serde(default)]
+    pub allow_implicit_invocation: bool,
     pub state: String,
     pub revision: i64,
     pub status: String,
@@ -150,6 +188,8 @@ pub struct PluginsSetEnabledParams {
     pub plugin_id: String,
     pub expected_revision: i64,
     pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_implicit_invocation: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]

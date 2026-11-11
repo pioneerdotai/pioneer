@@ -1,6 +1,8 @@
 mod auth;
 mod avatars;
 mod content;
+mod images;
+mod plugins;
 mod errors;
 pub(crate) mod header_policy;
 mod health;

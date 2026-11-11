@@ -76,7 +76,34 @@ pub(crate) fn manifest(
         "keywords",
     ] {
         if let Some(value) = object.get(key) {
-            canonical.insert(key.into(), value.clone());
+            let value = match key {
+                "name" => Some(value.clone()), // Required identity retains strict validation.
+                "author" => value.as_object().map(|author| {
+                    Value::Object(
+                        author
+                            .iter()
+                            .filter(|(key, value)| {
+                                matches!(key.as_str(), "name" | "email" | "url")
+                                    && value.is_string()
+                            })
+                            .map(|(key, value)| (key.clone(), value.clone()))
+                            .collect(),
+                    )
+                }),
+                "keywords" => value.as_array().map(|items| {
+                    Value::Array(
+                        items
+                            .iter()
+                            .filter(|value| value.is_string())
+                            .cloned()
+                            .collect(),
+                    )
+                }),
+                _ => value.as_str().map(|text| Value::String(text.to_owned())),
+            };
+            if let Some(value) = value {
+                canonical.insert(key.into(), value);
+            }
         }
     }
     let bytes = serde_json::to_vec(&canonical).map_err(|_| invalid("fatal_manifest", path))?;
@@ -96,7 +123,7 @@ pub(crate) fn manifest(
                 "ignored_vendor_manifest",
                 Boundary::Package,
                 other,
-                "Vendor manifest ignored; priority is canonical, Codex, Claude, Cursor",
+                "Vendor execution manifest ignored; optional presentation may supplement missing metadata",
             ));
         }
     }
@@ -112,6 +139,25 @@ pub(crate) fn manifest(
             "keywords",
             "skills",
             "mcpServers",
+            "interface",
+            "displayName",
+            "shortDescription",
+            "longDescription",
+            "developerName",
+            "icon",
+            "logo",
+            "composerIcon",
+            "category",
+            "brandColor",
+            "defaultPrompt",
+            "documentationUrl",
+            "documentationURL",
+            "supportUrl",
+            "supportURL",
+            "privacyPolicyUrl",
+            "privacyPolicyURL",
+            "termsOfServiceUrl",
+            "termsOfServiceURL",
         ]
         .contains(&key.as_str())
         {

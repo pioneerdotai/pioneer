@@ -34,6 +34,11 @@ pub fn plugin_capability(plugin: &PluginItem) -> Option<ComposerCapability> {
         kind: ComposerCapabilityKind::Plugin {
             plugin_id: plugin.id.clone(),
             expected_revision: plugin.revision,
+            icon: plugin
+                .metadata
+                .composer_icon
+                .clone()
+                .or_else(|| plugin.metadata.logo.clone()),
         },
     })
 }
@@ -93,7 +98,8 @@ mod tests {
             name: "mixed".into(),
             version: None,
             description: None,
-            enabled: true,
+            metadata: Default::default(),
+            enabled: true, allow_implicit_invocation: false,
             state: state.into(),
             revision: 7,
             status: "partial".into(),
@@ -162,7 +168,7 @@ mod tests {
 }
 
 pub use pioneer_protocol::{
-    PluginComponentItem, PluginComponentKey, PluginItem, PluginManagementIntent,
+    PluginComponentItem, PluginComponentKey, PluginItem, PluginManagementIntent, PluginIcon, PluginMetadata,
     PluginsMutateParams, PluginsSetEnabledParams, PluginsUpdatePreviewResponse,
 };
 
@@ -277,7 +283,8 @@ mod picker_regressions {
             name: "Mixed".into(),
             version: None,
             description: None,
-            enabled: true,
+            metadata: Default::default(),
+            enabled: true, allow_implicit_invocation: false,
             state: "installed".into(),
             revision: 7,
             status: "partial".into(),
