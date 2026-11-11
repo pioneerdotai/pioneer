@@ -430,13 +430,18 @@ impl ToolOrchestrator {
         trace: &ToolEventTrace,
         permission_context: &PermissionEvaluationContext,
     ) -> Result<AnyToolResult, ToolError> {
+        // A dynamic proxy re-enters the complete permission/handler pipeline.
+        // Box its attempt before composing observation scopes to bound the
+        // stack state retained by each level without spawning or detaching it.
+        let attempt =
+            Box::pin(self.run_observed_attempt(registry, invocation, trace, permission_context));
         pioneer_provider::usage::scope_causal_parent(
             format!("tool:{}:{}:1", trace.turn_id(), trace.tool_call_id()),
             crate::observation::scope_trace(
                 trace.clone(),
                 crate::observation::measure(
                     pioneer_observability::tool_call::Phase::Attempt,
-                    self.run_observed_attempt(registry, invocation, trace, permission_context),
+                    attempt,
                 ),
             ),
         )

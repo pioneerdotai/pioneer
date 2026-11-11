@@ -183,15 +183,17 @@ impl ToolCallRuntime {
         } else {
             Default::default()
         };
-        let result = work
-            .scope_result(correlation.scope(self.execute_tool_call_observed(
-                call,
-                cancellation,
-                source,
-                workdir,
-                commit_delivery,
-            )))
-            .await;
+        // Proxy handlers re-enter this runtime on the same task. Keep the
+        // execution state behind a heap boundary before the causal/work scopes
+        // wrap it, so each proxy does not copy that state through every wrapper.
+        let execution = Box::pin(self.execute_tool_call_observed(
+            call,
+            cancellation,
+            source,
+            workdir,
+            commit_delivery,
+        ));
+        let result = work.scope_result(correlation.scope(execution)).await;
         if let Some(observation) = &mut observation {
             observation.finish(match &result {
                 Ok(_) => pioneer_observability::tool_call::Fact::Returned,
