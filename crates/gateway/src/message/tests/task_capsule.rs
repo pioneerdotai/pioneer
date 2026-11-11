@@ -277,10 +277,14 @@ fn capsule_run_with_rounds(
                 } else {
                     TaskStatus::Completed
                 };
-                assert_eq!(
-                    wait_for_task_status(store.clone(), &id, expected).await,
-                    expected
-                );
+                let status = wait_for_task_status(store.clone(), &id, expected).await;
+                if status != expected {
+                    let state = store.get_task(&id).await.unwrap().unwrap();
+                    panic!(
+                        "capsule step {step}: {} worker must reach {expected:?}, got {status:?}; task={:?}, runs={:?}, run_turns={:?}",
+                        call.name, state.task, state.runs, state.task_run_turns,
+                    );
+                }
             }
         }
         let lineage = wait_for_child_lineage_for_run(store.clone(), &owner_run_id).await;
